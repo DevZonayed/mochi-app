@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import type { ServerResponse } from 'node:http';
-import type { Repositories, Effort } from './repositories.js';
+import type { Repositories, Effort, ApprovalStatus } from './repositories.js';
 import type { EngineAdapter } from './engine.js';
 
 export function buildServer(repos: Repositories, engine: EngineAdapter): FastifyInstance {
@@ -21,33 +21,58 @@ export function buildServer(repos: Repositories, engine: EngineAdapter): Fastify
     }
   }
 
-  app.get('/health', async () => ({ ok: true, name: 'maestro-server', version: '0.1.0', engine: engine.id, time: Date.now() }));
-  app.get('/', async () => ({ ok: true, service: 'maestro-server', docs: '/health, /api/workspaces, /api/projects, /api/jobs, /api/stream' }));
+  app.get('/health', async () => ({ ok: true, name: 'maestro-server', version: '0.2.0', engine: engine.id, time: Date.now() }));
+  app.get('/', async () => ({
+    ok: true,
+    service: 'maestro-server',
+    docs: '/health, /api/dashboard, /api/workspaces, /api/projects, /api/jobs, /api/approvals, /api/schedules, /api/skills, /api/templates, /api/budget, /api/stream',
+  }));
+
+  function defaultWorkspaceId(): string | undefined {
+    return repos.defaultWorkspace()?.id;
+  }
+  function resolveWorkspaceId(q: unknown): string | undefined {
+    return (q as { workspaceId?: string }).workspaceId ?? defaultWorkspaceId();
+  }
 
   // ── Workspaces ────────────────────────────────────────────────────
   app.get('/api/workspaces', async () => repos.listWorkspaces());
   app.post('/api/workspaces', async (req, reply) => {
-    const { name } = (req.body ?? {}) as { name?: string };
+    const { name, budgetCap } = (req.body ?? {}) as { name?: string; budgetCap?: number };
     if (!name) return reply.code(400).send({ error: 'name required' });
-    return repos.createWorkspace(name);
+    return repos.createWorkspace(name, budgetCap ?? 200);
+  });
+  app.post('/api/workspaces/:id/budget', async (req, reply) => {
+    const cap = Number(((req.body ?? {}) as { cap?: number }).cap);
+    if (!Number.isFinite(cap) || cap <= 0) return reply.code(400).send({ error: 'cap must be a positive number' });
+    repos.setBudgetCap((req.params as { id: string }).id, cap);
+    return { ok: true, cap };
   });
 
-  function defaultWorkspaceId(): string | undefined {
-    return repos.listWorkspaces()[0]?.id;
-  }
+  // ── Dashboard + Budget aggregates ─────────────────────────────────
+  app.get('/api/dashboard', async (req) => {
+    const wsId = resolveWorkspaceId(req.query);
+    if (!wsId) return { workspace: null, greetingProjects: [], gates: [], activeJobs: [], recentlyCompleted: [], schedule: [], budget: { cap: 200, spent: 0, byProject: [] } };
+    return repos.dashboard(wsId);
+  });
+  app.get('/api/budget', async (req) => {
+    const wsId = resolveWorkspaceId(req.query);
+    if (!wsId) return { cap: 200, spent: 0, byProject: [] };
+    return repos.budget(wsId);
+  });
 
   // ── Projects ──────────────────────────────────────────────────────
-  app.get('/api/projects', async (req, reply) => {
-    const wsId = (req.query as { workspaceId?: string }).workspaceId ?? defaultWorkspaceId();
+  app.get('/api/projects', async (req) => {
+    const wsId = resolveWorkspaceId(req.query);
     if (!wsId) return [];
     return repos.listProjects(wsId);
   });
   app.post('/api/projects', async (req, reply) => {
-    const body = (req.body ?? {}) as { workspaceId?: string; name?: string; template?: string; instructions?: string };
+    const body = (req.body ?? {}) as { workspaceId?: string; name?: string; template?: string; instructions?: string; color?: string };
     const workspaceId = body.workspaceId ?? defaultWorkspaceId();
     if (!workspaceId) return reply.code(400).send({ error: 'no workspace; create one first' });
     if (!body.name) return reply.code(400).send({ error: 'name required' });
-    return repos.createProject({ workspaceId, name: body.name, template: body.template, instructions: body.instructions });
+    return repos.createProject({ workspaceId, name: body.name, template: body.template, instructions: body.instructions, color: body.color });
   });
   app.get('/api/projects/:id', async (req, reply) => {
     const p = repos.getProject((req.params as { id: string }).id);
@@ -71,23 +96,81 @@ export function buildServer(repos: Repositories, engine: EngineAdapter): Fastify
     const j = repos.getJob((req.params as { id: string }).id);
     return j ?? reply.code(404).send({ error: 'job not found' });
   });
-  app.post('/api/jobs/:id/run', async (req, reply) => {
-    const jobId = (req.params as { id: string }).id;
-    const effort = ((req.body ?? {}) as { effort?: Effort }).effort;
+
+  async function runJob(jobId: string, effortOverride?: Effort) {
     let job = repos.getJob(jobId);
-    if (!job) return reply.code(404).send({ error: 'job not found' });
-    job = repos.updateJob(jobId, { status: 'running', output: null, error: null });
+    if (!job) return undefined;
+    job = repos.updateJob(jobId, { status: 'running', phase: 'Working', progress: 15, output: null, error: null, stage: 'starting…' });
     broadcast('job', job);
     const project = repos.getProject(job.projectId);
     try {
-      const result = await engine.run({ prompt: job.input, projectInstructions: project?.instructions, effort: effort ?? job.effort });
-      job = repos.updateJob(jobId, { status: 'done', output: result.output, error: null });
+      const result = await engine.run({ prompt: job.input, projectInstructions: project?.instructions, effort: effortOverride ?? job.effort });
+      job = repos.updateJob(jobId, { status: 'done', phase: 'Done', progress: 100, output: result.output, error: null, cost: result.cost, tokens: result.tokens, stage: '' });
     } catch (e) {
-      job = repos.updateJob(jobId, { status: 'failed', output: null, error: e instanceof Error ? e.message : String(e) });
+      job = repos.updateJob(jobId, { status: 'failed', phase: 'Failed', error: e instanceof Error ? e.message : String(e), stage: '' });
     }
     broadcast('job', job);
     return job;
+  }
+
+  app.post('/api/jobs/:id/run', async (req, reply) => {
+    const effort = ((req.body ?? {}) as { effort?: Effort }).effort;
+    const job = await runJob((req.params as { id: string }).id, effort);
+    return job ?? reply.code(404).send({ error: 'job not found' });
   });
+  // Create + run in one call (the "Run a job" composer flow).
+  app.post('/api/jobs/run', async (req, reply) => {
+    const body = (req.body ?? {}) as { projectId?: string; input?: string; title?: string; effort?: Effort };
+    if (!body.projectId || !body.input) return reply.code(400).send({ error: 'projectId and input required' });
+    if (!repos.getProject(body.projectId)) return reply.code(404).send({ error: 'project not found' });
+    const created = repos.createJob(body.projectId, body.input, body.title ?? '', body.effort ?? 'balanced');
+    broadcast('job', created);
+    const job = await runJob(created.id, body.effort);
+    return job ?? created;
+  });
+
+  // ── Approvals ─────────────────────────────────────────────────────
+  app.get('/api/approvals', async (req) => {
+    const status = (req.query as { status?: ApprovalStatus }).status;
+    return repos.listApprovals(status);
+  });
+  app.post('/api/approvals/:id/approve', async (req, reply) => {
+    const a = repos.getApproval((req.params as { id: string }).id);
+    if (!a) return reply.code(404).send({ error: 'approval not found' });
+    const next = repos.resolveApproval(a.id, 'approved');
+    broadcast('approval', next);
+    return next;
+  });
+  app.post('/api/approvals/:id/deny', async (req, reply) => {
+    const a = repos.getApproval((req.params as { id: string }).id);
+    if (!a) return reply.code(404).send({ error: 'approval not found' });
+    const next = repos.resolveApproval(a.id, 'denied');
+    broadcast('approval', next);
+    return next;
+  });
+
+  // ── Schedules ─────────────────────────────────────────────────────
+  app.get('/api/schedules', async () => repos.listSchedules());
+  app.post('/api/schedules', async (req, reply) => {
+    const body = (req.body ?? {}) as { title?: string; projectId?: string; time?: string; cadence?: string };
+    if (!body.title) return reply.code(400).send({ error: 'title required' });
+    return repos.createSchedule({ title: body.title, projectId: body.projectId ?? null, time: body.time, cadence: body.cadence });
+  });
+  app.post('/api/schedules/:id/toggle', async (req) => {
+    const body = (req.body ?? {}) as { enabled?: boolean };
+    repos.setScheduleEnabled((req.params as { id: string }).id, body.enabled ?? false);
+    return { ok: true };
+  });
+
+  // ── Skills ────────────────────────────────────────────────────────
+  app.get('/api/skills', async () => repos.listSkills());
+  app.post('/api/skills/:id/toggle', async (req, reply) => {
+    const s = repos.toggleSkill((req.params as { id: string }).id);
+    return s ?? reply.code(404).send({ error: 'skill not found' });
+  });
+
+  // ── Templates ─────────────────────────────────────────────────────
+  app.get('/api/templates', async () => repos.listTemplates());
 
   // ── SSE stream ────────────────────────────────────────────────────
   app.get('/api/stream', (req, reply) => {
