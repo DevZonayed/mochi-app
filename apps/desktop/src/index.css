@@ -1,0 +1,13 @@
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--backdrop-base);
+  font-family: var(--font-text);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}

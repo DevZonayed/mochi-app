@@ -1,0 +1,33 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# builds / generated
+dist/
+dist-electron/
+build/
+web-build/
+.turbo/
+*.tsbuildinfo
+
+# expo / metro
+.expo/
+.expo-shared/
+
+# databases (runtime)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# tooling / local state
+.context/
+.continuum/
+.DS_Store
+*.log
+coverage/

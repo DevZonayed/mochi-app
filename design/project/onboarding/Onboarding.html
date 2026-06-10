@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Maestro — Onboarding</title>
+<link rel="stylesheet" href="tokens.css" />
+<style>
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* animated muted blue/purple backdrop */
+  .backdrop { position: absolute; inset: 0; overflow: hidden; z-index: 0; }
+  .blob {
+    position: absolute; border-radius: 50%; filter: blur(48px);
+    mix-blend-mode: screen; opacity: 0.85;
+  }
+  [data-theme="light"] .blob { mix-blend-mode: normal; opacity: 0.7; }
+  .b1 { width: 760px; height: 760px; top: -200px; left: -140px;
+        background: radial-gradient(circle at 50% 50%, var(--blob-a), transparent 62%);
+        animation: drift1 24s ease-in-out infinite; }
+  .b2 { width: 720px; height: 720px; bottom: -240px; right: -160px;
+        background: radial-gradient(circle at 50% 50%, var(--blob-b), transparent 62%);
+        animation: drift2 29s ease-in-out infinite; }
+  .b3 { width: 560px; height: 560px; top: 26%; left: 38%; opacity: 0.5;
+        background: radial-gradient(circle at 50% 50%, var(--blob-c), transparent 60%);
+        animation: drift3 34s ease-in-out infinite; }
+  .grain { position: absolute; inset: 0;
+    background: radial-gradient(120% 90% at 50% 0%, transparent 55%, rgba(10,15,40,0.22) 100%); }
+  [data-theme="light"] .grain { background: radial-gradient(120% 90% at 50% 0%, transparent 60%, rgba(120,130,170,0.18) 100%); }
+  @keyframes drift1 { 0%,100% { transform: translate(0,0) scale(1); } 50% { transform: translate(80px,60px) scale(1.08); } }
+  @keyframes drift2 { 0%,100% { transform: translate(0,0) scale(1); } 50% { transform: translate(-70px,-50px) scale(1.1); } }
+  @keyframes drift3 { 0%,100% { transform: translate(0,0) scale(1); } 50% { transform: translate(-60px,70px) scale(0.92); } }
+
+  /* frosted glass card */
+  .glass-card {
+    width: 560px; padding: 38px 40px 32px; border-radius: var(--r-card);
+    background: var(--glass-tint);
+    backdrop-filter: blur(34px) saturate(180%); -webkit-backdrop-filter: blur(34px) saturate(180%);
+    border: 0.5px solid var(--glass-border);
+    box-shadow: var(--card-shadow), var(--glass-inner);
+  }
+
+  .card-body { min-height: 296px; }
+  [data-dir="fwd"].card-body { animation: stepInFwd 320ms var(--spring); }
+  [data-dir="back"].card-body { animation: stepInBack 320ms var(--spring); }
+  @keyframes stepInFwd { from { transform: translateX(22px); } to { transform: none; } }
+  @keyframes stepInBack { from { transform: translateX(-22px); } to { transform: none; } }
+
+  /* dashboard behind finish — sharp at rest; blur→sharp only while finishing */
+  .dash-wrap { position: absolute; inset: 0; z-index: 10; }
+  .dash-wrap[data-phase="finishing"] { animation: dashReveal 1200ms var(--spring) both; }
+  @keyframes dashReveal { from { filter: blur(26px) saturate(0.92); transform: scale(1.04); } to { filter: none; transform: none; } }
+
+  .youre-set {
+    position: absolute; inset: 0; z-index: 25; display: grid; place-items: center;
+    text-align: center; background: var(--glass-tint);
+    backdrop-filter: blur(20px) saturate(160%); -webkit-backdrop-filter: blur(20px) saturate(160%);
+    animation: youreSet 1500ms ease forwards;
+  }
+  .youre-set > * { animation: setRise 600ms var(--spring); }
+  @keyframes youreSet { 0% { opacity: 0; } 16% { opacity: 1; } 72% { opacity: 1; } 100% { opacity: 0; } }
+  @keyframes setRise { from { opacity: 0; transform: translateY(10px) scale(0.96); } to { opacity: 1; transform: none; } }
+
+  /* iOS slider */
+  input[type="range"].ios-slider { -webkit-appearance: none; appearance: none; outline: none; }
+  input[type="range"].ios-slider::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; width: 28px; height: 28px; border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.28), 0 0 0 0.5px rgba(0,0,0,0.05); cursor: pointer;
+  }
+  input[type="range"].ios-slider::-moz-range-thumb {
+    width: 28px; height: 28px; border: none; border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.28); cursor: pointer;
+  }
+  ::selection { background: rgba(0,122,255,0.22); }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <template id="__bundler_thumbnail">
+    <svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg">
+      <rect width="96" height="96" rx="22" fill="#5E8BFF"/>
+      <g stroke="#fff" stroke-width="2.6" stroke-linecap="round">
+        <path d="M48 48 L30 32"/><path d="M48 48 L68 30"/><path d="M48 48 L30 66"/><path d="M48 48 L66 66"/>
+      </g>
+      <g fill="#fff"><circle cx="30" cy="32" r="5"/><circle cx="68" cy="30" r="5"/><circle cx="30" cy="66" r="5"/><circle cx="66" cy="66" r="5"/></g>
+      <circle cx="48" cy="48" r="9" fill="#fff"/>
+    </svg>
+  </template>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="icons.jsx"></script>
+  <script type="text/babel" src="ui.jsx"></script>
+  <script type="text/babel" src="steps.jsx"></script>
+  <script type="text/babel" src="dashboard.jsx"></script>
+  <script type="text/babel" src="app.jsx"></script>
+</body>
+</html>

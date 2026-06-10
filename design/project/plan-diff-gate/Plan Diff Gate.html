@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Maestro — Plan &amp; Diff Gate</title>
+<link rel="stylesheet" href="../lib/tokens.css" />
+<style>
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* diff line backgrounds */
+  :root, [data-theme="light"] { --diff-add: #E8F8EE; --diff-del: #FDEBEC; }
+  [data-theme="dark"] { --diff-add: rgba(52,199,89,0.15); --diff-del: rgba(255,59,48,0.14); }
+
+  .app-wallpaper {
+    position: absolute; inset: 0; z-index: 0; pointer-events: none;
+    background:
+      radial-gradient(60% 50% at 16% 0%, color-mix(in srgb, var(--blob-a) 30%, transparent), transparent 70%),
+      radial-gradient(55% 50% at 100% 100%, color-mix(in srgb, var(--blob-b) 26%, transparent), transparent 70%),
+      var(--bg);
+  }
+
+  .nav-item:hover { background: var(--fill-tertiary); color: var(--ink); }
+  .ws-header:hover { background: var(--fill-tertiary); }
+  .search-field:hover { background: var(--fill-secondary); }
+  .tb-icon:hover { background: var(--fill-secondary); color: var(--ink); }
+  .link-btn:hover { text-decoration: underline; }
+  .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease, background 140ms ease; }
+  .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.45); }
+  .primary-cta:active { transform: translateY(1px); }
+  .ghost-btn:hover { background: color-mix(in srgb, var(--fill-secondary) 60%, var(--ink) 7%); }
+  .reject-btn:hover { background: rgba(255,59,48,0.1); }
+  .file-row:hover { background: var(--fill-tertiary); }
+
+  /* diff line flash on jump */
+  .line-flash { animation: lineFlash 1.2s ease; }
+  @keyframes lineFlash { 0%, 100% { box-shadow: inset 0 0 0 0 rgba(0,122,255,0); } 25% { box-shadow: inset 3px 0 0 0 var(--blue), inset 0 0 0 100px rgba(0,122,255,0.10); } }
+
+  /* findings green sweep + strike on resolve */
+  .finding.sweeping .fixed-sweep { animation: sweep 700ms ease forwards; }
+  @keyframes sweep { to { transform: translateX(100%); } }
+  .finding-fixed .finding-text { color: var(--ink-tertiary); text-decoration: line-through; text-decoration-color: var(--green); }
+
+  /* approve check-pop — frozen-clock-safe (scale only, base visible) */
+  .checkpop { animation: popFade 200ms ease; }
+  @keyframes popFade { from { opacity: 0.4; } to { opacity: 1; } }
+  .checkpop-circle { animation: checkPop 420ms var(--spring); }
+  @keyframes checkPop { 0% { transform: scale(0.5); } 60% { transform: scale(1.12); } 100% { transform: scale(1); } }
+
+  .sheet-pop { animation: sheetPop 220ms var(--spring); }
+  @keyframes sheetPop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
+  @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
+  @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
+
+  *::-webkit-scrollbar { width: 9px; height: 9px; }
+  *::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  ::selection { background: rgba(0,122,255,0.22); }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <template id="__bundler_thumbnail">
+    <svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg">
+      <rect width="96" height="96" rx="22" fill="#fff"/>
+      <rect x="20" y="26" width="56" height="11" rx="3" fill="#E8F8EE"/><rect x="22" y="29" width="4" height="5" fill="#34C759"/>
+      <rect x="20" y="42" width="56" height="11" rx="3" fill="#FDEBEC"/><rect x="22" y="45" width="4" height="5" fill="#FF3B30"/>
+      <rect x="20" y="58" width="40" height="11" rx="3" fill="#F2F2F7"/>
+    </svg>
+  </template>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="../lib/icons.jsx"></script>
+  <script type="text/babel" src="../lib/ui.jsx"></script>
+  <script type="text/babel" src="../lib/app-shell.jsx"></script>
+  <script type="text/babel" src="../command-center/cc-palette.jsx"></script>
+  <script type="text/babel" src="pg-plan.jsx"></script>
+  <script type="text/babel" src="pg-diff.jsx"></script>
+  <script type="text/babel" src="pg-app.jsx"></script>
+</body>
+</html>

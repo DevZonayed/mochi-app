@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Maestro — Projects</title>
+<link rel="stylesheet" href="../lib/tokens.css" />
+<style>
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .app-wallpaper {
+    position: absolute; inset: 0; z-index: 0; pointer-events: none;
+    background:
+      radial-gradient(60% 50% at 16% 0%, color-mix(in srgb, var(--blob-a) 30%, transparent), transparent 70%),
+      radial-gradient(55% 50% at 100% 100%, color-mix(in srgb, var(--blob-b) 26%, transparent), transparent 70%),
+      var(--bg);
+  }
+
+  .nav-item:hover { background: var(--fill-tertiary); color: var(--ink); }
+  .ws-header:hover { background: var(--fill-tertiary); }
+  .search-field:hover { background: var(--fill-secondary); }
+  .tb-icon:hover { background: var(--fill-secondary); color: var(--ink); }
+  .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease; }
+  .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.4); }
+  .primary-cta:active { transform: translateY(1px); }
+
+  .breathe { animation: breathe 1.8s ease-in-out infinite; }
+  @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+  /* project cards */
+  .proj-card { transition: transform 160ms var(--spring), box-shadow 160ms ease, border-color 160ms ease; }
+  .proj-card:hover { transform: translateY(-2px); box-shadow: var(--card-shadow), 0 10px 30px rgba(15,20,60,0.12); border-color: var(--separator-strong); }
+  .proj-row { transition: background 120ms ease; }
+  .proj-row:hover { background: var(--fill-tertiary); }
+  .proj-menu:hover { background: var(--fill-secondary); color: var(--ink); }
+  .tpl-pick { transition: transform 140ms var(--spring), box-shadow 160ms ease; }
+  .tpl-pick:hover { transform: translateY(-2px); box-shadow: var(--card-shadow), 0 8px 22px rgba(15,20,60,0.12); }
+
+  /* skeleton shimmer */
+  .shim { position: relative; overflow: hidden; background: var(--fill-secondary); }
+  .shim::after { content: ''; position: absolute; inset: 0; transform: translateX(-100%);
+    background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--ink) 6%, transparent), transparent);
+    animation: shimmer 1.4s infinite; }
+  @keyframes shimmer { 100% { transform: translateX(100%); } }
+
+  /* modal + palette — frozen-clock-safe */
+  @keyframes modalFade { from { opacity: 0.3; } to { opacity: 1; } }
+  @keyframes modalPop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
+  @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
+  @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
+
+  main::-webkit-scrollbar { width: 9px; }
+  main::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  ::selection { background: rgba(0,122,255,0.22); }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <template id="__bundler_thumbnail">
+    <svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg">
+      <rect width="96" height="96" rx="22" fill="#30B0C7"/>
+      <g fill="#fff"><rect x="26" y="30" width="44" height="13" rx="4"/><rect x="26" y="50" width="30" height="13" rx="4"/></g>
+    </svg>
+  </template>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="../lib/icons.jsx"></script>
+  <script type="text/babel" src="../lib/ui.jsx"></script>
+  <script type="text/babel" src="../lib/app-shell.jsx"></script>
+  <script type="text/babel" src="../command-center/cc-palette.jsx"></script>
+  <script type="text/babel" src="pj-cards.jsx"></script>
+  <script type="text/babel" src="pj-modal.jsx"></script>
+  <script type="text/babel" src="pj-app.jsx"></script>
+</body>
+</html>

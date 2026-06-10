@@ -1,0 +1,41 @@
+/* Maestro mobile — shared interaction + animation styles. */
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; height: 100%; background: #b9bccb; overflow: hidden; font-family: var(--font-text); -webkit-font-smoothing: antialiased; }
+[data-theme="dark"] body { background: #08090d; }
+:root, [data-theme="light"] { --diff-add: #E8F8EE; --diff-del: #FDEBEC; }
+[data-theme="dark"] { --diff-add: rgba(52,199,89,0.15); --diff-del: rgba(255,59,48,0.14); }
+button { font-family: inherit; cursor: pointer; border: none; background: none; padding: 0; color: inherit; }
+input, textarea { font-family: inherit; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes mFade { from { opacity: 0; } to { opacity: 1; } }
+
+.m-scroll::-webkit-scrollbar { width: 0; }
+.breathe { animation: breathe 1.8s ease-in-out infinite; }
+@keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+.m-pill { transition: transform 100ms var(--spring), filter 140ms ease; }
+.m-pill:active { transform: scale(0.97); }
+.m-card { transition: transform 120ms var(--spring); }
+.m-card:active { transform: scale(0.985); }
+
+.gate-card { transition: transform 360ms var(--spring), opacity 360ms ease; }
+.gate-approve { animation: gateApprove 380ms var(--spring) forwards; }
+@keyframes gateApprove { 0% { box-shadow: 0 0 0 0 rgba(52,199,89,0.5); } 35% { box-shadow: 0 0 0 6px rgba(52,199,89,0.18); transform: translateX(8px); } 100% { transform: translateX(120%); opacity: 0; } }
+
+/* bottom sheet rise */
+.m-sheet { animation: sheetUp 320ms var(--spring); }
+@keyframes sheetUp { from { transform: translateY(40px); } to { transform: none; } }
+
+/* frozen-clock-safe entrances (transform only) */
+.rise { animation: rise 300ms var(--spring); }
+@keyframes rise { from { transform: translateY(8px); } to { transform: none; } }
+
+.cursor-blink { animation: blink 1.05s step-end infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.wave { animation: wave 0.8s ease-in-out infinite alternate; transform-origin: center; }
+@keyframes wave { from { transform: scaleY(0.4); } to { transform: scaleY(1); } }
+.faceid-pulse { animation: fidp 1.2s ease-in-out infinite; }
+@keyframes fidp { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.05); opacity: 0.85; } }
+
+::selection { background: rgba(0,122,255,0.22); }
+@media (prefers-reduced-motion: reduce) { * { animation-duration: 0.001ms !important; } }

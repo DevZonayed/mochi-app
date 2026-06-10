@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Maestro — Mobile Screens</title>
+<link rel="stylesheet" href="../lib/tokens.css" />
+<style>
+  body { margin: 0; background: var(--backdrop-base); min-height: 100vh; font-family: var(--font-text); -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 28px 64px; }
+  .kicker { font: 700 12px/1 var(--font-text); letter-spacing: 0.14em; text-transform: uppercase; color: var(--blue); margin: 0 0 12px; }
+  h1 { margin: 0; font: 700 36px/1.05 var(--font-display); letter-spacing: -0.02em; color: var(--ink); }
+  p.sub { margin: 10px 0 36px; font: 400 17px/1.5 var(--font-text); color: var(--ink-secondary); max-width: 540px; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; }
+  .card { text-decoration: none; background: var(--bg-elevated); border: 0.5px solid var(--separator); border-radius: 16px; overflow: hidden; box-shadow: var(--card-shadow); transition: transform 160ms cubic-bezier(0.32,0.72,0,1), box-shadow 160ms ease; }
+  .card:hover { transform: translateY(-3px); box-shadow: var(--card-shadow), 0 16px 40px rgba(15,20,60,0.16); }
+  .thumb { height: 150px; display: grid; place-items: center; position: relative; }
+  .phone { width: 74px; height: 116px; border-radius: 16px; background: rgba(0,0,0,0.55); border: 2px solid rgba(255,255,255,0.25); display: grid; place-items: center; backdrop-filter: blur(4px); }
+  .phone svg { width: 30px; height: 30px; }
+  .meta { padding: 14px 16px 16px; }
+  .n { font: 700 11px/1 var(--font-mono); color: var(--ink-tertiary); letter-spacing: 0.08em; }
+  .t { margin: 7px 0 3px; font: 700 16px/1.15 var(--font-display); letter-spacing: -0.01em; color: var(--ink); }
+  .d { font: 400 12px/1.4 var(--font-text); color: var(--ink-secondary); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <p class="kicker">Maestro · iPhone</p>
+    <h1>Twelve screens, in your pocket.</h1>
+    <p class="sub">The thin-client companion to the Maestro Mac app — approve gates, watch live runs, and steer agents from anywhere.</p>
+    <div class="grid" id="grid"></div>
+  </div>
+  <script>
+    const ic = {
+      qr:'<rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="6" height="6" rx="1.5"/>',
+      home:'<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/>',
+      jobs:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 14h6"/>',
+      tl:'<path d="M4 6h16M4 12h10M4 18h13"/>',
+      shield:'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="M9 11l2 2 4-4"/>',
+      diff:'<path d="M5 6h9M5 12h12M5 18h7"/>',
+      plus:'<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
+      gauge:'<circle cx="12" cy="13" r="8"/><path d="M12 13l4-3"/>',
+      film:'<rect x="4" y="6" width="16" height="12" rx="2"/><path d="m10 10 5 3-5 3z"/>',
+      bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
+      gear:'<circle cx="12" cy="12" r="3"/><path d="M12 4V2M12 22v-2M4 12H2M22 12h-2"/>',
+      box:'<path d="M3 8 12 3l9 5v8l-9 5-9-5z"/><path d="M3 8l9 5 9-5"/>',
+    };
+    const screens = [
+      ['01','Onboarding','QR pairing flow','onboarding/Onboarding.html','qr','linear-gradient(150deg,#0E2A5E,#5E8BFF)'],
+      ['02','Home','Needs-you, live, today','home/Home.html','home','linear-gradient(150deg,#5E8BFF,#A24BE0)'],
+      ['03','Jobs','Projects & job list','jobs/Jobs.html','jobs','linear-gradient(150deg,#2A6FDB,#30B0C7)'],
+      ['04','Job Timeline','Live streaming transcript','job-timeline/Job Timeline.html','tl','linear-gradient(150deg,#7C5CFF,#30B0C7)'],
+      ['05','Approvals','Gate cards · Face ID','approvals/Approvals.html','shield','linear-gradient(150deg,#0E2A5E,#1F8A5B)'],
+      ['06','Diff Review','Mobile code review','diff-review/Diff Review.html','diff','linear-gradient(150deg,#2A6FDB,#1F8A5B)'],
+      ['07','New Job','Quick-trigger sheet','new-job/New Job.html','plus','linear-gradient(150deg,#007AFF,#5856D6)'],
+      ['08','Budget','Ring, caps, ledger','budget/Budget.html','gauge','linear-gradient(150deg,#1F8A5B,#2A6FDB)'],
+      ['09','Studio','Gallery & preview','studio/Studio.html','film','linear-gradient(150deg,#30B0C7,#1F8A5B)'],
+      ['10','Notifications','In-app + push designs','notifications/Notifications.html','bell','linear-gradient(150deg,#FF9500,#AF52DE)'],
+      ['11','Settings','Connection & security','settings/Settings.html','gear','linear-gradient(150deg,#3C3C43,#6b6b76)'],
+      ['12','Outbox','Offline intent queue','outbox/Outbox.html','box','linear-gradient(150deg,#FF9500,#2A6FDB)'],
+    ];
+    document.getElementById('grid').innerHTML = screens.map(s => `
+      <a class="card" href="${s[3]}">
+        <div class="thumb" style="background:${s[5]}"><div class="phone"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ic[s[4]]}</svg></div></div>
+        <div class="meta"><span class="n">${s[0]}</span><div class="t">${s[1]}</div><div class="d">${s[2]}</div></div>
+      </a>`).join('');
+  </script>
+</body>
+</html>

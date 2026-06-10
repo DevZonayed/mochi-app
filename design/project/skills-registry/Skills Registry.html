@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Maestro — Skills Registry</title>
+<link rel="stylesheet" href="../lib/tokens.css" />
+<style>
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .app-wallpaper {
+    position: absolute; inset: 0; z-index: 0; pointer-events: none;
+    background:
+      radial-gradient(60% 50% at 16% 0%, color-mix(in srgb, var(--blob-a) 30%, transparent), transparent 70%),
+      radial-gradient(55% 50% at 100% 100%, color-mix(in srgb, var(--blob-b) 26%, transparent), transparent 70%),
+      var(--bg);
+  }
+
+  .nav-item:hover { background: var(--fill-tertiary); color: var(--ink); }
+  .ws-header:hover { background: var(--fill-tertiary); }
+  .search-field:hover { background: var(--fill-secondary); }
+  .tb-icon:hover { background: var(--fill-secondary); color: var(--ink); }
+  .link-btn:hover { text-decoration: underline; }
+  .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease, background 140ms ease; }
+  .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.45); }
+  .primary-cta:active { transform: translateY(1px); }
+  .split-quiet:hover { background: color-mix(in srgb, var(--fill-secondary) 60%, var(--ink) 7%); }
+  .reject-btn:hover { background: rgba(255,59,48,0.1); }
+  .filter-chip { transition: background 140ms ease, color 140ms ease, filter 140ms ease; }
+  .filter-chip:hover { filter: brightness(0.97); }
+  .sk-row { transition: background 120ms ease; }
+  .sk-row:hover { background: var(--fill-tertiary); }
+  .ver-pick:hover, .sha-copy:hover { background: color-mix(in srgb, var(--fill-secondary) 60%, var(--ink) 7%); }
+  .drop-zone { transition: border-color 140ms ease, background 140ms ease; cursor: pointer; }
+  .drop-zone:hover { border-color: var(--blue); background: color-mix(in srgb, var(--blue) 6%, var(--fill-tertiary)); }
+
+  /* list reorder + tab + scan — frozen-clock-safe (transform only) */
+  .reg-list { animation: listIn 280ms var(--spring); }
+  @keyframes listIn { from { transform: translateY(6px); } to { transform: none; } }
+  .tab-body { animation: tabIn 220ms var(--spring); }
+  @keyframes tabIn { from { transform: translateY(5px); } to { transform: none; } }
+  .scan-pop { animation: scanPop 360ms var(--spring); }
+  @keyframes scanPop { 0% { transform: scale(0.5); } 60% { transform: scale(1.15); } 100% { transform: scale(1); } }
+  .toast { animation: toastIn 280ms var(--spring); }
+  @keyframes toastIn { from { transform: translate(-50%, 12px); } to { transform: translate(-50%, 0); } }
+
+  .sheet-pop { animation: sheetPop 220ms var(--spring); }
+  @keyframes sheetPop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
+  @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
+  @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
+
+  *::-webkit-scrollbar { width: 9px; height: 9px; }
+  *::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  input::placeholder { color: var(--ink-tertiary); }
+  ::selection { background: rgba(0,122,255,0.22); }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <template id="__bundler_thumbnail">
+    <svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg">
+      <rect width="96" height="96" rx="22" fill="#5856D6"/>
+      <path d="M48 26l5.5 11.5L66 39l-9 8.7 2.2 12.8L48 54.5 36.8 60.5 39 47.7 30 39l12.5-1.5z" fill="#fff"/>
+    </svg>
+  </template>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="../lib/icons.jsx"></script>
+  <script type="text/babel" src="../lib/ui.jsx"></script>
+  <script type="text/babel" src="../lib/app-shell.jsx"></script>
+  <script type="text/babel" src="../command-center/cc-palette.jsx"></script>
+  <script type="text/babel" src="sk-list.jsx"></script>
+  <script type="text/babel" src="sk-detail.jsx"></script>
+  <script type="text/babel" src="sk-publish.jsx"></script>
+  <script type="text/babel" src="sk-app.jsx"></script>
+</body>
+</html>

@@ -1,0 +1,157 @@
+import { Link } from 'react-router-dom';
+
+const styles = `
+  body { background: var(--backdrop-base); display: grid; place-items: center; height: 100vh; }
+  .wrap { width: min(960px, 92vw); }
+  .head { margin-bottom: 32px; }
+  .kicker { font: 700 var(--fs-caption)/1 var(--font-text); letter-spacing: 0.14em; text-transform: uppercase; color: var(--blue); margin: 0 0 12px; }
+  h1 { margin: 0; font: 700 var(--fs-large-title)/1.05 var(--font-display); letter-spacing: -0.02em; color: var(--ink); }
+  p.sub { margin: 10px 0 0; font: 400 var(--fs-body)/1.5 var(--font-text); color: var(--ink-secondary); max-width: 520px; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
+  .card { display: flex; flex-direction: column; gap: 0; background: var(--bg-elevated); border-radius: 18px; overflow: hidden;
+    border: 0.5px solid var(--separator); box-shadow: var(--card-shadow); text-decoration: none; transition: transform 160ms cubic-bezier(0.32,0.72,0,1), box-shadow 160ms ease; }
+  .card:hover { transform: translateY(-3px); box-shadow: var(--card-shadow), 0 14px 40px rgba(15,20,60,0.16); }
+  .thumb { height: 132px; display: grid; place-items: center; position: relative; }
+  .thumb svg { width: 56px; height: 56px; }
+  .meta { padding: 16px 18px 18px; }
+  .n { font: 700 var(--fs-caption)/1 var(--font-mono); color: var(--ink-tertiary); letter-spacing: 0.08em; }
+  .t { margin: 8px 0 4px; font: 700 var(--fs-title2)/1.1 var(--font-display); letter-spacing: -0.01em; color: var(--ink); }
+  .d { font: 400 var(--fs-footnote)/1.4 var(--font-text); color: var(--ink-secondary); }
+`;
+
+export default function Launcher() {
+  return (
+    <>
+      <style>{styles}</style>
+      <div className="wrap">
+        <div className="head">
+          <p className="kicker">Maestro · Desktop</p>
+          <h1>Twenty screens, one cockpit.</h1>
+          <p className="sub">An orchestration app for running a fleet of AI agents — built in the Maestro iOS visual language on macOS chrome. Light &amp; dark, fully interactive.</p>
+        </div>
+        <div className="grid">
+          <Link className="card" to="/onboarding">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #5E8BFF, #A24BE0)' }}>
+              <svg viewBox="0 0 96 96" fill="none"><g stroke="#fff" strokeWidth="3" strokeLinecap="round"><path d="M48 48 L30 32" /><path d="M48 48 L68 30" /><path d="M48 48 L30 66" /><path d="M48 48 L66 66" /></g><g fill="#fff"><circle cx="30" cy="32" r="5.5" /><circle cx="68" cy="30" r="5.5" /><circle cx="30" cy="66" r="5.5" /><circle cx="66" cy="66" r="5.5" /></g><circle cx="48" cy="48" r="10" fill="#fff" /></svg>
+            </div>
+            <div className="meta"><span className="n">01</span><div className="t">Onboarding</div><div className="d">5-step first-run setup — workspace, providers, budget, pairing.</div></div>
+          </Link>
+          <Link className="card" to="/command-center">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #7C5CFF, #30B0C7)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12l1-8.5Z" /></svg>
+            </div>
+            <div className="meta"><span className="n">02</span><div className="t">Command Center</div><div className="d">Operator cockpit — needs-you gates, live jobs, spend, ⌘K palette.</div></div>
+          </Link>
+          <Link className="card" to="/projects">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #30B0C7, #5856D6)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5Z" /><path d="m3 12 9 5 9-5" /><path d="m3 17 9 5 9-5" /></svg>
+            </div>
+            <div className="meta"><span className="n">03</span><div className="t">Projects</div><div className="d">Grid &amp; list of typed projects, budgets, schedules, template gallery.</div></div>
+          </Link>
+          <Link className="card" to="/project-detail">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #5856D6, #007AFF)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><polyline points="7 8 11 12 7 16" /><line x1="13" y1="16" x2="17" y2="16" /></svg>
+            </div>
+            <div className="meta"><span className="n">04</span><div className="t">Project Detail</div><div className="d">Goal composer, jobs, instructions, skills &amp; tools, budget.</div></div>
+          </Link>
+          <Link className="card" to="/templates">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #7C5CFF, #5856D6)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><line x1="7" y1="9" x2="7" y2="17" /><line x1="12" y1="12" x2="12" y2="17" /><line x1="17" y1="9" x2="17" y2="17" /><circle cx="7" cy="6.5" r="1.4" /><circle cx="12" cy="9.5" r="1.4" /><circle cx="17" cy="6.5" r="1.4" /></svg>
+            </div>
+            <div className="meta"><span className="n">05</span><div className="t">Templates</div><div className="d">Template gallery + full-page editor with live preview.</div></div>
+          </Link>
+          <Link className="card" to="/job-monitor">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #0E2A5E, #5E8BFF)' }}>
+              <svg viewBox="0 0 24 24" fill="none"><rect x="4" y="6" width="9" height="2.6" rx="1.3" fill="#AF52DE" /><rect x="7" y="10.7" width="10" height="2.6" rx="1.3" fill="#FF9500" /><rect x="4" y="15.4" width="6" height="2.6" rx="1.3" fill="#34C759" /><line x1="15" y1="4" x2="15" y2="20" stroke="#fff" strokeWidth="1.6" /></svg>
+            </div>
+            <div className="meta"><span className="n">06</span><div className="t">Job Monitor</div><div className="d">Fleet swim-lane timeline, table view, and live inspector.</div></div>
+          </Link>
+          <Link className="card" to="/session-transcript">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #AF52DE, #7C5CFF)' }}>
+              <svg viewBox="0 0 24 24" fill="none"><g fill="#fff"><rect x="5" y="6" width="14" height="2.4" rx="1.2" /><rect x="5" y="11" width="10" height="2.4" rx="1.2" /><rect x="5" y="16" width="7" height="2.4" rx="1.2" opacity="0.6" /></g><rect x="13" y="16" width="1.4" height="2.4" fill="#fff" /></svg>
+            </div>
+            <div className="meta"><span className="n">07</span><div className="t">Session Transcript</div><div className="d">Live streaming agent transcript with run outline and meters.</div></div>
+          </Link>
+          <Link className="card" to="/scheduler">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #1F8A5B, #30B0C7)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="5" width="16" height="16" rx="2.5" /><line x1="4" y1="9.5" x2="20" y2="9.5" /><line x1="8" y1="3" x2="8" y2="6" /><line x1="16" y1="3" x2="16" y2="6" /><rect x="7" y="13" width="3.5" height="2.6" rx="1" fill="#fff" stroke="none" /></svg>
+            </div>
+            <div className="meta"><span className="n">08</span><div className="t">Scheduler</div><div className="d">Durable per-project cron — week calendar, list, and new-schedule sheet.</div></div>
+          </Link>
+          <Link className="card" to="/plan-diff-gate">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #2A6FDB, #1F8A5B)' }}>
+              <svg viewBox="0 0 24 24" fill="none"><rect x="4" y="5" width="16" height="3.4" rx="1.5" fill="rgba(255,255,255,0.85)" /><rect x="4" y="10.3" width="16" height="3.4" rx="1.5" fill="#fff" /><rect x="4" y="15.6" width="11" height="3.4" rx="1.5" fill="rgba(255,255,255,0.6)" /><circle cx="19" cy="17.3" r="3.4" fill="#fff" /><path d="M17.6 17.3l1 1 1.8-1.9" stroke="#1F8A5B" strokeWidth="1.4" fill="none" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            </div>
+            <div className="meta"><span className="n">09</span><div className="t">Plan &amp; Diff Gate</div><div className="d">Plan checkpoint and code-review diff gate with reviewer findings.</div></div>
+          </Link>
+          <Link className="card" to="/approvals">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #0E2A5E, #1F8A5B)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="11" r="7.5" /><path d="M8.5 11l2.4 2.4 4.6-5" stroke="#34C759" /></svg>
+            </div>
+            <div className="meta"><span className="n">10</span><div className="t">Approvals Center</div><div className="d">HITL gate queue — every pending decision in one place.</div></div>
+          </Link>
+          <Link className="card" to="/skills-registry">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #5856D6, #7C5CFF)' }}>
+              <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l2.5 5.2L20 9l-4 4 1 6-5-3-5 3 1-6-4-4 5.5-.8z" fill="#fff" /></svg>
+            </div>
+            <div className="meta"><span className="n">11</span><div className="t">Skills Registry</div><div className="d">Personal skill marketplace — search, inspect, sign, publish.</div></div>
+          </Link>
+          <Link className="card" to="/mcp-gateway">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #2A6FDB, #30B0C7)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><rect x="8" y="8" width="8" height="8" rx="2" /><path d="M10 4v4M14 4v4M10 16v4M14 16v4M4 10h4M4 14h4M16 10h4M16 14h4" /></svg>
+            </div>
+            <div className="meta"><span className="n">12</span><div className="t">MCP Gateway</div><div className="d">MCP servers, live tool-call stream, and denials.</div></div>
+          </Link>
+          <Link className="card" to="/media-studio">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #30B0C7, #1F8A5B)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="6" width="18" height="13" rx="2.5" /><path d="m10 10 5 3-5 3z" fill="#fff" stroke="none" /></svg>
+            </div>
+            <div className="meta"><span className="n">13</span><div className="t">Media Studio</div><div className="d">Brief-to-published creative pipeline with cost transparency.</div></div>
+          </Link>
+          <Link className="card" to="/publishing">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #007AFF, #5856D6)' }}>
+              <svg viewBox="0 0 24 24" fill="none"><path d="M20 4 9 9l4 1.5L14.5 15z" fill="#fff" /></svg>
+            </div>
+            <div className="meta"><span className="n">14</span><div className="t">Publishing Center</div><div className="d">Draft-first multi-platform publishing, calendar, and ledger.</div></div>
+          </Link>
+          <Link className="card" to="/trends">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #5856D6, #2A6FDB)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="m4 15 6-1.6 1.7 4.4L5.7 19.4 4 15Z" /><path d="m10 13.4 8.5-2.3" /><path d="M9 17v3M7.5 20h3" /></svg>
+            </div>
+            <div className="meta"><span className="n">15</span><div className="t">Trend Intelligence</div><div className="d">Genre research that produces content briefs for the studio.</div></div>
+          </Link>
+          <Link className="card" to="/comms">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #1F8A5B, #2A6FDB)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8 8 0 0 1-11.5 7.2L4 20l1.3-5.5A8 8 0 1 1 21 11.5Z" /></svg>
+            </div>
+            <div className="meta"><span className="n">16</span><div className="t">Comms Gateway</div><div className="d">Telegram &amp; WhatsApp lanes, chat bindings, and send queue.</div></div>
+          </Link>
+          <Link className="card" to="/budget">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #1F8A5B, #2A6FDB)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="8" /><path d="M12 4a8 8 0 0 1 8 8" /></svg>
+            </div>
+            <div className="meta"><span className="n">17</span><div className="t">Budget Dashboard</div><div className="d">Cost governance — ceilings, caps, breakdown, ledger, rules.</div></div>
+          </Link>
+          <Link className="card" to="/settings">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #3C3C43, #6b6b76)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3" /><path d="M12 5V3M12 21v-2M5 12H3M21 12h-2M7 7 5.5 5.5M18.5 18.5 17 17M17 7l1.5-1.5M5.5 18.5 7 17" /></svg>
+            </div>
+            <div className="meta"><span className="n">18</span><div className="t">Settings</div><div className="d">Settings, secrets &amp; security — macOS System Settings model.</div></div>
+          </Link>
+          <Link className="card" to="/device-pairing">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #2A6FDB, #7C5CFF)' }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><rect x="8" y="3" width="8" height="14" rx="2" /><circle cx="12" cy="19.5" r="3.2" /><path d="M10.7 19.5l.9.9 1.7-1.9" /></svg>
+            </div>
+            <div className="meta"><span className="n">19</span><div className="t">Pair a Phone</div><div className="d">E2EE phone pairing with morphing QR states.</div></div>
+          </Link>
+          <Link className="card" to="/audit">
+            <div className="thumb" style={{ background: 'linear-gradient(140deg, #0E2A5E, #1F8A5B)' }}>
+              <svg viewBox="0 0 24 24" fill="none"><g fill="#fff"><rect x="5" y="6" width="9" height="2.4" rx="1.2" /><rect x="5" y="11" width="13" height="2.4" rx="1.2" /><rect x="5" y="16" width="7" height="2.4" rx="1.2" /></g><circle cx="17.5" cy="7.2" r="3" fill="none" stroke="#34C759" strokeWidth="1.6" /><path d="M16.3 7.2l0.8 0.8 1.3-1.5" stroke="#34C759" strokeWidth="1.4" fill="none" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            </div>
+            <div className="meta"><span className="n">20</span><div className="t">Audit &amp; History</div><div className="d">Run replay + tamper-evident hash-chained audit log.</div></div>
+          </Link>
+        </div>
+      </div>
+    </>
+  );
+}

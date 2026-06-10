@@ -1,0 +1,112 @@
+/* ───────────────────────────────────────────────────────────
+   Maestro — iOS "glass and ink" design tokens
+   Light is default; [data-theme="dark"] overrides.
+   ─────────────────────────────────────────────────────────── */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  /* type */
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro", Inter, sans-serif;
+  --font-text: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro", Inter, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
+
+  /* iOS type ramp */
+  --fs-large-title: 34px;
+  --fs-title1: 28px;
+  --fs-title2: 22px;
+  --fs-headline: 17px;
+  --fs-body: 17px;
+  --fs-callout: 16px;
+  --fs-subhead: 15px;
+  --fs-footnote: 13px;
+  --fs-caption: 11px;
+
+  /* semantic */
+  --blue: #007AFF;
+  --blue-press: #0062cc;
+  --green: #34C759;
+  --red: #FF3B30;
+  --orange: #FF9500;
+  --purple: #AF52DE;
+  --teal: #30B0C7;
+  --indigo: #5856D6;
+
+  /* radii / motion */
+  --r-card: 20px;
+  --r-group: 12px;
+  --r-pill: 980px;
+  --spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --dur: 320ms;
+}
+
+:root,
+[data-theme="light"] {
+  --bg: #F2F2F7;
+  --bg-elevated: #FFFFFF;
+  --bg-grouped: rgba(255,255,255,0.72);
+  --fill-secondary: rgba(118,118,128,0.12);
+  --fill-tertiary: rgba(118,118,128,0.08);
+  --ink: #000000;
+  --ink-secondary: rgba(60,60,67,0.60);
+  --ink-tertiary: rgba(60,60,67,0.30);
+  --separator: rgba(60,60,67,0.18);
+  --separator-strong: rgba(60,60,67,0.29);
+  --card-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 12px 40px rgba(15,20,60,0.10);
+  --glass-tint: rgba(255,255,255,0.62);
+  --glass-border: rgba(255,255,255,0.7);
+  --glass-inner: inset 0 1px 0 rgba(255,255,255,0.65);
+  --on-glass: #1c1c2e;
+  /* desktop backdrop blobs */
+  --blob-a: #6b8cff;
+  --blob-b: #9b7bff;
+  --blob-c: #58c6e8;
+  --backdrop-base: #e7e9f3;
+}
+
+[data-theme="dark"] {
+  --bg: #000000;
+  --bg-elevated: #1C1C1E;
+  --bg-grouped: rgba(44,44,46,0.66);
+  --fill-secondary: rgba(120,120,128,0.24);
+  --fill-tertiary: rgba(120,120,128,0.16);
+  --ink: #FFFFFF;
+  --ink-secondary: rgba(235,235,245,0.60);
+  --ink-tertiary: rgba(235,235,245,0.30);
+  --separator: rgba(84,84,88,0.55);
+  --separator-strong: rgba(84,84,88,0.65);
+  --card-shadow: 0 1px 3px rgba(0,0,0,0.4), 0 18px 60px rgba(0,0,0,0.55);
+  --glass-tint: rgba(40,40,48,0.55);
+  --glass-border: rgba(255,255,255,0.10);
+  --glass-inner: inset 0 1px 0 rgba(255,255,255,0.10);
+  --on-glass: #f5f5fa;
+  --blob-a: #2b3f8c;
+  --blob-b: #5a3f8c;
+  --blob-c: #1f5a6e;
+  --backdrop-base: #06070d;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  font-family: var(--font-text);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+body { background: #b9bccb; overflow: hidden; }
+[data-theme="dark"] body { background: #0a0b10; }
+
+button { font-family: inherit; cursor: pointer; border: none; background: none; }
+input { font-family: inherit; }
+
+/* Effort / Model switcher polish (shared) */
+.effort-btn:not(:disabled):hover { background: color-mix(in srgb, currentColor 4%, transparent); }
+.effort-btn:not(:disabled):active { transform: translateY(1px); }
+.model-btn:not(:disabled):hover { background: color-mix(in srgb, var(--fill-secondary) 55%, var(--ink) 8%); }
+.model-opt:hover { background: var(--fill-tertiary) !important; }
+.model-pop { animation: modelPop 160ms cubic-bezier(0.32,0.72,0,1); }
+@keyframes modelPop { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}

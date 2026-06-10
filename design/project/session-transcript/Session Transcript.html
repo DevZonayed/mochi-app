@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Maestro — Session Transcript</title>
+<link rel="stylesheet" href="../lib/tokens.css" />
+<style>
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .app-wallpaper {
+    position: absolute; inset: 0; z-index: 0; pointer-events: none;
+    background:
+      radial-gradient(60% 50% at 16% 0%, color-mix(in srgb, var(--blob-a) 30%, transparent), transparent 70%),
+      radial-gradient(55% 50% at 100% 100%, color-mix(in srgb, var(--blob-b) 26%, transparent), transparent 70%),
+      var(--bg);
+  }
+
+  .nav-item:hover { background: var(--fill-tertiary); color: var(--ink); }
+  .ws-header:hover { background: var(--fill-tertiary); }
+  .search-field:hover { background: var(--fill-secondary); }
+  .tb-icon:hover { background: var(--fill-secondary); color: var(--ink); }
+  .split-quiet:hover { background: color-mix(in srgb, var(--fill-secondary) 60%, var(--ink) 6%); }
+  .link-btn:hover { text-decoration: underline; }
+  .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease, background 140ms ease; }
+  .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.4); }
+  .primary-cta:active { transform: translateY(1px); }
+  .tool-chip { transition: background 120ms ease; }
+  .tool-chip:hover { background: color-mix(in srgb, var(--fill-secondary) 60%, var(--ink) 7%); }
+  .ol-node:hover span, .ckpt:hover { }
+  .ckpt:hover { background: var(--fill-tertiary); }
+  .ckpt-restore:hover { background: var(--fill-secondary); color: var(--blue); }
+  .ctrl:hover { background: color-mix(in srgb, var(--fill-secondary) 60%, var(--ink) 7%); }
+  .ctrl-cancel:hover { background: rgba(255,59,48,0.2); }
+  .artifact:hover { background: color-mix(in srgb, var(--fill-secondary) 60%, var(--ink) 8%); }
+  .jump-pill { transition: transform 140ms var(--spring), box-shadow 160ms ease; }
+  .jump-pill:hover { box-shadow: 0 10px 28px rgba(0,122,255,0.5); }
+
+  .breathe { animation: breathe 1.8s ease-in-out infinite; }
+  @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .stream-caret { animation: blink 1.05s step-end infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .ol-pulse { animation: olPulse 1.6s ease-in-out infinite; }
+  @keyframes olPulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(0.7); opacity: 0.6; } }
+
+  /* block entrances — frozen-clock-safe (transform only) */
+  .gate-block { animation: blockIn 280ms var(--spring); }
+  .summary-done, .summary-fail { animation: blockIn 280ms var(--spring); }
+  @keyframes blockIn { from { transform: translateY(-6px); } to { transform: none; } }
+
+  /* palette — frozen-clock-safe */
+  @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
+  @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
+
+  main::-webkit-scrollbar, aside::-webkit-scrollbar, div::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  ::selection { background: rgba(0,122,255,0.22); }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <template id="__bundler_thumbnail">
+    <svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg">
+      <rect width="96" height="96" rx="22" fill="#AF52DE"/>
+      <g fill="#fff"><rect x="24" y="30" width="48" height="6" rx="3"/><rect x="24" y="44" width="36" height="6" rx="3"/><rect x="24" y="58" width="30" height="6" rx="3" opacity="0.6"/></g>
+      <rect x="56" y="58" width="4" height="6" fill="#fff"/>
+    </svg>
+  </template>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="../lib/icons.jsx"></script>
+  <script type="text/babel" src="../lib/ui.jsx"></script>
+  <script type="text/babel" src="../lib/app-shell.jsx"></script>
+  <script type="text/babel" src="../command-center/cc-palette.jsx"></script>
+  <script type="text/babel" src="st-blocks.jsx"></script>
+  <script type="text/babel" src="st-rail.jsx"></script>
+  <script type="text/babel" src="st-app.jsx"></script>
+</body>
+</html>

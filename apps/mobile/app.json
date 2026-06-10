@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "Maestro",
+    "slug": "maestro-mobile",
+    "version": "0.0.1",
+    "orientation": "portrait",
+    "scheme": "maestro",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "ai.maestro.app"
+    },
+    "android": {
+      "package": "ai.maestro.app",
+      "edgeToEdgeEnabled": true
+    },
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}

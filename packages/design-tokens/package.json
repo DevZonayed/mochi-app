@@ -1,0 +1,15 @@
+{
+  "name": "@maestro/design-tokens",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Maestro iOS 'glass & ink' design tokens — shared by the desktop (CSS) and mobile (TS theme) apps.",
+  "type": "module",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./theme": "./src/theme.ts",
+    "./tokens.css": "./src/tokens.css"
+  },
+  "files": ["index.ts", "src"]
+}
