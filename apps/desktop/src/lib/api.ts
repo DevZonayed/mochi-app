@@ -86,6 +86,15 @@ export interface BudgetData {
   spent: number;
   byProject: { projectId: string; name: string; color: string; spent: number }[];
 }
+export type ProviderId = 'anthropic' | 'openai';
+export interface ProviderConn {
+  workspaceId: string;
+  provider: ProviderId;
+  keyLast4: string;
+  model: string;
+  status: string;
+  createdAt: number;
+}
 export interface DashboardData {
   workspace: Workspace | null;
   greetingProjects: { id: string; name: string; color: string }[];
@@ -190,6 +199,13 @@ export const api = {
 
   // Templates
   listTemplates: () => req<Template[]>('/api/templates'),
+
+  // Providers (real Anthropic/OpenAI credentials — keys validated live, stored encrypted server-side)
+  listProviders: (workspaceId?: string) => req<ProviderConn[]>('/api/providers' + qp({ workspaceId })),
+  connectProvider: (provider: ProviderId, apiKey: string, model?: string, workspaceId?: string) =>
+    req<ProviderConn>(`/api/providers/${provider}/connect`, { method: 'POST', body: JSON.stringify({ apiKey, model, workspaceId }) }),
+  disconnectProvider: (provider: ProviderId, workspaceId?: string) =>
+    req<{ ok: boolean }>(`/api/providers/${provider}/disconnect`, { method: 'POST', body: JSON.stringify({ workspaceId }) }),
 
   /** Subscribe to live SSE updates. Returns an unsubscribe function. */
   subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void }): () => void {

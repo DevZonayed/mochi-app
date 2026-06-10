@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Db } from './db.js';
+import { encrypt, decrypt } from './crypto.js';
 
 export const id = (): string => randomUUID();
 export const now = (): number => Date.now();
@@ -79,6 +80,16 @@ export interface Template {
   category: string;
   icon: string;
   engine: string;
+  createdAt: number;
+}
+
+export type ProviderId = 'anthropic' | 'openai';
+export interface ProviderConn {
+  workspaceId: string;
+  provider: ProviderId;
+  keyLast4: string;
+  model: string;
+  status: string;
   createdAt: number;
 }
 
@@ -253,6 +264,39 @@ export class Repositories {
   }
   listTemplates(): Template[] {
     return this.db.prepare('SELECT * FROM templates ORDER BY category, name').all() as unknown as Template[];
+  }
+
+  // ── Providers (encrypted API keys) ──────────────────────────────────
+  connectProvider(workspaceId: string, provider: ProviderId, apiKey: string, model = ''): ProviderConn {
+    const keyCipher = encrypt(apiKey);
+    const keyLast4 = apiKey.slice(-4);
+    const createdAt = now();
+    this.db
+      .prepare(`INSERT INTO providers (workspaceId,provider,keyCipher,keyLast4,model,status,createdAt) VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(workspaceId,provider) DO UPDATE SET keyCipher=excluded.keyCipher, keyLast4=excluded.keyLast4, model=excluded.model, status='connected', createdAt=excluded.createdAt`)
+      .run(workspaceId, provider, keyCipher, keyLast4, model, 'connected', createdAt);
+    return { workspaceId, provider, keyLast4, model, status: 'connected', createdAt };
+  }
+  listProviders(workspaceId: string): ProviderConn[] {
+    return this.db
+      .prepare('SELECT workspaceId,provider,keyLast4,model,status,createdAt FROM providers WHERE workspaceId=?')
+      .all(workspaceId) as unknown as ProviderConn[];
+  }
+  getProviderKey(workspaceId: string, provider: ProviderId): string | undefined {
+    const row = this.db.prepare('SELECT keyCipher FROM providers WHERE workspaceId=? AND provider=?').get(workspaceId, provider) as { keyCipher: string } | undefined;
+    if (!row) return undefined;
+    try {
+      return decrypt(row.keyCipher);
+    } catch {
+      return undefined;
+    }
+  }
+  getProviderModel(workspaceId: string, provider: ProviderId): string | undefined {
+    const row = this.db.prepare('SELECT model FROM providers WHERE workspaceId=? AND provider=?').get(workspaceId, provider) as { model: string } | undefined;
+    return row?.model || undefined;
+  }
+  disconnectProvider(workspaceId: string, provider: ProviderId): void {
+    this.db.prepare('DELETE FROM providers WHERE workspaceId=? AND provider=?').run(workspaceId, provider);
   }
 
   // ── Budget / Dashboard aggregates ───────────────────────────────────

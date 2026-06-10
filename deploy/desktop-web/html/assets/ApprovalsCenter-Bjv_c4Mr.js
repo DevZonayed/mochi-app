@@ -1,4 +1,4 @@
-import{u as W,R as p,j as e}from"./index-Ch_3E_z0.js";import{u as N,a as E,b as F,c as $,T as O,S as L,d as Y}from"./appShell-BQooW_4k.js";import{I as d,O as K}from"./icons-uZun5Wf4.js";import{a as m}from"./api-DwC29CkQ.js";const _=`
+import{u as W,R as p,j as e}from"./index-DBrmBso5.js";import{u as N,a as E,b as F,c as $,T as O,S as L,d as Y}from"./appShell-UAZvKxOb.js";import{I as d,O as K}from"./icons-BjcEVTG7.js";import{a as m}from"./api-TzPuOslc.js";const _=`
   .nav-item:hover { background: var(--fill-tertiary); color: var(--ink); }
   .ws-header:hover { background: var(--fill-tertiary); }
   .search-field:hover { background: var(--fill-secondary); }

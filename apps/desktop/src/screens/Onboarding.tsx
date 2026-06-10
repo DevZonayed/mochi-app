@@ -10,7 +10,7 @@
 
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
 import {
   Icon,
   MaestroMark,
@@ -265,26 +265,30 @@ type ProviderState = 'idle' | 'waiting' | 'connected' | 'error';
 
 interface ProvidersStepProps {
   providers: Record<ProviderKey, ProviderState>;
+  keys: Record<ProviderKey, string>;
+  errors: Record<ProviderKey, string>;
+  onKeyChange: (key: ProviderKey, val: string) => void;
   onConnect: (key: ProviderKey) => void;
 }
 
-function ProvidersStep({ providers, onConnect }: ProvidersStepProps) {
-  const rows: { key: ProviderKey; name: string; meta: string; glyph: React.ReactNode; brand: string }[] = [
-    { key: 'anthropic', name: 'Anthropic', meta: 'Claude · coding & reasoning', glyph: <AnthropicGlyph size={24} />, brand: '#D97757' },
-    { key: 'openai', name: 'OpenAI', meta: 'GPT · media & vision', glyph: <OpenAIGlyph size={22} />, brand: 'var(--ink)' },
+function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect }: ProvidersStepProps) {
+  const rows: { key: ProviderKey; name: string; meta: string; glyph: React.ReactNode; brand: string; hint: string }[] = [
+    { key: 'anthropic', name: 'Anthropic', meta: 'Claude · coding & reasoning', glyph: <AnthropicGlyph size={24} />, brand: '#D97757', hint: 'sk-ant-…' },
+    { key: 'openai', name: 'OpenAI', meta: 'GPT · media & vision', glyph: <OpenAIGlyph size={22} />, brand: 'var(--ink)', hint: 'sk-…' },
   ];
   return (
     <div>
       <StepHeading icon="key" tint="var(--indigo)"
         title="Connect your providers"
-        sub="Sign in once. Agents run on your accounts." />
+        sub="Paste your API key — agents run on your own account." />
       <GroupedList footer={
         <span style={{ display: 'inline-flex', gap: 6 }}>
           <Icon name="lock" size={13} style={{ flexShrink: 0, marginTop: 1, opacity: 0.7 }} />
-          <span>Keys are stored in your Mac's Keychain. Agents can use them but never see them.</span>
+          <span>Keys are validated live, then stored encrypted on your server. Agents use them, never see them. You can also do this later in Settings.</span>
         </span>}>
         {rows.map((r, idx) => {
           const st = providers[r.key];
+          const connected = st === 'connected';
           return (
             <Row key={r.key} last={idx === rows.length - 1}>
               <span style={{
@@ -292,24 +296,33 @@ function ProvidersStep({ providers, onConnect }: ProvidersStepProps) {
                 display: 'grid', placeItems: 'center', color: r.brand,
                 background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)',
               }}>{r.glyph}</span>
-              <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ flexShrink: 0, width: 92 }}>
                 <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{r.name}</span>
-                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
-                  {st === 'error'
-                    ? <span style={{ color: 'var(--red)' }}>Connection failed — try again.</span>
-                    : r.meta}
+                <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: errors[r.key] ? 'var(--red)' : 'var(--ink-secondary)', marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {errors[r.key] || r.meta}
                 </span>
               </span>
-              {st === 'connected'
-                ? <StatusPill state="connected" />
-                : st === 'waiting'
-                  ? <StatusPill state="waiting" />
-                  : <PillButton kind="plain" onClick={() => onConnect(r.key)}
-                      style={{ height: 34, padding: '0 16px', fontSize: 14,
-                        background: st === 'error' ? 'rgba(255,59,48,0.12)' : 'var(--fill-secondary)',
-                        color: st === 'error' ? 'var(--red)' : 'var(--blue)' }}>
-                      {st === 'error' ? 'Retry' : 'Connect'}
-                    </PillButton>}
+              {connected ? (
+                <span style={{ flex: 1, display: 'flex', justifyContent: 'flex-end' }}>
+                  <StatusPill state="connected" />
+                </span>
+              ) : (
+                <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' }}>
+                  <input
+                    type="password" value={keys[r.key]} placeholder={r.hint}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => onKeyChange(r.key, e.target.value)}
+                    onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter' && keys[r.key].trim()) onConnect(r.key); }}
+                    style={{ flex: 1, minWidth: 0, maxWidth: 168, height: 34, border: '0.5px solid var(--separator-strong)', borderRadius: 8, outline: 'none', background: 'var(--fill-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', padding: '0 10px' }} />
+                  {st === 'waiting'
+                    ? <StatusPill state="waiting" />
+                    : <PillButton kind="plain" disabled={!keys[r.key].trim()} onClick={() => onConnect(r.key)}
+                        style={{ height: 34, padding: '0 14px', fontSize: 14,
+                          background: st === 'error' ? 'rgba(255,59,48,0.12)' : 'var(--fill-secondary)',
+                          color: st === 'error' ? 'var(--red)' : 'var(--blue)' }}>
+                        {st === 'error' ? 'Retry' : 'Connect'}
+                      </PillButton>}
+                </span>
+              )}
             </Row>
           );
         })}
@@ -549,6 +562,8 @@ export default function Onboarding() {
 
   const [workspace, setWorkspace] = React.useState('');
   const [providers, setProviders] = React.useState<Record<ProviderKey, ProviderState>>({ anthropic: 'idle', openai: 'idle' });
+  const [keys, setKeys] = React.useState<Record<ProviderKey, string>>({ anthropic: '', openai: '' });
+  const [providerErrors, setProviderErrors] = React.useState<Record<ProviderKey, string>>({ anthropic: '', openai: '' });
   const [budget, setBudget] = React.useState(200);
   const [secondsLeft, setSecondsLeft] = React.useState(120);
   const openaiTries = React.useRef(0);
@@ -570,13 +585,18 @@ export default function Onboarding() {
     setMaxVisited(m => Math.max(m, next));
   };
 
-  const connect = (key: ProviderKey) => {
+  const connect = async (key: ProviderKey) => {
+    const apiKey = keys[key].trim();
+    if (!apiKey) return;
     setProviders(p => ({ ...p, [key]: 'waiting' }));
-    const willFail = key === 'openai' && openaiTries.current === 0;
-    if (key === 'openai') openaiTries.current += 1;
-    setTimeout(() => {
-      setProviders(p => ({ ...p, [key]: willFail ? 'error' : 'connected' }));
-    }, willFail ? 1700 : 1500);
+    setProviderErrors(e => ({ ...e, [key]: '' }));
+    try {
+      await api.connectProvider(key, apiKey);
+      setProviders(p => ({ ...p, [key]: 'connected' }));
+    } catch (err) {
+      setProviders(p => ({ ...p, [key]: 'error' }));
+      setProviderErrors(e => ({ ...e, [key]: err instanceof ApiError ? err.message : 'Connection failed' }));
+    }
   };
 
   const finish = () => {
@@ -598,13 +618,12 @@ export default function Onboarding() {
     openaiTries.current = 0;
   };
 
-  const providerOk = providers.anthropic === 'connected' || providers.openai === 'connected';
-  const canContinue = [true, workspace.trim().length > 0, providerOk, true, true][step];
+  const canContinue = [true, workspace.trim().length > 0, true, true, true][step];
 
   const steps: React.ReactNode[] = [
     <WelcomeStep />,
     <WorkspaceStep value={workspace} onChange={setWorkspace} />,
-    <ProvidersStep providers={providers} onConnect={connect} />,
+    <ProvidersStep providers={providers} keys={keys} errors={providerErrors} onKeyChange={(k, v) => setKeys(s => ({ ...s, [k]: v }))} onConnect={connect} />,
     <BudgetStep amount={budget} onAmount={setBudget} />,
     <PairStep secondsLeft={secondsLeft} onRefresh={() => setSecondsLeft(120)} />,
   ];

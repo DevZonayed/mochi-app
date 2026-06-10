@@ -3,6 +3,8 @@ import cors from '@fastify/cors';
 import type { ServerResponse } from 'node:http';
 import type { Repositories, Effort, ApprovalStatus } from './repositories.js';
 import type { EngineAdapter } from './engine.js';
+import { AnthropicEngine, OpenAIEngine } from './engine.js';
+import { validateProviderKey, isProviderId } from './providers.js';
 
 export function buildServer(repos: Repositories, engine: EngineAdapter): FastifyInstance {
   const app = Fastify({ logger: true });
@@ -105,14 +107,26 @@ export function buildServer(repos: Repositories, engine: EngineAdapter): Fastify
     return j ?? reply.code(404).send({ error: 'job not found' });
   });
 
+  // Pick the engine for a workspace: a connected provider's real engine, else Echo.
+  function resolveEngine(workspaceId: string | undefined): EngineAdapter {
+    if (workspaceId) {
+      const aKey = repos.getProviderKey(workspaceId, 'anthropic');
+      if (aKey) return new AnthropicEngine(aKey, repos.getProviderModel(workspaceId, 'anthropic'));
+      const oKey = repos.getProviderKey(workspaceId, 'openai');
+      if (oKey) return new OpenAIEngine(oKey, repos.getProviderModel(workspaceId, 'openai'));
+    }
+    return engine;
+  }
+
   async function runJob(jobId: string, effortOverride?: Effort) {
     let job = repos.getJob(jobId);
     if (!job) return undefined;
-    job = repos.updateJob(jobId, { status: 'running', phase: 'Working', progress: 15, output: null, error: null, stage: 'starting…' });
-    broadcast('job', job);
     const project = repos.getProject(job.projectId);
+    const eng = resolveEngine(project?.workspaceId);
+    job = repos.updateJob(jobId, { status: 'running', phase: 'Working', progress: 15, output: null, error: null, stage: `running on ${eng.id}…` });
+    broadcast('job', job);
     try {
-      const result = await engine.run({ prompt: job.input, projectInstructions: project?.instructions, effort: effortOverride ?? job.effort });
+      const result = await eng.run({ prompt: job.input, projectInstructions: project?.instructions, effort: effortOverride ?? job.effort });
       job = repos.updateJob(jobId, { status: 'done', phase: 'Done', progress: 100, output: result.output, error: null, cost: result.cost, tokens: result.tokens, stage: '' });
     } catch (e) {
       job = repos.updateJob(jobId, { status: 'failed', phase: 'Failed', error: e instanceof Error ? e.message : String(e), stage: '' });
@@ -179,6 +193,32 @@ export function buildServer(repos: Repositories, engine: EngineAdapter): Fastify
 
   // ── Templates ─────────────────────────────────────────────────────
   app.get('/api/templates', async () => repos.listTemplates());
+
+  // ── Providers (real Anthropic/OpenAI credentials) ─────────────────
+  app.get('/api/providers', async (req) => {
+    const wsId = resolveWorkspaceId(req.query);
+    if (!wsId) return [];
+    return repos.listProviders(wsId);
+  });
+  app.post('/api/providers/:provider/connect', async (req, reply) => {
+    const provider = (req.params as { provider: string }).provider;
+    if (!isProviderId(provider)) return reply.code(400).send({ error: 'unsupported provider' });
+    const body = (req.body ?? {}) as { apiKey?: string; model?: string; workspaceId?: string };
+    if (!body.apiKey || !body.apiKey.trim()) return reply.code(400).send({ error: 'apiKey required' });
+    const wsId = body.workspaceId ?? defaultWorkspaceId();
+    if (!wsId) return reply.code(400).send({ error: 'no workspace; create one first' });
+    const check = await validateProviderKey(provider, body.apiKey.trim());
+    if (!check.ok) return reply.code(400).send({ error: check.error ?? 'invalid key' });
+    return repos.connectProvider(wsId, provider, body.apiKey.trim(), body.model ?? '');
+  });
+  app.post('/api/providers/:provider/disconnect', async (req, reply) => {
+    const provider = (req.params as { provider: string }).provider;
+    if (!isProviderId(provider)) return reply.code(400).send({ error: 'unsupported provider' });
+    const wsId = resolveWorkspaceId(req.body ?? {}) ?? defaultWorkspaceId();
+    if (!wsId) return reply.code(400).send({ error: 'no workspace' });
+    repos.disconnectProvider(wsId, provider);
+    return { ok: true };
+  });
 
   // ── SSE stream ────────────────────────────────────────────────────
   app.get('/api/stream', (req, reply) => {

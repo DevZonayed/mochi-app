@@ -16,7 +16,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, TrafficLights, Sidebar, Toolbar,
   type Theme,
 } from '../lib/appShell';
-import { api, type Workspace, type BudgetData } from '../lib/api';
+import { api, ApiError, type Workspace, type BudgetData, type ProviderConn, type ProviderId } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -205,30 +205,90 @@ function GeneralPane({ theme, setTheme, workspace }: {
   );
 }
 
-interface Provider { name: string; tint: string; glyph: string; status: string; used: string; }
-const PROVIDERS: Provider[] = [
-  { name: 'Anthropic', tint: '#D97757', glyph: 'A', status: 'Auto-refreshing ✓', used: '2 min ago' },
-  { name: 'OpenAI', tint: 'var(--ink)', glyph: 'O', status: 'Key in Keychain', used: '14 min ago' },
-  { name: 'fal', tint: 'var(--purple)', glyph: 'f', status: 'Key in Keychain', used: '1 hr ago' },
-  { name: 'Replicate', tint: 'var(--teal)', glyph: 'R', status: 'Key in Keychain', used: 'Yesterday' },
-  { name: 'ElevenLabs', tint: 'var(--indigo)', glyph: 'E', status: 'Key in Keychain', used: '3 hr ago' },
-  { name: 'Google', tint: 'var(--blue)', glyph: 'G', status: 'Auto-refreshing ✓', used: '5 min ago' },
+const REAL_PROVIDERS: { id: ProviderId; name: string; tint: string; glyph: string; meta: string; hint: string }[] = [
+  { id: 'anthropic', name: 'Anthropic', tint: '#D97757', glyph: 'A', meta: 'Claude · coding & reasoning', hint: 'sk-ant-…' },
+  { id: 'openai', name: 'OpenAI', tint: 'var(--ink)', glyph: 'O', meta: 'GPT · media & vision', hint: 'sk-…' },
 ];
+const OTHER_PROVIDERS = [
+  { name: 'fal', tint: 'var(--purple)', glyph: 'f' },
+  { name: 'Replicate', tint: 'var(--teal)', glyph: 'R' },
+  { name: 'ElevenLabs', tint: 'var(--indigo)', glyph: 'E' },
+  { name: 'Google', tint: 'var(--blue)', glyph: 'G' },
+];
+
 function AccountsPane() {
+  const [conns, setConns] = React.useState<ProviderConn[]>([]);
+  const [keys, setKeys] = React.useState<Record<string, string>>({ anthropic: '', openai: '' });
+  const [errors, setErrors] = React.useState<Record<string, string>>({ anthropic: '', openai: '' });
+  const [busy, setBusy] = React.useState<Record<string, boolean>>({ anthropic: false, openai: false });
+
+  const refetch = React.useCallback(() => { api.listProviders().then(setConns).catch(() => {}); }, []);
+  React.useEffect(() => { refetch(); }, [refetch]);
+
+  const connOf = (id: ProviderId) => conns.find(c => c.provider === id);
+
+  const connect = async (id: ProviderId) => {
+    const key = (keys[id] || '').trim();
+    if (!key) return;
+    setBusy(b => ({ ...b, [id]: true })); setErrors(e => ({ ...e, [id]: '' }));
+    try {
+      await api.connectProvider(id, key);
+      setKeys(k => ({ ...k, [id]: '' }));
+      refetch();
+    } catch (err) {
+      setErrors(e => ({ ...e, [id]: err instanceof ApiError ? err.message : 'Connection failed' }));
+    } finally {
+      setBusy(b => ({ ...b, [id]: false }));
+    }
+  };
+  const disconnect = async (id: ProviderId) => {
+    setBusy(b => ({ ...b, [id]: true }));
+    try { await api.disconnectProvider(id); refetch(); } catch { /* ignore */ } finally { setBusy(b => ({ ...b, [id]: false })); }
+  };
+
   return (
     <div>
-      <PaneHead sub="Agents use keys; they never see them.">Accounts &amp; keys</PaneHead>
-      <GroupedList footer="Keys live in your Mac's Keychain. We show status, never the value.">
-        {PROVIDERS.map((p, i) => (
-          <Row key={p.name} last={i === PROVIDERS.length - 1}>
+      <PaneHead sub="Agents use your keys; they never see them.">Accounts &amp; keys</PaneHead>
+      <GroupedList footer="Keys are validated live, then stored encrypted on your server. We show status, never the value.">
+        {REAL_PROVIDERS.map((p, i) => {
+          const c = connOf(p.id);
+          const connected = !!c;
+          return (
+            <Row key={p.id} last={i === REAL_PROVIDERS.length - 1}>
+              <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${p.tint} 15%, transparent)`, color: p.tint, font: '800 var(--fs-callout)/1 var(--font-display)' }}>{p.glyph}</span>
+              <span style={{ flexShrink: 0, width: 138, minWidth: 0 }}>
+                <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{p.name}</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: errors[p.id] ? 'var(--red)' : connected ? 'var(--green)' : 'var(--ink-secondary)', marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%' }}>
+                  <Icon name="lock" size={11} /> {errors[p.id] ? errors[p.id] : connected ? `Connected · ••••${c?.keyLast4 ?? ''}` : p.meta}
+                </span>
+              </span>
+              {connected ? (
+                <span style={{ flex: 1, display: 'flex', justifyContent: 'flex-end' }}>
+                  <button onClick={() => disconnect(p.id)} disabled={busy[p.id]} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{busy[p.id] ? '…' : 'Disconnect'}</button>
+                </span>
+              ) : (
+                <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' }}>
+                  <input type="password" value={keys[p.id] || ''} placeholder={p.hint}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setKeys(k => ({ ...k, [p.id]: e.target.value }))}
+                    onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') connect(p.id); }}
+                    style={{ flex: 1, minWidth: 0, maxWidth: 184, height: 32, border: '0.5px solid var(--separator-strong)', borderRadius: 8, outline: 'none', background: 'var(--fill-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', padding: '0 10px' }} />
+                  <button onClick={() => connect(p.id)} disabled={busy[p.id] || !(keys[p.id] || '').trim()} style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: busy[p.id] || !(keys[p.id] || '').trim() ? 0.5 : 1 }}>{busy[p.id] ? '…' : 'Connect'}</button>
+                </span>
+              )}
+            </Row>
+          );
+        })}
+      </GroupedList>
+      <div style={{ height: 18 }} />
+      <GroupedList header="More providers" footer="Additional providers are on the roadmap.">
+        {OTHER_PROVIDERS.map((p, i) => (
+          <Row key={p.name} last={i === OTHER_PROVIDERS.length - 1}>
             <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${p.tint} 15%, transparent)`, color: p.tint, font: '800 var(--fs-callout)/1 var(--font-display)' }}>{p.glyph}</span>
             <span style={{ flex: 1, minWidth: 0 }}>
               <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{p.name}</span>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: p.status.includes('✓') ? 'var(--green)' : 'var(--ink-secondary)', marginTop: 2 }}>
-                <Icon name="lock" size={11} /> {p.status} · used {p.used}
-              </span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>Not connected</span>
             </span>
-            <button className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Replace key</button>
+            <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Soon</span>
           </Row>
         ))}
       </GroupedList>

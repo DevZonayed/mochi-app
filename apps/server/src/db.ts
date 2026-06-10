@@ -78,6 +78,16 @@ CREATE TABLE IF NOT EXISTS templates (
   engine TEXT NOT NULL DEFAULT 'claude-code',
   createdAt INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS providers (
+  workspaceId TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  keyCipher TEXT NOT NULL,
+  keyLast4 TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'connected',
+  createdAt INTEGER NOT NULL,
+  PRIMARY KEY (workspaceId, provider)
+);
 CREATE INDEX IF NOT EXISTS idx_projects_workspace ON projects(workspaceId);
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(projectId);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);

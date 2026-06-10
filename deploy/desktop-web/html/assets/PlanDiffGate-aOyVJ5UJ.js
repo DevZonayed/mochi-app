@@ -1,4 +1,4 @@
-import{u as _,R as p,j as e}from"./index-Ch_3E_z0.js";import{I as l,O as V}from"./icons-uZun5Wf4.js";import{a as K}from"./ui-vo358jYN.js";import{A as U}from"./appShell-BQooW_4k.js";import{a as R}from"./api-DwC29CkQ.js";const $=`
+import{u as _,R as p,j as e}from"./index-DBrmBso5.js";import{I as l,O as V}from"./icons-BjcEVTG7.js";import{a as K}from"./ui-Damo6xBT.js";import{A as U}from"./appShell-UAZvKxOb.js";import{a as R}from"./api-TzPuOslc.js";const $=`
   /* diff line backgrounds */
   :root, [data-theme="light"] { --diff-add: #E8F8EE; --diff-del: #FDEBEC; }
   [data-theme="dark"] { --diff-add: rgba(52,199,89,0.15); --diff-del: rgba(255,59,48,0.14); }
