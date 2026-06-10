@@ -1,39 +1,104 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, Animated } from 'react-native';
 import Svg, { Path, Rect } from 'react-native-svg';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useFocusEffect } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
-import { Card, Mono, useProjects } from '../ui';
+import { Card, Mono } from '../ui';
+import { api, type Approval, type ApprovalKind, type Project } from '../api';
 
-type ProjKey = 'atlas' | 'content' | 'scan' | 'brand' | 'infra';
 type TintKey = 'blue' | 'purple' | 'green' | 'orange' | 'teal' | 'indigo' | 'red';
 type Platform = 'x' | 'linkedin';
 
 type Gate =
-  | { id: string; type: 'plan'; label: string; icon: IconName; tint: TintKey; proj: ProjKey; age: string; faceid?: boolean; steps: string[]; cost: string }
-  | { id: string; type: 'publish'; label: string; icon: IconName; tint: TintKey; proj: ProjKey; age: string; faceid?: boolean; caption: string; platforms: Platform[] }
-  | { id: string; type: 'merge'; label: string; icon: IconName; tint: TintKey; proj: ProjKey; age: string; faceid?: boolean; stat: string }
-  | { id: string; type: 'budget'; label: string; icon: IconName; tint: TintKey; proj: ProjKey; age: string; faceid?: boolean; over: string; cap: number };
+  | { id: string; type: 'plan'; label: string; icon: IconName; tint: TintKey; projName: string; age: string; faceid?: boolean; steps: string[]; cost: string }
+  | { id: string; type: 'publish'; label: string; icon: IconName; tint: TintKey; projName: string; age: string; faceid?: boolean; caption: string; platforms: Platform[] }
+  | { id: string; type: 'merge'; label: string; icon: IconName; tint: TintKey; projName: string; age: string; faceid?: boolean; stat: string }
+  | { id: string; type: 'budget'; label: string; icon: IconName; tint: TintKey; projName: string; age: string; faceid?: boolean; over: string; cap: number };
 
-const GATES: Gate[] = [
-  {
-    id: 'g1', type: 'plan', label: 'Plan approval', icon: 'sliders', tint: 'blue', proj: 'atlas', age: '1m', cost: '0.60',
-    steps: ['Add a reversible migration', 'Issue short-lived JWTs on login', 'Read token-first with cookie fallback'],
-  },
-  {
-    id: 'g2', type: 'publish', label: 'Publish draft', icon: 'send', tint: 'purple', proj: 'content', age: '9m', faceid: true,
-    caption: 'Maestro is live. One operator, a fleet of agents.', platforms: ['x', 'linkedin'],
-  },
-  {
-    id: 'g3', type: 'merge', label: 'Merge', icon: 'gitMerge', tint: 'green', proj: 'atlas', age: '14m', faceid: true,
-    stat: '+204 −67 · 12 files · reviewer: 0 issues',
-  },
-  {
-    id: 'g4', type: 'budget', label: 'Over budget', icon: 'gauge', tint: 'orange', proj: 'scan', age: '2m', over: '4.10', cap: 50,
-  },
-];
+const TINT_NAMES: TintKey[] = ['blue', 'purple', 'green', 'orange', 'teal', 'indigo', 'red'];
+
+/** Resolve a project color name (e.g. 'blue') to a valid TintKey, with a fallback. */
+function tintFromColor(color: string | undefined, fallback: TintKey): TintKey {
+  return color && (TINT_NAMES as string[]).includes(color) ? (color as TintKey) : fallback;
+}
+
+/** Relative-age label ("1m", "2h", "3d") matching the design's compact format. */
+function ageLabel(createdAt: number): string {
+  const s = Math.max(0, Math.floor((Date.now() - createdAt) / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+/** Per-kind presentation defaults (icon, tint, body type, whether Face ID gates it). */
+const KIND_META: Record<ApprovalKind, { type: Gate['type']; icon: IconName; tint: TintKey; faceid: boolean }> = {
+  merge: { type: 'merge', icon: 'gitMerge', tint: 'green', faceid: true },
+  budget: { type: 'budget', icon: 'gauge', tint: 'orange', faceid: false },
+  publish: { type: 'publish', icon: 'send', tint: 'purple', faceid: true },
+  deploy: { type: 'plan', icon: 'sliders', tint: 'blue', faceid: true },
+  review: { type: 'plan', icon: 'sliders', tint: 'blue', faceid: false },
+};
+
+/** Pull a dollar amount out of free text like "+$4.10 over the $50 cap". */
+function parseMoney(...sources: (string | null | undefined)[]): { over: string; cap: number } {
+  const text = sources.filter(Boolean).join(' ');
+  const overMatch = text.match(/\$?\s*([0-9]+(?:\.[0-9]+)?)/);
+  const capMatch = text.match(/cap[^0-9]*\$?\s*([0-9]+)/i);
+  const over = overMatch ? overMatch[1] : '0.00';
+  const cap = capMatch ? Number(capMatch[1]) : 50;
+  return { over, cap: Number.isFinite(cap) ? cap : 50 };
+}
+
+/** Map a live Approval into the Gate shape the existing JSX renders. */
+function toGate(a: Approval, projects: Record<string, Project>): Gate {
+  const meta = KIND_META[a.kind];
+  const proj = a.projectId ? projects[a.projectId] : undefined;
+  const projName = proj?.name ?? 'Workspace';
+  const tint = tintFromColor(proj?.color, meta.tint);
+  const base = {
+    id: a.id,
+    label: a.title,
+    icon: meta.icon,
+    tint,
+    projName,
+    age: ageLabel(a.createdAt),
+    faceid: meta.faceid,
+  };
+
+  switch (meta.type) {
+    case 'merge':
+      return { ...base, type: 'merge', stat: a.detail || a.subtitle || '' };
+    case 'budget': {
+      const { over, cap } = parseMoney(a.subtitle, a.detail, a.title);
+      return { ...base, type: 'budget', over, cap };
+    }
+    case 'publish':
+      return {
+        ...base,
+        type: 'publish',
+        caption: a.detail || a.subtitle || '',
+        platforms: ['x', 'linkedin'],
+      };
+    case 'plan':
+    default: {
+      const steps = (a.detail || a.subtitle || '')
+        .split(/\n|·|;/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      return {
+        ...base,
+        type: 'plan',
+        steps: steps.length ? steps : [a.subtitle || a.title],
+        cost: '0.00',
+      };
+    }
+  }
+}
 
 function useTints(): Record<TintKey, string> {
   const { theme } = useTheme();
@@ -173,11 +238,9 @@ function GateBody({ g }: { g: Gate }) {
   }
 }
 
-function GateCard({ g, approving, onApprove }: { g: Gate; approving: boolean; onApprove: (g: Gate) => void }) {
+function GateCard({ g, approving, onApprove, onReject }: { g: Gate; approving: boolean; onApprove: (g: Gate) => void; onReject: (g: Gate) => void }) {
   const { theme } = useTheme();
-  const projects = useProjects();
   const tints = useTints();
-  const p = projects[g.proj];
   const tint = tints[g.tint];
 
   const cover = useRef(new Animated.Value(0)).current;
@@ -196,8 +259,8 @@ function GateCard({ g, approving, onApprove }: { g: Gate; approving: boolean; on
         <View style={{ flex: 1, minWidth: 0 }}>
           <Text style={{ fontSize: 16, fontWeight: '700', color: theme.color.ink }}>{g.label}</Text>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 4 }}>
-            <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: p.color }} />
-            <Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkSecondary }}>{p.name}</Text>
+            <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: tint }} />
+            <Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkSecondary }}>{g.projName}</Text>
             <Mono style={{ fontSize: 12, color: theme.color.inkTertiary }}>· {g.age}</Mono>
           </View>
         </View>
@@ -218,7 +281,7 @@ function GateCard({ g, approving, onApprove }: { g: Gate; approving: boolean; on
         <Pressable style={{ width: 46, height: 46, borderRadius: 23, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}>
           <Icon name="command" size={19} color={theme.color.inkSecondary} />
         </Pressable>
-        <Pressable style={{ paddingHorizontal: 4 }}>
+        <Pressable onPress={() => onReject(g)} style={{ paddingHorizontal: 4 }}>
           <Text style={{ fontSize: 16, fontWeight: '600', color: theme.color.red }}>Reject</Text>
         </Pressable>
       </View>
@@ -267,23 +330,54 @@ function FaceIDOverlay({ g, onDone }: { g: Gate; onDone: () => void }) {
 export function ApprovalsScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
-  const [gates, setGates] = useState<Gate[]>(GATES);
+  const [gates, setGates] = useState<Gate[]>([]);
   const [approvingId, setApprovingId] = useState<string | null>(null);
   const [faceid, setFaceid] = useState<Gate | null>(null);
 
   const sub = useMemo(() => (gates.length ? `${gates.length} waiting · approve from anywhere` : null), [gates.length]);
 
+  const load = useCallback(async () => {
+    try {
+      const [approvals, projects] = await Promise.all([api.listApprovals('pending'), api.listProjects()]);
+      const byId: Record<string, Project> = {};
+      for (const p of projects) byId[p.id] = p;
+      setGates(approvals.map((a) => toGate(a, byId)));
+    } catch {
+      // fail soft — keep whatever's already on screen
+    }
+  }, []);
+
+  // Refetch on focus (and on mount) so newly-arrived gates and resolutions show up.
+  useFocusEffect(
+    useCallback(() => {
+      void load();
+    }, [load]),
+  );
+
+  // Approve: plays the green-cover animation, hits the API, then refetches.
   const finish = (g: Gate) => {
     setApprovingId(g.id);
+    void api.approveApproval(g.id).catch(() => {});
     setTimeout(() => {
       setGates((gs) => gs.filter((x) => x.id !== g.id));
       setApprovingId(null);
+      void load();
     }, 420);
   };
 
   const approve = (g: Gate) => {
     if (g.faceid) setFaceid(g);
     else finish(g);
+  };
+
+  const reject = (g: Gate) => {
+    setGates((gs) => gs.filter((x) => x.id !== g.id));
+    void api
+      .denyApproval(g.id)
+      .catch(() => {})
+      .finally(() => {
+        void load();
+      });
   };
 
   return (
@@ -305,7 +399,7 @@ export function ApprovalsScreen() {
               <Text style={{ fontSize: 16, lineHeight: 22, color: theme.color.inkSecondary, textAlign: 'center' }}>Gates will appear here and as notifications.</Text>
             </View>
           ) : (
-            gates.map((g) => <GateCard key={g.id} g={g} approving={approvingId === g.id} onApprove={approve} />)
+            gates.map((g) => <GateCard key={g.id} g={g} approving={approvingId === g.id} onApprove={approve} onReject={reject} />)
           )}
         </View>
       </ScrollView>

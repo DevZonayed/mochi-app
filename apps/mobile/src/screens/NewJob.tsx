@@ -1,19 +1,29 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { View, Text, Pressable, ScrollView, TextInput } from 'react-native';
 import Svg, { Rect } from 'react-native-svg';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
-import { Card, Mono, useProjects } from '../ui';
+import { Card, Mono } from '../ui';
+import { api, type Effort as ApiEffort } from '../api';
 
-type ProjKey = 'atlas' | 'content' | 'scan' | 'brand' | 'infra';
 type Effort = 'FAST' | 'BALANCED' | 'DEEP' | 'MAX';
 type ModelId = 'auto' | 'opus' | 'sonnet' | 'haiku' | 'gpt';
 type AutoKey = 'plan' | 'gated' | 'unatt';
 
-const NJ_PROJ: ProjKey[] = ['atlas', 'content', 'scan', 'brand', 'infra'];
+/** A live project mapped into the shape the picker JSX consumes. */
+interface LiveProj { id: string; name: string; color: string }
+
 const EFFORT_STOPS: Effort[] = ['FAST', 'BALANCED', 'DEEP', 'MAX'];
+
+/** Map the composer's effort dial to the API effort scale. */
+const EFFORT_API: Record<Effort, ApiEffort> = {
+  FAST: 'fast',
+  BALANCED: 'balanced',
+  DEEP: 'deep',
+  MAX: 'max',
+};
 
 const EST: Record<Effort, [string, string]> = {
   FAST: ['0.30', '3'],
@@ -257,16 +267,59 @@ function FieldLabel({ children }: { children: React.ReactNode }) {
 export function NewJobScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
-  const projects = useProjects();
   const nav = useNavigation<any>();
 
-  const [proj, setProj] = useState<ProjKey>('atlas');
+  /** Resolve an API color name ('blue','teal',…) to a theme hex; fall back to raw value. */
+  const resolveColor = (color: string): string => {
+    const palette = theme.color as unknown as Record<string, string | undefined>;
+    return palette[color] ?? color ?? theme.color.inkTertiary;
+  };
+
+  const [projects, setProjects] = useState<LiveProj[]>([]);
+  const [proj, setProj] = useState<string | null>(null);
   const [goal, setGoal] = useState('');
   const [effort, setEffort] = useState<Effort>('BALANCED');
   const [model, setModel] = useState<ModelId>('auto');
   const [auto, setAuto] = useState<AutoKey>('plan');
+  const [running, setRunning] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .listProjects()
+      .then((list) => {
+        if (!alive) return;
+        const mapped = list.map((p) => ({ id: p.id, name: p.name, color: resolveColor(p.color) }));
+        setProjects(mapped);
+        setProj((cur) => cur ?? mapped[0]?.id ?? null);
+      })
+      .catch(() => {
+        /* fail soft — picker stays empty */
+      });
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const selectedProject = projects.find((p) => p.id === proj) ?? null;
+
+  const submit = () => {
+    if (running || !proj || !goal.trim()) return;
+    setRunning(true);
+    api
+      .createAndRunJob({ projectId: proj, input: goal.trim(), effort: EFFORT_API[effort] })
+      .then(() => {
+        nav.goBack();
+      })
+      .catch(() => {
+        // fail soft — re-enable submit so the user can retry
+        setRunning(false);
+      });
+  };
 
   const est = EST[effort];
+  const canSubmit = !running && !!proj && goal.trim().length > 0;
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
@@ -278,7 +331,7 @@ export function NewJobScreen() {
       {/* header */}
       <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingTop: 10, paddingBottom: 14 }}>
         <Text numberOfLines={1} style={{ flex: 1, fontSize: 22, fontWeight: '700', letterSpacing: -0.2, color: theme.color.ink }}>
-          New job · {projects[proj].name}
+          New job{selectedProject ? ` · ${selectedProject.name}` : ''}
         </Text>
         <Pressable
           onPress={() => nav.navigate('Tabs')}
@@ -305,11 +358,10 @@ export function NewJobScreen() {
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={{ gap: 10, paddingBottom: 16 }}
         >
-          {NJ_PROJ.map((p) => {
-            const pr = projects[p];
-            const on = proj === p;
+          {projects.map((pr) => {
+            const on = proj === pr.id;
             return (
-              <Pressable key={p} onPress={() => setProj(p)} style={{ alignItems: 'center', gap: 6 }}>
+              <Pressable key={pr.id} onPress={() => setProj(pr.id)} style={{ alignItems: 'center', gap: 6 }}>
                 <View
                   style={{
                     width: 50,
@@ -322,7 +374,7 @@ export function NewJobScreen() {
                     borderColor: theme.color.blue,
                   }}
                 >
-                  <Text style={{ fontSize: 19, fontWeight: '800', color: pr.color }}>{pr.name[0]}</Text>
+                  <Text style={{ fontSize: 19, fontWeight: '800', color: pr.color }}>{pr.name[0] ?? '?'}</Text>
                 </View>
               </Pressable>
             );
@@ -434,7 +486,8 @@ export function NewJobScreen() {
 
         {/* primary action */}
         <Pressable
-          onPress={() => nav.navigate(auto === 'plan' ? 'DiffReview' : 'JobTimeline')}
+          onPress={canSubmit ? submit : undefined}
+          disabled={!canSubmit}
           style={{
             flexDirection: 'row',
             alignItems: 'center',
@@ -443,10 +496,11 @@ export function NewJobScreen() {
             height: 50,
             borderRadius: theme.radius.pill,
             backgroundColor: theme.color.blue,
+            opacity: canSubmit ? 1 : 0.5,
           }}
         >
           <Text style={{ fontSize: 17, fontWeight: '600', color: '#fff' }}>
-            {auto === 'plan' ? 'Get plan first' : 'Start job'}
+            {running ? 'Starting…' : auto === 'plan' ? 'Get plan first' : 'Start job'}
           </Text>
           <Icon name="arrowRight" size={18} color="#fff" />
         </Pressable>

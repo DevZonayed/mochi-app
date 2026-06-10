@@ -1,41 +1,23 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, Animated } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
-import { Card, Mono, useProjects } from '../ui';
+import { Card, Mono } from '../ui';
+import { api, type Job, type Project } from '../api';
 
-type ProjKey = 'atlas' | 'content' | 'scan' | 'brand' | 'infra';
-const PROJ_ORDER: ProjKey[] = ['atlas', 'content', 'scan', 'brand', 'infra'];
+/** Live project descriptor used to render the filter avatars + row subtitles. */
+type LiveProj = { id: string; name: string; color: string };
 
-const M_JOBS: {
-  gated: { proj: ProjKey; name: string; sub: string; cost: string }[];
-  running: { proj: ProjKey; name: string; tint: 'purple' | 'teal'; cost: string; el: string }[];
-  scheduled: { proj: ProjKey; name: string; countdown: string }[];
-  done: { proj: ProjKey; name: string; ok: boolean; cost: string }[];
-} = {
-  gated: [{ proj: 'atlas', name: 'Merge PR #482', sub: 'auth refactor', cost: '0.31' }],
-  running: [
-    { proj: 'atlas', name: 'Refactor auth service', tint: 'purple', cost: '0.42', el: '4:21' },
-    { proj: 'brand', name: 'Export icon set @3x', tint: 'teal', cost: '0.12', el: '1:08' },
-    { proj: 'infra', name: 'CI hardening', tint: 'purple', cost: '0.18', el: '2:55' },
-  ],
-  scheduled: [
-    { proj: 'atlas', name: 'Nightly test suite', countdown: 'in 3h 23m' },
-    { proj: 'scan', name: 'Competitor digest', countdown: 'in 7m' },
-  ],
-  done: [
-    { proj: 'brand', name: 'Generate OG images', ok: true, cost: '0.34' },
-    { proj: 'content', name: 'Translate docs (ES)', ok: true, cost: '0.46' },
-    { proj: 'infra', name: 'Deploy preview', ok: false, cost: '0.02' },
-  ],
-};
+/** Theme color names a project may carry (mirrors the backend palette). */
+type ColorName = 'blue' | 'purple' | 'indigo' | 'teal' | 'orange' | 'green' | 'red';
+const COLOR_NAMES: ColorName[] = ['blue', 'purple', 'indigo', 'teal', 'orange', 'green', 'red'];
 
-function useTints() {
-  const { theme } = useTheme();
-  return { purple: theme.color.purple, teal: theme.color.teal } as const;
-}
+/** Resolve a job's projectId to a name + theme color via the live project map. */
+type ProjResolved = { name: string; color: string };
+
+const cost2 = (n: number): string => n.toFixed(2);
 
 function Pulse({ color, size = 9 }: { color: string; size?: number }) {
   const a = useRef(new Animated.Value(1)).current;
@@ -52,11 +34,10 @@ function Pulse({ color, size = 9 }: { color: string; size?: number }) {
   return <Animated.View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: color, opacity: a }} />;
 }
 
-function ProjAvatar({ id, sel, onPress }: { id: ProjKey | 'all'; sel: boolean; onPress: () => void }) {
+function ProjAvatar({ proj, sel, onPress }: { proj: LiveProj | null; sel: boolean; onPress: () => void }) {
   const { theme } = useTheme();
-  const projects = useProjects();
-  const all = id === 'all';
-  const p = all ? { name: 'All', color: theme.color.ink } : projects[id];
+  const all = proj === null;
+  const p = all ? { name: 'All', color: theme.color.ink } : proj;
   return (
     <Pressable onPress={onPress} style={{ alignItems: 'center', gap: 6, width: 64 }}>
       <View
@@ -76,25 +57,6 @@ function ProjAvatar({ id, sel, onPress }: { id: ProjKey | 'all'; sel: boolean; o
         ) : (
           <Text style={{ fontSize: 20, fontWeight: '800', color: p.color }}>{p.name[0]}</Text>
         )}
-        {id === 'scan' ? (
-          <View
-            style={{
-              position: 'absolute',
-              top: -3,
-              right: -3,
-              width: 16,
-              height: 16,
-              borderRadius: 8,
-              backgroundColor: theme.color.red,
-              borderWidth: 2,
-              borderColor: theme.color.bg,
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          >
-            <Icon name="lock" size={8} color="#fff" />
-          </View>
-        ) : null}
       </View>
       <Text numberOfLines={1} style={{ fontSize: 11, fontWeight: '500', maxWidth: 60, color: sel ? theme.color.blue : theme.color.inkSecondary }}>
         {all ? 'All' : p.name.split(' ')[0]}
@@ -121,16 +83,63 @@ function Section({ label, count, tint, children }: { label: string; count: numbe
 export function JobsScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
-  const projects = useProjects();
-  const tints = useTints();
   const nav = useNavigation<any>();
-  const [filter, setFilter] = useState<ProjKey | 'all'>('all');
+  const [filter, setFilter] = useState<string | 'all'>('all');
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [projects, setProjects] = useState<LiveProj[]>([]);
 
-  const match = (proj: ProjKey) => filter === 'all' || proj === filter;
-  const g = M_JOBS.gated.filter((j) => match(j.proj));
-  const r = M_JOBS.running.filter((j) => match(j.proj));
-  const s = M_JOBS.scheduled.filter((j) => match(j.proj));
-  const d = M_JOBS.done.filter((j) => match(j.proj));
+  // color-name -> theme hex; default to blue for unknown names.
+  const resolveColor = useCallback(
+    (color: string): string => {
+      const name = (COLOR_NAMES.includes(color as ColorName) ? color : 'blue') as ColorName;
+      return theme.color[name];
+    },
+    [theme],
+  );
+
+  // load live jobs + projects (refetch on focus + light polling for a live feel).
+  useFocusEffect(
+    useCallback(() => {
+      let alive = true;
+      const load = () => {
+        Promise.all([api.listJobs(), api.listProjects()])
+          .then(([js, ps]) => {
+            if (!alive) return;
+            setJobs(js);
+            setProjects(ps.map((p: Project): LiveProj => ({ id: p.id, name: p.name, color: resolveColor(p.color) })));
+          })
+          .catch(() => {
+            /* fail soft — keep last good data */
+          });
+      };
+      const stop = api.poll(load, 5000);
+      return () => {
+        alive = false;
+        stop();
+      };
+    }, [resolveColor]),
+  );
+
+  const projById = useCallback(
+    (projectId: string | null): ProjResolved => {
+      const p = projectId ? projects.find((x) => x.id === projectId) : undefined;
+      return p ? { name: p.name, color: p.color } : { name: 'Workspace', color: theme.color.inkSecondary };
+    },
+    [projects, theme],
+  );
+
+  const match = (projectId: string | null) => filter === 'all' || projectId === filter;
+  // Map live job statuses into the existing section shapes (markup unchanged).
+  const g = jobs
+    .filter((j) => j.status === 'pending' && match(j.projectId))
+    .map((j) => ({ id: j.id, projectId: j.projectId, name: j.title, sub: j.phase, cost: cost2(j.cost) }));
+  const r = jobs
+    .filter((j) => j.status === 'running' && match(j.projectId))
+    .map((j) => ({ id: j.id, projectId: j.projectId, name: j.title, cost: cost2(j.cost), el: j.phase }));
+  const s: { id: string; projectId: string | null; name: string; countdown: string }[] = [];
+  const d = jobs
+    .filter((j) => (j.status === 'done' || j.status === 'failed') && match(j.projectId))
+    .map((j) => ({ id: j.id, name: j.title, ok: j.status === 'done', cost: cost2(j.cost) }));
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
@@ -146,9 +155,9 @@ export function JobsScreen() {
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={{ gap: 6, paddingHorizontal: 16, paddingTop: 4, paddingBottom: 16 }}
         >
-          <ProjAvatar id="all" sel={filter === 'all'} onPress={() => setFilter('all')} />
-          {PROJ_ORDER.map((p) => (
-            <ProjAvatar key={p} id={p} sel={filter === p} onPress={() => setFilter(p)} />
+          <ProjAvatar proj={null} sel={filter === 'all'} onPress={() => setFilter('all')} />
+          {projects.map((p) => (
+            <ProjAvatar key={p.id} proj={p} sel={filter === p.id} onPress={() => setFilter(p.id)} />
           ))}
         </ScrollView>
 
@@ -156,8 +165,8 @@ export function JobsScreen() {
           <Section label="Gated" count={g.length} tint={theme.color.orange}>
             {g.map((j, i) => (
               <Pressable
-                key={i}
-                onPress={() => nav.navigate('Approvals')}
+                key={j.id}
+                onPress={() => nav.navigate('JobTimeline', { jobId: j.id })}
                 style={{ flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, paddingHorizontal: 15, borderBottomWidth: i < g.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}
               >
                 <View style={{ width: 30, height: 30, borderRadius: 9, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,149,0,0.15)' }}>
@@ -165,7 +174,7 @@ export function JobsScreen() {
                 </View>
                 <View style={{ flex: 1, minWidth: 0 }}>
                   <Text style={{ fontSize: 16, lineHeight: 19, fontWeight: '600', color: theme.color.ink }}>{j.name}</Text>
-                  <Text style={{ fontSize: 13, color: theme.color.inkTertiary, marginTop: 3 }}>{projects[j.proj].name} · {j.sub}</Text>
+                  <Text style={{ fontSize: 13, color: theme.color.inkTertiary, marginTop: 3 }}>{projById(j.projectId).name} · {j.sub}</Text>
                 </View>
                 <Mono style={{ fontSize: 14, fontWeight: '600', color: theme.color.orange }}>Gated</Mono>
                 <Icon name="chevronRight" size={17} color={theme.color.inkTertiary} />
@@ -178,14 +187,14 @@ export function JobsScreen() {
           <Section label="Running" count={r.length}>
             {r.map((j, i) => (
               <Pressable
-                key={i}
-                onPress={() => nav.navigate('JobTimeline')}
+                key={j.id}
+                onPress={() => nav.navigate('JobTimeline', { jobId: j.id })}
                 style={{ flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, paddingHorizontal: 15, borderBottomWidth: i < r.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}
               >
-                <Pulse color={tints[j.tint]} />
+                <Pulse color={projById(j.projectId).color} />
                 <View style={{ flex: 1, minWidth: 0 }}>
                   <Text numberOfLines={1} style={{ fontSize: 16, lineHeight: 19, fontWeight: '600', color: theme.color.ink }}>{j.name}</Text>
-                  <Text style={{ fontSize: 13, color: theme.color.inkTertiary, marginTop: 3 }}>{projects[j.proj].name} · {j.el}</Text>
+                  <Text style={{ fontSize: 13, color: theme.color.inkTertiary, marginTop: 3 }}>{projById(j.projectId).name} · {j.el}</Text>
                 </View>
                 <Mono style={{ fontSize: 14, fontWeight: '600', color: theme.color.ink }}>${j.cost}</Mono>
                 <Icon name="chevronRight" size={17} color={theme.color.inkTertiary} />
@@ -198,13 +207,13 @@ export function JobsScreen() {
           <Section label="Scheduled" count={s.length}>
             {s.map((j, i) => (
               <View
-                key={i}
+                key={j.id}
                 style={{ flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, paddingHorizontal: 15, borderBottomWidth: i < s.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}
               >
                 <Icon name="clock" size={18} color={theme.color.teal} />
                 <View style={{ flex: 1, minWidth: 0 }}>
                   <Text style={{ fontSize: 16, lineHeight: 19, fontWeight: '600', color: theme.color.ink }}>{j.name}</Text>
-                  <Text style={{ fontSize: 13, color: theme.color.inkTertiary, marginTop: 3 }}>{projects[j.proj].name}</Text>
+                  <Text style={{ fontSize: 13, color: theme.color.inkTertiary, marginTop: 3 }}>{projById(j.projectId).name}</Text>
                 </View>
                 <Mono style={{ fontSize: 13, fontWeight: '600', color: theme.color.teal }}>{j.countdown}</Mono>
               </View>
@@ -216,7 +225,7 @@ export function JobsScreen() {
           <Section label="Done today" count={d.length}>
             {d.map((j, i) => (
               <View
-                key={i}
+                key={j.id}
                 style={{ flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 12, paddingHorizontal: 15, borderBottomWidth: i < d.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}
               >
                 <Icon name={j.ok ? 'checkCircle' : 'xCircle'} size={17} color={j.ok ? theme.color.green : theme.color.red} />

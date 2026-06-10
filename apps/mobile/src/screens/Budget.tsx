@@ -1,20 +1,22 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, Animated, Easing, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import Svg, { Circle } from 'react-native-svg';
 import { useTheme } from '../theme';
+import type { Theme } from '@maestro/design-tokens';
 import { Icon } from '../Icon';
-import { Mono, useProjects } from '../ui';
+import { api, type BudgetData } from '../api';
+import { Mono } from '../ui';
 
-type ProjKey = 'atlas' | 'content' | 'scan' | 'brand' | 'infra';
-
-const CAPS: { proj: ProjKey; spent: number; cap: number; paused?: boolean }[] = [
-  { proj: 'atlas', spent: 14.2, cap: 50 },
-  { proj: 'content', spent: 9.1, cap: 30 },
-  { proj: 'scan', spent: 30, cap: 30, paused: true },
-  { proj: 'brand', spent: 3.9, cap: 40 },
-];
+/** Resolve a live project color NAME ('blue'|'purple'|…) to a theme hex. */
+const PROJECT_COLOR_NAMES = ['blue', 'purple', 'indigo', 'teal', 'orange', 'green', 'red'] as const;
+type ProjectColorName = (typeof PROJECT_COLOR_NAMES)[number];
+function projectColor(theme: Theme, name: string): string {
+  return (PROJECT_COLOR_NAMES as readonly string[]).includes(name)
+    ? theme.color[name as ProjectColorName]
+    : theme.color.blue;
+}
 
 const LEDGER: [string, string, string][] = [
   ['14:02', 'Opus tokens · build pass', '0.43'],
@@ -50,11 +52,11 @@ function Spinner({ color, size = 16 }: { color: string; size?: number }) {
   );
 }
 
-function HeroRing() {
+function HeroRing({ cap, spent }: { cap: number; spent: number }) {
   const { theme } = useTheme();
   const R = 88;
   const C = 2 * Math.PI * R;
-  const pct = 38.2 / 200;
+  const pct = cap > 0 ? Math.min(1, spent / cap) : 0;
   return (
     <View style={{ alignItems: 'center', paddingTop: 8, paddingBottom: 18 }}>
       <View style={{ width: 220, height: 220 }}>
@@ -73,8 +75,8 @@ function HeroRing() {
           />
         </Svg>
         <View style={{ position: 'absolute', inset: 0, alignItems: 'center', justifyContent: 'center' } as any}>
-          <Mono style={{ fontSize: 44, fontWeight: '700', letterSpacing: -0.9 }}>$38.20</Mono>
-          <Text style={{ fontSize: 15, fontWeight: '500', color: theme.color.inkTertiary, marginTop: 6 }}>of $200</Text>
+          <Mono style={{ fontSize: 44, fontWeight: '700', letterSpacing: -0.9 }}>{`$${spent.toFixed(2)}`}</Mono>
+          <Text style={{ fontSize: 15, fontWeight: '500', color: theme.color.inkTertiary, marginTop: 6 }}>{`of $${cap.toFixed(0)}`}</Text>
         </View>
       </View>
       <Mono style={{ fontSize: 14, fontWeight: '500', color: theme.color.inkSecondary, marginTop: 8 }}>≈ $96 by Jun 30</Mono>
@@ -85,9 +87,26 @@ function HeroRing() {
 export function BudgetScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
-  const projects = useProjects();
   const nav = useNavigation<any>();
   const mx = Math.max(...SPARK);
+
+  const [budget, setBudget] = useState<BudgetData | null>(null);
+  useEffect(() => {
+    const stop = api.poll(() => {
+      api
+        .budget()
+        .then(setBudget)
+        .catch(() => {
+          /* fail soft — keep last good / empty render */
+        });
+    });
+    return stop;
+  }, []);
+
+  const cap = budget?.cap ?? 0;
+  const spent = budget?.spent ?? 0;
+  const caps = budget?.byProject ?? [];
+  const maxSpent = caps.reduce((m, c) => Math.max(m, c.spent), 0);
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
@@ -129,7 +148,7 @@ export function BudgetScreen() {
           </Pressable>
         </View>
 
-        <HeroRing />
+        <HeroRing cap={cap} spent={spent} />
 
         {/* today strip */}
         <View
@@ -168,14 +187,13 @@ export function BudgetScreen() {
             Per-project caps
           </Text>
           <View style={{ backgroundColor: theme.color.bgElevated, borderRadius: 12, overflow: 'hidden', borderWidth: StyleSheet.hairlineWidth, borderColor: theme.color.separator }}>
-            {CAPS.map((c, i) => {
-              const p = projects[c.proj];
-              const pct = Math.min(1, c.spent / c.cap);
-              const col = pct >= 1 ? theme.color.red : pct >= 0.75 ? theme.color.orange : p.color;
-              const last = i === CAPS.length - 1;
+            {caps.map((c, i) => {
+              const dotColor = projectColor(theme, c.color);
+              const pct = maxSpent > 0 ? Math.min(1, c.spent / maxSpent) : 0;
+              const last = i === caps.length - 1;
               return (
                 <View
-                  key={i}
+                  key={c.projectId}
                   style={{
                     flexDirection: 'row',
                     alignItems: 'center',
@@ -187,22 +205,17 @@ export function BudgetScreen() {
                     borderBottomColor: theme.color.separator,
                   }}
                 >
-                  <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: p.color }} />
+                  <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: dotColor }} />
                   <View style={{ flex: 1, minWidth: 0 }}>
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 7 }}>
-                      <Text style={{ fontSize: 15, fontWeight: '500', color: theme.color.ink }}>{p.name}</Text>
-                      {c.paused ? (
-                        <View style={{ height: 18, paddingHorizontal: 7, borderRadius: 9, backgroundColor: 'rgba(255,59,48,0.14)', justifyContent: 'center' }}>
-                          <Text style={{ fontSize: 11, lineHeight: 18, fontWeight: '600', color: theme.color.red }}>Paused</Text>
-                        </View>
-                      ) : null}
+                      <Text style={{ fontSize: 15, fontWeight: '500', color: theme.color.ink }}>{c.name}</Text>
                     </View>
                     <View style={{ height: 5, borderRadius: 3, backgroundColor: theme.color.fillSecondary, overflow: 'hidden' }}>
-                      <View style={{ width: `${pct * 100}%`, height: '100%', borderRadius: 3, backgroundColor: col }} />
+                      <View style={{ width: `${pct * 100}%`, height: '100%', borderRadius: 3, backgroundColor: dotColor }} />
                     </View>
                   </View>
                   <Mono style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkSecondary }}>
-                    {`$${c.spent.toFixed(2)} / $${c.cap}`}
+                    {`$${c.spent.toFixed(2)}`}
                   </Mono>
                 </View>
               );

@@ -1,6 +1,10 @@
 import React from 'react';
-import { HashRouter, Routes, Route } from 'react-router-dom';
-import Launcher from './screens/Launcher';
+import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
+
+/* Real application entry. First run → Onboarding (creates the workspace, sets
+   the budget); afterwards the app opens on the Command Center. The old "Launcher"
+   gallery was Claude Design's screen index — a design-tool artifact — and is no
+   longer part of the product. */
 
 const Onboarding = React.lazy(() => import('./screens/Onboarding'));
 const CommandCenter = React.lazy(() => import('./screens/CommandCenter'));
@@ -23,19 +27,30 @@ const Settings = React.lazy(() => import('./screens/Settings'));
 const DevicePairing = React.lazy(() => import('./screens/DevicePairing'));
 const AuditHistory = React.lazy(() => import('./screens/AuditHistory'));
 
+/** Where the app should land: first-run setup, or straight into the cockpit. */
+function entryPath(): string {
+  try {
+    return localStorage.getItem('maestro.onboarded') === '1' ? '/command-center' : '/onboarding';
+  } catch {
+    return '/onboarding';
+  }
+}
+
 export function App() {
   return (
     <HashRouter>
       <React.Suspense fallback={null}>
         <Routes>
-          <Route path="/" element={<Launcher />} />
+          <Route path="/" element={<Navigate to={entryPath()} replace />} />
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/command-center" element={<CommandCenter />} />
           <Route path="/projects" element={<Projects />} />
           <Route path="/project-detail" element={<ProjectDetail />} />
+          <Route path="/project-detail/:id" element={<ProjectDetail />} />
           <Route path="/templates" element={<Templates />} />
           <Route path="/job-monitor" element={<JobMonitor />} />
           <Route path="/session-transcript" element={<SessionTranscript />} />
+          <Route path="/session-transcript/:id" element={<SessionTranscript />} />
           <Route path="/scheduler" element={<Scheduler />} />
           <Route path="/plan-diff-gate" element={<PlanDiffGate />} />
           <Route path="/approvals" element={<ApprovalsCenter />} />
@@ -49,6 +64,7 @@ export function App() {
           <Route path="/settings" element={<Settings />} />
           <Route path="/device-pairing" element={<DevicePairing />} />
           <Route path="/audit" element={<AuditHistory />} />
+          <Route path="*" element={<Navigate to={entryPath()} replace />} />
         </Routes>
       </React.Suspense>
     </HashRouter>

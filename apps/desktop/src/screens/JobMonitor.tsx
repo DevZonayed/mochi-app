@@ -9,6 +9,7 @@ import { useNavigate } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { Spinner } from '../lib/ui';
 import { AppShell } from '../lib/appShell';
+import { api, type Job as ApiJob, type Project } from '../lib/api';
 
 /* ── page-specific CSS lifted from <Job Monitor.html>'s <style> ── */
 const styles = `
@@ -75,13 +76,11 @@ interface Lane {
   capped?: boolean;
 }
 
-const LANES: Lane[] = [
-  { id: 'atlas',   name: 'Atlas API',     color: 'var(--blue)' },
-  { id: 'brand',   name: 'Brand Refresh', color: 'var(--teal)' },
-  { id: 'content', name: 'Q3 Content',    color: 'var(--purple)' },
-  { id: 'scan',    name: 'Market Scan',   color: 'var(--indigo)', capped: true },
-  { id: 'infra',   name: 'Infra / CI',    color: 'var(--orange)' },
-];
+/* Swim-lanes are built live from projects (id/name/color). laneOf() falls back
+   to an "Unassigned" lane for any job whose project is missing. */
+function lanesFromProjects(projects: Project[]): Lane[] {
+  return projects.map(p => ({ id: p.id, name: p.name, color: `var(--${p.color})` }));
+}
 
 interface Job {
   id: string;
@@ -101,22 +100,6 @@ interface Job {
 }
 
 // status: running | gated | queued | failed | done | scheduled
-const MON_JOBS: Job[] = [
-  { id: 'm1',  lane: 'atlas',   name: 'Refactor auth service', status: 'running',   start: 44, end: 60, cost: 0.42, shape: 'pbr',      trigger: 'hand',    effort: 'DEEP',     autonomy: 'Gated', last: 'patching 3 call sites in routes/' },
-  { id: 'm2',  lane: 'atlas',   name: 'Add rate-limiter tests',status: 'running',   start: 53, end: 60, cost: 0.21, shape: 'fanout',   trigger: 'webhook', effort: 'BALANCED', autonomy: 'Gated', last: 'asserting retry-after header' },
-  { id: 'm3',  lane: 'atlas',   name: 'Nightly test suite',    status: 'scheduled', start: 72, dur: 9,  cost: 0,    shape: 'pipeline', trigger: 'clock',   effort: 'FAST',     autonomy: 'Unattended', last: 'queued for 18:00' },
-  { id: 'm4',  lane: 'brand',   name: 'Export icon set @3x',   status: 'running',   start: 55, end: 60, cost: 0.12, shape: 'fanout',   trigger: 'hand',    effort: 'BALANCED', autonomy: 'Gated', last: 'optimizing with pngquant…' },
-  { id: 'm5',  lane: 'brand',   name: 'Generate OG images',    status: 'done',      start: 28, end: 41, cost: 0.34, shape: 'fanout',   trigger: 'hand',    effort: 'BALANCED', autonomy: 'Gated', last: 'zipped 24 assets' },
-  { id: 'm6',  lane: 'brand',   name: 'Newsletter hero',       status: 'queued',    start: 60, dur: 5,  cost: 0,    shape: 'single',   trigger: 'hand',    effort: 'BALANCED', autonomy: 'Plan first', last: 'waiting for a slot' },
-  { id: 'm7',  lane: 'content', name: 'Draft launch thread',   status: 'gated',     start: 49, end: 58, cost: 0.07, shape: 'single',   trigger: 'chat',    effort: 'BALANCED', autonomy: 'Gated', last: 'awaiting your review' },
-  { id: 'm8',  lane: 'content', name: 'Newsletter draft',      status: 'scheduled', start: 79, dur: 10, cost: 0,    shape: 'pipeline', trigger: 'clock',   effort: 'BALANCED', autonomy: 'Gated', last: 'queued for 16:30' },
-  { id: 'm9',  lane: 'scan',    name: 'Competitor digest',     status: 'failed',    start: 38, end: 47, cost: 1.20, shape: 'pipeline', trigger: 'clock',   effort: 'DEEP',     autonomy: 'Unattended', last: 'stopped — project cap reached' },
-  { id: 'm10', lane: 'scan',    name: 'Trend summary',         status: 'queued',    start: 60, dur: 6,  cost: 0,    shape: 'single',   trigger: 'clock',   effort: 'FAST',     autonomy: 'Unattended', last: 'blocked by budget cap' },
-  { id: 'm11', lane: 'infra',   name: 'Dependency audit',      status: 'done',      start: 18, end: 31, cost: 0.12, shape: 'pipeline', trigger: 'clock',   effort: 'FAST',     autonomy: 'Unattended', last: 'no advisories found' },
-  { id: 'm12', lane: 'infra',   name: 'Deploy preview',        status: 'failed',    start: 47, end: 49, cost: 0.02, shape: 'single',   trigger: 'webhook', effort: 'FAST',     autonomy: 'Unattended', last: 'build error: missing env' },
-  { id: 'm13', lane: 'infra',   name: 'CI hardening',          status: 'running',   start: 54, end: 60, cost: 0.18, shape: 'pbr',      trigger: 'hand',    effort: 'BALANCED', autonomy: 'Gated', last: 'rotating CI tokens' },
-];
-
 const STATUS_META: Record<Status, { label: string; tint: string }> = {
   running:   { label: 'Running',   tint: 'var(--purple)' },
   gated:     { label: 'Gated',     tint: 'var(--orange)' },
@@ -130,6 +113,61 @@ function axisLabel(min: number): string {
   const d = min - NOW_MIN;
   if (d === 0) return 'now';
   return (d > 0 ? '+' : '') + d + 'm';
+}
+
+/* ── live-API → local timeline Job adapter ──
+   The local Job/Status model and the synthetic "minutes" time axis are purely
+   presentational. We map each api Job onto it so the existing render code is
+   unchanged: api status → local status, projectId → lane, cost/tokens through,
+   and a synthetic start/end derived from status+progress so capsules land in a
+   sensible spot relative to the now-line. */
+function statusFromApi(s: ApiJob['status']): Status {
+  // pending shows under the Scheduled/Queued/Gated buckets; we surface it as 'scheduled'
+  if (s === 'pending') return 'scheduled';
+  return s; // 'running' | 'done' | 'failed' all share names with the local model
+}
+
+const SHAPE_BY_EFFORT: Record<string, string> = { fast: 'single', balanced: 'fanout', deep: 'pbr', max: 'pipeline' };
+
+function mapApiJob(j: ApiJob): Job {
+  const status = statusFromApi(j.status);
+  const effort = j.effort.toUpperCase();
+  const last = j.error ?? (j.phase || j.stage);
+  // synthetic axis placement (minutes): running spans up to now; done sits in the
+  // past; scheduled/pending sits in the future; failed ends a touch before now.
+  let start: number;
+  let end: number | undefined;
+  let dur: number | undefined;
+  if (status === 'running') {
+    start = Math.max(0, NOW_MIN - 16 - Math.round((1 - Math.min(1, j.progress)) * 8));
+    end = NOW_MIN;
+  } else if (status === 'scheduled') {
+    start = NOW_MIN + 12;
+    dur = 8;
+  } else if (status === 'failed') {
+    start = NOW_MIN - 13;
+    end = NOW_MIN - 11;
+  } else {
+    // done
+    start = NOW_MIN - 32;
+    end = NOW_MIN - 19;
+  }
+  return {
+    id: j.id,
+    lane: j.projectId,
+    name: j.title,
+    status,
+    start,
+    end,
+    dur,
+    cost: j.cost,
+    shape: SHAPE_BY_EFFORT[j.effort] ?? 'single',
+    trigger: 'hand',
+    effort: (effort in EFFORT_TINT ? effort : 'BALANCED'),
+    autonomy: 'Gated',
+    last,
+    _liveCost: j.cost,
+  };
 }
 
 interface CapsuleProps {
@@ -176,12 +214,13 @@ function Capsule({ job, nowMin, onClick, selected }: CapsuleProps) {
 
 interface TimelineProps {
   jobs: Job[];
+  lanes: Lane[];
   nowMin: number;
   onSelect: (job: Job) => void;
   selectedId: string | null;
 }
 
-function Timeline({ jobs, nowMin, onSelect, selectedId }: TimelineProps) {
+function Timeline({ jobs, lanes, nowMin, onSelect, selectedId }: TimelineProps) {
   const ticks: number[] = [];
   for (let m = 0; m <= AXIS_MAX; m += 12) ticks.push(m);
   return (
@@ -211,7 +250,7 @@ function Timeline({ jobs, nowMin, onSelect, selectedId }: TimelineProps) {
               <span className="now-dot" style={{ position: 'absolute', top: -4, left: -4, width: 10, height: 10, borderRadius: '50%', background: 'var(--blue)' }} />
             </div>
 
-            {LANES.map(lane => {
+            {lanes.map(lane => {
               const laneJobs = jobs.filter(j => j.lane === lane.id);
               return (
                 <div key={lane.id} style={{ display: 'flex', height: LANE_H, borderBottom: '0.5px solid var(--separator)' }}>
@@ -391,8 +430,8 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 const EFFORT_TINT: Record<string, string> = { FAST: 'var(--green)', BALANCED: 'var(--blue)', DEEP: 'var(--orange)', MAX: 'var(--red)' };
 const MON_TRIG_ICON: Record<string, IconName> = { hand: 'play', clock: 'clock', chat: 'command', webhook: 'bolt' };
 
-function laneOf(id: string): Lane {
-  return LANES.find(l => l.id === id) as Lane;
+function laneOf(lanes: Lane[], id: string): Lane {
+  return lanes.find(l => l.id === id) ?? { id, name: 'Unassigned', color: 'var(--ink-secondary)' };
 }
 
 function MonStatus({ status }: { status: Status }) {
@@ -411,12 +450,13 @@ function MonStatus({ status }: { status: Status }) {
 
 interface MonTableProps {
   jobs: Job[];
+  lanes: Lane[];
   onSelect: (job: Job) => void;
   selectedId: string | null;
   onCancel: (job: Job) => void;
 }
 
-function MonTable({ jobs, onSelect, selectedId, onCancel }: MonTableProps) {
+function MonTable({ jobs, lanes, onSelect, selectedId, onCancel }: MonTableProps) {
   const cols = '1.1fr 1.8fr 1.1fr 0.7fr 1fr 0.8fr 0.7fr 0.8fr 0.7fr 64px';
   return (
     <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden',
@@ -429,7 +469,7 @@ function MonTable({ jobs, onSelect, selectedId, onCancel }: MonTableProps) {
         ))}
       </div>
       {jobs.map((j, i) => {
-        const lane = laneOf(j.lane);
+        const lane = laneOf(lanes, j.lane);
         const dur = j.status === 'scheduled' ? `~${j.dur}m` : j.end != null ? `${j.end - j.start}m` : '—';
         const started = j.status === 'scheduled' ? `in ${j.start - NOW_MIN}m` : `${NOW_MIN - j.start}m ago`;
         return (
@@ -465,14 +505,15 @@ function MonTable({ jobs, onSelect, selectedId, onCancel }: MonTableProps) {
 /* ── Inspector slide-over ── */
 interface InspectorProps {
   job: Job | null;
+  lanes: Lane[];
   onClose: () => void;
   onCancel: (job: Job) => void;
 }
 
-function Inspector({ job, onClose, onCancel }: InspectorProps) {
+function Inspector({ job, lanes, onClose, onCancel }: InspectorProps) {
   const navigate = useNavigate();
   if (!job) return null;
-  const lane = laneOf(job.lane);
+  const lane = laneOf(lanes, job.lane);
   const m = STATUS_META[job.status];
   const cost = job.status === 'running' ? job._liveCost ?? job.cost : job.cost;
   const cap = job.lane === 'scan' ? 30 : 50;
@@ -628,13 +669,33 @@ function CounterPill({ n, label, tint }: { n: number; label: string; tint: strin
 export default function JobMonitor() {
   const [view, setView] = React.useState('timeline');
   const [filter, setFilter] = React.useState('all');
-  const [jobs, setJobs] = React.useState<Job[]>(() => MON_JOBS.map(j => ({ ...j, _liveCost: j.cost })));
+  const [jobs, setJobs] = React.useState<Job[]>([]);
+  const [lanes, setLanes] = React.useState<Lane[]>([]);
   const [nowMin, setNowMin] = React.useState(NOW_MIN);
   const [sel, setSel] = React.useState<Job | null>(null);
   const [cancelJob, setCancelJob] = React.useState<Job | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
 
-  // live drift: advance now-line + tick running costs
+  // live load: projects → swim-lanes, jobs → timeline. Re-runnable for refetch.
+  const refetch = React.useCallback(async () => {
+    try {
+      const [apiProjects, apiJobs] = await Promise.all([api.listProjects(), api.listJobs()]);
+      setLanes(lanesFromProjects(apiProjects));
+      setJobs(apiJobs.map(mapApiJob));
+    } catch {
+      /* fail soft — leave whatever we have */
+    }
+  }, []);
+
+  React.useEffect(() => { void refetch(); }, [refetch]);
+
+  // LIVE: SSE job updates → refetch the board
+  React.useEffect(() => {
+    const unsubscribe = api.subscribe({ onJob: () => { void refetch(); } });
+    return unsubscribe;
+  }, [refetch]);
+
+  // live drift: advance now-line + tick running costs (presentational)
   React.useEffect(() => {
     const t = setInterval(() => {
       setNowMin(n => (n < 67 ? +(n + 0.08).toFixed(2) : n));
@@ -706,12 +767,12 @@ export default function JobMonitor() {
         {/* board */}
         <div style={{ flex: 1, overflowY: 'auto', paddingBottom: 28 }}>
           {view === 'timeline'
-            ? <Timeline jobs={shown} nowMin={nowMin} onSelect={setSel} selectedId={sel && sel.id} />
-            : <MonTable jobs={shown} onSelect={setSel} selectedId={sel && sel.id} onCancel={setCancelJob} />}
+            ? <Timeline jobs={shown} lanes={lanes} nowMin={nowMin} onSelect={setSel} selectedId={sel && sel.id} />
+            : <MonTable jobs={shown} lanes={lanes} onSelect={setSel} selectedId={sel && sel.id} onCancel={setCancelJob} />}
         </div>
       </main>
 
-      <Inspector job={sel} onClose={() => setSel(null)} onCancel={setCancelJob} />
+      <Inspector job={sel} lanes={lanes} onClose={() => setSel(null)} onCancel={setCancelJob} />
       <CancelSheet job={cancelJob} onClose={() => setCancelJob(null)} onConfirm={doCancel} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>

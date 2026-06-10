@@ -4,6 +4,7 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useTheme } from './theme';
 import { Icon, type IconName } from './Icon';
+import { getFlag, ONBOARDED } from './storage';
 
 import { HomeScreen } from './screens/Home';
 import { JobsScreen } from './screens/Jobs';
@@ -77,7 +78,7 @@ export function RootNavigator() {
   };
   return (
     <NavigationContainer theme={navTheme}>
-      <Stack.Navigator screenOptions={{ headerShown: false }}>
+      <Stack.Navigator screenOptions={{ headerShown: false }} initialRouteName={getFlag(ONBOARDED) ? 'Tabs' : 'Onboarding'}>
         <Stack.Screen name="Tabs" component={Tabs} />
         <Stack.Screen name="Onboarding" component={OnboardingScreen} />
         <Stack.Screen name="JobTimeline" component={JobTimelineScreen} />

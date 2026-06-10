@@ -9,6 +9,7 @@ import { Icon, type IconName } from '../lib/icons';
 import {
   APP_W, APP_H, useAppScale, useTheme, TrafficLights, Sidebar, Toolbar, type Theme,
 } from '../lib/appShell';
+import { api, type Job, type Project } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from Audit History.html <style>) ───────────────────────── */
 const styles = `
@@ -151,31 +152,95 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 interface RunItem { proj: string; tint: string; name: string; out: keyof typeof OUT; shape: string; cost: string; dur: string; time: string; }
 interface RunGroup { day: string; items: RunItem[]; }
 
-const RUNS: RunGroup[] = [
-  { day: 'Today', items: [
-    { proj: 'Atlas API', tint: 'var(--blue)', name: 'Refactor auth service', out: 'done', shape: 'pbr', cost: '0.58', dur: '6:12', time: '14:08' },
-    { proj: 'Q3 Content', tint: 'var(--purple)', name: 'Draft launch thread', out: 'done', shape: 'single', cost: '0.07', dur: '0:52', time: '11:40' },
-    { proj: 'Market Scan', tint: 'var(--indigo)', name: 'Competitor digest', out: 'failed', shape: 'pipeline', cost: '1.20', dur: '4:01', time: '09:30' },
-  ]},
-  { day: 'Yesterday', items: [
-    { proj: 'Brand Refresh', tint: 'var(--teal)', name: 'Export icon set @3x', out: 'done', shape: 'fanout', cost: '0.34', dur: '5:40', time: '18:22' },
-    { proj: 'Infra / CI', tint: 'var(--orange)', name: 'Deploy preview', out: 'cancelled', shape: 'single', cost: '0.02', dur: '0:12', time: '16:05' },
-  ]},
-  { day: 'June 8', items: [
-    { proj: 'Atlas API', tint: 'var(--blue)', name: 'Nightly test suite', out: 'done', shape: 'pipeline', cost: '0.12', dur: '3:11', time: '18:00' },
-    { proj: 'Q3 Content', tint: 'var(--purple)', name: 'Translate docs (ES)', out: 'done', shape: 'fanout', cost: '0.46', dur: '7:20', time: '10:15' },
-  ]},
-];
 const OUT = { done: { icon: 'checkCircle', tint: 'var(--green)' }, failed: { icon: 'xCircle', tint: 'var(--red)' }, cancelled: { icon: 'pause', tint: 'var(--ink-tertiary)' } } as const;
 
-function RunsTab({ onOpen }: { onOpen: (run: RunItem) => void }) {
+/* ── live-API → run-history adapters ──
+   The run list is a read-only audit/history view of the job log. Each api Job is
+   mapped onto the existing RunItem shape: status → outcome icon, effort → shape
+   chip, projectId → project name/color, cost through, and time/duration derived
+   from createdAt/updatedAt. Rows are grouped by the day of updatedAt. */
+const SHAPE_BY_EFFORT: Record<string, string> = { fast: 'single', balanced: 'fanout', deep: 'pbr', max: 'pipeline' };
+
+function outFromStatus(s: Job['status']): keyof typeof OUT {
+  if (s === 'done') return 'done';
+  if (s === 'failed') return 'failed';
+  // pending / running are not terminal outcomes — surface with the neutral marker
+  return 'cancelled';
+}
+
+function pad2(n: number): string { return n < 10 ? '0' + n : String(n); }
+
+function clockOf(ms: number): string {
+  const d = new Date(ms);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/* m:ss elapsed from createdAt→updatedAt (clamped to ≥0). */
+function durOf(start: number, end: number): string {
+  const secs = Math.max(0, Math.round((end - start) / 1000));
+  return `${Math.floor(secs / 60)}:${pad2(secs % 60)}`;
+}
+
+function dayKeyOf(ms: number): string {
+  const d = new Date(ms); d.setHours(0, 0, 0, 0);
+  return String(d.getTime());
+}
+
+function dayLabelOf(ms: number): string {
+  const d = new Date(ms); d.setHours(0, 0, 0, 0);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const diff = Math.round((today.getTime() - d.getTime()) / 86_400_000);
+  if (diff === 0) return 'Today';
+  if (diff === 1) return 'Yesterday';
+  return d.toLocaleDateString(undefined, { month: 'long', day: 'numeric' });
+}
+
+/* Build the grouped, day-sorted run history from live jobs + projects. */
+function buildRuns(jobs: Job[], projects: Project[]): RunGroup[] {
+  const byId = new Map(projects.map(p => [p.id, p]));
+  const sorted = [...jobs].sort((a, b) => b.updatedAt - a.updatedAt);
+  const groups = new Map<string, { ms: number; label: string; items: RunItem[] }>();
+  for (const j of sorted) {
+    const proj = byId.get(j.projectId);
+    const key = dayKeyOf(j.updatedAt);
+    let g = groups.get(key);
+    if (!g) { g = { ms: Number(key), label: dayLabelOf(j.updatedAt), items: [] }; groups.set(key, g); }
+    g.items.push({
+      proj: proj?.name ?? 'Unassigned',
+      tint: proj?.color ? `var(--${proj.color})` : 'var(--ink-secondary)',
+      name: j.title,
+      out: outFromStatus(j.status),
+      shape: SHAPE_BY_EFFORT[j.effort] ?? 'single',
+      cost: j.cost.toFixed(2),
+      dur: durOf(j.createdAt, j.updatedAt),
+      time: clockOf(j.updatedAt),
+    });
+  }
+  return [...groups.values()].sort((a, b) => b.ms - a.ms).map(g => ({ day: g.label, items: g.items }));
+}
+
+function RunsTab({ runs, onOpen }: { runs: RunGroup[]; onOpen: (run: RunItem) => void }) {
+  const [q, setQ] = React.useState('');
+  const term = q.trim().toLowerCase();
+  // Live filter over the run history: project, job title, or outcome.
+  const shown = runs
+    .map(g => ({
+      day: g.day,
+      items: term === '' ? g.items : g.items.filter(r =>
+        r.proj.toLowerCase().includes(term) || r.name.toLowerCase().includes(term) || r.out.toLowerCase().includes(term)),
+    }))
+    .filter(g => g.items.length > 0);
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 11, height: 44, padding: '0 14px', borderRadius: 12, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator)', marginBottom: 18, backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)', maxWidth: 420 }}>
         <Icon name="search" size={17} style={{ color: 'var(--ink-tertiary)' }} />
-        <span style={{ font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Search runs by project, job, or outcome</span>
+        <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search runs by project, job, or outcome"
+          style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-tertiary)' }} />
       </div>
-      {RUNS.map(g => (
+      {shown.length === 0 && (
+        <div style={{ padding: '48px 0', textAlign: 'center', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No runs yet</div>
+      )}
+      {shown.map(g => (
         <div key={g.day} style={{ marginBottom: 20 }}>
           <div style={{ position: 'sticky', top: 0, zIndex: 2, padding: '6px 2px', background: 'color-mix(in srgb, var(--bg) 86%, transparent)', backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)' }}>
             <span style={{ font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-secondary)' }}>{g.day}</span>
@@ -325,7 +390,23 @@ export default function AuditHistory() {
   const [tab, setTab] = React.useState<'runs' | 'audit'>('runs');
   const [replay, setReplay] = React.useState<RunItem | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [runs, setRuns] = React.useState<RunGroup[]>([]);
   const ti = AU_TABS.findIndex(t => t.key === tab);
+
+  // live load: jobs → run/audit history, projects → name + color. Re-runnable.
+  const refetch = React.useCallback(async () => {
+    try {
+      const [apiJobs, apiProjects] = await Promise.all([api.listJobs(), api.listProjects()]);
+      setRuns(buildRuns(apiJobs, apiProjects));
+    } catch {
+      /* fail soft — keep whatever we already have */
+    }
+  }, []);
+
+  React.useEffect(() => { void refetch(); }, [refetch]);
+
+  // LIVE: SSE job updates → refetch the history
+  React.useEffect(() => api.subscribe({ onJob: () => { void refetch(); } }), [refetch]);
 
   // shared cross-page nav routing
   const navTo = (k: string) => {
@@ -369,7 +450,7 @@ export default function AuditHistory() {
               </div>
             </div>
             <div key={tab} className="tab-fade">
-              {tab === 'runs' ? <RunsTab onOpen={setReplay} /> : <AuditTab broken={false} />}
+              {tab === 'runs' ? <RunsTab runs={runs} onOpen={setReplay} /> : <AuditTab broken={false} />}
             </div>
           </main>
         </div>

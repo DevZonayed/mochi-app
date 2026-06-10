@@ -10,6 +10,7 @@ import React from 'react';
 import { AppShell } from '../lib/appShell';
 import { Icon, type IconName } from '../lib/icons';
 import { GroupedList, Row, Switch } from '../lib/ui';
+import { api, type BudgetData } from '../lib/api';
 
 /* Page-specific CSS from the prototype's <style> block. Rendered as a real
    <style> element so the hover/animation classNames below keep working. */
@@ -55,25 +56,26 @@ function GlassStat({ children }: { children?: React.ReactNode }) {
   return <div style={{ background: 'var(--bg-grouped)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 22, backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>{children}</div>;
 }
 
-function HeroBand() {
+function HeroBand({ cap, spent }: { cap: number; spent: number }) {
   const ringColor = (p: number) => (p >= 0.9 ? 'var(--red)' : p >= 0.75 ? 'var(--orange)' : 'var(--blue)');
   const spark = [12, 18, 9, 22, 30, 16, 24, 28, 20, 34, 26, 31];
   const maxS = Math.max(...spark);
+  const pct = cap > 0 ? spent / cap : 0;
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 18, marginBottom: 26 }}>
       {/* this month */}
       <GlassStat>
         <div style={{ display: 'flex', alignItems: 'center', gap: 18 }}>
           <div style={{ position: 'relative', width: 120, height: 120, flexShrink: 0 }}>
-            <Ring pct={38.2 / 200} color={ringColor(38.2 / 200)} />
+            <Ring pct={pct} color={ringColor(pct)} />
             <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
-              <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>19%</span>
+              <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{Math.round(pct * 100)}%</span>
             </div>
           </div>
           <div>
             <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 8 }}>This month</div>
-            <div className="count-num" style={{ font: '700 40px/1 var(--font-mono)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>$38.20</div>
-            <div style={{ font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-secondary)', marginTop: 8 }}>of $200 ceiling</div>
+            <div className="count-num" style={{ font: '700 40px/1 var(--font-mono)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>${spent.toFixed(2)}</div>
+            <div style={{ font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-secondary)', marginTop: 8 }}>of ${cap.toFixed(0)} ceiling</div>
           </div>
         </div>
       </GlassStat>
@@ -108,22 +110,15 @@ interface Cap {
   capped?: boolean;
 }
 
-const CAPS: Cap[] = [
-  { name: 'Atlas API', tint: 'var(--blue)', spent: 18.4, cap: 50 },
-  { name: 'Q3 Content', tint: 'var(--purple)', spent: 9.1, cap: 30 },
-  { name: 'Market Scan', tint: 'var(--indigo)', spent: 30.0, cap: 30, capped: true },
-  { name: 'Brand Refresh', tint: 'var(--teal)', spent: 3.9, cap: 40 },
-  { name: 'Infra / CI', tint: 'var(--orange)', spent: 5.2, cap: 25 },
-];
-
-function CapsList({ onEdit }: { onEdit: (c: Cap) => void }) {
+function CapsList({ caps, onEdit }: { caps: Cap[]; onEdit: (c: Cap) => void }) {
+  const maxSpent = caps.reduce((m, c) => Math.max(m, c.spent), 0);
   return (
     <div style={{ background: 'var(--bg-elevated)', borderRadius: 16, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: '8px 18px' }}>
-      {CAPS.map((c, i) => {
-        const pct = Math.min(1, c.spent / c.cap);
-        const col = pct >= 1 ? 'var(--red)' : pct >= 0.75 ? 'var(--orange)' : c.tint;
+      {caps.map((c, i) => {
+        const pct = maxSpent > 0 ? Math.min(1, c.spent / maxSpent) : 0;
+        const col = c.cap > 0 && c.spent >= c.cap ? 'var(--red)' : pct >= 0.75 ? 'var(--orange)' : c.tint;
         return (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 0', borderBottom: i < CAPS.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 0', borderBottom: i < caps.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
             <span style={{ width: 110, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ width: 8, height: 8, borderRadius: 4, background: c.tint }} />
               <span style={{ font: '600 var(--fs-callout)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{c.name}</span>
@@ -404,17 +399,41 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 export default function BudgetDashboard() {
   const [editCap, setEditCap] = React.useState<Cap | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [budget, setBudget] = React.useState<BudgetData | null>(null);
 
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   }, []);
 
+  React.useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const b = await api.budget();
+        if (alive) setBudget(b);
+      } catch {
+        /* fail soft — leave null, render empty/zeroed gracefully */
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const cap = budget?.cap ?? 0;
+  const spent = budget?.spent ?? 0;
+  const caps: Cap[] = (budget?.byProject ?? []).map(p => ({
+    name: p.name,
+    tint: `var(--${p.color})`,
+    spent: p.spent,
+    cap,
+    capped: cap > 0 && p.spent >= cap,
+  }));
+
   return (
     <AppShell
       active="budget"
       onSearch={() => setPaletteOpen(true)}
-      budget={{ spent: 38.20, cap: 200, animateKey: 0 }}
+      budget={{ spent, cap, animateKey: 0 }}
     >
       <style>{styles}</style>
 
@@ -428,16 +447,16 @@ export default function BudgetDashboard() {
             <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Market Scan hit its $30 cap and paused</span>
             <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>1 job is waiting · raise the cap or review what's running.</span>
           </span>
-          <button onClick={() => setEditCap(CAPS[2])} className="primary-cta" style={{ height: 36, padding: '0 15px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', boxShadow: '0 4px 14px rgba(0,122,255,0.28)' }}>Raise cap</button>
+          <button onClick={() => { const target = caps.find(c => c.capped) ?? caps[0]; if (target) setEditCap(target); }} className="primary-cta" style={{ height: 36, padding: '0 15px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', boxShadow: '0 4px 14px rgba(0,122,255,0.28)' }}>Raise cap</button>
           <button className="ghost-btn" style={{ height: 36, padding: '0 15px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Review jobs</button>
         </div>
 
-        <HeroBand />
+        <HeroBand cap={cap} spent={spent} />
 
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 320px', gap: 18, marginBottom: 24, alignItems: 'start' }}>
           <div>
             <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 12 }}>Per-project caps</div>
-            <CapsList onEdit={setEditCap} />
+            <CapsList caps={caps} onEdit={setEditCap} />
           </div>
           <SavingsCard />
         </div>

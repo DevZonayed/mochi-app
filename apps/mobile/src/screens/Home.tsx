@@ -1,32 +1,50 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, Animated } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
-import { Card, SectionLabel, ProgressBar, Mono, useProjects } from '../ui';
+import { Card, SectionLabel, ProgressBar, Mono } from '../ui';
+import { api, type DashboardData, type Approval, type Job } from '../api';
 
-type ProjKey = 'atlas' | 'content' | 'scan' | 'brand' | 'infra';
+/** Resolved project label + accent for a live row. */
+type ProjVM = { name: string; color: string };
 
-const GATES: { id: string; proj: ProjKey; icon: IconName; tint: keyof ReturnType<typeof useTints>; type: string; summary: string; age: string }[] = [
-  { id: 'g1', proj: 'atlas', icon: 'gitMerge', tint: 'blue', type: 'Merge', summary: 'Merge PR #482 — auth refactor', age: '4m' },
-  { id: 'g2', proj: 'content', icon: 'send', tint: 'purple', type: 'Publish', summary: 'Publish “Launch week” thread to X', age: '9m' },
-  { id: 'g3', proj: 'scan', icon: 'gauge', tint: 'orange', type: 'Over budget', summary: 'Deep run needs $4.10 over cap', age: '1m' },
-];
-const LIVE: { proj: ProjKey; name: string; verb: string; tint: 'purple' | 'teal'; pct: number; cost: string }[] = [
-  { proj: 'atlas', name: 'Refactor auth service', verb: 'Building', tint: 'purple', pct: 64, cost: '0.42' },
-  { proj: 'brand', name: 'Export icon set @3x', verb: 'Rendering', tint: 'teal', pct: 88, cost: '0.12' },
-  { proj: 'infra', name: 'CI hardening', verb: 'Building', tint: 'purple', pct: 32, cost: '0.18' },
-];
-const DONE = [
-  { ok: true, name: 'Generate OG images', cost: '0.34', when: '20m ago' },
-  { ok: true, name: 'Summarize tickets', cost: '0.11', when: '1h ago' },
-  { ok: false, name: 'Deploy preview', cost: '0.02', when: '2h ago' },
-];
+type GateVM = { id: string; proj: ProjVM; icon: IconName; tint: string; type: string; summary: string; age: string };
+type LiveVM = { proj: ProjVM; name: string; verb: string; tint: string; pct: number; cost: string };
+type DoneVM = { ok: boolean; name: string; cost: string; when: string };
 
-function useTints() {
-  const { theme } = useTheme();
-  return { blue: theme.color.blue, purple: theme.color.purple, orange: theme.color.orange, teal: theme.color.teal, green: theme.color.green };
+/** Color names carried by live projects -> theme accent. */
+type ColorName = 'blue' | 'purple' | 'indigo' | 'teal' | 'orange' | 'green' | 'red';
+const COLOR_NAMES: readonly ColorName[] = ['blue', 'purple', 'indigo', 'teal', 'orange', 'green', 'red'];
+function isColorName(c: string): c is ColorName {
+  return (COLOR_NAMES as readonly string[]).includes(c);
+}
+
+/** Approval kind -> {type label, icon}. */
+const GATE_KIND: Record<Approval['kind'], { type: string; icon: IconName }> = {
+  merge: { type: 'Merge', icon: 'gitMerge' },
+  publish: { type: 'Publish', icon: 'send' },
+  budget: { type: 'Over budget', icon: 'gauge' },
+  deploy: { type: 'Deploy', icon: 'bolt' },
+  review: { type: 'Review', icon: 'shield' },
+};
+
+/** Compact relative age, e.g. "4m", "1h", "now". */
+function ago(ts: number): string {
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return 'now';
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+/** Relative "when" suffixed with ago, e.g. "20m ago", "1h ago". */
+function agoLong(ts: number): string {
+  const a = ago(ts);
+  return a === 'now' ? 'just now' : `${a} ago`;
 }
 
 function Pulse({ color, size = 7 }: { color: string; size?: number }) {
@@ -44,10 +62,8 @@ function Pulse({ color, size = 7 }: { color: string; size?: number }) {
   return <Animated.View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: color, opacity: a }} />;
 }
 
-function NeedsYou({ gates, onApprove }: { gates: typeof GATES; onApprove: (id: string) => void }) {
+function NeedsYou({ gates, onApprove }: { gates: GateVM[]; onApprove: (id: string) => void }) {
   const { theme } = useTheme();
-  const projects = useProjects();
-  const tints = useTints();
   const nav = useNavigation<any>();
 
   if (!gates.length) {
@@ -62,8 +78,8 @@ function NeedsYou({ gates, onApprove }: { gates: typeof GATES; onApprove: (id: s
   }
 
   const top = gates[0];
-  const p = projects[top.proj];
-  const tint = tints[top.tint];
+  const p = top.proj;
+  const tint = top.tint;
 
   return (
     <View style={{ marginHorizontal: 20, marginTop: 4, marginBottom: 24 }}>
@@ -119,10 +135,89 @@ function NeedsYou({ gates, onApprove }: { gates: typeof GATES; onApprove: (id: s
 export function HomeScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
-  const projects = useProjects();
-  const tints = useTints();
   const nav = useNavigation<any>();
-  const [gates, setGates] = useState(GATES);
+
+  const [gates, setGates] = useState<GateVM[]>([]);
+  const [live, setLive] = useState<LiveVM[]>([]);
+  const [done, setDone] = useState<DoneVM[]>([]);
+  const [strip, setStrip] = useState({ spend: 0, scheduled: 0, done: 0 });
+
+  // Resolve a live project's accent name -> theme color, falling back softly.
+  const colorFor = useCallback(
+    (name: string): string => (isColorName(name) ? theme.color[name] : theme.color.inkTertiary),
+    [theme],
+  );
+
+  const apply = useCallback(
+    (d: DashboardData) => {
+      const projById = new Map<string, ProjVM>();
+      for (const gp of d.greetingProjects) projById.set(gp.id, { name: gp.name, color: colorFor(gp.color) });
+      const resolve = (projectId: string | null): ProjVM =>
+        (projectId ? projById.get(projectId) : undefined) ?? { name: 'Maestro', color: theme.color.inkTertiary };
+
+      setGates(
+        d.gates.map((a: Approval): GateVM => {
+          const k = GATE_KIND[a.kind];
+          const proj = resolve(a.projectId);
+          return { id: a.id, proj, icon: k.icon, tint: proj.color, type: k.type, summary: a.title, age: ago(a.createdAt) };
+        }),
+      );
+
+      setLive(
+        d.activeJobs.map((j: Job): LiveVM => {
+          const proj = resolve(j.projectId);
+          return { proj, name: j.title, verb: j.phase, tint: proj.color, pct: j.progress, cost: j.cost.toFixed(2) };
+        }),
+      );
+
+      setDone(
+        d.recentlyCompleted.map((j: Job): DoneVM => ({
+          ok: j.status === 'done',
+          name: j.title,
+          cost: j.cost.toFixed(2),
+          when: agoLong(j.updatedAt),
+        })),
+      );
+
+      setStrip({ spend: d.budget.spent, scheduled: d.schedule.length, done: d.recentlyCompleted.length });
+    },
+    [colorFor, theme],
+  );
+
+  const refetch = useCallback(async () => {
+    try {
+      const d = await api.dashboard();
+      apply(d);
+    } catch {
+      /* fail soft — keep last good state */
+    }
+  }, [apply]);
+
+  // Refetch whenever the screen regains focus (and on first mount).
+  useFocusEffect(
+    useCallback(() => {
+      void refetch();
+    }, [refetch]),
+  );
+
+  const onApprove = useCallback(
+    (id: string) => {
+      setGates((g) => g.filter((x) => x.id !== id)); // optimistic
+      void api
+        .approveApproval(id)
+        .then(refetch)
+        .catch(() => {
+          void refetch();
+        });
+    },
+    [refetch],
+  );
+
+  const stripCells: [string, string][] = [
+    [`$${strip.spend.toFixed(2)}`, 'spend'],
+    [`${strip.scheduled}`, 'scheduled'],
+    [`${strip.done} ✓`, 'done'],
+  ];
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
@@ -136,15 +231,15 @@ export function HomeScreen() {
           </Pressable>
         </View>
 
-        <NeedsYou gates={gates} onApprove={(id) => setGates((g) => g.filter((x) => x.id !== id))} />
+        <NeedsYou gates={gates} onApprove={onApprove} />
 
         {/* live now */}
         <View style={{ paddingHorizontal: 20, marginBottom: 22 }}>
           <SectionLabel icon="bolt" color={theme.color.purple}>Live now</SectionLabel>
           <View style={{ gap: 9 }}>
-            {LIVE.map((j, i) => {
-              const p = projects[j.proj];
-              const tint = tints[j.tint];
+            {live.map((j, i) => {
+              const p = j.proj;
+              const tint = j.tint;
               return (
                 <Pressable key={i} onPress={() => nav.navigate('JobTimeline')}>
                   <Card style={{ padding: 14 } as any}>
@@ -169,7 +264,7 @@ export function HomeScreen() {
 
         {/* today strip */}
         <Pressable onPress={() => nav.navigate('Budget')} style={{ flexDirection: 'row', marginHorizontal: 20, marginBottom: 22, paddingVertical: 14, paddingHorizontal: 18, borderRadius: 14, backgroundColor: theme.color.bgGrouped, borderWidth: 0.5, borderColor: theme.color.separator }}>
-          {[['$6.40', 'spend'], ['3', 'scheduled'], ['2 ✓', 'done']].map((s, i) => (
+          {stripCells.map((s, i) => (
             <React.Fragment key={i}>
               {i > 0 ? <View style={{ width: 1, backgroundColor: theme.color.separator, marginHorizontal: 14 }} /> : null}
               <View style={{ flex: 1 }}>
@@ -184,8 +279,8 @@ export function HomeScreen() {
         <View style={{ paddingHorizontal: 20 }}>
           <Text style={{ fontSize: 13, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary, marginBottom: 11 }}>Recently finished</Text>
           <Card>
-            {DONE.map((d, i) => (
-              <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, paddingHorizontal: 15, borderBottomWidth: i < DONE.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}>
+            {done.map((d, i) => (
+              <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, paddingHorizontal: 15, borderBottomWidth: i < done.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}>
                 <Icon name={d.ok ? 'checkCircle' : 'xCircle'} size={18} color={d.ok ? theme.color.green : theme.color.red} />
                 <Text numberOfLines={1} style={{ flex: 1, fontSize: 15, fontWeight: '500', color: theme.color.ink }}>{d.name}</Text>
                 <Mono style={{ fontSize: 13, color: theme.color.inkSecondary }}>${d.cost}</Mono>

@@ -6,6 +6,7 @@
 
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
+import { api, type Template as ApiTemplate } from '../lib/api';
 import { Icon, MaestroMark, type IconName } from '../lib/icons';
 import {
   GroupedList,
@@ -222,6 +223,29 @@ const TEMPLATE_DATA: Template[] = [
 ];
 
 const TRIG_ICON: Record<TriggerKey, IconName> = { hand: 'play', clock: 'clock', chat: 'command', webhook: 'bolt' };
+
+// Map a live API template into the gallery card shape (fields the API has no
+// source for — version/effort/triggers — fall back to sensible defaults).
+const ENGINE_TINT: Record<string, string> = {
+  'claude-code': 'var(--blue)', 'claude-design': 'var(--teal)', research: 'var(--indigo)',
+};
+const ENGINE_EFFORT: Record<string, EffortStop> = {
+  'claude-code': 'DEEP', 'claude-design': 'BALANCED', research: 'FAST',
+};
+function fromApiTemplate(t: ApiTemplate): Template {
+  return {
+    id: t.id,
+    name: t.name,
+    icon: (t.icon || 'spark') as IconName,
+    tint: ENGINE_TINT[t.engine] ?? 'var(--purple)',
+    ver: '1.0.0',
+    shipped: true,
+    purpose: t.description,
+    effort: ENGINE_EFFORT[t.engine] ?? 'BALANCED',
+    review: true,
+    triggers: ['hand'],
+  };
+}
 
 /* ───────────────────────── gallery ───────────────────────── */
 function OriginChip({ shipped }: { shipped?: boolean }) {
@@ -724,13 +748,20 @@ export default function Templates() {
   const [historyOpen, setHistoryOpen] = React.useState(false);
   const [toast, setToast] = React.useState('');
   const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [templates, setTemplates] = React.useState<Template[]>([]);
 
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   }, []);
 
-  const byId = (id: string) => TEMPLATE_DATA.find(t => t.id === id)!;
+  React.useEffect(() => {
+    let alive = true;
+    api.listTemplates().then(rows => { if (alive) setTemplates(rows.map(fromApiTemplate)); }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
+  const byId = (id: string) => templates.find(t => t.id === id)!;
   const toBase = (t: Template, extra?: Partial<EditorBase>): EditorBase => ({
     name: t.name, icon: t.icon, tint: t.tint, ver: t.ver, effort: t.effort, review: t.review, triggers: t.triggers, ...extra,
   });
@@ -740,7 +771,11 @@ export default function Templates() {
   };
 
   const onEdit = (id: string) => openEditor(toBase(byId(id)));
-  const onUse = () => { navigate('/project-detail'); };
+  const onUse = (id: string) => {
+    const t = byId(id);
+    if (t) void api.createProject({ name: t.name, template: 'claude-code', color: 'blue' }).catch(() => {});
+    navigate('/project-detail');
+  };
   const onClone = (id: string) => {
     const card = document.querySelector<HTMLElement>(`[data-tpl="${id}"]`);
     if (card) { card.classList.add('cloning'); setTimeout(() => { card.classList.remove('cloning'); openEditor(toBase(byId(id), { _cloned: true })); }, 420); }
@@ -768,7 +803,7 @@ export default function Templates() {
             <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} budget={{ spent: 38.20, cap: 200, animateKey: 0 }} />
 
             {view === 'gallery'
-              ? <TemplateGalleryView templates={TEMPLATE_DATA} onUse={onUse} onClone={onClone} onEdit={onEdit} onNew={onNew} onImport={() => setToast('Template imported')} />
+              ? <TemplateGalleryView templates={templates} onUse={onUse} onClone={onClone} onEdit={onEdit} onNew={onNew} onImport={() => setToast('Template imported')} />
               : <TemplateEditor base={editBase!} onBack={() => setView('gallery')} onExport={() => setToast('Template exported')} onHistory={() => setHistoryOpen(true)} onSave={() => { setToast('Saved as v1.3.0'); setView('gallery'); }} />}
           </div>
 

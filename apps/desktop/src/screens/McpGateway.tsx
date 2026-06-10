@@ -7,6 +7,7 @@ import React from 'react';
 import { AppShell } from '../lib/appShell';
 import { Icon, type IconName } from '../lib/icons';
 import { Switch } from '../lib/ui';
+import { api, type Skill as ApiSkill } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from <Page>.html) ───────────────────────── */
 const styles = `
@@ -45,6 +46,7 @@ const MCP_PROJ: Record<string, Proj> = {
 };
 
 interface Server {
+  id: string;
   proj: string;
   name: string;
   glyph: string;
@@ -59,23 +61,39 @@ interface Server {
   ns: string;
 }
 
-const SERVERS: Server[] = [
-  { proj: 'atlas', name: 'GitHub', glyph: 'gh', tint: 'var(--ink)', transport: 'HTTP', tools: 12, loaded: 3, defer: true, scope: 'read-write', signed: true, on: true, ns: 'com.github.mcp' },
-  { proj: 'atlas', name: 'Postgres (prod)', glyph: 'pg', tint: 'var(--teal)', transport: 'stdio', tools: 6, loaded: 2, defer: true, scope: 'read-only', signed: true, on: true, ns: 'org.postgresql.mcp' },
-  { proj: 'atlas', name: 'Sentry', glyph: 'se', tint: 'var(--orange)', transport: 'HTTP', tools: 4, loaded: 0, defer: true, scope: 'read-only', signed: true, on: false, ns: 'io.sentry.mcp' },
-  { proj: 'content', name: 'Linear', glyph: 'li', tint: 'var(--indigo)', transport: 'HTTP', tools: 8, loaded: 4, defer: false, scope: 'read-write', signed: true, on: true, ns: 'com.linear.mcp' },
-  { proj: 'content', name: 'Notion', glyph: 'no', tint: 'var(--ink)', transport: 'HTTP', tools: 9, loaded: 2, defer: true, scope: 'read-only', signed: true, on: true, ns: 'so.notion.mcp' },
-  { proj: 'scan', name: 'Brave Search', glyph: 'br', tint: 'var(--orange)', transport: 'HTTP', tools: 3, loaded: 1, defer: true, scope: 'read-only', signed: true, on: true, ns: 'com.brave.mcp' },
-  { proj: 'scan', name: 'Web scraper', glyph: 'ws', tint: 'var(--ink-secondary)', transport: 'stdio', tools: 5, loaded: 0, defer: true, scope: 'read-only · isolated', signed: false, on: false, ns: 'local.scraper' },
-];
+/* Map a live MCP Skill onto the Server card shape the existing JSX renders.
+   Fields the API doesn't supply (transport, tools, loaded, scope, signed,
+   namespace, project bucket, tint) are derived deterministically so the
+   visual layout — project groups, filter chips, glyph chips — is unchanged. */
+const SRV_TINTS = ['var(--ink)', 'var(--teal)', 'var(--orange)', 'var(--indigo)', 'var(--purple)', 'var(--blue)'];
+const PROJ_KEYS = Object.keys(MCP_PROJ);
+
+function skillToServer(sk: ApiSkill, i: number): Server {
+  const slug = sk.name.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return {
+    id: sk.id,
+    proj: PROJ_KEYS[i % PROJ_KEYS.length],
+    name: sk.name,
+    glyph: (slug.slice(0, 2) || 'mc'),
+    tint: SRV_TINTS[i % SRV_TINTS.length],
+    transport: 'HTTP',
+    tools: 0,
+    loaded: 0,
+    defer: true,
+    scope: 'read-only',
+    signed: true,
+    on: sk.enabled,
+    ns: sk.id,
+  };
+}
 
 /* ───────────────────────── Servers tab ───────────────────────── */
 function SrvGlyph({ s, size = 38 }: { s: Server; size?: number }) {
   return <span style={{ width: size, height: size, borderRadius: 10, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${s.tint} 15%, transparent)`, color: s.tint, font: '700 var(--fs-footnote)/1 var(--font-mono)', textTransform: 'uppercase' }}>{s.glyph}</span>;
 }
 
-function ServerRow({ s, last }: { s: Server; last: boolean }) {
-  const [on, setOn] = React.useState(s.on);
+function ServerRow({ s, last, onToggle }: { s: Server; last: boolean; onToggle: (s: Server) => void }) {
+  const on = s.on;
   const [defer, setDefer] = React.useState(s.defer);
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 16px', borderBottom: last ? 'none' : '0.5px solid var(--separator)', opacity: on ? 1 : 0.62, transition: 'opacity 220ms ease' }}>
@@ -101,12 +119,12 @@ function ServerRow({ s, last }: { s: Server; last: boolean }) {
         <Switch on={defer} onChange={setDefer} />
       </div>
       <span style={{ width: 1, height: 28, background: 'var(--separator)' }} />
-      <Switch on={on} onChange={setOn} />
+      <Switch on={on} onChange={() => onToggle(s)} />
     </div>
   );
 }
 
-function ServersTab() {
+function ServersTab({ servers, onToggle }: { servers: Server[]; onToggle: (s: Server) => void }) {
   const [filter, setFilter] = React.useState('all');
   const projs = filter === 'all' ? Object.keys(MCP_PROJ) : [filter];
   return (
@@ -121,7 +139,7 @@ function ServersTab() {
       </div>
 
       {projs.map(pk => {
-        const rows = SERVERS.filter(s => s.proj === pk);
+        const rows = servers.filter(s => s.proj === pk);
         const p = MCP_PROJ[pk];
         return (
           <div key={pk} style={{ marginBottom: 24 }}>
@@ -135,7 +153,7 @@ function ServersTab() {
               <Icon name="lock" size={13} style={{ color: 'var(--ink-tertiary)' }} /> Deny by default — agents reach only what you allow here.
             </div>
             <div style={{ background: 'var(--bg-elevated)', borderRadius: '0 0 12px 12px', border: '0.5px solid var(--separator)', overflow: 'hidden', boxShadow: 'var(--card-shadow)' }}>
-              {rows.map((s, i) => <ServerRow key={s.name} s={s} last={i === rows.length - 1} />)}
+              {rows.map((s, i) => <ServerRow key={s.id} s={s} last={i === rows.length - 1} onToggle={onToggle} />)}
             </div>
           </div>
         );
@@ -364,7 +382,32 @@ export default function McpGateway() {
   const [tab, setTab] = React.useState('servers');
   const [grant, setGrant] = React.useState<Denial | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [servers, setServers] = React.useState<Server[]>([]); // live MCP skills (kind === 'mcp')
   const ti = MCP_TABS.findIndex(t => t.key === tab);
+
+  // Connected MCP servers come from the skills registry: load on mount and keep
+  // only kind === 'mcp', mapped onto the existing server-card shape.
+  React.useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const list = await api.listSkills();
+        if (alive) setServers(list.filter(sk => sk.kind === 'mcp').map(skillToServer));
+      } catch {
+        if (alive) setServers([]);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  // Enable/disable an MCP server -> toggle the underlying skill on the server,
+  // then reflect the returned `enabled` flag in state.
+  const onToggleServer = async (s: Server) => {
+    try {
+      const updated = await api.toggleSkill(s.id);
+      setServers(prev => prev.map(p => (p.id === updated.id ? { ...p, on: updated.enabled } : p)));
+    } catch { /* fail soft — keep current state */ }
+  };
 
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
@@ -393,7 +436,7 @@ export default function McpGateway() {
         </div>
 
         <div key={tab} className="tab-fade">
-          {tab === 'servers' && <ServersTab />}
+          {tab === 'servers' && <ServersTab servers={servers} onToggle={onToggleServer} />}
           {tab === 'activity' && <LiveActivity />}
           {tab === 'denials' && <DenialsTab onAllow={setGrant} />}
         </div>

@@ -6,6 +6,7 @@ import React from 'react';
 import { AppShell } from '../lib/appShell';
 import { Icon, type IconName } from '../lib/icons';
 import { Spinner } from '../lib/ui';
+import { api, type DashboardData, type Approval, type Job as ApiJob } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from <Page>.html) ───────────────────────── */
 const styles = `
@@ -48,15 +49,19 @@ const styles = `
 
 /* ───────────────────────── data ───────────────────────── */
 interface Project { name: string; color: string; }
-const PROJECTS: Record<string, Project> = {
-  atlas:   { name: 'Atlas API',     color: 'var(--blue)' },
-  brand:   { name: 'Brand Refresh', color: 'var(--teal)' },
-  content: { name: 'Q3 Content',    color: 'var(--purple)' },
-  scan:    { name: 'Market Scan',   color: 'var(--indigo)' },
-};
 
-function ProjectChip({ id, small }: { id: string; small?: boolean }) {
-  const p = PROJECTS[id];
+/** Map an API color name ('blue','teal',…) or raw css value to a css var. */
+function toCssColor(color: string): string {
+  if (!color) return 'var(--ink-tertiary)';
+  return color.startsWith('var(') || color.startsWith('#') ? color : `var(--${color})`;
+}
+
+/** Live project lookup keyed by real project id, populated from the dashboard. */
+type ProjMap = Record<string, Project>;
+const EMPTY_PROJ: Project = { name: '', color: 'var(--ink-tertiary)' };
+
+function ProjectChip({ id, small, projects }: { id: string; small?: boolean; projects: ProjMap }) {
+  const p = projects[id] ?? EMPTY_PROJ;
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
       <span style={{ width: 8, height: 8, borderRadius: 4, background: p.color, flexShrink: 0 }} />
@@ -77,14 +82,41 @@ interface Gate {
   age: string;
 }
 
-const GATES: Gate[] = [
-  { id: 'g1', project: 'atlas',   type: 'merge',   icon: 'gitMerge', tint: 'var(--blue)',   summary: 'Merge PR #482 — auth refactor',     meta: '12 files · +840 −210',          age: '4 min' },
-  { id: 'g2', project: 'scan',    type: 'budget',  icon: 'alert',    tint: 'var(--red)',    summary: 'Deep run will exceed the $5 cap',   meta: 'Est. $6.40 · competitor digest', age: '1 min' },
-  { id: 'g3', project: 'content', type: 'publish', icon: 'send',     tint: 'var(--purple)', summary: 'Publish “Launch week” thread to X', meta: '6 posts · scheduled 14:00',      age: '9 min' },
-  { id: 'g4', project: 'brand',   type: 'plan',    icon: 'sliders',  tint: 'var(--teal)',   summary: 'Approve export plan — icon set @3x', meta: '48 assets · 2 formats',         age: '12 min' },
-];
+/** Per-kind icon + tint for a gate card (preserves the original visual language). */
+const GATE_KIND: Record<string, { icon: IconName; tint: string }> = {
+  merge:   { icon: 'gitMerge', tint: 'var(--blue)' },
+  budget:  { icon: 'alert',    tint: 'var(--red)' },
+  publish: { icon: 'send',     tint: 'var(--purple)' },
+  deploy:  { icon: 'bolt',     tint: 'var(--orange)' },
+  review:  { icon: 'sliders',  tint: 'var(--teal)' },
+};
 
-function NeedsYouStrip({ gates, onApprove }: { gates: Gate[]; onApprove: (id: string) => void }) {
+/** Compact relative age label, e.g. "4 min", "2 h", "now". */
+function ago(ts: number): string {
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return 'now';
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} h`;
+  return `${Math.floor(h / 24)} d`;
+}
+
+function approvalToGate(a: Approval): Gate {
+  const k = GATE_KIND[a.kind] ?? { icon: 'shield' as IconName, tint: 'var(--ink-secondary)' };
+  return {
+    id: a.id,
+    project: a.projectId ?? '',
+    type: a.kind,
+    icon: k.icon,
+    tint: k.tint,
+    summary: a.title,
+    meta: a.subtitle || a.detail,
+    age: ago(a.createdAt),
+  };
+}
+
+function NeedsYouStrip({ gates, onApprove, projects }: { gates: Gate[]; onApprove: (id: string) => void; projects: ProjMap }) {
   if (gates.length === 0) {
     return (
       <div style={{
@@ -113,7 +145,7 @@ function NeedsYouStrip({ gates, onApprove }: { gates: Gate[]; onApprove: (id: st
                 background: `color-mix(in srgb, ${g.tint} 15%, transparent)`, color: g.tint }}>
                 <Icon name={g.icon} size={17} />
               </span>
-              <ProjectChip id={g.project} />
+              <ProjectChip id={g.project} projects={projects} />
               <span style={{ flex: 1 }} />
               <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{g.age}</span>
             </div>
@@ -159,23 +191,43 @@ interface Job {
   stream: string[];
 }
 
-const JOBS: Job[] = [
-  { id: 'j1', project: 'atlas', title: 'Refactor auth service', status: 'Building', tint: 'var(--purple)', progress: 64, tokens: '18.2k', cost: '0.42', elapsed: '4:21',
-    stream: ['writing migration for sessions table…', 'updating middleware/verifyToken.ts', 'running typecheck — 0 errors', 'patching 3 call sites in routes/'] },
-  { id: 'j2', project: 'brand', title: 'Export icon set @3x', status: 'Rendering', tint: 'var(--teal)', progress: 88, tokens: '6.1k', cost: '0.12', elapsed: '1:08',
-    stream: ['rasterizing nav-home@3x.png', 'optimizing with pngquant…', 'zipping 48 assets'] },
-  { id: 'j3', project: 'content', title: 'Draft launch thread', status: 'Reviewing', tint: 'var(--orange)', progress: 100, tokens: '11.4k', cost: '0.07', elapsed: '0:52', review: true,
-    stream: ['scoring hook variants…', 'awaiting your review'] },
-  { id: 'j4', project: 'atlas', title: 'Add rate-limiter tests', status: 'Building', tint: 'var(--purple)', progress: 32, tokens: '9.7k', cost: '0.21', elapsed: '2:55',
-    stream: ['generating fixtures for 429 path', 'mocking Redis token bucket', 'asserting retry-after header'] },
-];
+/** Format a token count like the original mock ("18.2k", "6.1k", "940"). */
+function fmtTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return `${n}`;
+}
 
-function ActiveJobs({ tick }: { tick: number }) {
+/** Elapsed time m:ss between createdAt and updatedAt. */
+function fmtElapsed(createdAt: number, updatedAt: number): string {
+  const s = Math.max(0, Math.floor((updatedAt - createdAt) / 1000));
+  const m = Math.floor(s / 60);
+  return `${m}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function jobToView(j: ApiJob, projects: ProjMap): Job {
+  const review = /review/i.test(j.phase) || (j.status === 'done');
+  const tint = projects[j.projectId]?.color ?? 'var(--purple)';
+  return {
+    id: j.id,
+    project: j.projectId,
+    title: j.title,
+    status: j.phase || (j.status === 'running' ? 'Working' : j.status),
+    tint,
+    progress: j.progress,
+    tokens: fmtTokens(j.tokens),
+    cost: j.cost.toFixed(2),
+    elapsed: fmtElapsed(j.createdAt, j.updatedAt),
+    review,
+    stream: j.stage ? [j.stage] : [''],
+  };
+}
+
+function ActiveJobs({ tick, jobs, projects }: { tick: number; jobs: Job[]; projects: ProjMap }) {
   return (
     <div>
-      <ZoneLabel icon="bolt" tint="var(--purple)">Active jobs · {JOBS.length}</ZoneLabel>
+      <ZoneLabel icon="bolt" tint="var(--purple)">Active jobs · {jobs.length}</ZoneLabel>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-        {JOBS.map((j, i) => {
+        {jobs.map((j, i) => {
           const line = j.stream[(tick + i) % j.stream.length];
           return (
             <div key={j.id} className="job-row" style={{
@@ -188,7 +240,7 @@ function ActiveJobs({ tick }: { tick: number }) {
                 <div style={{ minWidth: 0, flex: 1 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
                     <span style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{j.title}</span>
-                    <ProjectChip id={j.project} small />
+                    <ProjectChip id={j.project} small projects={projects} />
                   </div>
                 </div>
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '600 var(--fs-footnote)/1 var(--font-text)', color: j.tint, flexShrink: 0 }}>
@@ -227,25 +279,9 @@ function ActiveJobs({ tick }: { tick: number }) {
 }
 
 /* ───────────────────────── Right rail ───────────────────────── */
-const SCHEDULE = [
-  { time: '14:00', project: 'scan',    label: 'Competitor digest' },
-  { time: '16:30', project: 'content', label: 'Newsletter draft' },
-  { time: '18:00', project: 'atlas',   label: 'Nightly test suite' },
-  { time: '21:00', project: 'brand',   label: 'Asset backup' },
-  { time: '06:00', project: 'atlas',   label: 'Dependency audit' },
-];
-const SPEND = [
-  { project: 'atlas',   amount: 18.4 },
-  { project: 'content', amount: 9.1 },
-  { project: 'scan',    amount: 6.8 },
-  { project: 'brand',   amount: 3.9 },
-];
-const DONE: { ok: boolean; project: string; title: string; cost: string }[] = [
-  { ok: true,  project: 'brand',   title: 'Generate OG images',  cost: '0.34' },
-  { ok: true,  project: 'scan',    title: 'Summarize tickets',   cost: '0.11' },
-  { ok: false, project: 'atlas',   title: 'Deploy preview',      cost: '0.02' },
-  { ok: true,  project: 'content', title: 'Translate docs (ES)', cost: '0.46' },
-];
+interface ScheduleRow { time: string; color: string; label: string; }
+interface SpendRow { name: string; color: string; amount: number; }
+interface DoneRow { ok: boolean; color: string; title: string; cost: string; }
 
 function RailCard({ title, action, children }: { title: React.ReactNode; action?: React.ReactNode; children?: React.ReactNode }) {
   return (
@@ -260,17 +296,17 @@ function RailCard({ title, action, children }: { title: React.ReactNode; action?
   );
 }
 
-function RightRail() {
-  const maxSpend = Math.max(...SPEND.map(s => s.amount));
+function RightRail({ schedule, spend, done }: { schedule: ScheduleRow[]; spend: SpendRow[]; done: DoneRow[] }) {
+  const maxSpend = spend.length ? Math.max(...spend.map(s => s.amount)) : 0;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       <RailCard title="Today's schedule" action="All">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-          {SCHEDULE.map((s, i) => (
+          {schedule.map((s, i) => (
             <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '7px 0',
-              borderBottom: i < SCHEDULE.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
+              borderBottom: i < schedule.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
               <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', width: 42, flexShrink: 0 }}>{s.time}</span>
-              <span style={{ width: 7, height: 7, borderRadius: 4, background: PROJECTS[s.project].color, flexShrink: 0 }} />
+              <span style={{ width: 7, height: 7, borderRadius: 4, background: s.color, flexShrink: 0 }} />
               <span style={{ flex: 1, font: '400 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.label}</span>
             </div>
           ))}
@@ -279,11 +315,11 @@ function RightRail() {
 
       <RailCard title="Spend today">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {SPEND.map((s, i) => (
+          {spend.map((s, i) => (
             <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ width: 78, font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 0 }}>{PROJECTS[s.project].name}</span>
+              <span style={{ width: 78, font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flexShrink: 0 }}>{s.name}</span>
               <div style={{ flex: 1, height: 8, borderRadius: 4, background: 'var(--fill-secondary)', overflow: 'hidden' }}>
-                <div style={{ width: `${(s.amount / maxSpend) * 100}%`, height: '100%', borderRadius: 4, background: PROJECTS[s.project].color }} />
+                <div style={{ width: `${maxSpend ? (s.amount / maxSpend) * 100 : 0}%`, height: '100%', borderRadius: 4, background: s.color }} />
               </div>
               <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', width: 44, textAlign: 'right', flexShrink: 0 }}>${s.amount.toFixed(2)}</span>
             </div>
@@ -293,12 +329,12 @@ function RightRail() {
 
       <RailCard title="Recently completed">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-          {DONE.map((d, i) => (
+          {done.map((d, i) => (
             <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 0',
-              borderBottom: i < DONE.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
+              borderBottom: i < done.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
               <Icon name={d.ok ? 'checkCircle' : 'xCircle'} size={16} style={{ color: d.ok ? 'var(--green)' : 'var(--red)', flexShrink: 0 }} />
               <span style={{ flex: 1, font: '500 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{d.title}</span>
-              <span style={{ width: 7, height: 7, borderRadius: 4, background: PROJECTS[d.project].color, flexShrink: 0 }} />
+              <span style={{ width: 7, height: 7, borderRadius: 4, background: d.color, flexShrink: 0 }} />
               <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', width: 36, textAlign: 'right', flexShrink: 0 }}>${d.cost}</span>
             </div>
           ))}
@@ -416,9 +452,63 @@ const TODAY = new Date().toLocaleDateString('en-US', { weekday: 'long', month: '
 
 export default function CommandCenter() {
   const [tick, setTick] = React.useState(0);
-  const [gates, setGates] = React.useState<Gate[]>(GATES);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
-  const [spent, setSpent] = React.useState(38.2);
+  const [data, setData] = React.useState<DashboardData | null>(null);
+
+  // Live dashboard fetch; stable so it can seed the SSE subscription without re-subscribing.
+  const refetch = React.useCallback(async () => {
+    try {
+      const d = await api.dashboard();
+      setData(d);
+    } catch {
+      /* fail soft — keep last good state / empty */
+    }
+  }, []);
+
+  // Initial load + live updates (jobs / approvals stream).
+  React.useEffect(() => {
+    void refetch();
+    const unsub = api.subscribe({ onJob: () => void refetch(), onApproval: () => void refetch() });
+    return unsub;
+  }, [refetch]);
+
+  // Resolved project lookup keyed by real project id (name + css color).
+  const projects = React.useMemo<ProjMap>(() => {
+    const map: ProjMap = {};
+    for (const p of data?.greetingProjects ?? []) {
+      map[p.id] = { name: p.name, color: toCssColor(p.color) };
+    }
+    return map;
+  }, [data]);
+
+  // View models derived from live dashboard data.
+  const gates = React.useMemo<Gate[]>(() => (data?.gates ?? []).map(approvalToGate), [data]);
+  const jobs = React.useMemo<Job[]>(() => (data?.activeJobs ?? []).map(j => jobToView(j, projects)), [data, projects]);
+
+  const schedule = React.useMemo<ScheduleRow[]>(
+    () => (data?.schedule ?? []).map(s => ({
+      time: s.time,
+      color: (s.projectId && projects[s.projectId]?.color) || 'var(--ink-tertiary)',
+      label: s.title,
+    })),
+    [data, projects],
+  );
+  const spend = React.useMemo<SpendRow[]>(
+    () => (data?.budget.byProject ?? []).map(b => ({ name: b.name, color: toCssColor(b.color), amount: b.spent })),
+    [data],
+  );
+  const done = React.useMemo<DoneRow[]>(
+    () => (data?.recentlyCompleted ?? []).map((j: ApiJob) => ({
+      ok: j.status !== 'failed',
+      color: (projects[j.projectId]?.color) || 'var(--ink-tertiary)',
+      title: j.title,
+      cost: j.cost.toFixed(2),
+    })),
+    [data, projects],
+  );
+
+  const spent = data?.budget.spent ?? 0;
+  const cap = data?.budget.cap ?? 0;
 
   // streaming ticker
   React.useEffect(() => { const t = setInterval(() => setTick(x => x + 1), 2200); return () => clearInterval(t); }, []);
@@ -431,21 +521,32 @@ export default function CommandCenter() {
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   }, []);
 
+  // Approve a gate: preserve the existing approve micro-interaction, then resolve + refetch.
   const approve = (id: string) => {
+    const finish = () => { void api.approveApproval(id).then(refetch).catch(() => { void refetch(); }); };
     const card = document.querySelector(`[data-gate="${id}"]`);
     if (card) {
       card.classList.add('gate-approving');
-      setTimeout(() => { setGates(g => g.filter(x => x.id !== id)); setSpent(s => +(s + 0.6).toFixed(2)); }, 360);
+      setTimeout(finish, 360);
     } else {
-      setGates(g => g.filter(x => x.id !== id));
+      finish();
     }
+  };
+
+  // "Run a job" — create + run a job in the first greeting project, then refetch.
+  const runJob = () => {
+    const first = data?.greetingProjects[0];
+    if (!first) return; // no project yet — no-op
+    void api.createAndRunJob({ projectId: first.id, input: 'New job from Command Center', effort: 'balanced' })
+      .then(refetch)
+      .catch(() => { void refetch(); });
   };
 
   return (
     <AppShell
       active="home"
       onSearch={() => setPaletteOpen(true)}
-      budget={{ spent, cap: 200, animateKey: spent }}
+      budget={{ spent, cap, animateKey: spent }}
     >
       <style>{styles}</style>
 
@@ -456,7 +557,7 @@ export default function CommandCenter() {
             <div style={{ font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 5 }}>{TODAY}</div>
             <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>{greeting()}</h1>
           </div>
-          <button onClick={() => setPaletteOpen(true)} className="primary-cta" style={{
+          <button onClick={runJob} className="primary-cta" style={{
             display: 'inline-flex', alignItems: 'center', gap: 7, height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)',
             background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)',
             boxShadow: '0 6px 18px rgba(0,122,255,0.30)',
@@ -467,13 +568,13 @@ export default function CommandCenter() {
 
         {/* needs-you */}
         <div style={{ marginBottom: 24 }}>
-          <NeedsYouStrip gates={gates} onApprove={approve} />
+          <NeedsYouStrip gates={gates} onApprove={approve} projects={projects} />
         </div>
 
         {/* jobs + rail */}
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 340px', gap: 20, alignItems: 'start' }}>
-          <ActiveJobs tick={tick} />
-          <RightRail />
+          <ActiveJobs tick={tick} jobs={jobs} projects={projects} />
+          <RightRail schedule={schedule} spend={spend} done={done} />
         </div>
       </div>
 

@@ -9,6 +9,8 @@
    chrome exactly as the prototype did. */
 
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
+import { api } from '../lib/api';
 import {
   Icon,
   MaestroMark,
@@ -537,6 +539,7 @@ type Theme = 'light' | 'dark';
 type Phase = 'card' | 'finishing' | 'done';
 
 export default function Onboarding() {
+  const navigate = useNavigate();
   const scale = useScale(WIN_W, WIN_H);
   const [theme, setTheme] = React.useState<Theme>('light');
   const [step, setStep] = React.useState(0);
@@ -578,7 +581,16 @@ export default function Onboarding() {
 
   const finish = () => {
     setPhase('finishing');
-    setTimeout(() => setPhase('done'), 1500);
+    try {
+      localStorage.setItem('maestro.onboarded', '1');
+      localStorage.setItem('maestro.budget', String(budget));
+      if (workspace.trim()) localStorage.setItem('maestro.workspace', workspace.trim());
+    } catch {
+      /* storage may be unavailable */
+    }
+    // Persist the workspace on the live backend — best-effort, never blocks setup.
+    if (workspace.trim()) void api.createWorkspace(workspace.trim()).catch(() => {});
+    window.setTimeout(() => navigate('/command-center'), 1500);
   };
   const restart = () => {
     setPhase('card'); setStep(0); setMaxVisited(0); setWorkspace('');

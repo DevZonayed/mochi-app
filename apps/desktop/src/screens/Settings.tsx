@@ -16,6 +16,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, TrafficLights, Sidebar, Toolbar,
   type Theme,
 } from '../lib/appShell';
+import { api, type Workspace, type BudgetData } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -177,7 +178,10 @@ function ToggleRow({ label, sub, on: initial, last }: { label: React.ReactNode; 
 }
 
 /* ───────────────────────── panes ───────────────────────── */
-function GeneralPane({ theme, setTheme }: { theme: Theme; setTheme: React.Dispatch<React.SetStateAction<Theme>> }) {
+function GeneralPane({ theme, setTheme, workspace }: {
+  theme: Theme; setTheme: React.Dispatch<React.SetStateAction<Theme>>;
+  workspace: Workspace | null;
+}) {
   const [eff, setEff] = React.useState<EffortStop>('BALANCED');
   const [model, setModel] = React.useState('auto');
   return (
@@ -185,7 +189,7 @@ function GeneralPane({ theme, setTheme }: { theme: Theme; setTheme: React.Dispat
       <PaneHead>General</PaneHead>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
         <GroupedList header="Workspace">
-          <Row><span style={{ width: 110, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Name</span><input defaultValue="Atlas Studio" style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)', padding: '13px 0' }} /></Row>
+          <Row><span style={{ width: 110, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Name</span><input key={workspace?.id ?? 'ws'} defaultValue={workspace?.name ?? 'Atlas Studio'} style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)', padding: '13px 0' }} /></Row>
           <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Appearance</span><Seg options={['Light', 'Dark', 'Auto']} value={theme === 'dark' ? 'Dark' : 'Light'} onChange={v => setTheme(v === 'Dark' ? 'dark' : 'light')} /></Row>
         </GroupedList>
         <GroupedList header="Defaults" footer="Applies to new jobs across the workspace; projects can override.">
@@ -382,6 +386,26 @@ export default function Settings() {
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const navigate = useNavigate();
 
+  // Live workspace (first one) + budget figures backing the name row and the
+  // toolbar budget chip. Empty until the API resolves; fail-soft on error.
+  const [workspace, setWorkspace] = React.useState<Workspace | null>(null);
+  const [budget, setBudget] = React.useState<BudgetData | null>(null);
+
+  React.useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const [workspaces, budgetData] = await Promise.all([api.listWorkspaces(), api.budget()]);
+        if (!alive) return;
+        setWorkspace(workspaces[0] ?? null);
+        setBudget(budgetData);
+      } catch {
+        /* fail-soft: keep static design defaults */
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
   const navTo = (key: string) => { const r = NAV_ROUTES[key]; if (r) navigate(r); };
 
   React.useEffect(() => {
@@ -389,8 +413,13 @@ export default function Settings() {
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   }, []);
 
+  // Live budget cap prefers the workspace's configured ceiling, then the budget
+  // aggregate, falling back to the prototype's design value.
+  const liveCap = workspace?.budgetCap ?? budget?.cap ?? 200;
+  const liveSpent = budget?.spent ?? 38.20;
+
   const panes: Record<string, React.ReactNode> = {
-    general: <GeneralPane theme={theme} setTheme={setTheme} />,
+    general: <GeneralPane theme={theme} setTheme={setTheme} workspace={workspace} />,
     accounts: <AccountsPane />,
     security: <SecurityPane onExportAudit={() => navigate('/audit')} />,
     devices: <DevicesPane onPair={() => navigate('/device-pairing')} />,
@@ -412,7 +441,7 @@ export default function Settings() {
         <TrafficLights />
         <Sidebar active="" onNav={navTo} onWorkspace={() => {}} />
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, position: 'relative', zIndex: 1 }}>
-          <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} budget={{ spent: 38.20, cap: 200, animateKey: 0 }} />
+          <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} budget={{ spent: liveSpent, cap: liveCap, animateKey: liveCap }} />
           <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
             {/* settings nav */}
             <aside style={{ width: 232, flexShrink: 0, borderRight: '0.5px solid var(--separator)', padding: '20px 12px', overflowY: 'auto', background: 'var(--bg-grouped)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>

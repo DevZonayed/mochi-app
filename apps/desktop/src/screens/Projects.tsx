@@ -9,6 +9,7 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { AppShell, WORKSPACE } from '../lib/appShell';
+import { api, type Project as ApiProject, type Job } from '../lib/api';
 
 /* Page-specific CSS from Projects.html <style> (the app-shell already provides
    the spin/app-wallpaper/nav-item/ws-header/search-field/tb-icon hooks, but we
@@ -74,20 +75,37 @@ interface Project {
   paused?: boolean;
 }
 
-const SEED: Project[] = [
-  { id: 'p1', name: 'Atlas API',        tpl: 'code',     jobs: 2, gates: 1, spent: 18.40, cap: 50,  subs: 4, next: '18:00', activity: '2m ago' },
-  { id: 'p2', name: 'Q3 Content',       tpl: 'content',  jobs: 0, gates: 1, spent: 9.10,  cap: 30,  subs: 3, next: '14:00', activity: '9m ago' },
-  { id: 'p3', name: 'Brand Refresh',    tpl: 'design',   jobs: 1, gates: 0, spent: 3.90,  cap: 40,  subs: 2, next: '21:00', activity: '12m ago' },
-  { id: 'p4', name: 'Competitor Watch', tpl: 'research', jobs: 1, gates: 0, spent: 27.90, cap: 30,  subs: 1, next: '06:00', activity: '4m ago' },
-  { id: 'p5', name: 'iOS Rewrite',      tpl: 'code',     jobs: 0, gates: 0, spent: 31.50, cap: 80,  subs: 6, next: '23:00', activity: '1h ago' },
-  { id: 'p6', name: 'Ad Variations',    tpl: 'design',   jobs: 0, gates: 0, spent: 45.00, cap: 45,  subs: 2, next: '—',     activity: '3h ago', paused: true },
-  { id: 'p7', name: 'Market Scan',      tpl: 'research', jobs: 1, gates: 1, spent: 22.50, cap: 60,  subs: 2, next: '16:30', activity: '6m ago' },
-  { id: 'p8', name: 'Support Triage',   tpl: 'content',  jobs: 0, gates: 0, spent: 0,     cap: 25,  subs: 0, next: '—',     activity: 'Idle' },
-];
-
 function health(spent: number, cap: number): string {
   const pct = cap ? spent / cap : 0;
   return pct >= 0.9 ? 'var(--red)' : pct >= 0.75 ? 'var(--orange)' : 'var(--blue)';
+}
+
+/* Coerce an API project's free-form `template` string onto one of the four
+   known template keys this screen renders (falls back to 'code'). */
+function templateKey(t: string): string {
+  const k = (t || '').toLowerCase();
+  return k in TEMPLATES ? k : 'code';
+}
+
+/* Build the screen's local Project rows from the live API. Per-project job
+   counts and spend are derived from listJobs(id); pending gates from the
+   workspace approvals list. Fields the API does not expose (cap, subs, next,
+   activity) keep sane static defaults so the render shape stays intact. */
+function toRow(p: ApiProject, jobs: Job[], pendingGates: number): Project {
+  const running = jobs.filter(j => j.status === 'running' || j.status === 'pending').length;
+  const spent = jobs.reduce((sum, j) => sum + (j.cost || 0), 0);
+  return {
+    id: p.id,
+    name: p.name,
+    tpl: templateKey(p.template),
+    jobs: running,
+    gates: pendingGates,
+    spent,
+    cap: 50,
+    subs: 0,
+    next: '—',
+    activity: 'Idle',
+  };
 }
 
 // ── Status line ─────────────────────────────────────────────────────────────
@@ -368,7 +386,7 @@ interface GalleryItem {
   blurb: string;
 }
 
-function TemplateGallery({ open, onClose }: { open: boolean; onClose: () => void }) {
+function TemplateGallery({ open, onClose, onCreate }: { open: boolean; onClose: () => void; onCreate: (template: string) => void }) {
   const [sel, setSel] = React.useState('code');
   React.useEffect(() => { if (open) setSel('code'); }, [open]);
   if (!open) return null;
@@ -435,7 +453,7 @@ function TemplateGallery({ open, onClose }: { open: boolean; onClose: () => void
             You can change tools and gates after creating.
           </span>
           <button onClick={onClose} style={{ height: 40, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
-          <button onClick={onClose} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Create project</button>
+          <button onClick={() => onCreate(sel)} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Create project</button>
         </div>
       </div>
     </div>
@@ -544,11 +562,46 @@ export default function Projects() {
   const navigate = useNavigate();
   const [view, setView] = React.useState('grid');
   const [loading, setLoading] = React.useState(true);
-  const [projects, setProjects] = React.useState<Project[]>(SEED);
+  const [projects, setProjects] = React.useState<Project[]>([]);
+  const [budget, setBudget] = React.useState<{ spent: number; cap: number }>({ spent: 0, cap: 200 });
   const [galleryOpen, setGalleryOpen] = React.useState(false);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
 
-  React.useEffect(() => { const t = setTimeout(() => setLoading(false), 850); return () => clearTimeout(t); }, []);
+  const load = React.useCallback(async () => {
+    try {
+      const [apiProjects, pendingGates, budgetData] = await Promise.all([
+        api.listProjects(),
+        api.listApprovals('pending'),
+        api.budget(),
+      ]);
+      const jobsByProject = await Promise.all(
+        apiProjects.map(p => api.listJobs(p.id).catch(() => [] as Job[])),
+      );
+      const gatesByProject = pendingGates.reduce<Record<string, number>>((acc, g) => {
+        if (g.projectId) acc[g.projectId] = (acc[g.projectId] ?? 0) + 1;
+        return acc;
+      }, {});
+      setProjects(apiProjects.map((p, i) => toRow(p, jobsByProject[i] ?? [], gatesByProject[p.id] ?? 0)));
+      setBudget({ spent: budgetData.spent, cap: budgetData.cap });
+    } catch {
+      /* fail soft — leave whatever state we have */
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => { void load(); }, [load]);
+
+  const createProject = async (template: string) => {
+    setGalleryOpen(false);
+    try {
+      const label = TEMPLATES[template]?.label ?? 'New';
+      await api.createProject({ name: `${label} Project`, template });
+      await load();
+    } catch {
+      /* fail soft */
+    }
+  };
 
   const archive = (id: string) => setProjects(ps => ps.filter(p => p.id !== id));
   const open = () => { navigate('/project-detail'); };
@@ -565,7 +618,7 @@ export default function Projects() {
   return (
     <>
       <style>{PAGE_CSS}</style>
-      <AppShell active="projects" onSearch={() => setPaletteOpen(true)} budget={{ spent: 38.20, cap: 200, animateKey: 0 }}>
+      <AppShell active="projects" onSearch={() => setPaletteOpen(true)} budget={{ spent: budget.spent, cap: budget.cap, animateKey: budget.spent }}>
         <div style={{ padding: '26px 28px 32px' }}>
           {/* header */}
           <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginBottom: 22, gap: 16 }}>
@@ -592,7 +645,7 @@ export default function Projects() {
         </div>
       </AppShell>
 
-      <TemplateGallery open={galleryOpen} onClose={() => setGalleryOpen(false)} />
+      <TemplateGallery open={galleryOpen} onClose={() => setGalleryOpen(false)} onCreate={createProject} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </>
   );

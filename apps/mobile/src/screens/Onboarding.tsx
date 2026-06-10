@@ -6,6 +6,8 @@ import Svg, { Rect, G } from 'react-native-svg';
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { MaestroMark } from '../Icon';
+import { api } from '../api';
+import { setFlag, ONBOARDED } from '../storage';
 
 const BLUE = '#007AFF';
 const GREEN = '#34C759';
@@ -303,7 +305,12 @@ export function OnboardingScreen() {
       {step === 0 ? <Welcome insets={insets} onNext={() => setStep(1)} /> : null}
       {step === 1 ? <Scanner insets={insets} onScan={() => setStep(2)} /> : null}
       {step >= 2 ? (
-        <ConfirmSheet insets={insets} paired={step === 3} onConfirm={() => setStep(3)} onEnable={() => nav.navigate('Tabs')} />
+        <ConfirmSheet
+          insets={insets}
+          paired={step === 3}
+          onConfirm={() => { void api.health().catch(() => {}); setStep(3); }}
+          onEnable={() => { setFlag(ONBOARDED, true); nav.navigate('Tabs'); }}
+        />
       ) : null}
 
       {/* tiny step nav for review */}

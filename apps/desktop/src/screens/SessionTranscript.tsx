@@ -9,10 +9,11 @@
    <a href> navigation is replaced with react-router useNavigate(). */
 
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { EffortDial, ModelSwitcher } from '../lib/ui';
 import { AppShell } from '../lib/appShell';
+import { api, type Job, type Effort } from '../lib/api';
 
 type RunState = 'live' | 'gate' | 'done' | 'failed';
 
@@ -335,8 +336,26 @@ function SummaryCard({ kind }: SummaryCardProps) {
   );
 }
 
-function transcriptBlocks(runState: RunState, onApprove: () => void, onChanges: () => void, onTick: () => void): React.ReactNode[] {
+// User goal / prompt for the job (the live `input`), shown atop the transcript.
+function GoalBlock({ goal }: { goal: string }) {
+  return (
+    <div style={{ maxWidth: 720, background: 'var(--bg-elevated)', borderRadius: 12, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '10px 14px', borderBottom: '0.5px solid var(--separator)', background: 'var(--fill-tertiary)' }}>
+        <Icon name="send" size={14} style={{ color: 'var(--blue)', flexShrink: 0 }} />
+        <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Goal</span>
+      </div>
+      <div style={{ padding: '12px 14px', font: '400 var(--fs-body)/1.6 var(--font-text)', color: 'var(--ink)', textWrap: 'pretty' as React.CSSProperties['textWrap'] }}>{goal}</div>
+    </div>
+  );
+}
+
+function transcriptBlocks(runState: RunState, onApprove: () => void, onChanges: () => void, onTick: () => void, job: Job | null): React.ReactNode[] {
   const blocks: React.ReactNode[] = [];
+  // Live user goal / prompt for this job (input). The fine-grained timeline rows
+  // below have no API source and keep their existing static structure.
+  if (job && job.input) {
+    blocks.push(<GoalBlock key="goal" goal={job.input} />);
+  }
   blocks.push(<PhaseMarker key="pm-plan" phase="Plan" tint="var(--blue)" />);
   blocks.push(<SystemRow key="sys" icon="refresh" text="Resumed from checkpoint after sleep" />);
   blocks.push(<Narration key="n1" text="I'll move the auth service to short-lived JWTs while keeping the legacy cookie path intact. Plan: add a jwt_id column, issue tokens on login, and update the three read sites behind a fallback." />);
@@ -354,21 +373,23 @@ function transcriptBlocks(runState: RunState, onApprove: () => void, onChanges: 
   blocks.push(<ToolCall key="t2" tool="bash" cmd="npm test -- auth" time="3.2s" ok stdout={"PASS  test/auth/session.test.ts\nPASS  test/auth/jwt.test.ts\n\nTests: 24 passed, 24 total\nTime:  3.18 s"} />);
   blocks.push(<ToolCall key="t3" tool="bash" cmd="npm run typecheck" time="5.1s" ok stdout={"tsc --noEmit\n✓ 0 errors"} />);
 
+  // The live result/transcript body comes from job.output (or job.error when failed).
+  const resultBody = job ? (job.error ?? job.output) : null;
   if (runState === 'live') {
-    blocks.push(<Typewriter key="tail" text={LIVE_TAIL} live onTick={onTick} />);
+    blocks.push(<Typewriter key="tail" text={resultBody ?? LIVE_TAIL} live onTick={onTick} />);
   }
   if (runState === 'gate') {
-    blocks.push(<Narration key="n3" text="Patched all three call sites behind a token-first fallback. Tests green, typecheck clean. Opening the PR for your review." />);
+    blocks.push(<Narration key="n3" text={resultBody ?? "Patched all three call sites behind a token-first fallback. Tests green, typecheck clean. Opening the PR for your review."} />);
     blocks.push(<PhaseMarker key="pm-rev" phase="Review" tint="var(--teal)" />);
     blocks.push(<Narration key="n4" text="Reviewer pass complete — no blocking issues. One note: consider rotating the signing key quarterly. Handing off to the merge gate." />);
     blocks.push(<GateCard key="gate" onApprove={onApprove} onChanges={onChanges} />);
   }
   if (runState === 'done') {
-    blocks.push(<Narration key="n3" text="Patched all three call sites, reviewer signed off, and you approved the merge. Shipped to main." />);
+    blocks.push(<Narration key="n3" text={resultBody ?? "Patched all three call sites, reviewer signed off, and you approved the merge. Shipped to main."} />);
     blocks.push(<SummaryCard key="sum" kind="done" />);
   }
   if (runState === 'failed') {
-    blocks.push(<Narration key="n3" text="Wiring the token signer into the login route…" />);
+    blocks.push(<Narration key="n3" text={resultBody ?? "Wiring the token signer into the login route…"} />);
     blocks.push(<SummaryCard key="sum" kind="failed" />);
   }
   return blocks;
@@ -666,19 +687,72 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 
 /* ───────────────────────────── page root ───────────────────────────── */
 
+// Map the live job status onto the screen's RunState vocabulary. The API has no
+// "gate" state — that only arrives via the demo state-switch / Pause control.
+function statusToRunState(s: Job['status']): RunState {
+  if (s === 'done') return 'done';
+  if (s === 'failed') return 'failed';
+  return 'live'; // pending | running
+}
+
+const fmtTokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+
+const EFFORT_TO_PILL: Record<Effort, 'FAST' | 'BALANCED' | 'DEEP' | 'MAX'> = {
+  fast: 'FAST',
+  balanced: 'BALANCED',
+  deep: 'DEEP',
+  max: 'MAX',
+};
+
 export default function SessionTranscript() {
   const navigate = useNavigate();
+  const { id: routeId } = useParams<{ id: string }>();
   const [runState, setRunState] = React.useState<RunState>('live');
   const [cost, setCost] = React.useState(0.42);
-  const [tokens] = React.useState('31.8k');
+  const [tokens, setTokens] = React.useState('31.8k');
   const [elapsed, setElapsed] = React.useState(252); // seconds
   const [atBottom, setAtBottom] = React.useState(true);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [job, setJob] = React.useState<Job | null>(null);
+  const [projectName, setProjectName] = React.useState<string>('Project');
   const scrollRef = React.useRef<HTMLDivElement>(null);
 
   const live = runState === 'live';
 
-  // live tickers
+  // Pick + load the live job: route id if present, else first 'done' (or first) job.
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        let j: Job | null = null;
+        if (routeId) {
+          j = await api.getJob(routeId);
+        } else {
+          const jobs = await api.listJobs();
+          j = jobs.find(x => x.status === 'done') ?? jobs[0] ?? null;
+          if (j) j = await api.getJob(j.id);
+        }
+        if (cancelled || !j) return;
+        setJob(j);
+        setRunState(statusToRunState(j.status));
+        setCost(j.cost);
+        setTokens(fmtTokens(j.tokens));
+        // Derive elapsed from the job's own timestamps (createdAt → updatedAt).
+        setElapsed(Math.max(0, Math.round((j.updatedAt - j.createdAt) / 1000)));
+        try {
+          const p = await api.getProject(j.projectId);
+          if (!cancelled) setProjectName(p.name);
+        } catch {
+          /* keep fallback name */
+        }
+      } catch {
+        /* fail-soft: keep empty initial state, never throw in render */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [routeId]);
+
+  // live tickers — only advance synthetic meters when the job has no settled cost yet
   React.useEffect(() => {
     if (!live) return;
     const t = setInterval(() => {
@@ -720,15 +794,15 @@ export default function SessionTranscript() {
               background: 'var(--fill-secondary)', color: 'var(--ink)', textDecoration: 'none', flexShrink: 0 }}><Icon name="arrowLeft" size={17} /></a>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 7, font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 4 }}>
-                <span>Atlas API</span><Icon name="chevronRight" size={12} style={{ color: 'var(--ink-tertiary)' }} /><span style={{ color: 'var(--ink)', fontWeight: 600 }}>Refactor auth service</span>
+                <span>{projectName}</span><Icon name="chevronRight" size={12} style={{ color: 'var(--ink-tertiary)' }} /><span style={{ color: 'var(--ink)', fontWeight: 600 }}>{job?.title ?? 'Refactor auth service'}</span>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 24, padding: '0 11px', borderRadius: 'var(--r-pill)',
                   background: `color-mix(in srgb, ${statusMap.tint} 15%, transparent)`, color: statusMap.tint, font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                   <span className={statusMap.pulse ? 'breathe' : ''} style={{ width: 7, height: 7, borderRadius: 4, background: statusMap.tint }} /> {statusMap.label}
                 </span>
-                <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>ran at</span>
-                <EffortDial value="DEEP" compact />
+                <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{job?.phase ? job.phase : 'ran at'}</span>
+                <EffortDial value={job ? EFFORT_TO_PILL[job.effort] : 'DEEP'} compact />
               </div>
             </div>
             {/* state switch (demo of run states) */}
@@ -759,7 +833,7 @@ export default function SessionTranscript() {
               )}
               <div ref={scrollRef} onScroll={onScroll} style={{ flex: 1, overflowY: 'auto', padding: '24px 24px 80px' }}>
                 <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
-                  {transcriptBlocks(runState, () => setRunState('done'), () => setRunState('failed'), followStream)}
+                  {transcriptBlocks(runState, () => setRunState('done'), () => setRunState('failed'), followStream, job)}
                 </div>
               </div>
 

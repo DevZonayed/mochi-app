@@ -11,6 +11,7 @@ import { useNavigate } from 'react-router-dom';
 import { Icon, OpenAIGlyph, type IconName } from '../lib/icons';
 import { Spinner } from '../lib/ui';
 import { AppShell } from '../lib/appShell';
+import { api, type Approval, type Project } from '../lib/api';
 
 /* ────────────────────────────────────────────────────────────────────────
    Page-specific CSS (from "Plan Diff Gate.html" <style>), rendered as a
@@ -68,7 +69,7 @@ const PLAN_STEPS: PlanStep[] = [
   { title: 'Open a PR behind the merge gate', detail: 'Summarize the change in plain language, link the issue, and stop at the gate — nothing merges without your approval.' },
 ];
 
-function PlanGate({ editing }: { editing: boolean }) {
+function PlanGate({ editing, subtitle }: { editing: boolean; subtitle?: string }) {
   return (
     <div style={{ maxWidth: 720, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
       {/* plan card */}
@@ -79,7 +80,7 @@ function PlanGate({ editing }: { editing: boolean }) {
           </span>
           <div style={{ flex: 1 }}>
             <h1 style={{ margin: 0, font: '700 var(--fs-title1)/1.1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Plan</h1>
-            <div style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Refactor auth service to short-lived JWTs</div>
+            <div style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{subtitle ?? 'Refactor auth service to short-lived JWTs'}</div>
           </div>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 24, padding: '0 11px', borderRadius: 'var(--r-pill)',
             background: 'color-mix(in srgb, var(--orange) 14%, transparent)', color: 'var(--orange)', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em' }}>
@@ -541,10 +542,35 @@ export default function PlanDiffGate() {
   const [approved, setApproved] = React.useState<null | 'building' | 'merging'>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
 
+  // Live gate under review: the pending 'merge' approval (else first pending),
+  // plus the project it belongs to. Falls back to the static prototype copy
+  // when nothing is loaded yet so the layout renders identically while empty.
+  const [gate, setGate] = React.useState<Approval | null>(null);
+  const [project, setProject] = React.useState<Project | null>(null);
+
+  const loadGate = React.useCallback(async () => {
+    try {
+      const [approvals, projects] = await Promise.all([api.listApprovals('pending'), api.listProjects()]);
+      const picked = approvals.find(a => a.kind === 'merge') ?? approvals[0] ?? null;
+      setGate(picked);
+      const proj = picked ? projects.find(p => p.id === picked.projectId) ?? null : null;
+      setProject(proj);
+    } catch {
+      // fail-soft: keep prototype defaults; never throw in render
+    }
+  }, []);
+
+  React.useEffect(() => { void loadGate(); }, [loadGate]);
+
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   }, []);
+
+  // Derived header copy — live gate values when present, else original strings.
+  const projectName = project?.name ?? 'Atlas API';
+  const gateTitle = gate?.title ?? 'Refactor auth service';
+  const gateSubtitle = gate?.detail ?? gate?.subtitle ?? 'Refactor auth service to short-lived JWTs';
 
   const jumpToLine = (n: number) => { const el = document.querySelector(`[data-line="${n}"]`); if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' }); el && el.classList.add('line-flash'); setTimeout(() => el && el.classList.remove('line-flash'), 1200); };
 
@@ -555,6 +581,24 @@ export default function PlanDiffGate() {
 
   const approve = () => {
     setApproved(mode === 'plan' ? 'building' : 'merging');
+    if (gate) {
+      void (async () => {
+        try { await api.approveApproval(gate.id); await loadGate(); }
+        catch { /* fail-soft: overlay already shown */ }
+      })();
+    }
+  };
+
+  const reject = () => {
+    if (gate) {
+      void (async () => {
+        try { await api.denyApproval(gate.id); }
+        catch { /* fail-soft */ }
+        finally { await loadGate(); setResolved(true); }
+      })();
+    } else {
+      setResolved(true);
+    }
   };
 
   return (
@@ -567,7 +611,7 @@ export default function PlanDiffGate() {
           <button onClick={() => navigate('/job-monitor')} className="ghost-btn" style={{ width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: 'var(--ink)', flexShrink: 0 }}><Icon name="arrowLeft" size={17} /></button>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 7, font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 4 }}>
-              <span>Atlas API</span><Icon name="chevronRight" size={12} style={{ color: 'var(--ink-tertiary)' }} /><span style={{ color: 'var(--ink)', fontWeight: 600 }}>Refactor auth service</span>
+              <span>{projectName}</span><Icon name="chevronRight" size={12} style={{ color: 'var(--ink-tertiary)' }} /><span style={{ color: 'var(--ink)', fontWeight: 600 }}>{gateTitle}</span>
             </div>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 24, padding: '0 11px', borderRadius: 'var(--r-pill)',
               background: 'color-mix(in srgb, var(--orange) 15%, transparent)', color: 'var(--orange)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
@@ -590,14 +634,14 @@ export default function PlanDiffGate() {
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, position: 'relative' }}>
           {mode === 'plan' ? (
             <React.Fragment>
-              <div style={{ flex: 1, overflowY: 'auto', padding: '28px 24px 28px' }}><PlanGate editing={editing} /></div>
+              <div style={{ flex: 1, overflowY: 'auto', padding: '28px 24px 28px' }}><PlanGate editing={editing} subtitle={gateSubtitle} /></div>
               {responding && <RespondField onClose={() => setResponding(false)} />}
               <ActionBar>
                 <PrimaryBtn icon="check" onClick={approve}>Approve &amp; build</PrimaryBtn>
                 <GhostBtn icon="sliders" onClick={() => setEditing(e => !e)}>{editing ? 'Done editing' : 'Edit plan'}</GhostBtn>
                 <GhostBtn icon="command" onClick={() => setResponding(r => !r)}>Respond</GhostBtn>
                 <span style={{ flex: 1 }} />
-                <GhostBtn danger onClick={() => {}}>Reject</GhostBtn>
+                <GhostBtn danger onClick={reject}>Reject</GhostBtn>
               </ActionBar>
             </React.Fragment>
           ) : (
@@ -623,7 +667,7 @@ export default function PlanDiffGate() {
               <ActionBar>
                 <PrimaryBtn icon="gitMerge" onClick={approve}>Approve &amp; merge to PR</PrimaryBtn>
                 <GhostBtn icon="refresh" onClick={requestFixes}>Request fixes</GhostBtn>
-                <GhostBtn danger onClick={() => {}}>Reject</GhostBtn>
+                <GhostBtn danger onClick={reject}>Reject</GhostBtn>
                 <span style={{ flex: 1 }} />
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 30, padding: '0 12px', borderRadius: 'var(--r-pill)',
                   background: 'rgba(52,199,89,0.13)', color: 'var(--green)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>

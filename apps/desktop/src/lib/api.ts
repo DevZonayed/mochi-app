@@ -111,9 +111,12 @@ export class ApiError extends Error {
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  // Only send a JSON content-type when there's actually a body — otherwise
+  // Fastify rejects the empty body (FST_ERR_CTP_EMPTY_JSON_BODY) on bodyless POSTs.
+  const hasBody = init?.body != null;
   const res = await fetch(API_BASE + path, {
     ...init,
-    headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
+    headers: { ...(hasBody ? { 'content-type': 'application/json' } : {}), ...(init?.headers ?? {}) },
   });
   if (!res.ok) {
     let detail = res.statusText;

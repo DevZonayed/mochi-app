@@ -4,8 +4,9 @@
    visual output unchanged. */
 
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Icon, MaestroMark, type IconName } from './icons';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { Icon, MaestroMark } from './icons';
+import { NAV_ROUTES, ALL_NAV } from './routes';
 
 export const APP_W = 1320, APP_H = 860;
 
@@ -27,27 +28,6 @@ export function useTheme(initial: Theme = 'light'): [Theme, React.Dispatch<React
 }
 
 export const WORKSPACE = 'Atlas Studio';
-
-export interface NavItem {
-  key: string;
-  icon: IconName;
-  label: string;
-  badge?: number;
-}
-
-export const NAV: NavItem[] = [
-  { key: 'home', icon: 'home', label: 'Home' },
-  { key: 'projects', icon: 'layers', label: 'Projects' },
-  { key: 'jobs', icon: 'jobs', label: 'Jobs' },
-  { key: 'approvals', icon: 'shield', label: 'Approvals', badge: 3 },
-  { key: 'scheduler', icon: 'calendar', label: 'Scheduler' },
-  { key: 'skills', icon: 'spark', label: 'Skills' },
-  { key: 'templates', icon: 'sliders', label: 'Templates' },
-  { key: 'trends', icon: 'telescope', label: 'Trends' },
-  { key: 'studio', icon: 'clapper', label: 'Studio' },
-  { key: 'publishing', icon: 'send', label: 'Publishing' },
-  { key: 'budget', icon: 'gauge', label: 'Budget' },
-];
 
 export function TrafficLights() {
   return (
@@ -87,7 +67,7 @@ export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
 
       {/* nav */}
       <nav style={{ flex: 1, overflow: 'auto', padding: '6px 10px', display: 'flex', flexDirection: 'column', gap: 1 }}>
-        {NAV.map(n => {
+        {NAV_ROUTES.map(n => {
           const on = active === n.key;
           return (
             <button key={n.key} onClick={() => onNav && onNav(n.key)} style={{
@@ -214,13 +194,19 @@ export interface AppShellProps {
 }
 
 /* Full desktop chrome: scaled macOS window + frosted sidebar + toolbar wrapper.
-   Replaces the prototype's location.href navTo with react-router: clicking a
-   nav item routes to "/" + key via useNavigate(). */
+   Sidebar navigation is driven by the shared route registry (routes.ts) so the
+   nav keys always resolve to real routes, and the active item is derived from
+   the current location — this is the fix for the original dead-nav bug. */
 export function AppShell({ active, children, onSearch, budget, right, initialTheme = 'light', onWorkspace }: AppShellProps) {
   const scale = useAppScale();
   const [theme, setTheme] = useTheme(initialTheme);
   const navigate = useNavigate();
-  const onNav = (key: string) => navigate('/' + key);
+  const location = useLocation();
+  const routeKey = ALL_NAV.find(r => location.pathname === r.path || location.pathname.startsWith(r.path + '/'))?.key;
+  const onNav = (key: string) => {
+    const r = ALL_NAV.find(x => x.key === key);
+    navigate(r ? r.path : '/' + key);
+  };
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
       <div style={{
@@ -231,7 +217,7 @@ export function AppShell({ active, children, onSearch, budget, right, initialThe
       }}>
         <div className="app-wallpaper" aria-hidden="true" />
         <TrafficLights />
-        <Sidebar active={active} onNav={onNav} onWorkspace={onWorkspace} />
+        <Sidebar active={active ?? routeKey} onNav={onNav} onWorkspace={onWorkspace} />
         <div style={{ flex: 1, minWidth: 0, height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', zIndex: 1 }}>
           <Toolbar onSearch={onSearch} budget={budget} theme={theme} setTheme={setTheme} right={right} />
           <main style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>

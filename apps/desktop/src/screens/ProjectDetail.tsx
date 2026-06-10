@@ -6,7 +6,7 @@
    preserved exactly. Cross-page navigation uses react-router. */
 
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import {
   GroupedList,
@@ -18,6 +18,7 @@ import {
   type EffortStop,
 } from '../lib/ui';
 import { AppShell, WORKSPACE } from '../lib/appShell';
+import { api, type Project, type Job, type Effort } from '../lib/api';
 
 /* ───────────────── page-specific CSS (from Project Detail.html <style>) ───────────────── */
 const PAGE_CSS = `
@@ -227,16 +228,47 @@ interface ProjectJob {
   duration: string;
 }
 
-const PROJECT_JOBS: ProjectJob[] = [
-  { id: 'j1', trigger: 'hand',    name: 'Refactor auth service',         shape: 'pbr',      status: 'running',   cost: '0.42', started: '4 min ago',  duration: '4:21' },
-  { id: 'j2', trigger: 'clock',   name: 'Nightly test suite',            shape: 'pipeline', status: 'scheduled', cost: '—',    started: '18:00',       duration: '~8 min' },
-  { id: 'j3', trigger: 'hand',    name: 'Merge PR #482 — auth refactor', shape: 'single',   status: 'gated',     cost: '0.31', started: '9 min ago',  duration: '2:02' },
-  { id: 'j4', trigger: 'webhook', name: 'Add rate-limiter tests',        shape: 'fanout',   status: 'running',   cost: '0.21', started: '3 min ago',  duration: '2:55' },
-  { id: 'j5', trigger: 'chat',    name: 'Explain DSC fallback path',     shape: 'single',   status: 'done',      cost: '0.04', started: '1 hr ago',   duration: '0:38' },
-  { id: 'j6', trigger: 'clock',   name: 'Dependency audit',              shape: 'pipeline', status: 'done',      cost: '0.12', started: '6 hr ago',   duration: '3:11' },
-  { id: 'j7', trigger: 'hand',    name: 'Generate OG images',            shape: 'fanout',   status: 'done',      cost: '0.34', started: 'Yesterday',  duration: '5:40' },
-  { id: 'j8', trigger: 'webhook', name: 'Deploy preview',                shape: 'single',   status: 'failed',    cost: '0.02', started: 'Yesterday',  duration: '0:12' },
-];
+/* ── live-data adapters: map api.Job → the ProjectJob shape the render expects ── */
+const EFFORT_TO_API: Record<EffortStop, Effort> = { FAST: 'fast', BALANCED: 'balanced', DEEP: 'deep', MAX: 'max' };
+
+const API_STATUS_TO_LOCAL: Record<Job['status'], JobStatus> = {
+  pending: 'scheduled',
+  running: 'running',
+  done: 'done',
+  failed: 'failed',
+};
+
+function relativeTime(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 0) return 'just now';
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr} hr ago`;
+  const day = Math.floor(hr / 24);
+  return day === 1 ? 'Yesterday' : `${day} days ago`;
+}
+
+function jobDuration(j: Job): string {
+  const totalSec = Math.max(0, Math.floor((j.updatedAt - j.createdAt) / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function toProjectJob(j: Job): ProjectJob {
+  return {
+    id: j.id,
+    trigger: 'hand',
+    name: j.title || j.input || 'Untitled job',
+    shape: 'single',
+    status: API_STATUS_TO_LOCAL[j.status],
+    cost: j.cost > 0 ? j.cost.toFixed(2) : '—',
+    started: relativeTime(j.createdAt),
+    duration: j.status === 'pending' ? '—' : jobDuration(j),
+  };
+}
 
 const JOB_FILTERS: { key: string; label: string }[] = [
   { key: 'all', label: 'All' },
@@ -246,10 +278,10 @@ const JOB_FILTERS: { key: string; label: string }[] = [
   { key: 'failed', label: 'Failed' },
 ];
 
-function JobsTab() {
+function JobsTab({ jobs }: { jobs: ProjectJob[] }) {
   const [filter, setFilter] = React.useState('all');
-  const rows = PROJECT_JOBS.filter(j => filter === 'all' || j.status === filter);
-  const count = (k: string) => k === 'all' ? PROJECT_JOBS.length : PROJECT_JOBS.filter(j => j.status === k).length;
+  const rows = jobs.filter(j => filter === 'all' || j.status === filter);
+  const count = (k: string) => k === 'all' ? jobs.length : jobs.filter(j => j.status === k).length;
 
   return (
     <div>
@@ -312,12 +344,28 @@ const AUTONOMY: AutonomyMode[] = [
   { key: 'unatt',  label: 'Unattended', hint: 'Runs end-to-end. Only hard guardrails can stop it.' },
 ];
 
-function GoalComposer() {
+function GoalComposer({ projectId, onRun }: { projectId: string | null; onRun: () => void }) {
   const [goal, setGoal] = React.useState('');
   const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
   const [autonomy, setAutonomy] = React.useState('gated');
+  const [running, setRunning] = React.useState(false);
   const est = EFFORT_EST[effort];
   const ai = AUTONOMY.findIndex(a => a.key === autonomy);
+
+  const run = async () => {
+    const text = goal.trim();
+    if (!text || !projectId || running) return;
+    setRunning(true);
+    try {
+      await api.createAndRunJob({ projectId, input: text || 'New job', effort: EFFORT_TO_API[effort] });
+      setGoal('');
+      onRun();
+    } catch {
+      /* fail soft */
+    } finally {
+      setRunning(false);
+    }
+  };
 
   return (
     <div className="composer" style={{
@@ -334,7 +382,7 @@ function GoalComposer() {
             font: '400 var(--fs-title2)/1.4 var(--font-text)', color: 'var(--ink)', letterSpacing: '-0.01em',
             minHeight: 62, paddingTop: 4,
           }} />
-        <button className="send-btn" disabled={!goal.trim()} style={{
+        <button className="send-btn" onClick={run} disabled={!goal.trim() || running} style={{
           width: 44, height: 44, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
           background: goal.trim() ? 'var(--blue)' : 'var(--fill-secondary)',
           color: goal.trim() ? '#fff' : 'var(--ink-tertiary)',
@@ -725,7 +773,7 @@ const TABS: { key: string; label: string }[] = [
   { key: 'settings', label: 'Settings' },
 ];
 
-function Breadcrumb() {
+function Breadcrumb({ name }: { name: string }) {
   const navigate = useNavigate();
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10, font: '500 var(--fs-subhead)/1 var(--font-text)' }}>
@@ -733,7 +781,7 @@ function Breadcrumb() {
       <Icon name="chevronRight" size={14} style={{ color: 'var(--ink-tertiary)' }} />
       <a onClick={() => navigate('/projects')} className="crumb" style={{ color: 'var(--ink-secondary)', textDecoration: 'none', cursor: 'pointer' }}>Projects</a>
       <Icon name="chevronRight" size={14} style={{ color: 'var(--ink-tertiary)' }} />
-      <span style={{ color: 'var(--ink)', fontWeight: 600 }}>Atlas API</span>
+      <span style={{ color: 'var(--ink)', fontWeight: 600 }}>{name}</span>
     </div>
   );
 }
@@ -761,9 +809,58 @@ function GateBanner({ gate, onApprove, onDismiss }: { gate: boolean; onApprove: 
 }
 
 export default function ProjectDetail() {
+  const { id: routeId } = useParams<{ id: string }>();
   const [tab, setTab] = React.useState('overview');
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const [gate, setGate] = React.useState(false);
+
+  // live data
+  const [projectId, setProjectId] = React.useState<string | null>(routeId ?? null);
+  const [project, setProject] = React.useState<Project | null>(null);
+  const [jobs, setJobs] = React.useState<Job[]>([]);
+
+  // Resolve the project id: route param wins, else first project in the workspace.
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (routeId) { if (!cancelled) setProjectId(routeId); return; }
+      try {
+        const projects = await api.listProjects();
+        if (!cancelled && projects[0]) setProjectId(projects[0].id);
+      } catch { /* fail soft */ }
+    })();
+    return () => { cancelled = true; };
+  }, [routeId]);
+
+  const refetchJobs = React.useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const next = await api.listJobs(projectId);
+      setJobs(next);
+    } catch { /* fail soft */ }
+  }, [projectId]);
+
+  // Load project header + jobs when the id resolves.
+  React.useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const [p, js] = await Promise.all([api.getProject(projectId), api.listJobs(projectId)]);
+        if (cancelled) return;
+        setProject(p);
+        setJobs(js);
+      } catch { /* fail soft — render empty */ }
+    })();
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  // LIVE: refetch this project's jobs on any job update.
+  React.useEffect(() => {
+    if (!projectId) return;
+    const unsub = api.subscribe({ onJob: () => { void refetchJobs(); } });
+    return unsub;
+  }, [projectId, refetchJobs]);
 
   // ⌘K + g
   React.useEffect(() => {
@@ -776,24 +873,29 @@ export default function ProjectDetail() {
 
   const tabIdx = TABS.findIndex(t => t.key === tab);
 
+  const projectJobs = jobs.map(toProjectJob);
+  const projectName = project?.name ?? 'Project';
+  const projectColor = project?.color ? `var(--${project.color})` : 'var(--blue)';
+  const runningCount = jobs.filter(j => j.status === 'running').length;
+
   return (
     <AppShell active="projects" onSearch={() => setPaletteOpen(true)} budget={{ spent: 22.90, cap: 50, animateKey: 0 }}>
       <style>{PAGE_CSS}</style>
 
       {/* header block */}
       <div style={{ padding: '24px 28px 0' }}>
-        <Breadcrumb />
+        <Breadcrumb name={projectName} />
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16 }}>
           <span style={{ width: 52, height: 52, borderRadius: 15, flexShrink: 0, display: 'grid', placeItems: 'center',
-            background: 'color-mix(in srgb, var(--blue) 15%, transparent)', color: 'var(--blue)' }}>
+            background: `color-mix(in srgb, ${projectColor} 15%, transparent)`, color: projectColor }}>
             <Icon name="terminal" size={28} />
           </span>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Atlas API</h1>
+              <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>{projectName}</h1>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)',
                 background: 'rgba(52,199,89,0.16)', color: 'var(--green)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-                <span className="breathe" style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--green)' }} /> Active · 2 running
+                <span className="breathe" style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--green)' }} /> Active · {runningCount} running
               </span>
             </div>
             <div style={{ font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 7 }}>Code · 4 sub-projects · TypeScript, Fastify, Postgres</div>
@@ -833,12 +935,12 @@ export default function ProjectDetail() {
         {tab === 'overview' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 26 }}>
             <GateBanner gate={gate} onApprove={() => setGate(false)} onDismiss={() => setGate(false)} />
-            <GoalComposer />
+            <GoalComposer projectId={projectId} onRun={() => { void refetchJobs(); }} />
             <SubProjects />
-            <RecentJobs jobs={PROJECT_JOBS.slice(0, 5)} />
+            <RecentJobs jobs={projectJobs.slice(0, 5)} />
           </div>
         )}
-        {tab === 'jobs' && <JobsTab />}
+        {tab === 'jobs' && <JobsTab jobs={projectJobs} />}
         {tab === 'instructions' && <InstructionsTab />}
         {tab === 'skills' && <SkillsTab />}
         {tab === 'budget' && <BudgetTab />}

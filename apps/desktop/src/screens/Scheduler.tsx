@@ -12,6 +12,7 @@ import React from 'react';
 import { Icon, type IconName } from '../lib/icons';
 import { Switch } from '../lib/ui';
 import { AppShell } from '../lib/appShell';
+import { api, type Schedule, type Project } from '../lib/api';
 
 // page-specific CSS lifted from Scheduler.html <style> (hover/animation hooks)
 const SCHEDULER_CSS = `
@@ -200,17 +201,6 @@ interface SchedRow {
   blocked?: boolean;
 }
 
-const SCHED_ROWS: SchedRow[] = [
-  { id: 's1', proj: 'atlas',   name: 'Dependency audit',  cron: 'Every day at 06:00',          next: '15h 23m', conc: 1, misfire: 'Coalesce', paused: false },
-  { id: 's2', proj: 'atlas',   name: 'Nightly tests',     cron: 'Every day at 18:00',          next: '3h 23m',  conc: 1, misfire: 'Fire now', paused: false },
-  { id: 's3', proj: 'content', name: 'Weekly report',     cron: 'Every Monday at 08:00',       next: '4d 17h',  conc: 1, misfire: 'Skip', paused: false },
-  { id: 's4', proj: 'content', name: 'Newsletter draft',  cron: 'Mon, Wed, Fri at 16:30',      next: '1h 53m',  conc: 1, misfire: 'Fire now', paused: false },
-  { id: 's5', proj: 'scan',    name: 'Market open scan',  cron: 'Weekdays at 09:30',           next: '18h 53m', conc: 2, misfire: 'Fire now', paused: false, blocked: true },
-  { id: 's6', proj: 'scan',    name: 'Competitor digest', cron: 'Every day at 14:00',          next: 'in 7m',   conc: 1, misfire: 'Skip', paused: true },
-  { id: 's7', proj: 'brand',   name: 'Asset backup',      cron: 'Every day at 21:00',          next: '6h 23m',  conc: 1, misfire: 'Coalesce', paused: false },
-  { id: 's8', proj: 'infra',   name: 'CI hardening',      cron: 'Tue & Thu at 11:00',          next: '21h 23m', conc: 3, misfire: 'Skip', paused: false },
-];
-
 function MisfireChip({ policy }: { policy: string }) {
   const tint = ({ 'Fire now': 'var(--blue)', 'Skip': 'var(--ink-secondary)', 'Coalesce': 'var(--teal)' } as Record<string, string>)[policy];
   return (
@@ -221,11 +211,12 @@ function MisfireChip({ policy }: { policy: string }) {
   );
 }
 
-interface ScheduleRowProps { s: SchedRow; last: boolean; onPick: (s: SchedRow) => void }
+interface ScheduleRowProps { s: SchedRow; last: boolean; onPick: (s: SchedRow) => void; projMeta: ProjMeta; onToggle: (id: string, nextEnabled: boolean) => void }
 
-function ScheduleRow({ s, last, onPick }: ScheduleRowProps) {
+function ScheduleRow({ s, last, onPick, projMeta, onToggle }: ScheduleRowProps) {
   const [paused, setPaused] = React.useState(s.paused);
-  const p = SCHED_PROJ[s.proj];
+  React.useEffect(() => { setPaused(s.paused); }, [s.paused]);
+  const p = projMeta;
   return (
     <div className="sched-row" onClick={() => onPick(s)} style={{ display: 'grid', gridTemplateColumns: '1.7fr 1.5fr 1fr 0.9fr 1.1fr 60px', alignItems: 'center', gap: 14,
       padding: '13px 16px', borderBottom: last ? 'none' : '0.5px solid var(--separator)', cursor: 'pointer', opacity: paused ? 0.6 : 1, transition: 'opacity 200ms ease' }}>
@@ -244,19 +235,22 @@ function ScheduleRow({ s, last, onPick }: ScheduleRowProps) {
       </span>
       <span><MisfireChip policy={s.misfire} /></span>
       <span style={{ display: 'flex', justifyContent: 'flex-end' }} onClick={e => e.stopPropagation()}>
-        <Switch on={!paused} onChange={v => setPaused(!v)} />
+        <Switch on={!paused} onChange={v => { setPaused(!v); onToggle(s.id, v); }} />
       </span>
     </div>
   );
 }
 
-function ListView({ onPick }: { onPick: (s: SchedRow) => void }) {
+interface ListViewProps { onPick: (s: SchedRow) => void; rows: SchedRow[]; projMeta: Record<string, ProjMeta>; onToggle: (id: string, nextEnabled: boolean) => void }
+
+function ListView({ onPick, rows: allRows, projMeta, onToggle }: ListViewProps) {
+  const fallbackMeta: ProjMeta = { name: 'Workspace', color: 'var(--ink-tertiary)' };
   const byProj: Record<string, SchedRow[]> = {};
-  SCHED_ROWS.forEach(s => { (byProj[s.proj] = byProj[s.proj] || []).push(s); });
+  allRows.forEach(s => { (byProj[s.proj] = byProj[s.proj] || []).push(s); });
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
       {Object.entries(byProj).map(([proj, rows]) => {
-        const p = SCHED_PROJ[proj];
+        const p = projMeta[proj] ?? fallbackMeta;
         return (
           <div key={proj}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 11, padding: '0 2px' }}>
@@ -266,7 +260,7 @@ function ListView({ onPick }: { onPick: (s: SchedRow) => void }) {
             </div>
             <div style={{ background: 'var(--bg-grouped)', borderRadius: 14, border: '0.5px solid var(--separator)', overflow: 'hidden',
               backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-              {rows.map((s, i) => <ScheduleRow key={s.id} s={s} last={i === rows.length - 1} onPick={onPick} />)}
+              {rows.map((s, i) => <ScheduleRow key={s.id} s={s} last={i === rows.length - 1} onPick={onPick} projMeta={p} onToggle={onToggle} />)}
             </div>
           </div>
         );
@@ -350,7 +344,7 @@ function SheetPick({ icon, label, value, tint, last }: { icon: IconName; label: 
 interface ScheduleSheetProps {
   open: boolean;
   onClose: () => void;
-  onSave: () => void;
+  onSave: (data: { title: string; time: string; cadence: string }) => void;
   initial: SchedEvent | SchedRow | null;
 }
 
@@ -463,7 +457,7 @@ function ScheduleSheet({ open, onClose, onSave }: ScheduleSheetProps) {
             ≈ <b style={{ color: 'var(--ink)', fontWeight: 600 }}>$0.18</b>/run · ≈ <b style={{ color: 'var(--ink)', fontWeight: 600 }}>${monthly}</b>/mo
           </div>
           <button onClick={onClose} style={{ height: 40, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
-          <button onClick={onSave} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Save schedule</button>
+          <button onClick={() => onSave({ title: parsed.summary, time: parsed.time, cadence: parsed.label })} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Save schedule</button>
         </div>
       </div>
     </div>
@@ -590,12 +584,94 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 // Scheduler page root (sc-app)
 // ──────────────────────────────────────────────────────────────────────────
 
+// derive a human cron line from the API's time + cadence fields
+function cronLine(s: Schedule): string {
+  const cad = (s.cadence || '').trim();
+  const time = (s.time || '').trim();
+  if (!cad && !time) return 'On demand';
+  if (!time) return cad;
+  if (!cad || /every\s*day/i.test(cad) || cad === '*') return `Every day at ${time}`;
+  return `${cad} at ${time}`;
+}
+
+// derive a relative "next run" string from the API's nextRun timestamp
+function nextLine(nextRun: number | null): string {
+  if (!nextRun) return '—';
+  const ms = nextRun - Date.now();
+  if (ms <= 0) return 'in 7m';
+  const mins = Math.round(ms / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ${mins % 60}m`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ${hrs % 24}h`;
+}
+
 export default function Scheduler() {
   const [view, setView] = React.useState('calendar');
   const [nowTime, setNowTime] = React.useState(14.62); // 14:37
   const [sheetOpen, setSheetOpen] = React.useState(false);
   const [editing, setEditing] = React.useState<SchedEvent | SchedRow | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [schedules, setSchedules] = React.useState<Schedule[]>([]);
+  const [projects, setProjects] = React.useState<Project[]>([]);
+
+  const loadSchedules = React.useCallback(async () => {
+    try {
+      const list = await api.listSchedules();
+      setSchedules(list);
+    } catch { /* fail soft — leave empty */ }
+  }, []);
+
+  React.useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const [sched, projs] = await Promise.all([api.listSchedules(), api.listProjects()]);
+        if (!alive) return;
+        setSchedules(sched);
+        setProjects(projs);
+      } catch { /* fail soft — leave empty */ }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  // project meta keyed by projectId (color name -> var(--name)); '' = unassigned
+  const projMeta = React.useMemo<Record<string, ProjMeta>>(() => {
+    const m: Record<string, ProjMeta> = {};
+    projects.forEach(p => { m[p.id] = { name: p.name, color: `var(--${p.color})` }; });
+    return m;
+  }, [projects]);
+
+  // adapt live schedules into the existing SchedRow shape the list renders
+  const rows = React.useMemo<SchedRow[]>(() => schedules.map(s => ({
+    id: s.id,
+    proj: s.projectId ?? '',
+    name: s.title,
+    cron: cronLine(s),
+    next: nextLine(s.nextRun),
+    conc: 1,
+    misfire: 'Fire now',
+    paused: !s.enabled,
+  })), [schedules]);
+
+  const onToggle = React.useCallback(async (id: string, nextEnabled: boolean) => {
+    setSchedules(prev => prev.map(s => s.id === id ? { ...s, enabled: nextEnabled } : s));
+    try {
+      await api.toggleSchedule(id, nextEnabled);
+    } catch {
+      // revert on failure
+      setSchedules(prev => prev.map(s => s.id === id ? { ...s, enabled: !nextEnabled } : s));
+    }
+  }, []);
+
+  const onCreateSchedule = React.useCallback(async (data: { title: string; time: string; cadence: string }) => {
+    setSheetOpen(false);
+    try {
+      await api.createSchedule(data);
+      await loadSchedules();
+    } catch { /* fail soft */ }
+  }, [loadSchedules]);
 
   // live now-line
   React.useEffect(() => {
@@ -637,11 +713,11 @@ export default function Scheduler() {
         <div style={{ flex: 1, minHeight: 0, overflowY: view === 'list' ? 'auto' : 'hidden', paddingBottom: view === 'list' ? 28 : 0 }}>
           {view === 'calendar'
             ? <CalendarView nowTime={nowTime} onPick={openEdit} />
-            : <ListView onPick={openEdit} />}
+            : <ListView onPick={openEdit} rows={rows} projMeta={projMeta} onToggle={onToggle} />}
         </div>
       </div>
 
-      <ScheduleSheet open={sheetOpen} onClose={() => setSheetOpen(false)} onSave={() => setSheetOpen(false)} initial={editing} />
+      <ScheduleSheet open={sheetOpen} onClose={() => setSheetOpen(false)} onSave={onCreateSchedule} initial={editing} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>
   );

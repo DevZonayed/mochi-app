@@ -14,6 +14,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, TrafficLights, Sidebar, Toolbar,
 } from '../lib/appShell';
 import { Icon, OpenAIGlyph, type IconName } from '../lib/icons';
+import { api, type Approval, type ApprovalKind, type Project } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from Approvals Center.html) ───────────────────────── */
 const styles = `
@@ -46,12 +47,11 @@ const styles = `
 
 /* ───────────────────────── data (from ac-queue.jsx) ───────────────────────── */
 interface ProjMeta { name: string; color: string; }
+/* Project metadata is resolved live (see page root). Live entries are keyed by
+   project id and merged in at runtime; '_none' is the fallback for approvals
+   with no associated project. Render code reads AC_PROJ[g.proj] unchanged. */
 const AC_PROJ: Record<string, ProjMeta> = {
-  atlas:   { name: 'Atlas API',     color: 'var(--blue)' },
-  content: { name: 'Q3 Content',    color: 'var(--purple)' },
-  scan:    { name: 'Market Scan',   color: 'var(--indigo)' },
-  brand:   { name: 'Brand Refresh', color: 'var(--teal)' },
-  infra:   { name: 'Infra / CI',    color: 'var(--orange)' },
+  _none: { name: 'Workspace', color: 'var(--ink-secondary)' },
 };
 
 interface GateTypeMeta { icon: IconName; tint: string; label: string; }
@@ -80,7 +80,7 @@ type GateDetailData =
 interface Gate {
   id: string;
   type: keyof typeof GATE_TYPE;
-  proj: keyof typeof AC_PROJ;
+  proj: string;
   urgency: string;
   summary: string;
   age: string;
@@ -89,29 +89,64 @@ interface Gate {
   detail: GateDetailData;
 }
 
-const GATES: Gate[] = [
-  // over budget
-  { id: 'g1', type: 'budget', proj: 'scan', urgency: 'budget', summary: 'Deep run needs $4.10 over the $50 cap', age: '1 min', scheduled: true, unread: true,
-    detail: { need: 4.10, cap: 50, spent: 49.30, run: 'Competitor digest' } },
-  // waiting longest
-  { id: 'g2', type: 'merge', proj: 'atlas', urgency: 'old', summary: 'Merge PR #482 — auth refactor', age: '14 min',
-    detail: { pr: 482, files: 12, add: 840, del: 210, verdict: 'clear', findings: '2 issues → fixed in loop' } },
-  { id: 'g3', type: 'skill', proj: 'brand', urgency: 'old', summary: 'Allow unverified skill: figma-export', age: '13 min',
-    detail: { skill: 'figma-export', ver: '0.3.1', publisher: 'community', caps: [
-      { kind: 'net', label: 'api.figma.com', risk: 'amber' }, { kind: 'net', label: '*.amazonaws.com', risk: 'red' },
-      { kind: 'fs', label: '~/Exports (read-write)', risk: 'amber' }, { kind: 'fs', label: 'project assets (read)', risk: 'grey' } ] } },
-  { id: 'g4', type: 'publish', proj: 'content', urgency: 'old', summary: 'Publish “Launch week” thread to X', age: '9 min',
-    detail: { platform: 'X', caption: 'Maestro is live. One operator, a fleet of agents — projects, schedules, and budgets from one calm place. Here’s what shipped this week ↓', posts: 6, consent: false } },
-  // new
-  { id: 'g5', type: 'plan', proj: 'atlas', urgency: 'new', unread: true, summary: 'Approve plan — add rate-limiter tests', age: '1 min',
-    detail: { title: 'Add rate-limiter tests', effort: 'BALANCED', cost: '0.30', mins: '4', steps: ['Generate fixtures for the 429 path', 'Mock the Redis token bucket', 'Assert the Retry-After header', 'Wire into the CI matrix'] } },
-  { id: 'g6', type: 'send', proj: 'content', urgency: 'new', unread: true, summary: 'Send newsletter to 3,210 subscribers', age: '2 min',
-    detail: { channel: 'Email · Resend', recipients: '3,210', subject: 'What shipped in Maestro this week', consent: true } },
-  { id: 'g7', type: 'publish', proj: 'brand', urgency: 'new', summary: 'Publish icon set to Dribbble', age: '4 min',
-    detail: { platform: 'Dribbble', caption: 'Fresh system icons — 48 glyphs, 3 weights, exported @3x.', posts: 1, consent: false } },
-  { id: 'g8', type: 'plan', proj: 'infra', urgency: 'new', summary: 'Approve plan — dependency upgrade', age: '6 min',
-    detail: { title: 'Upgrade dependencies (minor)', effort: 'FAST', cost: '0.12', mins: '2', steps: ['Bump 14 minor versions', 'Run the full test suite', 'Open a PR if green'] } },
-];
+/* Map a live Approval.kind to one of the screen's gate types (which drive the
+   icon, tint, label and detail renderer). 'deploy'→publish, 'review'→merge. */
+const KIND_TO_TYPE: Record<ApprovalKind, keyof typeof GATE_TYPE> = {
+  merge:   'merge',
+  budget:  'budget',
+  publish: 'publish',
+  deploy:  'publish',
+  review:  'merge',
+};
+
+/* Human "age" string from a created-at epoch (ms). */
+function ageLabel(createdAt: number): string {
+  const secs = Math.max(0, Math.floor((Date.now() - createdAt) / 1000));
+  if (secs < 60) return `${secs || 1} sec`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins} min`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hr`;
+  return `${Math.floor(hrs / 24)} d`;
+}
+
+/* Build the type-specific detail object the matching renderer expects, from the
+   approval's free-text fields. Each renderer reads only the fields below. */
+function buildDetail(type: keyof typeof GATE_TYPE, a: Approval): GateDetailData {
+  const text = a.detail || a.subtitle || '';
+  switch (type) {
+    case 'budget':
+      return { need: 0, cap: 0, spent: 0, run: a.title } as BudgetDetailData;
+    case 'merge':
+      return { pr: 0, files: 0, add: 0, del: 0, verdict: 'clear', findings: text } as MergeDetailData;
+    case 'skill':
+      return { skill: a.title, ver: '—', publisher: a.subtitle || '—', caps: [] } as SkillDetailData;
+    case 'publish':
+      return { platform: a.subtitle || 'Publish', caption: text, posts: 1, consent: false } as PublishDetailData;
+    case 'send':
+      return { channel: a.subtitle || 'Send', recipients: '—', subject: a.title, consent: false } as SendDetailData;
+    case 'plan':
+    default:
+      return { title: a.title, effort: '—', cost: '—', mins: '—', steps: text ? [text] : [] } as PlanDetailData;
+  }
+}
+
+/* Adapt a pending Approval into the Gate shape the render code consumes. */
+function approvalToGate(a: Approval): Gate {
+  const type = KIND_TO_TYPE[a.kind] ?? 'plan';
+  const proj = a.projectId && AC_PROJ[a.projectId] ? a.projectId : '_none';
+  const ageMins = Math.floor((Date.now() - a.createdAt) / 60000);
+  const urgency = type === 'budget' ? 'budget' : ageMins >= 10 ? 'old' : 'new';
+  return {
+    id: a.id,
+    type,
+    proj,
+    urgency,
+    summary: a.title,
+    age: ageLabel(a.createdAt),
+    detail: buildDetail(type, a),
+  };
+}
 
 interface UrgencyGroup { key: string; label: string; tint: string; }
 const URGENCY: UrgencyGroup[] = [
@@ -509,12 +544,42 @@ export default function ApprovalsCenter() {
   const navigate = useNavigate();
   const onNav = (key: string) => navigate('/' + key);
 
-  const [gates, setGates] = React.useState<Gate[]>(GATES);
-  const [activeId, setActiveId] = React.useState<string | null>(GATES[0].id);
+  const [gates, setGates] = React.useState<Gate[]>([]);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
   const [confirm, setConfirm] = React.useState(false);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
 
   const active = gates.find(g => g.id === activeId);
+
+  /* Merge live projects into AC_PROJ once so the render's AC_PROJ[g.proj]
+     lookup resolves names/colors. Idempotent. */
+  const mergeProjects = React.useCallback((projects: Project[]) => {
+    for (const p of projects) AC_PROJ[p.id] = { name: p.name, color: `var(--${p.color})` };
+  }, []);
+
+  /* Fetch the pending decision queue (and projects for labels) and rebuild the
+     gate list. Fails soft to an empty queue. Keeps the active selection if it
+     still exists, otherwise selects the first gate. */
+  const refetch = React.useCallback(async () => {
+    try {
+      const [projects, approvals] = await Promise.all([
+        api.listProjects(),
+        api.listApprovals('pending'),
+      ]);
+      mergeProjects(projects);
+      const next = approvals.map(approvalToGate);
+      setGates(next);
+      setActiveId(prev => (prev && next.some(g => g.id === prev) ? prev : (next[0]?.id ?? null)));
+    } catch {
+      /* fail soft — leave the queue as-is */
+    }
+  }, [mergeProjects]);
+
+  React.useEffect(() => {
+    void refetch();
+    const unsubscribe = api.subscribe({ onApproval: () => { void refetch(); } });
+    return unsubscribe;
+  }, [refetch]);
 
   const advance = (id: string) => {
     const idx = gates.findIndex(g => g.id === id);
@@ -523,21 +588,25 @@ export default function ApprovalsCenter() {
     setActiveId(next ? next.id : null);
   };
 
-  const decide = (id: string) => {
+  /* Optimistically advance off the resolved gate, then call the mutator and
+     refetch so the UI reflects the server's authoritative queue. */
+  const resolve = (id: string, action: (id: string) => Promise<Approval>) => {
     advance(id);
+    action(id).catch(() => { /* ignore */ }).finally(() => { void refetch(); });
   };
 
   const approve = () => {
     if (!active) return;
     if (active.type === 'budget') { setConfirm(true); return; }
-    decide(active.id);
+    resolve(active.id, (id) => api.approveApproval(id));
   };
-  const confirmRaise = () => { setConfirm(false); if (active) decide(active.id); };
+  const reject = (id: string) => { resolve(id, (i) => api.denyApproval(i)); };
+  const confirmRaise = () => { setConfirm(false); if (active) resolve(active.id, (id) => api.approveApproval(id)); };
 
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); approve(); }
-      else if ((e.metaKey || e.ctrlKey) && (e.key === 'Backspace' || e.key === 'Delete')) { e.preventDefault(); if (active) decide(active.id); }
+      else if ((e.metaKey || e.ctrlKey) && (e.key === 'Backspace' || e.key === 'Delete')) { e.preventDefault(); if (active) reject(active.id); }
       else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); }
     };
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
@@ -582,7 +651,7 @@ export default function ApprovalsCenter() {
                       <Icon name="command" size={16} /> Respond
                     </button>
                     <span style={{ flex: 1 }} />
-                    <button onClick={() => active && decide(active.id)} className="reject-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, height: 42, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>
+                    <button onClick={() => active && reject(active.id)} className="reject-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, height: 42, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>
                       Reject <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: 18, height: 18, padding: '0 4px', borderRadius: 5, background: 'rgba(255,59,48,0.14)', font: '600 var(--fs-caption)/1 var(--font-mono)' }}>⌘⌫</span>
                     </button>
                   </div>

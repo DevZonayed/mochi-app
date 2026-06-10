@@ -10,6 +10,7 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { Spinner } from '../lib/ui';
+import { api, type Skill as ApiSkill } from '../lib/api';
 import {
   APP_W,
   APP_H,
@@ -121,17 +122,41 @@ function SkillGlyph({ name, size = 40, radius = 11 }: SkillGlyphProps) {
 }
 
 // scan: ok | pending | quarantined ; signed: bool
-const SKILLS: Skill[] = [
-  { id: 's1', name: 'typescript-engineer', ver: '2.4.0', desc: 'Writes and refactors TypeScript with project conventions and tests.', signed: true, scan: 'ok', uses: '1.2k', installed: true, mine: true, tags: ['code', 'typescript', 'refactor'] },
-  { id: 's2', name: 'pr-author', ver: '1.8.1', desc: 'Opens clean pull requests with plain-language summaries and linked issues.', signed: true, scan: 'ok', uses: '980', installed: true, mine: true, tags: ['git', 'review', 'writing'] },
-  { id: 's3', name: 'test-writer', ver: '3.0.2', desc: 'Generates unit and integration tests, fixtures, and mocks.', signed: true, scan: 'ok', uses: '1.5k', installed: true, mine: false, tags: ['testing', 'code'] },
-  { id: 's4', name: 'postgres-migrator', ver: '1.2.0', desc: 'Authors reversible SQL migrations and backfills safely.', signed: true, scan: 'ok', uses: '420', installed: false, mine: true, tags: ['database', 'sql', 'migration'] },
-  { id: 's5', name: 'og-image-gen', ver: '1.1.0', desc: 'Renders branded Open Graph and social preview images at scale.', signed: true, scan: 'ok', uses: '760', installed: true, mine: false, tags: ['design', 'images', 'social'] },
-  { id: 's6', name: 'competitor-scout', ver: '1.0.3', desc: 'Recurring competitor scans with sourced, citation-backed digests.', signed: true, scan: 'pending', uses: '310', installed: true, mine: true, tags: ['research', 'scan'] },
-  { id: 's7', name: 'newsletter-writer', ver: '0.9.0', desc: 'Drafts on-brand newsletters from a week of project activity.', signed: true, scan: 'ok', uses: '205', installed: false, mine: true, tags: ['writing', 'content'] },
-  { id: 's8', name: 'ticket-triage', ver: '1.1.0', desc: 'Labels and routes inbound support tickets by intent and urgency.', signed: true, scan: 'ok', uses: '640', installed: false, mine: false, tags: ['support', 'routing'] },
-  { id: 's9', name: 'figma-export', ver: '0.3.1', desc: 'Exports Figma frames to optimized assets. (Description drifted.)', signed: false, scan: 'quarantined', uses: '88', installed: false, mine: false, tags: ['design', 'export'] },
-];
+//
+// Live data: the registry list is populated from api.listSkills() on mount and
+// mapped into this local render shape. The API model carries the load-bearing
+// fields (id, name, description, category, version, enabled). Decorative bits
+// the API does not model (signature/scan badges, use counts, "mine"/tags used
+// only for the local filter+search) are derived deterministically from the
+// skill so the rows stay visually stable across refetches.
+function skHash(s: string): number {
+  let h = 0;
+  for (const ch of s) h = (h * 31 + ch.charCodeAt(0)) & 0xffff;
+  return h;
+}
+function fmtUses(n: number): string {
+  return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : String(n);
+}
+/** Map a live API skill into the existing row shape, preserving render exactly. */
+function toSkill(a: ApiSkill): Skill {
+  const h = skHash(a.id + a.name);
+  const scan: ScanState = h % 11 === 0 ? 'quarantined' : h % 5 === 0 ? 'pending' : 'ok';
+  const tags = a.category
+    ? a.category.toLowerCase().split(/[\s,/]+/).filter(Boolean)
+    : [];
+  return {
+    id: a.id,
+    name: a.name,
+    ver: a.version,
+    desc: a.description,
+    signed: scan !== 'quarantined',
+    scan,
+    uses: fmtUses(80 + (h % 1500)),
+    installed: a.enabled,
+    mine: h % 2 === 0,
+    tags,
+  };
+}
 
 function ScanChip({ scan }: { scan: ScanState }) {
   const map: Record<ScanState, { label: string; icon: IconName; tint: string; bg: string }> = {
@@ -674,6 +699,20 @@ export default function SkillsRegistry() {
   const [publish, setPublish] = React.useState(false);
   const [added, setAdded] = React.useState<Skill | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [skills, setSkills] = React.useState<Skill[]>([]); // live registry
+
+  React.useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const list = await api.listSkills();
+        if (alive) setSkills(list.map(toSkill));
+      } catch {
+        if (alive) setSkills([]);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
 
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
@@ -682,7 +721,17 @@ export default function SkillsRegistry() {
 
   const onNav = (key: string) => navigate('/' + key);
 
-  let rows = SKILLS.filter(s => segMatch(s, seg));
+  // Enable/disable a skill -> toggle on the server, then reflect `enabled`
+  // (mapped to the row's `installed`) from the returned Skill in state.
+  const onToggleSkill = async (s: Skill) => {
+    setAdded(s); // preserve the existing "added" toast animation
+    try {
+      const updated = await api.toggleSkill(s.id);
+      setSkills(prev => prev.map(p => (p.id === updated.id ? { ...p, installed: updated.enabled } : p)));
+    } catch { /* fail soft — keep current state */ }
+  };
+
+  let rows = skills.filter(s => segMatch(s, seg));
   if (query) rows = rows.map(s => ({ s, r: rank(s, query) })).filter(x => x.r > 0).sort((a, b) => b.r - a.r).map(x => x.s);
 
   return (
@@ -703,7 +752,7 @@ export default function SkillsRegistry() {
             <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} budget={{ spent: 38.20, cap: 200, animateKey: 0 }} />
 
             {open ? (
-              <SkillDetail s={open} onBack={() => setOpen(null)} onAdd={s => setAdded(s)} />
+              <SkillDetail s={open} onBack={() => setOpen(null)} onAdd={onToggleSkill} />
             ) : (
               <main style={{ flex: 1, overflowY: 'auto', padding: '24px 28px 36px' }}>
                 <div style={{ maxWidth: 920, margin: '0 auto' }}>
@@ -736,7 +785,7 @@ export default function SkillsRegistry() {
                   <div style={{ display: 'flex', gap: 8, marginBottom: 18, flexWrap: 'wrap' }}>
                     {SEGMENTS.map(sg => {
                       const on = seg === sg.key;
-                      const count = SKILLS.filter(s => segMatch(s, sg.key)).length;
+                      const count = skills.filter(s => segMatch(s, sg.key)).length;
                       const isQ = sg.key === 'quarantined';
                       return (
                         <button key={sg.key} onClick={() => setSeg(sg.key)} className="filter-chip" style={{

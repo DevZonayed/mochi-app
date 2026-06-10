@@ -8,6 +8,14 @@ export function buildServer(repos: Repositories, engine: EngineAdapter): Fastify
   const app = Fastify({ logger: true });
   app.register(cors, { origin: true });
 
+  // Tolerate empty JSON bodies on bodyless POSTs (approve/deny/toggle) instead of
+  // returning FST_ERR_CTP_EMPTY_JSON_BODY when a client sends content-type: application/json.
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+    const s = typeof body === 'string' ? body : '';
+    if (s.trim() === '') { done(null, undefined); return; }
+    try { done(null, JSON.parse(s)); } catch (err) { done(err instanceof Error ? err : new Error('invalid json'), undefined); }
+  });
+
   // ── Server-Sent Events: live job updates ──────────────────────────
   const clients = new Set<ServerResponse>();
   function broadcast(event: string, data: unknown) {

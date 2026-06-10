@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
 import { View, Text, Pressable, ScrollView, Animated, StyleSheet, Modal, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { Card, Group, Row } from '../ui';
+import { api, type Workspace } from '../api';
 
 /* iOS-style toggle switch — animated thumb. */
 function MSwitch({ value, onValueChange }: { value: boolean; onValueChange?: (v: boolean) => void }) {
@@ -225,6 +226,25 @@ export function SettingsScreen() {
   const [notifs, setNotifs] = useState<boolean[]>(NOTIFS.map(([, v]) => v));
   const [faceId, setFaceId] = useState(true);
   const [lockApprove, setLockApprove] = useState(true);
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
+
+  // Live workspace/account info for the connection hero (name + budget cap).
+  useFocusEffect(
+    React.useCallback(() => {
+      let alive = true;
+      api
+        .listWorkspaces()
+        .then((wss) => {
+          if (alive) setWorkspace(wss[0] ?? null);
+        })
+        .catch(() => {
+          if (alive) setWorkspace(null);
+        });
+      return () => {
+        alive = false;
+      };
+    }, []),
+  );
 
   const rowLabel: ViewStyle = { flex: 1 };
   const labelText = { fontSize: 16, color: theme.color.ink } as const;
@@ -244,7 +264,7 @@ export function SettingsScreen() {
               <Icon name="smartphone" size={24} color={theme.color.inkSecondary} />
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={{ fontSize: 17, fontWeight: '600', color: theme.color.ink }}>Jillur's MacBook Pro</Text>
+              <Text style={{ fontSize: 17, fontWeight: '600', color: theme.color.ink }}>{workspace?.name ?? "Jillur's MacBook Pro"}</Text>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 5 }}>
                 <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: theme.color.green }} />
                 <Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.green }}>Connected via relay · E2EE</Text>
