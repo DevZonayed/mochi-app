@@ -1,4 +1,4 @@
-import{R as p,j as e}from"./index-DBrmBso5.js";import{I as d}from"./icons-BjcEVTG7.js";import{A as T}from"./appShell-UAZvKxOb.js";const A=`
+import{R as p,j as e}from"./index-CK6hCZ-D.js";import{I as d}from"./icons-BSHulfzE.js";import{A as T}from"./appShell-DBZ7rqtE.js";const A=`
   .link-btn:hover { text-decoration: underline; }
   .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease, background 140ms ease; }
   .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.4); }

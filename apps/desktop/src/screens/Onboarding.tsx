@@ -634,18 +634,14 @@ export default function Onboarding() {
     <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
       <style>{styles}</style>
       <div style={{
-        width: WIN_W, height: WIN_H, transform: `scale(${scale})`, transformOrigin: 'center',
-        borderRadius: 18, overflow: 'hidden', position: 'relative',
+        width: '100%', height: '100%', overflow: 'hidden', position: 'relative',
         background: 'var(--backdrop-base)',
-        boxShadow: '0 0 0 0.5px rgba(0,0,0,0.18), 0 40px 100px rgba(10,15,40,0.45)',
       }}>
         {/* animated backdrop */}
         <div className="backdrop" aria-hidden="true">
           <span className="blob b1" /><span className="blob b2" /><span className="blob b3" />
           <span className="grain" />
         </div>
-        <TrafficLights />
-
         {/* appearance toggle */}
         <div style={{ position: 'absolute', top: 16, right: 18, zIndex: 30, display: 'flex', gap: 2, padding: 3,
           borderRadius: 'var(--r-pill)', background: 'var(--glass-tint)', border: '0.5px solid var(--glass-border)',

@@ -790,9 +790,7 @@ export default function Templates() {
       <style>{PAGE_CSS}</style>
       <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
         <div style={{
-          width: APP_W, height: APP_H, transform: `scale(${scale})`, transformOrigin: 'center',
-          borderRadius: 16, overflow: 'hidden', position: 'relative', background: 'var(--bg)',
-          boxShadow: '0 0 0 0.5px rgba(0,0,0,0.16), 0 44px 110px rgba(10,15,40,0.42)',
+          width: '100%', height: '100%', overflow: 'hidden', position: 'relative', background: 'var(--bg)',
           display: 'flex',
         }}>
           <div className="app-wallpaper" aria-hidden="true" />

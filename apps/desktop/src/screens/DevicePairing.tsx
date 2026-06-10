@@ -224,9 +224,8 @@ export default function DevicePairing() {
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
       <style>{styles}</style>
-      <div style={{ width: PAIR_W, height: PAIR_H, transform: `scale(${scale})`, transformOrigin: 'center', borderRadius: 18, overflow: 'hidden', position: 'relative', background: 'var(--backdrop-base)', boxShadow: '0 0 0 0.5px rgba(0,0,0,0.18), 0 40px 100px rgba(10,15,40,0.45)' }}>
+      <div style={{ width: '100%', height: '100%', overflow: 'hidden', position: 'relative', background: 'var(--backdrop-base)' }}>
         <div className="backdrop" aria-hidden="true"><span className="blob b1" /><span className="blob b2" /><span className="blob b3" /></div>
-        <div style={{ display: 'flex', gap: 8, position: 'absolute', top: 18, left: 20, zIndex: 30 }}>{['#ff5f57', '#febc2e', '#28c840'].map(c => <span key={c} style={{ width: 12, height: 12, borderRadius: '50%', background: c }} />)}</div>
 
         {/* demo state switch */}
         <div style={{ position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)', zIndex: 30, display: 'inline-flex', padding: 3, borderRadius: 'var(--r-pill)', background: 'var(--glass-tint)', border: '0.5px solid var(--glass-border)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>

@@ -30,13 +30,9 @@ export function useTheme(initial: Theme = 'light'): [Theme, React.Dispatch<React
 export const WORKSPACE = 'Atlas Studio';
 
 export function TrafficLights() {
-  return (
-    <div style={{ display: 'flex', gap: 8, position: 'absolute', top: 19, left: 20, zIndex: 50 }}>
-      {['#ff5f57', '#febc2e', '#28c840'].map(c => (
-        <span key={c} style={{ width: 12, height: 12, borderRadius: '50%', background: c, border: '0.5px solid rgba(0,0,0,0.13)' }} />
-      ))}
-    </div>
-  );
+  // The native macOS window supplies the real traffic lights (titleBarStyle:
+  // hiddenInset). The app now fills the window, so no fake chrome is drawn.
+  return null;
 }
 
 export interface SidebarProps {
@@ -210,9 +206,7 @@ export function AppShell({ active, children, onSearch, budget, right, initialThe
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
       <div style={{
-        width: APP_W, height: APP_H, transform: `scale(${scale})`, transformOrigin: 'center',
-        borderRadius: 16, overflow: 'hidden', position: 'relative', background: 'var(--bg)',
-        boxShadow: '0 0 0 0.5px rgba(0,0,0,0.16), 0 44px 110px rgba(10,15,40,0.42)',
+        width: '100%', height: '100%', overflow: 'hidden', position: 'relative', background: 'var(--bg)',
         display: 'flex',
       }}>
         <div className="app-wallpaper" aria-hidden="true" />
