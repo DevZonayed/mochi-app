@@ -1,4 +1,4 @@
-import{R as c,j as e}from"./index-CK6hCZ-D.js";import{A as S}from"./appShell-DBZ7rqtE.js";import{I as p}from"./icons-BSHulfzE.js";import{G as R,R as y,c as I}from"./ui-DY0leG2n.js";import{a as B}from"./api-TzPuOslc.js";const C=`
+import{R as c,j as e}from"./index-DOPFM81N.js";import{A as S}from"./appShell-RjRBWUz7.js";import{I as p}from"./icons-BiM4_yI8.js";import{G as R,R as y,c as I}from"./ui-RQoc6Glv.js";import{a as B}from"./api-TzPuOslc.js";const C=`
   @keyframes spin { to { transform: rotate(360deg); } }
   .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease, background 140ms ease; }
   .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.4); }

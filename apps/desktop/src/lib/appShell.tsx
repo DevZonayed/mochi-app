@@ -43,7 +43,7 @@ export interface SidebarProps {
 
 export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
   return (
-    <aside style={{
+    <aside className="win-drag" style={{
       width: 260, flexShrink: 0, height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', zIndex: 2,
       background: 'var(--bg-grouped)', backdropFilter: 'blur(40px) saturate(180%)', WebkitBackdropFilter: 'blur(40px) saturate(180%)',
       borderRight: '0.5px solid var(--separator)',
@@ -134,7 +134,7 @@ export interface ToolbarProps {
 
 export function Toolbar({ onSearch, budget, theme, setTheme, right }: ToolbarProps) {
   return (
-    <header style={{
+    <header className="win-drag" style={{
       height: 56, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 14, padding: '0 16px 0 18px',
       background: 'var(--bg-grouped)', backdropFilter: 'blur(40px) saturate(180%)', WebkitBackdropFilter: 'blur(40px) saturate(180%)',
       borderBottom: '0.5px solid var(--separator)', position: 'relative', zIndex: 20,

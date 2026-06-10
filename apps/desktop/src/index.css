@@ -11,3 +11,21 @@ body {
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
 }
+
+/* Native window dragging (Electron). The sidebar + toolbar act as the title bar
+   and drag the window; interactive elements opt back out so they stay clickable.
+   These properties are ignored in a normal browser. */
+.win-drag {
+  -webkit-app-region: drag;
+}
+button,
+input,
+textarea,
+select,
+a,
+label,
+[role='button'],
+[contenteditable],
+.win-no-drag {
+  -webkit-app-region: no-drag;
+}

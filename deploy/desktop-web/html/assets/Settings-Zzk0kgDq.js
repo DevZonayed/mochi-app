@@ -1,4 +1,4 @@
-import{R as l,u as I,j as e}from"./index-CK6hCZ-D.js";import{I as y}from"./icons-BSHulfzE.js";import{G as v,R as c,E as T,M as z,c as L}from"./ui-DY0leG2n.js";import{u as W,a as M,T as O,S as N,b as F}from"./appShell-DBZ7rqtE.js";import{a as R,A as B}from"./api-TzPuOslc.js";const U=`
+import{R as l,u as I,j as e}from"./index-DOPFM81N.js";import{I as y}from"./icons-BiM4_yI8.js";import{G as v,R as c,E as T,M as z,c as L}from"./ui-RQoc6Glv.js";import{u as W,a as M,T as O,S as N,b as F}from"./appShell-RjRBWUz7.js";import{a as R,A as B}from"./api-TzPuOslc.js";const U=`
   @keyframes spin { to { transform: rotate(360deg); } }
   .app-wallpaper { position: absolute; inset: 0; z-index: 0; pointer-events: none;
     background: radial-gradient(60% 50% at 16% 0%, color-mix(in srgb, var(--blob-a) 26%, transparent), transparent 70%), radial-gradient(55% 50% at 100% 100%, color-mix(in srgb, var(--blob-b) 22%, transparent), transparent 70%), var(--bg); }

@@ -1,4 +1,4 @@
-import{u as V,R as d,j as e}from"./index-CK6hCZ-D.js";import{a as L}from"./api-TzPuOslc.js";import{I as o,M as U}from"./icons-BSHulfzE.js";import{G as M,R as N,c as W,E as X,b as J}from"./ui-DY0leG2n.js";import{u as Q,a as Z,T as ee,S as re,b as te}from"./appShell-DBZ7rqtE.js";const ae=`
+import{u as V,R as d,j as e}from"./index-DOPFM81N.js";import{a as L}from"./api-TzPuOslc.js";import{I as o,M as U}from"./icons-BiM4_yI8.js";import{G as M,R as N,c as W,E as X,b as J}from"./ui-RQoc6Glv.js";import{u as Q,a as Z,T as ee,S as re,b as te}from"./appShell-RjRBWUz7.js";const ae=`
   @keyframes spin { to { transform: rotate(360deg); } }
 
   .app-wallpaper {

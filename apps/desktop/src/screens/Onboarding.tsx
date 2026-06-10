@@ -633,7 +633,7 @@ export default function Onboarding() {
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
       <style>{styles}</style>
-      <div style={{
+      <div className="win-drag" style={{
         width: '100%', height: '100%', overflow: 'hidden', position: 'relative',
         background: 'var(--backdrop-base)',
       }}>

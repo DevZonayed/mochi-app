@@ -1,4 +1,4 @@
-import{R as c,j as e}from"./index-CK6hCZ-D.js";import{I as m}from"./icons-BSHulfzE.js";import{c as N}from"./ui-DY0leG2n.js";import{A as z}from"./appShell-DBZ7rqtE.js";import{a as I}from"./api-TzPuOslc.js";const W=`
+import{R as c,j as e}from"./index-DOPFM81N.js";import{I as m}from"./icons-BiM4_yI8.js";import{c as N}from"./ui-RQoc6Glv.js";import{A as z}from"./appShell-RjRBWUz7.js";import{a as I}from"./api-TzPuOslc.js";const W=`
   .link-btn:hover { text-decoration: underline; }
   .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease, background 140ms ease; }
   .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.4); }

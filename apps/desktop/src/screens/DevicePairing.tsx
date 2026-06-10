@@ -224,7 +224,7 @@ export default function DevicePairing() {
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
       <style>{styles}</style>
-      <div style={{ width: '100%', height: '100%', overflow: 'hidden', position: 'relative', background: 'var(--backdrop-base)' }}>
+      <div className="win-drag" style={{ width: '100%', height: '100%', overflow: 'hidden', position: 'relative', background: 'var(--backdrop-base)' }}>
         <div className="backdrop" aria-hidden="true"><span className="blob b1" /><span className="blob b2" /><span className="blob b3" /></div>
 
         {/* demo state switch */}
