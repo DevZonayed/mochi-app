@@ -16,7 +16,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, TrafficLights, Sidebar, Toolbar,
   type Theme,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type BudgetData, type ProviderConn, type ProviderId, type Routing, type PairingInfo, type EngineStatuses, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type PairingInfo, type EngineStatuses, type AppSettings, IS_LOCAL } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -165,41 +165,52 @@ function Seg({ options, value, onChange }: { options: string[]; value: string; o
   );
 }
 
-function ToggleRow({ label, sub, on: initial, last }: { label: React.ReactNode; sub?: React.ReactNode; on: boolean; last?: boolean }) {
+function ToggleRow({ label, sub, on: initial, last, onChange }: { label: React.ReactNode; sub?: React.ReactNode; on: boolean; last?: boolean; onChange?: (v: boolean) => void }) {
   const [on, setOn] = React.useState(initial);
+  React.useEffect(() => { setOn(initial); }, [initial]);
+  const toggle = (v: boolean) => { setOn(v); onChange?.(v); };
   return (
     <Row last={last}>
       <span style={{ flex: 1 }}>
         <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>{label}</span>
         {sub && <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{sub}</span>}
       </span>
-      <Switch on={on} onChange={setOn} />
+      <Switch on={on} onChange={toggle} />
     </Row>
   );
 }
 
 /* ───────────────────────── panes ───────────────────────── */
+const EFFORT_TO_STOP: Record<string, EffortStop> = { fast: 'FAST', balanced: 'BALANCED', deep: 'DEEP', max: 'MAX' };
+const STOP_TO_EFFORT: Record<EffortStop, 'fast' | 'balanced' | 'deep' | 'max'> = { FAST: 'fast', BALANCED: 'balanced', DEEP: 'deep', MAX: 'max' };
+
 function GeneralPane({ theme, setTheme, workspace }: {
   theme: Theme; setTheme: React.Dispatch<React.SetStateAction<Theme>>;
   workspace: Workspace | null;
 }) {
-  const [eff, setEff] = React.useState<EffortStop>('BALANCED');
-  const [model, setModel] = React.useState('auto');
+  const [settings, setSettings] = React.useState<AppSettings | null>(null);
+  React.useEffect(() => { api.getSettings().then(setSettings).catch(() => {}); }, []);
+
+  const eff: EffortStop = settings ? EFFORT_TO_STOP[settings.defaultEffort] ?? 'BALANCED' : 'BALANCED';
+  const model = settings?.defaultEngine ?? 'auto';
+
+  const patch = (p: Partial<AppSettings>) => { setSettings(s => (s ? { ...s, ...p } : s)); void api.setSettings(p).catch(() => {}); };
+  const saveName = (name: string) => { const n = name.trim(); if (n && n !== workspace?.name) void api.createWorkspace(n).catch(() => {}); };
+
   return (
     <div>
       <PaneHead>General</PaneHead>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
         <GroupedList header="Workspace">
-          <Row><span style={{ width: 110, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Name</span><input key={workspace?.id ?? 'ws'} defaultValue={workspace?.name ?? 'Atlas Studio'} style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)', padding: '13px 0' }} /></Row>
+          <Row><span style={{ width: 110, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Name</span><input key={workspace?.id ?? 'ws'} defaultValue={workspace?.name ?? 'Maestro'} onBlur={e => saveName(e.target.value)} style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)', padding: '13px 0' }} /></Row>
           <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Appearance</span><Seg options={['Light', 'Dark', 'Auto']} value={getThemePref() === 'auto' ? 'Auto' : getThemePref() === 'dark' ? 'Dark' : 'Light'} onChange={v => setThemePref(v === 'Auto' ? 'auto' : v === 'Dark' ? 'dark' : 'light')} /></Row>
         </GroupedList>
-        <GroupedList header="Defaults" footer="Applies to new jobs across the workspace; projects can override.">
-          <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default effort</span><EffortDial value={eff} onChange={setEff} compact /></Row>
-          <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default model</span><ModelSwitcher value={model} onChange={setModel} align="right" /></Row>
+        <GroupedList header="Defaults" footer="Applies to new jobs; a project or the composer can override per run.">
+          <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default effort</span><EffortDial value={eff} onChange={v => patch({ defaultEffort: STOP_TO_EFFORT[v] })} compact /></Row>
+          <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default engine</span><ModelSwitcher value={model} onChange={v => patch({ defaultEngine: v === 'claude' || v === 'codex' ? v : 'auto' })} align="right" /></Row>
         </GroupedList>
         <GroupedList header="Startup">
-          <ToggleRow label="Open Maestro at login" on={true} />
-          <ToggleRow label="Resume in-flight jobs on launch" on={true} last />
+          <ToggleRow label="Open Maestro at login" on={settings?.openAtLogin ?? false} onChange={v => patch({ openAtLogin: v })} last />
         </GroupedList>
       </div>
     </div>
@@ -417,7 +428,6 @@ function SecurityPane({ onExportAudit }: { onExportAudit: () => void }) {
 }
 
 function DevicesPane({ onPair }: { onPair: () => void }) {
-  const devs: [string, string][] = [['Jillur’s iPhone 15 Pro', 'Last seen 2 min ago'], ['iPad Air', 'Last seen yesterday']];
   const [pairing, setPairing] = React.useState<PairingInfo | null>(null);
   const [copied, setCopied] = React.useState(false);
   React.useEffect(() => {
@@ -445,17 +455,14 @@ function DevicesPane({ onPair }: { onPair: () => void }) {
           <div style={{ height: 18 }} />
         </>
       )}
-      <GroupedList footer="Paired phones use the end-to-end encrypted relay.">
-        {devs.map((d, i) => (
-          <Row key={i}>
-            <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--teal) 13%, transparent)', color: 'var(--teal)' }}><Icon name="smartphone" size={18} /></span>
-            <span style={{ flex: 1 }}>
-              <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{d[0]}</span>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, color: 'var(--green)' }}><Icon name="lock" size={10} /> E2EE</span> · {d[1]}</span>
-            </span>
-            <button className="reject-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Revoke</button>
-          </Row>
-        ))}
+      <GroupedList footer="Anyone who enters your code can control this Mac, so keep it private. Regenerating the code (Danger zone → reset is not required) would unpair existing devices.">
+        <Row>
+          <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'var(--fill-tertiary)', color: 'var(--ink-tertiary)' }}><Icon name="smartphone" size={18} /></span>
+          <span style={{ flex: 1 }}>
+            <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>No paired devices yet</span>
+            <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Pair your phone with the code above to control this Mac remotely.</span>
+          </span>
+        </Row>
         <Row last onClick={onPair}>
           <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 13%, transparent)', color: 'var(--blue)' }}><Icon name="plus" size={18} stroke={2.4} /></span>
           <span style={{ flex: 1, font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--blue)' }}>Pair new device</span>

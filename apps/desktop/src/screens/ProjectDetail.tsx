@@ -18,7 +18,7 @@ import {
   ModelSwitcher,
   type EffortStop,
 } from '../lib/ui';
-import { AppShell, WORKSPACE } from '../lib/appShell';
+import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
@@ -812,9 +812,10 @@ const TABS: { key: string; label: string }[] = [
 
 function Breadcrumb({ name }: { name: string }) {
   const navigate = useNavigate();
+  const workspaceName = useWorkspaceName();
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10, font: '500 var(--fs-subhead)/1 var(--font-text)' }}>
-      <a onClick={() => navigate('/projects')} className="crumb" style={{ color: 'var(--ink-secondary)', textDecoration: 'none', cursor: 'pointer' }}>{WORKSPACE}</a>
+      <a onClick={() => navigate('/projects')} className="crumb" style={{ color: 'var(--ink-secondary)', textDecoration: 'none', cursor: 'pointer' }}>{workspaceName}</a>
       <Icon name="chevronRight" size={14} style={{ color: 'var(--ink-tertiary)' }} />
       <a onClick={() => navigate('/projects')} className="crumb" style={{ color: 'var(--ink-secondary)', textDecoration: 'none', cursor: 'pointer' }}>Projects</a>
       <Icon name="chevronRight" size={14} style={{ color: 'var(--ink-tertiary)' }} />

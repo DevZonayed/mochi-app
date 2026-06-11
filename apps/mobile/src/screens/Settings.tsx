@@ -6,6 +6,7 @@ import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { Card, Group, Row } from '../ui';
 import { api, getPairToken, setPairToken, type Workspace } from '../api';
+import { setFlag, ONBOARDED } from '../storage';
 
 /* iOS-style toggle switch — animated thumb. */
 function MSwitch({ value, onValueChange }: { value: boolean; onValueChange?: (v: boolean) => void }) {
@@ -227,6 +228,12 @@ export function SettingsScreen() {
   const [faceId, setFaceId] = useState(true);
   const [lockApprove, setLockApprove] = useState(true);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [conn, setConn] = useState<'idle' | 'testing' | 'ok' | 'fail'>('idle');
+
+  const testConnection = () => {
+    setConn('testing');
+    api.health().then(() => setConn('ok')).catch(() => setConn('fail'));
+  };
 
   // Live workspace/account info for the connection hero (name + budget cap).
   useFocusEffect(
@@ -264,20 +271,19 @@ export function SettingsScreen() {
               <Icon name="smartphone" size={24} color={theme.color.inkSecondary} />
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={{ fontSize: 17, fontWeight: '600', color: theme.color.ink }}>{workspace?.name ?? "Jillur's MacBook Pro"}</Text>
+              <Text style={{ fontSize: 17, fontWeight: '600', color: theme.color.ink }}>{workspace?.name ?? 'Your Mac'}</Text>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 5 }}>
-                <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: theme.color.green }} />
-                <Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.green }}>Connected via relay · E2EE</Text>
-                <Text style={{ fontSize: 12, fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>· 84 ms</Text>
+                {conn === 'fail'
+                  ? <><View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: theme.color.red }} /><Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.red }}>Can't reach your Mac</Text></>
+                  : conn === 'testing'
+                    ? <Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkSecondary }}>Testing…</Text>
+                    : <><View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: theme.color.green }} /><Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.green }}>{conn === 'ok' ? 'Reachable via relay' : 'Paired via relay'}</Text></>}
               </View>
             </View>
           </View>
           <View style={{ flexDirection: 'row', gap: 10, marginTop: 14 }}>
-            <Pressable style={{ flex: 1, height: 38, borderRadius: theme.radius.pill, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}>
-              <Text style={{ fontSize: 14, fontWeight: '600', color: theme.color.ink }}>Test connection</Text>
-            </Pressable>
-            <Pressable style={{ width: 38, height: 38, borderRadius: 19, backgroundColor: 'rgba(52,199,89,0.14)', alignItems: 'center', justifyContent: 'center' }}>
-              <Icon name="shield" size={18} color={theme.color.green} />
+            <Pressable onPress={testConnection} style={{ flex: 1, height: 38, borderRadius: theme.radius.pill, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}>
+              <Text style={{ fontSize: 14, fontWeight: '600', color: theme.color.ink }}>{conn === 'testing' ? 'Testing…' : 'Test connection'}</Text>
             </Pressable>
           </View>
         </Card>
@@ -412,14 +418,12 @@ export function SettingsScreen() {
 
         {/* This device */}
         <View style={{ marginBottom: 22 }}>
-          <Group header="This device">
-            <Row>
-              <Text style={{ width: 110, fontSize: 16, color: theme.color.inkTertiary }}>Name</Text>
-              <View style={rowLabel}>
-                <Text style={labelText}>iPhone 15 Pro</Text>
-              </View>
-            </Row>
-            <Row last>
+          <Group header="This device" footer="Unpairing clears the code on this phone; pair again from your Mac's code to reconnect.">
+            <Row last onPress={() => {
+              setPairToken('');
+              setFlag(ONBOARDED, false);
+              nav.reset({ index: 0, routes: [{ name: 'Onboarding' }] });
+            }}>
               <View style={rowLabel}>
                 <Text style={{ fontSize: 16, color: theme.color.red }}>Unpair from Mac</Text>
               </View>

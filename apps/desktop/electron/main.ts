@@ -44,11 +44,16 @@ app.whenReady().then(() => {
   const store = new Store();
   const providers = new Providers(store);
 
+  // Apply the persisted "open at login" preference, and re-apply whenever it changes.
+  const applyLoginItem = (openAtLogin: boolean) => { try { app.setLoginItemSettings({ openAtLogin }); } catch { /* unsupported */ } };
+  applyLoginItem(store.getSettings().openAtLogin);
+
   let relay: RelayClient | null = null;
   const emit = (name: string, data: unknown) => {
     for (const w of BrowserWindow.getAllWindows()) {
       try { w.webContents.send('maestro:event', { name, data }); } catch { /* window closing */ }
     }
+    if (name === 'settings' && data && typeof data === 'object') applyLoginItem(!!(data as { openAtLogin?: boolean }).openAtLogin);
     relay?.event(name, data);
     relay?.pushSnapshot();
   };

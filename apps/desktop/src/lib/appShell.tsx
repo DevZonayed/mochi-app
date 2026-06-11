@@ -66,7 +66,32 @@ export function useTheme(_initial: Theme = 'light'): [Theme, React.Dispatch<Reac
   return [resolvedTheme(), setTheme];
 }
 
-export const WORKSPACE = 'Atlas Studio';
+/** Default workspace name until the live one loads (and for fresh installs). */
+export const WORKSPACE = 'Maestro';
+
+/* Live workspace name — one shared, ref-counted fetch for the whole chrome.
+   Refreshes on project events (workspace is created lazily with the first one). */
+let wsName = WORKSPACE;
+let wsRefs = 0;
+let wsStop: (() => void) | null = null;
+const wsListeners = new Set<() => void>();
+function notifyWs() { for (const l of wsListeners) l(); }
+function startWsWatch(): () => void {
+  const refresh = () => api.listWorkspaces().then(ws => { const n = ws[0]?.name || WORKSPACE; if (n !== wsName) { wsName = n; notifyWs(); } }).catch(() => {});
+  refresh();
+  const unsub = api.subscribe({ onProject: refresh });
+  return () => { unsub(); };
+}
+export function useWorkspaceName(): string {
+  const [, force] = React.useReducer((x: number) => x + 1, 0);
+  React.useEffect(() => {
+    wsListeners.add(force);
+    if (wsRefs === 0) wsStop = startWsWatch();
+    wsRefs++;
+    return () => { wsListeners.delete(force); wsRefs--; if (wsRefs === 0 && wsStop) { wsStop(); wsStop = null; } };
+  }, []);
+  return wsName;
+}
 
 export function TrafficLights() {
   // The native macOS window supplies the real traffic lights (titleBarStyle:
@@ -112,6 +137,7 @@ export interface SidebarProps {
 
 export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
   const pending = usePendingApprovals();
+  const workspaceName = useWorkspaceName();
   return (
     <aside className="win-drag" style={{
       width: 260, flexShrink: 0, height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', zIndex: 2,
@@ -125,7 +151,7 @@ export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
       }} className="ws-header">
         <MaestroMark size={30} />
         <span style={{ flex: 1, minWidth: 0 }}>
-          <span style={{ display: 'block', font: '700 var(--fs-callout)/1.1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>{WORKSPACE}</span>
+          <span style={{ display: 'block', font: '700 var(--fs-callout)/1.1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>{workspaceName}</span>
           <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 1 }}>Workspace</span>
         </span>
         <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)' }} />

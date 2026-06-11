@@ -8,7 +8,7 @@
 import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
-import { AppShell, WORKSPACE } from '../lib/appShell';
+import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, type Project as ApiProject, type Job, type ProjectKind, type FolderInspect, IS_LOCAL } from '../lib/api';
 
 /* Page-specific CSS from Projects.html <style> (the app-shell already provides
@@ -711,6 +711,7 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 export default function Projects() {
   const navigate = useNavigate();
   const location = useLocation();
+  const workspaceName = useWorkspaceName();
   const [view, setView] = React.useState('grid');
   const [loading, setLoading] = React.useState(true);
   const [projects, setProjects] = React.useState<Project[]>([]);
@@ -782,7 +783,7 @@ export default function Projects() {
             <div>
               <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Projects</h1>
               <p style={{ margin: '6px 0 0', font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>
-                {projects.length} project{projects.length !== 1 ? 's' : ''} in {WORKSPACE}
+                {projects.length} project{projects.length !== 1 ? 's' : ''} in {workspaceName}
               </p>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
