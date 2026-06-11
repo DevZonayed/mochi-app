@@ -149,7 +149,8 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 }
 
 /* ───────────────────────── data ───────────────────────── */
-interface RunItem { proj: string; tint: string; name: string; out: keyof typeof OUT; shape: string; cost: string; dur: string; time: string; }
+interface RunItem { proj: string; tint: string; name: string; out: keyof typeof OUT; shape: string; engine: string; cost: string; dur: string; time: string; }
+const ENGINE_SHORT: Record<string, string> = { claude: 'Claude Code', codex: 'Codex' };
 interface RunGroup { day: string; items: RunItem[]; }
 
 const OUT = { done: { icon: 'checkCircle', tint: 'var(--green)' }, failed: { icon: 'xCircle', tint: 'var(--red)' }, cancelled: { icon: 'pause', tint: 'var(--ink-tertiary)' } } as const;
@@ -211,6 +212,7 @@ function buildRuns(jobs: Job[], projects: Project[]): RunGroup[] {
       name: j.title,
       out: outFromStatus(j.status),
       shape: SHAPE_BY_EFFORT[j.effort] ?? 'single',
+      engine: ENGINE_SHORT[j.engine ?? 'claude'] ?? (j.engine ?? ''),
       cost: j.cost.toFixed(2),
       dur: durOf(j.createdAt, j.updatedAt),
       time: clockOf(j.updatedAt),
@@ -251,7 +253,10 @@ function RunsTab({ runs, onOpen }: { runs: RunGroup[]; onOpen: (run: RunItem) =>
                 <Icon name={OUT[r.out].icon} size={17} style={{ color: OUT[r.out].tint }} />
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, minWidth: 0 }}><span style={{ width: 8, height: 8, borderRadius: 4, background: r.tint, flexShrink: 0 }} /><span style={{ font: '500 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.proj}</span></span>
                 <span style={{ font: '600 var(--fs-callout)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name}</span>
-                <span><ShapeChip shape={r.shape} /></span>
+                <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
+                  <ShapeChip shape={r.shape} />
+                  {r.engine && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{r.engine}</span>}
+                </span>
                 <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', textAlign: 'right' }}>${r.cost}</span>
                 <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', textAlign: 'right' }}>{r.dur}</span>
                 <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', textAlign: 'right' }}>{r.time}</span>

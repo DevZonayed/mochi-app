@@ -101,6 +101,10 @@ export function createDispatch(store: Store, engine: LocalEngine, providers: Pro
         return j;
       }
       case 'runJob': return engine.run(String(p.id ?? ''), { effort: p.effort as Effort | undefined, engine: asEngine(p.engine) });
+      case 'cancelJob': {
+        const c = engine.cancel(String(p.id ?? ''));
+        return c ?? bad('job is not running', 409);
+      }
       case 'deleteJob': { store.deleteJob(String(p.id ?? '')); return { ok: true }; }
       case 'createAndRunJob': {
         if (!p.projectId || !p.input) bad('projectId and input required');
@@ -145,6 +149,9 @@ export function createDispatch(store: Store, engine: LocalEngine, providers: Pro
         providers.disconnect(prov as ProviderId);
         return { ok: true };
       }
+
+      // ── Engine status (THE single source of truth) ────────────
+      case 'engineStatus': return engine.statuses();
 
       // ── Engine routing (which engine plays which role) ─────────
       case 'getRouting': return store.routing();

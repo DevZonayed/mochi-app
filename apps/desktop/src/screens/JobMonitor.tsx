@@ -637,7 +637,7 @@ function CancelSheet({ job, onClose, onConfirm }: CancelSheetProps) {
           </span>
           <h2 style={{ margin: '0 0 8px', font: '700 var(--fs-title2)/1.2 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Cancel this job?</h2>
           <p style={{ margin: 0, font: '400 var(--fs-subhead)/1.45 var(--font-text)', color: 'var(--ink-secondary)', textWrap: 'pretty' }}>
-            “{job.name}” will stop immediately. Work in progress is discarded and you’ll be billed for ${(job._liveCost ?? job.cost).toFixed(2)} already spent.
+            “{job.name}” will stop immediately on this Mac. Partial output so far is kept; the run won’t continue.
           </p>
         </div>
         <div style={{ display: 'flex', gap: 10, padding: '0 18px 18px' }}>
@@ -699,11 +699,10 @@ export default function JobMonitor() {
     return unsubscribe;
   }, [refetch]);
 
-  // live drift: advance now-line + tick running costs (presentational)
+  // live drift: advance the now-line only (cost is real, streamed from the engine)
   React.useEffect(() => {
     const t = setInterval(() => {
       setNowMin(n => (n < 67 ? +(n + 0.08).toFixed(2) : n));
-      setJobs(js => js.map(j => j.status === 'running' ? { ...j, _liveCost: +((j._liveCost ?? j.cost) + 0.002 + Math.random() * 0.004).toFixed(3) } : j));
     }, 900);
     return () => clearInterval(t);
   }, []);
@@ -724,10 +723,11 @@ export default function JobMonitor() {
     const capEl = document.querySelector(`[data-cap="${job.id}"]`);
     if (capEl) capEl.classList.add('cap-cancelling');
     setCancelJob(null);
-    setTimeout(() => {
-      setJobs(js => js.map(j => j.id === job.id ? { ...j, status: 'failed', end: Math.round(nowMin), last: 'cancelled by operator' } : j));
-      setSel(s => s && s.id === job.id ? { ...s, status: 'failed', last: 'cancelled by operator' } : s);
-    }, 360);
+    // Real cancel: abort the run on the Mac. The job event refetches the board
+    // into its true 'cancelled' state; optimistically reflect it meanwhile.
+    setJobs(js => js.map(j => j.id === job.id ? { ...j, status: 'cancelled', end: Math.round(nowMin), last: 'cancelling…' } : j));
+    setSel(s => s && s.id === job.id ? { ...s, status: 'cancelled', last: 'cancelling…' } : s);
+    void api.cancelJob(job.id).catch(() => { void refetch(); });
   };
 
   return (

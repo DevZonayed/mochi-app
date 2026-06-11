@@ -154,6 +154,14 @@ export interface DashboardData {
   schedule: Schedule[];
   budget: BudgetData;
 }
+export interface EngineStatus {
+  engine: EngineId;
+  available: boolean;
+  method: 'subscription' | 'apiKey' | 'none';
+  detail: string;
+  reason: string;
+}
+export type EngineStatuses = Record<EngineId, EngineStatus>;
 
 const RAW_BASE =
   (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_API_BASE ??
@@ -264,6 +272,7 @@ export const api = {
     call<BudgetData>('budget', { workspaceId }, () => req<BudgetData>('/api/budget' + qp({ workspaceId }))),
   costs: () => call<CostsData>('costs', {}, () => req<CostsData>('/api/costs')),
   listEvents: () => call<AppEvent[]>('listEvents', {}, () => req<AppEvent[]>('/api/events')),
+  engineStatus: () => call<EngineStatuses>('engineStatus', {}, () => req<EngineStatuses>('/api/engine-status')),
 
   // Settings
   getSettings: () => call<AppSettings>('getSettings', {}, () => req<AppSettings>('/api/settings')),

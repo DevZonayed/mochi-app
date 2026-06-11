@@ -42,6 +42,7 @@ interface Snapshot {
   providers?: unknown[];
   routing?: unknown;
   settings?: unknown;
+  engineStatus?: unknown;
   at?: number;
 }
 
@@ -224,6 +225,7 @@ export function buildServer(): FastifyInstance {
   app.get('/api/costs', async () => st()?.costs ?? { today: 0, thisMonth: 0, projectedMonth: 0, byDay: [], byProject: [], byEngine: [], includedCodexRuns: 0, claudeRuns: 0 });
   app.get('/api/events', async () => st()?.events ?? []);
   app.get('/api/settings', async () => st()?.settings ?? null);
+  app.get('/api/engine-status', async () => st()?.engineStatus ?? { claude: { engine: 'claude', available: false, method: 'none', detail: 'Mac offline', reason: 'Desktop not connected.' }, codex: { engine: 'codex', available: false, method: 'none', detail: 'Mac offline', reason: 'Desktop not connected.' } });
   app.get('/api/workspaces', async () => st()?.workspaces ?? []);
   app.get('/api/projects', async () => st()?.projects ?? []);
   app.get('/api/projects/:id', async (req, reply) => {

@@ -691,9 +691,11 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 // "gate" state — that only arrives via the demo state-switch / Pause control.
 function statusToRunState(s: Job['status']): RunState {
   if (s === 'done') return 'done';
-  if (s === 'failed') return 'failed';
+  if (s === 'failed' || s === 'cancelled') return 'failed';
   return 'live'; // pending | running
 }
+
+const ENGINE_LABEL: Record<string, string> = { claude: 'Claude Code', codex: 'Codex' };
 
 const fmtTokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
 
@@ -752,13 +754,28 @@ export default function SessionTranscript() {
     return () => { cancelled = true; };
   }, [routeId]);
 
-  // live tickers — only advance synthetic meters when the job has no settled cost yet
+  // LIVE: the engine streams partial output + real cost/tokens through job
+  // events. Mirror them straight onto the transcript as they arrive.
+  React.useEffect(() => {
+    const jobId = job?.id;
+    if (!jobId) return;
+    const unsub = api.subscribe({
+      onJob: (j) => {
+        if (j.id !== jobId) return;
+        setJob(j);
+        setRunState(statusToRunState(j.status));
+        setCost(j.cost);
+        setTokens(fmtTokens(j.tokens));
+        setElapsed(Math.max(0, Math.round((j.updatedAt - j.createdAt) / 1000)));
+      },
+    });
+    return unsub;
+  }, [job?.id]);
+
+  // elapsed clock only — cost & tokens are real, streamed from the engine
   React.useEffect(() => {
     if (!live) return;
-    const t = setInterval(() => {
-      setCost(c => +(c + 0.003 + Math.random() * 0.004).toFixed(3));
-      setElapsed(e => e + 1);
-    }, 1000);
+    const t = setInterval(() => setElapsed(e => e + 1), 1000);
     return () => clearInterval(t);
   }, [live]);
 
@@ -805,14 +822,14 @@ export default function SessionTranscript() {
                 <EffortDial value={job ? EFFORT_TO_PILL[job.effort] : 'DEEP'} compact />
               </div>
             </div>
-            {/* state switch (demo of run states) */}
-            <div style={{ display: 'inline-flex', padding: 2, background: 'var(--fill-secondary)', borderRadius: 9 }}>
-              {([['live', 'Live'], ['gate', 'At gate'], ['done', 'Done'], ['failed', 'Failed']] as [RunState, string][]).map(([k, label]) => (
-                <button key={k} onClick={() => setRunState(k)} style={{ padding: '6px 12px', borderRadius: 7, font: '600 var(--fs-footnote)/1 var(--font-text)',
-                  background: runState === k ? 'var(--bg-elevated)' : 'transparent', color: runState === k ? 'var(--ink)' : 'var(--ink-secondary)',
-                  boxShadow: runState === k ? '0 1px 3px rgba(0,0,0,0.14)' : 'none', transition: 'all 160ms ease' }}>{label}</button>
-              ))}
-            </div>
+            {/* real engine · model badge — which engine ran this job, on this Mac */}
+            {job?.engine && (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)',
+                background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)', flexShrink: 0 }}>
+                <Icon name={job.engine === 'codex' ? 'cpu' : 'terminal'} size={14} style={{ color: 'var(--ink)' }} />
+                {ENGINE_LABEL[job.engine] ?? job.engine}{job.model && job.model !== job.engine ? <span style={{ color: 'var(--ink-tertiary)', fontWeight: 500 }}>· {job.model}</span> : null}
+              </span>
+            )}
             <button className="tb-icon" title="Share / export" style={{ width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0 }}>
               <Icon name="enter" size={18} style={{ transform: 'rotate(-90deg)' }} />
             </button>
@@ -847,7 +864,7 @@ export default function SessionTranscript() {
               )}
             </div>
 
-            <RightRail runState={runState} cost={cost} tokens={tokens} elapsed={`${mm}:${ss}`} onPause={() => setRunState('gate')} onCancel={() => setRunState('failed')} />
+            <RightRail runState={runState} cost={cost} tokens={tokens} elapsed={`${mm}:${ss}`} onPause={() => setRunState('gate')} onCancel={() => { if (job) void api.cancelJob(job.id).catch(() => {}); setRunState('failed'); }} />
           </div>
         </div>
       </AppShell>

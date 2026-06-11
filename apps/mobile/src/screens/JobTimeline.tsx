@@ -263,9 +263,15 @@ export function JobTimelineScreen() {
             <Text numberOfLines={1} style={{ fontSize: 12, fontWeight: '500', color: projColor }}>{headerSub}</Text>
           </View>
         </View>
-        <Pressable hitSlop={8}>
-          <Icon name="more" size={22} color={theme.color.inkSecondary} />
-        </Pressable>
+        {isLive && job ? (
+          <Pressable hitSlop={8} onPress={() => { void api.cancelJob(job.id).catch(() => {}); }}>
+            <Icon name="x" size={22} color={theme.color.red} />
+          </Pressable>
+        ) : (
+          <Pressable hitSlop={8}>
+            <Icon name="more" size={22} color={theme.color.inkSecondary} />
+          </Pressable>
+        )}
       </View>
 
       <MeterStrip meters={meters} />
@@ -292,7 +298,7 @@ export function JobTimelineScreen() {
             <Text style={{ flex: 1, fontSize: 15, fontWeight: '600', color: theme.color.ink }}>
               {job ? `${job.tokens.toLocaleString()} tokens` : '0 tokens'}
             </Text>
-            <Mono style={{ fontSize: 14, fontWeight: '600', color: theme.color.green }}>{`${job ? Math.round(job.progress * 100) : 0}%`}</Mono>
+            <Mono style={{ fontSize: 14, fontWeight: '600', color: theme.color.green }}>{`${job ? Math.round(job.progress) : 0}%`}</Mono>
             <Mono style={{ fontSize: 14, fontWeight: '600', color: theme.color.red }}>{`$${job ? job.cost.toFixed(2) : '0.00'}`}</Mono>
             <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
           </Card>

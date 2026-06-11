@@ -16,7 +16,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, TrafficLights, Sidebar, Toolbar,
   type Theme,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type BudgetData, type ProviderConn, type ProviderId, type Routing, type PairingInfo, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type BudgetData, type ProviderConn, type ProviderId, type Routing, type PairingInfo, type EngineStatuses, IS_LOCAL } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -220,15 +220,21 @@ const engineToLabel = (e: string): string => (e === 'claude' ? 'Claude Code' : e
 
 function EnginesPane() {
   const [routing, setRouting] = React.useState<Routing | null>(null);
-  const [conns, setConns] = React.useState<ProviderConn[]>([]);
+  const [engines, setEngines] = React.useState<EngineStatuses | null>(null);
 
-  React.useEffect(() => {
-    let alive = true;
-    Promise.all([api.getRouting(), api.listProviders()])
-      .then(([r, p]) => { if (alive) { setRouting(r); setConns(p); } })
+  const refetch = React.useCallback(() => {
+    Promise.all([api.getRouting(), api.engineStatus()])
+      .then(([r, e]) => { setRouting(r); setEngines(e); })
       .catch(() => {});
-    return () => { alive = false; };
   }, []);
+  React.useEffect(() => {
+    refetch();
+    // Engine status can change out-of-band (user runs `claude login` in a
+    // terminal); re-check when jobs move and on a slow poll while the pane is open.
+    const unsub = api.subscribe({ onJob: () => refetch() });
+    const t = setInterval(refetch, 10000);
+    return () => { unsub(); clearInterval(t); };
+  }, [refetch]);
 
   const setRole = (key: RoleKey, label: string) => {
     const value = labelToEngine(label);
@@ -236,8 +242,12 @@ function EnginesPane() {
     void api.setRouting({ [key]: value } as Partial<Routing>).then(setRouting).catch(() => {});
   };
 
-  const claudeOk = conns.some(c => c.provider === 'anthropic');
-  const codexOk = conns.some(c => c.provider === 'openai');
+  // ONE source of truth: the same status the run path uses, so the pane can
+  // never disagree with what actually happens when a job runs.
+  const ENGINE_STATUS_ROWS: { id: 'claude' | 'codex'; label: string }[] = [
+    { id: 'claude', label: 'Claude Code' },
+    { id: 'codex', label: 'Codex' },
+  ];
 
   return (
     <div>
@@ -260,14 +270,23 @@ function EnginesPane() {
           ))}
         </GroupedList>
         <GroupedList header="Engine status" footer="Engines use your own sign-ins on this Mac — Claude Code (`claude login`) and Codex (ChatGPT).">
-          <Row>
-            <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Claude Code</span>
-            <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: claudeOk ? 'var(--green)' : 'var(--red)' }}>{claudeOk ? 'Signed in' : 'Not signed in'}</span>
-          </Row>
-          <Row last>
-            <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Codex</span>
-            <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: codexOk ? 'var(--green)' : 'var(--red)' }}>{codexOk ? 'Signed in' : 'Not signed in'}</span>
-          </Row>
+          {ENGINE_STATUS_ROWS.map((row, i) => {
+            const s = engines?.[row.id];
+            const ok = !!s?.available;
+            return (
+              <Row key={row.id} last={i === ENGINE_STATUS_ROWS.length - 1}>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ display: 'block', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>{row.label}</span>
+                  {s && !ok && s.reason
+                    ? <span style={{ display: 'block', font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 3 }}>{s.reason}</span>
+                    : ok && s ? <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>{s.detail}</span> : null}
+                </span>
+                <span style={{ flexShrink: 0, font: '500 var(--fs-footnote)/1 var(--font-text)', color: !engines ? 'var(--ink-tertiary)' : ok ? 'var(--green)' : 'var(--red)' }}>
+                  {!engines ? '…' : ok ? 'Ready' : 'Not signed in'}
+                </span>
+              </Row>
+            );
+          })}
         </GroupedList>
       </div>
     </div>

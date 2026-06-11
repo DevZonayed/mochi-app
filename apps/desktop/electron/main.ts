@@ -52,7 +52,7 @@ app.whenReady().then(() => {
     relay?.pushSnapshot();
   };
 
-  const engine = new LocalEngine(store, emit);
+  const engine = new LocalEngine(store, emit, providers);
   const dispatch = createDispatch(store, engine, providers, emit, RELAY_URL);
 
   relay = new RelayClient({
@@ -60,7 +60,7 @@ app.whenReady().then(() => {
     deckId: store.deck.deckId,
     deckSecret: store.deck.deckSecret,
     accessToken: store.accessToken,
-    getSnapshot: () => store.snapshot(providers.list()),
+    getSnapshot: () => ({ ...store.snapshot(providers.list()), engineStatus: engine.statuses() }),
     onCommand: (method, params) => dispatch(method, params),
   });
   relay.start();

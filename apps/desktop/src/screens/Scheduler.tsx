@@ -211,14 +211,15 @@ function MisfireChip({ policy }: { policy: string }) {
   );
 }
 
-interface ScheduleRowProps { s: SchedRow; last: boolean; onPick: (s: SchedRow) => void; projMeta: ProjMeta; onToggle: (id: string, nextEnabled: boolean) => void }
+interface ScheduleRowProps { s: SchedRow; last: boolean; onPick: (s: SchedRow) => void; projMeta: ProjMeta; onToggle: (id: string, nextEnabled: boolean) => void; onDelete: (id: string) => void }
 
-function ScheduleRow({ s, last, onPick, projMeta, onToggle }: ScheduleRowProps) {
+function ScheduleRow({ s, last, onPick, projMeta, onToggle, onDelete }: ScheduleRowProps) {
   const [paused, setPaused] = React.useState(s.paused);
+  const [hover, setHover] = React.useState(false);
   React.useEffect(() => { setPaused(s.paused); }, [s.paused]);
   const p = projMeta;
   return (
-    <div className="sched-row" onClick={() => onPick(s)} style={{ display: 'grid', gridTemplateColumns: '1.7fr 1.5fr 1fr 0.9fr 1.1fr 60px', alignItems: 'center', gap: 14,
+    <div className="sched-row" onClick={() => onPick(s)} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)} style={{ display: 'grid', gridTemplateColumns: '1.7fr 1.5fr 1fr 0.9fr 1.1fr 88px', alignItems: 'center', gap: 14,
       padding: '13px 16px', borderBottom: last ? 'none' : '0.5px solid var(--separator)', cursor: 'pointer', opacity: paused ? 0.6 : 1, transition: 'opacity 200ms ease' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
         <span style={{ width: 9, height: 9, borderRadius: 5, background: p.color, flexShrink: 0 }} />
@@ -234,16 +235,20 @@ function ScheduleRow({ s, last, onPick, projMeta, onToggle }: ScheduleRowProps) 
         <Icon name="layers" size={13} style={{ color: 'var(--ink-tertiary)' }} /> {s.conc}×
       </span>
       <span><MisfireChip policy={s.misfire} /></span>
-      <span style={{ display: 'flex', justifyContent: 'flex-end' }} onClick={e => e.stopPropagation()}>
+      <span style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8 }} onClick={e => e.stopPropagation()}>
+        <button title="Remove schedule" onClick={() => onDelete(s.id)} style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center',
+          background: 'transparent', color: 'var(--ink-tertiary)', opacity: hover ? 1 : 0, transition: 'opacity 140ms ease', cursor: 'pointer' }}>
+          <Icon name="x" size={14} />
+        </button>
         <Switch on={!paused} onChange={v => { setPaused(!v); onToggle(s.id, v); }} />
       </span>
     </div>
   );
 }
 
-interface ListViewProps { onPick: (s: SchedRow) => void; rows: SchedRow[]; projMeta: Record<string, ProjMeta>; onToggle: (id: string, nextEnabled: boolean) => void }
+interface ListViewProps { onPick: (s: SchedRow) => void; rows: SchedRow[]; projMeta: Record<string, ProjMeta>; onToggle: (id: string, nextEnabled: boolean) => void; onDelete: (id: string) => void }
 
-function ListView({ onPick, rows: allRows, projMeta, onToggle }: ListViewProps) {
+function ListView({ onPick, rows: allRows, projMeta, onToggle, onDelete }: ListViewProps) {
   const fallbackMeta: ProjMeta = { name: 'Workspace', color: 'var(--ink-tertiary)' };
   const byProj: Record<string, SchedRow[]> = {};
   allRows.forEach(s => { (byProj[s.proj] = byProj[s.proj] || []).push(s); });
@@ -260,7 +265,7 @@ function ListView({ onPick, rows: allRows, projMeta, onToggle }: ListViewProps) 
             </div>
             <div style={{ background: 'var(--bg-grouped)', borderRadius: 14, border: '0.5px solid var(--separator)', overflow: 'hidden',
               backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-              {rows.map((s, i) => <ScheduleRow key={s.id} s={s} last={i === rows.length - 1} onPick={onPick} projMeta={p} onToggle={onToggle} />)}
+              {rows.map((s, i) => <ScheduleRow key={s.id} s={s} last={i === rows.length - 1} onPick={onPick} projMeta={p} onToggle={onToggle} onDelete={onDelete} />)}
             </div>
           </div>
         );
@@ -665,6 +670,16 @@ export default function Scheduler() {
     }
   }, []);
 
+  const onDelete = React.useCallback(async (id: string) => {
+    const prev = schedules;
+    setSchedules(p => p.filter(s => s.id !== id));
+    try {
+      await api.deleteSchedule(id);
+    } catch {
+      setSchedules(prev); // restore on failure
+    }
+  }, [schedules]);
+
   const onCreateSchedule = React.useCallback(async (data: { title: string; time: string; cadence: string }) => {
     setSheetOpen(false);
     try {
@@ -713,7 +728,7 @@ export default function Scheduler() {
         <div style={{ flex: 1, minHeight: 0, overflowY: view === 'list' ? 'auto' : 'hidden', paddingBottom: view === 'list' ? 28 : 0 }}>
           {view === 'calendar'
             ? <CalendarView nowTime={nowTime} onPick={openEdit} />
-            : <ListView onPick={openEdit} rows={rows} projMeta={projMeta} onToggle={onToggle} />}
+            : <ListView onPick={openEdit} rows={rows} projMeta={projMeta} onToggle={onToggle} onDelete={onDelete} />}
         </div>
       </div>
 

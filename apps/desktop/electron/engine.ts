@@ -1,18 +1,36 @@
 /* Local engines — jobs execute ON THIS MAC on the operator's own logins:
    - claude → Claude Agent SDK riding the Claude Code subscription (`claude login`)
-   - codex  → `codex exec` riding the Codex (ChatGPT) sign-in
+             or, if only an Anthropic API key is connected, on that key.
+   - codex  → `codex exec` riding the Codex (ChatGPT) sign-in.
    Routing decides which engine plays which role (master agent / reviewer);
    a per-job override can force either. The reviewer role, when enabled, runs a
-   real second pass on the other engine and appends its verdict to the output. */
+   real second pass on the other engine and appends its verdict to the output.
 
-import { execFileSync, spawn } from 'node:child_process';
+   engineStatus() is the SINGLE source of truth for "is this engine runnable" —
+   the Settings pane, the run path, and every error string read from it, so the
+   UI can never claim "signed in" in one place and "not signed in" in another. */
+
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Store, Job, Effort, EngineId } from './store.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
+import type { Providers } from './providers.js';
 
+const require = createRequire(__filename);
 const EFFORT_TURNS: Record<string, number> = { fast: 2, balanced: 4, deep: 8, max: 16 };
+const STREAM_THROTTLE_MS = 800;
+
+export interface EngineStatus {
+  engine: EngineId;
+  available: boolean;
+  method: 'subscription' | 'apiKey' | 'none';
+  detail: string;
+  /** Actionable hint when unavailable (empty when available). */
+  reason: string;
+}
 
 interface EngineRun {
   text: string;
@@ -21,44 +39,55 @@ interface EngineRun {
   model: string;
 }
 
-function workDirFor(projectName?: string): string {
-  const safe = (projectName || 'default').replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
+interface RunHooks {
+  /** Live partial output (full text so far). Persisted+emitted, throttled, by the caller. */
+  onText?: (full: string) => void;
+  signal?: AbortSignal;
+  /** Receives the child process for codex so the caller can kill it on cancel. */
+  onChild?: (child: ChildProcess) => void;
+}
+
+class CancelledError extends Error {
+  constructor() { super('cancelled'); this.name = 'CancelledError'; }
+}
+
+function workDirFor(project?: { name?: string; path?: string }): string {
+  // A coding project with a real folder/clone runs IN that folder.
+  if (project?.path && existsSync(project.path)) return project.path;
+  const safe = (project?.name || 'default').replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
   const dir = path.join(homedir(), 'Maestro', safe);
   try { mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
   return dir;
 }
 
-/* ── Claude (Agent SDK on the subscription login) ───────────────────── */
-async function runClaude(prompt: string, cwd: string, effort: Effort, maxTurnsOverride?: number): Promise<EngineRun> {
-  const { query } = await import('@anthropic-ai/claude-agent-sdk');
-  const it = query({
-    prompt,
-    options: { cwd, maxTurns: maxTurnsOverride ?? EFFORT_TURNS[effort] ?? 4, permissionMode: 'bypassPermissions' },
-  });
-  let text = '';
-  let usage: { input_tokens?: number; output_tokens?: number } | null = null;
-  let cost = 0;
-  let model = 'claude';
-  for await (const raw of it as AsyncIterable<Record<string, unknown>>) {
-    const m = raw as { type?: string; message?: { content?: { type: string; text?: string }[]; model?: string }; usage?: { input_tokens?: number; output_tokens?: number }; total_cost_usd?: number; result?: unknown };
-    if (m.type === 'assistant' && m.message?.content) {
-      for (const b of m.message.content) if (b.type === 'text' && b.text) text += b.text;
-      model = m.message.model ?? model;
-    } else if (m.type === 'result') {
-      usage = m.usage ?? usage;
-      cost = m.total_cost_usd ?? 0;
-      if (typeof m.result === 'string' && m.result) text = m.result;
-    }
+/* ── Claude binary resolution (bundled SDK binary first) ─────────────── */
+let claudePath: string | null | undefined;
+export function resolveClaude(): string | null {
+  if (claudePath !== undefined) return claudePath;
+  // 1) The binary the SDK bundles for this platform/arch (always present in node_modules).
+  try {
+    const pkg = require.resolve(`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/package.json`);
+    const cand = path.join(path.dirname(pkg), 'claude');
+    if (existsSync(cand)) { claudePath = cand; return claudePath; }
+  } catch { /* not bundled for this platform — fall through */ }
+  // 2) A `claude` on the login shell PATH.
+  try {
+    const found = execFileSync('/bin/zsh', ['-lc', 'command -v claude'], { encoding: 'utf8' }).trim();
+    if (found && existsSync(found)) { claudePath = found; return claudePath; }
+  } catch { /* none */ }
+  // 3) Common install locations.
+  for (const cand of [
+    path.join(homedir(), '.local', 'bin', 'claude'),
+    '/opt/homebrew/bin/claude',
+    '/usr/local/bin/claude',
+  ]) {
+    if (existsSync(cand)) { claudePath = cand; return claudePath; }
   }
-  return {
-    text: text || '(no output)',
-    tokens: (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0),
-    cost: Math.round(cost * 100) / 100,
-    model,
-  };
+  claudePath = null;
+  return claudePath;
 }
 
-/* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
+/* ── Codex binary resolution ─────────────────────────────────────────── */
 let codexPath: string | null | undefined;
 export function resolveCodex(): string | null {
   if (codexPath !== undefined) return codexPath;
@@ -78,11 +107,77 @@ export function resolveCodex(): string | null {
   }
   return codexPath ?? null;
 }
-export function codexAvailable(): boolean {
-  return codexLoggedIn() && resolveCodex() !== null;
+
+function abortControllerFromSignal(signal: AbortSignal): AbortController {
+  const ac = new AbortController();
+  if (signal.aborted) ac.abort();
+  else signal.addEventListener('abort', () => ac.abort(), { once: true });
+  return ac;
 }
 
-function runCodex(prompt: string, cwd: string, readOnly = false): Promise<EngineRun> {
+/* ── Claude (Agent SDK on the subscription login or a connected key) ──── */
+async function runClaude(
+  prompt: string, cwd: string, effort: Effort,
+  apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
+): Promise<EngineRun> {
+  const { query } = await import('@anthropic-ai/claude-agent-sdk');
+  const binary = resolveClaude();
+  let stderrTail = '';
+  const it = query({
+    prompt,
+    options: {
+      cwd,
+      maxTurns: maxTurnsOverride ?? EFFORT_TURNS[effort] ?? 4,
+      permissionMode: 'bypassPermissions',
+      includePartialMessages: !!hooks.onText,
+      ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
+      ...(apiKey ? { env: { ...process.env, ANTHROPIC_API_KEY: apiKey } as NodeJS.ProcessEnv } : {}),
+      ...(hooks.signal ? { abortController: abortControllerFromSignal(hooks.signal) } : {}),
+      stderr: (d: string) => { stderrTail = (stderrTail + d).slice(-2000); },
+    },
+  });
+  let text = '';
+  let streamed = '';
+  let usage: { input_tokens?: number; output_tokens?: number } | null = null;
+  let cost = 0;
+  let model = 'claude';
+  try {
+    for await (const raw of it as AsyncIterable<Record<string, unknown>>) {
+      if (hooks.signal?.aborted) throw new CancelledError();
+      const m = raw as {
+        type?: string;
+        message?: { content?: { type: string; text?: string }[]; model?: string };
+        event?: { type?: string; delta?: { type?: string; text?: string } };
+        usage?: { input_tokens?: number; output_tokens?: number };
+        total_cost_usd?: number; result?: unknown;
+      };
+      if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
+        streamed += m.event.delta.text ?? '';
+        hooks.onText?.(streamed);
+      } else if (m.type === 'assistant' && m.message?.content) {
+        for (const b of m.message.content) if (b.type === 'text' && b.text) text += b.text;
+        model = m.message.model ?? model;
+      } else if (m.type === 'result') {
+        usage = m.usage ?? usage;
+        cost = m.total_cost_usd ?? 0;
+        if (typeof m.result === 'string' && m.result) text = m.result;
+      }
+    }
+  } catch (e) {
+    if (e instanceof CancelledError || hooks.signal?.aborted) throw new CancelledError();
+    const detail = stderrTail.trim();
+    throw new Error(`${e instanceof Error ? e.message : String(e)}${detail ? `\n${detail}` : ''}`);
+  }
+  return {
+    text: text || streamed || '(no output)',
+    tokens: (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0),
+    cost: Math.round(cost * 1000) / 1000,
+    model,
+  };
+}
+
+/* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
+function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex CLI not found on this Mac'), { statusCode: 503 }));
   const outFile = path.join(tmpdir(), `maestro-codex-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
@@ -94,14 +189,42 @@ function runCodex(prompt: string, cwd: string, readOnly = false): Promise<Engine
   ];
   return new Promise<EngineRun>((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    hooks.onChild?.(child);
     let stdout = '';
     let stderr = '';
-    const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 15 * 60 * 1000);
-    child.stdout.on('data', (d: Buffer) => { stdout += String(d); });
+    let streamed = '';
+    let buf = '';
+    const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 30 * 60 * 1000);
+    const onAbort = () => { try { child.kill('SIGTERM'); } catch { /* gone */ } };
+    if (hooks.signal) {
+      if (hooks.signal.aborted) onAbort();
+      else hooks.signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const consumeLine = (line: string) => {
+      const t = line.trim();
+      if (!t) return;
+      try {
+        const ev = JSON.parse(t) as { type?: string; item?: { type?: string; text?: string; content?: string } };
+        // Stream the agent's message text as it arrives (event schema is best-effort;
+        // the -o outfile remains the authoritative final text).
+        const item = ev.item;
+        if (item && (item.type === 'agent_message' || item.type === 'message') && (item.text || item.content)) {
+          streamed += (item.text ?? item.content ?? '');
+          hooks.onText?.(streamed);
+        }
+      } catch { /* non-JSON line */ }
+    };
+    child.stdout.on('data', (d: Buffer) => {
+      stdout += String(d);
+      buf += String(d);
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) { consumeLine(buf.slice(0, nl)); buf = buf.slice(nl + 1); }
+    });
     child.stderr.on('data', (d: Buffer) => { stderr += String(d); });
     child.on('error', (e) => { clearTimeout(killer); reject(Object.assign(new Error(`Codex failed to start: ${e.message}`), { statusCode: 500 })); });
-    child.on('close', (code) => {
+    child.on('close', (code, sig) => {
       clearTimeout(killer);
+      if (hooks.signal?.aborted) { reject(new CancelledError()); return; }
       let tokens = 0;
       for (const line of stdout.split('\n')) {
         const t = line.trim();
@@ -115,24 +238,62 @@ function runCodex(prompt: string, cwd: string, readOnly = false): Promise<Engine
       try { text = readFileSync(outFile, 'utf8').trim(); } catch { /* no file */ }
       try { rmSync(outFile, { force: true }); } catch { /* best effort */ }
       if (code !== 0 && !text) {
-        reject(Object.assign(new Error(`Codex exited ${code}: ${stderr.slice(0, 300) || 'no output'}`), { statusCode: 500 }));
+        reject(Object.assign(new Error(`Codex exited ${code ?? sig}: ${stderr.slice(0, 300) || 'no output'}`), { statusCode: 500 }));
         return;
       }
       // Subscription run — Codex doesn't bill per-token, so cost stays 0.
-      resolve({ text: text || '(no output)', tokens, cost: 0, model: 'codex' });
+      resolve({ text: text || streamed || '(no output)', tokens, cost: 0, model: 'codex' });
     });
   });
 }
 
-/* ── Engine selection + the job runner ──────────────────────────────── */
-export function engineAvailable(engine: EngineId): boolean {
-  return engine === 'claude' ? claudeLoggedIn() : codexAvailable();
-}
-
+/* ── The job runner + the single status source ──────────────────────── */
 const ENGINE_LABEL: Record<EngineId, string> = { claude: 'Claude Code', codex: 'Codex' };
 
 export class LocalEngine {
-  constructor(private store: Store, private emit: (name: string, data: unknown) => void) {}
+  /** jobId → live cancel handle (abort for claude, child for codex). */
+  private running = new Map<string, { ac: AbortController; child?: ChildProcess }>();
+
+  constructor(private store: Store, private emit: (name: string, data: unknown) => void, private providers?: Providers) {}
+
+  /** Is this engine actually runnable right now, and if not, exactly why. */
+  status(engine: EngineId): EngineStatus {
+    if (engine === 'claude') {
+      if (claudeLoggedIn()) return { engine, available: true, method: 'subscription', detail: 'Claude Code login', reason: '' };
+      const key = this.providers?.getLocalKey('anthropic');
+      if (key) return { engine, available: true, method: 'apiKey', detail: 'Anthropic API key', reason: '' };
+      return { engine, available: false, method: 'none', detail: 'Not signed in', reason: 'Run `claude login` once on this Mac, or add an Anthropic API key in Settings → Accounts.' };
+    }
+    // codex
+    const loggedIn = codexLoggedIn();
+    const bin = resolveCodex();
+    if (loggedIn && bin) return { engine, available: true, method: 'subscription', detail: 'Codex (ChatGPT) login', reason: '' };
+    if (!bin) return { engine, available: false, method: 'none', detail: 'CLI not found', reason: 'Install the Codex CLI (`npm i -g @openai/codex`) so it is on your PATH.' };
+    return { engine, available: false, method: 'none', detail: 'Not signed in', reason: 'Sign into Codex (`codex login`) on this Mac.' };
+  }
+
+  statuses(): Record<EngineId, EngineStatus> {
+    return { claude: this.status('claude'), codex: this.status('codex') };
+  }
+
+  available(engine: EngineId): boolean { return this.status(engine).available; }
+
+  /** Cancel a running job. Returns the updated (cancelled) job, or null if not running. */
+  cancel(jobId: string): Job | null {
+    const h = this.running.get(jobId);
+    if (!h) return null;
+    h.ac.abort();
+    try { h.child?.kill('SIGTERM'); } catch { /* gone */ }
+    this.running.delete(jobId);
+    const job = this.store.getJob(jobId);
+    if (!job || job.status !== 'running') return job ?? null;
+    const cancelled = this.store.updateJob(jobId, { status: 'cancelled', phase: 'Cancelled', stage: '', error: null });
+    this.emit('job', cancelled);
+    this.store.pushEvent({ kind: 'job-cancelled', title: `Cancelled: ${cancelled.title}`, projectId: cancelled.projectId, jobId });
+    return cancelled;
+  }
+
+  isRunning(jobId: string): boolean { return this.running.has(jobId); }
 
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
   async run(jobId: string, opts: { effort?: Effort; engine?: EngineId } = {}): Promise<Job> {
@@ -142,66 +303,130 @@ export class LocalEngine {
     const routing = this.store.routing();
 
     let master: EngineId = opts.engine ?? routing.master;
-    if (!engineAvailable(master)) {
+    if (!this.available(master)) {
       const other: EngineId = master === 'claude' ? 'codex' : 'claude';
-      if (!opts.engine && engineAvailable(other)) {
+      if (!opts.engine && this.available(other)) {
         master = other; // routing target unavailable — fall back to the signed-in engine
       } else {
-        const hint = master === 'claude' ? 'run `claude login` once on this Mac' : 'sign into Codex (`codex login`) on this Mac';
-        const failed = this.store.updateJob(jobId, { status: 'failed', phase: 'Failed', stage: '', error: `${ENGINE_LABEL[master]} is not signed in — ${hint}, then retry.` });
+        const failed = this.store.updateJob(jobId, { status: 'failed', phase: 'Failed', stage: '', engine: master, error: `${ENGINE_LABEL[master]} is unavailable — ${this.status(master).reason}` });
         this.emit('job', failed);
+        this.store.pushEvent({ kind: 'job-failed', title: `Failed: ${failed.title}`, subtitle: failed.error ?? undefined, projectId: failed.projectId, jobId });
         return failed;
       }
     }
 
+    const ac = new AbortController();
+    const handle: { ac: AbortController; child?: ChildProcess } = { ac };
+    this.running.set(jobId, handle);
+
     let cur = this.store.updateJob(jobId, {
-      status: 'running', phase: 'Working', progress: 20, output: null, error: null,
+      status: 'running', phase: 'Working', progress: 20, output: '', error: null, engine: master,
       stage: `running on this Mac via ${ENGINE_LABEL[master]}…`,
     });
     this.emit('job', cur);
 
+    // Throttled live-output writer (persist + emit at most every STREAM_THROTTLE_MS).
+    let lastFlush = 0;
+    let pending: string | null = null;
+    const flush = (full: string) => {
+      pending = full;
+      const t = Date.now();
+      if (t - lastFlush < STREAM_THROTTLE_MS) return;
+      lastFlush = t;
+      const u = this.store.updateJob(jobId, { output: pending, progress: Math.min(70, 20 + Math.floor(pending.length / 80)) });
+      this.emit('job', u);
+    };
+
     try {
       const effort = opts.effort ?? cur.effort;
-      const cwd = workDirFor(project?.name);
+      const cwd = workDirFor(project);
       const prompt = project?.instructions ? `${project.instructions}\n\n---\n\n${cur.input}` : cur.input;
+      const anthropicKey = this.status(master).method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined;
 
-      const main = master === 'claude' ? await runClaude(prompt, cwd, effort) : await runCodex(prompt, cwd);
+      const hooks: RunHooks = {
+        signal: ac.signal,
+        onText: (full) => flush(full),
+        onChild: (child) => { handle.child = child; },
+      };
+      const main = master === 'claude'
+        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks)
+        : await runCodex(prompt, cwd, hooks);
+
       let output = main.text;
       let tokens = main.tokens;
       let cost = main.cost;
+      const model = main.model;
 
       // Reviewer pass — a REAL second opinion from the configured engine.
       const reviewer = routing.reviewer;
-      if (reviewer !== 'off' && engineAvailable(reviewer)) {
-        cur = this.store.updateJob(jobId, { progress: 80, stage: `reviewer pass via ${ENGINE_LABEL[reviewer]}…` });
+      let reviewVerdict: 'approved' | 'needs-work' | null = null;
+      if (reviewer !== 'off' && this.available(reviewer) && !ac.signal.aborted) {
+        cur = this.store.updateJob(jobId, { progress: 85, stage: `reviewer pass via ${ENGINE_LABEL[reviewer]}…` });
         this.emit('job', cur);
         try {
           const reviewPrompt =
             `You are the reviewer. Briefly review the result below for correctness and completeness (3-5 tight bullets), ` +
             `then end with exactly one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".\n\n` +
             `## Task\n${cur.input}\n\n## Result\n${output.slice(0, 12000)}`;
-          const review = reviewer === 'claude' ? await runClaude(reviewPrompt, cwd, 'fast', 1) : await runCodex(reviewPrompt, cwd, true);
+          const review = reviewer === 'claude'
+            ? await runClaude(reviewPrompt, cwd, 'fast', this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined, 1, {})
+            : await runCodex(reviewPrompt, cwd, {}, true);
           output += `\n\n―― Reviewer (${ENGINE_LABEL[reviewer]}) ――\n${review.text}`;
           tokens += review.tokens;
-          cost = Math.round((cost + review.cost) * 100) / 100;
+          cost = Math.round((cost + review.cost) * 1000) / 1000;
+          reviewVerdict = /verdict:\s*needs\s*work/i.test(review.text) ? 'needs-work' : 'approved';
         } catch (re) {
+          if (re instanceof CancelledError) throw re;
           output += `\n\n―― Reviewer (${ENGINE_LABEL[reviewer]}) ――\n(review failed: ${re instanceof Error ? re.message : String(re)})`;
         }
       }
 
       const done = this.store.updateJob(jobId, {
         status: 'done', phase: 'Done', progress: 100, stage: '',
-        output, tokens, cost,
+        output, tokens, cost, model,
       });
+      this.running.delete(jobId);
       this.emit('job', done);
+      this.store.pushEvent({ kind: 'job-done', title: `Done: ${done.title}`, projectId: done.projectId, jobId });
+
+      // Reviewer flagged NEEDS WORK → open a real linked approval gate.
+      if (reviewVerdict === 'needs-work' && reviewer !== 'off') {
+        const ap = this.store.createApproval({
+          projectId: done.projectId, kind: 'review', jobId,
+          title: `Reviewer flagged: ${done.title}`,
+          subtitle: `${ENGINE_LABEL[reviewer]} review · needs work`,
+          detail: output.slice(-2000),
+        });
+        this.emit('approval', ap);
+        this.store.pushEvent({ kind: 'approval-created', title: ap.title, projectId: done.projectId, jobId });
+      }
       return done;
     } catch (e) {
+      this.running.delete(jobId);
+      if (e instanceof CancelledError || ac.signal.aborted) {
+        const existing = this.store.getJob(jobId);
+        if (existing && existing.status !== 'cancelled') {
+          const c = this.store.updateJob(jobId, { status: 'cancelled', phase: 'Cancelled', stage: '', error: null, output: pending ?? existing.output });
+          this.emit('job', c);
+          this.store.pushEvent({ kind: 'job-cancelled', title: `Cancelled: ${c.title}`, projectId: c.projectId, jobId });
+          return c;
+        }
+        return existing as Job;
+      }
       const failed = this.store.updateJob(jobId, {
         status: 'failed', phase: 'Failed', stage: '',
         error: e instanceof Error ? e.message : String(e),
       });
       this.emit('job', failed);
+      this.store.pushEvent({ kind: 'job-failed', title: `Failed: ${failed.title}`, subtitle: failed.error ?? undefined, projectId: failed.projectId, jobId });
       return failed;
     }
   }
 }
+
+/* Back-compat free functions (used by cron) — prefer LocalEngine.status(). */
+export function engineAvailable(engine: EngineId): boolean {
+  if (engine === 'claude') return claudeLoggedIn();
+  return codexLoggedIn() && resolveCodex() !== null;
+}
+export function codexAvailable(): boolean { return codexLoggedIn() && resolveCodex() !== null; }

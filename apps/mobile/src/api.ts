@@ -33,6 +33,8 @@ export interface CostsData {
   byEngine: { engine: string; total: number; jobs: number; tokens: number }[];
   includedCodexRuns: number; claudeRuns: number;
 }
+export interface EngineStatus { engine: EngineId; available: boolean; method: 'subscription' | 'apiKey' | 'none'; detail: string; reason: string }
+export type EngineStatuses = Record<EngineId, EngineStatus>;
 export interface Schedule { id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean; nextRun: number | null; createdAt: number }
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
@@ -109,6 +111,7 @@ export const api = {
   budget: (workspaceId?: string) => req<BudgetData>('/api/budget' + qp({ workspaceId })),
   costs: () => req<CostsData>('/api/costs'),
   listEvents: () => req<AppEvent[]>('/api/events'),
+  engineStatus: () => req<EngineStatuses>('/api/engine-status'),
 
   listWorkspaces: () => req<Workspace[]>('/api/workspaces'),
   createWorkspace: (name: string, budgetCap?: number) => req<Workspace>('/api/workspaces', { method: 'POST', body: JSON.stringify({ name, budgetCap }) }),
