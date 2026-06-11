@@ -6,7 +6,9 @@ import { LocalEngine } from './engine.js';
 import { MediaEngine } from './media.js';
 import { ResearchEngine } from './research.js';
 import { PublishingEngine } from './publishing.js';
+import { TelegramBot } from './telegram.js';
 import { Providers } from './providers.js';
+import type { Approval } from './store.js';
 import { createDispatch } from './localApi.js';
 import { RelayClient } from './relay.js';
 import { CronRunner } from './cron.js';
@@ -52,11 +54,14 @@ app.whenReady().then(() => {
   applyLoginItem(store.getSettings().openAtLogin);
 
   let relay: RelayClient | null = null;
+  let telegram: TelegramBot | null = null;
   const emit = (name: string, data: unknown) => {
     for (const w of BrowserWindow.getAllWindows()) {
       try { w.webContents.send('maestro:event', { name, data }); } catch { /* window closing */ }
     }
     if (name === 'settings' && data && typeof data === 'object') applyLoginItem(!!(data as { openAtLogin?: boolean }).openAtLogin);
+    // A new pending approval (e.g. reviewer NEEDS WORK) → push to Telegram gates.
+    if (name === 'approval' && telegram && (data as Approval)?.status === 'pending') telegram.notifyApproval(data as Approval);
     relay?.event(name, data);
     relay?.pushSnapshot();
   };
@@ -66,7 +71,9 @@ app.whenReady().then(() => {
   media.resumeOnBoot();
   const research = new ResearchEngine(store, engine, emit);
   const publishing = new PublishingEngine(store, emit);
-  const dispatch = createDispatch(store, engine, media, research, publishing, providers, emit, RELAY_URL);
+  telegram = new TelegramBot(store, engine, providers, emit);
+  telegram.resumeOnBoot();
+  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, providers, emit, RELAY_URL);
 
   relay = new RelayClient({
     url: RELAY_URL,
@@ -80,7 +87,7 @@ app.whenReady().then(() => {
 
   const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs));
   cron.start();
-  app.on('before-quit', () => { cron.stop(); relay?.stop(); });
+  app.on('before-quit', () => { cron.stop(); relay?.stop(); telegram?.stop(); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {

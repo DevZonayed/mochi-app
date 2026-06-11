@@ -70,6 +70,21 @@ export class Providers {
     this.store.deleteProviderKey(provider);
   }
 
+  /** Store an already-trusted secret (e.g. a validated bot token) encrypted,
+      without the provider-key validation path. Returns the stored last4. */
+  setRawKey(provider: string, secret: string): string {
+    if (!safeStorage.isEncryptionAvailable()) throw Object.assign(new Error('Keychain encryption unavailable'), { statusCode: 500 });
+    const cipherB64 = safeStorage.encryptString(secret).toString('base64');
+    this.store.setProviderKey(provider, cipherB64, secret.slice(-4));
+    return secret.slice(-4);
+  }
+  getRawKey(provider: string): string | undefined {
+    const cipher = this.store.getProviderKeyCipher(provider);
+    if (!cipher) return undefined;
+    try { return safeStorage.decryptString(Buffer.from(cipher, 'base64')); } catch { return undefined; }
+  }
+  clearKey(provider: string): void { this.store.deleteProviderKey(provider); }
+
   getLocalKey(provider: ProviderId): string | undefined {
     const cipher = this.store.getProviderKeyCipher(provider);
     if (!cipher) return undefined;

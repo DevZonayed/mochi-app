@@ -7,6 +7,7 @@ import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
 import type { ResearchEngine } from './research.js';
 import type { PublishingEngine } from './publishing.js';
+import type { TelegramBot } from './telegram.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable } from './git.js';
 
@@ -21,7 +22,7 @@ function asEngine(v: unknown): EngineId | undefined {
   return typeof v === 'string' && ENGINE_VALUES.has(v) ? (v as EngineId) : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -257,6 +258,36 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'exportDraft': return publishing.exportDraft(String(p.id ?? ''));
       case 'markPublished': return publishing.markPublished(String(p.id ?? ''));
+
+      // ── Comms (Telegram bot) ───────────────────────────────────
+      case 'commsStatus': return store.commsStatus();
+      case 'listChatBindings': return store.listChatBindings();
+      case 'listPendingChats': return store.listPendingChats();
+      case 'listCommEvents': return store.listCommEvents();
+      case 'connectTelegram': {
+        if (!p.token || typeof p.token !== 'string') bad('token required');
+        return telegram.connect(p.token as string);
+      }
+      case 'disconnectTelegram': { telegram.disconnect(); return { ok: true }; }
+      case 'bindChat': {
+        if (!p.chatId) bad('chatId required');
+        const pending = store.listPendingChats().find(c => c.chatId === String(p.chatId));
+        const perms = (p.permissions && typeof p.permissions === 'object') ? p.permissions as Record<string, boolean> : {};
+        const b = store.bindChat({
+          chatId: String(p.chatId), name: String(p.name ?? pending?.name ?? p.chatId), kind: (pending?.kind ?? 'dm'),
+          projectId: (p.projectId as string) ?? null,
+          permissions: { startJobs: perms.startJobs ?? true, receiveReports: perms.receiveReports ?? true, approveGates: perms.approveGates ?? false },
+        });
+        emit('comms', store.commsStatus());
+        return b;
+      }
+      case 'unbindChat': { store.unbindChat(String(p.chatId ?? '')); emit('comms', store.commsStatus()); return { ok: true }; }
+      case 'setChatPermissions': {
+        if (!p.chatId || !p.permissions || typeof p.permissions !== 'object') bad('chatId and permissions required');
+        const b = store.setChatPermissions(String(p.chatId), p.permissions as Record<string, boolean>);
+        emit('comms', store.commsStatus());
+        return b;
+      }
 
       // ── Engine status (THE single source of truth) ────────────
       case 'engineStatus': return engine.statuses();

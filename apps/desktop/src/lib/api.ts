@@ -199,6 +199,14 @@ export interface PublishDraft {
   status: PublishStatus; provenance: string; exportedPaths: string[]; createdAt: number; updatedAt: number;
 }
 export interface PublishLedgerRow { id: string; draftId: string; at: number; platforms: string[]; action: 'exported' | 'published-manual'; ok: boolean; hash: string; paths: string[] }
+export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; approveGates: boolean }
+export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; projectId: string | null; permissions: ChatPermissions; boundAt: number }
+export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
+export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
+export interface CommsStatus {
+  telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
+  whatsapp: { connected: false };
+}
 export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
 export interface FolderInspect { ok: boolean; path: string; info: RepoInfo; error?: string }
 export type CloneEvent =
@@ -394,6 +402,19 @@ export const api = {
   exportDraft: (id: string) => call<PublishDraft>('exportDraft', { id }, () => req<PublishDraft>(`/api/publish/drafts/${encodeURIComponent(id)}/export`, { method: 'POST' })),
   markPublished: (id: string) => call<PublishDraft>('markPublished', { id }, () => req<PublishDraft>(`/api/publish/drafts/${encodeURIComponent(id)}/published`, { method: 'POST' })),
   deleteDraft: (id: string) => call<{ ok: boolean }>('deleteDraft', { id }, () => req<{ ok: boolean }>(`/api/publish/drafts/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
+  // Comms (Telegram bot)
+  commsStatus: () => call<CommsStatus>('commsStatus', {}, () => req<CommsStatus>('/api/comms/status')),
+  listChatBindings: () => call<ChatBinding[]>('listChatBindings', {}, () => req<ChatBinding[]>('/api/comms/bindings')),
+  listPendingChats: () => call<PendingChat[]>('listPendingChats', {}, () => req<PendingChat[]>('/api/comms/pending')),
+  listCommEvents: () => call<CommEvent[]>('listCommEvents', {}, () => req<CommEvent[]>('/api/comms/events')),
+  connectTelegram: (token: string) => call<{ username: string }>('connectTelegram', { token }, () => req<{ username: string }>('/api/comms/telegram/connect', { method: 'POST', body: JSON.stringify({ token }) })),
+  disconnectTelegram: () => call<{ ok: boolean }>('disconnectTelegram', {}, () => req<{ ok: boolean }>('/api/comms/telegram/disconnect', { method: 'POST' })),
+  bindChat: (input: { chatId: string; name?: string; projectId?: string | null; permissions?: Partial<ChatPermissions> }) =>
+    call<ChatBinding>('bindChat', { ...input }, () => req<ChatBinding>('/api/comms/bind', { method: 'POST', body: JSON.stringify(input) })),
+  unbindChat: (chatId: string) => call<{ ok: boolean }>('unbindChat', { chatId }, () => req<{ ok: boolean }>('/api/comms/unbind', { method: 'POST', body: JSON.stringify({ chatId }) })),
+  setChatPermissions: (chatId: string, permissions: Partial<ChatPermissions>) =>
+    call<ChatBinding>('setChatPermissions', { chatId, permissions }, () => req<ChatBinding>('/api/comms/permissions', { method: 'POST', body: JSON.stringify({ chatId, permissions }) })),
+
   /** Native import picker — desktop only; resolves the imported asset or null. */
   importAsset: async (projectId: string | null): Promise<Asset | null> => {
     if (!bridge?.importAsset) return null;
@@ -468,7 +489,7 @@ export const api = {
     call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
@@ -478,6 +499,7 @@ export const api = {
         if (name === 'asset' && handlers.onAsset) handlers.onAsset(data as Asset);
         if (name === 'briefs' && handlers.onBriefs) handlers.onBriefs(data as Brief[]);
         if (name === 'publishDraft' && handlers.onPublishDraft) handlers.onPublishDraft(data as PublishDraft);
+        if (name === 'comms' && handlers.onComms) handlers.onComms(data as CommsStatus);
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
@@ -489,6 +511,7 @@ export const api = {
     if (handlers.onAsset) es.addEventListener('asset', (e: MessageEvent) => { try { handlers.onAsset!(JSON.parse(e.data) as Asset); } catch { /* ignore */ } });
     if (handlers.onBriefs) es.addEventListener('briefs', (e: MessageEvent) => { try { handlers.onBriefs!(JSON.parse(e.data) as Brief[]); } catch { /* ignore */ } });
     if (handlers.onPublishDraft) es.addEventListener('publishDraft', (e: MessageEvent) => { try { handlers.onPublishDraft!(JSON.parse(e.data) as PublishDraft); } catch { /* ignore */ } });
+    if (handlers.onComms) es.addEventListener('comms', (e: MessageEvent) => { try { handlers.onComms!(JSON.parse(e.data) as CommsStatus); } catch { /* ignore */ } });
     return () => es.close();
   },
   /** Convenience: subscribe to job updates only. */

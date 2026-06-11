@@ -248,6 +248,16 @@ export function buildServer(): FastifyInstance {
   app.post('/api/publish/drafts/:id/export', async (req, reply) => forward(reply, 'exportDraft', { id: (req.params as { id: string }).id }));
   app.post('/api/publish/drafts/:id/published', async (req, reply) => forward(reply, 'markPublished', { id: (req.params as { id: string }).id }));
   app.post('/api/publish/drafts/:id/delete', async (req, reply) => forward(reply, 'deleteDraft', { id: (req.params as { id: string }).id }));
+  // ── Comms (Telegram) — status/bindings mirror; actions forward to the Mac ──
+  app.get('/api/comms/status', async () => st()?.commsStatus ?? { telegram: { connected: false, botUsername: null, tokenLast4: null, messagesToday: 0, bindings: 0, pending: 0 }, whatsapp: { connected: false } });
+  app.get('/api/comms/bindings', async () => st()?.chatBindings ?? []);
+  app.get('/api/comms/pending', async () => st()?.pendingChats ?? []);
+  app.get('/api/comms/events', async () => st()?.commEvents ?? []);
+  app.post('/api/comms/telegram/connect', async (req, reply) => forward(reply, 'connectTelegram', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/comms/telegram/disconnect', async (_req, reply) => forward(reply, 'disconnectTelegram', {}));
+  app.post('/api/comms/bind', async (req, reply) => forward(reply, 'bindChat', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/comms/unbind', async (req, reply) => forward(reply, 'unbindChat', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/comms/permissions', async (req, reply) => forward(reply, 'setChatPermissions', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/assets/generate', async (req, reply) => forward(reply, 'generateAsset', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/assets/:id/cancel', async (req, reply) => forward(reply, 'cancelAsset', { id: (req.params as { id: string }).id }));
   app.post('/api/assets/:id/approve', async (req, reply) => forward(reply, 'approveAsset', { id: (req.params as { id: string }).id }));
