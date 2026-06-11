@@ -136,9 +136,45 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const proj = store.getProject(String(p.id ?? ''));
         return { path: proj?.path ?? null };
       }
+      case 'deleteProject': {
+        store.deleteProject(String(p.id ?? ''));
+        emit('project', { id: String(p.id ?? ''), deleted: true });
+        return { ok: true };
+      }
+
+      // ── Chat sessions (each turn is a Job with sessionId) ─────
+      case 'listSessions': return store.listSessions(p.projectId ? String(p.projectId) : undefined);
+      case 'renameSession': {
+        if (!p.title || typeof p.title !== 'string') bad('title required');
+        const s = store.updateSession(String(p.id ?? ''), { title: (p.title as string).slice(0, 60) });
+        emit('session', s);
+        return s;
+      }
+      case 'deleteSession': {
+        store.deleteSession(String(p.id ?? ''));
+        emit('session', { id: String(p.id ?? ''), deleted: true });
+        return { ok: true };
+      }
+      case 'sendChat': {
+        const projectId = String(p.projectId ?? '');
+        const text = String(p.text ?? '').trim();
+        if (!projectId || !text) bad('projectId and text required');
+        if (!store.getProject(projectId)) bad('project not found', 404);
+        let session = p.sessionId ? store.getSession(String(p.sessionId)) : undefined;
+        if (p.sessionId && !session) bad('session not found', 404);
+        if (!session) {
+          session = store.createSession(projectId, text);
+          emit('session', session);
+        }
+        const job = store.createJob(projectId, text, text.slice(0, 60), p.effort as Effort | undefined, session.id);
+        emit('job', job);
+        // Fire the run async — the reply streams in over job events.
+        void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine) });
+        return { session, job };
+      }
 
       // ── Jobs ───────────────────────────────────────────────────
-      case 'listJobs': return store.listJobs(p.projectId ? String(p.projectId) : undefined);
+      case 'listJobs': return store.listJobs(p.projectId ? String(p.projectId) : undefined, p.sessionId ? String(p.sessionId) : undefined);
       case 'getJob': {
         const j = store.getJob(String(p.id ?? ''));
         return j ?? bad('job not found', 404);

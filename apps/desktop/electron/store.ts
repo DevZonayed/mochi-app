@@ -41,6 +41,17 @@ export interface Job {
   id: string; projectId: string; title: string; status: JobStatus; phase: string; progress: number;
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
   engine?: EngineId; model?: string;
+  /** Chat turn: set when this job is one turn of a project chat session. */
+  sessionId?: string;
+  createdAt: number; updatedAt: number;
+}
+
+/** A chat thread inside a project. Each turn is a Job (sessionId set), so the
+    whole engine stack (streaming, cancel, costs, events) works per message. */
+export interface ChatSession {
+  id: string; projectId: string; title: string;
+  /** Engine continuity: Claude Agent SDK session id (Options.resume) once known. */
+  sdkSessionId?: string;
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
@@ -174,6 +185,7 @@ interface StoreData {
   workspace: Workspace | null;
   projects: Project[];
   jobs: Job[];
+  sessions: ChatSession[];
   approvals: Approval[];
   schedules: Schedule[];
   skills: Skill[];
@@ -218,6 +230,7 @@ export class Store {
       if (!this.data.accessToken) { this.data.accessToken = newPairingToken(); dirty = true; }
       if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
       if (!this.data.settings) { this.data.settings = { ...DEFAULT_SETTINGS }; dirty = true; }
+      if (!this.data.sessions) { this.data.sessions = []; dirty = true; }
       if (!this.data.assets) { this.data.assets = []; dirty = true; }
       if (!this.data.publishDrafts) { this.data.publishDrafts = []; dirty = true; }
       if (!this.data.publishLedger) { this.data.publishLedger = []; dirty = true; }
@@ -257,7 +270,7 @@ export class Store {
         deckId: id(), deckSecret: id(), accessToken: newPairingToken(),
         routing: { ...DEFAULT_ROUTING }, settings: { ...DEFAULT_SETTINGS }, catalogVersion: CATALOG_VERSION,
         workspace: null,
-        projects: [], jobs: [], approvals: [], schedules: [], skills: [], templates: [],
+        projects: [], jobs: [], sessions: [], approvals: [], schedules: [], skills: [], templates: [],
         assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
         chatBindings: [], pendingChats: [], commEvents: [],
         telegram: { offset: 0, botUsername: null, connectedAt: null },
@@ -334,18 +347,63 @@ export class Store {
     this.save();
     return cur;
   }
+  /** Remove a project + its jobs/sessions/schedules. Files on disk are untouched. */
+  deleteProject(projectId: string): void {
+    const i = this.data.projects.findIndex(p => p.id === projectId);
+    if (i === -1) throw Object.assign(new Error('project not found'), { statusCode: 404 });
+    this.data.projects.splice(i, 1);
+    this.data.jobs = this.data.jobs.filter(j => j.projectId !== projectId);
+    this.data.sessions = this.data.sessions.filter(s => s.projectId !== projectId);
+    this.data.schedules = this.data.schedules.filter(s => s.projectId !== projectId);
+    for (const a of this.data.assets) if (a.projectId === projectId) a.projectId = null;
+    this.save();
+  }
+
+  // ── Chat sessions ───────────────────────────────────────────────────
+  listSessions(projectId?: string): ChatSession[] {
+    const all = [...this.data.sessions].sort((a, b) => b.updatedAt - a.updatedAt);
+    return (projectId ? all.filter(s => s.projectId === projectId) : all).slice(0, 100);
+  }
+  getSession(sessionId: string): ChatSession | undefined { return this.data.sessions.find(s => s.id === sessionId); }
+  createSession(projectId: string, title: string): ChatSession {
+    const t = now();
+    const s: ChatSession = { id: id(), projectId, title: (title.trim() || 'New chat').slice(0, 60), createdAt: t, updatedAt: t };
+    this.data.sessions.push(s); this.save();
+    return s;
+  }
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId'>>): ChatSession {
+    const s = this.getSession(sessionId);
+    if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
+    Object.assign(s, patch, { updatedAt: now() });
+    this.save();
+    return s;
+  }
+  touchSession(sessionId: string): void {
+    const s = this.getSession(sessionId);
+    if (s) { s.updatedAt = now(); this.save(); }
+  }
+  deleteSession(sessionId: string): void {
+    const i = this.data.sessions.findIndex(s => s.id === sessionId);
+    if (i === -1) throw Object.assign(new Error('session not found'), { statusCode: 404 });
+    this.data.sessions.splice(i, 1);
+    // Turns stay in the jobs ledger (costs/audit) but leave the chat.
+    for (const j of this.data.jobs) if (j.sessionId === sessionId) j.sessionId = undefined;
+    this.save();
+  }
 
   // ── Jobs ────────────────────────────────────────────────────────────
-  listJobs(projectId?: string): Job[] {
+  listJobs(projectId?: string, sessionId?: string): Job[] {
     const all = [...this.data.jobs].sort((a, b) => b.updatedAt - a.updatedAt);
+    if (sessionId) return all.filter(j => j.sessionId === sessionId);
     return projectId ? all.filter(j => j.projectId === projectId) : all.slice(0, 200);
   }
   getJob(jobId: string): Job | undefined { return this.data.jobs.find(j => j.id === jobId); }
-  createJob(projectId: string, input: string, title = '', effort?: Effort): Job {
+  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string): Job {
     const t = now();
     const j: Job = {
       id: id(), projectId, title: title || input.slice(0, 60), status: 'pending', phase: 'Queued', progress: 0,
       input, output: null, error: null, effort: effort ?? this.data.settings.defaultEffort, cost: 0, tokens: 0, stage: '',
+      sessionId,
       createdAt: t, updatedAt: t,
     };
     this.data.jobs.push(j); this.save();
@@ -713,6 +771,7 @@ export class Store {
       workspaces: this.data.workspace ? [this.data.workspace] : [],
       projects: this.listProjects(),
       jobs: this.listJobs().map(slimJob),
+      sessions: this.listSessions(),
       approvals: this.listApprovals(),
       schedules: this.listSchedules(),
       skills: this.listSkills(),

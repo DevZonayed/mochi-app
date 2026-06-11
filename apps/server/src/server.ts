@@ -21,7 +21,8 @@ interface Snapshot {
   workspace?: unknown;
   workspaces?: unknown[];
   projects?: { id?: string }[];
-  jobs?: { id?: string; projectId?: string }[];
+  jobs?: { id?: string; projectId?: string; sessionId?: string }[];
+  sessions?: { id?: string; projectId?: string }[];
   approvals?: { id?: string; status?: string }[];
   schedules?: unknown[];
   skills?: unknown[];
@@ -275,9 +276,15 @@ export function buildServer(): FastifyInstance {
     return { branch: null, remote: p?.repoUrl ?? null, isRepo: !!p?.path };
   });
   app.get('/api/jobs', async (req) => {
-    const projectId = (req.query as { projectId?: string }).projectId;
+    const { projectId, sessionId } = req.query as { projectId?: string; sessionId?: string };
     const jobs = st()?.jobs ?? [];
+    if (sessionId) return jobs.filter((j) => j.sessionId === sessionId);
     return projectId ? jobs.filter((j) => j.projectId === projectId) : jobs;
+  });
+  app.get('/api/sessions', async (req) => {
+    const projectId = (req.query as { projectId?: string }).projectId;
+    const sessions = st()?.sessions ?? [];
+    return projectId ? sessions.filter((s) => s.projectId === projectId) : sessions;
   });
   app.get('/api/jobs/:id', async (req, reply) => {
     const j = (st()?.jobs ?? []).find((x) => x.id === (req.params as { id: string }).id);
@@ -302,6 +309,11 @@ export function buildServer(): FastifyInstance {
   app.post('/api/projects/:id/update', async (req, reply) =>
     forward(reply, 'updateProject', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/projects/clone', async (req, reply) => forward(reply, 'cloneRepo', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/projects/:id/delete', async (req, reply) => forward(reply, 'deleteProject', { id: (req.params as { id: string }).id }));
+  app.post('/api/chat', async (req, reply) => forward(reply, 'sendChat', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/sessions/:id/rename', async (req, reply) =>
+    forward(reply, 'renameSession', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
+  app.post('/api/sessions/:id/delete', async (req, reply) => forward(reply, 'deleteSession', { id: (req.params as { id: string }).id }));
   app.post('/api/settings', async (req, reply) => forward(reply, 'setSettings', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/jobs', async (req, reply) => forward(reply, 'createJob', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/jobs/run', async (req, reply) => forward(reply, 'createAndRunJob', (req.body ?? {}) as Record<string, unknown>));

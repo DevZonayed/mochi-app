@@ -16,10 +16,11 @@ import {
   EffortDial,
   EFFORT_EST,
   ModelSwitcher,
+  ProviderGlyph,
   type EffortStop,
 } from '../lib/ui';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -30,6 +31,12 @@ function shortHomePath(p: string): string {
 /* ───────────────── page-specific CSS (from Project Detail.html <style>) ───────────────── */
 const PAGE_CSS = `
   @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes caretBlink { 50% { opacity: 0; } }
+  .chat-caret { animation: caretBlink 1s steps(2) infinite; }
+  .sess-row:hover { background: var(--fill-tertiary); }
+  .sess-row .sess-x { opacity: 0; transition: opacity 120ms ease; }
+  .sess-row:hover .sess-x { opacity: 1; }
+  .sess-x:hover { color: var(--red); }
 
   .app-wallpaper {
     position: absolute; inset: 0; z-index: 0; pointer-events: none;
@@ -800,8 +807,361 @@ function SettingsTab() {
 }
 
 /* ───────────────── page assembly (from pd-app.jsx) ───────────────── */
+/* ───────────────── Chat tab — converse with the agent like a chat app ─────────────────
+   Each turn is a real Job (sessionId set): the engine streams partial output into
+   job.output, so replies render live. Sessions are first-class: rail on the left,
+   thread + composer on the right. Claude turns resume their SDK session (full
+   context); codex turns carry stitched history. */
+
+const CHAT_PROSE: React.CSSProperties = { whiteSpace: 'pre-wrap', wordBreak: 'break-word' };
+const CHAT_CODE: React.CSSProperties = {
+  margin: '6px 0', padding: '10px 12px', borderRadius: 10, background: 'var(--fill-tertiary)',
+  border: '0.5px solid var(--separator)', overflowX: 'auto', font: '400 var(--fs-caption)/1.55 var(--font-mono)', color: 'var(--ink)',
+};
+
+/** Light chat-body renderer: ``` fenced blocks become code cards, the rest stays prose. */
+function renderChatBody(text: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  const fence = /```[a-zA-Z0-9_+-]*\n?/g;
+  let idx = 0, inCode = false, key = 0;
+  let m: RegExpExecArray | null;
+  while ((m = fence.exec(text))) {
+    const chunk = text.slice(idx, m.index);
+    if (chunk.trim()) out.push(inCode
+      ? <pre key={key++} style={CHAT_CODE}>{chunk.replace(/\n$/, '')}</pre>
+      : <span key={key++} style={CHAT_PROSE}>{chunk}</span>);
+    inCode = !inCode;
+    idx = m.index + m[0].length;
+  }
+  const tail = text.slice(idx);
+  if (tail.trim()) out.push(inCode
+    ? <pre key={key++} style={CHAT_CODE}>{tail.replace(/\n$/, '')}</pre>
+    : <span key={key++} style={CHAT_PROSE}>{tail}</span>);
+  return out;
+}
+
+const fmtDuration = (ms: number): string => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+};
+
+function UserBubble({ text }: { text: string }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+      <div style={{ maxWidth: '76%', padding: '10px 14px', borderRadius: '16px 16px 4px 16px', background: 'var(--blue)',
+        color: '#fff', font: '400 var(--fs-body)/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+        {text}
+      </div>
+    </div>
+  );
+}
+
+function AssistantTurn({ job, onRetry }: { job: Job; onRetry: (input: string) => void }) {
+  const live = job.status === 'running' || job.status === 'pending';
+  const engineLabel = job.engine === 'codex' ? 'Codex' : 'Claude Code';
+  const provider = job.engine === 'codex' ? 'openai' as const : 'anthropic' as const;
+  const hasText = !!(job.output && job.output.length > 0);
+  return (
+    <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
+      <span style={{ width: 28, height: 28, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', marginTop: 2,
+        background: 'var(--fill-secondary)', color: 'var(--ink)', border: '0.5px solid var(--separator)' }}>
+        {live && !hasText ? <Spinner size={13} color="var(--purple)" /> : <ProviderGlyph provider={provider} size={15} />}
+      </span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+          <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{engineLabel}</span>
+          {job.model && job.model !== job.engine && (
+            <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{job.model}</span>
+          )}
+          {live && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)' }}>
+              <span className="breathe" style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--purple)' }} />
+              {hasText ? 'streaming' : (job.stage || 'working…')}
+            </span>
+          )}
+        </div>
+        {hasText && (
+          <div style={{ font: '400 var(--fs-body)/1.55 var(--font-text)', color: 'var(--ink)' }}>
+            {renderChatBody(job.output ?? '')}
+            {live && <span className="chat-caret" style={{ color: 'var(--purple)', fontWeight: 700 }}>▍</span>}
+          </div>
+        )}
+        {!hasText && live && (
+          <div style={{ font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink-tertiary)', fontStyle: 'italic' }}>
+            {job.stage || 'Working on it — the reply streams in here…'}
+          </div>
+        )}
+        {job.status === 'failed' && (
+          <div style={{ marginTop: 6, padding: '10px 12px', borderRadius: 10, background: 'rgba(255,59,48,0.09)',
+            border: '0.5px solid rgba(255,59,48,0.3)', font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--red)' }}>
+            {job.error ?? 'The run failed.'}
+            <button onClick={() => onRetry(job.input)} style={{ marginLeft: 10, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--red)', textDecoration: 'underline', cursor: 'pointer' }}>Retry</button>
+          </div>
+        )}
+        {job.status === 'cancelled' && (
+          <div style={{ marginTop: 4, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Stopped.</div>
+        )}
+        {job.status === 'done' && (
+          <div style={{ marginTop: 6, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>
+            {job.cost > 0 ? `$${job.cost.toFixed(2)} · ` : ''}{job.tokens > 0 ? `${job.tokens >= 1000 ? (job.tokens / 1000).toFixed(1) + 'k' : job.tokens} tok · ` : ''}{fmtDuration(job.updatedAt - job.createdAt)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ChatPane({ projectId, project }: { projectId: string | null; project: Project | null }) {
+  const [sessions, setSessions] = React.useState<ChatSession[]>([]);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [turns, setTurns] = React.useState<Job[]>([]);
+  const [text, setText] = React.useState('');
+  const [engine, setEngine] = React.useState('auto');
+  const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
+  const [renamingId, setRenamingId] = React.useState<string | null>(null);
+  const [renameVal, setRenameVal] = React.useState('');
+  const [sendError, setSendError] = React.useState('');
+  const activeRef = React.useRef<string | null>(null);
+  activeRef.current = activeId;
+  const scrollRef = React.useRef<HTMLDivElement>(null);
+  const stickBottom = React.useRef(true);
+  const taRef = React.useRef<HTMLTextAreaElement>(null);
+
+  // Sessions for this project (most recent first; open the latest by default).
+  // Reset the open thread whenever the project changes — a stale session id
+  // from another project would make sends 404.
+  React.useEffect(() => {
+    setActiveId(null);
+    setTurns([]);
+    if (!projectId) { setSessions([]); return; }
+    let alive = true;
+    api.listSessions(projectId)
+      .then(ss => { if (alive) { setSessions(ss); setActiveId(ss[0]?.id ?? null); } })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [projectId]);
+
+  // Turns of the open session (ascending — a chat thread).
+  React.useEffect(() => {
+    if (!activeId) { setTurns([]); return; }
+    let alive = true;
+    api.listJobs(undefined, activeId)
+      .then(js => { if (alive) setTurns([...js].sort((a, b) => a.createdAt - b.createdAt)); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [activeId]);
+
+  // LIVE: streamed job updates land directly in the open thread.
+  React.useEffect(() => {
+    const unsub = api.subscribe({
+      onJob: (j) => {
+        if (!j.sessionId || j.sessionId !== activeRef.current) return;
+        setTurns(ts => {
+          const i = ts.findIndex(t => t.id === j.id);
+          if (i === -1) return [...ts, j].sort((a, b) => a.createdAt - b.createdAt);
+          const next = ts.slice(); next[i] = j; return next;
+        });
+      },
+      onSession: (s) => {
+        if (s.deleted) {
+          setSessions(ss => ss.filter(x => x.id !== s.id));
+          if (activeRef.current === s.id) setActiveId(null);
+          return;
+        }
+        if (projectId && s.projectId !== projectId) return;
+        setSessions(ss => {
+          const i = ss.findIndex(x => x.id === s.id);
+          const next = i === -1 ? [s, ...ss] : ss.map(x => (x.id === s.id ? s : x));
+          return [...next].sort((a, b) => b.updatedAt - a.updatedAt);
+        });
+      },
+    });
+    return unsub;
+  }, [projectId]);
+
+  // Stick to the bottom while streaming unless the user scrolled up.
+  const onScroll = () => {
+    const el = scrollRef.current; if (!el) return;
+    stickBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+  };
+  React.useEffect(() => {
+    const el = scrollRef.current;
+    if (el && stickBottom.current) el.scrollTop = el.scrollHeight;
+  }, [turns]);
+
+  const lastTurn = turns.length ? turns[turns.length - 1] : null;
+  const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending');
+
+  const sendText = async (raw: string) => {
+    const t = raw.trim();
+    if (!t || !projectId || streaming) return;
+    setText('');
+    setSendError('');
+    if (taRef.current) taRef.current.style.height = 'auto';
+    stickBottom.current = true;
+    try {
+      const resp = await api.sendChat({
+        projectId, text: t, sessionId: activeRef.current ?? undefined,
+        effort: EFFORT_TO_API[effort],
+        ...(engine === 'claude' || engine === 'codex' ? { engine: engine as EngineId } : {}),
+      });
+      setSessions(ss => (ss.some(s => s.id === resp.session.id) ? ss : [resp.session, ...ss]));
+      if (activeRef.current !== resp.session.id) setActiveId(resp.session.id);
+      else setTurns(ts => [...ts.filter(x => x.id !== resp.job.id), resp.job].sort((a, b) => a.createdAt - b.createdAt));
+    } catch (e) {
+      setText(raw); // nothing lost — restore the draft
+      setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
+    }
+  };
+
+  const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
+
+  const newChat = () => { setActiveId(null); setTurns([]); setText(''); taRef.current?.focus(); };
+
+  const removeSession = (id: string) => {
+    void api.deleteSession(id).catch(() => {});
+    setSessions(ss => ss.filter(s => s.id !== id));
+    if (activeRef.current === id) setActiveId(null);
+  };
+
+  const commitRename = (id: string) => {
+    const title = renameVal.trim();
+    setRenamingId(null);
+    if (!title) return;
+    setSessions(ss => ss.map(s => (s.id === id ? { ...s, title } : s)));
+    void api.renameSession(id, title).catch(() => {});
+  };
+
+  const autoGrow = () => {
+    const el = taRef.current; if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = Math.min(150, el.scrollHeight) + 'px';
+  };
+
+  return (
+    <div style={{ display: 'flex', gap: 14, height: 'calc(100vh - 252px)', minHeight: 420 }}>
+      {/* sessions rail */}
+      <div style={{ width: 232, flexShrink: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-grouped)',
+        borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 12px 10px' }}>
+          <span style={{ flex: 1, font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-secondary)' }}>Chats</span>
+          <button onClick={newChat} title="New chat" style={{ width: 26, height: 26, borderRadius: 8, display: 'grid', placeItems: 'center',
+            background: 'var(--fill-secondary)', color: 'var(--ink)', cursor: 'pointer' }}>
+            <Icon name="plus" size={14} stroke={2.4} />
+          </button>
+        </div>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px 10px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+          {sessions.length === 0 && (
+            <div style={{ padding: '18px 10px', font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)', textAlign: 'center' }}>
+              No chats yet.<br />Say what you want built.
+            </div>
+          )}
+          {sessions.map(s => {
+            const active = s.id === activeId;
+            return (
+              <div key={s.id} className="sess-row" onClick={() => setActiveId(s.id)} style={{
+                display: 'flex', alignItems: 'center', gap: 6, padding: '8px 10px', borderRadius: 10, cursor: 'pointer',
+                background: active ? 'var(--fill-secondary)' : 'transparent' }}>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  {renamingId === s.id ? (
+                    <input autoFocus value={renameVal} onChange={e => setRenameVal(e.target.value)} onClick={e => e.stopPropagation()}
+                      onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
+                      style={{ width: '100%', border: '1px solid var(--blue)', borderRadius: 6, padding: '2px 6px', background: 'var(--bg)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1.3 var(--font-text)' }} />
+                  ) : (
+                    <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
+                      style={{ display: 'block', font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {s.title}
+                    </span>
+                  )}
+                  <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{relativeTime(s.updatedAt)}</span>
+                </span>
+                <button className="sess-x" title="Delete chat" onClick={e => { e.stopPropagation(); removeSession(s.id); }}
+                  style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+                  <Icon name="x" size={12} stroke={2.4} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* thread + composer */}
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)',
+        borderRadius: 16, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden' }}>
+        <div ref={scrollRef} onScroll={onScroll} style={{ flex: 1, overflowY: 'auto', padding: '20px 22px' }}>
+          <div style={{ maxWidth: 720, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
+            {turns.length === 0 && (
+              <div style={{ padding: '64px 20px', textAlign: 'center' }}>
+                <span style={{ width: 52, height: 52, borderRadius: 16, display: 'inline-grid', placeItems: 'center', marginBottom: 14,
+                  background: 'color-mix(in srgb, var(--blue) 12%, transparent)', color: 'var(--blue)' }}>
+                  <Icon name="terminal" size={26} />
+                </span>
+                <div style={{ font: '700 var(--fs-title2)/1.25 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)', marginBottom: 6 }}>
+                  What should we build{project?.name ? ` in ${project.name}` : ''}?
+                </div>
+                <div style={{ font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)', maxWidth: 400, margin: '0 auto' }}>
+                  Describe it like you'd tell a teammate — the agent works in this project's folder and the reply streams here live.
+                </div>
+              </div>
+            )}
+            {turns.map(t => (
+              <React.Fragment key={t.id}>
+                <UserBubble text={t.input} />
+                <AssistantTurn job={t} onRetry={(input) => { void sendText(input); }} />
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+
+        {/* composer */}
+        <div style={{ borderTop: '0.5px solid var(--separator)', padding: '12px 14px', background: 'color-mix(in srgb, var(--bg) 30%, var(--bg-elevated))' }}>
+          <div style={{ maxWidth: 720, margin: '0 auto' }}>
+            {sendError && (
+              <div style={{ marginBottom: 8, padding: '8px 11px', borderRadius: 9, background: 'rgba(255,59,48,0.09)',
+                font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)' }}>{sendError}</div>
+            )}
+            <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+              <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendText(text); } }}
+                placeholder={projectId ? `Message the agent… (Enter to send, Shift+Enter for a new line)` : 'Pick a project first'}
+                disabled={!projectId}
+                style={{ flex: 1, resize: 'none', border: '1px solid var(--separator-strong)', outline: 'none', borderRadius: 13,
+                  background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '10px 13px',
+                  minHeight: 22, maxHeight: 150, boxSizing: 'content-box' }} />
+              {streaming ? (
+                <button onClick={stop} title="Stop the run" style={{ width: 40, height: 40, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
+                  background: 'rgba(255,59,48,0.13)', color: 'var(--red)', cursor: 'pointer' }}>
+                  <span style={{ width: 13, height: 13, borderRadius: 3.5, background: 'currentColor' }} />
+                </button>
+              ) : (
+                <button onClick={() => { void sendText(text); }} disabled={!text.trim() || !projectId} title="Send" style={{
+                  width: 40, height: 40, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
+                  background: text.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: text.trim() ? '#fff' : 'var(--ink-tertiary)',
+                  boxShadow: text.trim() ? '0 5px 14px rgba(0,122,255,0.32)' : 'none', cursor: text.trim() ? 'pointer' : 'default',
+                  transition: 'all 160ms var(--spring)' }}>
+                  <Icon name="arrowRight" size={18} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} />
+                </button>
+              )}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 9 }}>
+              <ModelSwitcher compact value={engine} onChange={setEngine} />
+              <EffortDial compact value={effort} onChange={setEffort} />
+              <span style={{ flex: 1 }} />
+              {streaming && lastTurn && (
+                <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                  {lastTurn.stage || 'working…'}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const TABS: { key: string; label: string }[] = [
-  { key: 'overview', label: 'Overview' },
+  { key: 'chat', label: 'Chat' },
   { key: 'jobs', label: 'Jobs' },
   { key: 'instructions', label: 'Instructions' },
   { key: 'skills', label: 'Skills & tools' },
@@ -847,9 +1207,8 @@ function GateBanner({ gate, onApprove, onDismiss }: { gate: boolean; onApprove: 
 
 export default function ProjectDetail() {
   const { id: routeId } = useParams<{ id: string }>();
-  const [tab, setTab] = React.useState('overview');
+  const [tab, setTab] = React.useState('chat');
   const [paletteOpen, setPaletteOpen] = React.useState(false);
-  const [gate, setGate] = React.useState(false);
 
   // live data
   const [projectId, setProjectId] = React.useState<string | null>(routeId ?? null);
@@ -902,11 +1261,10 @@ export default function ProjectDetail() {
     return unsub;
   }, [projectId, refetchJobs]);
 
-  // ⌘K + g
+  // ⌘K
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); }
-      if (e.key === 'g' && !e.metaKey && !e.ctrlKey && document.activeElement?.tagName !== 'TEXTAREA') { setGate(true); setTab('overview'); }
     };
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   }, []);
@@ -990,15 +1348,9 @@ export default function ProjectDetail() {
         </div>
       </div>
 
-      {/* tab content */}
-      <div style={{ padding: '22px 28px 36px' }}>
-        {tab === 'overview' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 26 }}>
-            <GateBanner gate={gate} onApprove={() => setGate(false)} onDismiss={() => setGate(false)} />
-            <GoalComposer projectId={projectId} onRun={() => { void refetchJobs(); }} />
-            <RecentJobs jobs={projectJobs.slice(0, 5)} />
-          </div>
-        )}
+      {/* tab content — chat pins to the viewport; other tabs scroll the page */}
+      <div style={{ padding: tab === 'chat' ? '16px 28px 18px' : '22px 28px 36px' }}>
+        {tab === 'chat' && <ChatPane projectId={projectId} project={project} />}
         {tab === 'jobs' && <JobsTab jobs={projectJobs} />}
         {tab === 'instructions' && <InstructionsTab projectId={projectId} project={project} onSaved={(ins) => setProject(p => p ? { ...p, instructions: ins } : p)} />}
         {tab === 'skills' && <SkillsTab />}

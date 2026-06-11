@@ -30,6 +30,14 @@ export interface Project {
   repoUrl?: string;
   createdAt: number;
 }
+export interface ChatSession {
+  id: string;
+  projectId: string;
+  title: string;
+  sdkSessionId?: string;
+  createdAt: number;
+  updatedAt: number;
+}
 export interface Job {
   id: string;
   projectId: string;
@@ -37,6 +45,7 @@ export interface Job {
   status: JobStatus;
   phase: string;
   progress: number;
+  sessionId?: string;
   input: string;
   output: string | null;
   error: string | null;
@@ -423,9 +432,23 @@ export const api = {
     return (r.data as Asset | null) ?? null;
   },
 
+  // Chat sessions — conversations with the agent inside a project
+  listSessions: (projectId?: string) =>
+    call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; effort?: Effort }) =>
+    call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
+      req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
+  renameSession: (id: string, title: string) =>
+    call<ChatSession>('renameSession', { id, title }, () =>
+      req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/rename`, { method: 'POST', body: JSON.stringify({ title }) })),
+  deleteSession: (id: string) =>
+    call<{ ok: boolean }>('deleteSession', { id }, () => req<{ ok: boolean }>(`/api/sessions/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
+  deleteProject: (id: string) =>
+    call<{ ok: boolean }>('deleteProject', { id }, () => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
+
   // Jobs — in the desktop app these EXECUTE on this Mac (Claude Code login)
-  listJobs: (projectId?: string) =>
-    call<Job[]>('listJobs', { projectId }, () => req<Job[]>('/api/jobs' + qp({ projectId }))),
+  listJobs: (projectId?: string, sessionId?: string) =>
+    call<Job[]>('listJobs', { projectId, sessionId }, () => req<Job[]>('/api/jobs' + qp({ projectId, sessionId }))),
   createJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
     call<Job>('createJob', { ...input }, () =>
       req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) })),
@@ -489,7 +512,7 @@ export const api = {
     call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
@@ -500,6 +523,7 @@ export const api = {
         if (name === 'briefs' && handlers.onBriefs) handlers.onBriefs(data as Brief[]);
         if (name === 'publishDraft' && handlers.onPublishDraft) handlers.onPublishDraft(data as PublishDraft);
         if (name === 'comms' && handlers.onComms) handlers.onComms(data as CommsStatus);
+        if (name === 'session' && handlers.onSession) handlers.onSession(data as ChatSession & { deleted?: boolean });
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
@@ -512,6 +536,7 @@ export const api = {
     if (handlers.onBriefs) es.addEventListener('briefs', (e: MessageEvent) => { try { handlers.onBriefs!(JSON.parse(e.data) as Brief[]); } catch { /* ignore */ } });
     if (handlers.onPublishDraft) es.addEventListener('publishDraft', (e: MessageEvent) => { try { handlers.onPublishDraft!(JSON.parse(e.data) as PublishDraft); } catch { /* ignore */ } });
     if (handlers.onComms) es.addEventListener('comms', (e: MessageEvent) => { try { handlers.onComms!(JSON.parse(e.data) as CommsStatus); } catch { /* ignore */ } });
+    if (handlers.onSession) es.addEventListener('session', (e: MessageEvent) => { try { handlers.onSession!(JSON.parse(e.data) as ChatSession & { deleted?: boolean }); } catch { /* ignore */ } });
     return () => es.close();
   },
   /** Convenience: subscribe to job updates only. */

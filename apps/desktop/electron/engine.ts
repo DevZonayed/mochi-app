@@ -37,6 +37,8 @@ interface EngineRun {
   tokens: number;
   cost: number;
   model: string;
+  /** Claude Agent SDK session id (for chat continuity via Options.resume). */
+  sdkSessionId?: string;
 }
 
 interface RunHooks {
@@ -119,6 +121,7 @@ function abortControllerFromSignal(signal: AbortSignal): AbortController {
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
+  resume?: string,
 ): Promise<EngineRun> {
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -130,6 +133,7 @@ async function runClaude(
       maxTurns: maxTurnsOverride ?? EFFORT_TURNS[effort] ?? 4,
       permissionMode: 'bypassPermissions',
       includePartialMessages: !!hooks.onText,
+      ...(resume ? { resume } : {}),
       ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
       ...(apiKey ? { env: { ...process.env, ANTHROPIC_API_KEY: apiKey } as NodeJS.ProcessEnv } : {}),
       ...(hooks.signal ? { abortController: abortControllerFromSignal(hooks.signal) } : {}),
@@ -141,16 +145,19 @@ async function runClaude(
   let usage: { input_tokens?: number; output_tokens?: number } | null = null;
   let cost = 0;
   let model = 'claude';
+  let sdkSessionId: string | undefined;
   try {
     for await (const raw of it as AsyncIterable<Record<string, unknown>>) {
       if (hooks.signal?.aborted) throw new CancelledError();
       const m = raw as {
         type?: string;
+        session_id?: string;
         message?: { content?: { type: string; text?: string }[]; model?: string };
         event?: { type?: string; delta?: { type?: string; text?: string } };
         usage?: { input_tokens?: number; output_tokens?: number };
         total_cost_usd?: number; result?: unknown;
       };
+      if (m.session_id) sdkSessionId = m.session_id;
       if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
         streamed += m.event.delta.text ?? '';
         hooks.onText?.(streamed);
@@ -173,6 +180,7 @@ async function runClaude(
     tokens: (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0),
     cost: Math.round(cost * 1000) / 1000,
     model,
+    sdkSessionId,
   };
 }
 
@@ -295,6 +303,24 @@ export class LocalEngine {
 
   isRunning(jobId: string): boolean { return this.running.has(jobId); }
 
+  /** Recent finished turns of a chat session, formatted for prompt stitching
+      (codex has no resumable session, so context rides in the prompt). */
+  private chatHistory(sessionId: string, excludeJobId: string): string {
+    const turns = this.store.listJobs(undefined, sessionId)
+      .filter(j => j.id !== excludeJobId && j.status === 'done' && j.output)
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .slice(-8);
+    let total = 0;
+    const parts: string[] = [];
+    for (const t of turns) {
+      const block = `[User]: ${t.input.slice(0, 1500)}\n[Assistant]: ${(t.output ?? '').slice(0, 2500)}`;
+      total += block.length;
+      if (total > 12000) break;
+      parts.push(block);
+    }
+    return parts.join('\n\n');
+  }
+
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
   async run(jobId: string, opts: { effort?: Effort; engine?: EngineId } = {}): Promise<Job> {
     const job = this.store.getJob(jobId);
@@ -340,8 +366,25 @@ export class LocalEngine {
     try {
       const effort = opts.effort ?? cur.effort;
       const cwd = workDirFor(project);
-      const prompt = project?.instructions ? `${project.instructions}\n\n---\n\n${cur.input}` : cur.input;
       const anthropicKey = this.status(master).method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined;
+
+      // Chat turns: keep the conversation. Claude resumes its own SDK session
+      // (full context incl. tool use); codex gets recent turns stitched in.
+      const session = cur.sessionId ? this.store.getSession(cur.sessionId) : undefined;
+      const isChat = !!session;
+      const resumeId = isChat && master === 'claude' ? session.sdkSessionId : undefined;
+      const base = project?.instructions ? `${project.instructions}\n\n---\n\n` : '';
+      let prompt: string;
+      if (resumeId) {
+        prompt = cur.input;
+      } else if (isChat) {
+        const history = this.chatHistory(session.id, cur.id);
+        prompt = history
+          ? `${base}Earlier conversation in this chat:\n\n${history}\n\n---\n\nCurrent message:\n${cur.input}`
+          : `${base}${cur.input}`;
+      } else {
+        prompt = `${base}${cur.input}`;
+      }
 
       const hooks: RunHooks = {
         signal: ac.signal,
@@ -349,8 +392,12 @@ export class LocalEngine {
         onChild: (child) => { handle.child = child; },
       };
       const main = master === 'claude'
-        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks)
+        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks, resumeId)
         : await runCodex(prompt, cwd, hooks);
+
+      if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {
+        try { this.store.updateSession(session.id, { sdkSessionId: main.sdkSessionId }); } catch { /* session deleted mid-run */ }
+      }
 
       let output = main.text;
       let tokens = main.tokens;
@@ -358,9 +405,11 @@ export class LocalEngine {
       const model = main.model;
 
       // Reviewer pass — a REAL second opinion from the configured engine.
+      // Skipped for chat turns: a conversation wants fast back-and-forth, not a
+      // second engine appending verdicts to every reply.
       const reviewer = routing.reviewer;
       let reviewVerdict: 'approved' | 'needs-work' | null = null;
-      if (reviewer !== 'off' && this.available(reviewer) && !ac.signal.aborted) {
+      if (reviewer !== 'off' && !isChat && this.available(reviewer) && !ac.signal.aborted) {
         cur = this.store.updateJob(jobId, { progress: 85, stage: `reviewer pass via ${ENGINE_LABEL[reviewer]}…` });
         this.emit('job', cur);
         try {
@@ -386,8 +435,10 @@ export class LocalEngine {
         output, tokens, cost, model,
       });
       this.running.delete(jobId);
+      if (isChat) this.store.touchSession(session.id);
       this.emit('job', done);
-      this.store.pushEvent({ kind: 'job-done', title: `Done: ${done.title}`, projectId: done.projectId, jobId });
+      // Chat replies don't ping the events feed — per-message noise; failures still do.
+      if (!isChat) this.store.pushEvent({ kind: 'job-done', title: `Done: ${done.title}`, projectId: done.projectId, jobId });
 
       // Reviewer flagged NEEDS WORK → open a real linked approval gate.
       if (reviewVerdict === 'needs-work' && reviewer !== 'off') {
