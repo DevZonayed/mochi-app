@@ -5,6 +5,7 @@
 import type { Store, Effort, ApprovalStatus, EngineId, Routing, AppSettings, ProjectKind, AssetStatus } from './store.js';
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
+import type { ResearchEngine } from './research.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable } from './git.js';
 
@@ -19,7 +20,7 @@ function asEngine(v: unknown): EngineId | undefined {
   return typeof v === 'string' && ENGINE_VALUES.has(v) ? (v as EngineId) : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -217,6 +218,15 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('asset', a);
         return a;
       }
+
+      // ── Trends (real web research → content briefs) ────────────
+      case 'runResearch': {
+        if (!p.topic || typeof p.topic !== 'string') bad('topic required');
+        return research.runResearch(p.topic as string);
+      }
+      case 'listBriefs': return store.listBriefs();
+      case 'listResearchRuns': return store.listResearchRuns();
+      case 'markBriefSent': { const b = store.setBriefStatus(String(p.id ?? ''), 'sent-to-studio'); emit('briefs', [b]); return b; }
 
       // ── Engine status (THE single source of truth) ────────────
       case 'engineStatus': return engine.statuses();

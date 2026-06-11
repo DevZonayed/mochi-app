@@ -5,7 +5,7 @@
    Visual language preserved; the data + actions are now real. */
 
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { AppShell } from '../lib/appShell';
 import { Icon, type IconName } from '../lib/icons';
 import { api, type Asset, type MediaRate, type Project, type ProviderConn, ApiError, IS_LOCAL } from '../lib/api';
@@ -115,6 +115,7 @@ function AssetCard({ a, onCancel, onApprove, onDelete, onReveal, onUseAsSource }
 
 export default function MediaStudio() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [stageKey, setStageKey] = React.useState('image');
   const [rates, setRates] = React.useState<MediaRate[]>([]);
   const [assets, setAssets] = React.useState<Asset[]>([]);
@@ -146,6 +147,16 @@ export default function MediaStudio() {
     const unsub = api.subscribe({ onAsset: refetch });
     return unsub;
   }, [refetch]);
+
+  // Prefill the prompt when arriving from Trends ("Send to Studio").
+  React.useEffect(() => {
+    const brief = (location.state as { brief?: { headline?: string; hook?: string } } | null)?.brief;
+    if (brief) {
+      setPrompt([brief.headline, brief.hook].filter(Boolean).join(' — '));
+      navigate(location.pathname, { replace: true, state: null });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Models available for the active stage.
   const stageModels = React.useMemo(() => {

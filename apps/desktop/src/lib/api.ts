@@ -188,6 +188,11 @@ export interface Asset {
   updatedAt: number;
 }
 export interface MediaRate { key: string; label: string; kind: AssetKind; stage: AssetStage; rate: number; perSecond?: boolean; blurb: string }
+export interface Brief {
+  id: string; topic: string; headline: string; hook: string; titles: string[]; platforms: string[];
+  confidence: number; sources: string[]; status: 'ready' | 'sent-to-studio' | 'raw'; jobId: string; createdAt: number;
+}
+export interface ResearchRun { id: string; topic: string; jobId: string; status: 'running' | 'done' | 'failed'; briefCount: number; at: number }
 export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
 export interface FolderInspect { ok: boolean; path: string; info: RepoInfo; error?: string }
 export type CloneEvent =
@@ -364,6 +369,12 @@ export const api = {
   approveAsset: (id: string) => call<Asset>('approveAsset', { id }, () => req<Asset>(`/api/assets/${encodeURIComponent(id)}/approve`, { method: 'POST' })),
   deleteAsset: (id: string) => call<{ ok: boolean }>('deleteAsset', { id }, () => req<{ ok: boolean }>(`/api/assets/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 
+  // Trends (real web research → content briefs)
+  runResearch: (topic: string) => call<ResearchRun>('runResearch', { topic }, () => req<ResearchRun>('/api/research/run', { method: 'POST', body: JSON.stringify({ topic }) })),
+  listBriefs: () => call<Brief[]>('listBriefs', {}, () => req<Brief[]>('/api/briefs')),
+  listResearchRuns: () => call<ResearchRun[]>('listResearchRuns', {}, () => req<ResearchRun[]>('/api/research-runs')),
+  markBriefSent: (id: string) => call<Brief>('markBriefSent', { id }, () => req<Brief>(`/api/briefs/${encodeURIComponent(id)}/sent`, { method: 'POST' })),
+
   // Jobs — in the desktop app these EXECUTE on this Mac (Claude Code login)
   listJobs: (projectId?: string) =>
     call<Job[]>('listJobs', { projectId }, () => req<Job[]>('/api/jobs' + qp({ projectId }))),
@@ -430,7 +441,7 @@ export const api = {
     call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
@@ -438,6 +449,7 @@ export const api = {
         if (name === 'project' && handlers.onProject) handlers.onProject(data as Project);
         if (name === 'clone' && handlers.onClone) handlers.onClone(data as CloneEvent);
         if (name === 'asset' && handlers.onAsset) handlers.onAsset(data as Asset);
+        if (name === 'briefs' && handlers.onBriefs) handlers.onBriefs(data as Brief[]);
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
@@ -447,6 +459,7 @@ export const api = {
     if (handlers.onProject) es.addEventListener('project', (e: MessageEvent) => { try { handlers.onProject!(JSON.parse(e.data) as Project); } catch { /* ignore */ } });
     if (handlers.onClone) es.addEventListener('clone', (e: MessageEvent) => { try { handlers.onClone!(JSON.parse(e.data) as CloneEvent); } catch { /* ignore */ } });
     if (handlers.onAsset) es.addEventListener('asset', (e: MessageEvent) => { try { handlers.onAsset!(JSON.parse(e.data) as Asset); } catch { /* ignore */ } });
+    if (handlers.onBriefs) es.addEventListener('briefs', (e: MessageEvent) => { try { handlers.onBriefs!(JSON.parse(e.data) as Brief[]); } catch { /* ignore */ } });
     return () => es.close();
   },
   /** Convenience: subscribe to job updates only. */

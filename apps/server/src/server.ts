@@ -234,6 +234,11 @@ export function buildServer(): FastifyInstance {
     return projectId ? assets.filter((a) => a.projectId === projectId) : assets;
   });
   app.get('/api/media/rates', async () => st()?.mediaRates ?? []);
+  // ── Trends (briefs mirror; runs forward to the Mac's research engine) ──
+  app.get('/api/briefs', async () => st()?.briefs ?? []);
+  app.get('/api/research-runs', async () => st()?.researchRuns ?? []);
+  app.post('/api/research/run', async (req, reply) => forward(reply, 'runResearch', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/briefs/:id/sent', async (req, reply) => forward(reply, 'markBriefSent', { id: (req.params as { id: string }).id }));
   app.post('/api/assets/generate', async (req, reply) => forward(reply, 'generateAsset', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/assets/:id/cancel', async (req, reply) => forward(reply, 'cancelAsset', { id: (req.params as { id: string }).id }));
   app.post('/api/assets/:id/approve', async (req, reply) => forward(reply, 'approveAsset', { id: (req.params as { id: string }).id }));

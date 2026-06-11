@@ -7,6 +7,7 @@ import { useNavigate } from 'react-router-dom';
 import { AppShell } from '../lib/appShell';
 import { Icon, type IconName } from '../lib/icons';
 import { Spinner } from '../lib/ui';
+import { api, type Brief as ApiBrief, type ResearchRun } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from <Page>.html) ───────────────────────── */
 const styles = `
@@ -143,107 +144,100 @@ function SignalRow() {
   );
 }
 
-/* ───────────────────────── brief feed ───────────────────────── */
-interface Brief {
-  id: string;
-  title: string;
-  hook: string;
-  titles: string[];
-  platforms: PlatformKey[];
-  conf: number;
-  live: boolean;
+/* ───────────────────────── brief feed (real research) ───────────────────────── */
+const KNOWN_PLATFORMS: Record<string, PlatformKey> = { x: 'x', twitter: 'x', youtube: 'youtube', yt: 'youtube', linkedin: 'linkedin', tiktok: 'tiktok', instagram: 'instagram', ig: 'instagram' };
+
+function hostOf(url: string): string {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return url.slice(0, 40); }
 }
 
-const BRIEFS: Brief[] = [
-  { id: 'b1', title: 'Why agents that survive sleep change everything', hook: 'Your best ideas don’t clock out at 5pm — why should your tools?',
-    titles: ['I let AI agents run my projects overnight — here’s what I woke up to', 'The case for durable agents (that don’t die when your laptop sleeps)', 'Overnight automation: a calm operator’s setup'],
-    platforms: ['youtube', 'x'], conf: 92, live: false },
-  { id: 'b2', title: 'Self-hosted video for under a dollar a minute', hook: 'A video minute can cost $45. Here’s how we got ours to $0.90.',
-    titles: ['How I render AI video for pennies on my own GPU', 'Stop paying $45/min for AI video — self-host instead', 'The economics of self-hosted video models'],
-    platforms: ['youtube', 'linkedin'], conf: 84, live: false },
-];
-
-function BriefCard({ b, live, onStudio }: { b: Brief; live: boolean; onStudio: (id: string) => void }) {
+function BriefCard({ b, onStudio }: { b: ApiBrief; onStudio: (b: ApiBrief) => void }) {
   const [sel, setSel] = React.useState(0);
+  const conf = Math.round(b.confidence * 100);
+  const isRaw = b.status === 'raw';
   return (
-    <div data-brief={b.id} className="brief-card" style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 22, marginBottom: 16 }}>
+    <div data-brief={b.id} className="brief-card" style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 22, marginBottom: 16, opacity: b.status === 'sent-to-studio' ? 0.6 : 1 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 12 }}>
-        <h3 style={{ margin: 0, flex: 1, font: '700 var(--fs-title2)/1.2 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>{b.title}</h3>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 24, padding: '0 10px', borderRadius: 'var(--r-pill)', background: 'color-mix(in srgb, var(--green) 14%, transparent)', color: 'var(--green)', font: '600 var(--fs-caption)/1 var(--font-text)', flexShrink: 0 }}>
-          {b.conf}% confidence
-        </span>
+        <h3 style={{ margin: 0, flex: 1, font: '700 var(--fs-title2)/1.2 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>{b.headline}</h3>
+        {!isRaw && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 24, padding: '0 10px', borderRadius: 'var(--r-pill)', background: 'color-mix(in srgb, var(--green) 14%, transparent)', color: 'var(--green)', font: '600 var(--fs-caption)/1 var(--font-text)', flexShrink: 0 }}>{conf}% confidence</span>}
       </div>
 
-      {/* hook — the expressive type moment */}
-      <div style={{ padding: '14px 18px', borderRadius: 12, background: 'color-mix(in srgb, var(--indigo) 7%, transparent)', borderLeft: '3px solid var(--indigo)', marginBottom: 18 }}>
-        <span style={{ font: '500 italic 22px/1.4 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>“{b.hook}”</span>
-        {live && <span className="cursor-blink" style={{ marginLeft: 3, color: 'var(--indigo)' }}>▍</span>}
-      </div>
+      {b.hook && (
+        <div style={{ padding: '14px 18px', borderRadius: 12, background: 'color-mix(in srgb, var(--indigo) 7%, transparent)', borderLeft: '3px solid var(--indigo)', marginBottom: 18 }}>
+          <span style={{ font: '500 italic 22px/1.4 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>“{b.hook}”</span>
+        </div>
+      )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1.5fr 1fr', gap: 20 }}>
-        <div>
-          <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 10 }}>Suggested titles</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-            {b.titles.map((t, i) => (
-              <button key={i} onClick={() => setSel(i)} className="title-row" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderRadius: 10, textAlign: 'left',
-                background: sel === i ? 'color-mix(in srgb, var(--indigo) 9%, transparent)' : 'var(--fill-tertiary)', border: `1px solid ${sel === i ? 'color-mix(in srgb, var(--indigo) 35%, transparent)' : 'var(--separator)'}` }}>
-                <span style={{ width: 18, height: 18, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', background: sel === i ? 'var(--indigo)' : 'transparent', border: sel === i ? 'none' : '1.5px solid var(--separator-strong)' }}>{sel === i && <Icon name="check" size={11} stroke={3} style={{ color: '#fff' }} />}</span>
-                <span style={{ font: '500 var(--fs-subhead)/1.3 var(--font-text)', color: 'var(--ink)' }}>{t}</span>
-              </button>
-            ))}
+      {!isRaw && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1.5fr 1fr', gap: 20 }}>
+          <div>
+            <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 10 }}>Suggested titles</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+              {b.titles.length === 0 ? <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>—</span> : b.titles.map((t, i) => (
+                <button key={i} onClick={() => setSel(i)} className="title-row" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderRadius: 10, textAlign: 'left',
+                  background: sel === i ? 'color-mix(in srgb, var(--indigo) 9%, transparent)' : 'var(--fill-tertiary)', border: `1px solid ${sel === i ? 'color-mix(in srgb, var(--indigo) 35%, transparent)' : 'var(--separator)'}` }}>
+                  <span style={{ width: 18, height: 18, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', background: sel === i ? 'var(--indigo)' : 'transparent', border: sel === i ? 'none' : '1.5px solid var(--separator-strong)' }}>{sel === i && <Icon name="check" size={11} stroke={3} style={{ color: '#fff' }} />}</span>
+                  <span style={{ font: '500 var(--fs-subhead)/1.3 var(--font-text)', color: 'var(--ink)' }}>{t}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 10 }}>Sources</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {b.sources.length === 0 ? <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No sources cited</span>
+                : b.sources.slice(0, 5).map((s, i) => (
+                  <a key={i} href={s} target="_blank" rel="noreferrer" className="title-row" style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '7px 10px', borderRadius: 9, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', textDecoration: 'none' }}>
+                    <Icon name="telescope" size={12} style={{ color: 'var(--indigo)', flexShrink: 0 }} />
+                    <span style={{ font: '500 var(--fs-caption)/1.2 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{hostOf(s)}</span>
+                  </a>
+                ))}
+            </div>
           </div>
         </div>
-        <div>
-          <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 10 }}>Thumbnail concepts</div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-            {['linear-gradient(135deg,#2a1b4a,#5856D6)', 'linear-gradient(135deg,#1b2a4a,#007AFF)', 'linear-gradient(135deg,#1b3a2a,#1F8A5B)', 'linear-gradient(135deg,#3a2a1b,#FF9500)'].map((g, i) => (
-              <div key={i} style={{ aspectRatio: '16/10', borderRadius: 9, background: g, display: 'grid', placeItems: 'center', border: '0.5px solid var(--separator)' }}>
-                <Icon name="image" size={18} style={{ color: 'rgba(255,255,255,0.7)' }} />
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
+      )}
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 18, paddingTop: 16, borderTop: '0.5px solid var(--separator)' }}>
-        <div style={{ display: 'flex', gap: 6 }}>{b.platforms.map(p => <span key={p} style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: PLATFORMS[p].tint }}><PGlyph p={p} size={14} /></span>)}</div>
+        <div style={{ display: 'flex', gap: 6 }}>{b.platforms.map(p => { const k = KNOWN_PLATFORMS[p.toLowerCase()]; return k ? <span key={p} style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: PLATFORMS[k].tint }}><PGlyph p={k} size={14} /></span> : <span key={p} style={{ height: 26, padding: '0 9px', borderRadius: 7, display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{p}</span>; })}</div>
         <span style={{ flex: 1 }} />
-        <button className="ghost-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 40, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}><Icon name="calendar" size={16} /> Schedule series</button>
-        <button onClick={() => onStudio(b.id)} className="studio-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 40, padding: '0 18px', borderRadius: 'var(--r-pill)', background: 'var(--teal)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(48,176,199,0.32)' }}><Icon name="clapper" size={16} /> Send to Studio</button>
+        {b.status === 'sent-to-studio'
+          ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--teal)' }}><Icon name="check" size={15} stroke={2.6} /> Sent to Studio</span>
+          : <button onClick={() => onStudio(b)} className="studio-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 40, padding: '0 18px', borderRadius: 'var(--r-pill)', background: 'var(--teal)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(48,176,199,0.32)' }}><Icon name="clapper" size={16} /> Send to Studio</button>}
       </div>
     </div>
   );
 }
 
-/* ───────────────────────── right rail ───────────────────────── */
-function ResearchRail() {
-  const navigate = useNavigate();
-  const runs: [string, string, string][] = [['Tech explainers · YouTube', '12 min ago', 'done'], ['TikTok hooks · short-form', '2 hr ago', 'done'], ['Competitor sweep · weekly', 'Yesterday', 'done']];
-  const sources: [string, string][] = [['Official APIs', 'ok'], ['YouTube Data API', 'ok'], ['Scraper · trend mirror', 'risk']];
+/* ───────────────────────── right rail (real research runs) ───────────────────────── */
+function relAgo(ts: number): string {
+  const m = Math.floor((Date.now() - ts) / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} hr ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+function ResearchRail({ runs, onOpen }: { runs: ResearchRun[]; onOpen: (jobId: string) => void }) {
   return (
     <aside style={{ width: 300, flexShrink: 0, borderLeft: '0.5px solid var(--separator)', padding: 18, overflowY: 'auto',
       background: 'var(--bg-grouped)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
       <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 11 }}>Research history</div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 22 }}>
-        {runs.map((r, i) => (
-          <a key={i} onClick={(e) => { e.preventDefault(); navigate('/session-transcript'); }} href="#" className="run-link" style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '10px 11px', borderRadius: 10, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', textDecoration: 'none', cursor: 'pointer' }}>
-            <Icon name="checkCircle" size={15} style={{ color: 'var(--green)', flexShrink: 0 }} />
-            <span style={{ flex: 1, minWidth: 0 }}>
-              <span style={{ display: 'block', font: '500 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r[0]}</span>
-              <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{r[1]}</span>
-            </span>
-            <Icon name="chevronRight" size={14} style={{ color: 'var(--ink-tertiary)' }} />
-          </a>
-        ))}
+        {runs.length === 0 ? <span style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Your research runs will list here.</span>
+          : runs.map((r) => (
+            <a key={r.id} onClick={(e) => { e.preventDefault(); onOpen(r.jobId); }} href="#" className="run-link" style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '10px 11px', borderRadius: 10, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', textDecoration: 'none', cursor: 'pointer' }}>
+              <Icon name={r.status === 'running' ? 'clock' : r.status === 'failed' ? 'alert' : 'checkCircle'} size={15} style={{ color: r.status === 'running' ? 'var(--indigo)' : r.status === 'failed' ? 'var(--red)' : 'var(--green)', flexShrink: 0 }} />
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', font: '500 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.topic}</span>
+                <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{r.status === 'running' ? 'Researching…' : `${r.briefCount} brief${r.briefCount !== 1 ? 's' : ''} · ${relAgo(r.at)}`}</span>
+              </span>
+              <Icon name="chevronRight" size={14} style={{ color: 'var(--ink-tertiary)' }} />
+            </a>
+          ))}
       </div>
-      <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 11 }}>Source health</div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {sources.map((s, i) => (
-          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '10px 11px', borderRadius: 10, background: s[1] === 'risk' ? 'rgba(255,149,0,0.08)' : 'var(--fill-tertiary)', border: `0.5px solid ${s[1] === 'risk' ? 'rgba(255,149,0,0.3)' : 'var(--separator)'}` }}>
-            <Icon name={s[1] === 'risk' ? 'alert' : 'check'} size={14} stroke={2.4} style={{ color: s[1] === 'risk' ? 'var(--orange)' : 'var(--green)', flexShrink: 0 }} />
-            <span style={{ flex: 1, font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s[0]}{s[1] === 'risk' && <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--orange)', marginTop: 2 }}>Risk-flagged · isolated</span>}</span>
-          </div>
-        ))}
+      <div style={{ padding: '12px 13px', borderRadius: 12, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 6 }}><Icon name="telescope" size={14} style={{ color: 'var(--indigo)' }} /><span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Live web search</span></div>
+        <span style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>Runs use the agent’s built-in web search on your sign-in. Briefs cite the real pages it read.</span>
       </div>
     </aside>
   );
@@ -348,9 +342,22 @@ const STREAM_LINES = [
 ];
 
 export default function TrendIntelligence() {
-  const [running, setRunning] = React.useState(false);
+  const navigate = useNavigate();
   const [paletteOpen, setPaletteOpen] = React.useState(false);
-  const [flyToast, setFlyToast] = React.useState(false);
+  const [topic, setTopic] = React.useState('');
+  const [briefs, setBriefs] = React.useState<ApiBrief[]>([]);
+  const [runs, setRuns] = React.useState<ResearchRun[]>([]);
+  const [submitting, setSubmitting] = React.useState(false);
+
+  const refetch = React.useCallback(() => {
+    api.listBriefs().then(setBriefs).catch(() => {});
+    api.listResearchRuns().then(setRuns).catch(() => {});
+  }, []);
+  React.useEffect(() => {
+    refetch();
+    const unsub = api.subscribe({ onBriefs: refetch, onJob: refetch });
+    return unsub;
+  }, [refetch]);
 
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -359,12 +366,20 @@ export default function TrendIntelligence() {
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   }, []);
 
-  const sendStudio = (id: string) => {
-    const card = document.querySelector(`[data-brief="${id}"]`);
-    if (card) {
-      card.classList.add('fly-studio');
-      setTimeout(() => { card.classList.remove('fly-studio'); setFlyToast(true); setTimeout(() => setFlyToast(false), 2200); }, 420);
-    }
+  const running = runs.some(r => r.status === 'running');
+
+  const runResearch = async () => {
+    const t = topic.trim();
+    if (!t || submitting) return;
+    setSubmitting(true);
+    try { await api.runResearch(t); setTopic(''); refetch(); }
+    catch { /* fail soft */ }
+    finally { setSubmitting(false); }
+  };
+
+  const sendStudio = (b: ApiBrief) => {
+    void api.markBriefSent(b.id).then(refetch).catch(() => {});
+    navigate('/media-studio', { state: { brief: b } });
   };
 
   return (
@@ -377,16 +392,17 @@ export default function TrendIntelligence() {
       <div style={{ height: '100%', display: 'flex', minHeight: 0 }}>
         <main style={{ flex: 1, minWidth: 0, overflowY: 'auto', padding: '24px 28px 36px' }}>
           {/* header */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 22, flexWrap: 'wrap' }}>
-            <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Trends</h1>
-            <button className="ctx-pick" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'color-mix(in srgb, var(--indigo) 12%, transparent)', color: 'var(--indigo)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-              Tech explainers · YouTube <Icon name="chevronDown" size={14} />
-            </button>
-            <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Refreshed 12 min ago</span>
-            <span style={{ flex: 1 }} />
-            <button onClick={() => setRunning(r => !r)} className="primary-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--indigo)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(88,86,214,0.3)' }}>
-              {running ? <Spinner size={15} color="#fff" /> : <Icon name="telescope" size={16} />} {running ? 'Researching…' : 'Run research now'}
-            </button>
+          <div style={{ marginBottom: 22 }}>
+            <h1 style={{ margin: '0 0 12px', font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Trends</h1>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <input value={topic} onChange={e => setTopic(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') void runResearch(); }}
+                placeholder="Research a topic — e.g. “AI coding agents”, “short-form video hooks”…"
+                style={{ flex: 1, minWidth: 280, height: 42, padding: '0 15px', borderRadius: 'var(--r-pill)', boxSizing: 'border-box', border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)', color: 'var(--ink)', font: '400 var(--fs-body)/1 var(--font-text)' }} />
+              <button onClick={runResearch} disabled={!topic.trim() || submitting} className="primary-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 42, padding: '0 18px', borderRadius: 'var(--r-pill)', background: topic.trim() ? 'var(--indigo)' : 'var(--fill-secondary)', color: topic.trim() ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: topic.trim() ? '0 6px 18px rgba(88,86,214,0.3)' : 'none' }}>
+                {submitting ? <Spinner size={15} color="#fff" /> : <Icon name="telescope" size={16} />} Run research
+              </button>
+            </div>
+            <p style={{ margin: '10px 0 0', font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>A deep agent searches the live web on your sign-in and returns content briefs with real sources. Takes a couple of minutes.</p>
           </div>
 
           <SignalRow />
@@ -394,27 +410,20 @@ export default function TrendIntelligence() {
           <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 14 }}>Content briefs</div>
           {running && (
             <div className="brief-card" style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '1px solid color-mix(in srgb, var(--indigo) 30%, transparent)', boxShadow: '0 0 0 4px color-mix(in srgb, var(--indigo) 10%, transparent), var(--card-shadow)', padding: 22, marginBottom: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 14 }}>
-                <Spinner size={16} color="var(--indigo)" /><span style={{ font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink)' }}>Generating brief…</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8 }}>
+                <Spinner size={16} color="var(--indigo)" /><span style={{ font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink)' }}>Researching “{runs.find(r => r.status === 'running')?.topic}” — searching the web…</span>
               </div>
-              {STREAM_LINES.map((l, i) => (
-                <div key={i} className="stream-bullet" style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '5px 0', font: '400 var(--fs-subhead)/1.4 var(--font-mono)', color: 'var(--ink-secondary)', animationDelay: `${i * 0.3}s` }}>
-                  <span style={{ color: 'var(--indigo)' }}>›</span> {l}
-                </div>
-              ))}
+              <span style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>Briefs appear here when the run finishes. Follow along live in Jobs.</span>
             </div>
           )}
-          {BRIEFS.map(b => <BriefCard key={b.id} b={b} live={false} onStudio={sendStudio} />)}
+          {briefs.length === 0 && !running ? (
+            <div style={{ padding: '48px 0', textAlign: 'center', background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+              No briefs yet. Enter a topic above and run research.
+            </div>
+          ) : briefs.map(b => <BriefCard key={b.id} b={b} onStudio={sendStudio} />)}
         </main>
-        <ResearchRail />
+        <ResearchRail runs={runs} onOpen={(jobId) => navigate(`/session-transcript/${jobId}`)} />
       </div>
-
-      {flyToast && (
-        <div className="toast" style={{ position: 'absolute', bottom: 24, left: '50%', transform: 'translateX(-50%)', zIndex: 90, display: 'inline-flex', alignItems: 'center', gap: 10, height: 46, padding: '0 18px', borderRadius: 'var(--r-pill)', background: 'var(--on-glass)', color: 'var(--bg-elevated)', boxShadow: '0 12px 32px rgba(10,15,40,0.4)' }}>
-          <span style={{ width: 20, height: 20, borderRadius: '50%', background: 'var(--teal)', display: 'grid', placeItems: 'center' }}><Icon name="clapper" size={12} style={{ color: '#fff' }} /></span>
-          <span style={{ font: '600 var(--fs-subhead)/1 var(--font-text)' }}>Sent to Studio · pre-filled brief</span>
-        </div>
-      )}
 
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>

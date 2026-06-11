@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { Store } from './store.js';
 import { LocalEngine } from './engine.js';
 import { MediaEngine } from './media.js';
+import { ResearchEngine } from './research.js';
 import { Providers } from './providers.js';
 import { createDispatch } from './localApi.js';
 import { RelayClient } from './relay.js';
@@ -62,7 +63,8 @@ app.whenReady().then(() => {
   const engine = new LocalEngine(store, emit, providers);
   const media = new MediaEngine(store, emit, () => providers.getLocalKey('fal'));
   media.resumeOnBoot();
-  const dispatch = createDispatch(store, engine, media, providers, emit, RELAY_URL);
+  const research = new ResearchEngine(store, engine, emit);
+  const dispatch = createDispatch(store, engine, media, research, providers, emit, RELAY_URL);
 
   relay = new RelayClient({
     url: RELAY_URL,
