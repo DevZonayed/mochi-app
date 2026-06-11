@@ -277,8 +277,8 @@ function ConfirmSheet({
                 <Icon name="smartphone" size={22} color={theme.color.inkSecondary} />
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={{ color: theme.color.ink, fontSize: 17, fontWeight: '600' }}>Jillur's MacBook Pro</Text>
-                <Text style={{ color: theme.color.inkSecondary, fontSize: 14, marginTop: 3 }}>Atlas Studio workspace</Text>
+                <Text style={{ color: theme.color.ink, fontSize: 17, fontWeight: '600' }}>Your Mac</Text>
+                <Text style={{ color: theme.color.inkSecondary, fontSize: 14, marginTop: 3 }}>Paired and ready</Text>
               </View>
             </View>
             <View

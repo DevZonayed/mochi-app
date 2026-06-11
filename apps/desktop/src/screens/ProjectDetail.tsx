@@ -100,15 +100,14 @@ interface PaletteItem {
 }
 
 const PALETTE_ITEMS: PaletteItem[] = [
-  { group: 'Actions', icon: 'play', label: 'Run job…', hint: 'Start a new job in a project' },
-  { group: 'Actions', icon: 'plus', label: 'New project…', hint: 'From a template' },
-  { group: 'Actions', icon: 'calendar', label: 'Schedule a run…', hint: 'Pick time & cadence' },
-  { group: 'Actions', icon: 'gauge', label: 'Adjust budget cap…', hint: 'Workspace or project' },
-  { group: 'Recent', icon: 'gitMerge', label: 'Merge PR #482 — auth refactor', hint: 'Atlas API' },
-  { group: 'Recent', icon: 'send', label: 'Publish “Launch week” thread', hint: 'Q3 Content' },
-  { group: 'Recent', icon: 'telescope', label: 'Competitor digest', hint: 'Market Scan' },
+  { group: 'Jump to', icon: 'home', label: 'Command Center', hint: '⌘1' },
   { group: 'Jump to', icon: 'layers', label: 'Projects', hint: '⌘2' },
+  { group: 'Jump to', icon: 'jobs', label: 'Jobs', hint: '⌘3' },
   { group: 'Jump to', icon: 'shield', label: 'Approvals', hint: '⌘4' },
+  { group: 'Jump to', icon: 'clapper', label: 'Studio', hint: '' },
+  { group: 'Jump to', icon: 'telescope', label: 'Trends', hint: '' },
+  { group: 'Jump to', icon: 'send', label: 'Publishing', hint: '' },
+  { group: 'Jump to', icon: 'gauge', label: 'Costs', hint: '' },
 ];
 
 function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -838,10 +837,10 @@ function GateBanner({ gate, onApprove, onDismiss }: { gate: boolean; onApprove: 
       </span>
       <span style={{ flex: 1, minWidth: 0 }}>
         <span style={{ display: 'block', font: '600 var(--fs-callout)/1.25 var(--font-text)', color: 'var(--ink)' }}>A job is waiting at a gate</span>
-        <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-mono)', color: 'var(--ink-secondary)', marginTop: 2 }}>Merge PR #482 — auth refactor · 12 files · +840 −210</span>
+        <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Review it in Approvals to let the run continue.</span>
       </span>
-      <button onClick={onDismiss} style={{ height: 34, padding: '0 14px', borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Review</button>
-      <button onClick={onApprove} className="primary-cta" style={{ height: 34, padding: '0 16px', borderRadius: 8, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Approve &amp; merge</button>
+      <button onClick={onDismiss} style={{ height: 34, padding: '0 14px', borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Dismiss</button>
+      <button onClick={onApprove} className="primary-cta" style={{ height: 34, padding: '0 16px', borderRadius: 8, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Open Approvals</button>
     </div>
   );
 }

@@ -247,7 +247,7 @@ function WorkspaceStep({ value, onChange }: WorkspaceStepProps) {
         <Row last style={{ padding: '4px 14px' }}>
           <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)', width: 92, flexShrink: 0 }}>Name</span>
           <input ref={ref} value={value} onChange={(e: React.ChangeEvent<HTMLInputElement>) => onChange(e.target.value)}
-            placeholder="e.g. Atlas Studio"
+            placeholder="e.g. My Workspace"
             style={{
               flex: 1, border: 'none', outline: 'none', background: 'transparent',
               font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)',

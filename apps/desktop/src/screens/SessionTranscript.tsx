@@ -599,15 +599,14 @@ interface PaletteItem {
 }
 
 const PALETTE_ITEMS: PaletteItem[] = [
-  { group: 'Actions', icon: 'play', label: 'Run job…', hint: 'Start a new job in a project' },
-  { group: 'Actions', icon: 'plus', label: 'New project…', hint: 'From a template' },
-  { group: 'Actions', icon: 'calendar', label: 'Schedule a run…', hint: 'Pick time & cadence' },
-  { group: 'Actions', icon: 'gauge', label: 'Adjust budget cap…', hint: 'Workspace or project' },
-  { group: 'Recent', icon: 'gitMerge', label: 'Merge PR #482 — auth refactor', hint: 'Atlas API' },
-  { group: 'Recent', icon: 'send', label: 'Publish “Launch week” thread', hint: 'Q3 Content' },
-  { group: 'Recent', icon: 'telescope', label: 'Competitor digest', hint: 'Market Scan' },
+  { group: 'Jump to', icon: 'home', label: 'Command Center', hint: '⌘1' },
   { group: 'Jump to', icon: 'layers', label: 'Projects', hint: '⌘2' },
+  { group: 'Jump to', icon: 'jobs', label: 'Jobs', hint: '⌘3' },
   { group: 'Jump to', icon: 'shield', label: 'Approvals', hint: '⌘4' },
+  { group: 'Jump to', icon: 'clapper', label: 'Studio', hint: '' },
+  { group: 'Jump to', icon: 'telescope', label: 'Trends', hint: '' },
+  { group: 'Jump to', icon: 'send', label: 'Publishing', hint: '' },
+  { group: 'Jump to', icon: 'gauge', label: 'Costs', hint: '' },
 ];
 
 function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
