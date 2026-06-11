@@ -435,7 +435,7 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; effort?: Effort }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; effort?: Effort }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   renameSession: (id: string, title: string) =>
@@ -456,7 +456,7 @@ export const api = {
   runJob: (id: string, effort?: Effort, engine?: EngineId) =>
     call<Job>('runJob', { id, effort, engine }, () =>
       req<Job>(`/api/jobs/${encodeURIComponent(id)}/run`, { method: 'POST', body: JSON.stringify({ ...(effort ? { effort } : {}), ...(engine ? { engine } : {}) }) })),
-  createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort; engine?: EngineId }) =>
+  createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort; engine?: EngineId; model?: string }) =>
     call<Job>('createAndRunJob', { ...input }, () =>
       req<Job>('/api/jobs/run', { method: 'POST', body: JSON.stringify(input) })),
   cancelJob: (id: string) =>

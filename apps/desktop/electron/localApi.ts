@@ -21,6 +21,10 @@ const ENGINE_VALUES = new Set(['claude', 'codex']);
 function asEngine(v: unknown): EngineId | undefined {
   return typeof v === 'string' && ENGINE_VALUES.has(v) ? (v as EngineId) : undefined;
 }
+/** Model override: an alias (opus/sonnet/haiku) or a full model id — never shell-special. */
+function asModel(v: unknown): string | undefined {
+  return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
+}
 
 export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
@@ -169,7 +173,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const job = store.createJob(projectId, text, text.slice(0, 60), p.effort as Effort | undefined, session.id);
         emit('job', job);
         // Fire the run async — the reply streams in over job events.
-        void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine) });
+        void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model) });
         return { session, job };
       }
 
@@ -186,7 +190,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('job', j);
         return j;
       }
-      case 'runJob': return engine.run(String(p.id ?? ''), { effort: p.effort as Effort | undefined, engine: asEngine(p.engine) });
+      case 'runJob': return engine.run(String(p.id ?? ''), { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model) });
       case 'cancelJob': {
         const c = engine.cancel(String(p.id ?? ''));
         return c ?? bad('job is not running', 409);
@@ -197,7 +201,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!store.getProject(String(p.projectId))) bad('project not found', 404);
         const j = store.createJob(String(p.projectId), String(p.input), String(p.title ?? ''), (p.effort as Effort) ?? 'balanced');
         emit('job', j);
-        return engine.run(j.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine) });
+        return engine.run(j.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model) });
       }
 
       // ── Approvals ──────────────────────────────────────────────

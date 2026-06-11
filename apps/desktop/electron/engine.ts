@@ -121,7 +121,7 @@ function abortControllerFromSignal(signal: AbortSignal): AbortController {
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
-  resume?: string,
+  resume?: string, modelOverride?: string,
 ): Promise<EngineRun> {
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -133,6 +133,7 @@ async function runClaude(
       maxTurns: maxTurnsOverride ?? EFFORT_TURNS[effort] ?? 4,
       permissionMode: 'bypassPermissions',
       includePartialMessages: !!hooks.onText,
+      ...(modelOverride ? { model: modelOverride } : {}),
       ...(resume ? { resume } : {}),
       ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
       ...(apiKey ? { env: { ...process.env, ANTHROPIC_API_KEY: apiKey } as NodeJS.ProcessEnv } : {}),
@@ -185,13 +186,14 @@ async function runClaude(
 }
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
-function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false): Promise<EngineRun> {
+function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex CLI not found on this Mac'), { statusCode: 503 }));
   const outFile = path.join(tmpdir(), `maestro-codex-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
   const args = [
     'exec', '--json', '--ephemeral', '--skip-git-repo-check',
     '-s', readOnly ? 'read-only' : 'workspace-write',
+    ...(model ? ['-m', model] : []),
     '-C', cwd, '-o', outFile,
     prompt,
   ];
@@ -322,7 +324,7 @@ export class LocalEngine {
   }
 
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
-  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId } = {}): Promise<Job> {
+  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string } = {}): Promise<Job> {
     const job = this.store.getJob(jobId);
     if (!job) throw Object.assign(new Error('job not found'), { statusCode: 404 });
     const project = this.store.getProject(job.projectId);
@@ -347,6 +349,7 @@ export class LocalEngine {
 
     let cur = this.store.updateJob(jobId, {
       status: 'running', phase: 'Working', progress: 20, output: '', error: null, engine: master,
+      ...(opts.model ? { model: opts.model } : {}),
       stage: `running on this Mac via ${ENGINE_LABEL[master]}…`,
     });
     this.emit('job', cur);
@@ -392,8 +395,8 @@ export class LocalEngine {
         onChild: (child) => { handle.child = child; },
       };
       const main = master === 'claude'
-        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks, resumeId)
-        : await runCodex(prompt, cwd, hooks);
+        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks, resumeId, opts.model)
+        : await runCodex(prompt, cwd, hooks, false, opts.model);
 
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {
         try { this.store.updateSession(session.id, { sdkSessionId: main.sdkSessionId }); } catch { /* session deleted mid-run */ }

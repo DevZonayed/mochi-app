@@ -17,6 +17,8 @@ import {
   EFFORT_EST,
   ModelSwitcher,
   ProviderGlyph,
+  CHAT_MODELS,
+  chatModelToRun,
   type EffortStop,
 } from '../lib/ui';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
@@ -916,7 +918,17 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   const [activeId, setActiveId] = React.useState<string | null>(null);
   const [turns, setTurns] = React.useState<Job[]>([]);
   const [text, setText] = React.useState('');
-  const [engine, setEngine] = React.useState('auto');
+  // Remember the last model across the whole app — fewer clicks next time.
+  const [modelChoice, setModelChoiceState] = React.useState(() => {
+    try {
+      const v = localStorage.getItem('maestro.chat.model');
+      return v && CHAT_MODELS.some(m => m.id === v) ? v : 'auto';
+    } catch { return 'auto'; }
+  });
+  const setModelChoice = (id: string) => {
+    setModelChoiceState(id);
+    try { localStorage.setItem('maestro.chat.model', id); } catch { /* storage unavailable */ }
+  };
   const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
   const [renamingId, setRenamingId] = React.useState<string | null>(null);
   const [renameVal, setRenameVal] = React.useState('');
@@ -1000,10 +1012,12 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
     if (taRef.current) taRef.current.style.height = 'auto';
     stickBottom.current = true;
     try {
+      const run = chatModelToRun(modelChoice);
       const resp = await api.sendChat({
         projectId, text: t, sessionId: activeRef.current ?? undefined,
         effort: EFFORT_TO_API[effort],
-        ...(engine === 'claude' || engine === 'codex' ? { engine: engine as EngineId } : {}),
+        ...(run.engine ? { engine: run.engine as EngineId } : {}),
+        ...(run.model ? { model: run.model } : {}),
       });
       setSessions(ss => (ss.some(s => s.id === resp.session.id) ? ss : [resp.session, ...ss]));
       if (activeRef.current !== resp.session.id) setActiveId(resp.session.id);
@@ -1144,7 +1158,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
               )}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 9 }}>
-              <ModelSwitcher compact value={engine} onChange={setEngine} />
+              <ModelSwitcher compact direction="up" value={modelChoice} onChange={setModelChoice} models={CHAT_MODELS} />
               <EffortDial compact value={effort} onChange={setEffort} />
               <span style={{ flex: 1 }} />
               {streaming && lastTurn && (

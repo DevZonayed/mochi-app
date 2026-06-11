@@ -249,6 +249,24 @@ export const DEFAULT_MODELS: ModelOption[] = [
   { id: 'codex',  name: 'Codex',       provider: 'openai',    sub: 'Your ChatGPT login',  cost: 0 },
 ];
 
+/* One flat picker = engine AND model in a single click (no nested menus).
+   Claude entries use the CLI's stable aliases (opus/sonnet/haiku) so they always
+   resolve to your plan's current version; Codex runs your ~/.codex default. */
+export const CHAT_MODELS: ModelOption[] = [
+  { id: 'auto',          name: 'Auto',            provider: 'auto',      sub: 'Routing default',        cost: 0 },
+  { id: 'claude:opus',   name: 'Claude · Opus',   provider: 'anthropic', sub: 'Most capable',           cost: 0 },
+  { id: 'claude:sonnet', name: 'Claude · Sonnet', provider: 'anthropic', sub: 'Balanced speed & depth', cost: 0 },
+  { id: 'claude:haiku',  name: 'Claude · Haiku',  provider: 'anthropic', sub: 'Fastest replies',        cost: 0 },
+  { id: 'codex',         name: 'Codex',           provider: 'openai',    sub: 'Your codex default',     cost: 0 },
+];
+
+/** Map a CHAT_MODELS id → the engine/model pair the dispatcher understands. */
+export function chatModelToRun(id: string): { engine?: 'claude' | 'codex'; model?: string } {
+  if (id === 'codex') return { engine: 'codex' };
+  if (id.startsWith('claude:')) return { engine: 'claude', model: id.slice('claude:'.length) };
+  return {};
+}
+
 export function ProviderGlyph({ provider, size = 18 }: { provider: ModelProvider; size?: number }) {
   if (provider === 'anthropic') return <AnthropicGlyph size={size} />;
   if (provider === 'openai') return <OpenAIGlyph size={size} />;
@@ -266,9 +284,11 @@ export interface ModelSwitcherProps {
   models?: ModelOption[];
   compact?: boolean;
   align?: 'left' | 'right';
+  /** 'up' opens the menu above the button (for pickers docked at the bottom). */
+  direction?: 'down' | 'up';
 }
 
-export function ModelSwitcher({ value = 'auto', onChange, models, compact, align = 'left' }: ModelSwitcherProps) {
+export function ModelSwitcher({ value = 'auto', onChange, models, compact, align = 'left', direction = 'down' }: ModelSwitcherProps) {
   const list = models || DEFAULT_MODELS;
   const cur = list.find(m => m.id === value) || list[0];
   const interactive = typeof onChange === 'function';
@@ -294,7 +314,7 @@ export function ModelSwitcher({ value = 'auto', onChange, models, compact, align
       </button>
       {open && (
         <div className="model-pop" style={{
-          position: 'absolute', top: `calc(100% + 6px)`, [align]: 0, zIndex: 50, width: 232,
+          position: 'absolute', ...(direction === 'up' ? { bottom: 'calc(100% + 6px)' } : { top: 'calc(100% + 6px)' }), [align]: 0, zIndex: 50, width: 232,
           background: 'var(--bg-elevated)', borderRadius: 12, border: '0.5px solid var(--separator)',
           boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.22))', overflow: 'hidden', padding: 4,
         }}>
