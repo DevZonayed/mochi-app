@@ -26,9 +26,22 @@ interface Snapshot {
   schedules?: unknown[];
   skills?: unknown[];
   templates?: unknown[];
+  assets?: { id?: string; projectId?: string | null; status?: string }[];
+  publishDrafts?: unknown[];
+  publishLedger?: unknown[];
+  briefs?: unknown[];
+  researchRuns?: unknown[];
+  events?: unknown[];
+  chatBindings?: unknown[];
+  pendingChats?: unknown[];
+  commEvents?: unknown[];
+  commsStatus?: unknown;
   budget?: unknown;
+  costs?: unknown;
   dashboard?: unknown;
   providers?: unknown[];
+  routing?: unknown;
+  settings?: unknown;
   at?: number;
 }
 
@@ -208,6 +221,9 @@ export function buildServer(): FastifyInstance {
   // ── Reads — served from the Mac's mirrored snapshot ───────────────
   app.get('/api/dashboard', async () => st()?.dashboard ?? EMPTY_DASHBOARD);
   app.get('/api/budget', async () => st()?.budget ?? EMPTY_DASHBOARD.budget);
+  app.get('/api/costs', async () => st()?.costs ?? { today: 0, thisMonth: 0, projectedMonth: 0, byDay: [], byProject: [], byEngine: [], includedCodexRuns: 0, claudeRuns: 0 });
+  app.get('/api/events', async () => st()?.events ?? []);
+  app.get('/api/settings', async () => st()?.settings ?? null);
   app.get('/api/workspaces', async () => st()?.workspaces ?? []);
   app.get('/api/projects', async () => st()?.projects ?? []);
   app.get('/api/projects/:id', async (req, reply) => {
@@ -239,15 +255,22 @@ export function buildServer(): FastifyInstance {
   app.post('/api/workspaces/:id/budget', async (req, reply) =>
     forward(reply, 'setBudgetCap', { ...(req.body ?? {}) as Record<string, unknown>, workspaceId: (req.params as { id: string }).id }));
   app.post('/api/projects', async (req, reply) => forward(reply, 'createProject', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/projects/:id/update', async (req, reply) =>
+    forward(reply, 'updateProject', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
+  app.post('/api/projects/clone', async (req, reply) => forward(reply, 'cloneRepo', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/settings', async (req, reply) => forward(reply, 'setSettings', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/jobs', async (req, reply) => forward(reply, 'createJob', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/jobs/run', async (req, reply) => forward(reply, 'createAndRunJob', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/jobs/:id/run', async (req, reply) =>
     forward(reply, 'runJob', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
+  app.post('/api/jobs/:id/cancel', async (req, reply) => forward(reply, 'cancelJob', { id: (req.params as { id: string }).id }));
+  app.post('/api/jobs/:id/delete', async (req, reply) => forward(reply, 'deleteJob', { id: (req.params as { id: string }).id }));
   app.post('/api/approvals/:id/approve', async (req, reply) => forward(reply, 'approveApproval', { id: (req.params as { id: string }).id }));
   app.post('/api/approvals/:id/deny', async (req, reply) => forward(reply, 'denyApproval', { id: (req.params as { id: string }).id }));
   app.post('/api/schedules', async (req, reply) => forward(reply, 'createSchedule', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/schedules/:id/toggle', async (req, reply) =>
     forward(reply, 'toggleSchedule', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
+  app.post('/api/schedules/:id/delete', async (req, reply) => forward(reply, 'deleteSchedule', { id: (req.params as { id: string }).id }));
   app.post('/api/skills/:id/toggle', async (req, reply) => forward(reply, 'toggleSkill', { id: (req.params as { id: string }).id }));
   app.post('/api/providers/:provider/connect', async (req, reply) =>
     forward(reply, 'connectProvider', { ...(req.body ?? {}) as Record<string, unknown>, provider: (req.params as { provider: string }).provider }));

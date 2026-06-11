@@ -3,19 +3,35 @@
    React Native has fetch but no EventSource, so live updates use polling
    (api.poll) instead of SSE. Same shape/contract as the desktop client. */
 
-export type JobStatus = 'pending' | 'running' | 'done' | 'failed';
+export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
+export type EngineId = 'claude' | 'codex';
+export type ProjectKind = 'coding' | 'content' | 'research' | 'general';
 
 export interface Workspace { id: string; name: string; budgetCap: number; createdAt: number }
-export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; createdAt: number }
+export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; kind?: ProjectKind; path?: string; repoUrl?: string; createdAt: number }
 export interface Job {
   id: string; projectId: string; title: string; status: JobStatus; phase: string; progress: number;
-  input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string; createdAt: number; updatedAt: number;
+  input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
+  engine?: EngineId; model?: string; createdAt: number; updatedAt: number;
 }
 export interface Approval {
-  id: string; projectId: string | null; kind: ApprovalKind; title: string; subtitle: string; detail: string; status: ApprovalStatus; createdAt: number; resolvedAt: number | null;
+  id: string; projectId: string | null; kind: ApprovalKind; title: string; subtitle: string; detail: string; status: ApprovalStatus; jobId?: string | null; createdAt: number; resolvedAt: number | null;
+}
+export type AppEventKind =
+  | 'job-done' | 'job-failed' | 'job-cancelled'
+  | 'approval-created' | 'approval-resolved'
+  | 'schedule-fired' | 'clone-done' | 'clone-failed'
+  | 'research' | 'publish' | 'comm' | 'asset';
+export interface AppEvent { id: string; ts: number; kind: AppEventKind; title: string; subtitle?: string; projectId?: string | null; jobId?: string | null }
+export interface CostsData {
+  today: number; thisMonth: number; projectedMonth: number;
+  byDay: { day: string; total: number }[];
+  byProject: { projectId: string; name: string; color: string; total: number; jobs: number }[];
+  byEngine: { engine: string; total: number; jobs: number; tokens: number }[];
+  includedCodexRuns: number; claudeRuns: number;
 }
 export interface Schedule { id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean; nextRun: number | null; createdAt: number }
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
@@ -91,6 +107,8 @@ export const api = {
 
   dashboard: (workspaceId?: string) => req<DashboardData>('/api/dashboard' + qp({ workspaceId })),
   budget: (workspaceId?: string) => req<BudgetData>('/api/budget' + qp({ workspaceId })),
+  costs: () => req<CostsData>('/api/costs'),
+  listEvents: () => req<AppEvent[]>('/api/events'),
 
   listWorkspaces: () => req<Workspace[]>('/api/workspaces'),
   createWorkspace: (name: string, budgetCap?: number) => req<Workspace>('/api/workspaces', { method: 'POST', body: JSON.stringify({ name, budgetCap }) }),
@@ -105,8 +123,9 @@ export const api = {
     req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) }),
   getJob: (id: string) => req<Job>(`/api/jobs/${encodeURIComponent(id)}`),
   runJob: (id: string, effort?: Effort) => req<Job>(`/api/jobs/${encodeURIComponent(id)}/run`, { method: 'POST', body: JSON.stringify(effort ? { effort } : {}) }),
-  createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
+  createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort; engine?: EngineId }) =>
     req<Job>('/api/jobs/run', { method: 'POST', body: JSON.stringify(input) }),
+  cancelJob: (id: string) => req<Job>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
 
   listApprovals: (status?: ApprovalStatus) => req<Approval[]>('/api/approvals' + qp({ status })),
   approveApproval: (id: string) => req<Approval>(`/api/approvals/${encodeURIComponent(id)}/approve`, { method: 'POST' }),

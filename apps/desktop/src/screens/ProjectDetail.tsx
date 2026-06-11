@@ -236,6 +236,7 @@ const API_STATUS_TO_LOCAL: Record<Job['status'], JobStatus> = {
   running: 'running',
   done: 'done',
   failed: 'failed',
+  cancelled: 'failed',
 };
 
 function relativeTime(ts: number): string {

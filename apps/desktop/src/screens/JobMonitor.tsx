@@ -67,7 +67,7 @@ const styles = `
 // time axis in "minutes": now sits at NOW_MIN; axis spans 0..AXIS_MAX
 const NOW_MIN = 60, AXIS_MAX = 96, PX = 10.6, LANE_LABEL = 158, LANE_H = 60, TRACK_W = AXIS_MAX * PX;
 
-type Status = 'running' | 'gated' | 'queued' | 'failed' | 'done' | 'scheduled';
+type Status = 'running' | 'gated' | 'queued' | 'failed' | 'done' | 'scheduled' | 'cancelled';
 
 interface Lane {
   id: string;
@@ -107,6 +107,7 @@ const STATUS_META: Record<Status, { label: string; tint: string }> = {
   failed:    { label: 'Failed',    tint: 'var(--red)' },
   done:      { label: 'Done',      tint: 'var(--green)' },
   scheduled: { label: 'Scheduled', tint: 'var(--teal)' },
+  cancelled: { label: 'Cancelled', tint: 'var(--ink-tertiary)' },
 };
 
 function axisLabel(min: number): string {
@@ -195,10 +196,12 @@ function Capsule({ job, nowMin, onClick, selected }: CapsuleProps) {
     failed: { background: 'var(--bg-elevated)', border: '1.5px solid color-mix(in srgb, var(--red) 55%, transparent)', color: 'var(--ink)' },
     done: { background: 'var(--fill-secondary)', border: '1px solid var(--separator)', color: 'var(--ink-secondary)' },
     scheduled: { background: 'transparent', border: '1.5px dashed color-mix(in srgb, var(--teal) 55%, transparent)', color: 'var(--ink-secondary)' },
+    cancelled: { background: 'var(--fill-tertiary)', border: '1px solid var(--separator)', color: 'var(--ink-tertiary)' },
   };
   const icon: Record<Status, React.ReactNode> = { running: <Spinner size={12} color="var(--purple)" />, gated: <Icon name="pause" size={13} style={{ color: 'var(--orange)' }} />,
     queued: <Icon name="clock" size={13} />, failed: <Icon name="x" size={13} stroke={2.6} style={{ color: 'var(--red)' }} />,
-    done: <Icon name="check" size={13} stroke={2.6} style={{ color: 'var(--green)' }} />, scheduled: <Icon name="clock" size={13} style={{ color: 'var(--teal)' }} /> };
+    done: <Icon name="check" size={13} stroke={2.6} style={{ color: 'var(--green)' }} />, scheduled: <Icon name="clock" size={13} style={{ color: 'var(--teal)' }} />,
+    cancelled: <Icon name="x" size={13} stroke={2.6} style={{ color: 'var(--ink-tertiary)' }} /> };
 
   return (
     <div data-cap={job.id} onClick={() => onClick(job)} className={`capsule cap-${job.status}`} style={{ ...base, ...fills[job.status],
@@ -440,6 +443,7 @@ function MonStatus({ status }: { status: Status }) {
     running: <Spinner size={12} color={m.tint} />, gated: <Icon name="pause" size={13} />,
     queued: <Icon name="clock" size={13} />, failed: <Icon name="x" size={13} stroke={2.6} />,
     done: <Icon name="check" size={13} stroke={2.6} />, scheduled: <Icon name="clock" size={13} />,
+    cancelled: <Icon name="x" size={13} stroke={2.6} />,
   }[status];
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: m.tint, font: '600 var(--fs-footnote)/1 var(--font-text)' }}>

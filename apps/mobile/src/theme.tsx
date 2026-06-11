@@ -1,6 +1,13 @@
 import React, { createContext, useContext, useMemo, useState } from 'react';
 import { useColorScheme } from 'react-native';
 import { makeTheme, type Theme, type ThemeMode } from '@maestro/design-tokens';
+import { getStr, setStr } from './storage';
+
+const THEME_KEY = 'maestro.mobile.theme';
+function readOverride(): ThemeMode | null {
+  const v = getStr(THEME_KEY);
+  return v === 'dark' || v === 'light' ? v : null;
+}
 
 interface ThemeContextValue {
   theme: Theme;
@@ -14,7 +21,11 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const system = useColorScheme();
-  const [override, setOverride] = useState<ThemeMode | null>(null);
+  const [override, setOverrideState] = useState<ThemeMode | null>(readOverride);
+  const setOverride = (m: ThemeMode | null) => {
+    setOverrideState(m);
+    setStr(THEME_KEY, m ?? '');
+  };
   const mode: ThemeMode = override ?? (system === 'dark' ? 'dark' : 'light');
   const theme = useMemo(() => makeTheme(mode), [mode]);
 

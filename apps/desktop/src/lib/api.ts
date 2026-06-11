@@ -6,10 +6,11 @@
    falls back to REST against the relay server, which mirrors the Mac's pushed
    state and forwards commands to it — the web app is a remote control. */
 
-export type JobStatus = 'pending' | 'running' | 'done' | 'failed';
+export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
+export type ProjectKind = 'coding' | 'content' | 'research' | 'general';
 
 export interface Workspace {
   id: string;
@@ -24,6 +25,9 @@ export interface Project {
   template: string;
   instructions: string;
   color: string;
+  kind?: ProjectKind;
+  path?: string;
+  repoUrl?: string;
   createdAt: number;
 }
 export interface Job {
@@ -40,6 +44,8 @@ export interface Job {
   cost: number;
   tokens: number;
   stage: string;
+  engine?: EngineId;
+  model?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -51,6 +57,7 @@ export interface Approval {
   subtitle: string;
   detail: string;
   status: ApprovalStatus;
+  jobId?: string | null;
   createdAt: number;
   resolvedAt: number | null;
 }
@@ -107,6 +114,36 @@ export interface Routing {
 export interface PairingInfo {
   token: string;
   relayUrl: string;
+}
+export type AppEventKind =
+  | 'job-done' | 'job-failed' | 'job-cancelled'
+  | 'approval-created' | 'approval-resolved'
+  | 'schedule-fired' | 'clone-done' | 'clone-failed'
+  | 'research' | 'publish' | 'comm' | 'asset';
+export interface AppEvent {
+  id: string;
+  ts: number;
+  kind: AppEventKind;
+  title: string;
+  subtitle?: string;
+  projectId?: string | null;
+  jobId?: string | null;
+}
+export interface AppSettings {
+  defaultEffort: Effort;
+  defaultEngine: EngineId | 'auto';
+  openAtLogin: boolean;
+  rescanCadence: 'daily' | 'weekly' | 'onchange';
+}
+export interface CostsData {
+  today: number;
+  thisMonth: number;
+  projectedMonth: number;
+  byDay: { day: string; total: number }[];
+  byProject: { projectId: string; name: string; color: string; total: number; jobs: number }[];
+  byEngine: { engine: string; total: number; jobs: number; tokens: number }[];
+  includedCodexRuns: number;
+  claudeRuns: number;
 }
 export interface DashboardData {
   workspace: Workspace | null;
@@ -225,6 +262,14 @@ export const api = {
     call<DashboardData>('dashboard', { workspaceId }, () => req<DashboardData>('/api/dashboard' + qp({ workspaceId }))),
   budget: (workspaceId?: string) =>
     call<BudgetData>('budget', { workspaceId }, () => req<BudgetData>('/api/budget' + qp({ workspaceId }))),
+  costs: () => call<CostsData>('costs', {}, () => req<CostsData>('/api/costs')),
+  listEvents: () => call<AppEvent[]>('listEvents', {}, () => req<AppEvent[]>('/api/events')),
+
+  // Settings
+  getSettings: () => call<AppSettings>('getSettings', {}, () => req<AppSettings>('/api/settings')),
+  setSettings: (patch: Partial<AppSettings>) =>
+    call<AppSettings>('setSettings', { ...patch }, () =>
+      req<AppSettings>('/api/settings', { method: 'POST', body: JSON.stringify(patch) })),
 
   // Workspaces
   listWorkspaces: () => call<Workspace[]>('listWorkspaces', {}, () => req<Workspace[]>('/api/workspaces')),
@@ -238,9 +283,12 @@ export const api = {
   // Projects
   listProjects: (workspaceId?: string) =>
     call<Project[]>('listProjects', { workspaceId }, () => req<Project[]>('/api/projects' + qp({ workspaceId }))),
-  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string }) =>
+  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }) =>
     call<Project>('createProject', { ...input }, () =>
       req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) })),
+  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template'>>) =>
+    call<Project>('updateProject', { id, ...patch }, () =>
+      req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   getProject: (id: string) =>
     call<Project>('getProject', { id }, () => req<Project>(`/api/projects/${encodeURIComponent(id)}`)),
 
@@ -257,6 +305,10 @@ export const api = {
   createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort; engine?: EngineId }) =>
     call<Job>('createAndRunJob', { ...input }, () =>
       req<Job>('/api/jobs/run', { method: 'POST', body: JSON.stringify(input) })),
+  cancelJob: (id: string) =>
+    call<Job>('cancelJob', { id }, () => req<Job>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' })),
+  deleteJob: (id: string) =>
+    call<{ ok: boolean }>('deleteJob', { id }, () => req<{ ok: boolean }>(`/api/jobs/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 
   // Approvals
   listApprovals: (status?: ApprovalStatus) =>
@@ -274,6 +326,8 @@ export const api = {
   toggleSchedule: (id: string, enabled: boolean) =>
     call<{ ok: boolean }>('toggleSchedule', { id, enabled }, () =>
       req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) })),
+  deleteSchedule: (id: string) =>
+    call<{ ok: boolean }>('deleteSchedule', { id }, () => req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 
   // Skills
   listSkills: () => call<Skill[]>('listSkills', {}, () => req<Skill[]>('/api/skills')),

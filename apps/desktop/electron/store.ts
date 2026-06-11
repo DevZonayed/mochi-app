@@ -1,9 +1,11 @@
 /* Maestro local store — the source of truth lives ON THIS MAC.
 
-   A small JSON-file store in Electron userData holding every domain entity
-   (workspace, projects, jobs, approvals, schedules, skills, templates) plus
-   device identity for the relay. The remote server never owns this data; it
-   only mirrors the snapshot we push for the phone/web remote controls. */
+   A JSON-file store in Electron userData holding every domain entity
+   (workspace, projects, jobs, approvals, schedules, skills, templates,
+   media assets, publish drafts, research briefs, comms bindings, events,
+   settings) plus device identity for the relay. The remote server never
+   owns this data; it only mirrors the snapshot we push for the phone/web
+   remote controls. */
 
 import { app } from 'electron';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -21,21 +23,29 @@ export function newPairingToken(): string {
   return `${group()}-${group()}-${group()}`;
 }
 
-export type JobStatus = 'pending' | 'running' | 'done' | 'failed';
+/* ── Domain types ────────────────────────────────────────────────────── */
+
+export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
+export type ProjectKind = 'coding' | 'content' | 'research' | 'general';
 
 export interface Workspace { id: string; name: string; budgetCap: number; createdAt: number }
-export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; createdAt: number }
+export interface Project {
+  id: string; workspaceId: string; name: string; template: string; instructions: string; color: string;
+  kind?: ProjectKind; path?: string; repoUrl?: string;
+  createdAt: number;
+}
 export interface Job {
   id: string; projectId: string; title: string; status: JobStatus; phase: string; progress: number;
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
+  engine?: EngineId; model?: string;
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
   id: string; projectId: string | null; kind: ApprovalKind; title: string; subtitle: string; detail: string;
-  status: ApprovalStatus; createdAt: number; resolvedAt: number | null;
+  status: ApprovalStatus; jobId?: string | null; createdAt: number; resolvedAt: number | null;
 }
 export interface Schedule { id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean; nextRun: number | null; lastRun?: number | null; createdAt: number }
 
@@ -45,15 +55,102 @@ export interface Routing {
   master: EngineId;
   /** Reviewer — optional second pass appended to job output. */
   reviewer: EngineId | 'off';
-  /** Studio routing (applies when the media pipeline ships). */
+  /** Legacy studio routing (media now runs on fal; kept for store compat). */
   image: EngineId;
   video: EngineId;
 }
 export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex' };
+
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
 
+/* Media assets — generated on fal or imported from disk. ONE entity. */
+export type AssetKind = 'image' | 'video' | 'audio' | 'voiceover' | 'other';
+export type AssetStage = 'broll' | 'avatar' | 'voice' | 'music';
+export type AssetStatus = 'queued' | 'generating' | 'done' | 'failed' | 'cancelled' | 'approved';
+export interface Asset {
+  id: string;
+  projectId: string | null;
+  source: 'generated' | 'import';
+  kind: AssetKind;
+  stage?: AssetStage;
+  prompt?: string;
+  model?: string;
+  status: AssetStatus;
+  falRequestId?: string;
+  statusUrl?: string;
+  responseUrl?: string;
+  cancelUrl?: string;
+  url?: string;
+  localPath?: string;
+  name?: string;
+  bytes?: number;
+  sha256?: string;
+  thumbDataUrl?: string;
+  tint?: string;
+  cost: number;
+  durationS?: number;
+  width?: number;
+  height?: number;
+  error: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type PublishStatus = 'draft' | 'approved' | 'scheduled' | 'exported' | 'published-manual';
+export interface PublishDraft {
+  id: string; assetId: string; caption: string; platforms: string[]; scheduledAt: number | null;
+  status: PublishStatus; provenance: string; exportedPaths: string[]; createdAt: number; updatedAt: number;
+}
+export interface PublishLedgerRow {
+  id: string; draftId: string; at: number; platforms: string[]; action: 'exported' | 'published-manual'; ok: boolean; hash: string; paths: string[];
+}
+
+export interface Brief {
+  id: string; topic: string; headline: string; hook: string; titles: string[]; platforms: string[];
+  confidence: number; sources: string[]; status: 'ready' | 'sent-to-studio' | 'raw'; jobId: string; createdAt: number;
+}
+export interface ResearchRun { id: string; topic: string; jobId: string; status: 'running' | 'done' | 'failed'; briefCount: number; at: number }
+
+export type AppEventKind =
+  | 'job-done' | 'job-failed' | 'job-cancelled'
+  | 'approval-created' | 'approval-resolved'
+  | 'schedule-fired' | 'clone-done' | 'clone-failed'
+  | 'research' | 'publish' | 'comm' | 'asset';
+export interface AppEvent {
+  id: string; ts: number; kind: AppEventKind; title: string; subtitle?: string;
+  projectId?: string | null; jobId?: string | null;
+}
+
+export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; approveGates: boolean }
+export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; projectId: string | null; permissions: ChatPermissions; boundAt: number }
+export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
+export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
+export interface TelegramState { offset: number; botUsername: string | null; connectedAt: number | null }
+export interface CommsStatus {
+  telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
+  whatsapp: { connected: false };
+}
+
+export interface AppSettings {
+  defaultEffort: Effort;
+  defaultEngine: EngineId | 'auto';
+  openAtLogin: boolean;
+  rescanCadence: 'daily' | 'weekly' | 'onchange';
+}
+export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange' };
+
 export interface BudgetData { cap: number; spent: number; byProject: { projectId: string; name: string; color: string; spent: number }[] }
+export interface CostsData {
+  today: number;
+  thisMonth: number;
+  projectedMonth: number;
+  byDay: { day: string; total: number }[];
+  byProject: { projectId: string; name: string; color: string; total: number; jobs: number }[];
+  byEngine: { engine: string; total: number; jobs: number; tokens: number }[];
+  includedCodexRuns: number;
+  claudeRuns: number;
+}
 export interface DashboardData {
   workspace: Workspace | null;
   greetingProjects: { id: string; name: string; color: string }[];
@@ -64,12 +161,16 @@ export interface DashboardData {
   budget: BudgetData;
 }
 
+/* ── Persistence shape ───────────────────────────────────────────────── */
+
 interface StoreData {
   deckId: string;
   deckSecret: string;
   /** Pairing token remotes must present to the relay. Shown in the app; never in snapshots. */
   accessToken: string;
   routing: Routing;
+  settings: AppSettings;
+  catalogVersion?: number;
   workspace: Workspace | null;
   projects: Project[];
   jobs: Job[];
@@ -77,9 +178,25 @@ interface StoreData {
   schedules: Schedule[];
   skills: Skill[];
   templates: Template[];
+  assets: Asset[];
+  publishDrafts: PublishDraft[];
+  publishLedger: PublishLedgerRow[];
+  briefs: Brief[];
+  researchRuns: ResearchRun[];
+  events: AppEvent[];
+  chatBindings: ChatBinding[];
+  pendingChats: PendingChat[];
+  commEvents: CommEvent[];
+  telegram: TelegramState;
   /** Locally (safeStorage-)encrypted provider API keys, base64. Never leaves this Mac. */
   providerKeys: Record<string, { cipherB64: string; last4: string; createdAt: number }>;
 }
+
+const CATALOG_VERSION = 2;
+const SEED_PROJECT_NAMES = ['Atlas API', 'Q3 Content', 'Market Scan', 'Brand Refresh', 'Infra / CI'];
+const SEED_JOB_TITLE = 'Merge PR #482 — auth refactor';
+
+const ASSET_TINTS = ['#5b8cff', '#9b6bff', '#41c8d4', '#ff9f6b', '#6bd49a', '#ff6b9f'];
 
 export class Store {
   private file: string;
@@ -90,21 +207,61 @@ export class Store {
     mkdirSync(dir, { recursive: true });
     this.file = join(dir, 'maestro-store.json');
     this.load();
-    this.seedIfEmpty();
+    this.seedCatalog();
   }
 
   private load(): void {
     try {
       this.data = JSON.parse(readFileSync(this.file, 'utf8')) as StoreData;
-      // migrations for stores written by older builds
       let dirty = false;
+      // migrations for stores written by older builds (dirty-flag pattern)
       if (!this.data.accessToken) { this.data.accessToken = newPairingToken(); dirty = true; }
       if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
+      if (!this.data.settings) { this.data.settings = { ...DEFAULT_SETTINGS }; dirty = true; }
+      if (!this.data.assets) { this.data.assets = []; dirty = true; }
+      if (!this.data.publishDrafts) { this.data.publishDrafts = []; dirty = true; }
+      if (!this.data.publishLedger) { this.data.publishLedger = []; dirty = true; }
+      if (!this.data.briefs) { this.data.briefs = []; dirty = true; }
+      if (!this.data.researchRuns) { this.data.researchRuns = []; dirty = true; }
+      if (!this.data.events) { this.data.events = []; dirty = true; }
+      if (!this.data.chatBindings) { this.data.chatBindings = []; dirty = true; }
+      if (!this.data.pendingChats) { this.data.pendingChats = []; dirty = true; }
+      if (!this.data.commEvents) { this.data.commEvents = []; dirty = true; }
+      if (!this.data.telegram) { this.data.telegram = { offset: 0, botUsername: null, connectedAt: null }; dirty = true; }
+
+      // One-time demo-data purge: only fires on the full seed fingerprint so a
+      // real project that happens to share a name never gets wiped.
+      const seedNameHits = SEED_PROJECT_NAMES.filter((n) => this.data.projects.some((p) => p.name === n)).length;
+      const seedJobHit = this.data.jobs.some((j) => j.title === SEED_JOB_TITLE);
+      if (this.data.workspace?.name === 'Atlas Studio' && seedNameHits >= 4 && seedJobHit) {
+        this.data.workspace = null;
+        this.data.projects = [];
+        this.data.jobs = [];
+        this.data.approvals = [];
+        this.data.schedules = [];
+        this.data.skills = [];
+        this.data.templates = [];
+        this.data.catalogVersion = 0;
+        dirty = true;
+      }
+      // Catalog refresh (honest skills + templates) for older stores.
+      if ((this.data.catalogVersion ?? 0) < CATALOG_VERSION) {
+        this.data.skills = [];
+        this.data.templates = [];
+        this.data.catalogVersion = CATALOG_VERSION;
+        dirty = true;
+      }
       if (dirty) this.save();
     } catch {
       this.data = {
-        deckId: id(), deckSecret: id(), accessToken: newPairingToken(), routing: { ...DEFAULT_ROUTING }, workspace: null,
-        projects: [], jobs: [], approvals: [], schedules: [], skills: [], templates: [], providerKeys: {},
+        deckId: id(), deckSecret: id(), accessToken: newPairingToken(),
+        routing: { ...DEFAULT_ROUTING }, settings: { ...DEFAULT_SETTINGS }, catalogVersion: CATALOG_VERSION,
+        workspace: null,
+        projects: [], jobs: [], approvals: [], schedules: [], skills: [], templates: [],
+        assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
+        chatBindings: [], pendingChats: [], commEvents: [],
+        telegram: { offset: 0, botUsername: null, connectedAt: null },
+        providerKeys: {},
       };
       this.save();
     }
@@ -125,6 +282,13 @@ export class Store {
     return this.routing();
   }
 
+  getSettings(): AppSettings { return { ...this.data.settings }; }
+  setSettings(patch: Partial<AppSettings>): AppSettings {
+    this.data.settings = { ...this.data.settings, ...patch };
+    this.save();
+    return this.getSettings();
+  }
+
   // ── Workspace ───────────────────────────────────────────────────────
   workspace(): Workspace | null { return this.data.workspace; }
   createWorkspace(name: string, budgetCap = 200): Workspace {
@@ -143,14 +307,23 @@ export class Store {
   // ── Projects ────────────────────────────────────────────────────────
   listProjects(): Project[] { return [...this.data.projects].sort((a, b) => a.createdAt - b.createdAt); }
   getProject(projectId: string): Project | undefined { return this.data.projects.find(p => p.id === projectId); }
-  createProject(args: { name: string; template?: string; instructions?: string; color?: string }): Project {
+  createProject(args: { name: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }): Project {
     const ws = this.data.workspace ?? this.createWorkspace('My Workspace');
     const p: Project = {
       id: id(), workspaceId: ws.id, name: args.name,
-      template: args.template ?? 'claude-code', instructions: args.instructions ?? '', color: args.color ?? 'blue', createdAt: now(),
+      template: args.template ?? 'claude-code', instructions: args.instructions ?? '', color: args.color ?? 'blue',
+      kind: args.kind, path: args.path, repoUrl: args.repoUrl,
+      createdAt: now(),
     };
     this.data.projects.push(p); this.save();
     return p;
+  }
+  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template'>>): Project {
+    const cur = this.getProject(projectId);
+    if (!cur) throw Object.assign(new Error('project not found'), { statusCode: 404 });
+    Object.assign(cur, patch);
+    this.save();
+    return cur;
   }
 
   // ── Jobs ────────────────────────────────────────────────────────────
@@ -159,21 +332,28 @@ export class Store {
     return projectId ? all.filter(j => j.projectId === projectId) : all.slice(0, 200);
   }
   getJob(jobId: string): Job | undefined { return this.data.jobs.find(j => j.id === jobId); }
-  createJob(projectId: string, input: string, title = '', effort: Effort = 'balanced'): Job {
+  createJob(projectId: string, input: string, title = '', effort?: Effort): Job {
     const t = now();
     const j: Job = {
       id: id(), projectId, title: title || input.slice(0, 60), status: 'pending', phase: 'Queued', progress: 0,
-      input, output: null, error: null, effort, cost: 0, tokens: 0, stage: '', createdAt: t, updatedAt: t,
+      input, output: null, error: null, effort: effort ?? this.data.settings.defaultEffort, cost: 0, tokens: 0, stage: '',
+      createdAt: t, updatedAt: t,
     };
     this.data.jobs.push(j); this.save();
     return j;
   }
-  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage'>>): Job {
+  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model'>>): Job {
     const cur = this.getJob(jobId);
     if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });
     this.save();
     return cur;
+  }
+  deleteJob(jobId: string): void {
+    const i = this.data.jobs.findIndex(j => j.id === jobId);
+    if (i === -1) throw Object.assign(new Error('job not found'), { statusCode: 404 });
+    this.data.jobs.splice(i, 1);
+    this.save();
   }
 
   // ── Approvals ───────────────────────────────────────────────────────
@@ -181,10 +361,11 @@ export class Store {
     const all = [...this.data.approvals].sort((a, b) => b.createdAt - a.createdAt);
     return status ? all.filter(a => a.status === status) : all.slice(0, 200);
   }
-  createApproval(a: { projectId?: string | null; kind?: ApprovalKind; title: string; subtitle?: string; detail?: string }): Approval {
+  createApproval(a: { projectId?: string | null; kind?: ApprovalKind; title: string; subtitle?: string; detail?: string; jobId?: string | null }): Approval {
     const rec: Approval = {
       id: id(), projectId: a.projectId ?? null, kind: a.kind ?? 'review', title: a.title,
-      subtitle: a.subtitle ?? '', detail: a.detail ?? '', status: 'pending', createdAt: now(), resolvedAt: null,
+      subtitle: a.subtitle ?? '', detail: a.detail ?? '', status: 'pending', jobId: a.jobId ?? null,
+      createdAt: now(), resolvedAt: null,
     };
     this.data.approvals.push(rec); this.save();
     return rec;
@@ -219,6 +400,12 @@ export class Store {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (s && s.nextRun !== nextRun) { s.nextRun = nextRun; this.save(); }
   }
+  deleteSchedule(scheduleId: string): void {
+    const i = this.data.schedules.findIndex(s => s.id === scheduleId);
+    if (i === -1) throw Object.assign(new Error('schedule not found'), { statusCode: 404 });
+    this.data.schedules.splice(i, 1);
+    this.save();
+  }
 
   // ── Skills / Templates ─────────────────────────────────────────────
   listSkills(): Skill[] { return [...this.data.skills].sort((a, b) => (a.category + a.name).localeCompare(b.category + b.name)); }
@@ -229,6 +416,189 @@ export class Store {
     return s;
   }
   listTemplates(): Template[] { return [...this.data.templates].sort((a, b) => (a.category + a.name).localeCompare(b.category + b.name)); }
+
+  // ── Assets (generated + imported media) ─────────────────────────────
+  listAssets(filter?: { projectId?: string; status?: AssetStatus }): Asset[] {
+    let all = [...this.data.assets].sort((a, b) => b.updatedAt - a.updatedAt);
+    if (filter?.projectId) all = all.filter(a => a.projectId === filter.projectId);
+    if (filter?.status) all = all.filter(a => a.status === filter.status);
+    return all.slice(0, 200);
+  }
+  getAsset(assetId: string): Asset | undefined { return this.data.assets.find(a => a.id === assetId); }
+  createAsset(args: Partial<Asset> & { source: Asset['source']; kind: AssetKind; status: AssetStatus }): Asset {
+    const t = now();
+    const a: Asset = {
+      id: id(), projectId: args.projectId ?? null, source: args.source, kind: args.kind, stage: args.stage,
+      prompt: args.prompt, model: args.model, status: args.status,
+      falRequestId: args.falRequestId, statusUrl: args.statusUrl, responseUrl: args.responseUrl, cancelUrl: args.cancelUrl,
+      url: args.url, localPath: args.localPath, name: args.name, bytes: args.bytes, sha256: args.sha256,
+      thumbDataUrl: args.thumbDataUrl, tint: args.tint ?? ASSET_TINTS[Math.floor(Math.random() * ASSET_TINTS.length)],
+      cost: args.cost ?? 0, durationS: args.durationS, width: args.width, height: args.height,
+      error: null, createdAt: t, updatedAt: t,
+    };
+    this.data.assets.push(a); this.save();
+    return a;
+  }
+  updateAsset(assetId: string, patch: Partial<Asset>): Asset {
+    const cur = this.getAsset(assetId);
+    if (!cur) throw Object.assign(new Error('asset not found'), { statusCode: 404 });
+    Object.assign(cur, patch, { updatedAt: now() });
+    this.save();
+    return cur;
+  }
+  deleteAsset(assetId: string): Asset {
+    const i = this.data.assets.findIndex(a => a.id === assetId);
+    if (i === -1) throw Object.assign(new Error('asset not found'), { statusCode: 404 });
+    const [removed] = this.data.assets.splice(i, 1);
+    this.save();
+    return removed;
+  }
+
+  // ── Publishing ──────────────────────────────────────────────────────
+  listPublishDrafts(): PublishDraft[] { return [...this.data.publishDrafts].sort((a, b) => b.updatedAt - a.updatedAt); }
+  getPublishDraft(draftId: string): PublishDraft | undefined { return this.data.publishDrafts.find(d => d.id === draftId); }
+  createPublishDraft(args: { assetId: string; caption?: string; platforms?: string[]; provenance?: string }): PublishDraft {
+    const t = now();
+    const d: PublishDraft = {
+      id: id(), assetId: args.assetId, caption: args.caption ?? '', platforms: args.platforms ?? [],
+      scheduledAt: null, status: 'draft', provenance: args.provenance ?? '', exportedPaths: [], createdAt: t, updatedAt: t,
+    };
+    this.data.publishDrafts.push(d); this.save();
+    return d;
+  }
+  updatePublishDraft(draftId: string, patch: Partial<Pick<PublishDraft, 'caption' | 'platforms' | 'scheduledAt' | 'status' | 'exportedPaths' | 'provenance'>>): PublishDraft {
+    const cur = this.getPublishDraft(draftId);
+    if (!cur) throw Object.assign(new Error('draft not found'), { statusCode: 404 });
+    Object.assign(cur, patch, { updatedAt: now() });
+    this.save();
+    return cur;
+  }
+  deletePublishDraft(draftId: string): void {
+    const i = this.data.publishDrafts.findIndex(d => d.id === draftId);
+    if (i === -1) throw Object.assign(new Error('draft not found'), { statusCode: 404 });
+    this.data.publishDrafts.splice(i, 1);
+    this.save();
+  }
+  appendPublishLedger(row: Omit<PublishLedgerRow, 'id' | 'at'>): PublishLedgerRow {
+    const rec: PublishLedgerRow = { ...row, id: id(), at: now() };
+    this.data.publishLedger.unshift(rec);
+    if (this.data.publishLedger.length > 200) this.data.publishLedger.length = 200;
+    this.save();
+    return rec;
+  }
+  listPublishLedger(): PublishLedgerRow[] { return [...this.data.publishLedger]; }
+
+  // ── Research briefs ─────────────────────────────────────────────────
+  listBriefs(): Brief[] { return [...this.data.briefs].sort((a, b) => b.createdAt - a.createdAt).slice(0, 100); }
+  addBriefs(briefs: Omit<Brief, 'id' | 'createdAt'>[]): Brief[] {
+    const recs = briefs.map((b): Brief => ({ ...b, id: id(), createdAt: now() }));
+    this.data.briefs.unshift(...recs);
+    if (this.data.briefs.length > 100) this.data.briefs.length = 100;
+    this.save();
+    return recs;
+  }
+  setBriefStatus(briefId: string, status: Brief['status']): Brief {
+    const b = this.data.briefs.find(x => x.id === briefId);
+    if (!b) throw Object.assign(new Error('brief not found'), { statusCode: 404 });
+    b.status = status;
+    this.save();
+    return b;
+  }
+  createResearchRun(args: { topic: string; jobId: string }): ResearchRun {
+    const r: ResearchRun = { id: id(), topic: args.topic, jobId: args.jobId, status: 'running', briefCount: 0, at: now() };
+    this.data.researchRuns.unshift(r);
+    if (this.data.researchRuns.length > 50) this.data.researchRuns.length = 50;
+    this.save();
+    return r;
+  }
+  updateResearchRun(runId: string, patch: Partial<Pick<ResearchRun, 'status' | 'briefCount'>>): ResearchRun {
+    const r = this.data.researchRuns.find(x => x.id === runId);
+    if (!r) throw Object.assign(new Error('research run not found'), { statusCode: 404 });
+    Object.assign(r, patch);
+    this.save();
+    return r;
+  }
+  listResearchRuns(): ResearchRun[] { return [...this.data.researchRuns]; }
+
+  // ── Events feed ─────────────────────────────────────────────────────
+  pushEvent(e: Omit<AppEvent, 'id' | 'ts'>): AppEvent {
+    const rec: AppEvent = { ...e, id: id(), ts: now() };
+    this.data.events.unshift(rec);
+    if (this.data.events.length > 200) this.data.events.length = 200;
+    this.save();
+    return rec;
+  }
+  listEvents(): AppEvent[] { return [...this.data.events]; }
+
+  // ── Comms (Telegram) ────────────────────────────────────────────────
+  listChatBindings(): ChatBinding[] { return [...this.data.chatBindings]; }
+  getChatBinding(chatId: string): ChatBinding | undefined { return this.data.chatBindings.find(b => b.chatId === chatId); }
+  bindChat(args: { chatId: string; name: string; kind: 'dm' | 'group'; projectId?: string | null; permissions?: Partial<ChatPermissions> }): ChatBinding {
+    const existing = this.getChatBinding(args.chatId);
+    const perms: ChatPermissions = { startJobs: true, receiveReports: true, approveGates: false, ...(args.permissions ?? {}) };
+    if (existing) {
+      Object.assign(existing, { name: args.name, kind: args.kind, projectId: args.projectId ?? existing.projectId, permissions: perms });
+      this.save();
+      return existing;
+    }
+    const rec: ChatBinding = { chatId: args.chatId, name: args.name, kind: args.kind, projectId: args.projectId ?? null, permissions: perms, boundAt: now() };
+    this.data.chatBindings.push(rec);
+    this.removePendingChat(args.chatId);
+    this.save();
+    return rec;
+  }
+  unbindChat(chatId: string): void {
+    this.data.chatBindings = this.data.chatBindings.filter(b => b.chatId !== chatId);
+    this.save();
+  }
+  setChatPermissions(chatId: string, permissions: Partial<ChatPermissions>): ChatBinding {
+    const b = this.getChatBinding(chatId);
+    if (!b) throw Object.assign(new Error('chat not bound'), { statusCode: 404 });
+    b.permissions = { ...b.permissions, ...permissions };
+    this.save();
+    return b;
+  }
+  upsertPendingChat(c: Omit<PendingChat, 'at'>): void {
+    const existing = this.data.pendingChats.find(p => p.chatId === c.chatId);
+    if (existing) { existing.name = c.name; existing.firstText = c.firstText; existing.at = now(); }
+    else this.data.pendingChats.unshift({ ...c, at: now() });
+    if (this.data.pendingChats.length > 50) this.data.pendingChats.length = 50;
+    this.save();
+  }
+  removePendingChat(chatId: string): void {
+    this.data.pendingChats = this.data.pendingChats.filter(p => p.chatId !== chatId);
+    this.save();
+  }
+  listPendingChats(): PendingChat[] { return [...this.data.pendingChats]; }
+  addCommEvent(e: Omit<CommEvent, 'id' | 'at'>): CommEvent {
+    const rec: CommEvent = { ...e, id: id(), at: now() };
+    this.data.commEvents.unshift(rec);
+    if (this.data.commEvents.length > 200) this.data.commEvents.length = 200;
+    this.save();
+    return rec;
+  }
+  listCommEvents(): CommEvent[] { return [...this.data.commEvents]; }
+  telegramState(): TelegramState { return { ...this.data.telegram }; }
+  setTelegramState(patch: Partial<TelegramState>): TelegramState {
+    this.data.telegram = { ...this.data.telegram, ...patch };
+    this.save();
+    return this.telegramState();
+  }
+  commsStatus(): CommsStatus {
+    const key = this.providerKeyMeta('telegram');
+    const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+    return {
+      telegram: {
+        connected: !!key,
+        botUsername: this.data.telegram.botUsername,
+        tokenLast4: key?.last4 ?? null,
+        messagesToday: this.data.commEvents.filter(e => e.at >= midnight.getTime()).length,
+        bindings: this.data.chatBindings.length,
+        pending: this.data.pendingChats.length,
+      },
+      whatsapp: { connected: false },
+    };
+  }
 
   // ── Provider keys (local, encrypted) ───────────────────────────────
   providerKeyMeta(provider: string): { last4: string; createdAt: number } | undefined {
@@ -245,12 +615,62 @@ export class Store {
   // ── Aggregates ─────────────────────────────────────────────────────
   budget(): BudgetData {
     const cap = this.data.workspace?.budgetCap ?? 200;
-    const byProject = this.listProjects().map(p => ({
-      projectId: p.id, name: p.name, color: p.color,
-      spent: Math.round(this.data.jobs.filter(j => j.projectId === p.id).reduce((a, j) => a + j.cost, 0) * 100) / 100,
-    }));
+    const byProject = this.listProjects().map(p => {
+      const jobSpend = this.data.jobs.filter(j => j.projectId === p.id).reduce((a, j) => a + j.cost, 0);
+      const assetSpend = this.data.assets.filter(x => x.projectId === p.id).reduce((a, x) => a + x.cost, 0);
+      return { projectId: p.id, name: p.name, color: p.color, spent: Math.round((jobSpend + assetSpend) * 100) / 100 };
+    });
     const spent = Math.round(byProject.reduce((a, b) => a + b.spent, 0) * 100) / 100;
     return { cap, spent, byProject };
+  }
+
+  costs(): CostsData {
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+    const t = new Date();
+    const dayStart = new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime();
+    const monthStart = new Date(t.getFullYear(), t.getMonth(), 1).getTime();
+    const dayOfMonth = t.getDate();
+    const daysInMonth = new Date(t.getFullYear(), t.getMonth() + 1, 0).getDate();
+
+    interface Spend { at: number; cost: number; projectId: string | null; engine: string; tokens: number }
+    const spends: Spend[] = [
+      ...this.data.jobs.map(j => ({ at: j.createdAt, cost: j.cost, projectId: j.projectId as string | null, engine: j.engine ?? 'claude', tokens: j.tokens })),
+      ...this.data.assets.filter(a => a.source === 'generated').map(a => ({ at: a.createdAt, cost: a.cost, projectId: a.projectId, engine: 'media (fal)', tokens: 0 })),
+    ];
+
+    const today = r2(spends.filter(s => s.at >= dayStart).reduce((a, s) => a + s.cost, 0));
+    const thisMonth = r2(spends.filter(s => s.at >= monthStart).reduce((a, s) => a + s.cost, 0));
+    const projectedMonth = dayOfMonth > 0 ? r2((thisMonth / dayOfMonth) * daysInMonth) : thisMonth;
+
+    const byDay: { day: string; total: number }[] = [];
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date(t.getFullYear(), t.getMonth(), t.getDate() - i);
+      const start = d.getTime();
+      const end = start + 24 * 60 * 60 * 1000;
+      byDay.push({
+        day: `${d.getMonth() + 1}/${d.getDate()}`,
+        total: r2(spends.filter(s => s.at >= start && s.at < end).reduce((a, s) => a + s.cost, 0)),
+      });
+    }
+
+    const byProject = this.listProjects().map(p => {
+      const mine = spends.filter(s => s.projectId === p.id);
+      return { projectId: p.id, name: p.name, color: p.color, total: r2(mine.reduce((a, s) => a + s.cost, 0)), jobs: this.data.jobs.filter(j => j.projectId === p.id).length };
+    }).filter(p => p.total > 0 || p.jobs > 0);
+
+    const engineMap = new Map<string, { total: number; jobs: number; tokens: number }>();
+    for (const s of spends) {
+      const e = engineMap.get(s.engine) ?? { total: 0, jobs: 0, tokens: 0 };
+      e.total += s.cost; e.jobs += 1; e.tokens += s.tokens;
+      engineMap.set(s.engine, e);
+    }
+    const byEngine = [...engineMap.entries()].map(([engine, v]) => ({ engine, total: r2(v.total), jobs: v.jobs, tokens: v.tokens }));
+
+    return {
+      today, thisMonth, projectedMonth, byDay, byProject, byEngine,
+      includedCodexRuns: this.data.jobs.filter(j => j.engine === 'codex').length,
+      claudeRuns: this.data.jobs.filter(j => (j.engine ?? 'claude') === 'claude').length,
+    };
   }
 
   dashboard(): DashboardData {
@@ -267,91 +687,75 @@ export class Store {
     };
   }
 
-  /** Full snapshot pushed to the relay so phone/web remotes can mirror this Mac. */
+  /** Full snapshot pushed to the relay so phone/web remotes can mirror this Mac.
+      Slimmed: queue/file paths and thumbs never leave the Mac; long outputs truncate. */
   snapshot(providers: unknown): Record<string, unknown> {
+    const slimJob = (j: Job): Job => (j.output && j.output.length > 16384 ? { ...j, output: '…' + j.output.slice(-16384) } : j);
+    const slimAsset = (a: Asset) => ({
+      id: a.id, projectId: a.projectId, source: a.source, kind: a.kind, stage: a.stage,
+      prompt: a.prompt ? a.prompt.slice(0, 200) : undefined, model: a.model, status: a.status,
+      url: a.url, name: a.name, bytes: a.bytes, tint: a.tint, cost: a.cost,
+      durationS: a.durationS, width: a.width, height: a.height, error: a.error,
+      createdAt: a.createdAt, updatedAt: a.updatedAt,
+    });
+    const dashboard = this.dashboard();
     return {
       workspace: this.data.workspace,
       workspaces: this.data.workspace ? [this.data.workspace] : [],
       projects: this.listProjects(),
-      jobs: this.listJobs(),
+      jobs: this.listJobs().map(slimJob),
       approvals: this.listApprovals(),
       schedules: this.listSchedules(),
       skills: this.listSkills(),
       templates: this.listTemplates(),
+      assets: this.listAssets().slice(0, 100).map(slimAsset),
+      publishDrafts: this.listPublishDrafts(),
+      publishLedger: this.listPublishLedger(),
+      briefs: this.listBriefs(),
+      researchRuns: this.listResearchRuns(),
+      events: this.listEvents(),
+      chatBindings: this.listChatBindings(),
+      pendingChats: this.listPendingChats(),
+      commEvents: this.listCommEvents(),
+      commsStatus: this.commsStatus(),
       budget: this.budget(),
-      dashboard: this.dashboard(),
+      costs: this.costs(),
+      dashboard: { ...dashboard, activeJobs: dashboard.activeJobs.map(slimJob), recentlyCompleted: dashboard.recentlyCompleted.map(slimJob) },
       providers,
       routing: this.routing(),
+      settings: this.getSettings(),
       at: now(),
     };
   }
 
-  // ── Seed (first run only — same demo content the design shipped with) ─
-  private seedIfEmpty(): void {
-    if (this.data.workspace) return;
-    const ws = this.createWorkspace('Atlas Studio', 200);
-    void ws;
-    const mkProject = (name: string, template: string, color: string, instructions: string) =>
-      this.createProject({ name, template, instructions, color });
-    const atlas = mkProject('Atlas API', 'claude-code', 'blue', 'TypeScript, Fastify, Postgres. Be terse.');
-    const content = mkProject('Q3 Content', 'claude-design', 'purple', 'Brand voice: calm, confident.');
-    const scan = mkProject('Market Scan', 'research', 'indigo', 'Weekly competitor + pricing digest.');
-    const brand = mkProject('Brand Refresh', 'claude-design', 'teal', 'Export-ready assets at @1x/@2x/@3x.');
-    const infra = mkProject('Infra / CI', 'claude-code', 'orange', 'Keep the pipeline green.');
-
-    const mkJob = (p: Project, title: string, effort: Effort, patch: Partial<Job>) => {
-      const j = this.createJob(p.id, title, title, effort);
-      this.updateJob(j.id, patch as Parameters<Store['updateJob']>[1]);
-    };
-    mkJob(atlas, 'Refactor auth service', 'deep', { status: 'running', phase: 'Building', progress: 64, cost: 0.42, tokens: 18200, stage: 'patching 3 call sites in routes/' });
-    mkJob(atlas, 'Add rate-limiter tests', 'balanced', { status: 'running', phase: 'Building', progress: 28, cost: 0.21, tokens: 9700, stage: 'generating fixtures for 429 path' });
-    mkJob(brand, 'Export icon set @3x', 'balanced', { status: 'running', phase: 'Rendering', progress: 72, cost: 0.12, tokens: 6100, stage: 'optimizing with pngquant…' });
-    mkJob(content, 'Draft launch thread', 'balanced', { status: 'running', phase: 'Reviewing', progress: 88, cost: 0.07, tokens: 11400, stage: 'tightening hook on post 1/6' });
-    mkJob(atlas, 'Merge PR #482 — auth refactor', 'deep', { status: 'done', phase: 'Done', progress: 100, cost: 8.10, tokens: 41000, output: 'Merged. 12 files changed, +840 −210.' });
-    mkJob(atlas, 'Migrate session store to Redis', 'deep', { status: 'done', phase: 'Done', progress: 100, cost: 6.40, tokens: 33000, output: 'Done. Cutover behind a flag.' });
-    mkJob(content, 'Generate OG images', 'balanced', { status: 'done', phase: 'Done', progress: 100, cost: 0.34, tokens: 4200, output: '6 OG cards exported.' });
-    mkJob(scan, 'Competitor digest', 'deep', { status: 'done', phase: 'Done', progress: 100, cost: 6.80, tokens: 28000, output: 'Digest ready — 4 movers this week.' });
-    mkJob(brand, 'Color token audit', 'balanced', { status: 'done', phase: 'Done', progress: 100, cost: 3.90, tokens: 14000, output: 'Audit complete, 9 tokens reconciled.' });
-    mkJob(infra, 'Dependency audit', 'balanced', { status: 'done', phase: 'Done', progress: 100, cost: 0.12, tokens: 5000, output: '2 advisories patched.' });
-    mkJob(infra, 'Nightly test suite', 'balanced', { status: 'failed', phase: 'Failed', cost: 0.18, tokens: 7000, error: 'flaky: 2 timeouts in payments.spec' });
-    mkJob(scan, 'Deep pricing run', 'max', { status: 'pending', phase: 'Queued' });
-
-    this.createApproval({ projectId: atlas.id, kind: 'merge', title: 'Merge PR #482 — auth refactor', subtitle: '12 files · +840 −210', detail: 'Refactors the auth service to a token-bucket limiter and moves sessions to Redis behind a flag.' });
-    this.createApproval({ projectId: scan.id, kind: 'budget', title: 'Deep run will exceed the $5 cap', subtitle: 'Est. $6.40 · competitor digest', detail: 'The weekly competitor digest needs a deep run estimated at $6.40, above the per-job $5 cap.' });
-    this.createApproval({ projectId: content.id, kind: 'publish', title: 'Publish “Launch week” thread to X', subtitle: '6 posts · scheduled 14:00', detail: 'A 6-post thread is ready to publish to X at 14:00.' });
-    this.createApproval({ projectId: brand.id, kind: 'review', title: 'Approve export — 48 assets', subtitle: '48 assets · @1x/@2x/@3x', detail: 'Brand refresh export bundle is ready for review before handoff.' });
-
-    this.createSchedule({ projectId: scan.id, title: 'Competitor digest', time: '14:00', cadence: 'daily' });
-    this.createSchedule({ projectId: content.id, title: 'Newsletter draft', time: '16:30', cadence: 'weekly' });
-    this.createSchedule({ projectId: infra.id, title: 'Nightly test suite', time: '18:00', cadence: 'daily' });
-    this.createSchedule({ projectId: brand.id, title: 'Asset backup', time: '21:00', cadence: 'daily' });
-    this.createSchedule({ projectId: infra.id, title: 'Dependency audit', time: '06:00', cadence: 'weekly' });
-
-    const mkSkill = (name: string, description: string, category: string, kind: string, enabled: boolean) => {
-      this.data.skills.push({ id: id(), name, description, category, kind, version: '1.0.0', enabled, createdAt: now() });
-    };
-    mkSkill('Web Search', 'Search the live web and cite sources.', 'Core', 'builtin', true);
-    mkSkill('Code Interpreter', 'Run sandboxed Python for data + analysis.', 'Core', 'builtin', true);
-    mkSkill('File System', 'Read & write files in the project workspace.', 'Core', 'builtin', true);
-    mkSkill('Shell', 'Execute shell commands in a sandbox.', 'Core', 'builtin', false);
-    mkSkill('GitHub', 'PRs, issues, and code review.', 'Integrations', 'mcp', true);
-    mkSkill('Slack', 'Post updates and read channels.', 'Integrations', 'mcp', true);
-    mkSkill('Linear', 'Create and update issues.', 'Integrations', 'mcp', false);
-    mkSkill('Notion', 'Read & write docs and databases.', 'Integrations', 'mcp', false);
-    mkSkill('Postgres', 'Query the production read-replica.', 'Integrations', 'mcp', true);
-    mkSkill('Image Generation', 'Generate and edit images.', 'Media', 'builtin', true);
-    mkSkill('Video Render', 'Compose and render short clips.', 'Media', 'builtin', false);
-    mkSkill('Speech', 'Text-to-speech and transcription.', 'Media', 'builtin', false);
-
-    const mkTemplate = (name: string, description: string, category: string, icon: string, engine: string) => {
-      this.data.templates.push({ id: id(), name, description, category, icon, engine, createdAt: now() });
-    };
-    mkTemplate('Claude Code', 'Autonomous coding agent for a repo.', 'Build', 'terminal', 'claude-code');
-    mkTemplate('Claude Design', 'Design + front-end generation.', 'Build', 'clapper', 'claude-design');
-    mkTemplate('Deep Research', 'Multi-source research with citations.', 'Research', 'telescope', 'research');
-    mkTemplate('Content Studio', 'Drafts, threads, and newsletters.', 'Content', 'send', 'claude-design');
-    mkTemplate('Market Scan', 'Recurring competitor + pricing digest.', 'Research', 'gauge', 'research');
-    mkTemplate('Data Pipeline', 'ETL + scheduled analysis jobs.', 'Build', 'layers', 'claude-code');
-    this.save();
+  // ── Catalog seed (templates + honest skills only — NO demo data) ────
+  private seedCatalog(): void {
+    let dirty = false;
+    if (this.data.templates.length === 0) {
+      const mkTemplate = (name: string, description: string, category: string, icon: string, engine: string) => {
+        this.data.templates.push({ id: id(), name, description, category, icon, engine, createdAt: now() });
+      };
+      mkTemplate('Claude Code', 'Autonomous coding agent for a repo.', 'Build', 'terminal', 'claude-code');
+      mkTemplate('Codex', 'Coding agent on your ChatGPT sign-in.', 'Build', 'cpu', 'codex');
+      mkTemplate('Deep Research', 'Multi-source research with citations.', 'Research', 'telescope', 'research');
+      mkTemplate('Content Studio', 'Drafts, threads, and newsletters.', 'Content', 'send', 'claude-design');
+      mkTemplate('Media Studio', 'Generate images, video, and voice on fal.', 'Content', 'clapper', 'media');
+      mkTemplate('Blank', 'An empty project — bring your own goal.', 'Build', 'layers', 'claude-code');
+      dirty = true;
+    }
+    if (this.data.skills.length === 0) {
+      const mkSkill = (name: string, description: string, category: string, kind: string, enabled: boolean) => {
+        this.data.skills.push({ id: id(), name, description, category, kind, version: '1.0.0', enabled, createdAt: now() });
+      };
+      // Honest catalog: only capabilities the engines genuinely have today.
+      mkSkill('Web Search', 'Agents can search the live web during runs.', 'Core', 'builtin', true);
+      mkSkill('Shell & Code Execution', 'Run commands and code in the project folder.', 'Core', 'builtin', true);
+      mkSkill('File System', 'Read & write files in the project workspace.', 'Core', 'builtin', true);
+      mkSkill('Git', 'Clone, branch, and commit via the system git.', 'Core', 'builtin', true);
+      mkSkill('Media Generation (fal)', 'Image, video, and speech via your fal key.', 'Media', 'api', true);
+      mkSkill('Telegram Bot', 'Start jobs and approve gates from Telegram.', 'Integrations', 'api', true);
+      dirty = true;
+    }
+    if (dirty) this.save();
   }
 }

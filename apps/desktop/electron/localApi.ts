@@ -2,7 +2,7 @@
    (over IPC) and remote controls (phone/web via the relay). Every command
    executes locally on this Mac against the local store + local engine. */
 
-import type { Store, Effort, ApprovalStatus, EngineId, Routing } from './store.js';
+import type { Store, Effort, ApprovalStatus, EngineId, Routing, AppSettings, ProjectKind } from './store.js';
 import type { LocalEngine } from './engine.js';
 import type { Providers, ProviderId } from './providers.js';
 
@@ -27,6 +27,22 @@ export function createDispatch(store: Store, engine: LocalEngine, providers: Pro
       // ── Aggregates ─────────────────────────────────────────────
       case 'dashboard': return store.dashboard();
       case 'budget': return store.budget();
+      case 'costs': return store.costs();
+      case 'listEvents': return store.listEvents();
+
+      // ── Settings ───────────────────────────────────────────────
+      case 'getSettings': return store.getSettings();
+      case 'setSettings': {
+        const patch: Partial<AppSettings> = {};
+        if (p.defaultEffort === 'fast' || p.defaultEffort === 'balanced' || p.defaultEffort === 'deep' || p.defaultEffort === 'max') patch.defaultEffort = p.defaultEffort;
+        if (p.defaultEngine === 'auto' || p.defaultEngine === 'claude' || p.defaultEngine === 'codex') patch.defaultEngine = p.defaultEngine;
+        if (typeof p.openAtLogin === 'boolean') patch.openAtLogin = p.openAtLogin;
+        if (p.rescanCadence === 'daily' || p.rescanCadence === 'weekly' || p.rescanCadence === 'onchange') patch.rescanCadence = p.rescanCadence;
+        if (Object.keys(patch).length === 0) bad('no valid settings fields');
+        const next = store.setSettings(patch);
+        emit('settings', next);
+        return next;
+      }
 
       // ── Workspace ──────────────────────────────────────────────
       case 'listWorkspaces': { const w = store.workspace(); return w ? [w] : []; }
@@ -49,7 +65,24 @@ export function createDispatch(store: Store, engine: LocalEngine, providers: Pro
       }
       case 'createProject': {
         if (!p.name || typeof p.name !== 'string') bad('name required');
-        const proj = store.createProject({ name: p.name as string, template: p.template as string | undefined, instructions: p.instructions as string | undefined, color: p.color as string | undefined });
+        const kind = (p.kind === 'coding' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') ? (p.kind as ProjectKind) : undefined;
+        const proj = store.createProject({
+          name: p.name as string, template: p.template as string | undefined, instructions: p.instructions as string | undefined,
+          color: p.color as string | undefined, kind,
+          path: typeof p.path === 'string' && p.path ? p.path : undefined,
+          repoUrl: typeof p.repoUrl === 'string' && p.repoUrl ? p.repoUrl : undefined,
+        });
+        emit('project', proj);
+        return proj;
+      }
+      case 'updateProject': {
+        const patch: Record<string, unknown> = {};
+        for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl'] as const) {
+          if (typeof p[k] === 'string') patch[k] = p[k];
+        }
+        if (p.kind === 'coding' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') patch.kind = p.kind;
+        if (Object.keys(patch).length === 0) bad('no valid project fields');
+        const proj = store.updateProject(String(p.id ?? ''), patch);
         emit('project', proj);
         return proj;
       }
@@ -68,6 +101,7 @@ export function createDispatch(store: Store, engine: LocalEngine, providers: Pro
         return j;
       }
       case 'runJob': return engine.run(String(p.id ?? ''), { effort: p.effort as Effort | undefined, engine: asEngine(p.engine) });
+      case 'deleteJob': { store.deleteJob(String(p.id ?? '')); return { ok: true }; }
       case 'createAndRunJob': {
         if (!p.projectId || !p.input) bad('projectId and input required');
         if (!store.getProject(String(p.projectId))) bad('project not found', 404);
@@ -88,6 +122,7 @@ export function createDispatch(store: Store, engine: LocalEngine, providers: Pro
         return store.createSchedule({ title: p.title as string, projectId: (p.projectId as string) ?? null, time: p.time as string | undefined, cadence: p.cadence as string | undefined });
       }
       case 'toggleSchedule': { store.setScheduleEnabled(String(p.id ?? ''), Boolean(p.enabled)); return { ok: true }; }
+      case 'deleteSchedule': { store.deleteSchedule(String(p.id ?? '')); return { ok: true }; }
 
       // ── Skills / Templates ─────────────────────────────────────
       case 'listSkills': return store.listSkills();

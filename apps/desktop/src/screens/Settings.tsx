@@ -13,7 +13,7 @@ import {
   type EffortStop,
 } from '../lib/ui';
 import {
-  APP_W, APP_H, useAppScale, useTheme, TrafficLights, Sidebar, Toolbar,
+  APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, TrafficLights, Sidebar, Toolbar,
   type Theme,
 } from '../lib/appShell';
 import { api, ApiError, type Workspace, type BudgetData, type ProviderConn, type ProviderId, type Routing, type PairingInfo, IS_LOCAL } from '../lib/api';
@@ -191,7 +191,7 @@ function GeneralPane({ theme, setTheme, workspace }: {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
         <GroupedList header="Workspace">
           <Row><span style={{ width: 110, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Name</span><input key={workspace?.id ?? 'ws'} defaultValue={workspace?.name ?? 'Atlas Studio'} style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)', padding: '13px 0' }} /></Row>
-          <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Appearance</span><Seg options={['Light', 'Dark', 'Auto']} value={theme === 'dark' ? 'Dark' : 'Light'} onChange={v => setTheme(v === 'Dark' ? 'dark' : 'light')} /></Row>
+          <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Appearance</span><Seg options={['Light', 'Dark', 'Auto']} value={getThemePref() === 'auto' ? 'Auto' : getThemePref() === 'dark' ? 'Dark' : 'Light'} onChange={v => setThemePref(v === 'Auto' ? 'auto' : v === 'Dark' ? 'dark' : 'light')} /></Row>
         </GroupedList>
         <GroupedList header="Defaults" footer="Applies to new jobs across the workspace; projects can override.">
           <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default effort</span><EffortDial value={eff} onChange={setEff} compact /></Row>

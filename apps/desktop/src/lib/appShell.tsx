@@ -20,11 +20,49 @@ export function useAppScale(pad = 40): number {
 }
 
 export type Theme = 'light' | 'dark';
+export type ThemePref = Theme | 'auto';
 
-export function useTheme(initial: Theme = 'light'): [Theme, React.Dispatch<React.SetStateAction<Theme>>] {
-  const [theme, setTheme] = React.useState<Theme>(initial);
-  React.useEffect(() => { document.documentElement.dataset.theme = theme; }, [theme]);
-  return [theme, setTheme];
+/* Persisted, app-wide theme. One module-level source of truth: every screen's
+   useTheme() reads it and re-renders on change, so the selection survives
+   navigation and relaunch ('auto' follows the OS appearance live). */
+const THEME_KEY = 'maestro.theme';
+const themeListeners = new Set<() => void>();
+const themeMedia = typeof window !== 'undefined' && window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+
+function readThemePref(): ThemePref {
+  try {
+    const v = localStorage.getItem(THEME_KEY);
+    if (v === 'light' || v === 'dark' || v === 'auto') return v;
+  } catch { /* storage unavailable */ }
+  return 'auto';
+}
+let themePref: ThemePref = readThemePref();
+
+export function getThemePref(): ThemePref { return themePref; }
+function resolvedTheme(): Theme { return themePref === 'auto' ? (themeMedia?.matches ? 'dark' : 'light') : themePref; }
+function applyTheme(): void {
+  if (typeof document !== 'undefined') document.documentElement.dataset.theme = resolvedTheme();
+  for (const l of themeListeners) l();
+}
+export function setThemePref(p: ThemePref): void {
+  themePref = p;
+  try { localStorage.setItem(THEME_KEY, p); } catch { /* storage unavailable */ }
+  applyTheme();
+}
+themeMedia?.addEventListener('change', () => { if (themePref === 'auto') applyTheme(); });
+if (typeof document !== 'undefined') document.documentElement.dataset.theme = resolvedTheme();
+
+export function useTheme(_initial: Theme = 'light'): [Theme, React.Dispatch<React.SetStateAction<Theme>>] {
+  const [, force] = React.useReducer((x: number) => x + 1, 0);
+  React.useEffect(() => {
+    themeListeners.add(force);
+    return () => { themeListeners.delete(force); };
+  }, []);
+  const setTheme: React.Dispatch<React.SetStateAction<Theme>> = (next) => {
+    const value = typeof next === 'function' ? (next as (prev: Theme) => Theme)(resolvedTheme()) : next;
+    setThemePref(value);
+  };
+  return [resolvedTheme(), setTheme];
 }
 
 export const WORKSPACE = 'Atlas Studio';
