@@ -1,510 +1,348 @@
-/* Media Studio — page assembly. Pipeline stepper, brief & controls panel,
-   center canvas (video / assemble / consent gate), render queue, cost estimate,
-   ⌘K palette. Ported to ES-module TypeScript React — visual output unchanged. */
+/* Media Studio — real generation on the operator's fal.ai key. Pick a stage
+   (Image / Video / Voice / Music / Avatar), a model, write a prompt, and
+   generate; jobs run through fal's queue on this Mac, stream into the bin live,
+   download to ~/Maestro/<project>/assets/, and can be approved → Publishing.
+   Visual language preserved; the data + actions are now real. */
 
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
 import { AppShell } from '../lib/appShell';
 import { Icon, type IconName } from '../lib/icons';
-import { Spinner } from '../lib/ui';
+import { api, type Asset, type MediaRate, type Project, type ProviderConn, ApiError, IS_LOCAL } from '../lib/api';
 
-/* ───────────────────────── page-specific CSS (from <Page>.html) ───────────────────────── */
-const styles = `
-  .breathe { animation: breathe 1.8s ease-in-out infinite; }
-  @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
-  .render-ring { animation: spin 1.4s linear infinite; transform-origin: 30px 30px; }
-  .est-num { animation: estPulse 360ms var(--spring); }
-  @keyframes estPulse { 0% { transform: translateY(-2px); } 100% { transform: none; } }
-  .canvas-fade { animation: cfade 240ms var(--spring); }
-  @keyframes cfade { from { transform: translateY(6px); } to { transform: none; } }
-  @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
-  @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
-  .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease, background 140ms ease; }
-  .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.4); }
-  .primary-cta:active { transform: translateY(1px); }
-  .step-btn:hover { background: color-mix(in srgb, var(--fill-secondary) 55%, var(--ink) 8%); }
+const PAGE_CSS = `
   .pipe-stage:hover { filter: brightness(0.98); }
-  .voice-row:hover, .filmstrip:hover, .tpl-thumb:hover, .asset-cell:hover { filter: brightness(1.02); }
-  .pipe-scroll::-webkit-scrollbar { height: 0; }
+  .send-btn { transition: transform 180ms var(--spring), box-shadow 160ms ease, background 160ms ease; }
+  .send-btn:active { transform: scale(0.96); }
+  .asset-card { transition: transform 140ms var(--spring), box-shadow 160ms ease; }
+  .asset-card:hover { transform: translateY(-2px); box-shadow: var(--card-shadow), 0 8px 22px rgba(15,20,60,0.12); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .breathe { animation: breathe 1.6s ease-in-out infinite; }
 `;
 
-/* ───────────────────────── shared data ───────────────────────── */
-
-const STUDIO_STAGES = ['Brief', 'Voice', 'Avatar', 'B-roll', 'Captions', 'Music', 'Assemble', 'Publish'];
-
-interface Lane {
-  label: string;
-  tint: string;
-  bg: string;
-}
-
-const LANES: Record<string, Lane> = {
-  draft: { label: 'Draft lane', tint: 'var(--ink-secondary)', bg: 'var(--fill-secondary)' },
-  hero: { label: 'Hero lane', tint: 'var(--teal)', bg: 'color-mix(in srgb, var(--teal) 14%, transparent)' },
-  selfhost: { label: 'Self-host', tint: 'var(--green)', bg: 'color-mix(in srgb, var(--green) 13%, transparent)' },
-};
-
-/* ───────────────────────── ⌘K command palette (from cc-palette.jsx) ───────────────────────── */
-
-interface PaletteItem {
-  group: string;
-  icon: IconName;
-  label: string;
-  hint: string;
-}
-
-const PALETTE_ITEMS: PaletteItem[] = [
-  { group: 'Actions', icon: 'play', label: 'Run job…', hint: 'Start a new job in a project' },
-  { group: 'Actions', icon: 'plus', label: 'New project…', hint: 'From a template' },
-  { group: 'Actions', icon: 'calendar', label: 'Schedule a run…', hint: 'Pick time & cadence' },
-  { group: 'Actions', icon: 'gauge', label: 'Adjust budget cap…', hint: 'Workspace or project' },
-  { group: 'Recent', icon: 'gitMerge', label: 'Merge PR #482 — auth refactor', hint: 'Atlas API' },
-  { group: 'Recent', icon: 'send', label: 'Publish “Launch week” thread', hint: 'Q3 Content' },
-  { group: 'Recent', icon: 'telescope', label: 'Competitor digest', hint: 'Market Scan' },
-  { group: 'Jump to', icon: 'layers', label: 'Projects', hint: '⌘2' },
-  { group: 'Jump to', icon: 'shield', label: 'Approvals', hint: '⌘4' },
+interface Stage { key: string; label: string; icon: IconName; kinds: string[]; needsConsent?: boolean; needsImage?: boolean }
+const STAGES: Stage[] = [
+  { key: 'image', label: 'Image', icon: 'brush', kinds: ['image'] },
+  { key: 'video', label: 'Video', icon: 'clapper', kinds: ['video'] },
+  { key: 'voice', label: 'Voice', icon: 'send', kinds: ['voiceover'] },
+  { key: 'music', label: 'Music', icon: 'play', kinds: ['audio'] },
+  { key: 'avatar', label: 'Avatar', icon: 'smartphone', kinds: ['video'], needsConsent: true, needsImage: true },
 ];
+// Avatar uses the image→video model specifically.
+const AVATAR_MODEL = 'kling-i2v';
+const VOICES = ['af_heart', 'af_bella', 'am_adam', 'bf_emma', 'bm_george'];
 
-function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [q, setQ] = React.useState('');
-  const [sel, setSel] = React.useState(0);
-  const inputRef = React.useRef<HTMLInputElement>(null);
+function Spinner({ size = 16, color = 'var(--purple)' }: { size?: number; color?: string }) {
+  return <span style={{ width: size, height: size, borderRadius: '50%', border: `2px solid color-mix(in srgb, ${color} 30%, transparent)`, borderTopColor: color, display: 'inline-block', animation: 'spin 0.8s linear infinite' }} />;
+}
 
+function NoKeyCard({ onConnected }: { onConnected: () => void }) {
+  const [key, setKey] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState('');
+  const connect = async () => {
+    if (!key.trim()) return;
+    setBusy(true); setErr('');
+    try { await api.connectProvider('fal', key.trim()); onConnected(); }
+    catch (e) { setErr(e instanceof ApiError ? e.message : 'Could not connect'); }
+    finally { setBusy(false); }
+  };
+  return (
+    <div style={{ maxWidth: 520, margin: '60px auto', textAlign: 'center', padding: '0 20px' }}>
+      <span style={{ display: 'inline-grid', placeItems: 'center', width: 64, height: 64, borderRadius: 18, background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)', marginBottom: 20 }}><Icon name="clapper" size={32} /></span>
+      <h2 style={{ margin: '0 0 8px', font: '700 var(--fs-title1)/1.1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Connect fal.ai to generate</h2>
+      <p style={{ margin: '0 0 22px', font: '400 var(--fs-body)/1.45 var(--font-text)', color: 'var(--ink-secondary)' }}>
+        The Studio generates images, video, voice, and music on your own fal.ai key. It’s stored encrypted on this Mac and never leaves it. Get a key at fal.ai/dashboard/keys.
+      </p>
+      {IS_LOCAL ? (
+        <div style={{ display: 'flex', gap: 10, maxWidth: 420, margin: '0 auto' }}>
+          <input type="password" value={key} onChange={e => setKey(e.target.value)} placeholder="fal key (key_id:key_secret)" onKeyDown={e => { if (e.key === 'Enter') void connect(); }}
+            style={{ flex: 1, height: 44, padding: '0 14px', borderRadius: 12, boxSizing: 'border-box', border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-body)/1 var(--font-mono)' }} />
+          <button onClick={connect} disabled={busy || !key.trim()} className="send-btn" style={{ height: 44, padding: '0 20px', borderRadius: 12, background: key.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: key.trim() ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{busy ? 'Connecting…' : 'Connect'}</button>
+        </div>
+      ) : <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Connect your fal key in the desktop app (Settings → Accounts).</div>}
+      {err && <div style={{ marginTop: 12, font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--red)' }}>{err}</div>}
+    </div>
+  );
+}
+
+function AssetPreview({ a }: { a: Asset }) {
+  const src = a.url;
+  if (a.kind === 'image' && src) return <img src={src} alt={a.prompt ?? 'image'} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />;
+  if (a.kind === 'video' && src) return <video src={src} controls style={{ width: '100%', height: '100%', objectFit: 'cover', background: '#000', display: 'block' }} />;
+  if ((a.kind === 'audio' || a.kind === 'voiceover') && src) return (
+    <div style={{ width: '100%', height: '100%', display: 'grid', placeItems: 'center', background: `linear-gradient(135deg, color-mix(in srgb, ${a.tint ?? 'var(--purple)'} 22%, var(--bg-elevated)), var(--bg-elevated))`, padding: 12 }}>
+      <audio src={src} controls style={{ width: '100%' }} />
+    </div>
+  );
+  return <div style={{ width: '100%', height: '100%', background: `linear-gradient(135deg, color-mix(in srgb, ${a.tint ?? 'var(--blue)'} 30%, transparent), transparent)` }} />;
+}
+
+function AssetCard({ a, onCancel, onApprove, onDelete, onReveal, onUseAsSource }: {
+  a: Asset; onCancel: () => void; onApprove: () => void; onDelete: () => void; onReveal: () => void; onUseAsSource?: () => void;
+}) {
+  const busy = a.status === 'queued' || a.status === 'generating';
+  return (
+    <div className="asset-card" style={{ background: 'var(--bg-elevated)', borderRadius: 14, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ aspectRatio: a.kind === 'video' ? '16/9' : a.kind === 'image' ? '1/1' : '16/6', position: 'relative', background: 'var(--fill-secondary)' }}>
+        {a.status === 'done' || a.status === 'approved' ? <AssetPreview a={a} />
+          : a.status === 'failed' ? <div style={{ width: '100%', height: '100%', display: 'grid', placeItems: 'center', padding: 14, textAlign: 'center', font: '500 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--red)' }}>{a.error ?? 'Failed'}</div>
+          : a.status === 'cancelled' ? <div style={{ width: '100%', height: '100%', display: 'grid', placeItems: 'center', font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Cancelled</div>
+          : <div style={{ width: '100%', height: '100%', display: 'grid', placeItems: 'center', gap: 10 }}><Spinner size={22} /><span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{a.status === 'queued' ? 'Queued…' : 'Generating…'}</span></div>}
+        {a.status === 'approved' && <span style={{ position: 'absolute', top: 8, left: 8, display: 'inline-flex', alignItems: 'center', gap: 4, height: 22, padding: '0 8px', borderRadius: 'var(--r-pill)', background: 'rgba(52,199,89,0.92)', color: '#fff', font: '600 var(--fs-caption)/1 var(--font-text)' }}><Icon name="check" size={11} stroke={2.6} /> Approved</span>}
+      </div>
+      <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <span title={a.prompt} style={{ font: '500 var(--fs-footnote)/1.35 var(--font-text)', color: 'var(--ink)', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{a.prompt || a.name || a.kind}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{a.model}</span>
+          <span style={{ flex: 1 }} />
+          <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>${a.cost.toFixed(3)}</span>
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {busy && <button onClick={onCancel} style={{ flex: 1, height: 30, borderRadius: 8, background: 'rgba(255,59,48,0.1)', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Cancel</button>}
+          {(a.status === 'done') && <>
+            <button onClick={onApprove} className="send-btn" style={{ flex: 1, height: 30, borderRadius: 8, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Send to Publishing</button>
+            {onUseAsSource && a.kind === 'image' && <button onClick={onUseAsSource} title="Use as avatar source" style={{ width: 30, height: 30, borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', display: 'grid', placeItems: 'center' }}><Icon name="smartphone" size={14} /></button>}
+            {IS_LOCAL && a.localPath && <button onClick={onReveal} title="Reveal in Finder" style={{ width: 30, height: 30, borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', display: 'grid', placeItems: 'center' }}><Icon name="folder" size={14} /></button>}
+          </>}
+          {(a.status === 'failed' || a.status === 'cancelled' || a.status === 'approved') && <button onClick={onDelete} style={{ flex: 1, height: 30, borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Remove</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function MediaStudio() {
+  const navigate = useNavigate();
+  const [stageKey, setStageKey] = React.useState('image');
+  const [rates, setRates] = React.useState<MediaRate[]>([]);
+  const [assets, setAssets] = React.useState<Asset[]>([]);
+  const [projects, setProjects] = React.useState<Project[]>([]);
+  const [projectId, setProjectId] = React.useState<string | null>(null);
+  const [hasFal, setHasFal] = React.useState<boolean | null>(null);
+
+  // composer
+  const [modelKey, setModelKey] = React.useState('');
+  const [prompt, setPrompt] = React.useState('');
+  const [durationS, setDurationS] = React.useState(5);
+  const [aspect, setAspect] = React.useState('16:9');
+  const [voice, setVoice] = React.useState(VOICES[0]);
+  const [sourceImage, setSourceImage] = React.useState<string | null>(null);
+  const [consent, setConsent] = React.useState(false);
+  const [submitting, setSubmitting] = React.useState(false);
+  const [err, setErr] = React.useState('');
+
+  const stage = STAGES.find(s => s.key === stageKey)!;
+
+  const refetch = React.useCallback(() => {
+    api.listAssets().then(setAssets).catch(() => {});
+  }, []);
   React.useEffect(() => {
-    if (open) { setQ(''); setSel(0); setTimeout(() => inputRef.current && inputRef.current.focus(), 60); }
-  }, [open]);
+    api.mediaRates().then(setRates).catch(() => {});
+    api.listProjects().then(setProjects).catch(() => {});
+    api.listProviders().then(cs => setHasFal(cs.some((c: ProviderConn) => c.provider === 'fal'))).catch(() => setHasFal(false));
+    refetch();
+    const unsub = api.subscribe({ onAsset: refetch });
+    return unsub;
+  }, [refetch]);
 
-  const filtered = PALETTE_ITEMS.filter(it => it.label.toLowerCase().includes(q.toLowerCase()) || it.hint.toLowerCase().includes(q.toLowerCase()));
-  const groups = filtered.reduce<Record<string, PaletteItem[]>>((acc, it) => { (acc[it.group] = acc[it.group] || []).push(it); return acc; }, {});
-  const flat = filtered;
+  // Models available for the active stage.
+  const stageModels = React.useMemo(() => {
+    if (stage.key === 'avatar') return rates.filter(r => r.key === AVATAR_MODEL);
+    return rates.filter(r => stage.kinds.includes(r.kind));
+  }, [rates, stage]);
+  React.useEffect(() => { if (stageModels[0] && !stageModels.some(m => m.key === modelKey)) setModelKey(stageModels[0].key); }, [stageModels, modelKey]);
 
-  const onKey = (e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => Math.min(flat.length - 1, s + 1)); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => Math.max(0, s - 1)); }
-    else if (e.key === 'Escape') { onClose(); }
-    else if (e.key === 'Enter') { onClose(); }
+  const model = stageModels.find(m => m.key === modelKey);
+  const isVideo = stage.key === 'video' || stage.key === 'avatar';
+  const isTimed = isVideo || stage.key === 'music';
+  const est = model ? (model.perSecond ? model.rate * durationS : model.rate) : 0;
+
+  const doneImages = assets.filter(a => a.kind === 'image' && (a.status === 'done' || a.status === 'approved') && a.url);
+
+  const canGenerate = !!model && prompt.trim().length > 0 && !submitting
+    && (!stage.needsConsent || consent)
+    && (!stage.needsImage || !!sourceImage);
+
+  const generate = async () => {
+    if (!canGenerate || !model) return;
+    setSubmitting(true); setErr('');
+    try {
+      await api.generateAsset({
+        projectId, modelKey: model.key, prompt: prompt.trim(),
+        durationS: isTimed ? durationS : undefined,
+        voice: stage.key === 'voice' ? voice : undefined,
+        imageUrl: stage.needsImage ? sourceImage ?? undefined : undefined,
+        aspect: isVideo ? aspect : undefined,
+      });
+      setPrompt('');
+      refetch();
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : 'Could not start generation');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
-  if (!open) return null;
-  let idx = -1;
+  const sessionCost = assets.filter(a => a.source === 'generated' && (a.status === 'done' || a.status === 'approved')).reduce((s, a) => s + a.cost, 0);
+  const generating = assets.filter(a => a.status === 'queued' || a.status === 'generating');
+  const bin = assets.filter(a => a.status !== 'queued' && a.status !== 'generating');
+
   return (
-    <div onMouseDown={onClose} style={{
-      position: 'absolute', inset: 0, zIndex: 80, display: 'flex', justifyContent: 'center', paddingTop: 132,
-      background: 'rgba(10,12,24,0.28)', backdropFilter: 'blur(3px)', WebkitBackdropFilter: 'blur(3px)',
-    }}>
-      <div onMouseDown={e => e.stopPropagation()} style={{
-        width: 640, maxHeight: 460, alignSelf: 'flex-start', display: 'flex', flexDirection: 'column',
-        background: 'var(--bg-elevated)', borderRadius: 16, border: '0.5px solid var(--glass-border)',
-        backdropFilter: 'blur(40px) saturate(180%)', WebkitBackdropFilter: 'blur(40px) saturate(180%)',
-        boxShadow: '0 30px 80px rgba(10,15,40,0.45), var(--glass-inner)', overflow: 'hidden',
-        animation: 'palettePop 200ms var(--spring)',
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '16px 18px', borderBottom: '0.5px solid var(--separator)' }}>
-          <Icon name="search" size={19} style={{ color: 'var(--ink-tertiary)' }} />
-          <input ref={inputRef} value={q} onChange={e => { setQ(e.target.value); setSel(0); }} onKeyDown={onKey}
-            placeholder="Search commands, projects, jobs…"
-            style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent',
-              font: '400 var(--fs-title2)/1 var(--font-text)', color: 'var(--ink)' }} />
-          <span style={{ padding: '3px 7px', borderRadius: 5, background: 'var(--fill-secondary)', font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>esc</span>
+    <AppShell active="studio" onSearch={() => {}}>
+      <style>{PAGE_CSS}</style>
+      <div style={{ padding: '24px 28px 36px' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 16, marginBottom: 18, flexWrap: 'wrap' }}>
+          <div>
+            <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Studio</h1>
+            <p style={{ margin: '6px 0 0', font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Generate images, video, voice, and music on your fal.ai key — saved to ~/Maestro.</p>
+          </div>
+          {hasFal && <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, height: 34, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)' }}>
+            <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>This session</span>
+            <span style={{ font: '600 var(--fs-subhead)/1 var(--font-mono)', color: 'var(--ink)' }}>${sessionCost.toFixed(2)}</span>
+          </div>}
         </div>
 
-        <div style={{ overflowY: 'auto', padding: 8 }}>
-          {flat.length === 0 && (
-            <div style={{ padding: '28px 0', textAlign: 'center', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No matches</div>
-          )}
-          {Object.entries(groups).map(([group, items]) => (
-            <div key={group} style={{ marginBottom: 6 }}>
-              <div style={{ padding: '6px 10px 4px', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{group}</div>
-              {items.map(it => {
-                idx++; const active = idx === sel; const myIdx = idx;
+        {hasFal === false ? <NoKeyCard onConnected={() => setHasFal(true)} /> : (
+          <>
+            {/* stage stepper */}
+            <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
+              {STAGES.map(s => {
+                const on = s.key === stageKey;
                 return (
-                  <div key={it.label} onMouseEnter={() => setSel(myIdx)} onMouseDown={onClose} style={{
-                    display: 'flex', alignItems: 'center', gap: 11, height: 42, padding: '0 10px', borderRadius: 9, cursor: 'pointer',
-                    background: active ? 'var(--blue)' : 'transparent',
-                  }}>
-                    <span style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', flexShrink: 0,
-                      background: active ? 'rgba(255,255,255,0.2)' : 'var(--fill-secondary)', color: active ? '#fff' : 'var(--ink-secondary)' }}>
-                      <Icon name={it.icon} size={16} />
-                    </span>
-                    <span style={{ flex: 1, font: '500 var(--fs-callout)/1.1 var(--font-text)', color: active ? '#fff' : 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{it.label}</span>
-                    <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: active ? 'rgba(255,255,255,0.8)' : 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{it.hint}</span>
-                    {active && <Icon name="enter" size={15} style={{ color: 'rgba(255,255,255,0.9)' }} />}
-                  </div>
+                  <button key={s.key} onClick={() => { setStageKey(s.key); setErr(''); }} className="pipe-stage" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 36, padding: '0 15px', borderRadius: 'var(--r-pill)',
+                    background: on ? 'var(--blue)' : 'var(--fill-secondary)', color: on ? '#fff' : 'var(--ink-secondary)', font: '600 var(--fs-subhead)/1 var(--font-text)' }}>
+                    <Icon name={s.icon} size={16} /> {s.label}
+                  </button>
                 );
               })}
             </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
 
-/* ───────────────────────── pipeline stepper ───────────────────────── */
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 380px) minmax(0, 1fr)', gap: 22, alignItems: 'start' }}>
+              {/* composer */}
+              <div style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 18, display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {/* project + model */}
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <label style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ display: 'block', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 }}>Project</span>
+                    <select value={projectId ?? ''} onChange={e => setProjectId(e.target.value || null)} style={{ width: '100%', height: 36, borderRadius: 9, border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', padding: '0 8px' }}>
+                      <option value="">No project</option>
+                      {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                    </select>
+                  </label>
+                  <label style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ display: 'block', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 }}>Model</span>
+                    <select value={modelKey} onChange={e => setModelKey(e.target.value)} style={{ width: '100%', height: 36, borderRadius: 9, border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', padding: '0 8px' }}>
+                      {stageModels.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}
+                    </select>
+                  </label>
+                </div>
+                {model && <div style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: -8 }}>{model.blurb} · ≈ ${model.rate.toFixed(3)}{model.perSecond ? '/s' : ''} est.</div>}
 
-function PipelineStepper({ active, onPick, done }: { active: string; onPick: (s: string) => void; done: string[] }) {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, overflowX: 'auto', padding: '2px 0' }} className="pipe-scroll">
-      {STUDIO_STAGES.map((s, i) => {
-        const isDone = done.includes(s);
-        const isActive = active === s;
-        return (
-          <React.Fragment key={s}>
-            {i > 0 && <span style={{ width: 14, height: 2, borderRadius: 1, background: isDone || (done.includes(STUDIO_STAGES[i - 1])) ? 'var(--teal)' : 'var(--separator)', flexShrink: 0 }} />}
-            <button onClick={() => onPick(s)} className="pipe-stage" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', flexShrink: 0,
-              background: isActive ? 'var(--teal)' : isDone ? 'color-mix(in srgb, var(--teal) 14%, transparent)' : 'var(--fill-secondary)',
-              color: isActive ? '#fff' : isDone ? 'var(--teal)' : 'var(--ink-tertiary)',
-              font: `${isActive ? 700 : 600} var(--fs-footnote)/1 var(--font-text)`,
-              boxShadow: isActive ? '0 0 0 4px color-mix(in srgb, var(--teal) 16%, transparent)' : 'none', transition: 'all 160ms ease' }}>
-              {isDone && <Icon name="check" size={12} stroke={3} />}
-              {isActive && <span className="breathe" style={{ width: 6, height: 6, borderRadius: 3, background: '#fff' }} />}
-              {s}
-            </button>
-          </React.Fragment>
-        );
-      })}
-    </div>
-  );
-}
+                {/* prompt */}
+                <textarea value={prompt} onChange={e => setPrompt(e.target.value)} rows={4} placeholder={stage.key === 'voice' ? 'The script to speak…' : 'Describe what to generate…'}
+                  style={{ width: '100%', boxSizing: 'border-box', border: '1px solid var(--separator-strong)', borderRadius: 12, outline: 'none', background: 'var(--bg)', resize: 'vertical', font: '400 var(--fs-body)/1.5 var(--font-text)', color: 'var(--ink)', padding: 12, minHeight: 96 }} />
 
-/* ───────────────────────── consent gate ───────────────────────── */
+                {/* avatar source picker */}
+                {stage.needsImage && (
+                  <div>
+                    <span style={{ display: 'block', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 7 }}>Source image (from your generated images)</span>
+                    {doneImages.length === 0 ? <div style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>Generate an Image first, then pick it here.</div>
+                      : <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 4 }}>
+                          {doneImages.map(img => (
+                            <button key={img.id} onClick={() => setSourceImage(img.url ?? null)} style={{ flexShrink: 0, width: 64, height: 64, borderRadius: 10, overflow: 'hidden', border: `2px solid ${sourceImage === img.url ? 'var(--blue)' : 'transparent'}`, padding: 0, background: 'none' }}>
+                              <img src={img.url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                            </button>
+                          ))}
+                        </div>}
+                  </div>
+                )}
 
-function ConsentGate({ stage, onRecord, onClose }: { stage: string; onRecord: () => void; onClose: () => void }) {
-  return (
-    <div style={{ maxWidth: 520, margin: '40px auto 0', background: 'var(--bg-elevated)', borderRadius: 18, border: '1px solid rgba(255,149,0,0.4)',
-      boxShadow: '0 0 0 4px rgba(255,149,0,0.10), var(--card-shadow)', padding: 26, textAlign: 'center' }}>
-      <span style={{ display: 'inline-grid', placeItems: 'center', width: 52, height: 52, borderRadius: '50%', background: 'rgba(255,149,0,0.14)', color: 'var(--orange)', marginBottom: 16 }}><Icon name="shield" size={26} /></span>
-      <h2 style={{ margin: '0 0 8px', font: '700 var(--fs-title2)/1.2 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Consent required before cloning</h2>
-      <p style={{ margin: '0 0 20px', font: '400 var(--fs-body)/1.5 var(--font-text)', color: 'var(--ink-secondary)', textWrap: 'pretty' }}>
-        The <b style={{ color: 'var(--ink)' }}>{stage}</b> stage clones a real voice or likeness. Record a consent statement from the person before Maestro will generate anything.
-      </p>
-      <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
-        <button onClick={onClose} style={{ height: 42, padding: '0 18px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Pick another stage</button>
-        <button onClick={onRecord} className="primary-cta" style={{ height: 42, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--orange)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(255,149,0,0.32)', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-          <Icon name="play" size={16} /> Record consent now
-        </button>
-      </div>
-    </div>
-  );
-}
+                {/* consent */}
+                {stage.needsConsent && (
+                  <label style={{ display: 'flex', alignItems: 'flex-start', gap: 9, padding: 12, borderRadius: 12, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={consent} onChange={e => setConsent(e.target.checked)} style={{ marginTop: 2 }} />
+                    <span style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>I have consent from anyone whose likeness or voice this generates. Lip-sync avatar generation ships next; today this animates the source image.</span>
+                  </label>
+                )}
 
-/* ───────────────────────── left brief & controls panel ───────────────────────── */
+                {/* controls */}
+                <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap' }}>
+                  {isTimed && (
+                    <label>
+                      <span style={{ display: 'block', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 }}>Duration</span>
+                      <select value={durationS} onChange={e => setDurationS(Number(e.target.value))} style={{ height: 34, borderRadius: 9, border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', padding: '0 8px' }}>
+                        {(isVideo ? [5, 10] : [10, 30, 60, 90]).map(d => <option key={d} value={d}>{d}s</option>)}
+                      </select>
+                    </label>
+                  )}
+                  {isVideo && (
+                    <label>
+                      <span style={{ display: 'block', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 }}>Aspect</span>
+                      <select value={aspect} onChange={e => setAspect(e.target.value)} style={{ height: 34, borderRadius: 9, border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', padding: '0 8px' }}>
+                        {['16:9', '9:16', '1:1'].map(a => <option key={a} value={a}>{a}</option>)}
+                      </select>
+                    </label>
+                  )}
+                  {stage.key === 'voice' && (
+                    <label>
+                      <span style={{ display: 'block', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 }}>Voice</span>
+                      <select value={voice} onChange={e => setVoice(e.target.value)} style={{ height: 34, borderRadius: 9, border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-mono)', padding: '0 8px' }}>
+                        {VOICES.map(v => <option key={v} value={v}>{v}</option>)}
+                      </select>
+                    </label>
+                  )}
+                </div>
 
-function LaneChips({ value, onChange }: { value: string; onChange: (k: string) => void }) {
-  return (
-    <div style={{ display: 'flex', gap: 6 }}>
-      {Object.entries(LANES).map(([k, l]) => {
-        const on = value === k;
-        return (
-          <button key={k} onClick={() => onChange(k)} style={{ flex: 1, padding: '7px 4px', borderRadius: 9, font: '600 var(--fs-caption)/1 var(--font-text)',
-            background: on ? l.bg : 'transparent', color: on ? l.tint : 'var(--ink-tertiary)', border: `1px solid ${on ? 'color-mix(in srgb, ' + l.tint + ' 35%, transparent)' : 'var(--separator)'}`, transition: 'all 140ms ease' }}>
-            {l.label}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
+                {err && <div style={{ padding: '9px 12px', borderRadius: 10, background: 'rgba(255,59,48,0.1)', color: 'var(--red)', font: '500 var(--fs-footnote)/1.4 var(--font-text)' }}>{err}</div>}
 
-function MiniStepper({ label, value, set, suffix, min = 1, max = 999, step = 1 }: {
-  label: string; value: number; set: (v: number) => void; suffix?: string; min?: number; max?: number; step?: number;
-}) {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-      <span style={{ flex: 1, font: '500 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{label}</span>
-      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, padding: 2, background: 'var(--fill-secondary)', borderRadius: 8 }}>
-        <button onClick={() => set(Math.max(min, value - step))} className="step-btn" style={{ width: 26, height: 26, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink)', font: '600 16px/1 var(--font-text)' }}>−</button>
-        <span style={{ minWidth: 48, textAlign: 'center', font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)' }}>{value}{suffix}</span>
-        <button onClick={() => set(Math.min(max, value + step))} className="step-btn" style={{ width: 26, height: 26, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink)', font: '600 16px/1 var(--font-text)' }}>+</button>
-      </div>
-    </div>
-  );
-}
-
-function PanelSection({ title, children }: { title: string; children?: React.ReactNode }) {
-  return (
-    <div style={{ marginBottom: 18 }}>
-      <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 10 }}>{title}</div>
-      {children}
-    </div>
-  );
-}
-
-function VoiceRow({ name, tag, playing, onPlay, selected, onSelect }: {
-  name: string; tag: string; playing: boolean; onPlay: () => void; selected: boolean; onSelect: () => void;
-}) {
-  return (
-    <div onClick={onSelect} className="voice-row" style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 11px', borderRadius: 10, cursor: 'pointer',
-      background: selected ? 'color-mix(in srgb, var(--teal) 10%, transparent)' : 'var(--fill-tertiary)', border: `1px solid ${selected ? 'color-mix(in srgb, var(--teal) 35%, transparent)' : 'var(--separator)'}` }}>
-      <button onClick={e => { e.stopPropagation(); onPlay(); }} style={{ width: 30, height: 30, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', color: 'var(--teal)' }}>
-        <Icon name={playing ? 'pause' : 'play'} size={13} />
-      </button>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ font: '600 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)' }}>{name}</div>
-        <div style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{tag}</div>
-      </div>
-      {selected && <Icon name="check" size={15} stroke={2.6} style={{ color: 'var(--teal)' }} />}
-    </div>
-  );
-}
-
-function BriefPanel({ lane, setLane, dur, setDur, est, voice, setVoice, playing, setPlaying }: {
-  lane: string; setLane: (k: string) => void; dur: number; setDur: (v: number) => void; est: number;
-  voice: number; setVoice: (v: number) => void; playing: number; setPlaying: (v: number) => void;
-}) {
-  const breakdown = [
-    { label: 'Voice · 24s', cost: 0.18 }, { label: 'Avatar · hero', cost: 3.20 }, { label: 'B-roll · 4 clips', cost: 2.40 },
-    { label: 'Captions', cost: 0.10 }, { label: 'Music', cost: 0.30 }, { label: 'Assemble · render', cost: est - 6.18 },
-  ];
-  const [open, setOpen] = React.useState(false);
-  const amber = est > 12;
-  return (
-    <aside style={{ width: 320, flexShrink: 0, borderRight: '0.5px solid var(--separator)', display: 'flex', flexDirection: 'column',
-      background: 'var(--bg-grouped)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-      <div style={{ flex: 1, overflowY: 'auto', padding: 18 }}>
-        <PanelSection title="Brief">
-          <div style={{ background: 'var(--bg-elevated)', borderRadius: 12, border: '0.5px solid var(--separator)', padding: 13, font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink)' }}>
-            A 24-second vertical explainer: “How Maestro runs a fleet of agents while you sleep.” Calm, confident VO. Cinematic city-at-night B-roll. End on the logo.
-          </div>
-        </PanelSection>
-
-        <PanelSection title="Model lane">
-          <LaneChips value={lane} onChange={setLane} />
-          <div style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 7 }}>
-            {lane === 'hero' ? 'Veo 3 · highest fidelity' : lane === 'selfhost' ? 'Wan 2.2 · your GPU, no per-second cost' : 'LTX · fast drafts at $0.02/s'}
-          </div>
-        </PanelSection>
-
-        <PanelSection title="Output">
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <MiniStepper label="Duration" value={dur} set={setDur} suffix="s" min={5} max={120} step={1} />
-            <MiniStepper label="Resolution" value={1080} set={() => {}} suffix="p" />
-          </div>
-        </PanelSection>
-
-        <PanelSection title="Voice">
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-            <VoiceRow name="Atlas — warm narrator" tag="ElevenLabs · en-US" playing={playing === 0} onPlay={() => setPlaying(playing === 0 ? -1 : 0)} selected={voice === 0} onSelect={() => setVoice(0)} />
-            <VoiceRow name="Nova — bright, upbeat" tag="ElevenLabs · en-US" playing={playing === 1} onPlay={() => setPlaying(playing === 1 ? -1 : 1)} selected={voice === 1} onSelect={() => setVoice(1)} />
-          </div>
-        </PanelSection>
-      </div>
-
-      {/* cost estimate pinned */}
-      <div style={{ flexShrink: 0, borderTop: '0.5px solid var(--separator)', padding: 16, background: 'var(--bg-grouped)' }}>
-        <button onClick={() => setOpen(o => !o)} style={{ display: 'flex', alignItems: 'center', width: '100%', marginBottom: open ? 12 : 0 }}>
-          <div style={{ textAlign: 'left' }}>
-            <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 5 }}>Estimated cost</div>
-            <div key={est} className="est-num" style={{ font: '700 32px/1 var(--font-mono)', letterSpacing: '-0.02em', color: amber ? 'var(--orange)' : 'var(--ink)' }}>≈ ${est.toFixed(2)}</div>
-          </div>
-          <span style={{ flex: 1 }} />
-          <Icon name="chevronDown" size={18} style={{ color: 'var(--ink-tertiary)', transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
-        </button>
-        {open && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 7, paddingTop: 12, borderTop: '0.5px solid var(--separator)' }}>
-            {breakdown.map((b, i) => (
-              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', font: '500 var(--fs-footnote)/1 var(--font-mono)' }}>
-                <span style={{ color: 'var(--ink-secondary)' }}>{b.label}</span><span style={{ color: 'var(--ink)' }}>${b.cost.toFixed(2)}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, paddingTop: 4 }}>
+                  <span style={{ flex: 1, font: '600 var(--fs-callout)/1 var(--font-mono)', color: 'var(--ink)' }}>≈ ${est.toFixed(3)}</span>
+                  <button onClick={generate} disabled={!canGenerate} className="send-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, height: 44, padding: '0 22px', borderRadius: 'var(--r-pill)',
+                    background: canGenerate ? 'var(--blue)' : 'var(--fill-secondary)', color: canGenerate ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: canGenerate ? '0 6px 18px rgba(0,122,255,0.3)' : 'none' }}>
+                    {submitting ? <><Spinner size={14} color="#fff" /> Starting…</> : <><Icon name="spark" size={17} /> Generate</>}
+                  </button>
+                </div>
               </div>
-            ))}
-          </div>
+
+              {/* bin */}
+              <div>
+                {generating.length > 0 && (
+                  <div style={{ marginBottom: 18 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 11 }}>
+                      <span className="breathe" style={{ width: 8, height: 8, borderRadius: 4, background: 'var(--purple)' }} />
+                      <span style={{ font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-secondary)' }}>Rendering · {generating.length}</span>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 14 }}>
+                      {generating.map(a => <AssetCard key={a.id} a={a} onCancel={() => void api.cancelAsset(a.id).catch(() => {})} onApprove={() => {}} onDelete={() => {}} onReveal={() => {}} />)}
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-secondary)', marginBottom: 11 }}>Asset bin</div>
+                {bin.length === 0 ? (
+                  <div style={{ padding: '48px 0', textAlign: 'center', background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                    Nothing yet. Write a prompt and hit Generate.
+                  </div>
+                ) : (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 14 }}>
+                    {bin.map(a => (
+                      <AssetCard key={a.id} a={a}
+                        onCancel={() => {}}
+                        onApprove={() => { void api.approveAsset(a.id).then(() => navigate('/publishing')).catch(() => {}); }}
+                        onDelete={() => void api.deleteAsset(a.id).then(refetch).catch(() => {})}
+                        onReveal={() => { if (a.localPath) void api.revealPath(a.localPath); }}
+                        onUseAsSource={() => { setStageKey('avatar'); setSourceImage(a.url ?? null); }}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </>
         )}
-        {amber && <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 10, font: '500 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--orange)' }}><Icon name="alert" size={13} /> Above this project's comfort threshold ($12).</div>}
       </div>
-    </aside>
-  );
-}
-
-/* ───────────────────────── center canvas: video / assemble ───────────────────────── */
-
-function VideoCanvas({ heroIdx, setHeroIdx, rendering }: { heroIdx: number; setHeroIdx: (i: number) => void; rendering: boolean }) {
-  const drafts = [
-    { tint: 'linear-gradient(135deg,#1b2a4a,#0E2A5E)', cps: '0.02' },
-    { tint: 'linear-gradient(135deg,#0E2A5E,#30B0C7)', cps: '0.02' },
-    { tint: 'linear-gradient(135deg,#2a1b4a,#5856D6)', cps: '0.02' },
-    { tint: 'linear-gradient(135deg,#1b3a2a,#1F8A5B)', cps: '0.02' },
-  ];
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 18, maxWidth: 560, margin: '0 auto', width: '100%' }}>
-      {/* player */}
-      <div style={{ width: 300, position: 'relative' }}>
-        <div style={{ width: 300, height: 533, borderRadius: 20, background: rendering ? 'var(--fill-secondary)' : drafts[heroIdx].tint, overflow: 'hidden', position: 'relative',
-          boxShadow: 'var(--card-shadow), 0 20px 60px rgba(15,20,60,0.2)', border: '0.5px solid var(--separator)', display: 'grid', placeItems: 'center' }}>
-          {rendering ? (
-            <div style={{ textAlign: 'center', filter: 'none' }}>
-              <svg width="60" height="60" viewBox="0 0 60 60" style={{ transform: 'rotate(-90deg)' }}>
-                <circle cx="30" cy="30" r="25" fill="none" stroke="var(--fill-secondary)" strokeWidth="5" />
-                <circle className="render-ring" cx="30" cy="30" r="25" fill="none" stroke="var(--teal)" strokeWidth="5" strokeLinecap="round" strokeDasharray={157} strokeDashoffset={62} />
-              </svg>
-              <div style={{ font: '600 var(--fs-subhead)/1.3 var(--font-text)', color: 'var(--ink)', marginTop: 12 }}>Rendering on fal · ~90s</div>
-              <div style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 4 }}>Continues in the background</div>
-            </div>
-          ) : (
-            <React.Fragment>
-              <span style={{ width: 64, height: 64, borderRadius: '50%', background: 'rgba(255,255,255,0.2)', backdropFilter: 'blur(6px)', display: 'grid', placeItems: 'center', color: '#fff' }}><Icon name="play" size={28} /></span>
-              <span style={{ position: 'absolute', top: 14, left: 14, display: 'inline-flex', alignItems: 'center', gap: 5, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)', background: 'rgba(0,0,0,0.4)', color: '#fff', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Hero · {heroIdx + 1}</span>
-            </React.Fragment>
-          )}
-        </div>
-        {/* scrubber */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12 }}>
-          <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>0:08</span>
-          <div style={{ flex: 1, height: 4, borderRadius: 2, background: 'var(--fill-secondary)', position: 'relative' }}>
-            <div style={{ width: '34%', height: '100%', borderRadius: 2, background: 'var(--teal)' }} />
-            <span style={{ position: 'absolute', left: '34%', top: '50%', transform: 'translate(-50%,-50%)', width: 13, height: 13, borderRadius: '50%', background: '#fff', boxShadow: '0 1px 4px rgba(0,0,0,0.3)' }} />
-          </div>
-          <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>0:24</span>
-        </div>
-      </div>
-
-      {/* filmstrip */}
-      <div style={{ width: '100%' }}>
-        <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 10 }}>Draft variants</div>
-        <div style={{ display: 'flex', gap: 10 }}>
-          {drafts.map((d, i) => (
-            <button key={i} onClick={() => setHeroIdx(i)} className="filmstrip" style={{ flex: 1, textAlign: 'left' }}>
-              <div style={{ width: '100%', aspectRatio: '9/16', borderRadius: 10, background: d.tint, border: `2px solid ${heroIdx === i ? 'var(--teal)' : 'transparent'}`, position: 'relative', overflow: 'hidden' }}>
-                {heroIdx === i && <span style={{ position: 'absolute', bottom: 5, left: '50%', transform: 'translateX(-50%)', whiteSpace: 'nowrap', display: 'inline-flex', alignItems: 'center', gap: 4, height: 20, padding: '0 8px', borderRadius: 'var(--r-pill)', background: 'var(--teal)', color: '#fff', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Re-render hero</span>}
-              </div>
-              <div style={{ font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', marginTop: 5, textAlign: 'center' }}>Draft · ${d.cps}/s</div>
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function AssembleCanvas() {
-  const tracks = [
-    { label: 'Video', tint: 'var(--teal)', clips: [{ w: 30 }, { w: 25 }, { w: 28 }] },
-    { label: 'Captions', tint: 'var(--blue)', clips: [{ w: 20 }, { w: 18 }, { w: 22 }, { w: 19 }] },
-    { label: 'Music', tint: 'var(--purple)', clips: [{ w: 92 }] },
-  ];
-  const templates = ['Bold kinetic', 'Clean lower-third', 'Word-pop', 'Minimal'];
-  return (
-    <div style={{ maxWidth: 680, margin: '0 auto', width: '100%' }}>
-      <div style={{ background: 'var(--bg-elevated)', borderRadius: 16, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 18, marginBottom: 18 }}>
-        <div style={{ font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink)', marginBottom: 14 }}>Remotion timeline</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-          {tracks.map((t, i) => (
-            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              <span style={{ width: 64, font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', flexShrink: 0 }}>{t.label}</span>
-              <div style={{ flex: 1, display: 'flex', gap: 4 }}>
-                {t.clips.map((c, j) => <div key={j} style={{ width: `${c.w}%`, height: 30, borderRadius: 6, background: `color-mix(in srgb, ${t.tint} 22%, var(--bg-elevated))`, border: `1px solid color-mix(in srgb, ${t.tint} 45%, transparent)` }} />)}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-      <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 10 }}>Kinetic-typography template</div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10 }}>
-        {templates.map((t, i) => (
-          <button key={i} className="tpl-thumb" style={{ textAlign: 'center' }}>
-            <div style={{ width: '100%', aspectRatio: '16/10', borderRadius: 10, background: i === 0 ? 'color-mix(in srgb, var(--teal) 16%, var(--bg-elevated))' : 'var(--fill-tertiary)', border: `2px solid ${i === 0 ? 'var(--teal)' : 'var(--separator)'}`, display: 'grid', placeItems: 'center', marginBottom: 6 }}>
-              <span style={{ font: '800 18px/1 var(--font-display)', color: i === 0 ? 'var(--teal)' : 'var(--ink-tertiary)' }}>Aa</span>
-            </div>
-            <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{t}</span>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-/* ───────────────────────── right render queue ───────────────────────── */
-
-function StudioQueue() {
-  const q = [
-    { stage: 'B-roll · clip 3', status: 'rendering', cost: '0.60' },
-    { stage: 'Voice · take 2', status: 'done', cost: '0.18' },
-    { stage: 'Avatar · hero', status: 'wait', cost: '3.20' },
-    { stage: 'Captions', status: 'done', cost: '0.10' },
-  ];
-  const assets = ['linear-gradient(135deg,#0E2A5E,#30B0C7)', 'linear-gradient(135deg,#2a1b4a,#5856D6)', 'linear-gradient(135deg,#1b3a2a,#1F8A5B)', 'linear-gradient(135deg,#3a2a1b,#FF9500)', 'linear-gradient(135deg,#1b2a4a,#007AFF)', 'linear-gradient(135deg,#3a1b2a,#AF52DE)'];
-  return (
-    <aside style={{ width: 300, flexShrink: 0, borderLeft: '0.5px solid var(--separator)', display: 'flex', flexDirection: 'column', overflowY: 'auto',
-      background: 'var(--bg-grouped)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-      <div style={{ padding: 18 }}>
-        <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 11 }}>Render queue</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-          {q.map((r, i) => (
-            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderRadius: 10, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)' }}>
-              <span style={{ flexShrink: 0 }}>
-                {r.status === 'rendering' ? <Spinner size={14} color="var(--teal)" /> : r.status === 'wait' ? <Spinner size={14} color="var(--orange)" /> : <Icon name="check" size={14} stroke={2.6} style={{ color: 'var(--green)' }} />}
-              </span>
-              <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.stage}{r.status === 'wait' && <span style={{ color: 'var(--orange)', fontSize: 'var(--fs-caption)' }}> · webhook</span>}</span>
-              <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>${r.cost}</span>
-            </div>
-          ))}
-        </div>
-
-        <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', margin: '20px 0 11px' }}>Asset bin</div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
-          {assets.map((a, i) => (
-            <div key={i} className="asset-cell" style={{ aspectRatio: '1', borderRadius: 9, background: a, border: '0.5px solid var(--separator)', cursor: 'grab' }} />
-          ))}
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 12, font: '500 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--green)' }}>
-          <Icon name="shield" size={12} /> C2PA ✓ · SynthID ✓ on every asset
-        </div>
-      </div>
-    </aside>
-  );
-}
-
-/* ───────────────────────── page root ───────────────────────── */
-
-export default function MediaStudio() {
-  const [active, setActive] = React.useState('B-roll');
-  const [lane, setLane] = React.useState('hero');
-  const [dur, setDur] = React.useState(24);
-  const [voice, setVoice] = React.useState(0);
-  const [playing, setPlaying] = React.useState(-1);
-  const [heroIdx, setHeroIdx] = React.useState(0);
-  const [consentDone, setConsentDone] = React.useState(false);
-  const [paletteOpen, setPaletteOpen] = React.useState(false);
-
-  React.useEffect(() => {
-    const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
-    window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
-  }, []);
-
-  // cost estimate reacts to controls
-  const base = lane === 'hero' ? 0.32 : lane === 'selfhost' ? 0.04 : 0.10;
-  const est = +(2.9 + dur * base + (voice === 1 ? 0.4 : 0)).toFixed(2);
-
-  const done = ['Brief', 'Voice'];
-  const needsConsent = (active === 'Avatar' || active === 'Voice') && !consentDone;
-
-  return (
-    <AppShell
-      active="studio"
-      onSearch={() => setPaletteOpen(true)}
-    >
-      <style>{styles}</style>
-
-      <div style={{ height: '100%', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-        {/* top: context + pipeline */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 24px', borderBottom: '0.5px solid var(--separator)', background: 'color-mix(in srgb, var(--bg) 86%, transparent)', position: 'relative', zIndex: 5 }}>
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 28, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'color-mix(in srgb, var(--teal) 12%, transparent)', color: 'var(--teal)', font: '600 var(--fs-footnote)/1 var(--font-text)', flexShrink: 0 }}>
-            <Icon name="clapper" size={14} /> Q3 Content · Launch film
-          </span>
-          <div style={{ flex: 1, minWidth: 0 }}><PipelineStepper active={active} onPick={s => { setActive(s); }} done={done} /></div>
-        </div>
-
-        {/* 3 columns */}
-        <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-          <BriefPanel lane={lane} setLane={setLane} dur={dur} setDur={setDur} est={est} voice={voice} setVoice={setVoice} playing={playing} setPlaying={setPlaying} />
-          <main style={{ flex: 1, minWidth: 0, overflowY: 'auto', padding: '28px 28px', display: 'flex', flexDirection: 'column' }} key={active} className="canvas-fade">
-            {needsConsent ? <ConsentGate stage={active} onRecord={() => setConsentDone(true)} onClose={() => setActive('B-roll')} />
-              : active === 'Assemble' ? <AssembleCanvas />
-              : <VideoCanvas heroIdx={heroIdx} setHeroIdx={setHeroIdx} rendering={false} />}
-          </main>
-          <StudioQueue />
-        </div>
-      </div>
-
-      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>
   );
 }

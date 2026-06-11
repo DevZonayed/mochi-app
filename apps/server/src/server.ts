@@ -27,6 +27,7 @@ interface Snapshot {
   skills?: unknown[];
   templates?: unknown[];
   assets?: { id?: string; projectId?: string | null; status?: string }[];
+  mediaRates?: unknown;
   publishDrafts?: unknown[];
   publishLedger?: unknown[];
   briefs?: unknown[];
@@ -226,6 +227,17 @@ export function buildServer(): FastifyInstance {
   app.get('/api/events', async () => st()?.events ?? []);
   app.get('/api/settings', async () => st()?.settings ?? null);
   app.get('/api/engine-status', async () => st()?.engineStatus ?? { claude: { engine: 'claude', available: false, method: 'none', detail: 'Mac offline', reason: 'Desktop not connected.' }, codex: { engine: 'codex', available: false, method: 'none', detail: 'Mac offline', reason: 'Desktop not connected.' } });
+  // ── Media Studio (assets mirror; generation forwards to the Mac's fal key) ──
+  app.get('/api/assets', async (req) => {
+    const projectId = (req.query as { projectId?: string }).projectId;
+    const assets = st()?.assets ?? [];
+    return projectId ? assets.filter((a) => a.projectId === projectId) : assets;
+  });
+  app.get('/api/media/rates', async () => st()?.mediaRates ?? []);
+  app.post('/api/assets/generate', async (req, reply) => forward(reply, 'generateAsset', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/assets/:id/cancel', async (req, reply) => forward(reply, 'cancelAsset', { id: (req.params as { id: string }).id }));
+  app.post('/api/assets/:id/approve', async (req, reply) => forward(reply, 'approveAsset', { id: (req.params as { id: string }).id }));
+  app.post('/api/assets/:id/delete', async (req, reply) => forward(reply, 'deleteAsset', { id: (req.params as { id: string }).id }));
   app.get('/api/workspaces', async () => st()?.workspaces ?? []);
   app.get('/api/projects', async () => st()?.projects ?? []);
   app.get('/api/projects/:id', async (req, reply) => {

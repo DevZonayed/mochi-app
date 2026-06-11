@@ -12,7 +12,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Store } from './store.js';
 
-export type ProviderId = 'anthropic' | 'openai';
+export type ProviderId = 'anthropic' | 'openai' | 'fal';
 
 export interface ProviderConn {
   provider: ProviderId;
@@ -48,6 +48,8 @@ export class Providers {
       const k = this.store.providerKeyMeta('openai');
       if (k) out.push({ provider: 'openai', method: 'apiKey', status: 'connected', detail: `API key ••••${k.last4}`, keyLast4: k.last4, createdAt: k.createdAt });
     }
+    const fal = this.store.providerKeyMeta('fal');
+    if (fal) out.push({ provider: 'fal', method: 'apiKey', status: 'connected', detail: `API key ••••${fal.last4}`, keyLast4: fal.last4, createdAt: fal.createdAt });
     return out;
   }
 
@@ -76,6 +78,13 @@ export class Providers {
 
   private async validate(provider: ProviderId, key: string): Promise<{ valid: boolean; error?: string }> {
     try {
+      if (provider === 'fal') {
+        // Zero-cost auth check: a bogus request id 401s on a bad key, 404s on a
+        // good one (request not found). Anything other than 401/403 = authed.
+        const res = await fetch('https://queue.fal.run/fal-ai/flux/schnell/requests/00000000-0000-0000-0000-000000000000/status', { headers: { authorization: `Key ${key}` } });
+        if (res.status === 401 || res.status === 403) return { valid: false, error: 'Invalid fal API key' };
+        return { valid: true };
+      }
       const res = provider === 'anthropic'
         ? await fetch('https://api.anthropic.com/v1/models?limit=1', { headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' } })
         : await fetch('https://api.openai.com/v1/models', { headers: { authorization: `Bearer ${key}` } });

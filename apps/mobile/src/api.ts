@@ -35,6 +35,14 @@ export interface CostsData {
 }
 export interface EngineStatus { engine: EngineId; available: boolean; method: 'subscription' | 'apiKey' | 'none'; detail: string; reason: string }
 export type EngineStatuses = Record<EngineId, EngineStatus>;
+
+export type AssetKind = 'image' | 'video' | 'audio' | 'voiceover' | 'other';
+export type AssetStatus = 'queued' | 'generating' | 'done' | 'failed' | 'cancelled' | 'approved';
+export interface Asset {
+  id: string; projectId: string | null; source: 'generated' | 'import'; kind: AssetKind; stage?: string;
+  prompt?: string; model?: string; status: AssetStatus; url?: string; name?: string; bytes?: number; tint?: string;
+  cost: number; durationS?: number; width?: number; height?: number; error: string | null; createdAt: number; updatedAt: number;
+}
 export interface Schedule { id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean; nextRun: number | null; createdAt: number }
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
@@ -112,6 +120,10 @@ export const api = {
   costs: () => req<CostsData>('/api/costs'),
   listEvents: () => req<AppEvent[]>('/api/events'),
   engineStatus: () => req<EngineStatuses>('/api/engine-status'),
+
+  listAssets: (projectId?: string) => req<Asset[]>('/api/assets' + qp({ projectId })),
+  approveAsset: (id: string) => req<Asset>(`/api/assets/${encodeURIComponent(id)}/approve`, { method: 'POST' }),
+  cancelAsset: (id: string) => req<Asset>(`/api/assets/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
 
   listWorkspaces: () => req<Workspace[]>('/api/workspaces'),
   createWorkspace: (name: string, budgetCap?: number) => req<Workspace>('/api/workspaces', { method: 'POST', body: JSON.stringify({ name, budgetCap }) }),

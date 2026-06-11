@@ -2,8 +2,9 @@
    (over IPC) and remote controls (phone/web via the relay). Every command
    executes locally on this Mac against the local store + local engine. */
 
-import type { Store, Effort, ApprovalStatus, EngineId, Routing, AppSettings, ProjectKind } from './store.js';
+import type { Store, Effort, ApprovalStatus, EngineId, Routing, AppSettings, ProjectKind, AssetStatus } from './store.js';
 import type { LocalEngine } from './engine.js';
+import type { MediaEngine } from './media.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable } from './git.js';
 
@@ -18,7 +19,7 @@ function asEngine(v: unknown): EngineId | undefined {
   return typeof v === 'string' && ENGINE_VALUES.has(v) ? (v as EngineId) : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -184,14 +185,37 @@ export function createDispatch(store: Store, engine: LocalEngine, providers: Pro
       case 'listProviders': return providers.list();
       case 'connectProvider': {
         const prov = String(p.provider ?? '');
-        if (prov !== 'anthropic' && prov !== 'openai') bad('unsupported provider');
+        if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal') bad('unsupported provider');
         return providers.connect(prov as ProviderId, String(p.apiKey ?? ''));
       }
       case 'disconnectProvider': {
         const prov = String(p.provider ?? '');
-        if (prov !== 'anthropic' && prov !== 'openai') bad('unsupported provider');
+        if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal') bad('unsupported provider');
         providers.disconnect(prov as ProviderId);
         return { ok: true };
+      }
+
+      // ── Media Studio (real fal generation) ─────────────────────
+      case 'mediaRates': return media.rates();
+      case 'listAssets': return store.listAssets({ projectId: p.projectId ? String(p.projectId) : undefined, status: p.status as AssetStatus | undefined });
+      case 'getAsset': { const a = store.getAsset(String(p.id ?? '')); return a ?? bad('asset not found', 404); }
+      case 'generateAsset': {
+        if (!p.modelKey || !p.prompt) bad('modelKey and prompt required');
+        return media.generate({
+          projectId: p.projectId ? String(p.projectId) : null,
+          modelKey: String(p.modelKey), prompt: String(p.prompt),
+          durationS: typeof p.durationS === 'number' ? p.durationS : undefined,
+          voice: typeof p.voice === 'string' ? p.voice : undefined,
+          imageUrl: typeof p.imageUrl === 'string' ? p.imageUrl : undefined,
+          aspect: typeof p.aspect === 'string' ? p.aspect : undefined,
+        });
+      }
+      case 'cancelAsset': return media.cancel(String(p.id ?? ''));
+      case 'deleteAsset': { const removed = store.deleteAsset(String(p.id ?? '')); emit('asset', { ...removed, status: 'deleted' }); return { ok: true }; }
+      case 'approveAsset': {
+        const a = store.updateAsset(String(p.id ?? ''), { status: 'approved' });
+        emit('asset', a);
+        return a;
       }
 
       // ── Engine status (THE single source of truth) ────────────

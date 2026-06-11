@@ -95,7 +95,7 @@ export interface BudgetData {
   spent: number;
   byProject: { projectId: string; name: string; color: string; spent: number }[];
 }
-export type ProviderId = 'anthropic' | 'openai';
+export type ProviderId = 'anthropic' | 'openai' | 'fal';
 export interface ProviderConn {
   provider: ProviderId;
   method: 'subscription' | 'apiKey';
@@ -162,6 +162,32 @@ export interface EngineStatus {
   reason: string;
 }
 export type EngineStatuses = Record<EngineId, EngineStatus>;
+export type AssetKind = 'image' | 'video' | 'audio' | 'voiceover' | 'other';
+export type AssetStage = 'broll' | 'avatar' | 'voice' | 'music';
+export type AssetStatus = 'queued' | 'generating' | 'done' | 'failed' | 'cancelled' | 'approved';
+export interface Asset {
+  id: string;
+  projectId: string | null;
+  source: 'generated' | 'import';
+  kind: AssetKind;
+  stage?: AssetStage;
+  prompt?: string;
+  model?: string;
+  status: AssetStatus;
+  url?: string;
+  localPath?: string;
+  name?: string;
+  bytes?: number;
+  tint?: string;
+  cost: number;
+  durationS?: number;
+  width?: number;
+  height?: number;
+  error: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+export interface MediaRate { key: string; label: string; kind: AssetKind; stage: AssetStage; rate: number; perSecond?: boolean; blurb: string }
 export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
 export interface FolderInspect { ok: boolean; path: string; info: RepoInfo; error?: string }
 export type CloneEvent =
@@ -327,6 +353,17 @@ export const api = {
   /** Reveal a local path in Finder — desktop only; no-op in the browser. */
   revealPath: async (p: string): Promise<void> => { if (bridge?.revealPath) await bridge.revealPath(p); },
 
+  // Media Studio (real fal generation, on the Mac's fal key)
+  mediaRates: () => call<MediaRate[]>('mediaRates', {}, () => req<MediaRate[]>('/api/media/rates')),
+  listAssets: (filter?: { projectId?: string; status?: AssetStatus }) =>
+    call<Asset[]>('listAssets', { ...filter }, () => req<Asset[]>('/api/assets' + qp({ projectId: filter?.projectId, status: filter?.status }))),
+  getAsset: (id: string) => call<Asset>('getAsset', { id }, () => req<Asset>(`/api/assets/${encodeURIComponent(id)}`)),
+  generateAsset: (input: { projectId?: string | null; modelKey: string; prompt: string; durationS?: number; voice?: string; imageUrl?: string; aspect?: string }) =>
+    call<Asset>('generateAsset', { ...input }, () => req<Asset>('/api/assets/generate', { method: 'POST', body: JSON.stringify(input) })),
+  cancelAsset: (id: string) => call<Asset>('cancelAsset', { id }, () => req<Asset>(`/api/assets/${encodeURIComponent(id)}/cancel`, { method: 'POST' })),
+  approveAsset: (id: string) => call<Asset>('approveAsset', { id }, () => req<Asset>(`/api/assets/${encodeURIComponent(id)}/approve`, { method: 'POST' })),
+  deleteAsset: (id: string) => call<{ ok: boolean }>('deleteAsset', { id }, () => req<{ ok: boolean }>(`/api/assets/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
+
   // Jobs — in the desktop app these EXECUTE on this Mac (Claude Code login)
   listJobs: (projectId?: string) =>
     call<Job[]>('listJobs', { projectId }, () => req<Job[]>('/api/jobs' + qp({ projectId }))),
@@ -393,13 +430,14 @@ export const api = {
     call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
         if (name === 'approval' && handlers.onApproval) handlers.onApproval(data as Approval);
         if (name === 'project' && handlers.onProject) handlers.onProject(data as Project);
         if (name === 'clone' && handlers.onClone) handlers.onClone(data as CloneEvent);
+        if (name === 'asset' && handlers.onAsset) handlers.onAsset(data as Asset);
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
@@ -408,6 +446,7 @@ export const api = {
     if (handlers.onApproval) es.addEventListener('approval', (e: MessageEvent) => { try { handlers.onApproval!(JSON.parse(e.data) as Approval); } catch { /* ignore */ } });
     if (handlers.onProject) es.addEventListener('project', (e: MessageEvent) => { try { handlers.onProject!(JSON.parse(e.data) as Project); } catch { /* ignore */ } });
     if (handlers.onClone) es.addEventListener('clone', (e: MessageEvent) => { try { handlers.onClone!(JSON.parse(e.data) as CloneEvent); } catch { /* ignore */ } });
+    if (handlers.onAsset) es.addEventListener('asset', (e: MessageEvent) => { try { handlers.onAsset!(JSON.parse(e.data) as Asset); } catch { /* ignore */ } });
     return () => es.close();
   },
   /** Convenience: subscribe to job updates only. */

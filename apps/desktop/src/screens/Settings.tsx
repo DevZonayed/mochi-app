@@ -307,9 +307,9 @@ function EnginesPane() {
 const REAL_PROVIDERS: { id: ProviderId; name: string; tint: string; glyph: string; meta: string; hint: string }[] = [
   { id: 'anthropic', name: 'Anthropic', tint: '#D97757', glyph: 'A', meta: 'Claude · coding & reasoning', hint: 'sk-ant-…' },
   { id: 'openai', name: 'OpenAI', tint: 'var(--ink)', glyph: 'O', meta: 'GPT · media & vision', hint: 'sk-…' },
+  { id: 'fal', name: 'fal.ai', tint: 'var(--purple)', glyph: 'f', meta: 'Media · image, video, voice', hint: 'key_id:key_secret' },
 ];
 const OTHER_PROVIDERS = [
-  { name: 'fal', tint: 'var(--purple)', glyph: 'f' },
   { name: 'Replicate', tint: 'var(--teal)', glyph: 'R' },
   { name: 'ElevenLabs', tint: 'var(--indigo)', glyph: 'E' },
   { name: 'Google', tint: 'var(--blue)', glyph: 'G' },
@@ -317,9 +317,9 @@ const OTHER_PROVIDERS = [
 
 function AccountsPane() {
   const [conns, setConns] = React.useState<ProviderConn[]>([]);
-  const [keys, setKeys] = React.useState<Record<string, string>>({ anthropic: '', openai: '' });
-  const [errors, setErrors] = React.useState<Record<string, string>>({ anthropic: '', openai: '' });
-  const [busy, setBusy] = React.useState<Record<string, boolean>>({ anthropic: false, openai: false });
+  const [keys, setKeys] = React.useState<Record<string, string>>({ anthropic: '', openai: '', fal: '' });
+  const [errors, setErrors] = React.useState<Record<string, string>>({ anthropic: '', openai: '', fal: '' });
+  const [busy, setBusy] = React.useState<Record<string, boolean>>({ anthropic: false, openai: false, fal: false });
 
   const refetch = React.useCallback(() => { api.listProviders().then(setConns).catch(() => {}); }, []);
   React.useEffect(() => { refetch(); }, [refetch]);

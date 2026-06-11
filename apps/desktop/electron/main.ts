@@ -3,6 +3,7 @@ import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { Store } from './store.js';
 import { LocalEngine } from './engine.js';
+import { MediaEngine } from './media.js';
 import { Providers } from './providers.js';
 import { createDispatch } from './localApi.js';
 import { RelayClient } from './relay.js';
@@ -59,14 +60,16 @@ app.whenReady().then(() => {
   };
 
   const engine = new LocalEngine(store, emit, providers);
-  const dispatch = createDispatch(store, engine, providers, emit, RELAY_URL);
+  const media = new MediaEngine(store, emit, () => providers.getLocalKey('fal'));
+  media.resumeOnBoot();
+  const dispatch = createDispatch(store, engine, media, providers, emit, RELAY_URL);
 
   relay = new RelayClient({
     url: RELAY_URL,
     deckId: store.deck.deckId,
     deckSecret: store.deck.deckSecret,
     accessToken: store.accessToken,
-    getSnapshot: () => ({ ...store.snapshot(providers.list()), engineStatus: engine.statuses() }),
+    getSnapshot: () => ({ ...store.snapshot(providers.list()), engineStatus: engine.statuses(), mediaRates: media.rates() }),
     onCommand: (method, params) => dispatch(method, params),
   });
   relay.start();
