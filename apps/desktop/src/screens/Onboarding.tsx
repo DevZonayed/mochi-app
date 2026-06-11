@@ -331,58 +331,39 @@ function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect }: Prov
   );
 }
 
-// ── Step 4: Budget ceiling
+// ── Step 4: How costs work (no cap — subscription model)
 interface BudgetStepProps {
   amount: number;
   onAmount: (next: number) => void;
 }
 
-function BudgetStep({ amount, onAmount }: BudgetStepProps) {
-  const min = 20, max = 1000;
-  const pct = ((amount - min) / (max - min)) * 100;
-  const runs = Math.round(amount / 5);
-  const minutes = (amount / 40).toFixed(1).replace(/\.0$/, '');
+function BudgetStep(_props: BudgetStepProps) {
+  const lines: [IconName, string, string, string][] = [
+    ['terminal', 'var(--blue)', 'Coding runs on your Claude Code / Codex sign-ins', "No per-run billing — they're covered by your plan."],
+    ['clapper', 'var(--purple)', 'Media runs on your fal key', 'Images, video, and voice are metered — real spend, shown live.'],
+    ['gauge', 'var(--green)', 'No caps — just calculation', "Maestro tracks every cost in the Costs view. You're never surprised, and nothing stops at a line."],
+  ];
   return (
     <div>
       <StepHeading icon="gauge" tint="var(--green)"
-        title="Set your budget ceiling"
-        sub="A hard cap. Jobs stop at the line — never a surprise bill." />
+        title="How costs work"
+        sub="No budget caps. Maestro calculates spend so you always know — it never blocks a job." />
       <div style={{
         background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)',
-        border: '0.5px solid var(--separator)', padding: '22px 22px 20px',
+        border: '0.5px solid var(--separator)', padding: 14, display: 'flex', flexDirection: 'column', gap: 4,
         backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)',
       }}>
-        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'center', gap: 6, marginBottom: 4 }}>
-          <span style={{ font: '500 32px/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>$</span>
-          <input
-            type="text" inputMode="numeric" value={amount}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) => { const v = parseInt(e.target.value.replace(/\D/g, '') || '0', 10); onAmount(Math.min(max, Math.max(min, v))); }}
-            style={{
-              width: 'auto', minWidth: 40, maxWidth: 150, fieldSizing: 'content',
-              border: 'none', outline: 'none', background: 'transparent', textAlign: 'center',
-              font: '600 56px/1 var(--font-mono)', letterSpacing: '-0.02em', color: 'var(--ink)',
-            } as React.CSSProperties} />
-          <span style={{ font: '500 17px/1 var(--font-text)', color: 'var(--ink-secondary)' }}>/ month</span>
-        </div>
-        <input type="range" min={min} max={max} step={5} value={amount}
-          onChange={(e: React.ChangeEvent<HTMLInputElement>) => onAmount(parseInt(e.target.value, 10))}
-          style={{
-            width: '100%', margin: '18px 0 16px', height: 28, WebkitAppearance: 'none',
-            background: `linear-gradient(var(--blue),var(--blue)) 0/${pct}% 100% no-repeat var(--fill-secondary)`,
-            borderRadius: 'var(--r-pill)', appearance: 'none', cursor: 'pointer',
-          }} className="ios-slider" />
-        <div style={{ display: 'flex', justifyContent: 'center' }}>
-          <span style={{
-            display: 'inline-flex', alignItems: 'center', gap: 7, padding: '7px 14px',
-            borderRadius: 'var(--r-pill)', background: 'var(--fill-tertiary)',
-            border: '0.5px solid var(--separator)',
-            font: '500 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)',
-          }}>
-            <Icon name="spark" size={15} style={{ color: 'var(--purple)' }} />
-            ≈ <b style={{ color: 'var(--ink)', fontWeight: 600 }}>{runs}</b> deep coding runs
-            &nbsp;·&nbsp; <b style={{ color: 'var(--ink)', fontWeight: 600 }}>{minutes}</b> video min
-          </span>
-        </div>
+        {lines.map(([icon, tint, title, sub], i) => (
+          <div key={i} style={{ display: 'flex', gap: 12, padding: 12, borderRadius: 12, background: i === 2 ? 'color-mix(in srgb, var(--green) 7%, transparent)' : 'transparent' }}>
+            <span style={{ width: 36, height: 36, borderRadius: 10, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${tint} 14%, transparent)`, color: tint }}>
+              <Icon name={icon} size={18} />
+            </span>
+            <span style={{ minWidth: 0 }}>
+              <span style={{ display: 'block', font: '600 var(--fs-callout)/1.25 var(--font-text)', color: 'var(--ink)' }}>{title}</span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{sub}</span>
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -540,7 +521,7 @@ function DashboardPeek({ workspace, budget }: DashboardPeekProps) {
                 strokeDasharray={ring} strokeDashoffset={ring * (1 - spent / budget)} />
             </svg>
             <div style={{ font: '600 var(--fs-title2)/1 var(--font-mono)', color: 'var(--ink)' }}>${spent.toFixed(0)}</div>
-            <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>of ${budget} cap</div>
+            <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>spent this month</div>
           </div>
         </div>
       </div>

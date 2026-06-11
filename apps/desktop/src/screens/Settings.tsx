@@ -560,23 +560,12 @@ export default function Settings() {
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const navigate = useNavigate();
 
-  // Live workspace (first one) + budget figures backing the name row and the
-  // toolbar budget chip. Empty until the API resolves; fail-soft on error.
+  // Live workspace (first one) backing the name row. Fail-soft on error.
   const [workspace, setWorkspace] = React.useState<Workspace | null>(null);
-  const [budget, setBudget] = React.useState<BudgetData | null>(null);
 
   React.useEffect(() => {
     let alive = true;
-    (async () => {
-      try {
-        const [workspaces, budgetData] = await Promise.all([api.listWorkspaces(), api.budget()]);
-        if (!alive) return;
-        setWorkspace(workspaces[0] ?? null);
-        setBudget(budgetData);
-      } catch {
-        /* fail-soft: keep static design defaults */
-      }
-    })();
+    api.listWorkspaces().then(ws => { if (alive) setWorkspace(ws[0] ?? null); }).catch(() => {});
     return () => { alive = false; };
   }, []);
 
@@ -586,11 +575,6 @@ export default function Settings() {
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   }, []);
-
-  // Live budget cap prefers the workspace's configured ceiling, then the budget
-  // aggregate, falling back to the prototype's design value.
-  const liveCap = workspace?.budgetCap ?? budget?.cap ?? 200;
-  const liveSpent = budget?.spent ?? 38.20;
 
   const panes: Record<string, React.ReactNode> = {
     general: <GeneralPane theme={theme} setTheme={setTheme} workspace={workspace} />,
@@ -614,7 +598,7 @@ export default function Settings() {
         <TrafficLights />
         <Sidebar active="" onNav={navTo} onWorkspace={() => {}} />
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, position: 'relative', zIndex: 1 }}>
-          <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} budget={{ spent: liveSpent, cap: liveCap, animateKey: liveCap }} />
+          <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} />
           <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
             {/* settings nav */}
             <aside style={{ width: 232, flexShrink: 0, borderRight: '0.5px solid var(--separator)', padding: '20px 12px', overflowY: 'auto', background: 'var(--bg-grouped)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>

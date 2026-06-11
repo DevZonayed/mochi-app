@@ -1,12 +1,11 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, Pressable, ScrollView, Animated, Easing, StyleSheet } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import { View, Text, Pressable, ScrollView, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
-import Svg, { Circle } from 'react-native-svg';
 import { useTheme } from '../theme';
 import type { Theme } from '@maestro/design-tokens';
 import { Icon } from '../Icon';
-import { api, type BudgetData } from '../api';
+import { api, type CostsData, type Job, type Project } from '../api';
 import { Mono } from '../ui';
 
 /** Resolve a live project color NAME ('blue'|'purple'|…) to a theme hex. */
@@ -18,267 +17,126 @@ function projectColor(theme: Theme, name: string): string {
     : theme.color.blue;
 }
 
-const LEDGER: [string, string, string][] = [
-  ['14:02', 'Opus tokens · build pass', '0.43'],
-  ['13:40', 'Video render · 24s', '28.80'],
-  ['11:15', 'Search · 120 queries', '0.48'],
-  ['09:30', 'Image gen · 48 @3x', '1.92'],
-];
+const ENGINE_NAME: Record<string, string> = { claude: 'Claude Code', codex: 'Codex' };
 
-const SPARK = [12, 18, 9, 22, 30, 16, 24, 28, 20, 34, 26, 31];
-
-function Spinner({ color, size = 16 }: { color: string; size?: number }) {
-  const a = useRef(new Animated.Value(0)).current;
-  useEffect(() => {
-    const loop = Animated.loop(
-      Animated.timing(a, { toValue: 1, duration: 900, easing: Easing.linear, useNativeDriver: true }),
-    );
-    loop.start();
-    return () => loop.stop();
-  }, [a]);
-  const spin = a.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
-  return (
-    <Animated.View
-      style={{
-        width: size,
-        height: size,
-        borderRadius: size / 2,
-        borderWidth: 2,
-        borderColor: color + '40',
-        borderTopColor: color,
-        transform: [{ rotate: spin }],
-      }}
-    />
-  );
-}
-
-function HeroRing({ cap, spent }: { cap: number; spent: number }) {
-  const { theme } = useTheme();
-  const R = 88;
-  const C = 2 * Math.PI * R;
-  const pct = cap > 0 ? Math.min(1, spent / cap) : 0;
-  return (
-    <View style={{ alignItems: 'center', paddingTop: 8, paddingBottom: 18 }}>
-      <View style={{ width: 220, height: 220 }}>
-        <Svg width={220} height={220} viewBox="0 0 220 220" style={{ transform: [{ rotate: '-90deg' }] }}>
-          <Circle cx={110} cy={110} r={R} fill="none" stroke={theme.color.fillSecondary} strokeWidth={16} />
-          <Circle
-            cx={110}
-            cy={110}
-            r={R}
-            fill="none"
-            stroke={theme.color.blue}
-            strokeWidth={16}
-            strokeLinecap="round"
-            strokeDasharray={C}
-            strokeDashoffset={C * (1 - pct)}
-          />
-        </Svg>
-        <View style={{ position: 'absolute', inset: 0, alignItems: 'center', justifyContent: 'center' } as any}>
-          <Mono style={{ fontSize: 44, fontWeight: '700', letterSpacing: -0.9 }}>{`$${spent.toFixed(2)}`}</Mono>
-          <Text style={{ fontSize: 15, fontWeight: '500', color: theme.color.inkTertiary, marginTop: 6 }}>{`of $${cap.toFixed(0)}`}</Text>
-        </View>
-      </View>
-      <Mono style={{ fontSize: 14, fontWeight: '500', color: theme.color.inkSecondary, marginTop: 8 }}>≈ $96 by Jun 30</Mono>
-    </View>
-  );
+function clockOf(ts: number): string {
+  const d = new Date(ts);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  if (ts >= today.getTime()) return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
 export function BudgetScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
   const nav = useNavigation<any>();
-  const mx = Math.max(...SPARK);
 
-  const [budget, setBudget] = useState<BudgetData | null>(null);
+  const [costs, setCosts] = useState<CostsData | null>(null);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [projects, setProjects] = useState<Record<string, Project>>({});
+
   useEffect(() => {
     const stop = api.poll(() => {
-      api
-        .budget()
-        .then(setBudget)
-        .catch(() => {
-          /* fail soft — keep last good / empty render */
-        });
+      api.costs().then(setCosts).catch(() => {});
+      api.listJobs().then(setJobs).catch(() => {});
+      api.listProjects().then(ps => setProjects(Object.fromEntries(ps.map(p => [p.id, p])))).catch(() => {});
     });
     return stop;
   }, []);
 
-  const cap = budget?.cap ?? 0;
-  const spent = budget?.spent ?? 0;
-  const caps = budget?.byProject ?? [];
-  const maxSpent = caps.reduce((m, c) => Math.max(m, c.spent), 0);
+  const c = costs ?? { today: 0, thisMonth: 0, projectedMonth: 0, byDay: [], byProject: [], byEngine: [], includedCodexRuns: 0, claudeRuns: 0 };
+  const maxDay = Math.max(1, ...c.byDay.map(d => d.total));
+  const ledger = jobs.filter(j => j.status === 'done' || j.cost > 0).slice(0, 30);
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
       <ScrollView contentContainerStyle={{ paddingTop: insets.top + 6, paddingBottom: 24 }} showsVerticalScrollIndicator={false}>
-        {/* back */}
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 16, paddingTop: 2, paddingBottom: 4 }}>
           <Pressable onPress={() => nav.navigate('Tabs')} hitSlop={8}>
             <Icon name="arrowLeft" size={22} color={theme.color.blue} />
           </Pressable>
         </View>
 
-        {/* large title */}
         <View style={{ paddingHorizontal: 20, paddingTop: 6, paddingBottom: 10 }}>
-          <Text style={{ fontSize: 34, fontWeight: '700', letterSpacing: -0.7, color: theme.color.ink }}>Budget</Text>
+          <Text style={{ fontSize: 34, fontWeight: '700', letterSpacing: -0.7, color: theme.color.ink }}>Costs</Text>
+          <Text style={{ fontSize: 14, color: theme.color.inkSecondary, marginTop: 3 }}>No caps — runs on your own subscriptions.</Text>
         </View>
 
-        {/* live expensive run pin */}
-        <View
-          style={{
-            marginHorizontal: 16,
-            marginBottom: 16,
-            flexDirection: 'row',
-            alignItems: 'center',
-            gap: 10,
-            paddingVertical: 12,
-            paddingHorizontal: 14,
-            borderRadius: 14,
-            backgroundColor: 'rgba(255,149,0,0.1)',
-            borderWidth: 0.5,
-            borderColor: 'rgba(255,149,0,0.3)',
-          }}
-        >
-          <Spinner color={theme.color.orange} size={16} />
-          <Text style={{ flex: 1, fontSize: 14, lineHeight: 17, fontWeight: '600', color: theme.color.ink }}>
-            Rendering · <Text style={{ fontFamily: theme.fontFamily.mono }}>$3.40</Text> and counting
-          </Text>
-          <Pressable hitSlop={8}>
-            <Text style={{ fontSize: 14, fontWeight: '600', color: theme.color.red }}>Cancel</Text>
-          </Pressable>
+        {/* this month hero */}
+        <View style={{ alignItems: 'center', paddingTop: 14, paddingBottom: 18 }}>
+          <Mono style={{ fontSize: 52, fontWeight: '700', letterSpacing: -1.2, color: theme.color.ink }}>{`$${c.thisMonth.toFixed(2)}`}</Mono>
+          <Text style={{ fontSize: 14, fontWeight: '500', color: theme.color.inkTertiary, marginTop: 4 }}>this month</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 12, paddingVertical: 6, paddingHorizontal: 12, borderRadius: 999, backgroundColor: theme.color.green + '24' }}>
+            <Icon name="check" size={12} color={theme.color.green} />
+            <Text style={{ fontSize: 12, fontWeight: '600', color: theme.color.green }}>No cap — subscription</Text>
+          </View>
         </View>
 
-        <HeroRing cap={cap} spent={spent} />
-
-        {/* today strip */}
-        <View
-          style={{
-            marginHorizontal: 16,
-            marginBottom: 20,
-            padding: 16,
-            borderRadius: 14,
-            backgroundColor: theme.color.bgElevated,
-            borderWidth: 0.5,
-            borderColor: theme.color.separator,
-          }}
-        >
+        {/* today + 14d spark */}
+        <View style={{ marginHorizontal: 16, marginBottom: 18, padding: 16, borderRadius: 14, backgroundColor: theme.color.bgElevated, borderWidth: 0.5, borderColor: theme.color.separator }}>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 12 }}>
             <Text style={{ fontSize: 13, fontWeight: '600', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkTertiary }}>Today</Text>
-            <Mono style={{ fontSize: 15, fontWeight: '700' }}>$6.40</Mono>
+            <Mono style={{ fontSize: 15, fontWeight: '700' }}>{`$${c.today.toFixed(2)}`}</Mono>
           </View>
-          <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 4, height: 44 }}>
-            {SPARK.map((v, i) => (
-              <View
-                key={i}
-                style={{
-                  flex: 1,
-                  height: `${(v / mx) * 100}%`,
-                  borderRadius: 2,
-                  backgroundColor: i === SPARK.length - 1 ? theme.color.blue : theme.color.blue + '59',
-                }}
-              />
+          <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 3, height: 44 }}>
+            {c.byDay.map((d, i) => (
+              <View key={i} style={{ flex: 1, height: `${Math.max(3, (d.total / maxDay) * 100)}%`, borderRadius: 2, backgroundColor: i === c.byDay.length - 1 ? theme.color.blue : theme.color.blue + '59' }} />
             ))}
           </View>
+          <Text style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 8 }}>{`by day · last 14d · ≈ $${c.projectedMonth.toFixed(0)} projected`}</Text>
         </View>
 
-        {/* per-project caps */}
-        <View style={{ paddingHorizontal: 16 }}>
-          <Text style={{ fontSize: 13, color: theme.color.inkSecondary, paddingHorizontal: 14, paddingBottom: 7, textTransform: 'uppercase', letterSpacing: 0.4 }}>
-            Per-project caps
-          </Text>
-          <View style={{ backgroundColor: theme.color.bgElevated, borderRadius: 12, overflow: 'hidden', borderWidth: StyleSheet.hairlineWidth, borderColor: theme.color.separator }}>
-            {caps.map((c, i) => {
-              const dotColor = projectColor(theme, c.color);
-              const pct = maxSpent > 0 ? Math.min(1, c.spent / maxSpent) : 0;
-              const last = i === caps.length - 1;
-              return (
-                <View
-                  key={c.projectId}
-                  style={{
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    gap: 12,
-                    minHeight: 48,
-                    paddingVertical: 10,
-                    paddingHorizontal: 16,
-                    borderBottomWidth: last ? 0 : StyleSheet.hairlineWidth,
-                    borderBottomColor: theme.color.separator,
-                  }}
-                >
-                  <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: dotColor }} />
-                  <View style={{ flex: 1, minWidth: 0 }}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 7 }}>
-                      <Text style={{ fontSize: 15, fontWeight: '500', color: theme.color.ink }}>{c.name}</Text>
-                    </View>
-                    <View style={{ height: 5, borderRadius: 3, backgroundColor: theme.color.fillSecondary, overflow: 'hidden' }}>
-                      <View style={{ width: `${pct * 100}%`, height: '100%', borderRadius: 3, backgroundColor: dotColor }} />
-                    </View>
-                  </View>
-                  <Mono style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkSecondary }}>
-                    {`$${c.spent.toFixed(2)}`}
-                  </Mono>
+        {/* by engine */}
+        {c.byEngine.length > 0 && (
+          <View style={{ paddingHorizontal: 16, marginBottom: 18 }}>
+            <Text style={{ fontSize: 13, color: theme.color.inkSecondary, paddingHorizontal: 14, paddingBottom: 7, textTransform: 'uppercase', letterSpacing: 0.4 }}>By engine</Text>
+            <View style={{ backgroundColor: theme.color.bgElevated, borderRadius: 12, overflow: 'hidden', borderWidth: StyleSheet.hairlineWidth, borderColor: theme.color.separator }}>
+              {c.byEngine.map((e, i) => (
+                <View key={e.engine} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, minHeight: 46, paddingVertical: 10, paddingHorizontal: 16, borderBottomWidth: i === c.byEngine.length - 1 ? 0 : StyleSheet.hairlineWidth, borderBottomColor: theme.color.separator }}>
+                  <Text style={{ flex: 1, fontSize: 15, fontWeight: '500', color: theme.color.ink }}>{ENGINE_NAME[e.engine] ?? e.engine}</Text>
+                  <Text style={{ fontSize: 13, color: theme.color.inkTertiary }}>{`${e.jobs} run${e.jobs !== 1 ? 's' : ''}`}</Text>
+                  <Mono style={{ fontSize: 14, fontWeight: '600' }}>{`$${e.total.toFixed(2)}`}</Mono>
                 </View>
-              );
-            })}
+              ))}
+            </View>
           </View>
-        </View>
+        )}
 
-        {/* savings */}
-        <View
-          style={{
-            marginHorizontal: 16,
-            marginVertical: 20,
-            padding: 16,
-            borderRadius: 14,
-            backgroundColor: theme.color.bgElevated,
-            borderWidth: 0.5,
-            borderColor: 'rgba(52,199,89,0.3)',
-            flexDirection: 'row',
-            alignItems: 'center',
-            gap: 12,
-          }}
-        >
-          <View style={{ width: 38, height: 38, borderRadius: 11, backgroundColor: theme.color.green, alignItems: 'center', justifyContent: 'center' }}>
-            <Icon name="dollar" size={18} color="#fff" />
+        {/* by project */}
+        {c.byProject.length > 0 && (
+          <View style={{ paddingHorizontal: 16, marginBottom: 18 }}>
+            <Text style={{ fontSize: 13, color: theme.color.inkSecondary, paddingHorizontal: 14, paddingBottom: 7, textTransform: 'uppercase', letterSpacing: 0.4 }}>By project</Text>
+            <View style={{ backgroundColor: theme.color.bgElevated, borderRadius: 12, overflow: 'hidden', borderWidth: StyleSheet.hairlineWidth, borderColor: theme.color.separator }}>
+              {c.byProject.map((p, i) => (
+                <View key={p.projectId} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, minHeight: 46, paddingVertical: 10, paddingHorizontal: 16, borderBottomWidth: i === c.byProject.length - 1 ? 0 : StyleSheet.hairlineWidth, borderBottomColor: theme.color.separator }}>
+                  <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: projectColor(theme, p.color) }} />
+                  <Text style={{ flex: 1, fontSize: 15, fontWeight: '500', color: theme.color.ink }}>{p.name}</Text>
+                  <Mono style={{ fontSize: 14, fontWeight: '600' }}>{`$${p.total.toFixed(2)}`}</Mono>
+                </View>
+              ))}
+            </View>
           </View>
-          <Text style={{ flex: 1, fontSize: 15, lineHeight: 21, fontWeight: '500', color: theme.color.ink }}>
-            Caching & batch saved{' '}
-            <Text style={{ fontWeight: '700', fontFamily: theme.fontFamily.mono, color: theme.color.green }}>$41.07</Text> this month
-          </Text>
-        </View>
+        )}
 
         {/* ledger */}
         <View style={{ paddingHorizontal: 16, marginBottom: 24 }}>
-          <Text style={{ fontSize: 13, color: theme.color.inkSecondary, paddingHorizontal: 14, paddingBottom: 7, textTransform: 'uppercase', letterSpacing: 0.4 }}>
-            Today's ledger
-          </Text>
+          <Text style={{ fontSize: 13, color: theme.color.inkSecondary, paddingHorizontal: 14, paddingBottom: 7, textTransform: 'uppercase', letterSpacing: 0.4 }}>Ledger</Text>
           <View style={{ backgroundColor: theme.color.bgElevated, borderRadius: 12, overflow: 'hidden', borderWidth: StyleSheet.hairlineWidth, borderColor: theme.color.separator }}>
-            {LEDGER.map((r, i) => {
-              const last = i === LEDGER.length - 1;
-              return (
-                <View
-                  key={i}
-                  style={{
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    gap: 12,
-                    minHeight: 48,
-                    paddingVertical: 10,
-                    paddingHorizontal: 16,
-                    borderBottomWidth: last ? 0 : StyleSheet.hairlineWidth,
-                    borderBottomColor: theme.color.separator,
-                  }}
-                >
-                  <Mono style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkTertiary, width: 44 }}>{r[0]}</Mono>
-                  <Text numberOfLines={1} style={{ flex: 1, fontSize: 14, lineHeight: 17, color: theme.color.ink }}>{r[1]}</Text>
-                  <Mono style={{ fontSize: 14, fontWeight: '600' }}>${r[2]}</Mono>
+            {ledger.length === 0 ? (
+              <View style={{ padding: 28, alignItems: 'center' }}>
+                <Text style={{ fontSize: 14, color: theme.color.inkTertiary }}>No runs yet.</Text>
+              </View>
+            ) : ledger.map((j, i) => (
+              <Pressable key={j.id} onPress={() => nav.navigate('JobTimeline', { id: j.id })} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, minHeight: 48, paddingVertical: 10, paddingHorizontal: 16, borderBottomWidth: i === ledger.length - 1 ? 0 : StyleSheet.hairlineWidth, borderBottomColor: theme.color.separator }}>
+                <Mono style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkTertiary, width: 44 }}>{clockOf(j.createdAt)}</Mono>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text numberOfLines={1} style={{ fontSize: 14, lineHeight: 17, color: theme.color.ink }}>{j.title}</Text>
+                  <Text numberOfLines={1} style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 1 }}>{projects[j.projectId]?.name ?? 'Project'} · {ENGINE_NAME[j.engine ?? 'claude'] ?? j.engine}</Text>
                 </View>
-              );
-            })}
+                <Mono style={{ fontSize: 14, fontWeight: '600' }}>{`$${j.cost.toFixed(2)}`}</Mono>
+              </Pressable>
+            ))}
           </View>
-          <Pressable hitSlop={8} style={{ paddingHorizontal: 14, paddingTop: 7 }}>
-            <Text style={{ fontSize: 13, color: theme.color.blue }}>View all on Mac →</Text>
-          </Pressable>
         </View>
       </ScrollView>
     </View>

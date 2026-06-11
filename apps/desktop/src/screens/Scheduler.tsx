@@ -702,7 +702,7 @@ export default function Scheduler() {
   const openEdit = (s: SchedEvent | SchedRow) => { setEditing(s); setSheetOpen(true); };
 
   return (
-    <AppShell active="scheduler" budget={{ spent: 38.20, cap: 200, animateKey: 0 }} onSearch={() => setPaletteOpen(true)}>
+    <AppShell active="scheduler" onSearch={() => setPaletteOpen(true)}>
       <style>{SCHEDULER_CSS}</style>
 
       <div style={{ height: '100%', display: 'flex', flexDirection: 'column', padding: '24px 28px 0' }}>

@@ -480,7 +480,6 @@ export default function MediaStudio() {
     <AppShell
       active="studio"
       onSearch={() => setPaletteOpen(true)}
-      budget={{ spent: 38.20, cap: 200, animateKey: 0 }}
     >
       <style>{styles}</style>
 

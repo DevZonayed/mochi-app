@@ -442,7 +442,7 @@ export default function AuditHistory() {
         <TrafficLights />
         <Sidebar active="" onNav={navTo} onWorkspace={() => {}} />
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, position: 'relative', zIndex: 1 }}>
-          <Toolbar theme={theme as Theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} budget={{ spent: 38.20, cap: 200, animateKey: 0 }} />
+          <Toolbar theme={theme as Theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} />
           <main style={{ flex: 1, overflowY: 'auto', padding: '24px 28px 36px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 22 }}>
               <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>History</h1>

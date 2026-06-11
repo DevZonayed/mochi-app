@@ -418,7 +418,6 @@ export default function McpGateway() {
     <AppShell
       active="skills"
       onSearch={() => setPaletteOpen(true)}
-      budget={{ spent: 38.20, cap: 200, animateKey: 0 }}
     >
       <style>{styles}</style>
 

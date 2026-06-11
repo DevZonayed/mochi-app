@@ -7,6 +7,7 @@ import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, MaestroMark } from './icons';
 import { NAV_ROUTES, ALL_NAV } from './routes';
+import { api } from './api';
 
 export const APP_W = 1320, APP_H = 860;
 
@@ -138,39 +139,42 @@ export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
   );
 }
 
-export interface BudgetChipProps {
-  spent: number;
-  cap: number;
-  animateKey?: React.Key;
-}
-
-export function BudgetChip({ spent, cap, animateKey }: BudgetChipProps) {
-  const pct = spent / cap;
-  const tone = pct >= 0.9 ? 'var(--red)' : pct >= 0.75 ? 'var(--orange)' : 'var(--ink)';
-  const bg = pct >= 0.9 ? 'rgba(255,59,48,0.12)' : pct >= 0.75 ? 'rgba(255,149,0,0.12)' : 'var(--fill-secondary)';
+/* Spend chip — no cap. Using a CLI subscription, there's nothing to cap; we
+   only ever show what's been spent this month. Self-fetches the live figure and
+   refreshes on job activity, so every screen shows the same real number. Clicking
+   opens the Costs view. */
+export function BudgetChip() {
+  const navigate = useNavigate();
+  const [month, setMonth] = React.useState<number | null>(null);
+  React.useEffect(() => {
+    let alive = true;
+    const refresh = () => { api.costs().then(c => { if (alive) setMonth(c.thisMonth); }).catch(() => {}); };
+    refresh();
+    const unsub = api.subscribe({ onJob: refresh });
+    return () => { alive = false; unsub(); };
+  }, []);
   return (
-    <div style={{
-      display: 'inline-flex', alignItems: 'center', gap: 8, height: 34, padding: '0 12px',
-      borderRadius: 'var(--r-pill)', background: bg, border: '0.5px solid var(--separator)',
+    <button onClick={() => navigate('/budget')} title="Costs this month" style={{
+      display: 'inline-flex', alignItems: 'center', gap: 8, height: 34, padding: '0 13px',
+      borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)', cursor: 'pointer',
     }}>
-      <span style={{ width: 7, height: 7, borderRadius: 4, background: tone === 'var(--ink)' ? 'var(--green)' : tone, flexShrink: 0 }} />
-      <span key={animateKey} className="count-up" style={{ font: '600 var(--fs-subhead)/1 var(--font-mono)', color: tone }}>
-        ${spent.toFixed(2)}
+      <span style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--green)', flexShrink: 0 }} />
+      <span className="count-up" style={{ font: '600 var(--fs-subhead)/1 var(--font-mono)', color: 'var(--ink)' }}>
+        {month === null ? '—' : `$${month.toFixed(2)}`}
       </span>
-      <span style={{ font: '500 var(--fs-subhead)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>/ ${cap}</span>
-    </div>
+      <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>this month</span>
+    </button>
   );
 }
 
 export interface ToolbarProps {
   onSearch?: () => void;
-  budget?: BudgetChipProps;
   theme: Theme;
   setTheme: React.Dispatch<React.SetStateAction<Theme>>;
   right?: React.ReactNode;
 }
 
-export function Toolbar({ onSearch, budget, theme, setTheme, right }: ToolbarProps) {
+export function Toolbar({ onSearch, theme, setTheme, right }: ToolbarProps) {
   return (
     <header className="win-drag" style={{
       height: 56, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 14, padding: '0 16px 0 18px',
@@ -194,7 +198,7 @@ export function Toolbar({ onSearch, budget, theme, setTheme, right }: ToolbarPro
 
       {right}
 
-      {budget && <BudgetChip {...budget} />}
+      <BudgetChip />
 
       <button className="tb-icon" aria-label="Notifications" style={{
         width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', position: 'relative',
@@ -219,7 +223,6 @@ export interface AppShellProps {
   children?: React.ReactNode;
   /** Toolbar props (all optional; theme is managed internally if omitted). */
   onSearch?: () => void;
-  budget?: BudgetChipProps;
   right?: React.ReactNode;
   /** Initial theme; the shell owns theme state and the appearance toggle. */
   initialTheme?: Theme;
@@ -231,7 +234,7 @@ export interface AppShellProps {
    Sidebar navigation is driven by the shared route registry (routes.ts) so the
    nav keys always resolve to real routes, and the active item is derived from
    the current location — this is the fix for the original dead-nav bug. */
-export function AppShell({ active, children, onSearch, budget, right, initialTheme = 'light', onWorkspace }: AppShellProps) {
+export function AppShell({ active, children, onSearch, right, initialTheme = 'light', onWorkspace }: AppShellProps) {
   const scale = useAppScale();
   const [theme, setTheme] = useTheme(initialTheme);
   const navigate = useNavigate();
@@ -251,7 +254,7 @@ export function AppShell({ active, children, onSearch, budget, right, initialThe
         <TrafficLights />
         <Sidebar active={active ?? routeKey} onNav={onNav} onWorkspace={onWorkspace} />
         <div style={{ flex: 1, minWidth: 0, height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', zIndex: 1 }}>
-          <Toolbar onSearch={onSearch} budget={budget} theme={theme} setTheme={setTheme} right={right} />
+          <Toolbar onSearch={onSearch} theme={theme} setTheme={setTheme} right={right} />
           <main style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
             {children}
           </main>

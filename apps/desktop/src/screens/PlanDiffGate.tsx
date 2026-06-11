@@ -602,7 +602,7 @@ export default function PlanDiffGate() {
   };
 
   return (
-    <AppShell active="approvals" onSearch={() => setPaletteOpen(true)} budget={{ spent: 38.20, cap: 200, animateKey: 0 }}>
+    <AppShell active="approvals" onSearch={() => setPaletteOpen(true)}>
       <style>{styles}</style>
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, height: '100%', position: 'relative', zIndex: 1 }}>
         {/* job header */}

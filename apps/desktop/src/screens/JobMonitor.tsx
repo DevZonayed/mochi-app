@@ -731,7 +731,7 @@ export default function JobMonitor() {
   };
 
   return (
-    <AppShell active="jobs" onSearch={() => setPaletteOpen(true)} budget={{ spent: 38.20, cap: 200, animateKey: 0 }}>
+    <AppShell active="jobs" onSearch={() => setPaletteOpen(true)}>
       <style>{styles}</style>
       <main style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', padding: '24px 28px 0', height: '100%' }}>
         {/* header row */}

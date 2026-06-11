@@ -919,7 +919,7 @@ export default function ProjectDetail() {
   const runningCount = jobs.filter(j => j.status === 'running').length;
 
   return (
-    <AppShell active="projects" onSearch={() => setPaletteOpen(true)} budget={{ spent: 22.90, cap: 50, animateKey: 0 }}>
+    <AppShell active="projects" onSearch={() => setPaletteOpen(true)}>
       <style>{PAGE_CSS}</style>
 
       {/* header block */}

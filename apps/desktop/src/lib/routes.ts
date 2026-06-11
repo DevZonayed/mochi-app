@@ -26,7 +26,7 @@ export const NAV_ROUTES: NavRoute[] = [
   { key: 'trends', path: '/trends', label: 'Trends', icon: 'telescope' },
   { key: 'studio', path: '/media-studio', label: 'Studio', icon: 'clapper' },
   { key: 'publishing', path: '/publishing', label: 'Publishing', icon: 'send' },
-  { key: 'budget', path: '/budget', label: 'Budget', icon: 'gauge' },
+  { key: 'budget', path: '/budget', label: 'Costs', icon: 'gauge' },
 ];
 
 export const SETTINGS_ROUTE: NavRoute = { key: 'settings', path: '/settings', label: 'Settings', icon: 'settings' };

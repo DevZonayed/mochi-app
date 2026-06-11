@@ -747,7 +747,7 @@ export default function SkillsRegistry() {
           <Sidebar active="skills" onNav={onNav} onWorkspace={() => {}} />
 
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, position: 'relative', zIndex: 1 }}>
-            <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} budget={{ spent: 38.20, cap: 200, animateKey: 0 }} />
+            <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} />
 
             {open ? (
               <SkillDetail s={open} onBack={() => setOpen(null)} onAdd={onToggleSkill} />

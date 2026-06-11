@@ -802,7 +802,7 @@ export default function SessionTranscript() {
   return (
     <>
       <style>{PAGE_CSS}</style>
-      <AppShell active="jobs" onSearch={() => setPaletteOpen(true)} budget={{ spent: 38.20, cap: 200, animateKey: 0 }}>
+      <AppShell active="jobs" onSearch={() => setPaletteOpen(true)}>
         <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           {/* job header */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 24px', borderBottom: '0.5px solid var(--separator)',

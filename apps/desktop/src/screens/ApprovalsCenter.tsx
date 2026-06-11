@@ -624,7 +624,7 @@ export default function ApprovalsCenter() {
         <TrafficLights />
         <Sidebar active="approvals" onNav={onNav} onWorkspace={() => {}} />
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, position: 'relative', zIndex: 1 }}>
-          <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} budget={{ spent: 38.20, cap: 200, animateKey: 0 }} />
+          <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} />
 
           <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
             <QueueList gates={gates} activeId={activeId} onPick={g => setActiveId(g.id)} />

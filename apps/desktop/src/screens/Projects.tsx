@@ -157,8 +157,6 @@ interface CardProps {
 
 function ProjectCard({ p, onMenu, onOpen }: CardProps) {
   const t = TEMPLATES[p.tpl];
-  const hc = health(p.spent, p.cap);
-  const pct = p.cap ? Math.min(100, (p.spent / p.cap) * 100) : 0;
   return (
     <div className="proj-card" onClick={() => onOpen && onOpen(p.id)} style={{
       position: 'relative', background: 'var(--bg-elevated)', borderRadius: 20, overflow: 'hidden',
@@ -166,13 +164,6 @@ function ProjectCard({ p, onMenu, onOpen }: CardProps) {
       display: 'flex', flexDirection: 'column',
     }}>
       <div style={{ height: 3, background: t.tint, flexShrink: 0 }} />
-      {p.paused && (
-        <div style={{ position: 'absolute', top: 14, right: 14, display: 'inline-flex', alignItems: 'center', gap: 5,
-          height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)', background: 'rgba(255,59,48,0.14)', color: 'var(--red)',
-          font: '600 var(--fs-caption)/1 var(--font-text)', zIndex: 2 }}>
-          <Icon name="pause" size={11} /> Paused — budget cap
-        </div>
-      )}
       <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 14, flex: 1 }}>
         {/* top row */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -194,14 +185,9 @@ function ProjectCard({ p, onMenu, onOpen }: CardProps) {
         {/* status */}
         <StatusLine p={p} />
 
-        {/* budget bar */}
-        <div>
-          <div style={{ height: 5, borderRadius: 3, background: 'var(--fill-secondary)', overflow: 'hidden' }}>
-            <div style={{ width: `${pct}%`, height: '100%', borderRadius: 3, background: hc }} />
-          </div>
-          <div style={{ marginTop: 7, font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>
-            <b style={{ color: 'var(--ink)', fontWeight: 600 }}>${p.spent.toFixed(2)}</b> / ${p.cap}
-          </div>
+        {/* spend so far — no cap (subscription) */}
+        <div style={{ font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>
+          {p.spent > 0 ? <><b style={{ color: 'var(--ink)', fontWeight: 600 }}>${p.spent.toFixed(2)}</b> spent</> : <span style={{ color: 'var(--ink-tertiary)' }}>No spend yet</span>}
         </div>
 
         {/* bottom row */}
@@ -239,8 +225,6 @@ interface RowProps {
 
 function ProjectRow({ p, onMenu, onOpen, last }: RowProps) {
   const t = TEMPLATES[p.tpl];
-  const hc = health(p.spent, p.cap);
-  const pct = p.cap ? Math.min(100, (p.spent / p.cap) * 100) : 0;
   return (
     <div className="proj-row" onClick={() => onOpen && onOpen(p.id)} style={{
       display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.4fr 0.8fr 1fr 36px', alignItems: 'center', gap: 14,
@@ -258,12 +242,9 @@ function ProjectRow({ p, onMenu, onOpen, last }: RowProps) {
       </div>
       <div><StatusLine p={p} /></div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <div style={{ flex: 1, height: 5, borderRadius: 3, background: 'var(--fill-secondary)', overflow: 'hidden', maxWidth: 90 }}>
-          <div style={{ width: `${pct}%`, height: '100%', borderRadius: 3, background: hc }} />
-        </div>
-        <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>${p.spent.toFixed(2)}/${p.cap}</span>
+        <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>{p.spent > 0 ? `$${p.spent.toFixed(2)}` : '—'}</span>
       </div>
-      <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{p.subs} sub</span>
+      <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{p.path ? (p.repoUrl ? 'repo' : 'folder') : '—'}</span>
       <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{p.next === '—' ? p.activity : `Next ${p.next}`}</span>
       <button className="proj-menu" onClick={e => { e.stopPropagation(); onMenu(p.id); }} style={{
         width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}>
@@ -315,7 +296,7 @@ interface ListTableProps {
 function ListTable({ projects, onMenu, onOpen }: ListTableProps) {
   const [sort, setSort] = React.useState<string>('activity');
   const sorted = [...projects].sort((a, b) => sort === 'spend' ? b.spent - a.spent : 0);
-  const cols: [string, string | null][] = [['Project', null], ['Status', null], ['Budget', 'spend'], ['Subs', null], ['Schedule', 'activity'], ['', null]];
+  const cols: [string, string | null][] = [['Project', null], ['Status', null], ['Spend', 'spend'], ['Source', null], ['Schedule', 'activity'], ['', null]];
   return (
     <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden',
       backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
@@ -794,7 +775,7 @@ export default function Projects() {
   return (
     <>
       <style>{PAGE_CSS}</style>
-      <AppShell active="projects" onSearch={() => setPaletteOpen(true)} budget={{ spent: budget.spent, cap: budget.cap, animateKey: budget.spent }}>
+      <AppShell active="projects" onSearch={() => setPaletteOpen(true)}>
         <div style={{ padding: '26px 28px 32px' }}>
           {/* header */}
           <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginBottom: 22, gap: 16 }}>

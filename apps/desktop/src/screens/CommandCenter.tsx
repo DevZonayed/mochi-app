@@ -157,7 +157,7 @@ function NeedsYouStrip({ gates, onApprove, projects }: { gates: Gate[]; onApprov
               <button onClick={() => onApprove(g.id)} style={{
                 flex: 1, height: 32, borderRadius: 8, background: 'var(--blue)', color: '#fff',
                 font: '600 var(--fs-footnote)/1 var(--font-text)',
-              }} className="gate-approve">{g.type === 'budget' ? 'Raise cap' : 'Approve'}</button>
+              }} className="gate-approve">Approve</button>
               <button style={{
                 flex: 1, height: 32, borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink)',
                 font: '600 var(--fs-footnote)/1 var(--font-text)',
@@ -507,9 +507,6 @@ export default function CommandCenter() {
     [data, projects],
   );
 
-  const spent = data?.budget.spent ?? 0;
-  const cap = data?.budget.cap ?? 0;
-
   // streaming ticker
   React.useEffect(() => { const t = setInterval(() => setTick(x => x + 1), 2200); return () => clearInterval(t); }, []);
 
@@ -546,7 +543,6 @@ export default function CommandCenter() {
     <AppShell
       active="home"
       onSearch={() => setPaletteOpen(true)}
-      budget={{ spent, cap, animateKey: spent }}
     >
       <style>{styles}</style>
 

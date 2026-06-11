@@ -397,7 +397,7 @@ export default function CommsGateway() {
   }, []);
 
   return (
-    <AppShell active="" budget={{ spent: 38.20, cap: 200, animateKey: 0 }} onSearch={() => setPaletteOpen(true)}>
+    <AppShell active="" onSearch={() => setPaletteOpen(true)}>
       <style>{COMMS_CSS}</style>
 
       <div style={{ padding: '24px 28px 36px' }}>
