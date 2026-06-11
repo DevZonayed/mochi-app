@@ -358,7 +358,7 @@ export const api = {
 
   // Coding agent: clone a repo / open a folder / inspect git (desktop owns git)
   gitAvailable: () => call<{ available: boolean }>('gitAvailable', {}, () => Promise.resolve({ available: false })),
-  cloneRepo: (input: { url: string; name?: string; dirName?: string; instructions?: string; color?: string }) =>
+  cloneRepo: (input: { url: string; dest: string; name?: string; dirName?: string; instructions?: string; color?: string }) =>
     call<Project>('cloneRepo', { ...input }, () =>
       req<Project>('/api/projects/clone', { method: 'POST', body: JSON.stringify(input) })),
   getProjectRepo: (id: string) =>

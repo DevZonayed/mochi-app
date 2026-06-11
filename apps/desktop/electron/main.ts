@@ -17,6 +17,13 @@ const RENDERER_DIST = path.join(__dirname, '../dist');
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
 const RELAY_URL = process.env['MAESTRO_RELAY_URL'] || 'wss://api.nexalance.cloud/ws';
 
+// The preload is emitted as either preload.mjs or preload.js depending on the
+// build; load whichever actually exists. If this resolves wrong, window.maestro
+// never loads → the renderer falls back to the relay (the "Unauthorized" bug).
+const PRELOAD = ['preload.mjs', 'preload.js']
+  .map((f) => path.join(__dirname, f))
+  .find((p) => existsSync(p)) ?? path.join(__dirname, 'preload.mjs');
+
 let win: BrowserWindow | null = null;
 
 function createWindow() {
@@ -29,7 +36,7 @@ function createWindow() {
     trafficLightPosition: { x: 16, y: 18 },
     backgroundColor: '#e7e9f3',
     webPreferences: {
-      preload: path.join(__dirname, 'preload.mjs'),
+      preload: PRELOAD,
       contextIsolation: true,
     },
   });

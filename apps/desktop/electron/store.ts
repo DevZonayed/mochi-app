@@ -307,10 +307,19 @@ export class Store {
   // ── Projects ────────────────────────────────────────────────────────
   listProjects(): Project[] { return [...this.data.projects].sort((a, b) => a.createdAt - b.createdAt); }
   getProject(projectId: string): Project | undefined { return this.data.projects.find(p => p.id === projectId); }
+  /** A project name that doesn't collide: "Repo", then "Repo v1", "Repo v2"… */
+  uniqueProjectName(base: string): string {
+    const wanted = (base || 'Project').trim() || 'Project';
+    const taken = new Set(this.data.projects.map(p => p.name));
+    if (!taken.has(wanted)) return wanted;
+    let n = 1;
+    while (taken.has(`${wanted} v${n}`)) n++;
+    return `${wanted} v${n}`;
+  }
   createProject(args: { name: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }): Project {
     const ws = this.data.workspace ?? this.createWorkspace('My Workspace');
     const p: Project = {
-      id: id(), workspaceId: ws.id, name: args.name,
+      id: id(), workspaceId: ws.id, name: this.uniqueProjectName(args.name),
       template: args.template ?? 'claude-code', instructions: args.instructions ?? '', color: args.color ?? 'blue',
       kind: args.kind, path: args.path, repoUrl: args.repoUrl,
       createdAt: now(),

@@ -399,25 +399,31 @@ const TYPE_ITEMS: GalleryItem[] = [
   { key: 'custom',   label: 'Custom',   icon: 'sliders',   tint: 'var(--ink-secondary)', blurb: 'Start blank. Bring your own goal, tools, and schedule.' },
 ];
 
-type CodeSource = 'blank' | 'folder' | 'clone';
+type CodeSource = 'folder' | 'clone';
 
-/* Two-step New-project sheet. Step 1 picks the type; step 2 names it and, for
-   Code projects, picks a source: blank, an existing local folder (native
-   picker), or a GitHub clone (streams progress). Creation happens here. */
+const baseNameOf = (p: string): string => p.split('/').filter(Boolean).pop() ?? '';
+const repoNameOf = (url: string): string => url.trim().replace(/\/+$/, '').replace(/\.git$/i, '').split(/[/:]/).pop() ?? '';
+
+/* Two-step New-project sheet. Step 1 picks the type. For Code projects, step 2
+   has no "blank": you either Open an existing folder (that folder IS the project,
+   named from its folder name) or Clone a repo into a destination you choose
+   (named from the repo). Names auto-fill and de-dupe to "name v1" on collision. */
 function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: boolean; onClose: () => void; onCreated: (projectId: string) => void; suggestedName?: string }) {
   const [step, setStep] = React.useState<1 | 2>(1);
   const [type, setType] = React.useState('code');
   const [name, setName] = React.useState('');
-  const [source, setSource] = React.useState<CodeSource>('blank');
+  const [nameEdited, setNameEdited] = React.useState(false);
+  const [source, setSource] = React.useState<CodeSource>('folder');
   const [repoUrl, setRepoUrl] = React.useState('');
   const [picked, setPicked] = React.useState<FolderInspect | null>(null);
   const [pickedPath, setPickedPath] = React.useState('');
+  const [destPath, setDestPath] = React.useState('');
   const [cloneLines, setCloneLines] = React.useState<string[]>([]);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState('');
 
   React.useEffect(() => {
-    if (open) { setStep(1); setType('code'); setName(suggestedName ?? ''); setSource('blank'); setRepoUrl(''); setPicked(null); setPickedPath(''); setCloneLines([]); setBusy(false); setError(''); }
+    if (open) { setStep(1); setType('code'); setName(suggestedName ?? ''); setNameEdited(!!suggestedName); setSource('folder'); setRepoUrl(''); setPicked(null); setPickedPath(''); setDestPath(''); setCloneLines([]); setBusy(false); setError(''); }
   }, [open, suggestedName]);
 
   // Stream clone progress lines while a clone is in flight.
@@ -436,37 +442,59 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
   const meta = TYPE_ITEMS.find(t => t.key === type) ?? TYPE_ITEMS[0];
   const isCode = type === 'code';
 
+  const editName = (v: string) => { setName(v); setNameEdited(true); };
+  const autoName = (v: string) => { if (!nameEdited) setName(v); };
+
+  // Open folder → the folder IS the project; name it from the folder.
   const chooseFolder = async () => {
     setError('');
     try {
       const res = await api.pickFolder();
       if (!res) return; // cancelled
       if (!res.ok) { setError(res.error ?? 'Could not open that folder.'); return; }
-      setPicked(res);
-      setPickedPath(res.path);
+      setPicked(res); setPickedPath(res.path);
+      autoName(baseNameOf(res.path));
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not open folder.');
     }
   };
 
+  // Clone → choose the destination folder the repo is cloned into.
+  const chooseDest = async () => {
+    setError('');
+    try {
+      const res = await api.pickFolder();
+      if (!res) return;
+      if (!res.ok) { setError(res.error ?? 'Could not open that folder.'); return; }
+      setDestPath(res.path);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not open folder.');
+    }
+  };
+
+  const onUrl = (v: string) => { setRepoUrl(v); autoName(repoNameOf(v)); };
+
   const create = async () => {
     setError('');
-    const finalName = name.trim() || `${meta.label} Project`;
     setBusy(true);
     try {
       if (isCode && source === 'clone') {
         const url = repoUrl.trim();
         if (!url) { setError('Enter a GitHub URL.'); setBusy(false); return; }
+        if (!destPath) { setError('Choose a destination folder for the clone.'); setBusy(false); return; }
         setCloneLines(['Cloning…']);
-        const proj = await api.cloneRepo({ url, name: name.trim() || undefined });
+        const proj = await api.cloneRepo({ url, dest: destPath, name: name.trim() || undefined });
         onCreated(proj.id);
         return;
       }
-      const path = isCode && source === 'folder' ? pickedPath : undefined;
-      if (isCode && source === 'folder' && !path) { setError('Choose a folder first.'); setBusy(false); return; }
-      const proj = await api.createProject({
-        name: finalName, template: type, kind: KIND_BY_TYPE[type] ?? 'general', path,
-      });
+      if (isCode) {
+        if (!pickedPath) { setError('Choose a folder to open.'); setBusy(false); return; }
+        const proj = await api.createProject({ name: name.trim() || baseNameOf(pickedPath), template: 'code', kind: 'coding', path: pickedPath });
+        onCreated(proj.id);
+        return;
+      }
+      // Non-code types have no folder — a named project to bring your own goal to.
+      const proj = await api.createProject({ name: name.trim() || `${meta.label} Project`, template: type, kind: KIND_BY_TYPE[type] ?? 'general' });
       onCreated(proj.id);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not create the project.');
@@ -474,7 +502,11 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
     }
   };
 
-  const canCreate = !busy && (!isCode || source !== 'clone' || repoUrl.trim().length > 0) && (!isCode || source !== 'folder' || !!pickedPath);
+  const canCreate = !busy && (
+    !isCode
+      ? true
+      : source === 'clone' ? (repoUrl.trim().length > 0 && !!destPath) : !!pickedPath
+  );
 
   return (
     <div onMouseDown={busy ? undefined : onClose} style={{
@@ -529,40 +561,41 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
           </div>
         ) : (
           <div style={{ padding: 20, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
-            <label style={{ display: 'block' }}>
-              <span style={{ display: 'block', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 7 }}>Project name</span>
-              <input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder={`${meta.label} Project`}
-                style={{ width: '100%', height: 42, padding: '0 13px', borderRadius: 11, boxSizing: 'border-box',
-                  border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-body)/1 var(--font-text)' }} />
-            </label>
-
-            {isCode && (
+            {isCode && !IS_LOCAL ? (
+              <div style={{ padding: '16px 18px', borderRadius: 12, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', font: '400 var(--fs-body)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                Coding projects open a folder or clone a repo on your Mac — create them in the <b style={{ color: 'var(--ink)' }}>Maestro desktop app</b>. (This is a remote view.)
+              </div>
+            ) : (
+            <>
+            {isCode ? (
               <div>
                 <span style={{ display: 'block', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 7 }}>Source</span>
                 <div style={{ display: 'flex', gap: 8 }}>
-                  {([['blank', 'plus', 'Blank'], ['folder', 'folder', 'Open folder'], ['clone', 'gitMerge', 'Clone GitHub']] as [CodeSource, IconName, string][]).map(([k, icon, label]) => {
+                  {([['folder', 'folder', 'Open folder', 'Use a folder already on your Mac'], ['clone', 'gitMerge', 'Clone from GitHub', 'Clone a repo into a folder you pick']] as [CodeSource, IconName, string, string][]).map(([k, icon, label, blurb]) => {
                     const on = source === k;
-                    const disabled = (k === 'folder') && !IS_LOCAL;
                     return (
-                      <button key={k} disabled={disabled} onClick={() => { setSource(k); setError(''); }} title={disabled ? 'Open the desktop app to pick a folder' : ''} style={{
-                        flex: 1, display: 'inline-flex', flexDirection: 'column', alignItems: 'center', gap: 6, padding: '13px 8px', borderRadius: 12,
+                      <button key={k} onClick={() => { setSource(k); setError(''); }} style={{
+                        flex: 1, display: 'flex', alignItems: 'flex-start', gap: 10, padding: '13px 14px', borderRadius: 12, textAlign: 'left',
                         background: on ? 'color-mix(in srgb, var(--blue) 10%, var(--bg-elevated))' : 'var(--fill-tertiary)',
-                        border: `1.5px solid ${on ? 'var(--blue)' : 'transparent'}`, opacity: disabled ? 0.4 : 1, cursor: disabled ? 'not-allowed' : 'pointer',
-                        font: '600 var(--fs-footnote)/1 var(--font-text)', color: on ? 'var(--blue)' : 'var(--ink)' }}>
-                        <Icon name={icon} size={19} /> {label}
+                        border: `1.5px solid ${on ? 'var(--blue)' : 'transparent'}`, cursor: 'pointer' }}>
+                        <Icon name={icon} size={20} style={{ color: on ? 'var(--blue)' : 'var(--ink-secondary)', flexShrink: 0, marginTop: 1 }} />
+                        <span style={{ minWidth: 0 }}>
+                          <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: on ? 'var(--blue)' : 'var(--ink)' }}>{label}</span>
+                          <span style={{ display: 'block', font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 3 }}>{blurb}</span>
+                        </span>
                       </button>
                     );
                   })}
                 </div>
 
                 {source === 'folder' && (
-                  <div style={{ marginTop: 12 }}>
-                    <button onClick={chooseFolder} style={{ height: 38, padding: '0 14px', borderRadius: 10, background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', display: 'inline-flex', alignItems: 'center', gap: 7 }}>
-                      <Icon name="folder" size={15} /> {pickedPath ? 'Change folder…' : 'Choose folder…'}
+                  <div style={{ marginTop: 14 }}>
+                    <button onClick={chooseFolder} className="primary-cta" style={{ height: 42, padding: '0 16px', borderRadius: 11, background: pickedPath ? 'var(--fill-secondary)' : 'var(--blue)', color: pickedPath ? 'var(--ink)' : '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                      <Icon name="folder" size={16} /> {pickedPath ? 'Change folder…' : 'Choose a folder…'}
                     </button>
                     {pickedPath && (
-                      <div style={{ marginTop: 9, display: 'flex', alignItems: 'center', gap: 8, font: '500 var(--fs-footnote)/1.3 var(--font-mono)', color: 'var(--ink-secondary)' }}>
-                        <Icon name="check" size={13} stroke={2.6} style={{ color: 'var(--green)' }} />
+                      <div style={{ marginTop: 11, display: 'flex', alignItems: 'center', gap: 8, font: '500 var(--fs-footnote)/1.3 var(--font-mono)', color: 'var(--ink-secondary)' }}>
+                        <Icon name="check" size={14} stroke={2.6} style={{ color: 'var(--green)' }} />
                         {shortPath(pickedPath)}
                         {picked?.info?.isRepo && <span style={{ color: 'var(--ink-tertiary)' }}>· git{picked.info.branch ? ` (${picked.info.branch})` : ''}</span>}
                       </div>
@@ -571,31 +604,48 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
                 )}
 
                 {source === 'clone' && (
-                  <div style={{ marginTop: 12 }}>
-                    <input value={repoUrl} onChange={e => setRepoUrl(e.target.value)} placeholder="https://github.com/owner/repo"
-                      style={{ width: '100%', height: 40, padding: '0 13px', borderRadius: 10, boxSizing: 'border-box',
-                        border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-mono)' }} />
+                  <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 11 }}>
+                    <div>
+                      <span style={{ display: 'block', font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', letterSpacing: '0.03em', textTransform: 'uppercase', marginBottom: 6 }}>Repository URL</span>
+                      <input value={repoUrl} onChange={e => onUrl(e.target.value)} placeholder="https://github.com/owner/repo"
+                        style={{ width: '100%', height: 40, padding: '0 13px', borderRadius: 10, boxSizing: 'border-box', border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-mono)' }} />
+                    </div>
+                    <div>
+                      <span style={{ display: 'block', font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', letterSpacing: '0.03em', textTransform: 'uppercase', marginBottom: 6 }}>Destination · required</span>
+                      <button onClick={chooseDest} style={{ height: 40, padding: '0 14px', borderRadius: 10, background: destPath ? 'var(--fill-secondary)' : 'color-mix(in srgb, var(--blue) 12%, var(--bg-elevated))', color: destPath ? 'var(--ink)' : 'var(--blue)', border: destPath ? 'none' : '1px solid var(--blue)', font: '600 var(--fs-footnote)/1 var(--font-text)', display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+                        <Icon name="folder" size={15} /> {destPath ? 'Change destination…' : 'Choose destination…'}
+                      </button>
+                      {destPath && <div style={{ marginTop: 8, font: '500 var(--fs-caption)/1.3 var(--font-mono)', color: 'var(--ink-secondary)' }}>Clones into {shortPath(destPath)}/{repoNameOf(repoUrl) || '<repo>'}</div>}
+                    </div>
                     {(busy || cloneLines.length > 0) && (
-                      <div style={{ marginTop: 10, maxHeight: 120, overflowY: 'auto', padding: '10px 12px', borderRadius: 10, background: 'var(--bg)', border: '0.5px solid var(--separator)',
-                        font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'pre-wrap' }}>
+                      <div style={{ maxHeight: 120, overflowY: 'auto', padding: '10px 12px', borderRadius: 10, background: 'var(--bg)', border: '0.5px solid var(--separator)', font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'pre-wrap' }}>
                         {cloneLines.length ? cloneLines.join('\n') : 'Cloning…'}
                       </div>
                     )}
-                    <p style={{ margin: '9px 0 0', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                    <p style={{ margin: 0, font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>
                       Public repos clone directly. For private repos, authenticate git on this Mac first (e.g. <code>gh auth login</code>).
                     </p>
                   </div>
                 )}
               </div>
-            )}
+            ) : null}
+
+            <label style={{ display: 'block' }}>
+              <span style={{ display: 'block', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 7 }}>Project name{isCode ? ' · auto-filled, editable' : ''}</span>
+              <input value={name} onChange={e => editName(e.target.value)} placeholder={isCode ? (source === 'clone' ? 'from the repo name' : 'from the folder name') : `${meta.label} Project`}
+                style={{ width: '100%', height: 42, padding: '0 13px', borderRadius: 11, boxSizing: 'border-box',
+                  border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-body)/1 var(--font-text)' }} />
+            </label>
 
             {error && <div style={{ padding: '10px 12px', borderRadius: 10, background: 'rgba(255,59,48,0.1)', color: 'var(--red)', font: '500 var(--fs-footnote)/1.4 var(--font-text)' }}>{error}</div>}
+            </>
+            )}
           </div>
         )}
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '14px 20px', borderTop: '0.5px solid var(--separator)' }}>
           <span style={{ flex: 1, font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-            {step === 2 && isCode && source === 'clone' ? 'Clones into ~/Maestro/<repo>.' : 'You can change instructions and engine after creating.'}
+            {step === 2 && isCode && source === 'folder' ? 'The folder you pick is the project — jobs run inside it.' : step === 2 && isCode ? 'Names that already exist become “name v1”, “name v2”…' : 'You can change instructions and engine after creating.'}
           </span>
           {step === 2 && <button onClick={() => setStep(1)} disabled={busy} style={{ height: 40, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)', opacity: busy ? 0.5 : 1 }}>Back</button>}
           {step === 1

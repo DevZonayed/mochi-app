@@ -52,22 +52,21 @@ export function dirNameFromUrl(url: string): string {
   return safe || 'repo';
 }
 
-/** A folder under ~/Maestro that doesn't collide (repo, repo-2, repo-3…). */
-function uniqueDir(base: string): string {
-  const root = path.join(homedir(), 'Maestro');
-  mkdirSync(root, { recursive: true });
-  let candidate = path.join(root, base);
+/** A folder inside `parent` that doesn't collide (repo, repo-2, repo-3…). */
+function uniqueDirIn(parent: string, base: string): string {
+  mkdirSync(parent, { recursive: true });
+  let candidate = path.join(parent, base);
   let n = 2;
-  while (existsSync(candidate)) { candidate = path.join(root, `${base}-${n}`); n++; }
+  while (existsSync(candidate)) { candidate = path.join(parent, `${base}-${n}`); n++; }
   return candidate;
 }
 
-export interface CloneResult { dir: string; branch: string | null; remote: string }
+export interface CloneResult { dir: string; branch: string | null; remote: string; name: string }
 
-/** Clone `url` into ~/Maestro/<name>. Streams progress lines via onProgress.
-    Rejects with an actionable Error (statusCode set) and cleans up partials. */
+/** Clone `url` into <dest>/<repo-name> (dest defaults to ~/Maestro). Streams
+    progress via onProgress. Rejects with an actionable Error + cleans up partials. */
 export function cloneRepo(
-  args: { url: string; dirName?: string },
+  args: { url: string; dirName?: string; dest?: string },
   onProgress?: (line: string) => void,
 ): Promise<CloneResult> {
   const git = resolveGit();
@@ -77,7 +76,9 @@ export function cloneRepo(
   if (!/^(https?:\/\/|git@|ssh:\/\/)/.test(url)) {
     return Promise.reject(Object.assign(new Error('Enter a valid git URL (https://… or git@…).'), { statusCode: 400 }));
   }
-  const dir = uniqueDir((args.dirName && args.dirName.trim()) || dirNameFromUrl(url));
+  const repoName = (args.dirName && args.dirName.trim()) || dirNameFromUrl(url);
+  const parent = args.dest && existsSync(args.dest) ? args.dest : path.join(homedir(), 'Maestro');
+  const dir = uniqueDirIn(parent, repoName);
 
   return new Promise<CloneResult>((resolve, reject) => {
     const child = spawn(git, ['clone', '--progress', '--depth', '1', url, dir], {
@@ -102,7 +103,7 @@ export function cloneRepo(
       clearTimeout(killer);
       if (code === 0) {
         const info = repoInfo(dir);
-        resolve({ dir, branch: info.branch, remote: info.remote ?? url });
+        resolve({ dir, branch: info.branch, remote: info.remote ?? url, name: repoName });
         return;
       }
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }

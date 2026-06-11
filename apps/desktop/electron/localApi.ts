@@ -107,13 +107,15 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'cloneRepo': {
         const url = String(p.url ?? '').trim();
         if (!url) bad('url required');
+        const dest = (typeof p.dest === 'string' && p.dest.trim()) ? p.dest.trim() : undefined;
+        if (!dest) bad('a destination folder is required');
         const name = (typeof p.name === 'string' && p.name.trim()) ? p.name.trim() : undefined;
         emit('clone', { phase: 'start', url });
         try {
-          const result = await cloneRepo({ url, dirName: typeof p.dirName === 'string' ? p.dirName : undefined },
+          const result = await cloneRepo({ url, dest, dirName: typeof p.dirName === 'string' ? p.dirName : undefined },
             (line) => emit('clone', { phase: 'progress', line }));
           const proj = store.createProject({
-            name: name ?? url.split(/[/:]/).pop()?.replace(/\.git$/i, '') ?? 'Repo',
+            name: name ?? result.name,
             template: 'claude-code', kind: 'coding', path: result.dir, repoUrl: result.remote,
             instructions: typeof p.instructions === 'string' ? p.instructions : '',
             color: typeof p.color === 'string' ? p.color : 'blue',
