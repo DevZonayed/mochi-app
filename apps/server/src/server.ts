@@ -1,226 +1,241 @@
-import Fastify, { type FastifyInstance } from 'fastify';
-import cors from '@fastify/cors';
-import type { ServerResponse } from 'node:http';
-import type { Repositories, Effort, ApprovalStatus } from './repositories.js';
-import type { EngineAdapter } from './engine.js';
-import { AnthropicEngine, OpenAIEngine } from './engine.js';
-import { validateProviderKey, isProviderId } from './providers.js';
+/* maestro-relay — the server owns NOTHING and computes NOTHING.
 
-export function buildServer(repos: Repositories, engine: EngineAdapter): FastifyInstance {
+   Its only job is to connect the operator's devices:
+   - The Mac (desktop app) dials in over WebSocket as the HOST, pushes state
+     snapshots, and executes every command locally.
+   - Phones / web remotes keep using the same REST surface as before: GETs are
+     served from the host's last pushed snapshot; POSTs are forwarded to the
+     Mac over the socket and answered with the Mac's result.
+   - SSE relays the host's live events to web clients.
+   No database, no engine, no credentials — if the Mac is offline, commands
+   return 503 and reads serve the last mirrored snapshot. */
+
+import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
+import cors from '@fastify/cors';
+import websocket from '@fastify/websocket';
+import { randomUUID } from 'node:crypto';
+import type { ServerResponse } from 'node:http';
+import type { WebSocket } from 'ws';
+
+interface Snapshot {
+  workspace?: unknown;
+  workspaces?: unknown[];
+  projects?: { id?: string }[];
+  jobs?: { id?: string; projectId?: string }[];
+  approvals?: { id?: string; status?: string }[];
+  schedules?: unknown[];
+  skills?: unknown[];
+  templates?: unknown[];
+  budget?: unknown;
+  dashboard?: unknown;
+  providers?: unknown[];
+  at?: number;
+}
+
+interface Pending {
+  resolve: (v: unknown) => void;
+  reject: (e: Error & { statusCode?: number }) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface Deck {
+  deckId: string;
+  secret: string;
+  ws: WebSocket | null;
+  online: boolean;
+  lastSeen: number;
+  state: Snapshot | null;
+  pending: Map<string, Pending>;
+}
+
+const EMPTY_DASHBOARD = {
+  workspace: null, greetingProjects: [], gates: [], activeJobs: [], recentlyCompleted: [], schedule: [],
+  budget: { cap: 200, spent: 0, byProject: [] },
+};
+
+const CMD_TIMEOUT_MS = 10 * 60 * 1000; // jobs run real models on the Mac — be generous
+
+export function buildServer(): FastifyInstance {
   const app = Fastify({ logger: true });
   app.register(cors, { origin: true });
 
-  // Tolerate empty JSON bodies on bodyless POSTs (approve/deny/toggle) instead of
-  // returning FST_ERR_CTP_EMPTY_JSON_BODY when a client sends content-type: application/json.
+  // Tolerate empty JSON bodies on bodyless POSTs (approve/deny/toggle).
   app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
     const s = typeof body === 'string' ? body : '';
     if (s.trim() === '') { done(null, undefined); return; }
     try { done(null, JSON.parse(s)); } catch (err) { done(err instanceof Error ? err : new Error('invalid json'), undefined); }
   });
 
-  // ── Server-Sent Events: live job updates ──────────────────────────
-  const clients = new Set<ServerResponse>();
-  function broadcast(event: string, data: unknown) {
+  app.register(websocket);
+
+  // Single-operator product: one deck (the most recent Mac to register).
+  let deck: Deck | null = null;
+
+  // ── SSE fan-out to web clients ─────────────────────────────────────
+  const sseClients = new Set<ServerResponse>();
+  function sseSend(event: string, data: unknown) {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    for (const res of clients) {
-      try {
-        res.write(payload);
-      } catch {
-        clients.delete(res);
-      }
+    for (const res of sseClients) {
+      try { res.write(payload); } catch { sseClients.delete(res); }
     }
   }
 
-  app.get('/health', async () => ({ ok: true, name: 'maestro-server', version: '0.2.0', engine: engine.id, time: Date.now() }));
+  // ── Forward a command to the Mac and await its result ─────────────
+  function cmd<T = unknown>(method: string, params: Record<string, unknown>): Promise<T> {
+    if (!deck || !deck.online || !deck.ws) {
+      return Promise.reject(Object.assign(new Error('Your Mac is offline — open the Maestro desktop app'), { statusCode: 503 }));
+    }
+    const id = randomUUID();
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        deck?.pending.delete(id);
+        reject(Object.assign(new Error('Your Mac did not respond in time'), { statusCode: 504 }));
+      }, CMD_TIMEOUT_MS);
+      deck!.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+      try {
+        deck!.ws!.send(JSON.stringify({ type: 'cmd', id, method, params }));
+      } catch {
+        clearTimeout(timer);
+        deck!.pending.delete(id);
+        reject(Object.assign(new Error('Relay write failed'), { statusCode: 502 }));
+      }
+    });
+  }
+
+  async function forward(reply: FastifyReply, method: string, params: Record<string, unknown>) {
+    try {
+      return await cmd(method, params);
+    } catch (e) {
+      const err = e as Error & { statusCode?: number };
+      return reply.code(err.statusCode ?? 500).send({ error: err.message });
+    }
+  }
+
+  // ── WebSocket: the Mac registers here as host ──────────────────────
+  app.register(async (scope) => {
+    scope.get('/ws', { websocket: true }, (conn: unknown) => {
+      const ws = ((conn as { socket?: WebSocket }).socket ?? conn) as WebSocket;
+      let isHost = false;
+
+      ws.on('message', (buf: Buffer | string) => {
+        let m: { type?: string; role?: string; deckId?: string; secret?: string; state?: Snapshot; name?: string; data?: unknown; id?: string; ok?: boolean; result?: unknown; error?: string; statusCode?: number };
+        try { m = JSON.parse(String(buf)) as typeof m; } catch { return; }
+
+        if (m.type === 'hello' && m.role === 'host' && m.deckId) {
+          if (deck && deck.deckId === m.deckId && deck.secret && m.secret !== deck.secret) {
+            ws.send(JSON.stringify({ type: 'denied', reason: 'bad secret' }));
+            ws.close();
+            return;
+          }
+          if (!deck || deck.deckId !== m.deckId) {
+            deck = { deckId: m.deckId, secret: m.secret ?? '', ws, online: true, lastSeen: Date.now(), state: deck?.state ?? null, pending: new Map() };
+          } else {
+            deck.ws = ws; deck.online = true; deck.lastSeen = Date.now();
+          }
+          isHost = true;
+          ws.send(JSON.stringify({ type: 'hello-ok' }));
+          sseSend('host', { online: true });
+          return;
+        }
+        if (!isHost || !deck) return;
+
+        if (m.type === 'state' && m.state) {
+          deck.state = m.state;
+          deck.lastSeen = Date.now();
+        } else if (m.type === 'event' && m.name) {
+          sseSend(m.name, m.data);
+        } else if (m.type === 'result' && m.id) {
+          const p = deck.pending.get(m.id);
+          if (p) {
+            clearTimeout(p.timer);
+            deck.pending.delete(m.id);
+            if (m.ok) p.resolve(m.result);
+            else p.reject(Object.assign(new Error(m.error ?? 'failed'), { statusCode: m.statusCode ?? 500 }));
+          }
+        } else if (m.type === 'pong') {
+          deck.lastSeen = Date.now();
+        }
+      });
+
+      ws.on('close', () => {
+        if (isHost && deck && deck.ws === ws) {
+          deck.online = false;
+          deck.ws = null;
+          for (const [, p] of deck.pending) { clearTimeout(p.timer); p.reject(Object.assign(new Error('Mac disconnected'), { statusCode: 503 })); }
+          deck.pending.clear();
+          sseSend('host', { online: false });
+        }
+      });
+    });
+  });
+
+  const keepalive = setInterval(() => {
+    try { deck?.ws?.send(JSON.stringify({ type: 'ping' })); } catch { /* closed */ }
+  }, 25000);
+  app.addHook('onClose', async () => clearInterval(keepalive));
+
+  const st = (): Snapshot | null => deck?.state ?? null;
+
+  // ── Health / meta ──────────────────────────────────────────────────
+  app.get('/health', async () => ({
+    ok: true, name: 'maestro-relay', version: '0.3.0', mode: 'relay',
+    host: { online: !!deck?.online, lastSeen: deck?.lastSeen ?? null, hasState: !!deck?.state },
+    time: Date.now(),
+  }));
   app.get('/', async () => ({
-    ok: true,
-    service: 'maestro-server',
-    docs: '/health, /api/dashboard, /api/workspaces, /api/projects, /api/jobs, /api/approvals, /api/schedules, /api/skills, /api/templates, /api/budget, /api/stream',
+    ok: true, service: 'maestro-relay',
+    docs: 'GETs mirror the Mac’s snapshot; POSTs execute ON the Mac. /ws is the host socket.',
   }));
 
-  function defaultWorkspaceId(): string | undefined {
-    return repos.defaultWorkspace()?.id;
-  }
-  function resolveWorkspaceId(q: unknown): string | undefined {
-    return (q as { workspaceId?: string }).workspaceId ?? defaultWorkspaceId();
-  }
-
-  // ── Workspaces ────────────────────────────────────────────────────
-  app.get('/api/workspaces', async () => repos.listWorkspaces());
-  app.post('/api/workspaces', async (req, reply) => {
-    const { name, budgetCap } = (req.body ?? {}) as { name?: string; budgetCap?: number };
-    if (!name) return reply.code(400).send({ error: 'name required' });
-    return repos.createWorkspace(name, budgetCap ?? 200);
-  });
-  app.post('/api/workspaces/:id/budget', async (req, reply) => {
-    const cap = Number(((req.body ?? {}) as { cap?: number }).cap);
-    if (!Number.isFinite(cap) || cap <= 0) return reply.code(400).send({ error: 'cap must be a positive number' });
-    repos.setBudgetCap((req.params as { id: string }).id, cap);
-    return { ok: true, cap };
-  });
-
-  // ── Dashboard + Budget aggregates ─────────────────────────────────
-  app.get('/api/dashboard', async (req) => {
-    const wsId = resolveWorkspaceId(req.query);
-    if (!wsId) return { workspace: null, greetingProjects: [], gates: [], activeJobs: [], recentlyCompleted: [], schedule: [], budget: { cap: 200, spent: 0, byProject: [] } };
-    return repos.dashboard(wsId);
-  });
-  app.get('/api/budget', async (req) => {
-    const wsId = resolveWorkspaceId(req.query);
-    if (!wsId) return { cap: 200, spent: 0, byProject: [] };
-    return repos.budget(wsId);
-  });
-
-  // ── Projects ──────────────────────────────────────────────────────
-  app.get('/api/projects', async (req) => {
-    const wsId = resolveWorkspaceId(req.query);
-    if (!wsId) return [];
-    return repos.listProjects(wsId);
-  });
-  app.post('/api/projects', async (req, reply) => {
-    const body = (req.body ?? {}) as { workspaceId?: string; name?: string; template?: string; instructions?: string; color?: string };
-    const workspaceId = body.workspaceId ?? defaultWorkspaceId();
-    if (!workspaceId) return reply.code(400).send({ error: 'no workspace; create one first' });
-    if (!body.name) return reply.code(400).send({ error: 'name required' });
-    return repos.createProject({ workspaceId, name: body.name, template: body.template, instructions: body.instructions, color: body.color });
-  });
+  // ── Reads — served from the Mac's mirrored snapshot ───────────────
+  app.get('/api/dashboard', async () => st()?.dashboard ?? EMPTY_DASHBOARD);
+  app.get('/api/budget', async () => st()?.budget ?? EMPTY_DASHBOARD.budget);
+  app.get('/api/workspaces', async () => st()?.workspaces ?? []);
+  app.get('/api/projects', async () => st()?.projects ?? []);
   app.get('/api/projects/:id', async (req, reply) => {
-    const p = repos.getProject((req.params as { id: string }).id);
+    const p = (st()?.projects ?? []).find((x) => x.id === (req.params as { id: string }).id);
     return p ?? reply.code(404).send({ error: 'project not found' });
   });
-
-  // ── Jobs ──────────────────────────────────────────────────────────
   app.get('/api/jobs', async (req) => {
     const projectId = (req.query as { projectId?: string }).projectId;
-    return repos.listJobs(projectId);
-  });
-  app.post('/api/jobs', async (req, reply) => {
-    const body = (req.body ?? {}) as { projectId?: string; input?: string; title?: string; effort?: Effort };
-    if (!body.projectId || !body.input) return reply.code(400).send({ error: 'projectId and input required' });
-    if (!repos.getProject(body.projectId)) return reply.code(404).send({ error: 'project not found' });
-    const job = repos.createJob(body.projectId, body.input, body.title ?? '', body.effort ?? 'balanced');
-    broadcast('job', job);
-    return job;
+    const jobs = st()?.jobs ?? [];
+    return projectId ? jobs.filter((j) => j.projectId === projectId) : jobs;
   });
   app.get('/api/jobs/:id', async (req, reply) => {
-    const j = repos.getJob((req.params as { id: string }).id);
+    const j = (st()?.jobs ?? []).find((x) => x.id === (req.params as { id: string }).id);
     return j ?? reply.code(404).send({ error: 'job not found' });
   });
-
-  // Pick the engine for a workspace: a connected provider's real engine, else Echo.
-  function resolveEngine(workspaceId: string | undefined): EngineAdapter {
-    if (workspaceId) {
-      const aKey = repos.getProviderKey(workspaceId, 'anthropic');
-      if (aKey) return new AnthropicEngine(aKey, repos.getProviderModel(workspaceId, 'anthropic'));
-      const oKey = repos.getProviderKey(workspaceId, 'openai');
-      if (oKey) return new OpenAIEngine(oKey, repos.getProviderModel(workspaceId, 'openai'));
-    }
-    return engine;
-  }
-
-  async function runJob(jobId: string, effortOverride?: Effort) {
-    let job = repos.getJob(jobId);
-    if (!job) return undefined;
-    const project = repos.getProject(job.projectId);
-    const eng = resolveEngine(project?.workspaceId);
-    job = repos.updateJob(jobId, { status: 'running', phase: 'Working', progress: 15, output: null, error: null, stage: `running on ${eng.id}…` });
-    broadcast('job', job);
-    try {
-      const result = await eng.run({ prompt: job.input, projectInstructions: project?.instructions, effort: effortOverride ?? job.effort });
-      job = repos.updateJob(jobId, { status: 'done', phase: 'Done', progress: 100, output: result.output, error: null, cost: result.cost, tokens: result.tokens, stage: '' });
-    } catch (e) {
-      job = repos.updateJob(jobId, { status: 'failed', phase: 'Failed', error: e instanceof Error ? e.message : String(e), stage: '' });
-    }
-    broadcast('job', job);
-    return job;
-  }
-
-  app.post('/api/jobs/:id/run', async (req, reply) => {
-    const effort = ((req.body ?? {}) as { effort?: Effort }).effort;
-    const job = await runJob((req.params as { id: string }).id, effort);
-    return job ?? reply.code(404).send({ error: 'job not found' });
-  });
-  // Create + run in one call (the "Run a job" composer flow).
-  app.post('/api/jobs/run', async (req, reply) => {
-    const body = (req.body ?? {}) as { projectId?: string; input?: string; title?: string; effort?: Effort };
-    if (!body.projectId || !body.input) return reply.code(400).send({ error: 'projectId and input required' });
-    if (!repos.getProject(body.projectId)) return reply.code(404).send({ error: 'project not found' });
-    const created = repos.createJob(body.projectId, body.input, body.title ?? '', body.effort ?? 'balanced');
-    broadcast('job', created);
-    const job = await runJob(created.id, body.effort);
-    return job ?? created;
-  });
-
-  // ── Approvals ─────────────────────────────────────────────────────
   app.get('/api/approvals', async (req) => {
-    const status = (req.query as { status?: ApprovalStatus }).status;
-    return repos.listApprovals(status);
+    const status = (req.query as { status?: string }).status;
+    const approvals = st()?.approvals ?? [];
+    return status ? approvals.filter((a) => a.status === status) : approvals;
   });
-  app.post('/api/approvals/:id/approve', async (req, reply) => {
-    const a = repos.getApproval((req.params as { id: string }).id);
-    if (!a) return reply.code(404).send({ error: 'approval not found' });
-    const next = repos.resolveApproval(a.id, 'approved');
-    broadcast('approval', next);
-    return next;
-  });
-  app.post('/api/approvals/:id/deny', async (req, reply) => {
-    const a = repos.getApproval((req.params as { id: string }).id);
-    if (!a) return reply.code(404).send({ error: 'approval not found' });
-    const next = repos.resolveApproval(a.id, 'denied');
-    broadcast('approval', next);
-    return next;
-  });
+  app.get('/api/schedules', async () => st()?.schedules ?? []);
+  app.get('/api/skills', async () => st()?.skills ?? []);
+  app.get('/api/templates', async () => st()?.templates ?? []);
+  app.get('/api/providers', async () => st()?.providers ?? []);
 
-  // ── Schedules ─────────────────────────────────────────────────────
-  app.get('/api/schedules', async () => repos.listSchedules());
-  app.post('/api/schedules', async (req, reply) => {
-    const body = (req.body ?? {}) as { title?: string; projectId?: string; time?: string; cadence?: string };
-    if (!body.title) return reply.code(400).send({ error: 'title required' });
-    return repos.createSchedule({ title: body.title, projectId: body.projectId ?? null, time: body.time, cadence: body.cadence });
-  });
-  app.post('/api/schedules/:id/toggle', async (req) => {
-    const body = (req.body ?? {}) as { enabled?: boolean };
-    repos.setScheduleEnabled((req.params as { id: string }).id, body.enabled ?? false);
-    return { ok: true };
-  });
+  // ── Writes — forwarded to the Mac, executed there ──────────────────
+  app.post('/api/workspaces', async (req, reply) => forward(reply, 'createWorkspace', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/workspaces/:id/budget', async (req, reply) =>
+    forward(reply, 'setBudgetCap', { ...(req.body ?? {}) as Record<string, unknown>, workspaceId: (req.params as { id: string }).id }));
+  app.post('/api/projects', async (req, reply) => forward(reply, 'createProject', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/jobs', async (req, reply) => forward(reply, 'createJob', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/jobs/run', async (req, reply) => forward(reply, 'createAndRunJob', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/jobs/:id/run', async (req, reply) =>
+    forward(reply, 'runJob', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
+  app.post('/api/approvals/:id/approve', async (req, reply) => forward(reply, 'approveApproval', { id: (req.params as { id: string }).id }));
+  app.post('/api/approvals/:id/deny', async (req, reply) => forward(reply, 'denyApproval', { id: (req.params as { id: string }).id }));
+  app.post('/api/schedules', async (req, reply) => forward(reply, 'createSchedule', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/schedules/:id/toggle', async (req, reply) =>
+    forward(reply, 'toggleSchedule', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
+  app.post('/api/skills/:id/toggle', async (req, reply) => forward(reply, 'toggleSkill', { id: (req.params as { id: string }).id }));
+  app.post('/api/providers/:provider/connect', async (req, reply) =>
+    forward(reply, 'connectProvider', { ...(req.body ?? {}) as Record<string, unknown>, provider: (req.params as { provider: string }).provider }));
+  app.post('/api/providers/:provider/disconnect', async (req, reply) =>
+    forward(reply, 'disconnectProvider', { ...(req.body ?? {}) as Record<string, unknown>, provider: (req.params as { provider: string }).provider }));
 
-  // ── Skills ────────────────────────────────────────────────────────
-  app.get('/api/skills', async () => repos.listSkills());
-  app.post('/api/skills/:id/toggle', async (req, reply) => {
-    const s = repos.toggleSkill((req.params as { id: string }).id);
-    return s ?? reply.code(404).send({ error: 'skill not found' });
-  });
-
-  // ── Templates ─────────────────────────────────────────────────────
-  app.get('/api/templates', async () => repos.listTemplates());
-
-  // ── Providers (real Anthropic/OpenAI credentials) ─────────────────
-  app.get('/api/providers', async (req) => {
-    const wsId = resolveWorkspaceId(req.query);
-    if (!wsId) return [];
-    return repos.listProviders(wsId);
-  });
-  app.post('/api/providers/:provider/connect', async (req, reply) => {
-    const provider = (req.params as { provider: string }).provider;
-    if (!isProviderId(provider)) return reply.code(400).send({ error: 'unsupported provider' });
-    const body = (req.body ?? {}) as { apiKey?: string; model?: string; workspaceId?: string };
-    if (!body.apiKey || !body.apiKey.trim()) return reply.code(400).send({ error: 'apiKey required' });
-    const wsId = body.workspaceId ?? defaultWorkspaceId();
-    if (!wsId) return reply.code(400).send({ error: 'no workspace; create one first' });
-    const check = await validateProviderKey(provider, body.apiKey.trim());
-    if (!check.ok) return reply.code(400).send({ error: check.error ?? 'invalid key' });
-    return repos.connectProvider(wsId, provider, body.apiKey.trim(), body.model ?? '');
-  });
-  app.post('/api/providers/:provider/disconnect', async (req, reply) => {
-    const provider = (req.params as { provider: string }).provider;
-    if (!isProviderId(provider)) return reply.code(400).send({ error: 'unsupported provider' });
-    const wsId = resolveWorkspaceId(req.body ?? {}) ?? defaultWorkspaceId();
-    if (!wsId) return reply.code(400).send({ error: 'no workspace' });
-    repos.disconnectProvider(wsId, provider);
-    return { ok: true };
-  });
-
-  // ── SSE stream ────────────────────────────────────────────────────
+  // ── SSE stream (host events relayed to web clients) ────────────────
   app.get('/api/stream', (req, reply) => {
     reply.hijack();
     const res = reply.raw;
@@ -230,18 +245,14 @@ export function buildServer(repos: Repositories, engine: EngineAdapter): Fastify
       Connection: 'keep-alive',
       'Access-Control-Allow-Origin': '*',
     });
-    res.write(`event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`);
-    clients.add(res);
+    res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, hostOnline: !!deck?.online })}\n\n`);
+    sseClients.add(res);
     const ping = setInterval(() => {
-      try {
-        res.write(': ping\n\n');
-      } catch {
-        /* closed */
-      }
+      try { res.write(': ping\n\n'); } catch { /* closed */ }
     }, 25000);
     req.raw.on('close', () => {
       clearInterval(ping);
-      clients.delete(res);
+      sseClients.delete(res);
     });
   });
 

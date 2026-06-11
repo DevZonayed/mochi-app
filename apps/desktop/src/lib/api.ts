@@ -1,8 +1,10 @@
-/* Maestro desktop — live API client for the deployed maestro-server.
+/* Maestro desktop — data client.
 
-   Base URL resolves from VITE_API_BASE at build time and falls back to the
-   production deployment, so the native app and the web build both talk to a
-   real backend out of the box. Screens use this instead of hardcoded mock data. */
+   In the ELECTRON APP every call routes over IPC to the local Maestro core in
+   the main process: data + execution live on this Mac (Claude Code login, local
+   store, local engine). In a BROWSER (the hosted web build) the same surface
+   falls back to REST against the relay server, which mirrors the Mac's pushed
+   state and forwards commands to it — the web app is a remote control. */
 
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
@@ -88,11 +90,11 @@ export interface BudgetData {
 }
 export type ProviderId = 'anthropic' | 'openai';
 export interface ProviderConn {
-  workspaceId: string;
   provider: ProviderId;
-  keyLast4: string;
-  model: string;
+  method: 'subscription' | 'apiKey';
   status: string;
+  detail: string;
+  keyLast4?: string;
   createdAt: number;
 }
 export interface DashboardData {
@@ -109,7 +111,7 @@ const RAW_BASE =
   (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_API_BASE ??
   'https://api.nexalance.cloud';
 
-/** Live maestro-server base URL (no trailing slash). */
+/** Relay server base URL (browser fallback only; no trailing slash). */
 export const API_BASE = RAW_BASE.replace(/\/$/, '');
 
 export class ApiError extends Error {
@@ -118,6 +120,18 @@ export class ApiError extends Error {
     this.name = 'ApiError';
   }
 }
+
+/* ── Local core bridge (Electron) ─────────────────────────────────────── */
+interface Bridge {
+  localEngine?: boolean;
+  call?: (method: string, params?: Record<string, unknown>) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  onEvent?: (cb: (e: { name: string; data: unknown }) => void) => () => void;
+}
+const bridge: Bridge | undefined =
+  typeof window !== 'undefined' ? (window as unknown as { maestro?: Bridge }).maestro : undefined;
+
+/** True when running inside the desktop app (local core owns everything). */
+export const IS_LOCAL = Boolean(bridge?.call);
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   // Only send a JSON content-type when there's actually a body — otherwise
@@ -141,6 +155,16 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** Route to the local core when in Electron, otherwise run the REST fallback. */
+async function call<T>(method: string, params: Record<string, unknown>, rest: () => Promise<T>): Promise<T> {
+  if (bridge?.call) {
+    const r = await bridge.call(method, params);
+    if (r.ok) return r.data as T;
+    throw new ApiError(r.status ?? 500, r.error ?? 'failed');
+  }
+  return rest();
+}
+
 const qp = (params: Record<string, string | undefined>): string => {
   const q = Object.entries(params)
     .filter(([, v]) => v !== undefined && v !== '')
@@ -151,64 +175,90 @@ const qp = (params: Record<string, string | undefined>): string => {
 
 export const api = {
   base: API_BASE,
-  health: () => req<{ ok: boolean; name: string; version: string; engine: string }>('/health'),
+  health: () =>
+    call('health', {}, () => req<{ ok: boolean; name: string; version: string; engine: string }>('/health')),
 
   // Aggregates
-  dashboard: (workspaceId?: string) => req<DashboardData>('/api/dashboard' + qp({ workspaceId })),
-  budget: (workspaceId?: string) => req<BudgetData>('/api/budget' + qp({ workspaceId })),
+  dashboard: (workspaceId?: string) =>
+    call<DashboardData>('dashboard', { workspaceId }, () => req<DashboardData>('/api/dashboard' + qp({ workspaceId }))),
+  budget: (workspaceId?: string) =>
+    call<BudgetData>('budget', { workspaceId }, () => req<BudgetData>('/api/budget' + qp({ workspaceId }))),
 
   // Workspaces
-  listWorkspaces: () => req<Workspace[]>('/api/workspaces'),
+  listWorkspaces: () => call<Workspace[]>('listWorkspaces', {}, () => req<Workspace[]>('/api/workspaces')),
   createWorkspace: (name: string, budgetCap?: number) =>
-    req<Workspace>('/api/workspaces', { method: 'POST', body: JSON.stringify({ name, budgetCap }) }),
+    call<Workspace>('createWorkspace', { name, budgetCap }, () =>
+      req<Workspace>('/api/workspaces', { method: 'POST', body: JSON.stringify({ name, budgetCap }) })),
   setBudgetCap: (workspaceId: string, cap: number) =>
-    req<{ ok: boolean; cap: number }>(`/api/workspaces/${encodeURIComponent(workspaceId)}/budget`, { method: 'POST', body: JSON.stringify({ cap }) }),
+    call<{ ok: boolean; cap: number }>('setBudgetCap', { workspaceId, cap }, () =>
+      req<{ ok: boolean; cap: number }>(`/api/workspaces/${encodeURIComponent(workspaceId)}/budget`, { method: 'POST', body: JSON.stringify({ cap }) })),
 
   // Projects
-  listProjects: (workspaceId?: string) => req<Project[]>('/api/projects' + qp({ workspaceId })),
+  listProjects: (workspaceId?: string) =>
+    call<Project[]>('listProjects', { workspaceId }, () => req<Project[]>('/api/projects' + qp({ workspaceId }))),
   createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string }) =>
-    req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) }),
-  getProject: (id: string) => req<Project>(`/api/projects/${encodeURIComponent(id)}`),
+    call<Project>('createProject', { ...input }, () =>
+      req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) })),
+  getProject: (id: string) =>
+    call<Project>('getProject', { id }, () => req<Project>(`/api/projects/${encodeURIComponent(id)}`)),
 
-  // Jobs
-  listJobs: (projectId?: string) => req<Job[]>('/api/jobs' + qp({ projectId })),
+  // Jobs — in the desktop app these EXECUTE on this Mac (Claude Code login)
+  listJobs: (projectId?: string) =>
+    call<Job[]>('listJobs', { projectId }, () => req<Job[]>('/api/jobs' + qp({ projectId }))),
   createJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
-    req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) }),
-  getJob: (id: string) => req<Job>(`/api/jobs/${encodeURIComponent(id)}`),
+    call<Job>('createJob', { ...input }, () =>
+      req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) })),
+  getJob: (id: string) => call<Job>('getJob', { id }, () => req<Job>(`/api/jobs/${encodeURIComponent(id)}`)),
   runJob: (id: string, effort?: Effort) =>
-    req<Job>(`/api/jobs/${encodeURIComponent(id)}/run`, { method: 'POST', body: JSON.stringify(effort ? { effort } : {}) }),
-  /** Create + run a job in one call (the "Run a job" composer). */
+    call<Job>('runJob', { id, effort }, () =>
+      req<Job>(`/api/jobs/${encodeURIComponent(id)}/run`, { method: 'POST', body: JSON.stringify(effort ? { effort } : {}) })),
   createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
-    req<Job>('/api/jobs/run', { method: 'POST', body: JSON.stringify(input) }),
+    call<Job>('createAndRunJob', { ...input }, () =>
+      req<Job>('/api/jobs/run', { method: 'POST', body: JSON.stringify(input) })),
 
   // Approvals
-  listApprovals: (status?: ApprovalStatus) => req<Approval[]>('/api/approvals' + qp({ status })),
-  approveApproval: (id: string) => req<Approval>(`/api/approvals/${encodeURIComponent(id)}/approve`, { method: 'POST' }),
-  denyApproval: (id: string) => req<Approval>(`/api/approvals/${encodeURIComponent(id)}/deny`, { method: 'POST' }),
+  listApprovals: (status?: ApprovalStatus) =>
+    call<Approval[]>('listApprovals', { status }, () => req<Approval[]>('/api/approvals' + qp({ status }))),
+  approveApproval: (id: string) =>
+    call<Approval>('approveApproval', { id }, () => req<Approval>(`/api/approvals/${encodeURIComponent(id)}/approve`, { method: 'POST' })),
+  denyApproval: (id: string) =>
+    call<Approval>('denyApproval', { id }, () => req<Approval>(`/api/approvals/${encodeURIComponent(id)}/deny`, { method: 'POST' })),
 
   // Schedules
-  listSchedules: () => req<Schedule[]>('/api/schedules'),
+  listSchedules: () => call<Schedule[]>('listSchedules', {}, () => req<Schedule[]>('/api/schedules')),
   createSchedule: (input: { title: string; projectId?: string; time?: string; cadence?: string }) =>
-    req<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(input) }),
+    call<Schedule>('createSchedule', { ...input }, () =>
+      req<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(input) })),
   toggleSchedule: (id: string, enabled: boolean) =>
-    req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) }),
+    call<{ ok: boolean }>('toggleSchedule', { id, enabled }, () =>
+      req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) })),
 
   // Skills
-  listSkills: () => req<Skill[]>('/api/skills'),
-  toggleSkill: (id: string) => req<Skill>(`/api/skills/${encodeURIComponent(id)}/toggle`, { method: 'POST' }),
+  listSkills: () => call<Skill[]>('listSkills', {}, () => req<Skill[]>('/api/skills')),
+  toggleSkill: (id: string) =>
+    call<Skill>('toggleSkill', { id }, () => req<Skill>(`/api/skills/${encodeURIComponent(id)}/toggle`, { method: 'POST' })),
 
   // Templates
-  listTemplates: () => req<Template[]>('/api/templates'),
+  listTemplates: () => call<Template[]>('listTemplates', {}, () => req<Template[]>('/api/templates')),
 
-  // Providers (real Anthropic/OpenAI credentials — keys validated live, stored encrypted server-side)
-  listProviders: (workspaceId?: string) => req<ProviderConn[]>('/api/providers' + qp({ workspaceId })),
+  // Providers — local CLI logins (Claude Code / Codex) + locally-encrypted keys
+  listProviders: (workspaceId?: string) =>
+    call<ProviderConn[]>('listProviders', { workspaceId }, () => req<ProviderConn[]>('/api/providers' + qp({ workspaceId }))),
   connectProvider: (provider: ProviderId, apiKey: string, model?: string, workspaceId?: string) =>
-    req<ProviderConn>(`/api/providers/${provider}/connect`, { method: 'POST', body: JSON.stringify({ apiKey, model, workspaceId }) }),
+    call<ProviderConn>('connectProvider', { provider, apiKey, model, workspaceId }, () =>
+      req<ProviderConn>(`/api/providers/${provider}/connect`, { method: 'POST', body: JSON.stringify({ apiKey, model, workspaceId }) })),
   disconnectProvider: (provider: ProviderId, workspaceId?: string) =>
-    req<{ ok: boolean }>(`/api/providers/${provider}/disconnect`, { method: 'POST', body: JSON.stringify({ workspaceId }) }),
+    call<{ ok: boolean }>('disconnectProvider', { provider, workspaceId }, () =>
+      req<{ ok: boolean }>(`/api/providers/${provider}/disconnect`, { method: 'POST', body: JSON.stringify({ workspaceId }) })),
 
-  /** Subscribe to live SSE updates. Returns an unsubscribe function. */
+  /** Live updates: local core events in Electron, relay SSE in the browser. */
   subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void }): () => void {
+    if (bridge?.onEvent) {
+      return bridge.onEvent(({ name, data }) => {
+        if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
+        if (name === 'approval' && handlers.onApproval) handlers.onApproval(data as Approval);
+      });
+    }
     if (typeof EventSource === 'undefined') return () => {};
     const es = new EventSource(API_BASE + '/api/stream');
     if (handlers.onJob) es.addEventListener('job', (e: MessageEvent) => { try { handlers.onJob!(JSON.parse(e.data) as Job); } catch { /* ignore */ } });

@@ -280,11 +280,11 @@ function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect }: Prov
     <div>
       <StepHeading icon="key" tint="var(--indigo)"
         title="Connect your providers"
-        sub="Paste your API key — agents run on your own account." />
+        sub="Signed into Claude Code or Codex on this Mac? You're already connected." />
       <GroupedList footer={
         <span style={{ display: 'inline-flex', gap: 6 }}>
           <Icon name="lock" size={13} style={{ flexShrink: 0, marginTop: 1, opacity: 0.7 }} />
-          <span>Keys are validated live, then stored encrypted on your server. Agents use them, never see them. You can also do this later in Settings.</span>
+          <span>Everything stays on this Mac: CLI sign-ins are detected automatically; an API key is the fallback, validated live and kept in your Keychain. You can also do this later in Settings.</span>
         </span>}>
         {rows.map((r, idx) => {
           const st = providers[r.key];
@@ -569,6 +569,25 @@ export default function Onboarding() {
   const openaiTries = React.useRef(0);
 
   React.useEffect(() => { document.documentElement.dataset.theme = theme; }, [theme]);
+
+  // Providers already signed in on this Mac (Claude Code / Codex CLI logins,
+  // or a key in the Keychain) show as connected automatically.
+  React.useEffect(() => {
+    let alive = true;
+    api.listProviders()
+      .then(conns => {
+        if (!alive) return;
+        setProviders(prev => {
+          const next = { ...prev };
+          for (const c of conns) {
+            if (c.provider === 'anthropic' || c.provider === 'openai') next[c.provider] = 'connected';
+          }
+          return next;
+        });
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   // pairing countdown
   React.useEffect(() => {

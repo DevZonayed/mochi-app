@@ -249,7 +249,7 @@ function AccountsPane() {
   return (
     <div>
       <PaneHead sub="Agents use your keys; they never see them.">Accounts &amp; keys</PaneHead>
-      <GroupedList footer="Keys are validated live, then stored encrypted on your server. We show status, never the value.">
+      <GroupedList footer="Connections live on this Mac: your Claude Code / Codex sign-ins are detected automatically, and any API key is validated live and stored in the Mac's Keychain. Nothing leaves this machine.">
         {REAL_PROVIDERS.map((p, i) => {
           const c = connOf(p.id);
           const connected = !!c;
@@ -259,12 +259,14 @@ function AccountsPane() {
               <span style={{ flexShrink: 0, width: 138, minWidth: 0 }}>
                 <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{p.name}</span>
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: errors[p.id] ? 'var(--red)' : connected ? 'var(--green)' : 'var(--ink-secondary)', marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%' }}>
-                  <Icon name="lock" size={11} /> {errors[p.id] ? errors[p.id] : connected ? `Connected · ••••${c?.keyLast4 ?? ''}` : p.meta}
+                  <Icon name="lock" size={11} /> {errors[p.id] ? errors[p.id] : connected ? `Connected · ${c?.detail ?? 'this Mac'}` : p.meta}
                 </span>
               </span>
               {connected ? (
                 <span style={{ flex: 1, display: 'flex', justifyContent: 'flex-end' }}>
-                  <button onClick={() => disconnect(p.id)} disabled={busy[p.id]} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{busy[p.id] ? '…' : 'Disconnect'}</button>
+                  {c?.method === 'subscription'
+                    ? <span style={{ height: 32, display: 'inline-flex', alignItems: 'center', padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'rgba(52,199,89,0.12)', color: 'var(--green)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Signed in</span>
+                    : <button onClick={() => disconnect(p.id)} disabled={busy[p.id]} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{busy[p.id] ? '…' : 'Disconnect'}</button>}
                 </span>
               ) : (
                 <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' }}>
