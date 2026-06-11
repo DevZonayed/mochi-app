@@ -22,4 +22,5 @@ contextBridge.exposeInMainWorld('maestro', {
   // Desktop-only native affordances (never available to web/mobile remotes).
   pickFolder: (): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:pickFolder'),
   revealPath: (p: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('maestro:revealPath', p),
+  importAsset: (projectId: string | null): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:importAsset', projectId),
 });

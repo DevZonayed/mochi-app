@@ -5,6 +5,7 @@ import { Store } from './store.js';
 import { LocalEngine } from './engine.js';
 import { MediaEngine } from './media.js';
 import { ResearchEngine } from './research.js';
+import { PublishingEngine } from './publishing.js';
 import { Providers } from './providers.js';
 import { createDispatch } from './localApi.js';
 import { RelayClient } from './relay.js';
@@ -64,7 +65,8 @@ app.whenReady().then(() => {
   const media = new MediaEngine(store, emit, () => providers.getLocalKey('fal'));
   media.resumeOnBoot();
   const research = new ResearchEngine(store, engine, emit);
-  const dispatch = createDispatch(store, engine, media, research, providers, emit, RELAY_URL);
+  const publishing = new PublishingEngine(store, emit);
+  const dispatch = createDispatch(store, engine, media, research, publishing, providers, emit, RELAY_URL);
 
   relay = new RelayClient({
     url: RELAY_URL,
@@ -76,7 +78,7 @@ app.whenReady().then(() => {
   });
   relay.start();
 
-  const cron = new CronRunner(store, engine, emit);
+  const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs));
   cron.start();
   app.on('before-quit', () => { cron.stop(); relay?.stop(); });
 
@@ -105,6 +107,16 @@ app.whenReady().then(() => {
   ipcMain.handle('maestro:revealPath', async (_e, p: string) => {
     if (typeof p === 'string' && p && existsSync(p)) { shell.showItemInFolder(p); return { ok: true }; }
     return { ok: false, error: 'path not found' };
+  });
+
+  // Import a local media file as an asset — DESKTOP-ONLY (native picker).
+  ipcMain.handle('maestro:importAsset', async (_e, projectId: string | null) => {
+    const w = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0] ?? null;
+    const opts = { properties: ['openFile' as const], title: 'Import media', filters: [{ name: 'Media', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'mp4', 'mov', 'webm', 'mp3', 'wav', 'm4a'] }] };
+    const res = w ? await dialog.showOpenDialog(w, opts) : await dialog.showOpenDialog(opts);
+    if (res.canceled || !res.filePaths[0]) return { ok: true, data: null };
+    try { return { ok: true, data: await dispatch('importAsset', { path: res.filePaths[0], projectId: projectId ?? null }) }; }
+    catch (e) { const err = e as { message?: string }; return { ok: false, error: err?.message ?? 'import failed' }; }
   });
 
   createWindow();

@@ -1,49 +1,27 @@
-/* Publishing Center — the studio's output lands here first, nothing publishes
-   without the operator. Drafts grid (approve & schedule), week calendar,
-   per-platform connection/quota status, and an append-only provenance ledger,
-   plus the ⌘K palette.
-
-   Ported from the design prototype (pub-data / pub-views / pub-app) to an
-   ES-module TypeScript React screen. Visual output is unchanged.
-
-   The prototype's WindowFrame + Sidebar + Toolbar chrome maps onto the shared
-   <AppShell>; cross-page location.href navigation is handled by AppShell's
-   react-router useNavigate. PGlyph, PlatChip, the four tab views, and the
-   CommandPalette are not exported by the shared library, so they are inlined
-   here. */
+/* Publishing Center — a real LOCAL pipeline. Approved Studio media (and imported
+   files) become drafts here; you write a caption, pick platforms, then Export
+   (copies media + caption to ~/Maestro/Exports/<platform>/ and your clipboard,
+   reveals in Finder) or Schedule (the cron runner exports it when due). Maestro
+   never posts on your behalf — every send is an auditable local export with a
+   provenance hash in the ledger. Nothing publishes without you. */
 
 import React from 'react';
-import { Icon, type IconName } from '../lib/icons';
+import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
+import { api, type PublishDraft, type PublishLedgerRow, type Asset, IS_LOCAL } from '../lib/api';
 
-// page-specific CSS lifted from "Publishing Center".html <style>
-// (hover/animation hooks; the shared global stylesheet already defines
-//  .nav-item / .ws-header / .search-field / .tb-icon / .app-wallpaper / spin)
 const PUBLISHING_CSS = `
-  .link-btn:hover { text-decoration: underline; }
   .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease, background 140ms ease; }
   .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.4); }
   .primary-cta:active { transform: translateY(1px); }
   .ghost-btn:hover { background: color-mix(in srgb, var(--fill-secondary) 60%, var(--ink) 7%); }
-  .draft-card { transition: transform 160ms var(--spring), box-shadow 160ms ease, opacity 320ms ease; }
-  .draft-card:hover { transform: translateY(-2px); box-shadow: var(--card-shadow), 0 10px 28px rgba(15,20,60,0.12); }
-  .draft-card.fly-out { animation: flyOut 360ms var(--spring) forwards; }
-  @keyframes flyOut { to { transform: translate(-40px,-30px) scale(0.85); opacity: 0; } }
-  .pub-chip:hover { box-shadow: var(--card-shadow); transform: translateY(-1px); }
-  .tab-fade { animation: tfade 240ms var(--spring); }
+  .draft-card { transition: transform 160ms var(--spring), box-shadow 160ms ease; }
+  .led-row:hover { background: var(--fill-tertiary); }
   @keyframes tfade { from { transform: translateY(6px); } to { transform: none; } }
-  .toast { animation: toastIn 280ms var(--spring); }
-  @keyframes toastIn { from { transform: translate(-50%, 12px); } to { transform: translate(-50%, 0); } }
-  @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
-  @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
+  .tab-fade { animation: tfade 240ms var(--spring); }
 `;
 
-// ──────────────────────────────────────────────────────────────────────────
-// Platform defs (monochrome brand glyphs) + data (pub-data)
-// ──────────────────────────────────────────────────────────────────────────
-
 type PlatformKey = 'youtube' | 'tiktok' | 'instagram' | 'x' | 'linkedin' | 'pinterest' | 'bluesky';
-
 function PGlyph({ p, size = 18 }: { p: PlatformKey; size?: number }) {
   const c = 'currentColor';
   const paths: Record<PlatformKey, React.ReactNode> = {
@@ -57,396 +35,210 @@ function PGlyph({ p, size = 18 }: { p: PlatformKey; size?: number }) {
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">{paths[p]}</svg>;
 }
-
-interface PlatformMeta { name: string; tint: string }
-
-const PLATFORMS: Record<PlatformKey, PlatformMeta> = {
-  youtube:   { name: 'YouTube',   tint: 'var(--red)' },
-  tiktok:    { name: 'TikTok',    tint: 'var(--ink)' },
-  instagram: { name: 'Instagram', tint: 'var(--purple)' },
-  x:         { name: 'X',         tint: 'var(--ink)' },
-  linkedin:  { name: 'LinkedIn',  tint: 'var(--blue)' },
-  pinterest: { name: 'Pinterest', tint: 'var(--red)' },
-  bluesky:   { name: 'Bluesky',   tint: 'var(--teal)' },
+const PLATFORMS: Record<PlatformKey, { name: string; tint: string }> = {
+  youtube: { name: 'YouTube', tint: 'var(--red)' }, tiktok: { name: 'TikTok', tint: 'var(--ink)' },
+  instagram: { name: 'Instagram', tint: 'var(--purple)' }, x: { name: 'X', tint: 'var(--ink)' },
+  linkedin: { name: 'LinkedIn', tint: 'var(--blue)' }, pinterest: { name: 'Pinterest', tint: 'var(--red)' }, bluesky: { name: 'Bluesky', tint: 'var(--teal)' },
 };
+const PLATFORM_KEYS = Object.keys(PLATFORMS) as PlatformKey[];
 
-interface Draft {
-  id: string;
-  title: string;
-  cap: string;
-  ar: string;
-  tint: string;
-  dest: PlatformKey[];
-  when: string;
-  inapp: boolean;
+function AssetThumb({ a }: { a?: Asset }) {
+  if (a?.kind === 'image' && a.url) return <img src={a.url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />;
+  if (a?.kind === 'video' && a.url) return <video src={a.url} style={{ width: '100%', height: '100%', objectFit: 'cover', background: '#000' }} muted />;
+  return <div style={{ width: '100%', height: '100%', display: 'grid', placeItems: 'center', background: `linear-gradient(135deg, color-mix(in srgb, ${a?.tint ?? 'var(--blue)'} 30%, transparent), transparent)` }}><Icon name={a?.kind === 'video' ? 'clapper' : a?.kind === 'audio' || a?.kind === 'voiceover' ? 'play' : 'image'} size={26} style={{ color: 'rgba(255,255,255,0.7)' }} /></div>;
 }
 
-const DRAFTS: Draft[] = [
-  { id: 'd1', title: 'Launch film — vertical cut', cap: 'Maestro is live. One operator, a fleet of agents — run projects, schedules, and budgets from one calm place.', ar: '9/16', tint: 'linear-gradient(150deg,#0E2A5E,#30B0C7)', dest: ['youtube', 'tiktok', 'instagram'], when: 'Today 14:00', inapp: true },
-  { id: 'd2', title: 'Launch week thread', cap: 'Here’s everything that shipped in Maestro this week ↓ A 7-part thread on durable agents.', ar: '16/9', tint: 'linear-gradient(150deg,#1b2a4a,#5856D6)', dest: ['x', 'linkedin', 'bluesky'], when: 'Today 16:30', inapp: false },
-  { id: 'd3', title: 'Icon set reveal', cap: 'Fresh system icons — 48 glyphs, 3 weights, exported @3x. Swipe for the grid.', ar: '9/16', tint: 'linear-gradient(150deg,#2a1b4a,#AF52DE)', dest: ['instagram', 'pinterest'], when: 'Tomorrow 09:00', inapp: true },
-  { id: 'd4', title: 'Behind the scenes — render farm', cap: 'How we render a video minute for under a dollar on self-hosted GPUs.', ar: '16/9', tint: 'linear-gradient(150deg,#1b3a2a,#1F8A5B)', dest: ['youtube', 'linkedin'], when: 'Jun 19 11:00', inapp: false },
-];
-
-// ──────────────────────────────────────────────────────────────────────────
-// Shared platform chip (pub-views)
-// ──────────────────────────────────────────────────────────────────────────
-
-function PlatChip({ p, small }: { p: PlatformKey; small?: boolean }) {
-  const pl = PLATFORMS[p];
-  return (
-    <span title={pl.name} style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: small ? 24 : 28, height: small ? 24 : 28, borderRadius: 7,
-      background: 'var(--fill-secondary)', color: pl.tint }}><PGlyph p={p} size={small ? 14 : 16} /></span>
-  );
+function toLocalInput(ts: number): string {
+  const d = new Date(ts - new Date().getTimezoneOffset() * 60000);
+  return d.toISOString().slice(0, 16);
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Drafts grid (pub-views)
-// ──────────────────────────────────────────────────────────────────────────
+function DraftCard({ d, asset, onChanged }: { d: PublishDraft; asset?: Asset; onChanged: () => void }) {
+  const [caption, setCaption] = React.useState(d.caption);
+  const [platforms, setPlatforms] = React.useState<string[]>(d.platforms);
+  const [when, setWhen] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  React.useEffect(() => { setCaption(d.caption); setPlatforms(d.platforms); }, [d.id]);
 
-function DraftsGrid({ onApprove }: { onApprove: (id: string) => void }) {
-  return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px,1fr))', gap: 18 }}>
-      {DRAFTS.map(d => (
-        <div key={d.id} data-draft={d.id} className="draft-card" style={{ background: 'var(--bg-elevated)', borderRadius: 16, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-          <div style={{ display: 'flex', gap: 14, padding: 14 }}>
-            <div style={{ width: d.ar === '9/16' ? 64 : 104, aspectRatio: d.ar, borderRadius: 10, background: d.tint, flexShrink: 0, position: 'relative', overflow: 'hidden' }}>
-              <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: 'rgba(255,255,255,0.85)' }}><Icon name="play" size={20} /></span>
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ font: '600 var(--fs-callout)/1.25 var(--font-text)', color: 'var(--ink)', marginBottom: 5 }}>{d.title}</div>
-              <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{d.cap}</div>
-            </div>
-          </div>
-          <div style={{ padding: '0 14px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <div style={{ display: 'flex', gap: 6 }}>{d.dest.map(p => <PlatChip key={p} p={p} small />)}</div>
-            <span style={{ flex: 1 }} />
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}><Icon name="clock" size={12} /> {d.when}</span>
-          </div>
-          <div style={{ padding: '0 14px 12px', display: 'flex', flexWrap: 'wrap', gap: 7 }}>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)', background: 'rgba(52,199,89,0.14)', color: 'var(--green)', font: '600 var(--fs-caption)/1 var(--font-text)' }}><Icon name="shield" size={11} /> AI label ✓ · C2PA ✓</span>
-            {d.inapp && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '500 var(--fs-caption)/1 var(--font-text)' }}><Icon name="alert" size={11} /> Goes to in-app drafts (platform rule)</span>}
-          </div>
-          <div style={{ display: 'flex', gap: 9, padding: '12px 14px', borderTop: '0.5px solid var(--separator)', marginTop: 'auto' }}>
-            <button onClick={() => onApprove(d.id)} className="primary-cta" style={{ flex: 1, height: 38, borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', boxShadow: '0 4px 14px rgba(0,122,255,0.28)' }}>Approve &amp; schedule</button>
-            <button className="ghost-btn" style={{ height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Edit</button>
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Calendar view (pub-views)
-// ──────────────────────────────────────────────────────────────────────────
-
-const PUB_WEEK = ['Mon 15', 'Tue 16', 'Wed 17', 'Thu 18', 'Fri 19', 'Sat 20', 'Sun 21'];
-
-interface PubEvent { day: number; time: string; p: PlatformKey; label: string }
-
-const PUB_EVENTS: PubEvent[] = [
-  { day: 0, time: '09:00', p: 'instagram', label: 'Icon set' },
-  { day: 2, time: '14:00', p: 'youtube', label: 'Launch film' },
-  { day: 2, time: '16:30', p: 'x', label: 'Launch thread' },
-  { day: 4, time: '11:00', p: 'youtube', label: 'Render farm' },
-  { day: 4, time: '18:00', p: 'linkedin', label: 'Recap post' },
-  { day: 5, time: '10:00', p: 'tiktok', label: 'Teaser' },
-];
-
-function PubCalendar() {
-  const hours = ['08:00', '10:00', '12:00', '14:00', '16:00', '18:00'];
-  const rowFor = (t: string) => hours.findIndex(h => h >= t.slice(0, 2) + ':00') >= 0 ? Math.max(0, Math.floor((parseInt(t) - 8) / 2)) : 0;
-  return (
-    <div style={{ background: 'var(--bg-elevated)', borderRadius: 16, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '56px repeat(7,1fr)', borderBottom: '0.5px solid var(--separator)' }}>
-        <div style={{ borderRight: '0.5px solid var(--separator)' }} />
-        {PUB_WEEK.map((d, i) => <div key={i} style={{ padding: '11px 0', textAlign: 'center', font: '600 var(--fs-footnote)/1.2 var(--font-text)', color: i === 2 ? 'var(--red)' : 'var(--ink)', borderRight: i < 6 ? '0.5px solid var(--separator)' : 'none' }}>{d}</div>)}
-      </div>
-      {hours.map((h, hi) => (
-        <div key={h} style={{ display: 'grid', gridTemplateColumns: '56px repeat(7,1fr)', borderBottom: hi < hours.length - 1 ? '0.5px solid var(--separator)' : 'none', minHeight: 64 }}>
-          <div style={{ borderRight: '0.5px solid var(--separator)', padding: '6px 8px 0', textAlign: 'right', font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{h}</div>
-          {PUB_WEEK.map((_, di) => (
-            <div key={di} style={{ borderRight: di < 6 ? '0.5px solid var(--separator)' : 'none', padding: 4, display: 'flex', flexDirection: 'column', gap: 4, background: di === 2 ? 'color-mix(in srgb, var(--red) 2%, transparent)' : 'transparent' }}>
-              {PUB_EVENTS.filter(e => e.day === di && rowFor(e.time) === hi).map((e, i) => (
-                <div key={i} className="pub-chip" style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '5px 7px', borderRadius: 7, cursor: 'grab',
-                  background: `color-mix(in srgb, ${PLATFORMS[e.p].tint} 14%, var(--bg-elevated))`, border: `1px solid color-mix(in srgb, ${PLATFORMS[e.p].tint} 35%, transparent)` }}>
-                  <span style={{ color: PLATFORMS[e.p].tint, flexShrink: 0 }}><PGlyph p={e.p} size={12} /></span>
-                  <span style={{ font: '600 var(--fs-caption)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{e.label}</span>
-                </div>
-              ))}
-            </div>
-          ))}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Platforms tab (pub-views)
-// ──────────────────────────────────────────────────────────────────────────
-
-type PlatStatus = 'connected' | 'exhausted' | 'disconnected';
-
-interface PlatRow { p: PlatformKey; status: PlatStatus; quota: string; pct: number; audit?: string; cost?: string }
-
-const PLAT_ROWS: PlatRow[] = [
-  { p: 'youtube', status: 'connected', quota: '4 / 6 uploads today', pct: 0.66 },
-  { p: 'tiktok', status: 'connected', quota: 'Tokens refresh in 14h', pct: 0.4, audit: 'Audit pending · posts are self-only' },
-  { p: 'instagram', status: 'connected', quota: '8 / 25 posts today', pct: 0.32 },
-  { p: 'x', status: 'connected', quota: 'Unlimited · paid tier', pct: 0.2, cost: '~$0.20 per post with URL — links go in replies' },
-  { p: 'linkedin', status: 'connected', quota: '3 / 5 posts today', pct: 0.6 },
-  { p: 'pinterest', status: 'exhausted', quota: 'Daily limit reached · resets 6h', pct: 1 },
-  { p: 'bluesky', status: 'disconnected', quota: '', pct: 0 },
-];
-
-function PlatformsTab() {
-  return (
-    <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-      {PLAT_ROWS.map((r, i) => {
-        const pl = PLATFORMS[r.p];
-        const sMap: Record<PlatStatus, [string, string]> = { connected: ['Connected', 'var(--green)'], exhausted: ['Quota exhausted', 'var(--orange)'], disconnected: ['Not connected', 'var(--ink-tertiary)'] };
-        const [sl, st] = sMap[r.status];
-        return (
-          <div key={r.p} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '15px 18px', borderBottom: i < PLAT_ROWS.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
-            <span style={{ width: 40, height: 40, borderRadius: 11, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: pl.tint }}><PGlyph p={r.p} size={22} /></span>
-            <div style={{ width: 130, flexShrink: 0 }}>
-              <div style={{ font: '600 var(--fs-callout)/1.1 var(--font-text)', color: 'var(--ink)' }}>{pl.name}</div>
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: st, marginTop: 3 }}>
-                <span style={{ width: 6, height: 6, borderRadius: 3, background: st }} /> {sl}
-              </div>
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              {r.status !== 'disconnected' && (
-                <React.Fragment>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
-                    <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: r.status === 'exhausted' ? 'var(--orange)' : 'var(--ink-secondary)' }}>{r.quota}</span>
-                  </div>
-                  <div style={{ height: 5, borderRadius: 3, background: 'var(--fill-secondary)', overflow: 'hidden', maxWidth: 280 }}>
-                    <div style={{ width: `${r.pct * 100}%`, height: '100%', borderRadius: 3, background: r.status === 'exhausted' ? 'var(--orange)' : pl.tint }} />
-                  </div>
-                </React.Fragment>
-              )}
-              {r.audit && <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, marginTop: 7, height: 20, padding: '0 8px', borderRadius: 'var(--r-pill)', background: 'rgba(255,149,0,0.13)', color: 'var(--orange)', font: '600 var(--fs-caption)/1 var(--font-text)' }}><Icon name="shield" size={11} /> {r.audit}</div>}
-              {r.cost && <div style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 6 }}>{r.cost}</div>}
-            </div>
-            <button className={r.status === 'disconnected' ? 'primary-cta' : 'ghost-btn'} style={{ height: 36, padding: '0 16px', borderRadius: 'var(--r-pill)', flexShrink: 0,
-              background: r.status === 'disconnected' ? 'var(--blue)' : 'var(--fill-secondary)', color: r.status === 'disconnected' ? '#fff' : 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', boxShadow: r.status === 'disconnected' ? '0 4px 14px rgba(0,122,255,0.28)' : 'none' }}>
-              {r.status === 'disconnected' ? 'Connect' : 'Reconnect'}
-            </button>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Ledger tab (pub-views)
-// ──────────────────────────────────────────────────────────────────────────
-
-interface LedgerRow { time: string; p: PlatformKey[]; asset: string; ok: boolean; cost: string; hash: string }
-
-const LEDGER: LedgerRow[] = [
-  { time: '14:02', p: ['youtube'], asset: 'linear-gradient(135deg,#0E2A5E,#30B0C7)', ok: true, cost: '1 unit', hash: '9f2c…e3a1' },
-  { time: '13:40', p: ['x', 'linkedin'], asset: 'linear-gradient(135deg,#1b2a4a,#5856D6)', ok: true, cost: '$0.20', hash: '4ab8…77d1' },
-  { time: '11:15', p: ['instagram'], asset: 'linear-gradient(135deg,#2a1b4a,#AF52DE)', ok: false, cost: '—', hash: 'c19e…02ba' },
-  { time: '09:30', p: ['pinterest'], asset: 'linear-gradient(135deg,#3a1b2a,#FF3B30)', ok: true, cost: '1 pin', hash: '7d10…aa3f' },
-  { time: 'Yest 18:00', p: ['tiktok'], asset: 'linear-gradient(135deg,#1b3a2a,#1F8A5B)', ok: true, cost: '1 token', hash: 'b81e…e3a1' },
-];
-
-function LedgerTab() {
-  return (
-    <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '90px 60px 1.4fr 0.9fr 0.8fr 1fr', gap: 14, padding: '11px 18px', borderBottom: '0.5px solid var(--separator)', background: 'var(--fill-tertiary)' }}>
-        {['Time', 'Asset', 'Platforms', 'Outcome', 'Cost', 'Provenance'].map((h, i) => <span key={i} style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{h}</span>)}
-      </div>
-      {LEDGER.map((r, i) => (
-        <div key={i} style={{ display: 'grid', gridTemplateColumns: '90px 60px 1.4fr 0.9fr 0.8fr 1fr', gap: 14, alignItems: 'center', padding: '12px 18px', borderBottom: i < LEDGER.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
-          <span style={{ font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{r.time}</span>
-          <span style={{ width: 30, height: 30, borderRadius: 7, background: r.asset, border: '0.5px solid var(--separator)' }} />
-          <span style={{ display: 'flex', gap: 6 }}>{r.p.map(p => <PlatChip key={p} p={p} small />)}</span>
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '600 var(--fs-footnote)/1 var(--font-text)', color: r.ok ? 'var(--green)' : 'var(--red)' }}>
-            <Icon name={r.ok ? 'checkCircle' : 'xCircle'} size={15} /> {r.ok ? 'Published' : 'Failed'}{!r.ok && <button className="link-btn" style={{ color: 'var(--blue)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Retry</button>}
-          </span>
-          <span style={{ font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)' }}>{r.cost}</span>
-          <span style={{ font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{r.hash}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Command palette (inlined from cc-palette — not exported by the shared lib)
-// ──────────────────────────────────────────────────────────────────────────
-
-interface PaletteItem { group: string; icon: IconName; label: string; hint: string }
-
-const PALETTE_ITEMS: PaletteItem[] = [
-  { group: 'Actions', icon: 'play', label: 'Run job…', hint: 'Start a new job in a project' },
-  { group: 'Actions', icon: 'plus', label: 'New project…', hint: 'From a template' },
-  { group: 'Actions', icon: 'calendar', label: 'Schedule a run…', hint: 'Pick time & cadence' },
-  { group: 'Actions', icon: 'gauge', label: 'Adjust budget cap…', hint: 'Workspace or project' },
-  { group: 'Recent', icon: 'gitMerge', label: 'Merge PR #482 — auth refactor', hint: 'Atlas API' },
-  { group: 'Recent', icon: 'send', label: 'Publish “Launch week” thread', hint: 'Q3 Content' },
-  { group: 'Recent', icon: 'telescope', label: 'Competitor digest', hint: 'Market Scan' },
-  { group: 'Jump to', icon: 'layers', label: 'Projects', hint: '⌘2' },
-  { group: 'Jump to', icon: 'shield', label: 'Approvals', hint: '⌘4' },
-];
-
-function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [q, setQ] = React.useState('');
-  const [sel, setSel] = React.useState(0);
-  const inputRef = React.useRef<HTMLInputElement>(null);
-
-  React.useEffect(() => {
-    if (open) { setQ(''); setSel(0); setTimeout(() => inputRef.current && inputRef.current.focus(), 60); }
-  }, [open]);
-
-  const filtered = PALETTE_ITEMS.filter(it => it.label.toLowerCase().includes(q.toLowerCase()) || it.hint.toLowerCase().includes(q.toLowerCase()));
-  const groups = filtered.reduce((acc, it) => { (acc[it.group] = acc[it.group] || []).push(it); return acc; }, {} as Record<string, PaletteItem[]>);
-  const flat = filtered;
-
-  const onKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => Math.min(flat.length - 1, s + 1)); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => Math.max(0, s - 1)); }
-    else if (e.key === 'Escape') { onClose(); }
-    else if (e.key === 'Enter') { onClose(); }
+  const saveCaption = () => { if (caption !== d.caption) void api.updateDraft(d.id, { caption }).then(onChanged).catch(() => {}); };
+  const togglePlatform = (k: string) => {
+    const next = platforms.includes(k) ? platforms.filter(x => x !== k) : [...platforms, k];
+    setPlatforms(next);
+    void api.updateDraft(d.id, { platforms: next }).then(onChanged).catch(() => {});
   };
+  const act = (fn: () => Promise<unknown>) => { setBusy(true); void fn().then(onChanged).catch(() => {}).finally(() => setBusy(false)); };
 
-  if (!open) return null;
-  let idx = -1;
+  const done = d.status === 'exported' || d.status === 'published-manual';
   return (
-    <div onMouseDown={onClose} style={{
-      position: 'absolute', inset: 0, zIndex: 80, display: 'flex', justifyContent: 'center', paddingTop: 132,
-      background: 'rgba(10,12,24,0.28)', backdropFilter: 'blur(3px)', WebkitBackdropFilter: 'blur(3px)',
-    }}>
-      <div onMouseDown={e => e.stopPropagation()} style={{
-        width: 640, maxHeight: 460, alignSelf: 'flex-start', display: 'flex', flexDirection: 'column',
-        background: 'var(--bg-elevated)', borderRadius: 16, border: '0.5px solid var(--glass-border)',
-        backdropFilter: 'blur(40px) saturate(180%)', WebkitBackdropFilter: 'blur(40px) saturate(180%)',
-        boxShadow: '0 30px 80px rgba(10,15,40,0.45), var(--glass-inner)', overflow: 'hidden',
-        animation: 'palettePop 200ms var(--spring)',
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '16px 18px', borderBottom: '0.5px solid var(--separator)' }}>
-          <Icon name="search" size={19} style={{ color: 'var(--ink-tertiary)' }} />
-          <input ref={inputRef} value={q} onChange={e => { setQ(e.target.value); setSel(0); }} onKeyDown={onKey}
-            placeholder="Search commands, projects, jobs…"
-            style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent',
-              font: '400 var(--fs-title2)/1 var(--font-text)', color: 'var(--ink)' }} />
-          <span style={{ padding: '3px 7px', borderRadius: 5, background: 'var(--fill-secondary)', font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>esc</span>
+    <div data-draft={d.id} className="draft-card" style={{ background: 'var(--bg-elevated)', borderRadius: 16, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ aspectRatio: asset?.kind === 'image' ? '1/1' : '16/9', background: 'var(--fill-secondary)', position: 'relative' }}>
+        <AssetThumb a={asset} />
+        <span style={{ position: 'absolute', top: 8, left: 8, display: 'inline-flex', alignItems: 'center', gap: 5, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)', background: 'rgba(10,12,24,0.6)', color: '#fff', font: '600 var(--fs-caption)/1 var(--font-text)', backdropFilter: 'blur(8px)' }}>
+          {d.status === 'scheduled' ? `Scheduled` : d.status === 'exported' ? 'Exported' : d.status === 'published-manual' ? 'Published' : 'Draft'}
+        </span>
+      </div>
+      <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 12, flex: 1 }}>
+        <textarea value={caption} onChange={e => setCaption(e.target.value)} onBlur={saveCaption} rows={2} placeholder="Write a caption…"
+          style={{ width: '100%', boxSizing: 'border-box', border: '1px solid var(--separator)', borderRadius: 10, outline: 'none', background: 'var(--bg)', resize: 'vertical', font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink)', padding: 10, minHeight: 52 }} />
+
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          {PLATFORM_KEYS.map(k => {
+            const on = platforms.includes(k);
+            return <button key={k} title={PLATFORMS[k].name} onClick={() => togglePlatform(k)} style={{ width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center',
+              background: on ? 'color-mix(in srgb, var(--blue) 14%, transparent)' : 'var(--fill-secondary)', border: `1px solid ${on ? 'var(--blue)' : 'transparent'}`, color: on ? PLATFORMS[k].tint : 'var(--ink-tertiary)' }}><PGlyph p={k} size={15} /></button>;
+          })}
         </div>
 
-        <div style={{ overflowY: 'auto', padding: 8 }}>
-          {flat.length === 0 && (
-            <div style={{ padding: '28px 0', textAlign: 'center', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No matches</div>
-          )}
-          {Object.entries(groups).map(([group, items]) => (
-            <div key={group} style={{ marginBottom: 6 }}>
-              <div style={{ padding: '6px 10px 4px', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{group}</div>
-              {items.map(it => {
-                idx++; const active = idx === sel; const myIdx = idx;
-                return (
-                  <div key={it.label} onMouseEnter={() => setSel(myIdx)} onMouseDown={onClose} style={{
-                    display: 'flex', alignItems: 'center', gap: 11, height: 42, padding: '0 10px', borderRadius: 9, cursor: 'pointer',
-                    background: active ? 'var(--blue)' : 'transparent',
-                  }}>
-                    <span style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', flexShrink: 0,
-                      background: active ? 'rgba(255,255,255,0.2)' : 'var(--fill-secondary)', color: active ? '#fff' : 'var(--ink-secondary)' }}>
-                      <Icon name={it.icon} size={16} />
-                    </span>
-                    <span style={{ flex: 1, font: '500 var(--fs-callout)/1.1 var(--font-text)', color: active ? '#fff' : 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{it.label}</span>
-                    <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: active ? 'rgba(255,255,255,0.8)' : 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{it.hint}</span>
-                    {active && <Icon name="enter" size={15} style={{ color: 'rgba(255,255,255,0.9)' }} />}
-                  </div>
-                );
-              })}
-            </div>
-          ))}
-        </div>
+        <div style={{ font: '400 var(--fs-caption)/1.3 var(--font-mono)', color: 'var(--ink-tertiary)' }}>provenance · {d.provenance || 'n/a'}</div>
+
+        {!done && (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button disabled={busy} onClick={() => act(() => api.exportDraft(d.id))} className="primary-cta" style={{ flex: 1, height: 34, minWidth: 110, borderRadius: 9, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Export now</button>
+            <input type="datetime-local" value={when} onChange={e => setWhen(e.target.value)} style={{ height: 34, borderRadius: 9, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-caption)/1 var(--font-mono)', padding: '0 6px' }} />
+            <button disabled={busy || !when} onClick={() => act(() => api.scheduleDraft(d.id, new Date(when).getTime()))} className="ghost-btn" style={{ height: 34, padding: '0 12px', borderRadius: 9, background: 'var(--fill-secondary)', color: when ? 'var(--ink)' : 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Schedule</button>
+            <button disabled={busy} onClick={() => act(() => api.deleteDraft(d.id))} title="Delete" style={{ width: 34, height: 34, borderRadius: 9, background: 'transparent', color: 'var(--ink-tertiary)', display: 'grid', placeItems: 'center' }}><Icon name="x" size={15} /></button>
+          </div>
+        )}
+        {d.status === 'scheduled' && d.scheduledAt && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ flex: 1, font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--orange)' }}><Icon name="clock" size={13} /> Fires {new Date(d.scheduledAt).toLocaleString()}</span>
+            <button onClick={() => act(() => api.updateDraft(d.id, { status: 'draft', scheduledAt: null }))} className="ghost-btn" style={{ height: 30, padding: '0 11px', borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Unschedule</button>
+          </div>
+        )}
+        {d.status === 'exported' && (
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={() => act(() => api.markPublished(d.id))} className="primary-cta" style={{ flex: 1, height: 34, borderRadius: 9, background: 'var(--green)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>I posted it — mark published</button>
+            {IS_LOCAL && d.exportedPaths[0] && <button onClick={() => api.revealPath(d.exportedPaths[0])} title="Reveal export" style={{ width: 34, height: 34, borderRadius: 9, background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', display: 'grid', placeItems: 'center' }}><Icon name="folder" size={15} /></button>}
+          </div>
+        )}
+        {d.status === 'published-manual' && <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--green)' }}><Icon name="check" size={14} stroke={2.6} /> Marked published</div>}
       </div>
     </div>
   );
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Publishing Center page root (pub-app)
-// ──────────────────────────────────────────────────────────────────────────
-
-interface PubTab { key: string; label: string; icon: IconName }
-
-const PUB_TABS: PubTab[] = [
-  { key: 'drafts', label: 'Drafts', icon: 'play' },
-  { key: 'calendar', label: 'Calendar', icon: 'calendar' },
-  { key: 'platforms', label: 'Platforms', icon: 'send' },
-  { key: 'ledger', label: 'Ledger', icon: 'jobs' },
-];
+function clockOf(ts: number): string { const d = new Date(ts); return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; }
 
 export default function PublishingCenter() {
-  const [tab, setTab] = React.useState('drafts');
-  const [toast, setToast] = React.useState(false);
-  const [paletteOpen, setPaletteOpen] = React.useState(false);
-  const tabIdx = PUB_TABS.findIndex(t => t.key === tab);
+  const [tab, setTab] = React.useState<'drafts' | 'scheduled' | 'ledger'>('drafts');
+  const [drafts, setDrafts] = React.useState<PublishDraft[]>([]);
+  const [assets, setAssets] = React.useState<Record<string, Asset>>({});
+  const [ledger, setLedger] = React.useState<PublishLedgerRow[]>([]);
 
-  React.useEffect(() => {
-    const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
-    window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
+  const refetch = React.useCallback(() => {
+    api.listPublishDrafts().then(setDrafts).catch(() => {});
+    api.listAssets().then(list => setAssets(Object.fromEntries(list.map(a => [a.id, a])))).catch(() => {});
+    api.listPublishLedger().then(setLedger).catch(() => {});
   }, []);
+  React.useEffect(() => {
+    refetch();
+    const unsub = api.subscribe({ onPublishDraft: refetch, onAsset: refetch });
+    return unsub;
+  }, [refetch]);
 
-  const approve = (id: string) => {
-    const card = document.querySelector(`[data-draft="${id}"]`);
-    if (card) { card.classList.add('fly-out'); setTimeout(() => { setToast(true); setTimeout(() => setToast(false), 2400); card.classList.remove('fly-out'); }, 360); }
-  };
+  // Approved Studio assets that don't have a draft yet → "ready to draft".
+  const draftedAssetIds = new Set(drafts.map(d => d.assetId));
+  const readyAssets = Object.values(assets).filter(a => a.status === 'approved' && !draftedAssetIds.has(a.id));
+
+  const importFile = () => { void api.importAsset(null).then(a => { if (a) void api.createDraft({ assetId: a.id }).then(refetch); }).catch(() => {}); };
+
+  const scheduled = drafts.filter(d => d.status === 'scheduled').sort((a, b) => (a.scheduledAt ?? 0) - (b.scheduledAt ?? 0));
+  const activeDrafts = drafts.filter(d => d.status !== 'published-manual');
+
+  const TABS = [['drafts', 'Drafts'], ['scheduled', 'Scheduled'], ['ledger', 'Ledger']] as const;
 
   return (
-    <AppShell active="publishing" onSearch={() => setPaletteOpen(true)}>
+    <AppShell active="publishing" onSearch={() => {}}>
       <style>{PUBLISHING_CSS}</style>
-
       <div style={{ padding: '24px 28px 36px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 20 }}>
-          <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Publishing</h1>
-          <span style={{ flex: 1 }} />
-          {/* segmented */}
-          <div style={{ position: 'relative', display: 'inline-flex', padding: 3, background: 'var(--fill-secondary)', borderRadius: 11 }}>
-            <div style={{ position: 'absolute', top: 3, bottom: 3, left: `calc(${tabIdx} * 110px + 3px)`, width: 110, background: 'var(--bg-elevated)', borderRadius: 8, boxShadow: '0 1px 3px rgba(0,0,0,0.14)', transition: 'left 280ms var(--spring)' }} />
-            {PUB_TABS.map(t => (
-              <button key={t.key} onClick={() => setTab(t.key)} style={{ position: 'relative', zIndex: 1, width: 110, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6, padding: '8px 0',
-                font: `${tab === t.key ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`, color: tab === t.key ? 'var(--ink)' : 'var(--ink-secondary)' }}>
-                <Icon name={t.icon} size={15} /> {t.label}
-              </button>
-            ))}
+        <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 16, marginBottom: 8, flexWrap: 'wrap' }}>
+          <div>
+            <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Publishing</h1>
+            <p style={{ margin: '6px 0 0', font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Export approved media + captions to ~/Maestro/Exports. Nothing posts without you.</p>
           </div>
+          {IS_LOCAL && <button onClick={importFile} className="ghost-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 38, padding: '0 15px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}><Icon name="plus" size={16} /> Import media</button>}
+        </div>
+
+        <div style={{ display: 'inline-flex', padding: 3, background: 'var(--fill-secondary)', borderRadius: 11, margin: '18px 0 20px' }}>
+          {TABS.map(([k, label]) => (
+            <button key={k} onClick={() => setTab(k)} style={{ width: 116, padding: '8px 0', textAlign: 'center', borderRadius: 8, font: `${tab === k ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`, color: tab === k ? 'var(--ink)' : 'var(--ink-secondary)', background: tab === k ? 'var(--bg-elevated)' : 'transparent', boxShadow: tab === k ? '0 1px 3px rgba(0,0,0,0.14)' : 'none' }}>{label}{k === 'scheduled' && scheduled.length > 0 ? ` · ${scheduled.length}` : ''}</button>
+          ))}
         </div>
 
         <div key={tab} className="tab-fade">
-          {tab === 'drafts' && <React.Fragment>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
-              <Icon name="shield" size={14} style={{ color: 'var(--green)' }} /> The studio's output lands here first. Nothing publishes without you.
-            </div>
-            <DraftsGrid onApprove={approve} />
-          </React.Fragment>}
-          {tab === 'calendar' && <PubCalendar />}
-          {tab === 'platforms' && <PlatformsTab />}
-          {tab === 'ledger' && <React.Fragment>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-              <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>Append-only · read-only · exportable</span>
-              <span style={{ flex: 1 }} />
-              <button className="ghost-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}><Icon name="enter" size={14} style={{ transform: 'rotate(-90deg)' }} /> Export</button>
-            </div>
-            <LedgerTab />
-          </React.Fragment>}
+          {tab === 'drafts' && (
+            <>
+              {readyAssets.length > 0 && (
+                <div style={{ marginBottom: 22 }}>
+                  <div style={{ font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-secondary)', marginBottom: 11 }}>Approved · ready to draft</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 12 }}>
+                    {readyAssets.map(a => (
+                      <button key={a.id} onClick={() => void api.createDraft({ assetId: a.id }).then(refetch)} className="draft-card" style={{ textAlign: 'left', background: 'var(--bg-elevated)', borderRadius: 14, border: '0.5px solid var(--separator)', overflow: 'hidden', padding: 0, cursor: 'pointer' }}>
+                        <div style={{ aspectRatio: '16/9', background: 'var(--fill-secondary)' }}><AssetThumb a={a} /></div>
+                        <div style={{ padding: '9px 11px', display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span style={{ flex: 1, font: '500 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.prompt || a.name || a.kind}</span>
+                          <Icon name="plus" size={14} style={{ color: 'var(--blue)' }} />
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {activeDrafts.length === 0 && readyAssets.length === 0 ? (
+                <div style={{ padding: '52px 0', textAlign: 'center', background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', font: '400 var(--fs-callout)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                  No drafts yet. Approve media in the Studio (Send to Publishing){IS_LOCAL ? ', or import a local file' : ''} to start.
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 16 }}>
+                  {activeDrafts.map(d => <DraftCard key={d.id} d={d} asset={assets[d.assetId]} onChanged={refetch} />)}
+                </div>
+              )}
+            </>
+          )}
+
+          {tab === 'scheduled' && (
+            scheduled.length === 0 ? <div style={{ padding: '52px 0', textAlign: 'center', background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Nothing scheduled. Set a time on a draft to queue its export.</div>
+            : <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {scheduled.map(d => (
+                  <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: 14, borderRadius: 14, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)' }}>
+                    <div style={{ width: 64, height: 40, borderRadius: 9, overflow: 'hidden', flexShrink: 0, background: 'var(--fill-secondary)' }}><AssetThumb a={assets[d.assetId]} /></div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.caption || 'Untitled'}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>{d.platforms.map(p => PLATFORMS[p as PlatformKey] && <span key={p} style={{ color: PLATFORMS[p as PlatformKey].tint }}><PGlyph p={p as PlatformKey} size={13} /></span>)}<span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--orange)', marginLeft: 4 }}>{d.scheduledAt ? new Date(d.scheduledAt).toLocaleString() : ''}</span></div>
+                    </div>
+                    <button onClick={() => void api.exportDraft(d.id).then(refetch)} className="ghost-btn" style={{ height: 32, padding: '0 12px', borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Export now</button>
+                  </div>
+                ))}
+              </div>
+          )}
+
+          {tab === 'ledger' && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 11 }}>
+                <span style={{ flex: 1, font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-secondary)' }}>Provenance ledger</span>
+                {ledger.length > 0 && <button onClick={() => { try { navigator.clipboard.writeText(JSON.stringify(ledger, null, 2)); } catch { /* */ } }} className="ghost-btn" style={{ height: 30, padding: '0 11px', borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Copy JSON</button>}
+              </div>
+              {ledger.length === 0 ? <div style={{ padding: '48px 0', textAlign: 'center', background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No exports yet. Every export and manual-publish is logged here with a hash.</div>
+              : <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '110px 1fr 1.2fr 90px', gap: 14, padding: '11px 18px', borderBottom: '0.5px solid var(--separator)', background: 'var(--fill-tertiary)' }}>
+                    {['Time', 'Action', 'Platforms', 'Hash'].map(h => <span key={h} style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{h}</span>)}
+                  </div>
+                  {ledger.map((r, i) => (
+                    <div key={r.id} className="led-row" style={{ display: 'grid', gridTemplateColumns: '110px 1fr 1.2fr 90px', gap: 14, alignItems: 'center', padding: '12px 18px', borderBottom: i < ledger.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
+                      <span style={{ font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{clockOf(r.at)}</span>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-footnote)/1 var(--font-text)', color: r.ok ? 'var(--ink)' : 'var(--red)' }}><Icon name={r.action === 'published-manual' ? 'check' : 'enter'} size={13} style={{ color: r.ok ? 'var(--green)' : 'var(--red)' }} />{r.action === 'published-manual' ? 'Published' : 'Exported'}</span>
+                      <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{r.platforms.join(', ') || '—'}</span>
+                      <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{r.hash.slice(0, 8)}</span>
+                    </div>
+                  ))}
+                </div>}
+              <div style={{ marginTop: 16, padding: '12px 14px', borderRadius: 12, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                Maestro exports to Finder rather than posting for you — so there are no platform tokens to leak and you stay in control of every post.
+              </div>
+            </>
+          )}
         </div>
       </div>
-
-      {toast && (
-        <div className="toast" style={{ position: 'absolute', bottom: 24, left: '50%', transform: 'translateX(-50%)', zIndex: 90, display: 'inline-flex', alignItems: 'center', gap: 10, height: 46, padding: '0 18px', borderRadius: 'var(--r-pill)', background: 'var(--on-glass)', color: 'var(--bg-elevated)', boxShadow: '0 12px 32px rgba(10,15,40,0.4)' }}>
-          <span style={{ width: 20, height: 20, borderRadius: '50%', background: 'var(--green)', display: 'grid', placeItems: 'center' }}><Icon name="calendar" size={12} style={{ color: '#fff' }} /></span>
-          <span style={{ font: '600 var(--fs-subhead)/1 var(--font-text)' }}>Scheduled · added to the calendar</span>
-        </div>
-      )}
-      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>
   );
 }

@@ -6,6 +6,7 @@ import type { Store, Effort, ApprovalStatus, EngineId, Routing, AppSettings, Pro
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
 import type { ResearchEngine } from './research.js';
+import type { PublishingEngine } from './publishing.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable } from './git.js';
 
@@ -20,7 +21,7 @@ function asEngine(v: unknown): EngineId | undefined {
   return typeof v === 'string' && ENGINE_VALUES.has(v) ? (v as EngineId) : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -227,6 +228,35 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'listBriefs': return store.listBriefs();
       case 'listResearchRuns': return store.listResearchRuns();
       case 'markBriefSent': { const b = store.setBriefStatus(String(p.id ?? ''), 'sent-to-studio'); emit('briefs', [b]); return b; }
+
+      // ── Publishing (local export pipeline) ─────────────────────
+      case 'listPublishDrafts': return store.listPublishDrafts();
+      case 'listPublishLedger': return store.listPublishLedger();
+      case 'importAsset': return publishing.importAsset(String(p.path ?? ''), (p.projectId as string) ?? null);
+      case 'createDraft': {
+        if (!p.assetId) bad('assetId required');
+        return publishing.createDraft({ assetId: String(p.assetId), caption: typeof p.caption === 'string' ? p.caption : undefined, platforms: Array.isArray(p.platforms) ? (p.platforms as string[]) : undefined });
+      }
+      case 'updateDraft': {
+        const patch: Record<string, unknown> = {};
+        if (typeof p.caption === 'string') patch.caption = p.caption;
+        if (Array.isArray(p.platforms)) patch.platforms = p.platforms;
+        if (typeof p.scheduledAt === 'number' || p.scheduledAt === null) patch.scheduledAt = p.scheduledAt;
+        if (p.status === 'draft' || p.status === 'approved' || p.status === 'scheduled') patch.status = p.status;
+        const d = store.updatePublishDraft(String(p.id ?? ''), patch);
+        emit('publishDraft', d);
+        return d;
+      }
+      case 'deleteDraft': { store.deletePublishDraft(String(p.id ?? '')); return { ok: true }; }
+      case 'scheduleDraft': {
+        const at = Number(p.scheduledAt);
+        if (!Number.isFinite(at)) bad('scheduledAt required');
+        const d = store.updatePublishDraft(String(p.id ?? ''), { status: 'scheduled', scheduledAt: at });
+        emit('publishDraft', d);
+        return d;
+      }
+      case 'exportDraft': return publishing.exportDraft(String(p.id ?? ''));
+      case 'markPublished': return publishing.markPublished(String(p.id ?? ''));
 
       // ── Engine status (THE single source of truth) ────────────
       case 'engineStatus': return engine.statuses();

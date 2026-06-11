@@ -193,6 +193,12 @@ export interface Brief {
   confidence: number; sources: string[]; status: 'ready' | 'sent-to-studio' | 'raw'; jobId: string; createdAt: number;
 }
 export interface ResearchRun { id: string; topic: string; jobId: string; status: 'running' | 'done' | 'failed'; briefCount: number; at: number }
+export type PublishStatus = 'draft' | 'approved' | 'scheduled' | 'exported' | 'published-manual';
+export interface PublishDraft {
+  id: string; assetId: string; caption: string; platforms: string[]; scheduledAt: number | null;
+  status: PublishStatus; provenance: string; exportedPaths: string[]; createdAt: number; updatedAt: number;
+}
+export interface PublishLedgerRow { id: string; draftId: string; at: number; platforms: string[]; action: 'exported' | 'published-manual'; ok: boolean; hash: string; paths: string[] }
 export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
 export interface FolderInspect { ok: boolean; path: string; info: RepoInfo; error?: string }
 export type CloneEvent =
@@ -222,6 +228,7 @@ interface Bridge {
   onEvent?: (cb: (e: { name: string; data: unknown }) => void) => () => void;
   pickFolder?: () => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   revealPath?: (p: string) => Promise<{ ok: boolean; error?: string }>;
+  importAsset?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
 }
 const bridge: Bridge | undefined =
   typeof window !== 'undefined' ? (window as unknown as { maestro?: Bridge }).maestro : undefined;
@@ -375,6 +382,26 @@ export const api = {
   listResearchRuns: () => call<ResearchRun[]>('listResearchRuns', {}, () => req<ResearchRun[]>('/api/research-runs')),
   markBriefSent: (id: string) => call<Brief>('markBriefSent', { id }, () => req<Brief>(`/api/briefs/${encodeURIComponent(id)}/sent`, { method: 'POST' })),
 
+  // Publishing (local export pipeline)
+  listPublishDrafts: () => call<PublishDraft[]>('listPublishDrafts', {}, () => req<PublishDraft[]>('/api/publish/drafts')),
+  listPublishLedger: () => call<PublishLedgerRow[]>('listPublishLedger', {}, () => req<PublishLedgerRow[]>('/api/publish/ledger')),
+  createDraft: (input: { assetId: string; caption?: string; platforms?: string[] }) =>
+    call<PublishDraft>('createDraft', { ...input }, () => req<PublishDraft>('/api/publish/drafts', { method: 'POST', body: JSON.stringify(input) })),
+  updateDraft: (id: string, patch: { caption?: string; platforms?: string[]; scheduledAt?: number | null; status?: PublishStatus }) =>
+    call<PublishDraft>('updateDraft', { id, ...patch }, () => req<PublishDraft>(`/api/publish/drafts/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
+  scheduleDraft: (id: string, scheduledAt: number) =>
+    call<PublishDraft>('scheduleDraft', { id, scheduledAt }, () => req<PublishDraft>(`/api/publish/drafts/${encodeURIComponent(id)}/schedule`, { method: 'POST', body: JSON.stringify({ scheduledAt }) })),
+  exportDraft: (id: string) => call<PublishDraft>('exportDraft', { id }, () => req<PublishDraft>(`/api/publish/drafts/${encodeURIComponent(id)}/export`, { method: 'POST' })),
+  markPublished: (id: string) => call<PublishDraft>('markPublished', { id }, () => req<PublishDraft>(`/api/publish/drafts/${encodeURIComponent(id)}/published`, { method: 'POST' })),
+  deleteDraft: (id: string) => call<{ ok: boolean }>('deleteDraft', { id }, () => req<{ ok: boolean }>(`/api/publish/drafts/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
+  /** Native import picker — desktop only; resolves the imported asset or null. */
+  importAsset: async (projectId: string | null): Promise<Asset | null> => {
+    if (!bridge?.importAsset) return null;
+    const r = await bridge.importAsset(projectId);
+    if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'failed');
+    return (r.data as Asset | null) ?? null;
+  },
+
   // Jobs — in the desktop app these EXECUTE on this Mac (Claude Code login)
   listJobs: (projectId?: string) =>
     call<Job[]>('listJobs', { projectId }, () => req<Job[]>('/api/jobs' + qp({ projectId }))),
@@ -441,7 +468,7 @@ export const api = {
     call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
@@ -450,6 +477,7 @@ export const api = {
         if (name === 'clone' && handlers.onClone) handlers.onClone(data as CloneEvent);
         if (name === 'asset' && handlers.onAsset) handlers.onAsset(data as Asset);
         if (name === 'briefs' && handlers.onBriefs) handlers.onBriefs(data as Brief[]);
+        if (name === 'publishDraft' && handlers.onPublishDraft) handlers.onPublishDraft(data as PublishDraft);
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
@@ -460,6 +488,7 @@ export const api = {
     if (handlers.onClone) es.addEventListener('clone', (e: MessageEvent) => { try { handlers.onClone!(JSON.parse(e.data) as CloneEvent); } catch { /* ignore */ } });
     if (handlers.onAsset) es.addEventListener('asset', (e: MessageEvent) => { try { handlers.onAsset!(JSON.parse(e.data) as Asset); } catch { /* ignore */ } });
     if (handlers.onBriefs) es.addEventListener('briefs', (e: MessageEvent) => { try { handlers.onBriefs!(JSON.parse(e.data) as Brief[]); } catch { /* ignore */ } });
+    if (handlers.onPublishDraft) es.addEventListener('publishDraft', (e: MessageEvent) => { try { handlers.onPublishDraft!(JSON.parse(e.data) as PublishDraft); } catch { /* ignore */ } });
     return () => es.close();
   },
   /** Convenience: subscribe to job updates only. */

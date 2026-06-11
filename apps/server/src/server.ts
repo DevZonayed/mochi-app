@@ -239,6 +239,15 @@ export function buildServer(): FastifyInstance {
   app.get('/api/research-runs', async () => st()?.researchRuns ?? []);
   app.post('/api/research/run', async (req, reply) => forward(reply, 'runResearch', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/briefs/:id/sent', async (req, reply) => forward(reply, 'markBriefSent', { id: (req.params as { id: string }).id }));
+  // ── Publishing (drafts mirror; actions forward to the Mac's local pipeline) ──
+  app.get('/api/publish/drafts', async () => st()?.publishDrafts ?? []);
+  app.get('/api/publish/ledger', async () => st()?.publishLedger ?? []);
+  app.post('/api/publish/drafts', async (req, reply) => forward(reply, 'createDraft', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/publish/drafts/:id/update', async (req, reply) => forward(reply, 'updateDraft', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
+  app.post('/api/publish/drafts/:id/schedule', async (req, reply) => forward(reply, 'scheduleDraft', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
+  app.post('/api/publish/drafts/:id/export', async (req, reply) => forward(reply, 'exportDraft', { id: (req.params as { id: string }).id }));
+  app.post('/api/publish/drafts/:id/published', async (req, reply) => forward(reply, 'markPublished', { id: (req.params as { id: string }).id }));
+  app.post('/api/publish/drafts/:id/delete', async (req, reply) => forward(reply, 'deleteDraft', { id: (req.params as { id: string }).id }));
   app.post('/api/assets/generate', async (req, reply) => forward(reply, 'generateAsset', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/assets/:id/cancel', async (req, reply) => forward(reply, 'cancelAsset', { id: (req.params as { id: string }).id }));
   app.post('/api/assets/:id/approve', async (req, reply) => forward(reply, 'approveAsset', { id: (req.params as { id: string }).id }));

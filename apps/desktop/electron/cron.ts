@@ -39,7 +39,8 @@ export function nextOccurrence(s: Schedule, from: number): number | null {
 export class CronRunner {
   private timer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(private store: Store, private engine: LocalEngine, private emit: (name: string, data: unknown) => void) {}
+  /** firePublish: optional hook to export scheduled publish drafts whose time has come. */
+  constructor(private store: Store, private engine: LocalEngine, private emit: (name: string, data: unknown) => void, private firePublish?: (nowMs: number) => void) {}
 
   start(): void {
     // Initialise nextRun for display, forward-only from now.
@@ -57,6 +58,8 @@ export class CronRunner {
 
   private tick(): void {
     const now = Date.now();
+    // Fire any due scheduled publish drafts first (cheap, local).
+    try { this.firePublish?.(now); } catch { /* non-fatal */ }
     for (const s of this.store.listSchedules()) {
       if (!s.enabled) { this.store.setScheduleNextRun(s.id, null); continue; }
       let next = s.nextRun ?? nextOccurrence(s, now);
