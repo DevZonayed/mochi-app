@@ -97,6 +97,17 @@ export interface ProviderConn {
   keyLast4?: string;
   createdAt: number;
 }
+export type EngineId = 'claude' | 'codex';
+export interface Routing {
+  master: EngineId;
+  reviewer: EngineId | 'off';
+  image: EngineId;
+  video: EngineId;
+}
+export interface PairingInfo {
+  token: string;
+  relayUrl: string;
+}
 export interface DashboardData {
   workspace: Workspace | null;
   greetingProjects: { id: string; name: string; color: string }[];
@@ -133,13 +144,44 @@ const bridge: Bridge | undefined =
 /** True when running inside the desktop app (local core owns everything). */
 export const IS_LOCAL = Boolean(bridge?.call);
 
+/* ── Remote pairing token (browser builds only) ───────────────────────
+   The relay requires the Mac's pairing token on every /api/* call. Web
+   remotes pick it up from ?token=… once (then it's persisted + stripped)
+   or from localStorage; it rides as a Bearer header / SSE query param. */
+const TOKEN_KEY = 'maestro.remote.token';
+function bootstrapRemoteToken(): string {
+  if (IS_LOCAL || typeof window === 'undefined') return '';
+  try {
+    const url = new URL(window.location.href);
+    const fromUrl = url.searchParams.get('token');
+    if (fromUrl) {
+      localStorage.setItem(TOKEN_KEY, fromUrl.trim());
+      url.searchParams.delete('token');
+      window.history.replaceState(null, '', url.toString());
+    }
+    return localStorage.getItem(TOKEN_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+let remoteToken = bootstrapRemoteToken();
+export function getRemoteToken(): string { return remoteToken; }
+export function setRemoteToken(token: string): void {
+  remoteToken = token.trim();
+  try { localStorage.setItem(TOKEN_KEY, remoteToken); } catch { /* storage unavailable */ }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   // Only send a JSON content-type when there's actually a body — otherwise
   // Fastify rejects the empty body (FST_ERR_CTP_EMPTY_JSON_BODY) on bodyless POSTs.
   const hasBody = init?.body != null;
   const res = await fetch(API_BASE + path, {
     ...init,
-    headers: { ...(hasBody ? { 'content-type': 'application/json' } : {}), ...(init?.headers ?? {}) },
+    headers: {
+      ...(hasBody ? { 'content-type': 'application/json' } : {}),
+      ...(remoteToken ? { authorization: `Bearer ${remoteToken}` } : {}),
+      ...(init?.headers ?? {}),
+    },
   });
   if (!res.ok) {
     let detail = res.statusText;
@@ -209,10 +251,10 @@ export const api = {
     call<Job>('createJob', { ...input }, () =>
       req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) })),
   getJob: (id: string) => call<Job>('getJob', { id }, () => req<Job>(`/api/jobs/${encodeURIComponent(id)}`)),
-  runJob: (id: string, effort?: Effort) =>
-    call<Job>('runJob', { id, effort }, () =>
-      req<Job>(`/api/jobs/${encodeURIComponent(id)}/run`, { method: 'POST', body: JSON.stringify(effort ? { effort } : {}) })),
-  createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
+  runJob: (id: string, effort?: Effort, engine?: EngineId) =>
+    call<Job>('runJob', { id, effort, engine }, () =>
+      req<Job>(`/api/jobs/${encodeURIComponent(id)}/run`, { method: 'POST', body: JSON.stringify({ ...(effort ? { effort } : {}), ...(engine ? { engine } : {}) }) })),
+  createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort; engine?: EngineId }) =>
     call<Job>('createAndRunJob', { ...input }, () =>
       req<Job>('/api/jobs/run', { method: 'POST', body: JSON.stringify(input) })),
 
@@ -251,6 +293,16 @@ export const api = {
     call<{ ok: boolean }>('disconnectProvider', { provider, workspaceId }, () =>
       req<{ ok: boolean }>(`/api/providers/${provider}/disconnect`, { method: 'POST', body: JSON.stringify({ workspaceId }) })),
 
+  // Engine routing (which engine plays which role)
+  getRouting: () => call<Routing>('getRouting', {}, () => req<Routing>('/api/routing')),
+  setRouting: (patch: Partial<Routing>) =>
+    call<Routing>('setRouting', { ...patch }, () =>
+      req<Routing>('/api/routing', { method: 'POST', body: JSON.stringify(patch) })),
+
+  // Pairing (desktop-only — the code remotes must enter)
+  getPairing: () =>
+    call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
+
   /** Live updates: local core events in Electron, relay SSE in the browser. */
   subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void }): () => void {
     if (bridge?.onEvent) {
@@ -260,7 +312,7 @@ export const api = {
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
-    const es = new EventSource(API_BASE + '/api/stream');
+    const es = new EventSource(API_BASE + '/api/stream' + (remoteToken ? `?token=${encodeURIComponent(remoteToken)}` : ''));
     if (handlers.onJob) es.addEventListener('job', (e: MessageEvent) => { try { handlers.onJob!(JSON.parse(e.data) as Job); } catch { /* ignore */ } });
     if (handlers.onApproval) es.addEventListener('approval', (e: MessageEvent) => { try { handlers.onApproval!(JSON.parse(e.data) as Approval); } catch { /* ignore */ } });
     return () => es.close();

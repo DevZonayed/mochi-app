@@ -41,6 +41,8 @@ interface Pending {
 interface Deck {
   deckId: string;
   secret: string;
+  /** Pairing token remotes must present on every /api/* request. */
+  accessToken: string;
   ws: WebSocket | null;
   online: boolean;
   lastSeen: number;
@@ -70,6 +72,21 @@ export function buildServer(): FastifyInstance {
 
   // Single-operator product: one deck (the most recent Mac to register).
   let deck: Deck | null = null;
+
+  // ── Pairing-token auth on the whole remote surface ─────────────────
+  // The Mac sets the token (host hello). Remotes send it as a Bearer header
+  // or ?token= (the SSE EventSource can't set headers). /health and / stay open.
+  app.addHook('onRequest', async (req, reply) => {
+    const url = req.raw.url ?? '';
+    if (!url.startsWith('/api/')) return;
+    const expected = deck?.accessToken;
+    if (!expected) return reply.code(503).send({ error: 'No Mac paired yet — open the Maestro desktop app' });
+    const header = req.headers.authorization ?? '';
+    const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+    const qtoken = (req.query as { token?: string } | undefined)?.token ?? '';
+    const presented = bearer || qtoken;
+    if (presented !== expected) return reply.code(401).send({ error: 'Unauthorized — pair with the code shown in the Maestro desktop app' });
+  });
 
   // ── SSE fan-out to web clients ─────────────────────────────────────
   const sseClients = new Set<ServerResponse>();
@@ -118,7 +135,7 @@ export function buildServer(): FastifyInstance {
       let isHost = false;
 
       ws.on('message', (buf: Buffer | string) => {
-        let m: { type?: string; role?: string; deckId?: string; secret?: string; state?: Snapshot; name?: string; data?: unknown; id?: string; ok?: boolean; result?: unknown; error?: string; statusCode?: number };
+        let m: { type?: string; role?: string; deckId?: string; secret?: string; accessToken?: string; state?: Snapshot; name?: string; data?: unknown; id?: string; ok?: boolean; result?: unknown; error?: string; statusCode?: number };
         try { m = JSON.parse(String(buf)) as typeof m; } catch { return; }
 
         if (m.type === 'hello' && m.role === 'host' && m.deckId) {
@@ -128,9 +145,10 @@ export function buildServer(): FastifyInstance {
             return;
           }
           if (!deck || deck.deckId !== m.deckId) {
-            deck = { deckId: m.deckId, secret: m.secret ?? '', ws, online: true, lastSeen: Date.now(), state: deck?.state ?? null, pending: new Map() };
+            deck = { deckId: m.deckId, secret: m.secret ?? '', accessToken: m.accessToken ?? '', ws, online: true, lastSeen: Date.now(), state: deck?.state ?? null, pending: new Map() };
           } else {
             deck.ws = ws; deck.online = true; deck.lastSeen = Date.now();
+            if (m.accessToken) deck.accessToken = m.accessToken;
           }
           isHost = true;
           ws.send(JSON.stringify({ type: 'hello-ok' }));
@@ -214,6 +232,7 @@ export function buildServer(): FastifyInstance {
   app.get('/api/skills', async () => st()?.skills ?? []);
   app.get('/api/templates', async () => st()?.templates ?? []);
   app.get('/api/providers', async () => st()?.providers ?? []);
+  app.get('/api/routing', async () => (st() as { routing?: unknown } | null)?.routing ?? { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex' });
 
   // ── Writes — forwarded to the Mac, executed there ──────────────────
   app.post('/api/workspaces', async (req, reply) => forward(reply, 'createWorkspace', (req.body ?? {}) as Record<string, unknown>));
@@ -234,6 +253,7 @@ export function buildServer(): FastifyInstance {
     forward(reply, 'connectProvider', { ...(req.body ?? {}) as Record<string, unknown>, provider: (req.params as { provider: string }).provider }));
   app.post('/api/providers/:provider/disconnect', async (req, reply) =>
     forward(reply, 'disconnectProvider', { ...(req.body ?? {}) as Record<string, unknown>, provider: (req.params as { provider: string }).provider }));
+  app.post('/api/routing', async (req, reply) => forward(reply, 'setRouting', (req.body ?? {}) as Record<string, unknown>));
 
   // ── SSE stream (host events relayed to web clients) ────────────────
   app.get('/api/stream', (req, reply) => {

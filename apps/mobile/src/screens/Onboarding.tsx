@@ -1,12 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { View, Text, Pressable, Animated, Easing, type ViewStyle } from 'react-native';
+import { View, Text, Pressable, TextInput, Animated, Easing, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import Svg, { Rect, G } from 'react-native-svg';
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { MaestroMark } from '../Icon';
-import { api } from '../api';
+import { api, setPairToken, getPairToken } from '../api';
 import { setFlag, ONBOARDED } from '../storage';
 
 const BLUE = '#007AFF';
@@ -137,6 +137,13 @@ function Welcome({ insets, onNext }: { insets: { top: number; bottom: number }; 
 }
 
 function Scanner({ insets, onScan }: { insets: { top: number; bottom: number }; onScan: () => void }) {
+  const [entering, setEntering] = useState(false);
+  const [code, setCode] = useState(getPairToken());
+  const save = () => {
+    if (!code.trim()) return;
+    setPairToken(code);
+    onScan();
+  };
   return (
     <View style={{ flex: 1, alignItems: 'center', paddingTop: insets.top + 8 }}>
       <View style={{ paddingHorizontal: 32, alignItems: 'center' }}>
@@ -149,15 +156,34 @@ function Scanner({ insets, onScan }: { insets: { top: number; bottom: number }; 
           <ScanBracket corner="tr" />
           <ScanBracket corner="bl" />
           <ScanBracket corner="br" />
-          <Pressable onPress={onScan} style={{ position: 'absolute', top: 28, left: 28, right: 28, bottom: 28, borderRadius: 18, backgroundColor: '#fff', padding: 14, overflow: 'hidden' }}>
+          <Pressable onPress={() => setEntering(true)} style={{ position: 'absolute', top: 28, left: 28, right: 28, bottom: 28, borderRadius: 18, backgroundColor: '#fff', padding: 14, overflow: 'hidden' }}>
             <MQR size={146} />
             <ScanShimmer />
           </Pressable>
         </View>
       </View>
-      <Pressable hitSlop={8} style={{ marginBottom: insets.bottom + 28 }}>
-        <Text style={{ color: BLUE, fontSize: 16, fontWeight: '600' }}>Enter code instead</Text>
-      </Pressable>
+      {entering ? (
+        <View style={{ width: '100%', paddingHorizontal: 32, marginBottom: insets.bottom + 24 }}>
+          <TextInput
+            value={code}
+            onChangeText={setCode}
+            onSubmitEditing={save}
+            autoFocus
+            autoCapitalize="characters"
+            autoCorrect={false}
+            placeholder="XXXX-XXXX-XXXX"
+            placeholderTextColor="rgba(255,255,255,0.35)"
+            style={{ height: 52, borderRadius: 14, backgroundColor: 'rgba(255,255,255,0.1)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.25)', color: '#fff', fontSize: 18, fontWeight: '600', letterSpacing: 2, textAlign: 'center', marginBottom: 12 }}
+          />
+          <Pressable onPress={save} style={({ pressed }) => ({ height: 52, borderRadius: 980, backgroundColor: code.trim() ? BLUE : 'rgba(255,255,255,0.15)', alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.9 : 1 })}>
+            <Text style={{ color: '#fff', fontSize: 17, fontWeight: '600' }}>Pair with this code</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <Pressable hitSlop={8} onPress={() => setEntering(true)} style={{ marginBottom: insets.bottom + 28 }}>
+          <Text style={{ color: BLUE, fontSize: 16, fontWeight: '600' }}>Enter code instead</Text>
+        </Pressable>
+      )}
     </View>
   );
 }

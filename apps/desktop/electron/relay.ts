@@ -9,6 +9,8 @@ export interface RelayOptions {
   url: string;
   deckId: string;
   deckSecret: string;
+  /** Pairing token remotes must present; the relay enforces it on /api/*. */
+  accessToken: string;
   getSnapshot: () => unknown;
   onCommand: (method: string, params: Record<string, unknown>) => Promise<unknown>;
 }
@@ -39,7 +41,7 @@ export class RelayClient {
       this.ws = ws;
       ws.on('open', () => {
         this.retryMs = 1000;
-        this.send({ type: 'hello', role: 'host', deckId: this.opts.deckId, secret: this.opts.deckSecret });
+        this.send({ type: 'hello', role: 'host', deckId: this.opts.deckId, secret: this.opts.deckSecret, accessToken: this.opts.accessToken });
         this.pushSnapshot();
       });
       ws.on('message', (buf: Buffer | string) => { void this.onMessage(String(buf)); });

@@ -23,3 +23,11 @@ export function setFlag(key: string, val: boolean): void {
 }
 
 export const ONBOARDED = 'maestro.mobile.onboarded';
+export const PAIR_TOKEN = 'maestro.mobile.token';
+
+export function getStr(key: string): string {
+  try { return ls()?.getItem(key) ?? ''; } catch { return ''; }
+}
+export function setStr(key: string, val: string): void {
+  try { ls()?.setItem(key, val); } catch { /* storage unavailable */ }
+}

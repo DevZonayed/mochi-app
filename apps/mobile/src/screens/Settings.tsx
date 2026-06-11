@@ -1,11 +1,11 @@
 import React, { useState } from 'react';
-import { View, Text, Pressable, ScrollView, Animated, StyleSheet, Modal, type ViewStyle } from 'react-native';
+import { View, Text, Pressable, ScrollView, Animated, StyleSheet, Modal, TextInput, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { Card, Group, Row } from '../ui';
-import { api, type Workspace } from '../api';
+import { api, getPairToken, setPairToken, type Workspace } from '../api';
 
 /* iOS-style toggle switch — animated thumb. */
 function MSwitch({ value, onValueChange }: { value: boolean; onValueChange?: (v: boolean) => void }) {
@@ -281,6 +281,26 @@ export function SettingsScreen() {
             </Pressable>
           </View>
         </Card>
+
+        {/* Pairing */}
+        <View style={{ marginBottom: 22 }}>
+          <Group header="Pairing" footer="The code from your Mac (Maestro → Settings → Devices). Without it, this phone can't reach your Mac.">
+            <Row last>
+              <View style={rowLabel}>
+                <Text style={labelText}>Code</Text>
+              </View>
+              <TextInput
+                defaultValue={getPairToken()}
+                onChangeText={(t: string) => setPairToken(t)}
+                autoCapitalize="characters"
+                autoCorrect={false}
+                placeholder="XXXX-XXXX-XXXX"
+                placeholderTextColor={theme.color.inkTertiary}
+                style={{ flex: 1, textAlign: 'right', fontSize: 15, fontWeight: '600', letterSpacing: 1, color: theme.color.ink, paddingVertical: 6 }}
+              />
+            </Row>
+          </Group>
+        </View>
 
         {/* Defaults */}
         <View style={{ marginBottom: 22 }}>

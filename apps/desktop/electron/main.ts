@@ -5,6 +5,7 @@ import { LocalEngine } from './engine.js';
 import { Providers } from './providers.js';
 import { createDispatch } from './localApi.js';
 import { RelayClient } from './relay.js';
+import { CronRunner } from './cron.js';
 
 const RENDERER_DIST = path.join(__dirname, '../dist');
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
@@ -52,16 +53,21 @@ app.whenReady().then(() => {
   };
 
   const engine = new LocalEngine(store, emit);
-  const dispatch = createDispatch(store, engine, providers, emit);
+  const dispatch = createDispatch(store, engine, providers, emit, RELAY_URL);
 
   relay = new RelayClient({
     url: RELAY_URL,
     deckId: store.deck.deckId,
     deckSecret: store.deck.deckSecret,
+    accessToken: store.accessToken,
     getSnapshot: () => store.snapshot(providers.list()),
     onCommand: (method, params) => dispatch(method, params),
   });
   relay.start();
+
+  const cron = new CronRunner(store, engine, emit);
+  cron.start();
+  app.on('before-quit', () => { cron.stop(); relay?.stop(); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {

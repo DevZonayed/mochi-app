@@ -13,6 +13,14 @@ import { randomUUID } from 'node:crypto';
 export const id = (): string => randomUUID();
 export const now = (): number => Date.now();
 
+/** Human-enterable pairing token, e.g. "M7K2-Q9XF-4DTB" (no 0/O/1/I). */
+export function newPairingToken(): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const pick = () => alphabet[Math.floor(Math.random() * alphabet.length)];
+  const group = () => Array.from({ length: 4 }, pick).join('');
+  return `${group()}-${group()}-${group()}`;
+}
+
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
@@ -29,7 +37,19 @@ export interface Approval {
   id: string; projectId: string | null; kind: ApprovalKind; title: string; subtitle: string; detail: string;
   status: ApprovalStatus; createdAt: number; resolvedAt: number | null;
 }
-export interface Schedule { id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean; nextRun: number | null; createdAt: number }
+export interface Schedule { id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean; nextRun: number | null; lastRun?: number | null; createdAt: number }
+
+export type EngineId = 'claude' | 'codex';
+export interface Routing {
+  /** Master agent — runs jobs. */
+  master: EngineId;
+  /** Reviewer — optional second pass appended to job output. */
+  reviewer: EngineId | 'off';
+  /** Studio routing (applies when the media pipeline ships). */
+  image: EngineId;
+  video: EngineId;
+}
+export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex' };
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
 
@@ -47,6 +67,9 @@ export interface DashboardData {
 interface StoreData {
   deckId: string;
   deckSecret: string;
+  /** Pairing token remotes must present to the relay. Shown in the app; never in snapshots. */
+  accessToken: string;
+  routing: Routing;
   workspace: Workspace | null;
   projects: Project[];
   jobs: Job[];
@@ -73,9 +96,14 @@ export class Store {
   private load(): void {
     try {
       this.data = JSON.parse(readFileSync(this.file, 'utf8')) as StoreData;
+      // migrations for stores written by older builds
+      let dirty = false;
+      if (!this.data.accessToken) { this.data.accessToken = newPairingToken(); dirty = true; }
+      if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
+      if (dirty) this.save();
     } catch {
       this.data = {
-        deckId: id(), deckSecret: id(), workspace: null,
+        deckId: id(), deckSecret: id(), accessToken: newPairingToken(), routing: { ...DEFAULT_ROUTING }, workspace: null,
         projects: [], jobs: [], approvals: [], schedules: [], skills: [], templates: [], providerKeys: {},
       };
       this.save();
@@ -87,6 +115,14 @@ export class Store {
 
   get deck(): { deckId: string; deckSecret: string } {
     return { deckId: this.data.deckId, deckSecret: this.data.deckSecret };
+  }
+  get accessToken(): string { return this.data.accessToken; }
+
+  routing(): Routing { return { ...this.data.routing }; }
+  setRouting(patch: Partial<Routing>): Routing {
+    this.data.routing = { ...this.data.routing, ...patch };
+    this.save();
+    return this.routing();
   }
 
   // ── Workspace ───────────────────────────────────────────────────────
@@ -175,6 +211,14 @@ export class Store {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (s) { s.enabled = enabled; this.save(); }
   }
+  markScheduleRun(scheduleId: string, ts: number, nextRun: number | null): void {
+    const s = this.data.schedules.find(x => x.id === scheduleId);
+    if (s) { s.lastRun = ts; s.nextRun = nextRun; this.save(); }
+  }
+  setScheduleNextRun(scheduleId: string, nextRun: number | null): void {
+    const s = this.data.schedules.find(x => x.id === scheduleId);
+    if (s && s.nextRun !== nextRun) { s.nextRun = nextRun; this.save(); }
+  }
 
   // ── Skills / Templates ─────────────────────────────────────────────
   listSkills(): Skill[] { return [...this.data.skills].sort((a, b) => (a.category + a.name).localeCompare(b.category + b.name)); }
@@ -237,6 +281,7 @@ export class Store {
       budget: this.budget(),
       dashboard: this.dashboard(),
       providers,
+      routing: this.routing(),
       at: now(),
     };
   }

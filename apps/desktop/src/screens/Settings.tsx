@@ -16,7 +16,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, TrafficLights, Sidebar, Toolbar,
   type Theme,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type BudgetData, type ProviderConn, type ProviderId } from '../lib/api';
+import { api, ApiError, type Workspace, type BudgetData, type ProviderConn, type ProviderId, type Routing, type PairingInfo, IS_LOCAL } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -136,6 +136,7 @@ interface SetNavItem { key: string; icon: IconName; label: string; tint: string;
 
 const SET_NAV: SetNavItem[] = [
   { key: 'general', icon: 'settings', label: 'General', tint: 'var(--ink-secondary)' },
+  { key: 'engines', icon: 'cpu', label: 'Engines', tint: 'var(--purple)' },
   { key: 'accounts', icon: 'key', label: 'Accounts & keys', tint: 'var(--blue)' },
   { key: 'security', icon: 'shield', label: 'Security', tint: 'var(--green)' },
   { key: 'devices', icon: 'smartphone', label: 'Devices', tint: 'var(--teal)' },
@@ -199,6 +200,74 @@ function GeneralPane({ theme, setTheme, workspace }: {
         <GroupedList header="Startup">
           <ToggleRow label="Open Maestro at login" on={true} />
           <ToggleRow label="Resume in-flight jobs on launch" on={true} last />
+        </GroupedList>
+      </div>
+    </div>
+  );
+}
+
+/* ── Engines pane — which engine plays which role ───────────────────── */
+type RoleKey = 'master' | 'reviewer' | 'image' | 'video';
+const ROLE_ROWS: { key: RoleKey; label: string; sub: string; offOption?: boolean }[] = [
+  { key: 'master', label: 'Master agent', sub: 'Runs your jobs end-to-end.' },
+  { key: 'reviewer', label: 'Reviewer', sub: 'Second pass appended to every result.', offOption: true },
+  { key: 'image', label: 'Image generation', sub: 'Used by Media Studio (preview).' },
+  { key: 'video', label: 'Video generation', sub: 'Used by Media Studio (preview).' },
+];
+const ENGINE_OPTIONS = ['Claude Code', 'Codex'] as const;
+const labelToEngine = (l: string): 'claude' | 'codex' | 'off' => (l === 'Claude Code' ? 'claude' : l === 'Codex' ? 'codex' : 'off');
+const engineToLabel = (e: string): string => (e === 'claude' ? 'Claude Code' : e === 'codex' ? 'Codex' : 'Off');
+
+function EnginesPane() {
+  const [routing, setRouting] = React.useState<Routing | null>(null);
+  const [conns, setConns] = React.useState<ProviderConn[]>([]);
+
+  React.useEffect(() => {
+    let alive = true;
+    Promise.all([api.getRouting(), api.listProviders()])
+      .then(([r, p]) => { if (alive) { setRouting(r); setConns(p); } })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
+  const setRole = (key: RoleKey, label: string) => {
+    const value = labelToEngine(label);
+    setRouting(r => (r ? { ...r, [key]: value } as Routing : r));
+    void api.setRouting({ [key]: value } as Partial<Routing>).then(setRouting).catch(() => {});
+  };
+
+  const claudeOk = conns.some(c => c.provider === 'anthropic');
+  const codexOk = conns.some(c => c.provider === 'openai');
+
+  return (
+    <div>
+      <PaneHead sub="Pick which engine plays each role. Both run locally on this Mac, on your own sign-ins.">Engines</PaneHead>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
+        <GroupedList footer="Master + Reviewer are active today. Image & video routing applies to Media Studio when the pipeline ships.">
+          {ROLE_ROWS.map((r, i) => (
+            <Row key={r.key} last={i === ROLE_ROWS.length - 1}>
+              <span style={{ flex: 1 }}>
+                <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>{r.label}</span>
+                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{r.sub}</span>
+              </span>
+              {routing
+                ? <Seg
+                    options={r.offOption ? ['Off', ...ENGINE_OPTIONS] : [...ENGINE_OPTIONS]}
+                    value={engineToLabel(routing[r.key])}
+                    onChange={v => setRole(r.key, v)} />
+                : <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</span>}
+            </Row>
+          ))}
+        </GroupedList>
+        <GroupedList header="Engine status" footer="Engines use your own sign-ins on this Mac — Claude Code (`claude login`) and Codex (ChatGPT).">
+          <Row>
+            <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Claude Code</span>
+            <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: claudeOk ? 'var(--green)' : 'var(--red)' }}>{claudeOk ? 'Signed in' : 'Not signed in'}</span>
+          </Row>
+          <Row last>
+            <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Codex</span>
+            <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: codexOk ? 'var(--green)' : 'var(--red)' }}>{codexOk ? 'Signed in' : 'Not signed in'}</span>
+          </Row>
         </GroupedList>
       </div>
     </div>
@@ -330,9 +399,33 @@ function SecurityPane({ onExportAudit }: { onExportAudit: () => void }) {
 
 function DevicesPane({ onPair }: { onPair: () => void }) {
   const devs: [string, string][] = [['Jillur’s iPhone 15 Pro', 'Last seen 2 min ago'], ['iPad Air', 'Last seen yesterday']];
+  const [pairing, setPairing] = React.useState<PairingInfo | null>(null);
+  const [copied, setCopied] = React.useState(false);
+  React.useEffect(() => {
+    if (!IS_LOCAL) return;
+    let alive = true;
+    api.getPairing().then(p => { if (alive) setPairing(p); }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
+  const copy = () => {
+    if (!pairing) return;
+    void navigator.clipboard?.writeText(pairing.token).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1600); });
+  };
   return (
     <div>
       <PaneHead>Devices</PaneHead>
+      {pairing && (
+        <>
+          <GroupedList header="Pairing code" footer="Enter this code on your phone (Onboarding → Enter code) or open the web remote with ?token=<code>. Remotes can't reach this Mac without it.">
+            <Row last>
+              <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 13%, transparent)', color: 'var(--blue)' }}><Icon name="key" size={17} /></span>
+              <span style={{ flex: 1, font: '600 var(--fs-headline)/1 var(--font-mono)', letterSpacing: '0.08em', color: 'var(--ink)' }}>{pairing.token}</span>
+              <button onClick={copy} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: copied ? 'rgba(52,199,89,0.14)' : 'var(--fill-secondary)', color: copied ? 'var(--green)' : 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{copied ? 'Copied ✓' : 'Copy'}</button>
+            </Row>
+          </GroupedList>
+          <div style={{ height: 18 }} />
+        </>
+      )}
       <GroupedList footer="Paired phones use the end-to-end encrypted relay.">
         {devs.map((d, i) => (
           <Row key={i}>
@@ -482,6 +575,7 @@ export default function Settings() {
 
   const panes: Record<string, React.ReactNode> = {
     general: <GeneralPane theme={theme} setTheme={setTheme} workspace={workspace} />,
+    engines: <EnginesPane />,
     accounts: <AccountsPane />,
     security: <SecurityPane onExportAudit={() => navigate('/audit')} />,
     devices: <DevicesPane onPair={() => navigate('/device-pairing')} />,

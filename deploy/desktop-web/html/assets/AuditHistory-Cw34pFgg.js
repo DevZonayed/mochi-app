@@ -1,4 +1,4 @@
-import{u as T,R as u,j as e}from"./index-CrBt9WLo.js";import{I as f}from"./icons-nL5SNIwG.js";import{u as A,a as C,T as B,S as P,b as M}from"./appShell-D-iXW5GG.js";import{a as y}from"./api-BDVowSSe.js";const z=`
+import{u as T,R as u,j as e}from"./index-9ppPm7yy.js";import{I as f}from"./icons-BMqSUh6f.js";import{u as A,a as C,T as B,S as P,b as M}from"./appShell-EQHm9DQz.js";import{a as y}from"./api-BpC5pLK1.js";const z=`
   @keyframes spin { to { transform: rotate(360deg); } }
   .app-wallpaper { position: absolute; inset: 0; z-index: 0; pointer-events: none;
     background: radial-gradient(60% 50% at 16% 0%, color-mix(in srgb, var(--blob-a) 26%, transparent), transparent 70%), radial-gradient(55% 50% at 100% 100%, color-mix(in srgb, var(--blob-b) 20%, transparent), transparent 70%), var(--bg); }

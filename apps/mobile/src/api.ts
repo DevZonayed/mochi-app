@@ -33,6 +33,17 @@ export interface DashboardData {
 
 export const API_BASE = 'https://api.nexalance.cloud';
 
+import { getStr, setStr, PAIR_TOKEN } from './storage';
+
+/* Pairing token — the relay refuses /api/* without the code shown in the
+   Maestro desktop app (Settings → Devices). Stored locally on this phone. */
+let pairToken = getStr(PAIR_TOKEN);
+export function getPairToken(): string { return pairToken; }
+export function setPairToken(token: string): void {
+  pairToken = token.trim();
+  setStr(PAIR_TOKEN, pairToken);
+}
+
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -46,7 +57,11 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const hasBody = init?.body != null;
   const res = await fetch(API_BASE + path, {
     ...init,
-    headers: { ...(hasBody ? { 'content-type': 'application/json' } : {}), ...(init?.headers ?? {}) },
+    headers: {
+      ...(hasBody ? { 'content-type': 'application/json' } : {}),
+      ...(pairToken ? { authorization: `Bearer ${pairToken}` } : {}),
+      ...(init?.headers ?? {}),
+    },
   });
   if (!res.ok) {
     let detail = res.statusText;
