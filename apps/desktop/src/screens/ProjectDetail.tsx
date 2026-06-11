@@ -22,7 +22,7 @@ import {
   type EffortStop,
 } from '../lib/ui';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -815,14 +815,63 @@ function SettingsTab() {
    thread + composer on the right. Claude turns resume their SDK session (full
    context); codex turns carry stitched history. */
 
-const CHAT_PROSE: React.CSSProperties = { whiteSpace: 'pre-wrap', wordBreak: 'break-word' };
 const CHAT_CODE: React.CSSProperties = {
   margin: '6px 0', padding: '10px 12px', borderRadius: 10, background: 'var(--fill-tertiary)',
   border: '0.5px solid var(--separator)', overflowX: 'auto', font: '400 var(--fs-caption)/1.55 var(--font-mono)', color: 'var(--ink)',
 };
 
-/** Light chat-body renderer: ``` fenced blocks become code cards, the rest stays prose. */
-function renderChatBody(text: string): React.ReactNode[] {
+/** Inline markdown: **bold** and `code` spans. */
+function renderInline(text: string, keyBase: string): React.ReactNode[] {
+  return text.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/g).map((seg, i) => {
+    if (seg.startsWith('`') && seg.endsWith('`')) {
+      return <code key={`${keyBase}-${i}`} style={{ padding: '1px 5px', borderRadius: 5, background: 'var(--fill-tertiary)', font: '500 0.92em var(--font-mono)' }}>{seg.slice(1, -1)}</code>;
+    }
+    if (seg.startsWith('**') && seg.endsWith('**')) {
+      return <b key={`${keyBase}-${i}`} style={{ fontWeight: 650 }}>{seg.slice(2, -2)}</b>;
+    }
+    return seg;
+  });
+}
+
+/** Block markdown: headings, bullets, paragraphs (with inline bold/code). */
+function renderProse(text: string, keyBase: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  const lines = text.split('\n');
+  let para: string[] = [];
+  let key = 0;
+  const flushPara = () => {
+    if (!para.length) return;
+    const t = para.join('\n');
+    out.push(<p key={`${keyBase}-p${key++}`} style={{ margin: '0 0 10px', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{renderInline(t, `${keyBase}-p${key}`)}</p>);
+    para = [];
+  };
+  for (const line of lines) {
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    const li = line.match(/^\s*[-*]\s+(.*)$/);
+    if (h) {
+      flushPara();
+      const lvl = h[1].length;
+      out.push(<div key={`${keyBase}-h${key++}`} style={{ margin: '14px 0 8px', font: `700 ${lvl <= 2 ? 'var(--fs-title3)' : 'var(--fs-callout)'}/1.25 var(--font-display)`, letterSpacing: '-0.01em', color: 'var(--ink)' }}>{renderInline(h[2], `${keyBase}-h${key}`)}</div>);
+    } else if (li) {
+      flushPara();
+      out.push(
+        <div key={`${keyBase}-l${key++}`} style={{ display: 'flex', gap: 8, margin: '0 0 5px', paddingLeft: 4 }}>
+          <span style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }}>•</span>
+          <span style={{ minWidth: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{renderInline(li[1], `${keyBase}-l${key}`)}</span>
+        </div>
+      );
+    } else if (!line.trim()) {
+      flushPara();
+    } else {
+      para.push(line);
+    }
+  }
+  flushPara();
+  return out;
+}
+
+/** Chat body: ``` fences become code cards; everything else renders as markdown prose. */
+function renderChatBody(text: string, keyBase = 'b'): React.ReactNode[] {
   const out: React.ReactNode[] = [];
   const fence = /```[a-zA-Z0-9_+-]*\n?/g;
   let idx = 0, inCode = false, key = 0;
@@ -830,16 +879,45 @@ function renderChatBody(text: string): React.ReactNode[] {
   while ((m = fence.exec(text))) {
     const chunk = text.slice(idx, m.index);
     if (chunk.trim()) out.push(inCode
-      ? <pre key={key++} style={CHAT_CODE}>{chunk.replace(/\n$/, '')}</pre>
-      : <span key={key++} style={CHAT_PROSE}>{chunk}</span>);
+      ? <pre key={`${keyBase}-c${key++}`} style={CHAT_CODE}>{chunk.replace(/\n$/, '')}</pre>
+      : <React.Fragment key={`${keyBase}-f${key++}`}>{renderProse(chunk, `${keyBase}-${key}`)}</React.Fragment>);
     inCode = !inCode;
     idx = m.index + m[0].length;
   }
   const tail = text.slice(idx);
   if (tail.trim()) out.push(inCode
-    ? <pre key={key++} style={CHAT_CODE}>{tail.replace(/\n$/, '')}</pre>
-    : <span key={key++} style={CHAT_PROSE}>{tail}</span>);
+    ? <pre key={`${keyBase}-c${key++}`} style={CHAT_CODE}>{tail.replace(/\n$/, '')}</pre>
+    : <React.Fragment key={`${keyBase}-f${key++}`}>{renderProse(tail, `${keyBase}-${key}`)}</React.Fragment>);
   return out;
+}
+
+/* Tool-call chip — which tool/skill ran, on what, and how long it took. */
+const TOOL_ICON = (name: string): IconName => {
+  const n = name.toLowerCase();
+  if (/bash|shell|command|exec/.test(n)) return 'terminal';
+  if (/read|write|edit|glob|grep|notebook|file|patch/.test(n)) return 'folder';
+  if (/web|search|fetch/.test(n)) return 'telescope';
+  if (/skill|task|agent/.test(n)) return 'spark';
+  return 'command';
+};
+const fmtToolDur = (ms?: number): string => (ms == null ? '' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`);
+
+function ToolChip({ item }: { item: TranscriptItem }) {
+  const running = item.toolStatus === 'running';
+  const error = item.toolStatus === 'error';
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '2px 0', padding: '6px 10px', borderRadius: 9,
+      background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', maxWidth: 560 }}>
+      <Icon name={TOOL_ICON(item.name ?? '')} size={13} style={{ color: error ? 'var(--red)' : 'var(--ink-secondary)', flexShrink: 0 }} />
+      <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{item.name}</span>
+      {item.text && <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text}</span>}
+      <span style={{ flexShrink: 0, marginLeft: 'auto' }}>
+        {running ? <Spinner size={11} color="var(--purple)" />
+          : error ? <Icon name="x" size={11} stroke={2.6} style={{ color: 'var(--red)' }} />
+          : <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{fmtToolDur(item.durMs)}</span>}
+      </span>
+    </div>
+  );
 }
 
 const fmtDuration = (ms: number): string => {
@@ -862,12 +940,55 @@ function AssistantTurn({ job, onRetry }: { job: Job; onRetry: (input: string) =>
   const live = job.status === 'running' || job.status === 'pending';
   const engineLabel = job.engine === 'codex' ? 'Codex' : 'Claude Code';
   const provider = job.engine === 'codex' ? 'openai' as const : 'anthropic' as const;
-  const hasText = !!(job.output && job.output.length > 0);
+  const transcript = job.transcript ?? [];
+  const hasBody = transcript.length > 0 || !!(job.output && job.output.length > 0);
+
+  // Live elapsed clock while the turn runs (the "time" the user watches).
+  const [, tick] = React.useReducer((x: number) => x + 1, 0);
+  React.useEffect(() => {
+    if (!live) return;
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, [live]);
+  const elapsed = fmtDuration((live ? Date.now() : job.updatedAt) - job.createdAt);
+
+  // Caret rides the last streaming text block.
+  const lastIdx = transcript.length - 1;
+  const caretOn = (i: number) => live && i === lastIdx && (transcript[i].kind === 'text' || transcript[i].kind === 'result');
+
+  const body = transcript.length > 0 ? (
+    <div style={{ font: '400 var(--fs-body)/1.55 var(--font-text)', color: 'var(--ink)' }}>
+      {transcript.map((it, i) => {
+        if (it.kind === 'tool') return <ToolChip key={i} item={it} />;
+        if (it.kind === 'result') {
+          return (
+            <div key={i} style={{ marginTop: 10, paddingTop: 10, borderTop: '0.5px solid var(--separator)' }}>
+              {renderChatBody(it.text, `r${i}`)}
+              {caretOn(i) && <span className="chat-caret" style={{ color: 'var(--purple)', fontWeight: 700 }}>▍</span>}
+            </div>
+          );
+        }
+        return (
+          <div key={i} style={{ margin: i > 0 ? '8px 0 0' : 0 }}>
+            {renderChatBody(it.text, `t${i}`)}
+            {caretOn(i) && <span className="chat-caret" style={{ color: 'var(--purple)', fontWeight: 700 }}>▍</span>}
+          </div>
+        );
+      })}
+    </div>
+  ) : hasBody ? (
+    // Legacy turns (pre-transcript) fall back to the flat output.
+    <div style={{ font: '400 var(--fs-body)/1.55 var(--font-text)', color: 'var(--ink)' }}>
+      {renderChatBody(job.output ?? '')}
+      {live && <span className="chat-caret" style={{ color: 'var(--purple)', fontWeight: 700 }}>▍</span>}
+    </div>
+  ) : null;
+
   return (
     <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
       <span style={{ width: 28, height: 28, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', marginTop: 2,
         background: 'var(--fill-secondary)', color: 'var(--ink)', border: '0.5px solid var(--separator)' }}>
-        {live && !hasText ? <Spinner size={13} color="var(--purple)" /> : <ProviderGlyph provider={provider} size={15} />}
+        {live && !hasBody ? <Spinner size={13} color="var(--purple)" /> : <ProviderGlyph provider={provider} size={15} />}
       </span>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
@@ -878,17 +999,12 @@ function AssistantTurn({ job, onRetry }: { job: Job; onRetry: (input: string) =>
           {live && (
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)' }}>
               <span className="breathe" style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--purple)' }} />
-              {hasText ? 'streaming' : (job.stage || 'working…')}
+              {hasBody ? 'streaming' : (job.stage || 'working…')} · {elapsed}
             </span>
           )}
         </div>
-        {hasText && (
-          <div style={{ font: '400 var(--fs-body)/1.55 var(--font-text)', color: 'var(--ink)' }}>
-            {renderChatBody(job.output ?? '')}
-            {live && <span className="chat-caret" style={{ color: 'var(--purple)', fontWeight: 700 }}>▍</span>}
-          </div>
-        )}
-        {!hasText && live && (
+        {body}
+        {!hasBody && live && (
           <div style={{ font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink-tertiary)', fontStyle: 'italic' }}>
             {job.stage || 'Working on it — the reply streams in here…'}
           </div>
@@ -905,7 +1021,8 @@ function AssistantTurn({ job, onRetry }: { job: Job; onRetry: (input: string) =>
         )}
         {job.status === 'done' && (
           <div style={{ marginTop: 6, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>
-            {job.cost > 0 ? `$${job.cost.toFixed(2)} · ` : ''}{job.tokens > 0 ? `${job.tokens >= 1000 ? (job.tokens / 1000).toFixed(1) + 'k' : job.tokens} tok · ` : ''}{fmtDuration(job.updatedAt - job.createdAt)}
+            {job.cost > 0 ? `$${job.cost.toFixed(2)} · ` : ''}{job.tokens > 0 ? `${job.tokens >= 1000 ? (job.tokens / 1000).toFixed(1) + 'k' : job.tokens} tok · ` : ''}{elapsed}
+            {transcript.some(t => t.kind === 'tool') ? ` · ${transcript.filter(t => t.kind === 'tool').length} tool calls` : ''}
           </div>
         )}
       </div>

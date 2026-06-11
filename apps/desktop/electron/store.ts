@@ -37,12 +37,27 @@ export interface Project {
   kind?: ProjectKind; path?: string; repoUrl?: string;
   createdAt: number;
 }
+/** One step of an agent run, in order: prose, a tool/skill invocation, or the
+    final result. The chat renders these as separate blocks with timings. */
+export interface TranscriptItem {
+  kind: 'text' | 'tool' | 'result';
+  /** text/result: the content. tool: short detail (command, file, query…). */
+  text: string;
+  /** tool only */
+  name?: string;
+  toolStatus?: 'running' | 'done' | 'error';
+  durMs?: number;
+  ts: number;
+}
+
 export interface Job {
   id: string; projectId: string; title: string; status: JobStatus; phase: string; progress: number;
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
   engine?: EngineId; model?: string;
   /** Chat turn: set when this job is one turn of a project chat session. */
   sessionId?: string;
+  /** Structured run log (assistant text blocks, tool calls, result) — capped. */
+  transcript?: TranscriptItem[];
   createdAt: number; updatedAt: number;
 }
 
@@ -409,7 +424,7 @@ export class Store {
     this.data.jobs.push(j); this.save();
     return j;
   }
-  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model'>>): Job {
+  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'transcript'>>): Job {
     const cur = this.getJob(jobId);
     if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });
@@ -757,7 +772,14 @@ export class Store {
   /** Full snapshot pushed to the relay so phone/web remotes can mirror this Mac.
       Slimmed: queue/file paths and thumbs never leave the Mac; long outputs truncate. */
   snapshot(providers: unknown): Record<string, unknown> {
-    const slimJob = (j: Job): Job => (j.output && j.output.length > 16384 ? { ...j, output: '…' + j.output.slice(-16384) } : j);
+    const slimJob = (j: Job): Job => {
+      const out = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
+      // Remotes get a trimmed run log: last 60 items, long text blocks truncated.
+      const transcript = j.transcript
+        ? j.transcript.slice(-60).map(t => (t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t))
+        : undefined;
+      return out === j.output && !j.transcript ? j : { ...j, output: out, transcript };
+    };
     const slimAsset = (a: Asset) => ({
       id: a.id, projectId: a.projectId, source: a.source, kind: a.kind, stage: a.stage,
       prompt: a.prompt ? a.prompt.slice(0, 200) : undefined, model: a.model, status: a.status,

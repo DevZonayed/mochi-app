@@ -38,6 +38,14 @@ export interface ChatSession {
   createdAt: number;
   updatedAt: number;
 }
+export interface TranscriptItem {
+  kind: 'text' | 'tool' | 'result';
+  text: string;
+  name?: string;
+  toolStatus?: 'running' | 'done' | 'error';
+  durMs?: number;
+  ts: number;
+}
 export interface Job {
   id: string;
   projectId: string;
@@ -46,6 +54,7 @@ export interface Job {
   phase: string;
   progress: number;
   sessionId?: string;
+  transcript?: TranscriptItem[];
   input: string;
   output: string | null;
   error: string | null;

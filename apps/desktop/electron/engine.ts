@@ -15,12 +15,14 @@ import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import type { Store, Job, Effort, EngineId } from './store.js';
+import type { Store, Job, Effort, EngineId, TranscriptItem } from './store.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import type { Providers } from './providers.js';
 
 const require = createRequire(__filename);
-const EFFORT_TURNS: Record<string, number> = { fast: 2, balanced: 4, deep: 8, max: 16 };
+// Agent-loop turn budget per effort. Every tool call consumes a turn, so a
+// coding agent needs real headroom — 4 turns dies mid-`ls`.
+const EFFORT_TURNS: Record<string, number> = { fast: 8, balanced: 24, deep: 48, max: 96 };
 const STREAM_THROTTLE_MS = 800;
 
 export interface EngineStatus {
@@ -39,15 +41,31 @@ interface EngineRun {
   model: string;
   /** Claude Agent SDK session id (for chat continuity via Options.resume). */
   sdkSessionId?: string;
+  /** Structured run log: text blocks, tool calls (with timings), result. */
+  transcript: TranscriptItem[];
 }
 
 interface RunHooks {
-  /** Live partial output (full text so far). Persisted+emitted, throttled, by the caller. */
-  onText?: (full: string) => void;
+  /** Live progress: prose-so-far + the structured transcript. Throttled by the caller. */
+  onProgress?: (output: string, transcript: TranscriptItem[]) => void;
   signal?: AbortSignal;
   /** Receives the child process for codex so the caller can kill it on cancel. */
   onChild?: (child: ChildProcess) => void;
 }
+
+/** Human-sized summary of a tool invocation's input for the chat chip. */
+function toolDetail(input: unknown): string {
+  if (!input || typeof input !== 'object') return '';
+  const i = input as Record<string, unknown>;
+  for (const k of ['command', 'file_path', 'path', 'pattern', 'query', 'url', 'skill', 'description', 'prompt', 'name']) {
+    if (typeof i[k] === 'string' && i[k]) return (i[k] as string).slice(0, 110);
+  }
+  const first = Object.values(i).find(v => typeof v === 'string' && v);
+  return typeof first === 'string' ? first.slice(0, 110) : '';
+}
+
+const proseOf = (items: TranscriptItem[]): string =>
+  items.filter(i => i.kind === 'text').map(i => i.text.trim()).filter(Boolean).join('\n\n');
 
 class CancelledError extends Error {
   constructor() { super('cancelled'); this.name = 'CancelledError'; }
@@ -132,7 +150,7 @@ async function runClaude(
       cwd,
       maxTurns: maxTurnsOverride ?? EFFORT_TURNS[effort] ?? 4,
       permissionMode: 'bypassPermissions',
-      includePartialMessages: !!hooks.onText,
+      includePartialMessages: !!hooks.onProgress,
       ...(modelOverride ? { model: modelOverride } : {}),
       ...(resume ? { resume } : {}),
       ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
@@ -141,8 +159,16 @@ async function runClaude(
       stderr: (d: string) => { stderrTail = (stderrTail + d).slice(-2000); },
     },
   });
-  let text = '';
-  let streamed = '';
+  /* Build a STRUCTURED transcript: each assistant message is its own text
+     block, each tool/skill call is a chip with status + duration, and the
+     final result closes the run. Live deltas stream into the open block;
+     the complete assistant message then replaces it (authoritative text). */
+  const items: TranscriptItem[] = [];
+  let openText: TranscriptItem | null = null;
+  const toolById = new Map<string, TranscriptItem>();
+  const progress = () => hooks.onProgress?.(proseOf(items), items);
+
+  let resultText = '';
   let usage: { input_tokens?: number; output_tokens?: number } | null = null;
   let cost = 0;
   let model = 'claude';
@@ -153,22 +179,46 @@ async function runClaude(
       const m = raw as {
         type?: string;
         session_id?: string;
-        message?: { content?: { type: string; text?: string }[]; model?: string };
+        parent_tool_use_id?: string | null;
+        message?: { content?: { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; is_error?: boolean }[]; model?: string };
         event?: { type?: string; delta?: { type?: string; text?: string } };
         usage?: { input_tokens?: number; output_tokens?: number };
         total_cost_usd?: number; result?: unknown;
       };
       if (m.session_id) sdkSessionId = m.session_id;
+      // Subagent traffic surfaces through its parent Task chip — don't interleave it.
+      if (m.parent_tool_use_id) continue;
+
       if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
-        streamed += m.event.delta.text ?? '';
-        hooks.onText?.(streamed);
+        if (!openText) { openText = { kind: 'text', text: '', ts: Date.now() }; items.push(openText); }
+        openText.text += m.event.delta.text ?? '';
+        progress();
       } else if (m.type === 'assistant' && m.message?.content) {
-        for (const b of m.message.content) if (b.type === 'text' && b.text) text += b.text;
         model = m.message.model ?? model;
+        for (const b of m.message.content) {
+          if (b.type === 'text' && typeof b.text === 'string') {
+            if (openText) { openText.text = b.text; openText = null; }
+            else if (b.text.trim()) items.push({ kind: 'text', text: b.text, ts: Date.now() });
+          } else if (b.type === 'tool_use') {
+            openText = null;
+            const t: TranscriptItem = { kind: 'tool', name: b.name ?? 'tool', text: toolDetail(b.input), toolStatus: 'running', ts: Date.now() };
+            items.push(t);
+            if (b.id) toolById.set(b.id, t);
+          }
+        }
+        progress();
+      } else if (m.type === 'user' && m.message?.content) {
+        for (const b of m.message.content) {
+          if (b.type === 'tool_result' && b.tool_use_id) {
+            const t = toolById.get(b.tool_use_id);
+            if (t) { t.toolStatus = b.is_error ? 'error' : 'done'; t.durMs = Date.now() - t.ts; }
+          }
+        }
+        progress();
       } else if (m.type === 'result') {
         usage = m.usage ?? usage;
         cost = m.total_cost_usd ?? 0;
-        if (typeof m.result === 'string' && m.result) text = m.result;
+        if (typeof m.result === 'string') resultText = m.result;
       }
     }
   } catch (e) {
@@ -176,12 +226,17 @@ async function runClaude(
     const detail = stderrTail.trim();
     throw new Error(`${e instanceof Error ? e.message : String(e)}${detail ? `\n${detail}` : ''}`);
   }
+  // The result usually repeats the last text block — only add it when it's new.
+  const lastText = [...items].reverse().find(i => i.kind === 'text')?.text.trim();
+  if (resultText && resultText.trim() !== lastText) items.push({ kind: 'result', text: resultText, ts: Date.now() });
+  const prose = proseOf(items);
   return {
-    text: text || streamed || '(no output)',
+    text: resultText || prose || '(no output)',
     tokens: (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0),
     cost: Math.round(cost * 1000) / 1000,
     model,
     sdkSessionId,
+    transcript: items,
   };
 }
 
@@ -202,8 +257,10 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
     hooks.onChild?.(child);
     let stdout = '';
     let stderr = '';
-    let streamed = '';
     let buf = '';
+    const items: TranscriptItem[] = [];
+    const toolById = new Map<string, TranscriptItem>();
+    const progress = () => hooks.onProgress?.(proseOf(items), items);
     const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 30 * 60 * 1000);
     const onAbort = () => { try { child.kill('SIGTERM'); } catch { /* gone */ } };
     if (hooks.signal) {
@@ -214,13 +271,33 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
       const t = line.trim();
       if (!t) return;
       try {
-        const ev = JSON.parse(t) as { type?: string; item?: { type?: string; text?: string; content?: string } };
-        // Stream the agent's message text as it arrives (event schema is best-effort;
-        // the -o outfile remains the authoritative final text).
+        const ev = JSON.parse(t) as { type?: string; item?: { id?: string; type?: string; text?: string; content?: string; command?: string; path?: string; status?: string } };
         const item = ev.item;
-        if (item && (item.type === 'agent_message' || item.type === 'message') && (item.text || item.content)) {
-          streamed += (item.text ?? item.content ?? '');
-          hooks.onText?.(streamed);
+        if (!item) return;
+        // Best-effort codex event mapping: message text → text blocks,
+        // command/file activity → tool chips. Unknown shapes are ignored;
+        // the -o outfile stays the authoritative final text.
+        if ((item.type === 'agent_message' || item.type === 'message') && (item.text || item.content)) {
+          items.push({ kind: 'text', text: item.text ?? item.content ?? '', ts: Date.now() });
+          progress();
+        } else if (item.type && /command|exec|file_change|patch|tool/.test(item.type)) {
+          const key = item.id ?? `${item.type}-${items.length}`;
+          const started = ev.type?.endsWith('started');
+          const existing = toolById.get(key);
+          if (existing && !started) {
+            existing.toolStatus = item.status === 'failed' ? 'error' : 'done';
+            existing.durMs = Date.now() - existing.ts;
+          } else if (!existing) {
+            const chip: TranscriptItem = {
+              kind: 'tool', name: item.type.replace(/_/g, ' '),
+              text: (item.command ?? item.path ?? '').slice(0, 110),
+              toolStatus: started ? 'running' : 'done', ts: Date.now(),
+            };
+            if (!started) chip.durMs = 0;
+            items.push(chip);
+            toolById.set(key, chip);
+          }
+          progress();
         }
       } catch { /* non-JSON line */ }
     };
@@ -251,8 +328,10 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
         reject(Object.assign(new Error(`Codex exited ${code ?? sig}: ${stderr.slice(0, 300) || 'no output'}`), { statusCode: 500 }));
         return;
       }
+      const lastText = [...items].reverse().find(i => i.kind === 'text')?.text.trim();
+      if (text && text !== lastText) items.push({ kind: 'result', text, ts: Date.now() });
       // Subscription run — Codex doesn't bill per-token, so cost stays 0.
-      resolve({ text: text || streamed || '(no output)', tokens, cost: 0, model: 'codex' });
+      resolve({ text: text || proseOf(items) || '(no output)', tokens, cost: 0, model: model ?? 'codex', transcript: items });
     });
   });
 }
@@ -354,15 +433,19 @@ export class LocalEngine {
     });
     this.emit('job', cur);
 
-    // Throttled live-output writer (persist + emit at most every STREAM_THROTTLE_MS).
+    // Throttled live writer: prose + structured transcript, at most every STREAM_THROTTLE_MS.
     let lastFlush = 0;
-    let pending: string | null = null;
-    const flush = (full: string) => {
-      pending = full;
+    const pendingRef: { out: string | null; tr: TranscriptItem[] } = { out: null, tr: [] };
+    const flush = (output: string, transcript: TranscriptItem[]) => {
+      pendingRef.out = output;
+      pendingRef.tr = transcript;
       const t = Date.now();
       if (t - lastFlush < STREAM_THROTTLE_MS) return;
       lastFlush = t;
-      const u = this.store.updateJob(jobId, { output: pending, progress: Math.min(70, 20 + Math.floor(pending.length / 80)) });
+      const u = this.store.updateJob(jobId, {
+        output, transcript: transcript.slice(-150),
+        progress: Math.min(70, 20 + Math.floor(output.length / 80)),
+      });
       this.emit('job', u);
     };
 
@@ -391,7 +474,7 @@ export class LocalEngine {
 
       const hooks: RunHooks = {
         signal: ac.signal,
-        onText: (full) => flush(full),
+        onProgress: flush,
         onChild: (child) => { handle.child = child; },
       };
       const main = master === 'claude'
@@ -435,7 +518,7 @@ export class LocalEngine {
 
       const done = this.store.updateJob(jobId, {
         status: 'done', phase: 'Done', progress: 100, stage: '',
-        output, tokens, cost, model,
+        output, tokens, cost, model, transcript: main.transcript.slice(-200),
       });
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
@@ -460,7 +543,11 @@ export class LocalEngine {
       if (e instanceof CancelledError || ac.signal.aborted) {
         const existing = this.store.getJob(jobId);
         if (existing && existing.status !== 'cancelled') {
-          const c = this.store.updateJob(jobId, { status: 'cancelled', phase: 'Cancelled', stage: '', error: null, output: pending ?? existing.output });
+          const c = this.store.updateJob(jobId, {
+            status: 'cancelled', phase: 'Cancelled', stage: '', error: null,
+            output: pendingRef.out ?? existing.output,
+            ...(pendingRef.tr.length ? { transcript: pendingRef.tr.slice(-150) } : {}),
+          });
           this.emit('job', c);
           this.store.pushEvent({ kind: 'job-cancelled', title: `Cancelled: ${c.title}`, projectId: c.projectId, jobId });
           return c;
