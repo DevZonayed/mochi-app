@@ -773,8 +773,9 @@ export default function Templates() {
   const onEdit = (id: string) => openEditor(toBase(byId(id)));
   const onUse = (id: string) => {
     const t = byId(id);
-    if (t) void api.createProject({ name: t.name, template: 'claude-code', color: 'blue' }).catch(() => {});
-    navigate('/project-detail');
+    // Open the real New-project flow prefilled with this template's name —
+    // no silent create; the operator picks the source (blank / folder / clone).
+    navigate('/projects', { state: { openNew: true, suggestedName: t?.name } });
   };
   const onClone = (id: string) => {
     const card = document.querySelector<HTMLElement>(`[data-tpl="${id}"]`);

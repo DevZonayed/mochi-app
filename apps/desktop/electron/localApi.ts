@@ -5,6 +5,7 @@
 import type { Store, Effort, ApprovalStatus, EngineId, Routing, AppSettings, ProjectKind } from './store.js';
 import type { LocalEngine } from './engine.js';
 import type { Providers, ProviderId } from './providers.js';
+import { cloneRepo, inspectFolder, repoInfo, gitAvailable } from './git.js';
 
 type Params = Record<string, unknown>;
 
@@ -85,6 +86,49 @@ export function createDispatch(store: Store, engine: LocalEngine, providers: Pro
         const proj = store.updateProject(String(p.id ?? ''), patch);
         emit('project', proj);
         return proj;
+      }
+
+      // ── Coding agent: folders + GitHub clone (git lives on this Mac) ──
+      case 'gitAvailable': return { available: gitAvailable() };
+      case 'inspectFolder': {
+        const dir = String(p.path ?? '');
+        if (!dir) bad('path required');
+        return inspectFolder(dir);
+      }
+      case 'getProjectRepo': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (!proj) bad('project not found', 404);
+        return proj!.path ? repoInfo(proj!.path) : { branch: null, remote: null, isRepo: false };
+      }
+      case 'cloneRepo': {
+        const url = String(p.url ?? '').trim();
+        if (!url) bad('url required');
+        const name = (typeof p.name === 'string' && p.name.trim()) ? p.name.trim() : undefined;
+        emit('clone', { phase: 'start', url });
+        try {
+          const result = await cloneRepo({ url, dirName: typeof p.dirName === 'string' ? p.dirName : undefined },
+            (line) => emit('clone', { phase: 'progress', line }));
+          const proj = store.createProject({
+            name: name ?? url.split(/[/:]/).pop()?.replace(/\.git$/i, '') ?? 'Repo',
+            template: 'claude-code', kind: 'coding', path: result.dir, repoUrl: result.remote,
+            instructions: typeof p.instructions === 'string' ? p.instructions : '',
+            color: typeof p.color === 'string' ? p.color : 'blue',
+          });
+          emit('clone', { phase: 'done', projectId: proj.id, dir: result.dir, branch: result.branch });
+          emit('project', proj);
+          store.pushEvent({ kind: 'clone-done', title: `Cloned ${proj.name}`, subtitle: result.branch ? `branch ${result.branch}` : undefined, projectId: proj.id });
+          return proj;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          emit('clone', { phase: 'failed', error: msg });
+          store.pushEvent({ kind: 'clone-failed', title: 'Clone failed', subtitle: msg });
+          throw e;
+        }
+      }
+      case 'revealProject': {
+        // Reveal handled natively in main via maestro:revealPath; this returns the path.
+        const proj = store.getProject(String(p.id ?? ''));
+        return { path: proj?.path ?? null };
       }
 
       // ── Jobs ───────────────────────────────────────────────────

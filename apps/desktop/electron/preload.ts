@@ -19,4 +19,7 @@ contextBridge.exposeInMainWorld('maestro', {
     ipcRenderer.on('maestro:event', listener);
     return () => ipcRenderer.removeListener('maestro:event', listener);
   },
+  // Desktop-only native affordances (never available to web/mobile remotes).
+  pickFolder: (): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:pickFolder'),
+  revealPath: (p: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('maestro:revealPath', p),
 });

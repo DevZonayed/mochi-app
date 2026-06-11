@@ -232,6 +232,12 @@ export function buildServer(): FastifyInstance {
     const p = (st()?.projects ?? []).find((x) => x.id === (req.params as { id: string }).id);
     return p ?? reply.code(404).send({ error: 'project not found' });
   });
+  // Repo info is computed by git ON THE MAC; remotes get a best-effort view from
+  // the mirrored project (branch unknown remotely → null).
+  app.get('/api/projects/:id/repo', async (req) => {
+    const p = (st()?.projects ?? []).find((x) => x.id === (req.params as { id: string }).id) as { path?: string; repoUrl?: string } | undefined;
+    return { branch: null, remote: p?.repoUrl ?? null, isRepo: !!p?.path };
+  });
   app.get('/api/jobs', async (req) => {
     const projectId = (req.query as { projectId?: string }).projectId;
     const jobs = st()?.jobs ?? [];

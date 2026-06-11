@@ -9,7 +9,7 @@ import { Card, Mono } from '../ui';
 import { api, type Effort as ApiEffort } from '../api';
 
 type Effort = 'FAST' | 'BALANCED' | 'DEEP' | 'MAX';
-type ModelId = 'auto' | 'opus' | 'sonnet' | 'haiku' | 'gpt';
+type ModelId = 'auto' | 'claude' | 'codex';
 type AutoKey = 'plan' | 'gated' | 'unatt';
 
 /** A live project mapped into the shape the picker JSX consumes. */
@@ -39,11 +39,9 @@ const AUTOS: Record<AutoKey, [string, string]> = {
 };
 
 const MODELS: { id: ModelId; name: string; sub: string; cost: number }[] = [
-  { id: 'auto', name: 'Auto', sub: 'Routed per task', cost: 0 },
-  { id: 'opus', name: 'Opus', sub: 'Most capable', cost: 3 },
-  { id: 'sonnet', name: 'Sonnet', sub: 'Balanced', cost: 2 },
-  { id: 'haiku', name: 'Haiku', sub: 'Fastest', cost: 1 },
-  { id: 'gpt', name: 'GPT-4o', sub: 'Media & vision', cost: 2 },
+  { id: 'auto', name: 'Auto', sub: 'Use routing default', cost: 0 },
+  { id: 'claude', name: 'Claude Code', sub: 'Your Claude login', cost: 0 },
+  { id: 'codex', name: 'Codex', sub: 'Your ChatGPT login', cost: 0 },
 ];
 
 function useEffortMeta() {
@@ -308,7 +306,7 @@ export function NewJobScreen() {
     if (running || !proj || !goal.trim()) return;
     setRunning(true);
     api
-      .createAndRunJob({ projectId: proj, input: goal.trim(), effort: EFFORT_API[effort] })
+      .createAndRunJob({ projectId: proj, input: goal.trim(), effort: EFFORT_API[effort], ...(model === 'claude' || model === 'codex' ? { engine: model } : {}) })
       .then(() => {
         nav.goBack();
       })

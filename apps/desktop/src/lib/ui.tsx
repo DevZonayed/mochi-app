@@ -240,12 +240,13 @@ export interface ModelOption {
   cost: number;
 }
 
+/* The real engines Maestro runs on this Mac. 'auto' follows the routing set in
+   Settings → Engines; the other two force a per-job engine override. Both run on
+   your own sign-ins (Claude Code subscription / Codex ChatGPT), so cost is 0 here. */
 export const DEFAULT_MODELS: ModelOption[] = [
-  { id: 'auto',   name: 'Auto',   provider: 'auto',      sub: 'Routed per task', cost: 0 },
-  { id: 'opus',   name: 'Opus',   provider: 'anthropic', sub: 'Most capable',    cost: 3 },
-  { id: 'sonnet', name: 'Sonnet', provider: 'anthropic', sub: 'Balanced',        cost: 2 },
-  { id: 'haiku',  name: 'Haiku',  provider: 'anthropic', sub: 'Fastest',         cost: 1 },
-  { id: 'gpt',    name: 'GPT-4o', provider: 'openai',    sub: 'Media & vision',  cost: 2 },
+  { id: 'auto',   name: 'Auto',        provider: 'auto',      sub: 'Use routing default', cost: 0 },
+  { id: 'claude', name: 'Claude Code', provider: 'anthropic', sub: 'Your Claude login',   cost: 0 },
+  { id: 'codex',  name: 'Codex',       provider: 'openai',    sub: 'Your ChatGPT login',  cost: 0 },
 ];
 
 export function ProviderGlyph({ provider, size = 18 }: { provider: ModelProvider; size?: number }) {

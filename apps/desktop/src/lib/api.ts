@@ -162,6 +162,13 @@ export interface EngineStatus {
   reason: string;
 }
 export type EngineStatuses = Record<EngineId, EngineStatus>;
+export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
+export interface FolderInspect { ok: boolean; path: string; info: RepoInfo; error?: string }
+export type CloneEvent =
+  | { phase: 'start'; url: string }
+  | { phase: 'progress'; line: string }
+  | { phase: 'done'; projectId: string; dir: string; branch: string | null }
+  | { phase: 'failed'; error: string };
 
 const RAW_BASE =
   (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_API_BASE ??
@@ -182,6 +189,8 @@ interface Bridge {
   localEngine?: boolean;
   call?: (method: string, params?: Record<string, unknown>) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   onEvent?: (cb: (e: { name: string; data: unknown }) => void) => () => void;
+  pickFolder?: () => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  revealPath?: (p: string) => Promise<{ ok: boolean; error?: string }>;
 }
 const bridge: Bridge | undefined =
   typeof window !== 'undefined' ? (window as unknown as { maestro?: Bridge }).maestro : undefined;
@@ -301,6 +310,23 @@ export const api = {
   getProject: (id: string) =>
     call<Project>('getProject', { id }, () => req<Project>(`/api/projects/${encodeURIComponent(id)}`)),
 
+  // Coding agent: clone a repo / open a folder / inspect git (desktop owns git)
+  gitAvailable: () => call<{ available: boolean }>('gitAvailable', {}, () => Promise.resolve({ available: false })),
+  cloneRepo: (input: { url: string; name?: string; dirName?: string; instructions?: string; color?: string }) =>
+    call<Project>('cloneRepo', { ...input }, () =>
+      req<Project>('/api/projects/clone', { method: 'POST', body: JSON.stringify(input) })),
+  getProjectRepo: (id: string) =>
+    call<RepoInfo>('getProjectRepo', { id }, () => req<RepoInfo>(`/api/projects/${encodeURIComponent(id)}/repo`)),
+  /** Native folder picker — desktop only; resolves null in the browser. */
+  pickFolder: async (): Promise<FolderInspect | null> => {
+    if (!bridge?.pickFolder) return null;
+    const r = await bridge.pickFolder();
+    if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'failed');
+    return (r.data as FolderInspect | null) ?? null;
+  },
+  /** Reveal a local path in Finder — desktop only; no-op in the browser. */
+  revealPath: async (p: string): Promise<void> => { if (bridge?.revealPath) await bridge.revealPath(p); },
+
   // Jobs — in the desktop app these EXECUTE on this Mac (Claude Code login)
   listJobs: (projectId?: string) =>
     call<Job[]>('listJobs', { projectId }, () => req<Job[]>('/api/jobs' + qp({ projectId }))),
@@ -367,17 +393,21 @@ export const api = {
     call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
         if (name === 'approval' && handlers.onApproval) handlers.onApproval(data as Approval);
+        if (name === 'project' && handlers.onProject) handlers.onProject(data as Project);
+        if (name === 'clone' && handlers.onClone) handlers.onClone(data as CloneEvent);
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
     const es = new EventSource(API_BASE + '/api/stream' + (remoteToken ? `?token=${encodeURIComponent(remoteToken)}` : ''));
     if (handlers.onJob) es.addEventListener('job', (e: MessageEvent) => { try { handlers.onJob!(JSON.parse(e.data) as Job); } catch { /* ignore */ } });
     if (handlers.onApproval) es.addEventListener('approval', (e: MessageEvent) => { try { handlers.onApproval!(JSON.parse(e.data) as Approval); } catch { /* ignore */ } });
+    if (handlers.onProject) es.addEventListener('project', (e: MessageEvent) => { try { handlers.onProject!(JSON.parse(e.data) as Project); } catch { /* ignore */ } });
+    if (handlers.onClone) es.addEventListener('clone', (e: MessageEvent) => { try { handlers.onClone!(JSON.parse(e.data) as CloneEvent); } catch { /* ignore */ } });
     return () => es.close();
   },
   /** Convenience: subscribe to job updates only. */

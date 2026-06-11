@@ -1,5 +1,6 @@
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { Store } from './store.js';
 import { LocalEngine } from './engine.js';
 import { Providers } from './providers.js';
@@ -77,6 +78,23 @@ app.whenReady().then(() => {
       const err = e as { message?: string; statusCode?: number };
       return { ok: false, error: err?.message ?? 'failed', status: err?.statusCode ?? 500 };
     }
+  });
+
+  // Native folder picker — DESKTOP-ONLY (never exposed to the relay/remotes).
+  // The coding agent opens an existing local folder as a project workspace.
+  ipcMain.handle('maestro:pickFolder', async () => {
+    const w = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0] ?? null;
+    const res = w
+      ? await dialog.showOpenDialog(w, { properties: ['openDirectory', 'createDirectory'], title: 'Open project folder' })
+      : await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: 'Open project folder' });
+    if (res.canceled || !res.filePaths[0]) return { ok: true, data: null };
+    return { ok: true, data: await dispatch('inspectFolder', { path: res.filePaths[0] }) };
+  });
+
+  // Reveal a project's folder in Finder — desktop-only, path-guarded.
+  ipcMain.handle('maestro:revealPath', async (_e, p: string) => {
+    if (typeof p === 'string' && p && existsSync(p)) { shell.showItemInFolder(p); return { ok: true }; }
+    return { ok: false, error: 'path not found' };
   });
 
   createWindow();

@@ -15,10 +15,17 @@ import {
   Spinner,
   EffortDial,
   EFFORT_EST,
+  ModelSwitcher,
   type EffortStop,
 } from '../lib/ui';
 import { AppShell, WORKSPACE } from '../lib/appShell';
-import { api, type Project, type Job, type Effort } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo } from '../lib/api';
+
+const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
+function shortHomePath(p: string): string {
+  const m = p.match(/^\/Users\/[^/]+\/(.*)$/);
+  return m ? `~/${m[1]}` : p;
+}
 
 /* ───────────────── page-specific CSS (from Project Detail.html <style>) ───────────────── */
 const PAGE_CSS = `
@@ -348,6 +355,7 @@ const AUTONOMY: AutonomyMode[] = [
 function GoalComposer({ projectId, onRun }: { projectId: string | null; onRun: () => void }) {
   const [goal, setGoal] = React.useState('');
   const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
+  const [engine, setEngine] = React.useState('auto');
   const [autonomy, setAutonomy] = React.useState('gated');
   const [running, setRunning] = React.useState(false);
   const est = EFFORT_EST[effort];
@@ -358,7 +366,10 @@ function GoalComposer({ projectId, onRun }: { projectId: string | null; onRun: (
     if (!text || !projectId || running) return;
     setRunning(true);
     try {
-      await api.createAndRunJob({ projectId, input: text || 'New job', effort: EFFORT_TO_API[effort] });
+      await api.createAndRunJob({
+        projectId, input: text || 'New job', effort: EFFORT_TO_API[effort],
+        ...(engine === 'claude' || engine === 'codex' ? { engine } : {}),
+      });
       setGoal('');
       onRun();
     } catch {
@@ -402,6 +413,11 @@ function GoalComposer({ projectId, onRun }: { projectId: string | null; onRun: (
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+          <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Engine</span>
+          <ModelSwitcher value={engine} onChange={setEngine} compact />
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
           <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Autonomy</span>
           <div style={{ position: 'relative', display: 'inline-flex', padding: 2, background: 'var(--fill-secondary)', borderRadius: 9 }}>
             <div style={{ position: 'absolute', top: 2, bottom: 2, left: `calc(${ai * 33.333}% + 2px)`, width: `calc(33.333% - 4px)`,
@@ -417,11 +433,11 @@ function GoalComposer({ projectId, onRun }: { projectId: string | null; onRun: (
 
         <span style={{ flex: 1 }} />
 
-        {/* live estimate */}
+        {/* effort guide — runs on your subscription, so no per-run dollar estimate */}
         <div style={{ textAlign: 'right' }}>
-          <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 5 }}>Pre-run estimate</div>
+          <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 5 }}>Depth</div>
           <div key={effort} className="estimate" style={{ font: '600 var(--fs-callout)/1 var(--font-mono)', color: 'var(--ink)' }}>
-            ≈ ${est.cost} <span style={{ color: 'var(--ink-tertiary)' }}>·</span> ~{est.mins} min <span style={{ color: 'var(--ink-tertiary)', fontWeight: 400 }}>at {effort}</span>
+            ~{est.mins} min <span style={{ color: 'var(--ink-tertiary)', fontWeight: 400 }}>at {effort}</span>
           </div>
         </div>
       </div>
@@ -529,7 +545,41 @@ const GUARDRAILS: { text: string; origin: string }[] = [
   { text: 'Never force-push to main', origin: 'Workspace rule' },
 ];
 
-function InstructionsTab() {
+function InstructionsTab({ projectId, project, onSaved }: { projectId: string | null; project: Project | null; onSaved: (instructions: string) => void }) {
+  const [text, setText] = React.useState(project?.instructions ?? '');
+  const [state, setState] = React.useState<'idle' | 'saving' | 'saved'>('idle');
+  const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSaved = React.useRef(project?.instructions ?? '');
+
+  // Re-seed when the project loads/changes.
+  React.useEffect(() => {
+    setText(project?.instructions ?? '');
+    lastSaved.current = project?.instructions ?? '';
+    setState('idle');
+  }, [project?.id]);
+
+  // Debounced persistence: 700ms after the last keystroke, save via updateProject.
+  const onChange = (v: string) => {
+    setText(v);
+    if (!projectId) return;
+    setState('saving');
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(async () => {
+      if (v === lastSaved.current) { setState('saved'); return; }
+      try {
+        await api.updateProject(projectId, { instructions: v });
+        lastSaved.current = v;
+        setState('saved');
+        onSaved(v);
+      } catch { setState('idle'); }
+    }, 700);
+  };
+  React.useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+
+  // The exact prompt the engine builds (engine.ts): instructions, a separator,
+  // then the goal you type for each job.
+  const resolvedPreview = (text.trim() ? `${text.trim()}\n\n---\n\n` : '') + '<your goal for the job>';
+
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 360px', gap: 20, alignItems: 'start' }}>
       {/* editor */}
@@ -537,55 +587,41 @@ function InstructionsTab() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderBottom: '0.5px solid var(--separator)' }}>
           <Icon name="terminal" size={16} style={{ color: 'var(--ink-secondary)' }} />
           <span style={{ font: '600 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink)' }}>instructions.md</span>
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 20, padding: '0 8px', borderRadius: 'var(--r-pill)',
-            background: 'var(--fill-secondary)', font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>v7</span>
           <span style={{ flex: 1 }} />
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)' }}>
-            <span style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--green)' }} /> Saved
-          </span>
+          {state === 'saving'
+            ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}><Spinner size={11} /> Saving…</span>
+            : state === 'saved'
+              ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)' }}><span style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--green)' }} /> Saved</span>
+              : <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Auto-saves</span>}
         </div>
-        <textarea defaultValue={INSTRUCTION_DOC} spellCheck={false} style={{
-          width: '100%', maxWidth: 680, display: 'block', margin: '0 auto', border: 'none', outline: 'none', background: 'transparent', resize: 'none',
-          font: '400 var(--fs-body)/1.7 var(--font-text)', color: 'var(--ink)', padding: '24px 28px', minHeight: 520, boxSizing: 'border-box',
-        }} />
+        <textarea value={text} onChange={e => onChange(e.target.value)} spellCheck={false}
+          placeholder="Standing instructions for this project — the agent reads these before every job. e.g. the stack, conventions, what to never touch, how to open PRs…"
+          style={{
+            width: '100%', maxWidth: 680, display: 'block', margin: '0 auto', border: 'none', outline: 'none', background: 'transparent', resize: 'none',
+            font: '400 var(--fs-body)/1.7 var(--font-text)', color: 'var(--ink)', padding: '24px 28px', minHeight: 520, boxSizing: 'border-box',
+          }} />
       </div>
 
-      {/* resolved rail */}
+      {/* resolved rail — honest: exactly what the engine concatenates */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
         <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', padding: 16,
           backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
           <div style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 4 }}>Resolved view</div>
-          <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 14 }}>What the agent actually sees, concatenated in order.</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {RESOLVED.map((r, i) => (
-              <div key={i} style={{ position: 'relative', paddingLeft: 14 }}>
-                <span style={{ position: 'absolute', left: 0, top: 4, bottom: 4, width: 3, borderRadius: 2, background: r.tint }} />
-                <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: r.tint, marginBottom: 5 }}>{r.origin}</div>
-                <div style={{ font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink)', textWrap: 'pretty' }}>{r.text}</div>
-              </div>
-            ))}
-          </div>
+          <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 14 }}>What the agent actually sees, in order, on every run.</div>
+          <pre style={{ margin: 0, font: '400 var(--fs-caption)/1.55 var(--font-mono)', color: 'var(--ink)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{resolvedPreview}</pre>
         </div>
 
-        <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', padding: 16,
-          backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 12 }}>
-            <Icon name="lock" size={14} style={{ color: 'var(--ink-secondary)' }} />
-            <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Hard guardrails</span>
+        {project?.path && (
+          <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', padding: 16,
+            backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10 }}>
+              <Icon name={project.repoUrl ? 'gitMerge' : 'folder'} size={14} style={{ color: 'var(--ink-secondary)' }} />
+              <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Workspace folder</span>
+            </div>
+            <div style={{ font: '400 var(--fs-footnote)/1.5 var(--font-mono)', color: 'var(--ink)', wordBreak: 'break-all' }}>{project.path}</div>
+            <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 8 }}>Jobs in this project run inside this folder on your Mac.</div>
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {GUARDRAILS.map((g, i) => (
-              <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 12px', borderRadius: 10,
-                background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)' }}>
-                <Icon name="lock" size={14} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, marginTop: 1 }} />
-                <span style={{ minWidth: 0 }}>
-                  <span style={{ display: 'block', font: '500 var(--fs-footnote)/1.35 var(--font-text)', color: 'var(--ink)' }}>{g.text}</span>
-                  <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>{g.origin}</span>
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );
@@ -818,6 +854,7 @@ export default function ProjectDetail() {
   // live data
   const [projectId, setProjectId] = React.useState<string | null>(routeId ?? null);
   const [project, setProject] = React.useState<Project | null>(null);
+  const [repo, setRepo] = React.useState<RepoInfo | null>(null);
   const [jobs, setJobs] = React.useState<Job[]>([]);
 
   // Resolve the project id: route param wins, else first project in the workspace.
@@ -851,6 +888,8 @@ export default function ProjectDetail() {
         if (cancelled) return;
         setProject(p);
         setJobs(js);
+        if (p.path) { api.getProjectRepo(projectId).then(r => { if (!cancelled) setRepo(r); }).catch(() => {}); }
+        else setRepo(null);
       } catch { /* fail soft — render empty */ }
     })();
     return () => { cancelled = true; };
@@ -899,13 +938,33 @@ export default function ProjectDetail() {
                 <span className="breathe" style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--green)' }} /> Active · {runningCount} running
               </span>
             </div>
-            <div style={{ font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 7 }}>Code · 4 sub-projects · TypeScript, Fastify, Postgres</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+              <span style={{ font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{KIND_LABEL[project?.kind ?? ''] ?? 'Project'}</span>
+              {project?.path && (
+                <>
+                  <span style={{ color: 'var(--ink-tertiary)' }}>·</span>
+                  <span title={project.path} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)', maxWidth: 280,
+                    background: 'var(--fill-tertiary)', font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>
+                    <Icon name={project.repoUrl ? 'gitMerge' : 'folder'} size={12} />
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shortHomePath(project.path)}</span>
+                  </span>
+                  {repo?.branch && (
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)',
+                      background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)', font: '600 var(--fs-caption)/1 var(--font-mono)' }}>
+                      <Icon name="gitMerge" size={11} /> {repo.branch}
+                    </span>
+                  )}
+                </>
+              )}
+            </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-            <button className="split-quiet" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 40, padding: '0 15px', borderRadius: 'var(--r-pill)',
-              background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>
-              <Icon name="layers" size={16} /> Run from template
-            </button>
+            {project?.path && IS_LOCAL && (
+              <button onClick={() => { if (project?.path) void api.revealPath(project.path); }} className="split-quiet" title="Reveal in Finder" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 40, padding: '0 15px', borderRadius: 'var(--r-pill)',
+                background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>
+                <Icon name="folder" size={16} /> Reveal
+              </button>
+            )}
             <button onClick={() => setPaletteOpen(true)} className="primary-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 40, padding: '0 18px', borderRadius: 'var(--r-pill)',
               background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.30)' }}>
               <Icon name="plus" size={16} stroke={2.4} /> New job
@@ -937,12 +996,11 @@ export default function ProjectDetail() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 26 }}>
             <GateBanner gate={gate} onApprove={() => setGate(false)} onDismiss={() => setGate(false)} />
             <GoalComposer projectId={projectId} onRun={() => { void refetchJobs(); }} />
-            <SubProjects />
             <RecentJobs jobs={projectJobs.slice(0, 5)} />
           </div>
         )}
         {tab === 'jobs' && <JobsTab jobs={projectJobs} />}
-        {tab === 'instructions' && <InstructionsTab />}
+        {tab === 'instructions' && <InstructionsTab projectId={projectId} project={project} onSaved={(ins) => setProject(p => p ? { ...p, instructions: ins } : p)} />}
         {tab === 'skills' && <SkillsTab />}
         {tab === 'budget' && <BudgetTab />}
         {tab === 'settings' && <SettingsTab />}
