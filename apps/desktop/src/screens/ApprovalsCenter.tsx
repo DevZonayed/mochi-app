@@ -84,6 +84,7 @@ interface Gate {
   urgency: string;
   summary: string;
   age: string;
+  jobId?: string | null;
   scheduled?: boolean;
   unread?: boolean;
   detail: GateDetailData;
@@ -144,6 +145,7 @@ function approvalToGate(a: Approval): Gate {
     urgency,
     summary: a.title,
     age: ageLabel(a.createdAt),
+    jobId: a.jobId ?? null,
     detail: buildDetail(type, a),
   };
 }
@@ -640,14 +642,13 @@ export default function ApprovalsCenter() {
                     background: 'var(--glass-tint)', backdropFilter: 'blur(40px) saturate(180%)', WebkitBackdropFilter: 'blur(40px) saturate(180%)', borderTop: '0.5px solid var(--separator)' }}>
                     <button onClick={approve} className="primary-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 9, height: 42, padding: '0 20px', borderRadius: 'var(--r-pill)',
                       background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.32)' }}>
-                      <Icon name="check" size={17} /> {active.type === 'budget' ? 'Raise & approve' : 'Approve'} <ActionKey>⌘↩</ActionKey>
+                      <Icon name="check" size={17} /> Approve <ActionKey>⌘↩</ActionKey>
                     </button>
-                    <button className="ghost-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 42, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>
-                      <Icon name="sliders" size={16} /> Edit
-                    </button>
-                    <button className="ghost-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 42, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>
-                      <Icon name="command" size={16} /> Respond
-                    </button>
+                    {active.jobId && (
+                      <button onClick={() => navigate(`/session-transcript/${active.jobId}`)} className="ghost-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 42, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>
+                        <Icon name="enter" size={16} style={{ transform: 'rotate(-90deg)' }} /> Open job
+                      </button>
+                    )}
                     <span style={{ flex: 1 }} />
                     <button onClick={() => active && reject(active.id)} className="reject-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, height: 42, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>
                       Reject <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minWidth: 18, height: 18, padding: '0 4px', borderRadius: 5, background: 'rgba(255,59,48,0.14)', font: '600 var(--fs-caption)/1 var(--font-mono)' }}>⌘⌫</span>

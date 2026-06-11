@@ -5,37 +5,44 @@ import { useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon, type IconName, MaestroMark } from '../Icon';
 import { Card, Mono } from '../ui';
+import { api, type AppEvent, type AppEventKind } from '../api';
+import { getStr, setStr } from '../storage';
 
 type Tab = 'inapp' | 'push';
+const NOTIF_READ = 'maestro.mobile.notifReadTs';
 
-interface Notif {
-  icon: IconName;
-  tint: keyof ReturnType<typeof useTints>;
-  msg: string;
-  proj: string;
-  t: string;
-  unread?: boolean;
+type TintKey = 'blue' | 'purple' | 'orange' | 'teal' | 'green' | 'red' | 'indigo';
+const KIND_META: Record<AppEventKind, { icon: IconName; tint: TintKey }> = {
+  'job-done': { icon: 'checkCircle', tint: 'green' },
+  'job-failed': { icon: 'xCircle', tint: 'red' },
+  'job-cancelled': { icon: 'xCircle', tint: 'orange' },
+  'approval-created': { icon: 'arrowRight', tint: 'orange' },
+  'approval-resolved': { icon: 'checkCircle', tint: 'green' },
+  'schedule-fired': { icon: 'clock', tint: 'blue' },
+  'clone-done': { icon: 'checkCircle', tint: 'green' },
+  'clone-failed': { icon: 'xCircle', tint: 'red' },
+  research: { icon: 'shield', tint: 'indigo' },
+  publish: { icon: 'send', tint: 'teal' },
+  comm: { icon: 'send', tint: 'purple' },
+  asset: { icon: 'clapper', tint: 'purple' },
+};
+
+function relTime(ts: number): string {
+  const m = Math.floor((Date.now() - ts) / 60000);
+  if (m < 1) return 'now';
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
 }
-
-const NOTIFS: { day: string; rows: Notif[] }[] = [
-  {
-    day: 'Today',
-    rows: [
-      { icon: 'arrowRight', tint: 'orange', msg: 'PsychGate needs approval — plan ready', proj: 'Atlas API', t: '2m', unread: true },
-      { icon: 'checkCircle', tint: 'green', msg: 'Build finished · $1.12 · 14 min', proj: 'Atlas API', t: '20m', unread: true },
-      { icon: 'send', tint: 'teal', msg: 'Published video to YouTube', proj: 'Q3 Content', t: '1h' },
-      { icon: 'gauge', tint: 'orange', msg: 'Market Scan at 90% of cap', proj: 'Market Scan', t: '2h' },
-    ],
-  },
-  {
-    day: 'Yesterday',
-    rows: [
-      { icon: 'xCircle', tint: 'red', msg: 'Job failed — render timeout', proj: 'Brand Refresh', t: '18h' },
-      { icon: 'shield', tint: 'indigo', msg: 'Skill quarantined: figma-export', proj: 'Workspace', t: '21h' },
-      { icon: 'clock', tint: 'blue', msg: 'Nightly test suite fired', proj: 'Atlas API', t: '1d' },
-    ],
-  },
-];
+function dayLabel(ts: number): string {
+  const d = new Date(ts); d.setHours(0, 0, 0, 0);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const diff = Math.round((today.getTime() - d.getTime()) / 86400000);
+  if (diff <= 0) return 'Today';
+  if (diff === 1) return 'Yesterday';
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
 
 function useTints() {
   const { theme } = useTheme();
@@ -74,29 +81,53 @@ function PushHeading({ children }: { children: React.ReactNode }) {
   );
 }
 
-function InAppList() {
+function InAppList({ events, readTs }: { events: AppEvent[]; readTs: number }) {
   const { theme } = useTheme();
   const tints = useTints();
+
+  if (events.length === 0) {
+    return (
+      <View style={{ alignItems: 'center', paddingVertical: 60, paddingHorizontal: 30 }}>
+        <View style={{ width: 64, height: 64, borderRadius: 20, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center', marginBottom: 18 }}>
+          <Icon name="checkCircle" size={32} color={theme.color.inkTertiary} />
+        </View>
+        <Text style={{ fontSize: 18, fontWeight: '700', color: theme.color.ink, marginBottom: 6 }}>Nothing yet</Text>
+        <Text style={{ fontSize: 14, lineHeight: 20, color: theme.color.inkSecondary, textAlign: 'center' }}>Job results, approvals, schedules, and clones from your Mac show up here.</Text>
+      </View>
+    );
+  }
+
+  // group consecutive events by day label
+  const sections: { day: string; rows: AppEvent[] }[] = [];
+  for (const ev of events) {
+    const day = dayLabel(ev.ts);
+    const last = sections[sections.length - 1];
+    if (last && last.day === day) last.rows.push(ev);
+    else sections.push({ day, rows: [ev] });
+  }
+
   return (
     <>
-      {NOTIFS.map((section) => (
+      {sections.map((section) => (
         <View key={section.day} style={{ marginBottom: 12 }}>
           <Text style={{ fontSize: 13, fontWeight: '600', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary, paddingHorizontal: 20, paddingTop: 4, paddingBottom: 8 }}>
             {section.day}
           </Text>
           <View style={{ marginHorizontal: 16, backgroundColor: theme.color.bgElevated, borderRadius: 14, borderWidth: 0.5, borderColor: theme.color.separator, overflow: 'hidden' }}>
-            {section.rows.map((r, i) => {
-              const tint = tints[r.tint];
+            {section.rows.map((ev, i) => {
+              const meta = KIND_META[ev.kind] ?? { icon: 'shield' as IconName, tint: 'blue' as TintKey };
+              const tint = tints[meta.tint];
+              const unread = ev.ts > readTs;
               return (
-                <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 13, paddingHorizontal: 15, borderBottomWidth: i < section.rows.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}>
+                <View key={ev.id} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 13, paddingHorizontal: 15, borderBottomWidth: i < section.rows.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}>
                   <View style={{ width: 34, height: 34, borderRadius: 10, alignItems: 'center', justifyContent: 'center', backgroundColor: tint + '24' }}>
-                    <Icon name={r.icon} size={18} color={tint} />
+                    <Icon name={meta.icon} size={18} color={tint} />
                   </View>
                   <View style={{ flex: 1, minWidth: 0 }}>
-                    <Text style={{ fontSize: 15, lineHeight: 19, fontWeight: r.unread ? '600' : '500', color: theme.color.ink }}>{r.msg}</Text>
-                    <Text style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 3 }}>{r.proj} · {r.t}</Text>
+                    <Text style={{ fontSize: 15, lineHeight: 19, fontWeight: unread ? '600' : '500', color: theme.color.ink }}>{ev.title}</Text>
+                    <Text style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 3 }}>{ev.subtitle ? `${ev.subtitle} · ` : ''}{relTime(ev.ts)}</Text>
                   </View>
-                  {r.unread ? <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: theme.color.blue }} /> : null}
+                  {unread ? <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: theme.color.blue }} /> : null}
                 </View>
               );
             })}
@@ -173,6 +204,19 @@ export function NotificationsScreen() {
   const insets = useSafeAreaInsets();
   const nav = useNavigation<any>();
   const [tab, setTab] = useState<Tab>('inapp');
+  const [events, setEvents] = useState<AppEvent[]>([]);
+  const [readTs, setReadTs] = useState<number>(() => Number(getStr(NOTIF_READ)) || 0);
+
+  useEffect(() => {
+    const stop = api.poll(() => { api.listEvents().then(setEvents).catch(() => {}); }, 8000);
+    return stop;
+  }, []);
+
+  const markAllRead = () => {
+    const ts = events[0]?.ts ?? Date.now();
+    setReadTs(ts);
+    setStr(NOTIF_READ, String(ts));
+  };
 
   const tabs: { key: Tab; label: string }[] = [
     { key: 'inapp', label: 'In-app' },
@@ -192,7 +236,7 @@ export function NotificationsScreen() {
         {/* large title */}
         <View style={{ paddingHorizontal: 20, paddingTop: 6, paddingBottom: 10, flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' }}>
           <Text style={{ fontSize: 34, fontWeight: '700', letterSpacing: -0.7, color: theme.color.ink }}>Activity</Text>
-          <Pressable>
+          <Pressable onPress={markAllRead} hitSlop={8}>
             <Text style={{ fontSize: 15, fontWeight: '500', color: theme.color.blue }}>Mark all read</Text>
           </Pressable>
         </View>
@@ -213,7 +257,7 @@ export function NotificationsScreen() {
           })}
         </View>
 
-        {tab === 'inapp' ? <InAppList /> : <PushDesigns />}
+        {tab === 'inapp' ? <InAppList events={events} readTs={readTs} /> : <PushDesigns />}
       </ScrollView>
     </View>
   );

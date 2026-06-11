@@ -5,6 +5,7 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useTheme } from './theme';
 import { Icon, type IconName } from './Icon';
 import { getFlag, ONBOARDED } from './storage';
+import { api } from './api';
 
 import { HomeScreen } from './screens/Home';
 import { JobsScreen } from './screens/Jobs';
@@ -43,6 +44,15 @@ const TAB_ICON: Record<string, IconName> = {
 
 function Tabs() {
   const { theme } = useTheme();
+  // Live pending-approvals badge — poll every 15s (RN has no SSE).
+  const [pending, setPending] = React.useState(0);
+  React.useEffect(() => {
+    let alive = true;
+    const refresh = () => api.listApprovals('pending').then(a => { if (alive) setPending(a.length); }).catch(() => {});
+    refresh();
+    const t = setInterval(refresh, 15000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
@@ -55,7 +65,7 @@ function Tabs() {
     >
       <Tab.Screen name="Home" component={HomeScreen} />
       <Tab.Screen name="Jobs" component={JobsScreen} />
-      <Tab.Screen name="Approvals" component={ApprovalsScreen} options={{ tabBarBadge: 2 }} />
+      <Tab.Screen name="Approvals" component={ApprovalsScreen} options={{ tabBarBadge: pending > 0 ? pending : undefined }} />
       <Tab.Screen name="Studio" component={StudioScreen} />
       <Tab.Screen name="Settings" component={SettingsScreen} />
     </Tab.Navigator>

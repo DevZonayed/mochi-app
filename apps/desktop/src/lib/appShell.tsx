@@ -74,6 +74,36 @@ export function TrafficLights() {
   return null;
 }
 
+/* Live pending-approvals count — one shared fetch+subscription for the whole
+   chrome (sidebar badge + toolbar bell), ref-counted so it runs once. Refreshes
+   on approval/job events and a slow poll. Zero when nothing is waiting. */
+let pendingCount = 0;
+let pendingRefs = 0;
+let pendingStop: (() => void) | null = null;
+const pendingListeners = new Set<() => void>();
+function notifyPending() { for (const l of pendingListeners) l(); }
+function startPendingWatch(): () => void {
+  const refresh = () => api.listApprovals('pending').then(a => { if (a.length !== pendingCount) { pendingCount = a.length; notifyPending(); } }).catch(() => {});
+  refresh();
+  const unsub = api.subscribe({ onApproval: refresh, onJob: refresh });
+  const poll = setInterval(refresh, 20000);
+  return () => { unsub(); clearInterval(poll); };
+}
+export function usePendingApprovals(): number {
+  const [, force] = React.useReducer((x: number) => x + 1, 0);
+  React.useEffect(() => {
+    pendingListeners.add(force);
+    if (pendingRefs === 0) pendingStop = startPendingWatch();
+    pendingRefs++;
+    return () => {
+      pendingListeners.delete(force);
+      pendingRefs--;
+      if (pendingRefs === 0 && pendingStop) { pendingStop(); pendingStop = null; }
+    };
+  }, []);
+  return pendingCount;
+}
+
 export interface SidebarProps {
   active?: string;
   onNav?: (key: string) => void;
@@ -81,6 +111,7 @@ export interface SidebarProps {
 }
 
 export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
+  const pending = usePendingApprovals();
   return (
     <aside className="win-drag" style={{
       width: 260, flexShrink: 0, height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', zIndex: 2,
@@ -104,6 +135,8 @@ export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
       <nav style={{ flex: 1, overflow: 'auto', padding: '6px 10px', display: 'flex', flexDirection: 'column', gap: 1 }}>
         {NAV_ROUTES.map(n => {
           const on = active === n.key;
+          // Live badge: approvals shows the real pending count, only when > 0.
+          const badge = n.key === 'approvals' ? (pending > 0 ? pending : 0) : 0;
           return (
             <button key={n.key} onClick={() => onNav && onNav(n.key)} style={{
               display: 'flex', alignItems: 'center', gap: 11, height: 36, padding: '0 10px', borderRadius: 8, textAlign: 'left',
@@ -114,12 +147,12 @@ export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
             }} className={on ? '' : 'nav-item'}>
               <Icon name={n.icon} size={18} stroke={on ? 2 : 1.85} />
               <span style={{ flex: 1 }}>{n.label}</span>
-              {n.badge && (
+              {badge > 0 && (
                 <span style={{
                   minWidth: 18, height: 18, padding: '0 5px', borderRadius: 'var(--r-pill)',
                   background: on ? 'rgba(255,255,255,0.25)' : 'var(--red)', color: '#fff',
                   font: '700 var(--fs-caption)/18px var(--font-text)', textAlign: 'center',
-                }}>{n.badge}</span>
+                }}>{badge}</span>
               )}
             </button>
           );
@@ -175,6 +208,8 @@ export interface ToolbarProps {
 }
 
 export function Toolbar({ onSearch, theme, setTheme, right }: ToolbarProps) {
+  const navigate = useNavigate();
+  const pending = usePendingApprovals();
   return (
     <header className="win-drag" style={{
       height: 56, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 14, padding: '0 16px 0 18px',
@@ -200,12 +235,12 @@ export function Toolbar({ onSearch, theme, setTheme, right }: ToolbarProps) {
 
       <BudgetChip />
 
-      <button className="tb-icon" aria-label="Notifications" style={{
+      <button className="tb-icon" onClick={() => navigate('/approvals')} aria-label="Approvals" title={pending > 0 ? `${pending} waiting` : 'Approvals'} style={{
         width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', position: 'relative',
         color: 'var(--ink-secondary)',
       }}>
         <Icon name="bell" size={19} />
-        <span style={{ position: 'absolute', top: 7, right: 8, width: 7, height: 7, borderRadius: 4, background: 'var(--red)', border: '1.5px solid var(--bg-grouped)' }} />
+        {pending > 0 && <span style={{ position: 'absolute', top: 7, right: 8, width: 7, height: 7, borderRadius: 4, background: 'var(--red)', border: '1.5px solid var(--bg-grouped)' }} />}
       </button>
 
       <button className="tb-icon" onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')} aria-label="Toggle appearance" style={{

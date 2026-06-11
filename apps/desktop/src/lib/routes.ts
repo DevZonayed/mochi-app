@@ -19,7 +19,7 @@ export const NAV_ROUTES: NavRoute[] = [
   { key: 'home', path: '/command-center', label: 'Home', icon: 'home' },
   { key: 'projects', path: '/projects', label: 'Projects', icon: 'layers' },
   { key: 'jobs', path: '/job-monitor', label: 'Jobs', icon: 'jobs' },
-  { key: 'approvals', path: '/approvals', label: 'Approvals', icon: 'shield', badge: 3 },
+  { key: 'approvals', path: '/approvals', label: 'Approvals', icon: 'shield' },
   { key: 'scheduler', path: '/scheduler', label: 'Scheduler', icon: 'calendar' },
   { key: 'skills', path: '/skills-registry', label: 'Skills', icon: 'spark' },
   { key: 'templates', path: '/templates', label: 'Templates', icon: 'sliders' },
