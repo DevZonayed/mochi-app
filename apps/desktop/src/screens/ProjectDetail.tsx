@@ -1255,12 +1255,19 @@ function UserBubble({ text }: { text: string }) {
 }
 
 
-/** A small quiet stat pill — `live` tints it while the counter is still ticking. */
-function MetaPill({ children, live }: { children: React.ReactNode; live?: boolean }) {
+/* One compact, FIXED stat line for a turn. It lives in the message header so it
+   stays put (top-right of the message) as the body streams, instead of drifting
+   at the bottom. Live numbers roll via CountUp; tinted purple while running. */
+function TurnMeta({ job, elapsed, toolCount, live }: { job: Job; elapsed: string; toolCount: number; live: boolean }) {
+  const dot = <span style={{ opacity: 0.45 }}>·</span>;
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 20, padding: '0 8px', borderRadius: 'var(--r-pill)',
-      background: live ? 'color-mix(in srgb, var(--purple) 12%, transparent)' : 'var(--fill-tertiary)',
-      font: '500 var(--fs-caption)/1 var(--font-mono)', color: live ? 'var(--purple)' : 'var(--ink-secondary)' }}>{children}</span>
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, flexShrink: 0, whiteSpace: 'nowrap',
+      font: '500 var(--fs-caption)/1 var(--font-mono)', color: live ? 'var(--purple)' : 'var(--ink-tertiary)' }}>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}><Icon name="clock" size={10} /> {elapsed}</span>
+      {job.tokens > 0 && <>{dot}<span><CountUp value={job.tokens} /> tok</span></>}
+      {job.cost > 0 && <>{dot}<span>{live ? '~' : ''}$<CountUp value={job.cost} format={n => n.toFixed(job.cost < 1 ? 3 : 2)} /></span></>}
+      {toolCount > 0 && <>{dot}<span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}><Icon name="command" size={10} /> <CountUp value={toolCount} /></span></>}
+    </span>
   );
 }
 
@@ -1371,21 +1378,13 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
             </span>
           )}
           <span style={{ flex: 1 }} />
+          {(live || job.tokens > 0 || job.cost > 0) && <TurnMeta job={job} elapsed={elapsed} toolCount={toolCount} live={live} />}
           {job.status === 'done' && replyText && <CopyButton text={replyText} className="turn-copy" />}
         </div>
         {body}
         {!hasBody && live && (
           <div style={{ font: '500 14px/1.5 var(--font-text)' }}>
             <span className="think-shimmer">{job.stage || 'Thinking…'}</span>
-          </div>
-        )}
-        {/* live HUD — time / tokens / spend / tools all count up in real time */}
-        {live && (
-          <div style={{ marginTop: 9, display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
-            <MetaPill live><Icon name="clock" size={10} /> {elapsed}</MetaPill>
-            {job.tokens > 0 && <MetaPill live><CountUp value={job.tokens} /> tok</MetaPill>}
-            {job.cost > 0 && <MetaPill live>~$<CountUp value={job.cost} format={n => n.toFixed(job.cost < 1 ? 3 : 2)} /></MetaPill>}
-            {toolCount > 0 && <MetaPill live><Icon name="command" size={10} /> <CountUp value={toolCount} /> {toolCount === 1 ? 'tool' : 'tools'}</MetaPill>}
           </div>
         )}
         {job.status === 'failed' && (
@@ -1404,14 +1403,6 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
         {job.status === 'cancelled' && (
           <div style={{ marginTop: 5, display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
             <Icon name="x" size={11} stroke={2.4} /> Stopped
-          </div>
-        )}
-        {job.status === 'done' && (
-          <div style={{ marginTop: 9, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            <MetaPill><Icon name="clock" size={10} /> {elapsed}</MetaPill>
-            {job.tokens > 0 && <MetaPill><CountUp value={job.tokens} /> tok</MetaPill>}
-            {job.cost > 0 && <MetaPill>$<CountUp value={job.cost} format={n => n.toFixed(job.cost < 1 ? 3 : 2)} /></MetaPill>}
-            {toolCount > 0 && <MetaPill><Icon name="command" size={10} /> {toolCount} {toolCount === 1 ? 'tool' : 'tools'}</MetaPill>}
           </div>
         )}
       </div>
