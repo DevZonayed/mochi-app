@@ -33,6 +33,31 @@ function shortHomePath(p: string): string {
   return m ? `~/${m[1]}` : p;
 }
 
+/* Composer theming — the prompt box border/glow takes on the current EFFORT's
+   color (--eff-accent), so switching FAST→BALANCED→DEEP→MAX visibly recolors
+   the box; MAX gets an animated rainbow border. Exported as its own block so
+   ChatThread can inject it itself and the theming works wherever the chat
+   renders (the project view AND the multi-project Workspace tabs). */
+export const COMPOSER_CSS = `
+  .composer-card { position: relative; transition: border-color 220ms ease, box-shadow 220ms ease; }
+  .composer-eff { border-color: color-mix(in srgb, var(--eff-accent) 52%, var(--separator-strong)) !important;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--eff-accent) 16%, transparent), 0 6px 22px color-mix(in srgb, var(--eff-accent) 13%, transparent); }
+  .composer-eff:focus-within { border-color: color-mix(in srgb, var(--eff-accent) 82%, var(--separator-strong)) !important;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--eff-accent) 18%, transparent), 0 10px 30px color-mix(in srgb, var(--eff-accent) 17%, transparent), var(--card-shadow); }
+  @keyframes ultraHue { to { filter: hue-rotate(360deg); } }
+  .composer-ultra { border-color: transparent !important; box-shadow: 0 6px 24px color-mix(in srgb, #9b6bff 16%, transparent); }
+  .composer-ultra::before {
+    content: ''; position: absolute; inset: 0; border-radius: inherit; padding: 1.6px; pointer-events: none;
+    background: conic-gradient(from 0deg, #ff5d5d, #ffb44b, #f4e04b, #6bd49a, #41c8d4, #5b8cff, #9b6bff, #ff6b9f, #ff5d5d);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0); -webkit-mask-composite: xor;
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0); mask-composite: exclude;
+    animation: ultraHue 6s linear infinite; }
+  .composer-ultra:focus-within { box-shadow: 0 0 0 4px color-mix(in srgb, #9b6bff 18%, transparent), 0 10px 30px color-mix(in srgb, #9b6bff 18%, transparent), var(--card-shadow); }
+  .send-fab { transition: transform 160ms cubic-bezier(.32,.72,0,1), background 160ms ease, box-shadow 160ms ease; }
+  .send-fab:not(:disabled):hover { transform: scale(1.06); }
+  .send-fab:not(:disabled):active { transform: scale(.94); }
+`;
+
 /* ───────────────── page-specific CSS (from Project Detail.html <style>) ───────────────── */
 const PAGE_CSS = `
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -89,20 +114,7 @@ const PAGE_CSS = `
   .code-card pre::-webkit-scrollbar-track { background: transparent; }
 
   /* composer — focus glow ring, tinted by the current EFFORT (--eff-accent) */
-  .composer-card { position: relative; transition: border-color 200ms ease, box-shadow 200ms ease; }
-  .composer-eff { border-color: color-mix(in srgb, var(--eff-accent) 30%, var(--separator-strong)) !important; }
-  .composer-eff:focus-within { border-color: color-mix(in srgb, var(--eff-accent) 60%, var(--separator-strong)) !important;
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--eff-accent) 14%, transparent), var(--card-shadow); }
-  /* MAX effort → animated rainbow gradient border (the "ultra" tier) */
-  @keyframes ultraHue { to { filter: hue-rotate(360deg); } }
-  .composer-ultra { border-color: transparent !important; }
-  .composer-ultra::before {
-    content: ''; position: absolute; inset: 0; border-radius: inherit; padding: 1.6px; pointer-events: none;
-    background: conic-gradient(from 0deg, #ff5d5d, #ffb44b, #f4e04b, #6bd49a, #41c8d4, #5b8cff, #9b6bff, #ff6b9f, #ff5d5d);
-    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0); -webkit-mask-composite: xor;
-    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0); mask-composite: exclude;
-    animation: ultraHue 6s linear infinite; }
-  .composer-ultra:focus-within { box-shadow: 0 0 0 4px color-mix(in srgb, #9b6bff 16%, transparent), var(--card-shadow); }
+  ${COMPOSER_CSS}
 
   /* queued-prompts panel */
   .q-panel { transition: box-shadow 160ms ease; }
@@ -120,9 +132,6 @@ const PAGE_CSS = `
   .q-row.q-drop-below { box-shadow: inset 0 -2px 0 var(--blue); }
   .kbd { display: inline-flex; align-items: center; height: 16px; padding: 0 5px; border-radius: 5px; background: var(--fill-secondary);
     border: 0.5px solid var(--separator); font: 600 10px/1 var(--font-mono); color: var(--ink-secondary); }
-  .send-fab { transition: transform 160ms cubic-bezier(.32,.72,0,1), background 160ms ease, box-shadow 160ms ease; }
-  .send-fab:not(:disabled):hover { transform: scale(1.06); }
-  .send-fab:not(:disabled):active { transform: scale(.94); }
 
   .sess-row { transition: background 140ms ease; }
   .sess-row:hover { background: var(--fill-tertiary); }
@@ -1778,6 +1787,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
   return (
     <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)', overflow: 'hidden',
       ...(flush ? {} : { borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)' }) }}>
+      {/* composer theming travels with the chat so the per-effort border vibes
+          everywhere ChatThread renders (project view + Workspace tabs) */}
+      <style>{COMPOSER_CSS}</style>
       {/* faint top atmosphere */}
       <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
         background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />

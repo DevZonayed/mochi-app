@@ -198,33 +198,23 @@ export interface EffortDialProps {
 export function EffortDial({ value = 'BALANCED', compact, onChange }: EffortDialProps) {
   const interactive = typeof onChange === 'function';
   const meta = EFFORT_META[value] || EFFORT_META.BALANCED;
-  const showCost = value === 'DEEP' || value === 'MAX';
   const h = compact ? 28 : 34;
   const cycle = () => { const i = EFFORT_STOPS.indexOf(value); onChange!(EFFORT_STOPS[(i + 1) % 4]); };
   return (
-    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-      <button onClick={() => interactive && cycle()} disabled={!interactive}
-        title={interactive ? 'Click to change effort' : undefined} aria-label={`Effort: ${value}`}
-        className="effort-btn" style={{
-          display: 'inline-flex', alignItems: 'center', gap: 7, height: h, padding: compact ? '0 11px' : '0 13px',
-          borderRadius: 'var(--r-pill)', background: `color-mix(in srgb, ${meta.tint} 11%, transparent)`,
-          border: `1px solid color-mix(in srgb, ${meta.tint} 32%, transparent)`,
-          cursor: interactive ? 'pointer' : 'default', transition: 'background 160ms ease, border-color 160ms ease, transform 100ms var(--spring)',
-        }}>
-        <StrengthBars level={meta.bars} tint={meta.tint} size={compact ? 13 : 15} />
-        <span style={{ font: '700 11px/1 var(--font-text)', letterSpacing: '0.05em', color: meta.tint }}>{value}</span>
-        {interactive && <span aria-hidden="true" style={{ display: 'inline-flex', gap: 2, marginLeft: 1 }}>
-          {[0, 1, 2, 3].map(d => <span key={d} style={{ width: 3, height: 3, borderRadius: 2, background: d === EFFORT_STOPS.indexOf(value) ? meta.tint : 'var(--ink-tertiary)', opacity: d === EFFORT_STOPS.indexOf(value) ? 1 : 0.35 }} />)}
-        </span>}
-      </button>
-      {showCost && (
-        <span className="cost-chip" style={{
-          display: 'inline-flex', alignItems: 'center', gap: 5, height: 24, padding: '0 9px',
-          borderRadius: 'var(--r-pill)', background: 'rgba(255,149,0,0.15)', color: 'var(--orange)',
-          font: '600 var(--fs-footnote)/1 var(--font-mono)', whiteSpace: 'nowrap',
-        }}>≈ {value === 'MAX' ? '5×' : '3×'} cost · {value === 'MAX' ? '12×' : '6×'} latency</span>
-      )}
-    </div>
+    <button onClick={() => interactive && cycle()} disabled={!interactive}
+      title={interactive ? 'Click to change effort' : undefined} aria-label={`Effort: ${value}`}
+      className="effort-btn" style={{
+        display: 'inline-flex', alignItems: 'center', gap: 7, height: h, padding: compact ? '0 11px' : '0 13px',
+        borderRadius: 'var(--r-pill)', background: `color-mix(in srgb, ${meta.tint} 11%, transparent)`,
+        border: `1px solid color-mix(in srgb, ${meta.tint} 32%, transparent)`,
+        cursor: interactive ? 'pointer' : 'default', transition: 'background 160ms ease, border-color 160ms ease, transform 100ms var(--spring)',
+      }}>
+      <StrengthBars level={meta.bars} tint={meta.tint} size={compact ? 13 : 15} />
+      <span style={{ font: '700 11px/1 var(--font-text)', letterSpacing: '0.05em', color: meta.tint }}>{value}</span>
+      {interactive && <span aria-hidden="true" style={{ display: 'inline-flex', gap: 2, marginLeft: 1 }}>
+        {[0, 1, 2, 3].map(d => <span key={d} style={{ width: 3, height: 3, borderRadius: 2, background: d === EFFORT_STOPS.indexOf(value) ? meta.tint : 'var(--ink-tertiary)', opacity: d === EFFORT_STOPS.indexOf(value) ? 1 : 0.35 }} />)}
+      </span>}
+    </button>
   );
 }
 
