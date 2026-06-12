@@ -459,6 +459,22 @@ export class Store {
     this.data.jobs.splice(i, 1);
     this.save();
   }
+  /** Boot sweep: jobs left 'running'/'pending' by a previous app instance can
+      never complete (their child process died with the app) — without this
+      they'd show as running forever. Called once at launch, before the engine
+      starts anything new. */
+  settleOrphanedRuns(): Job[] {
+    const orphans = this.data.jobs.filter(j => j.status === 'running' || j.status === 'pending');
+    for (const j of orphans) {
+      j.status = 'failed';
+      j.phase = 'Failed';
+      j.stage = '';
+      j.error = 'Interrupted — Maestro was restarted while this job was running.';
+      j.updatedAt = now();
+    }
+    if (orphans.length) this.save();
+    return orphans;
+  }
 
   // ── Approvals ───────────────────────────────────────────────────────
   listApprovals(status?: ApprovalStatus): Approval[] {

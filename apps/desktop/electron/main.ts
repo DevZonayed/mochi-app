@@ -54,6 +54,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   const store = new Store();
+  store.settleOrphanedRuns(); // jobs from a previous app instance can't finish — settle them honestly
   const providers = new Providers(store);
 
   // Apply the persisted "open at login" preference, and re-apply whenever it changes.
