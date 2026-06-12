@@ -34,11 +34,56 @@ function shortHomePath(p: string): string {
 const PAGE_CSS = `
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes caretBlink { 50% { opacity: 0; } }
-  .chat-caret { animation: caretBlink 1s steps(2) infinite; }
+  .chat-caret { display:inline-block; width:7px; height:1.05em; margin-left:1px; border-radius:2px;
+    background: var(--purple); vertical-align:-2px; animation: caretBlink 1.05s steps(2) infinite; }
+
+  /* message entry — each turn rises in once */
+  @keyframes chatRise { from { opacity:0; transform: translateY(7px); } to { opacity:1; transform:none; } }
+  .chat-msg { animation: chatRise 320ms cubic-bezier(.32,.72,0,1) both; }
+
+  /* tool node — refined card, lifts on hover, pops on mount */
+  @keyframes nodePop { from { opacity:0; transform: translateY(4px) scale(.985); } to { opacity:1; transform:none; } }
+  .tool-node { animation: nodePop 240ms cubic-bezier(.32,.72,0,1) both; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease, box-shadow 160ms ease; }
+  .tool-node:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(15,20,50,.08); }
+
+  /* "thinking" shimmer text before the first token */
+  @keyframes thinkSweep { to { background-position: -200% 0; } }
+  .think-shimmer { background: linear-gradient(100deg, var(--ink-tertiary) 30%, var(--ink) 50%, var(--ink-tertiary) 70%);
+    background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+    animation: thinkSweep 1.5s linear infinite; }
+
+  /* live tool dot — soft glow pulse */
+  @keyframes dotGlow { 0%,100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--purple) 55%, transparent); } 50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--purple) 0%, transparent); } }
+  .dot-live { animation: dotGlow 1.4s ease-in-out infinite; }
+
+  /* code card — copy button reveals on hover */
+  .code-card .code-copy { opacity: 0; transition: opacity 140ms ease; }
+  .code-card:hover .code-copy { opacity: 1; }
+  .code-copy:hover { color: var(--ink) !important; background: var(--fill-secondary) !important; }
+
+  /* assistant turn — copy-the-reply reveals on hover */
+  .turn-copy { opacity: 0; transition: opacity 140ms ease; }
+  .chat-msg:hover .turn-copy { opacity: 1; }
+  .turn-copy:hover { color: var(--ink) !important; }
+
+  /* example prompt chips (empty state) */
+  .ex-chip { transition: border-color 150ms ease, background 150ms ease, transform 150ms ease; cursor: pointer; }
+  .ex-chip:hover { border-color: color-mix(in srgb, var(--blue) 55%, var(--separator)) !important; background: color-mix(in srgb, var(--blue) 7%, var(--bg-elevated)) !important; transform: translateY(-1px); }
+
+  /* composer — focus glow ring */
+  .composer-card { transition: border-color 180ms ease, box-shadow 180ms ease; }
+  .composer-card:focus-within { border-color: color-mix(in srgb, var(--blue) 50%, var(--separator-strong)); box-shadow: 0 0 0 4px color-mix(in srgb, var(--blue) 12%, transparent), var(--card-shadow); }
+  .send-fab { transition: transform 160ms cubic-bezier(.32,.72,0,1), background 160ms ease, box-shadow 160ms ease; }
+  .send-fab:not(:disabled):hover { transform: scale(1.06); }
+  .send-fab:not(:disabled):active { transform: scale(.94); }
+
+  .sess-row { transition: background 140ms ease; }
   .sess-row:hover { background: var(--fill-tertiary); }
   .sess-row .sess-x { opacity: 0; transition: opacity 120ms ease; }
   .sess-row:hover .sess-x { opacity: 1; }
   .sess-x:hover { color: var(--red); }
+  .newchat-btn { transition: background 140ms ease, transform 140ms ease; }
+  .newchat-btn:hover { background: var(--fill-tertiary); transform: translateY(-1px); }
 
   .app-wallpaper {
     position: absolute; inset: 0; z-index: 0; pointer-events: none;
@@ -815,10 +860,38 @@ function SettingsTab() {
    thread + composer on the right. Claude turns resume their SDK session (full
    context); codex turns carry stitched history. */
 
-const CHAT_CODE: React.CSSProperties = {
-  margin: '6px 0', padding: '10px 12px', borderRadius: 10, background: 'var(--fill-tertiary)',
-  border: '0.5px solid var(--separator)', overflowX: 'auto', font: '400 var(--fs-caption)/1.55 var(--font-mono)', color: 'var(--ink)',
-};
+/** Tiny copy-to-clipboard control with a momentary ✓ confirmation. */
+function CopyButton({ text, className, label = 'Copy' }: { text: string; className?: string; label?: string }) {
+  const [copied, setCopied] = React.useState(false);
+  const copy = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try { void navigator.clipboard?.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1300); } catch { /* clipboard blocked */ }
+  };
+  return (
+    <button onClick={copy} title={label} className={className} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4, height: 22, padding: '0 7px', borderRadius: 7,
+      background: 'transparent', color: copied ? 'var(--green)' : 'var(--ink-tertiary)', cursor: 'pointer',
+      font: '600 var(--fs-caption)/1 var(--font-text)', flexShrink: 0 }}>
+      <Icon name={copied ? 'check' : 'command'} size={12} stroke={copied ? 2.6 : 2} />
+      {copied ? 'Copied' : label}
+    </button>
+  );
+}
+
+/** A code block with a header (language + copy) and a monospace body. */
+function CodeCard({ code, lang, keyId }: { code: string; lang?: string; keyId: string }) {
+  return (
+    <div key={keyId} className="code-card" style={{ margin: '10px 0', borderRadius: 12, overflow: 'hidden',
+      border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', height: 30, padding: '0 8px 0 12px',
+        background: 'color-mix(in srgb, var(--ink) 4%, var(--bg-grouped))', borderBottom: '0.5px solid var(--separator)' }}>
+        <span style={{ flex: 1, font: '600 var(--fs-caption)/1 var(--font-mono)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{lang || 'code'}</span>
+        <CopyButton text={code} className="code-copy" />
+      </div>
+      <pre style={{ margin: 0, padding: '11px 13px', overflowX: 'auto', font: '400 var(--fs-caption)/1.6 var(--font-mono)', color: 'var(--ink)' }}>{code}</pre>
+    </div>
+  );
+}
 
 /** Inline markdown: **bold** and `code` spans. */
 function renderInline(text: string, keyBase: string): React.ReactNode[] {
@@ -851,7 +924,7 @@ function renderProse(text: string, keyBase: string): React.ReactNode[] {
     if (h) {
       flushPara();
       const lvl = h[1].length;
-      out.push(<div key={`${keyBase}-h${key++}`} style={{ margin: '14px 0 8px', font: `700 ${lvl <= 2 ? 'var(--fs-title3)' : 'var(--fs-callout)'}/1.25 var(--font-display)`, letterSpacing: '-0.01em', color: 'var(--ink)' }}>{renderInline(h[2], `${keyBase}-h${key}`)}</div>);
+      out.push(<div key={`${keyBase}-h${key++}`} style={{ margin: lvl <= 2 ? '15px 0 7px' : '12px 0 6px', font: `700 ${lvl <= 2 ? 'var(--fs-headline)' : 'var(--fs-callout)'}/1.3 var(--font-display)`, letterSpacing: '-0.01em', color: 'var(--ink)' }}>{renderInline(h[2], `${keyBase}-h${key}`)}</div>);
     } else if (li) {
       flushPara();
       out.push(
@@ -873,49 +946,72 @@ function renderProse(text: string, keyBase: string): React.ReactNode[] {
 /** Chat body: ``` fences become code cards; everything else renders as markdown prose. */
 function renderChatBody(text: string, keyBase = 'b'): React.ReactNode[] {
   const out: React.ReactNode[] = [];
-  const fence = /```[a-zA-Z0-9_+-]*\n?/g;
-  let idx = 0, inCode = false, key = 0;
+  const fence = /```([a-zA-Z0-9_+-]*)\n?/g;
+  let idx = 0, inCode = false, key = 0, lang = '';
   let m: RegExpExecArray | null;
   while ((m = fence.exec(text))) {
     const chunk = text.slice(idx, m.index);
     if (chunk.trim()) out.push(inCode
-      ? <pre key={`${keyBase}-c${key++}`} style={CHAT_CODE}>{chunk.replace(/\n$/, '')}</pre>
+      ? <CodeCard key={`${keyBase}-c${key++}`} keyId={`${keyBase}-c${key}`} code={chunk.replace(/\n$/, '')} lang={lang} />
       : <React.Fragment key={`${keyBase}-f${key++}`}>{renderProse(chunk, `${keyBase}-${key}`)}</React.Fragment>);
+    if (!inCode) lang = m[1] || '';
     inCode = !inCode;
     idx = m.index + m[0].length;
   }
   const tail = text.slice(idx);
   if (tail.trim()) out.push(inCode
-    ? <pre key={`${keyBase}-c${key++}`} style={CHAT_CODE}>{tail.replace(/\n$/, '')}</pre>
+    ? <CodeCard key={`${keyBase}-c${key++}`} keyId={`${keyBase}-c${key}`} code={tail.replace(/\n$/, '')} lang={lang} />
     : <React.Fragment key={`${keyBase}-f${key++}`}>{renderProse(tail, `${keyBase}-${key}`)}</React.Fragment>);
   return out;
 }
 
-/* Tool-call chip — which tool/skill ran, on what, and how long it took. */
-const TOOL_ICON = (name: string): IconName => {
+/* Tool/skill metadata — which glyph + accent tint a tool family reads as. */
+const TOOL_META = (name: string): { icon: IconName; tint: string } => {
   const n = name.toLowerCase();
-  if (/bash|shell|command|exec/.test(n)) return 'terminal';
-  if (/read|write|edit|glob|grep|notebook|file|patch/.test(n)) return 'folder';
-  if (/web|search|fetch/.test(n)) return 'telescope';
-  if (/skill|task|agent/.test(n)) return 'spark';
-  return 'command';
+  if (/bash|shell|command|exec|terminal/.test(n)) return { icon: 'terminal', tint: 'var(--blue)' };
+  if (/read|write|edit|glob|grep|notebook|file|patch|ls/.test(n)) return { icon: 'folder', tint: 'var(--teal)' };
+  if (/web|search|fetch|browser/.test(n)) return { icon: 'telescope', tint: 'var(--indigo)' };
+  if (/skill|task|agent|subagent/.test(n)) return { icon: 'spark', tint: 'var(--purple)' };
+  return { icon: 'command', tint: 'var(--ink-secondary)' };
 };
 const fmtToolDur = (ms?: number): string => (ms == null ? '' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`);
 
-function ToolChip({ item }: { item: TranscriptItem }) {
+/** One step in the agent's tool sequence — a crisp, tinted, monospace card. */
+function ToolNode({ item, connect }: { item: TranscriptItem; connect: boolean }) {
   const running = item.toolStatus === 'running';
   const error = item.toolStatus === 'error';
+  const { icon, tint } = TOOL_META(item.name ?? '');
+  const accent = error ? 'var(--red)' : tint;
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '2px 0', padding: '6px 10px', borderRadius: 9,
-      background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', maxWidth: 560 }}>
-      <Icon name={TOOL_ICON(item.name ?? '')} size={13} style={{ color: error ? 'var(--red)' : 'var(--ink-secondary)', flexShrink: 0 }} />
-      <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{item.name}</span>
-      {item.text && <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text}</span>}
-      <span style={{ flexShrink: 0, marginLeft: 'auto' }}>
-        {running ? <Spinner size={11} color="var(--purple)" />
-          : error ? <Icon name="x" size={11} stroke={2.6} style={{ color: 'var(--red)' }} />
-          : <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{fmtToolDur(item.durMs)}</span>}
-      </span>
+    <div style={{ position: 'relative' }}>
+      {connect && <span style={{ position: 'absolute', left: 17, top: -7, width: 1.5, height: 7, background: 'var(--separator-strong)' }} />}
+      <div className="tool-node" style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px 7px 8px', borderRadius: 11,
+        background: error ? 'color-mix(in srgb, var(--red) 6%, var(--bg-elevated))' : `color-mix(in srgb, ${tint} 4.5%, var(--bg-elevated))`,
+        border: `0.5px solid color-mix(in srgb, ${accent} 26%, var(--separator))` }}>
+        <span style={{ width: 22, height: 22, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center',
+          background: `color-mix(in srgb, ${accent} 14%, transparent)`, color: accent }}>
+          <Icon name={icon} size={13} />
+        </span>
+        <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{item.name}</span>
+        {item.text && <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text}</span>}
+        <span style={{ flexShrink: 0, marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+          {running ? <Spinner size={11} color={tint} />
+            : error ? <Icon name="x" size={12} stroke={2.6} style={{ color: 'var(--red)' }} />
+            : <>
+                <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{fmtToolDur(item.durMs)}</span>
+                <Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)' }} />
+              </>}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** A run of consecutive tool steps, threaded into one sequence. */
+function ToolGroup({ items }: { items: TranscriptItem[] }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 7, margin: '10px 0' }}>
+      {items.map((it, i) => <ToolNode key={i} item={it} connect={i > 0} />)}
     </div>
   );
 }
@@ -927,12 +1023,22 @@ const fmtDuration = (ms: number): string => {
 
 function UserBubble({ text }: { text: string }) {
   return (
-    <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-      <div style={{ maxWidth: '76%', padding: '10px 14px', borderRadius: '16px 16px 4px 16px', background: 'var(--blue)',
-        color: '#fff', font: '400 var(--fs-body)/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+    <div className="chat-msg" style={{ display: 'flex', justifyContent: 'flex-end' }}>
+      <div style={{ maxWidth: '78%', padding: '11px 15px', borderRadius: '18px 18px 5px 18px',
+        background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
+        color: '#fff', font: '400 var(--fs-body)/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+        boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
         {text}
       </div>
     </div>
+  );
+}
+
+/** A small quiet stat pill used in the done-meta row. */
+function MetaPill({ children }: { children: React.ReactNode }) {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 20, padding: '0 8px', borderRadius: 'var(--r-pill)',
+      background: 'var(--fill-tertiary)', font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{children}</span>
   );
 }
 
@@ -952,77 +1058,96 @@ function AssistantTurn({ job, onRetry }: { job: Job; onRetry: (input: string) =>
   }, [live]);
   const elapsed = fmtDuration((live ? Date.now() : job.updatedAt) - job.createdAt);
 
-  // Caret rides the last streaming text block.
   const lastIdx = transcript.length - 1;
   const caretOn = (i: number) => live && i === lastIdx && (transcript[i].kind === 'text' || transcript[i].kind === 'result');
 
-  const body = transcript.length > 0 ? (
-    <div style={{ font: '400 var(--fs-body)/1.55 var(--font-text)', color: 'var(--ink)' }}>
-      {transcript.map((it, i) => {
-        if (it.kind === 'tool') return <ToolChip key={i} item={it} />;
-        if (it.kind === 'result') {
-          return (
-            <div key={i} style={{ marginTop: 10, paddingTop: 10, borderTop: '0.5px solid var(--separator)' }}>
-              {renderChatBody(it.text, `r${i}`)}
-              {caretOn(i) && <span className="chat-caret" style={{ color: 'var(--purple)', fontWeight: 700 }}>▍</span>}
-            </div>
-          );
-        }
-        return (
-          <div key={i} style={{ margin: i > 0 ? '8px 0 0' : 0 }}>
-            {renderChatBody(it.text, `t${i}`)}
-            {caretOn(i) && <span className="chat-caret" style={{ color: 'var(--purple)', fontWeight: 700 }}>▍</span>}
+  // Group consecutive tool steps so a burst of activity reads as one sequence.
+  const blocks: React.ReactNode[] = [];
+  if (transcript.length > 0) {
+    let i = 0;
+    while (i < transcript.length) {
+      const it = transcript[i];
+      if (it.kind === 'tool') {
+        const run: TranscriptItem[] = [];
+        while (i < transcript.length && transcript[i].kind === 'tool') { run.push(transcript[i]); i++; }
+        blocks.push(<ToolGroup key={`g${i}`} items={run} />);
+      } else {
+        const idx = i;
+        const isResult = it.kind === 'result';
+        blocks.push(
+          <div key={`b${idx}`} style={{ margin: idx > 0 ? '4px 0 0' : 0 }}>
+            {renderChatBody(it.text, isResult ? `r${idx}` : `t${idx}`)}
+            {caretOn(idx) && <span className="chat-caret" />}
           </div>
         );
-      })}
-    </div>
+        i++;
+      }
+    }
+  }
+
+  const body = transcript.length > 0 ? (
+    <div style={{ font: '400 var(--fs-body)/1.6 var(--font-text)', color: 'var(--ink)' }}>{blocks}</div>
   ) : hasBody ? (
-    // Legacy turns (pre-transcript) fall back to the flat output.
-    <div style={{ font: '400 var(--fs-body)/1.55 var(--font-text)', color: 'var(--ink)' }}>
+    <div style={{ font: '400 var(--fs-body)/1.6 var(--font-text)', color: 'var(--ink)' }}>
       {renderChatBody(job.output ?? '')}
-      {live && <span className="chat-caret" style={{ color: 'var(--purple)', fontWeight: 700 }}>▍</span>}
+      {live && <span className="chat-caret" />}
     </div>
   ) : null;
 
+  const toolCount = transcript.filter(t => t.kind === 'tool').length;
+  const replyText = transcript.filter(t => t.kind === 'text' || t.kind === 'result').map(t => t.text).join('\n\n') || job.output || '';
+
   return (
-    <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start' }}>
-      <span style={{ width: 28, height: 28, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', marginTop: 2,
-        background: 'var(--fill-secondary)', color: 'var(--ink)', border: '0.5px solid var(--separator)' }}>
-        {live && !hasBody ? <Spinner size={13} color="var(--purple)" /> : <ProviderGlyph provider={provider} size={15} />}
+    <div className="chat-msg" style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+      <span style={{ width: 30, height: 30, borderRadius: 10, flexShrink: 0, display: 'grid', placeItems: 'center', marginTop: 1,
+        background: 'var(--bg-elevated)', color: 'var(--ink)', border: '0.5px solid var(--separator)', boxShadow: '0 1px 3px rgba(15,20,50,.06)' }}>
+        {live && !hasBody ? <Spinner size={14} color="var(--purple)" /> : <ProviderGlyph provider={provider} size={16} />}
       </span>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5 }}>
           <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{engineLabel}</span>
           {job.model && job.model !== job.engine && (
             <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{job.model}</span>
           )}
           {live && (
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)' }}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)' }}>
               <span className="breathe" style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--purple)' }} />
-              {hasBody ? 'streaming' : (job.stage || 'working…')} · {elapsed}
+              {hasBody ? 'streaming' : 'thinking'} · {elapsed}
             </span>
           )}
+          <span style={{ flex: 1 }} />
+          {job.status === 'done' && replyText && <CopyButton text={replyText} className="turn-copy" />}
         </div>
         {body}
         {!hasBody && live && (
-          <div style={{ font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink-tertiary)', fontStyle: 'italic' }}>
-            {job.stage || 'Working on it — the reply streams in here…'}
+          <div style={{ font: '500 var(--fs-body)/1.5 var(--font-text)' }}>
+            <span className="think-shimmer">{job.stage || 'Thinking…'}</span>
           </div>
         )}
         {job.status === 'failed' && (
-          <div style={{ marginTop: 6, padding: '10px 12px', borderRadius: 10, background: 'rgba(255,59,48,0.09)',
-            border: '0.5px solid rgba(255,59,48,0.3)', font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--red)' }}>
-            {job.error ?? 'The run failed.'}
-            <button onClick={() => onRetry(job.input)} style={{ marginLeft: 10, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--red)', textDecoration: 'underline', cursor: 'pointer' }}>Retry</button>
+          <div style={{ marginTop: 8, padding: '11px 13px', borderRadius: 11, background: 'color-mix(in srgb, var(--red) 8%, var(--bg-elevated))',
+            border: '0.5px solid color-mix(in srgb, var(--red) 32%, transparent)', font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink)' }}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--red)', fontWeight: 600, marginBottom: 4 }}>
+              <Icon name="alert" size={13} /> Run failed
+            </span>
+            <div style={{ color: 'var(--ink-secondary)' }}>{job.error ?? 'Something went wrong.'}</div>
+            <button onClick={() => onRetry(job.input)} style={{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)',
+              background: 'var(--fill-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', cursor: 'pointer' }}>
+              <Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-45deg)' }} /> Retry
+            </button>
           </div>
         )}
         {job.status === 'cancelled' && (
-          <div style={{ marginTop: 4, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Stopped.</div>
+          <div style={{ marginTop: 5, display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+            <Icon name="x" size={11} stroke={2.4} /> Stopped
+          </div>
         )}
         {job.status === 'done' && (
-          <div style={{ marginTop: 6, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>
-            {job.cost > 0 ? `$${job.cost.toFixed(2)} · ` : ''}{job.tokens > 0 ? `${job.tokens >= 1000 ? (job.tokens / 1000).toFixed(1) + 'k' : job.tokens} tok · ` : ''}{elapsed}
-            {transcript.some(t => t.kind === 'tool') ? ` · ${transcript.filter(t => t.kind === 'tool').length} tool calls` : ''}
+          <div style={{ marginTop: 9, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {job.cost > 0 && <MetaPill>${job.cost.toFixed(2)}</MetaPill>}
+            {job.tokens > 0 && <MetaPill>{job.tokens >= 1000 ? (job.tokens / 1000).toFixed(1) + 'k' : job.tokens} tok</MetaPill>}
+            <MetaPill><Icon name="clock" size={10} /> {elapsed}</MetaPill>
+            {toolCount > 0 && <MetaPill><Icon name="command" size={10} /> {toolCount} {toolCount === 1 ? 'tool' : 'tools'}</MetaPill>}
           </div>
         )}
       </div>
@@ -1169,30 +1294,33 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
     el.style.height = Math.min(150, el.scrollHeight) + 'px';
   };
 
+  const fillComposer = (v: string) => { setText(v); taRef.current?.focus(); requestAnimationFrame(autoGrow); };
+
   return (
-    <div style={{ display: 'flex', gap: 14, height: 'calc(100vh - 252px)', minHeight: 420 }}>
+    <div style={{ display: 'flex', gap: 14, height: 'calc(100vh - 252px)', minHeight: 440 }}>
       {/* sessions rail */}
-      <div style={{ width: 232, flexShrink: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-grouped)',
-        borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 12px 10px' }}>
-          <span style={{ flex: 1, font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-secondary)' }}>Chats</span>
-          <button onClick={newChat} title="New chat" style={{ width: 26, height: 26, borderRadius: 8, display: 'grid', placeItems: 'center',
-            background: 'var(--fill-secondary)', color: 'var(--ink)', cursor: 'pointer' }}>
-            <Icon name="plus" size={14} stroke={2.4} />
+      <div style={{ width: 236, flexShrink: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-grouped)',
+        borderRadius: 18, border: '0.5px solid var(--separator)', overflow: 'hidden', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
+        <div style={{ padding: '11px 10px 9px' }}>
+          <button onClick={newChat} className="newchat-btn" title="New chat" style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, height: 36, padding: '0 11px', borderRadius: 11,
+            background: 'var(--fill-secondary)', color: 'var(--ink)', cursor: 'pointer', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+            <Icon name="plus" size={15} stroke={2.4} style={{ color: 'var(--blue)' }} /> New chat
           </button>
         </div>
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px 10px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+          {sessions.length > 0 && <div style={{ padding: '6px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Recent</div>}
           {sessions.length === 0 && (
-            <div style={{ padding: '18px 10px', font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)', textAlign: 'center' }}>
-              No chats yet.<br />Say what you want built.
+            <div style={{ padding: '22px 12px', font: '400 var(--fs-footnote)/1.55 var(--font-text)', color: 'var(--ink-tertiary)', textAlign: 'center' }}>
+              No chats yet.<br />Start one on the right.
             </div>
           )}
           {sessions.map(s => {
             const active = s.id === activeId;
             return (
               <div key={s.id} className="sess-row" onClick={() => setActiveId(s.id)} style={{
-                display: 'flex', alignItems: 'center', gap: 6, padding: '8px 10px', borderRadius: 10, cursor: 'pointer',
+                position: 'relative', display: 'flex', alignItems: 'center', gap: 6, padding: '8px 10px', borderRadius: 10, cursor: 'pointer',
                 background: active ? 'var(--fill-secondary)' : 'transparent' }}>
+                {active && <span style={{ position: 'absolute', left: 0, top: 9, bottom: 9, width: 2.5, borderRadius: 2, background: 'var(--blue)' }} />}
                 <span style={{ flex: 1, minWidth: 0 }}>
                   {renamingId === s.id ? (
                     <input autoFocus value={renameVal} onChange={e => setRenameVal(e.target.value)} onClick={e => e.stopPropagation()}
@@ -1200,11 +1328,11 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
                       style={{ width: '100%', border: '1px solid var(--blue)', borderRadius: 6, padding: '2px 6px', background: 'var(--bg)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1.3 var(--font-text)' }} />
                   ) : (
                     <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
-                      style={{ display: 'block', font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      style={{ display: 'block', font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: active ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {s.title}
                     </span>
                   )}
-                  <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{relativeTime(s.updatedAt)}</span>
+                  <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>{relativeTime(s.updatedAt)}</span>
                 </span>
                 <button className="sess-x" title="Delete chat" onClick={e => { e.stopPropagation(); removeSession(s.id); }}
                   style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
@@ -1217,21 +1345,33 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
       </div>
 
       {/* thread + composer */}
-      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)',
-        borderRadius: 16, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden' }}>
-        <div ref={scrollRef} onScroll={onScroll} style={{ flex: 1, overflowY: 'auto', padding: '20px 22px' }}>
-          <div style={{ maxWidth: 720, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
+      <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)',
+        borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden' }}>
+        {/* faint top atmosphere */}
+        <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
+          background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
+        <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, overflowY: 'auto', padding: '22px 24px' }}>
+          <div style={{ maxWidth: 720, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
             {turns.length === 0 && (
-              <div style={{ padding: '64px 20px', textAlign: 'center' }}>
-                <span style={{ width: 52, height: 52, borderRadius: 16, display: 'inline-grid', placeItems: 'center', marginBottom: 14,
-                  background: 'color-mix(in srgb, var(--blue) 12%, transparent)', color: 'var(--blue)' }}>
-                  <Icon name="terminal" size={26} />
+              <div style={{ padding: '52px 20px 20px', textAlign: 'center' }}>
+                <span style={{ width: 56, height: 56, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
+                  background: 'linear-gradient(160deg, color-mix(in srgb, var(--blue) 18%, transparent), color-mix(in srgb, var(--purple) 16%, transparent))',
+                  color: 'var(--blue)', boxShadow: '0 8px 22px color-mix(in srgb, var(--blue) 18%, transparent)' }}>
+                  <Icon name="terminal" size={27} />
                 </span>
-                <div style={{ font: '700 var(--fs-title2)/1.25 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)', marginBottom: 6 }}>
+                <div style={{ font: '700 var(--fs-title1)/1.2 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)', marginBottom: 7 }}>
                   What should we build{project?.name ? ` in ${project.name}` : ''}?
                 </div>
-                <div style={{ font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)', maxWidth: 400, margin: '0 auto' }}>
-                  Describe it like you'd tell a teammate — the agent works in this project's folder and the reply streams here live.
+                <div style={{ font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)', maxWidth: 420, margin: '0 auto 22px' }}>
+                  Describe it like you'd tell a teammate. The agent works in this project's folder and streams every step here.
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center', maxWidth: 520, margin: '0 auto' }}>
+                  {['Make a simple todo app with a JS frontend + backend', 'Explain how this repo is structured', 'Add tests for the core logic', 'Find and fix any bugs'].map(ex => (
+                    <button key={ex} className="ex-chip" onClick={() => fillComposer(ex)} style={{ padding: '8px 13px', borderRadius: 'var(--r-pill)',
+                      background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', textAlign: 'left' }}>
+                      {ex}
+                    </button>
+                  ))}
                 </div>
               </div>
             )}
@@ -1244,45 +1384,47 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
           </div>
         </div>
 
-        {/* composer */}
-        <div style={{ borderTop: '0.5px solid var(--separator)', padding: '12px 14px', background: 'color-mix(in srgb, var(--bg) 30%, var(--bg-elevated))' }}>
+        {/* composer — one floating card */}
+        <div style={{ position: 'relative', zIndex: 2, padding: '0 20px 16px' }}>
           <div style={{ maxWidth: 720, margin: '0 auto' }}>
             {sendError && (
-              <div style={{ marginBottom: 8, padding: '8px 11px', borderRadius: 9, background: 'rgba(255,59,48,0.09)',
-                font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)' }}>{sendError}</div>
+              <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 7, padding: '8px 11px', borderRadius: 10, background: 'color-mix(in srgb, var(--red) 9%, var(--bg-elevated))',
+                font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)' }}><Icon name="alert" size={13} /> {sendError}</div>
             )}
-            <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
-              <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendText(text); } }}
-                placeholder={projectId ? `Message the agent… (Enter to send, Shift+Enter for a new line)` : 'Pick a project first'}
-                disabled={!projectId}
-                style={{ flex: 1, resize: 'none', border: '1px solid var(--separator-strong)', outline: 'none', borderRadius: 13,
-                  background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '10px 13px',
-                  minHeight: 22, maxHeight: 150, boxSizing: 'content-box' }} />
-              {streaming ? (
-                <button onClick={stop} title="Stop the run" style={{ width: 40, height: 40, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
-                  background: 'rgba(255,59,48,0.13)', color: 'var(--red)', cursor: 'pointer' }}>
-                  <span style={{ width: 13, height: 13, borderRadius: 3.5, background: 'currentColor' }} />
-                </button>
-              ) : (
-                <button onClick={() => { void sendText(text); }} disabled={!text.trim() || !projectId} title="Send" style={{
-                  width: 40, height: 40, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
-                  background: text.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: text.trim() ? '#fff' : 'var(--ink-tertiary)',
-                  boxShadow: text.trim() ? '0 5px 14px rgba(0,122,255,0.32)' : 'none', cursor: text.trim() ? 'pointer' : 'default',
-                  transition: 'all 160ms var(--spring)' }}>
-                  <Icon name="arrowRight" size={18} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} />
-                </button>
-              )}
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 9 }}>
-              <ModelSwitcher compact direction="up" value={modelChoice} onChange={setModelChoice} models={CHAT_MODELS} />
-              <EffortDial compact value={effort} onChange={setEffort} />
-              <span style={{ flex: 1 }} />
-              {streaming && lastTurn && (
-                <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-                  {lastTurn.stage || 'working…'}
-                </span>
-              )}
+            <div className="composer-card" style={{ borderRadius: 18, border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)',
+              boxShadow: 'var(--card-shadow)', padding: '10px 10px 8px 14px' }}>
+              <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+                <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
+                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendText(text); } }}
+                  placeholder={projectId ? `Message the agent…` : 'Pick a project first'}
+                  disabled={!projectId}
+                  style={{ flex: 1, resize: 'none', border: 'none', outline: 'none', background: 'transparent',
+                    color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '6px 0',
+                    minHeight: 24, maxHeight: 150, boxSizing: 'content-box' }} />
+                {streaming ? (
+                  <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
+                    background: 'color-mix(in srgb, var(--red) 14%, transparent)', color: 'var(--red)', cursor: 'pointer' }}>
+                    <span style={{ width: 12, height: 12, borderRadius: 3.5, background: 'currentColor' }} />
+                  </button>
+                ) : (
+                  <button onClick={() => { void sendText(text); }} disabled={!text.trim() || !projectId} className="send-fab" title="Send (Enter)" style={{
+                    width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+                    background: text.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: text.trim() ? '#fff' : 'var(--ink-tertiary)',
+                    boxShadow: text.trim() ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: text.trim() ? 'pointer' : 'default' }}>
+                    <Icon name="arrowRight" size={18} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
+                  </button>
+                )}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 6 }}>
+                <ModelSwitcher compact direction="up" value={modelChoice} onChange={setModelChoice} models={CHAT_MODELS} />
+                <EffortDial compact value={effort} onChange={setEffort} />
+                <span style={{ flex: 1 }} />
+                {streaming && lastTurn
+                  ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                      <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn.stage || 'working…'}
+                    </span>
+                  : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Enter to send · Shift+Enter for newline</span>}
+              </div>
             </div>
           </div>
         </div>
