@@ -35,6 +35,7 @@ export interface ChatSession {
   projectId: string;
   title: string;
   sdkSessionId?: string;
+  pinned?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -455,6 +456,8 @@ export const api = {
       req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/rename`, { method: 'POST', body: JSON.stringify({ title }) })),
   deleteSession: (id: string) =>
     call<{ ok: boolean }>('deleteSession', { id }, () => req<{ ok: boolean }>(`/api/sessions/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
+  pinSession: (id: string, pinned: boolean) =>
+    call<ChatSession>('pinSession', { id, pinned }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/pin`, { method: 'POST', body: JSON.stringify({ pinned }) })),
   deleteProject: (id: string) =>
     call<{ ok: boolean }>('deleteProject', { id }, () => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 

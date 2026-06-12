@@ -1,0 +1,309 @@
+/* Workspace — the unified coding view. One place to reach every project and
+   every chat: a left tree (pinned chats across projects + projects → their
+   chats) and a tab bar of open chats you can keep open across projects, like a
+   real desktop coding app. The chat itself is the shared <ChatThread>. */
+
+import React from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Icon } from '../lib/icons';
+import { AppShell } from '../lib/appShell';
+import { api, type Project, type ChatSession } from '../lib/api';
+import { ChatThread } from './ProjectDetail';
+
+const PAGE_CSS = `
+  .ws-row { transition: background 120ms ease; }
+  .ws-row:hover { background: var(--fill-tertiary); }
+  .ws-row .ws-act { opacity: 0; transition: opacity 120ms ease; }
+  .ws-row:hover .ws-act, .ws-row.ws-active .ws-act { opacity: 1; }
+  .ws-tab { transition: background 120ms ease, color 120ms ease; }
+  .ws-tab:hover { background: var(--fill-tertiary); }
+  .ws-tab .ws-tab-x { opacity: 0; transition: opacity 120ms ease; }
+  .ws-tab:hover .ws-tab-x, .ws-tab.on .ws-tab-x { opacity: 1; }
+  .ws-newbtn:hover { background: var(--fill-secondary) !important; }
+  .ws-tabs::-webkit-scrollbar { height: 0; }
+  .ws-tree::-webkit-scrollbar { width: 8px; }
+  .ws-tree::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  .ws-proj:hover .ws-newchat { opacity: 1; }
+  .ws-newchat { opacity: 0; transition: opacity 120ms ease; }
+`;
+
+interface Tab { key: string; projectId: string; sessionId: string | null; title: string }
+
+const TABS_KEY = 'maestro.workspace.tabs';
+const EXPANDED_KEY = 'maestro.workspace.expanded';
+
+function relTime(ts: number): string {
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24); return d < 7 ? `${d}d ago` : `${Math.floor(d / 7)}w ago`;
+}
+const projColor = (p?: Project): string => (p?.color ? `var(--${p.color})` : 'var(--blue)');
+
+export default function Workspace() {
+  const navigate = useNavigate();
+  const [projects, setProjects] = React.useState<Project[]>([]);
+  const [sessions, setSessions] = React.useState<ChatSession[]>([]);
+  const [tabs, setTabs] = React.useState<Tab[]>([]);
+  const [activeKey, setActiveKey] = React.useState<string | null>(null);
+  const [expanded, setExpanded] = React.useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem(EXPANDED_KEY) || '[]')); } catch { return new Set(); }
+  });
+  const [renamingId, setRenamingId] = React.useState<string | null>(null);
+  const [renameVal, setRenameVal] = React.useState('');
+  const newCounter = React.useRef(0);
+  const restored = React.useRef(false);
+
+  const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
+
+  // initial load: projects + all sessions
+  React.useEffect(() => {
+    let alive = true;
+    Promise.all([api.listProjects(), api.listSessions()])
+      .then(([ps, ss]) => { if (alive) { setProjects(ps); setSessions(ss); } })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
+  // restore open tabs once sessions are known
+  React.useEffect(() => {
+    if (restored.current || sessions.length === 0) return;
+    restored.current = true;
+    try {
+      const saved = JSON.parse(localStorage.getItem(TABS_KEY) || '{}') as { tabs?: { projectId: string; sessionId: string }[]; active?: string };
+      const rebuilt: Tab[] = (saved.tabs || [])
+        .map((t): Tab | null => { const s = sessions.find(x => x.id === t.sessionId); return s ? { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title } : null; })
+        .filter((t): t is Tab => !!t);
+      if (rebuilt.length) { setTabs(rebuilt); setActiveKey(rebuilt.find(t => t.key === saved.active)?.key ?? rebuilt[0].key); }
+    } catch { /* ignore */ }
+  }, [sessions]);
+
+  // persist tabs (only the session-backed ones survive a relaunch)
+  React.useEffect(() => {
+    try {
+      const payload = { tabs: tabs.filter(t => t.sessionId).map(t => ({ projectId: t.projectId, sessionId: t.sessionId })), active: activeKey };
+      localStorage.setItem(TABS_KEY, JSON.stringify(payload));
+    } catch { /* ignore */ }
+  }, [tabs, activeKey]);
+
+  React.useEffect(() => { try { localStorage.setItem(EXPANDED_KEY, JSON.stringify([...expanded])); } catch { /* ignore */ } }, [expanded]);
+
+  // LIVE: keep the tree + tab titles current.
+  React.useEffect(() => {
+    const unsub = api.subscribe({
+      onSession: (s) => {
+        if ((s as { deleted?: boolean }).deleted) {
+          setSessions(ss => ss.filter(x => x.id !== s.id));
+          setTabs(ts => ts.filter(t => t.sessionId !== s.id));
+          return;
+        }
+        setSessions(ss => { const i = ss.findIndex(x => x.id === s.id); return i === -1 ? [s, ...ss] : ss.map(x => (x.id === s.id ? s : x)); });
+        setTabs(ts => ts.map(t => (t.sessionId === s.id ? { ...t, title: s.title } : t)));
+      },
+      onProject: () => { api.listProjects().then(setProjects).catch(() => {}); },
+    });
+    return unsub;
+  }, []);
+
+  const activeTab = tabs.find(t => t.key === activeKey) ?? null;
+
+  const openSession = (s: ChatSession) => {
+    const existing = tabs.find(t => t.sessionId === s.id);
+    if (existing) { setActiveKey(existing.key); return; }
+    setTabs(ts => [...ts, { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title }]);
+    setActiveKey(s.id);
+  };
+  const newChat = (projectId: string) => {
+    const key = `new:${newCounter.current++}`;
+    setTabs(ts => [...ts, { key, projectId, sessionId: null, title: 'New chat' }]);
+    setActiveKey(key);
+    if (!expanded.has(projectId)) setExpanded(e => new Set(e).add(projectId));
+  };
+  const closeTab = (key: string) => {
+    setTabs(ts => {
+      const idx = ts.findIndex(t => t.key === key);
+      const next = ts.filter(t => t.key !== key);
+      if (activeKey === key) setActiveKey(next.length ? next[Math.min(idx, next.length - 1)].key : null);
+      return next;
+    });
+  };
+  // a new chat's first send created a real session → adopt it into the tab + tree
+  const onSessionCreated = (tabKey: string) => (s: ChatSession) => {
+    setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss]));
+    setTabs(ts => ts.map(t => (t.key === tabKey ? { ...t, sessionId: s.id, title: s.title } : t)));
+  };
+
+  const togglePin = (s: ChatSession) => {
+    const pinned = !s.pinned;
+    setSessions(ss => ss.map(x => (x.id === s.id ? { ...x, pinned } : x)));
+    void api.pinSession(s.id, pinned).catch(() => {});
+  };
+  const deleteSession = (id: string) => {
+    void api.deleteSession(id).catch(() => {});
+    setSessions(ss => ss.filter(s => s.id !== id));
+    setTabs(ts => ts.filter(t => t.sessionId !== id));
+  };
+  const commitRename = (id: string) => {
+    const title = renameVal.trim(); setRenamingId(null);
+    if (!title) return;
+    setSessions(ss => ss.map(s => (s.id === id ? { ...s, title } : s)));
+    setTabs(ts => ts.map(t => (t.sessionId === id ? { ...t, title } : t)));
+    void api.renameSession(id, title).catch(() => {});
+  };
+
+  const pinned = sessions.filter(s => s.pinned).sort((a, b) => b.updatedAt - a.updatedAt);
+  const sessionsByProject = (pid: string) => sessions.filter(s => s.projectId === pid).sort((a, b) => b.updatedAt - a.updatedAt);
+
+  // a session row in the tree
+  const SessionRow = ({ s, indent }: { s: ChatSession; indent: number }) => {
+    const open = tabs.some(t => t.sessionId === s.id);
+    const isActive = activeTab?.sessionId === s.id;
+    const p = projById[s.projectId];
+    return (
+      <div className={`ws-row${isActive ? ' ws-active' : ''}`} onClick={() => openSession(s)} style={{
+        display: 'flex', alignItems: 'center', gap: 7, padding: `5px 8px 5px ${indent}px`, borderRadius: 8, cursor: 'pointer',
+        background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
+        <span style={{ width: 6, height: 6, borderRadius: 3, flexShrink: 0, background: open ? projColor(p) : 'var(--separator-strong)' }} />
+        {renamingId === s.id ? (
+          <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
+            onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
+            style={{ flex: 1, minWidth: 0, border: '1px solid var(--blue)', borderRadius: 6, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1.3 var(--font-text)' }} />
+        ) : (
+          <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
+            style={{ flex: 1, minWidth: 0, font: `${isActive ? 600 : 500} var(--fs-footnote)/1.35 var(--font-text)`, color: isActive ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {s.title}
+          </span>
+        )}
+        <span className="ws-act" style={{ display: 'inline-flex', gap: 1, flexShrink: 0 }}>
+          <button title={s.pinned ? 'Unpin' : 'Pin to top'} onClick={e => { e.stopPropagation(); togglePin(s); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: s.pinned ? 'var(--blue)' : 'var(--ink-tertiary)' }}>
+            <Icon name="bookmark" size={12} />
+          </button>
+          <button title="Delete chat" onClick={e => { e.stopPropagation(); deleteSession(s.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}>
+            <Icon name="x" size={12} stroke={2.4} />
+          </button>
+        </span>
+      </div>
+    );
+  };
+
+  const sectionLabel = (t: string) => (
+    <div style={{ padding: '10px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{t}</div>
+  );
+
+  return (
+    <AppShell active="workspace">
+      <style>{PAGE_CSS}</style>
+      <div style={{ height: '100%', display: 'flex', minHeight: 0 }}>
+        {/* ── left tree: pinned + projects → chats ── */}
+        <div style={{ width: 260, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 14px 10px' }}>
+            <Icon name="terminal" size={16} style={{ color: 'var(--blue)' }} />
+            <span style={{ flex: 1, font: '700 var(--fs-callout)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Workspace</span>
+            <button onClick={() => navigate('/projects')} title="Manage projects" className="ws-newbtn" style={{ width: 28, height: 28, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)' }}>
+              <Icon name="layers" size={15} />
+            </button>
+          </div>
+          <div className="ws-tree" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '0 8px 12px' }}>
+            {projects.length === 0 && (
+              <div style={{ padding: '40px 14px', textAlign: 'center', font: '400 var(--fs-footnote)/1.55 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                No projects yet.
+                <button onClick={() => navigate('/projects')} style={{ display: 'block', margin: '12px auto 0', height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Create a project</button>
+              </div>
+            )}
+
+            {pinned.length > 0 && (
+              <>
+                {sectionLabel('Pinned')}
+                {pinned.map(s => <SessionRow key={'p' + s.id} s={s} indent={8} />)}
+              </>
+            )}
+
+            {projects.length > 0 && sectionLabel('Projects')}
+            {projects.map(p => {
+              const isOpen = expanded.has(p.id);
+              const chats = sessionsByProject(p.id);
+              return (
+                <div key={p.id} className="ws-proj">
+                  <div className="ws-row" onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
+                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px 6px 6px', borderRadius: 8, cursor: 'pointer' }}>
+                    <Icon name="chevronRight" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
+                    <span style={{ width: 8, height: 8, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                    <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
+                    {chats.length > 0 && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{chats.length}</span>}
+                    <button className="ws-newchat" title="New chat here" onClick={e => { e.stopPropagation(); newChat(p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)', flexShrink: 0 }}>
+                      <Icon name="plus" size={14} stroke={2.4} />
+                    </button>
+                  </div>
+                  {isOpen && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                      {chats.length === 0 && (
+                        <button onClick={() => newChat(p.id)} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '5px 8px 5px 26px', borderRadius: 8, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1.3 var(--font-text)', cursor: 'pointer' }}>
+                          <Icon name="plus" size={12} /> New chat
+                        </button>
+                      )}
+                      {chats.map(s => <SessionRow key={s.id} s={s} indent={26} />)}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* ── right: tab bar + active chat ── */}
+        <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          {/* tab bar */}
+          <div style={{ display: 'flex', alignItems: 'stretch', height: 42, flexShrink: 0, borderBottom: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
+            <div className="ws-tabs" style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'stretch', overflowX: 'auto' }}>
+              {tabs.map(t => {
+                const on = t.key === activeKey;
+                const p = projById[t.projectId];
+                return (
+                  <div key={t.key} className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, cursor: 'pointer', position: 'relative',
+                      borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
+                    {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: projColor(p) }} />}
+                    <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                    <span style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
+                    <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+                      <Icon name="x" size={11} stroke={2.6} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            <button onClick={() => newChat(activeTab?.projectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
+              title="New chat" className="ws-newbtn" style={{ width: 40, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: tabs.length ? '0.5px solid var(--separator)' : 'none', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
+              <Icon name="plus" size={16} stroke={2.4} />
+            </button>
+          </div>
+
+          {/* chat panes — all open tabs stay mounted; only the active one shows */}
+          <div style={{ flex: 1, minHeight: 0, position: 'relative', display: 'flex' }}>
+            {tabs.length === 0 && (
+              <div style={{ flex: 1, display: 'grid', placeItems: 'center', textAlign: 'center', padding: 40 }}>
+                <div>
+                  <span style={{ width: 60, height: 60, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
+                    background: 'linear-gradient(160deg, color-mix(in srgb, var(--blue) 16%, transparent), color-mix(in srgb, var(--purple) 14%, transparent))', color: 'var(--blue)' }}>
+                    <Icon name="terminal" size={28} />
+                  </span>
+                  <div style={{ font: '700 var(--fs-title2)/1.2 var(--font-display)', color: 'var(--ink)', marginBottom: 6 }}>Open a chat to start coding</div>
+                  <div style={{ font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)', maxWidth: 380 }}>
+                    Pick a project on the left and start a chat — keep several open as tabs and jump between them.
+                  </div>
+                </div>
+              </div>
+            )}
+            {tabs.map(t => (
+              <div key={t.key} style={{ position: 'absolute', inset: 0, display: t.key === activeKey ? 'flex' : 'none' }}>
+                <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
+                  sessionId={t.sessionId} onSessionCreated={onSessionCreated(t.key)} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </AppShell>
+  );
+}

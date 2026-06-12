@@ -159,6 +159,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('session', { id: String(p.id ?? ''), deleted: true });
         return { ok: true };
       }
+      case 'pinSession': {
+        const s = store.setSessionPinned(String(p.id ?? ''), p.pinned === true);
+        emit('session', s);
+        return s;
+      }
       case 'sendChat': {
         const projectId = String(p.projectId ?? '');
         const text = String(p.text ?? '').trim();

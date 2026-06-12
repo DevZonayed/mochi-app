@@ -1531,54 +1531,41 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: 
   );
 }
 
-function ChatPane({ projectId, project }: { projectId: string | null; project: Project | null }) {
-  const location = useLocation();
-  const [sessions, setSessions] = React.useState<ChatSession[]>([]);
-  const [activeId, setActiveId] = React.useState<string | null>(null);
+/* The chat itself for ONE {project, session}: streamed thread + composer +
+   queue + steer. `sessionId` is the controlled active session (null = a fresh
+   chat); on the first send we create a session and report it via
+   onSessionCreated so the parent (the project view OR the multi-project
+   Workspace tabs) can adopt it. Fills its parent — only the thread scrolls. */
+export function ChatThread({ projectId, project, sessionId, onSessionCreated, flush, autoFocus }: {
+  projectId: string | null;
+  project: Project | null;
+  sessionId: string | null;
+  onSessionCreated?: (session: ChatSession) => void;
+  flush?: boolean;
+  autoFocus?: boolean;
+}) {
   const [turns, setTurns] = React.useState<Job[]>([]);
+  const [activeId, setActiveId] = React.useState<string | null>(sessionId);
   const [text, setText] = React.useState('');
   // Remember the last model across the whole app — fewer clicks next time.
   const [modelChoice, setModelChoiceState] = React.useState(() => {
-    try {
-      const v = localStorage.getItem('maestro.chat.model');
-      return v && CHAT_MODELS.some(m => m.id === v) ? v : 'auto';
-    } catch { return 'auto'; }
+    try { const v = localStorage.getItem('maestro.chat.model'); return v && CHAT_MODELS.some(m => m.id === v) ? v : 'auto'; } catch { return 'auto'; }
   });
-  const setModelChoice = (id: string) => {
-    setModelChoiceState(id);
-    try { localStorage.setItem('maestro.chat.model', id); } catch { /* storage unavailable */ }
-  };
+  const setModelChoice = (id: string) => { setModelChoiceState(id); try { localStorage.setItem('maestro.chat.model', id); } catch { /* storage unavailable */ } };
   const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
   // Plan mode: agent proposes a plan first (no execution). Persisted per app.
   const [planMode, setPlanModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.plan') === '1'; } catch { return false; } });
   const setPlanMode = (on: boolean) => { setPlanModeState(on); try { localStorage.setItem('maestro.chat.plan', on ? '1' : '0'); } catch { /* ignore */ } };
-  const [renamingId, setRenamingId] = React.useState<string | null>(null);
-  const [renameVal, setRenameVal] = React.useState('');
   const [sendError, setSendError] = React.useState('');
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
-  const activeRef = React.useRef<string | null>(null);
+  const activeRef = React.useRef<string | null>(activeId);
   activeRef.current = activeId;
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const stickBottom = React.useRef(true);
   const taRef = React.useRef<HTMLTextAreaElement>(null);
 
-  // Sessions for this project (most recent first; open the latest by default).
-  // Reset the open thread whenever the project changes — a stale session id
-  // from another project would make sends 404.
-  React.useEffect(() => {
-    setActiveId(null);
-    setTurns([]);
-    setQueue([]);
-    if (!projectId) { setSessions([]); return; }
-    let alive = true;
-    // Deep-link: /project-detail/<id>?s=<sessionId> opens that thread directly
-    // (used by the Jobs inspector's "Open chat"); else open the latest.
-    const want = new URLSearchParams(location.search).get('s');
-    api.listSessions(projectId)
-      .then(ss => { if (alive) { setSessions(ss); setActiveId((want && ss.some(x => x.id === want)) ? want : (ss[0]?.id ?? null)); } })
-      .catch(() => {});
-    return () => { alive = false; };
-  }, [projectId, location.search]);
+  // Controlled active session: follow the parent (tab switch / rail pick / new chat).
+  React.useEffect(() => { setActiveId(sessionId); }, [sessionId]);
 
   // Turns of the open session (ascending — a chat thread). Queue is per-session.
   React.useEffect(() => {
@@ -1591,7 +1578,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
     return () => { alive = false; };
   }, [activeId]);
 
-  // LIVE: streamed job updates land directly in the open thread.
+  // LIVE: streamed job updates for this session land directly in the thread.
   React.useEffect(() => {
     const unsub = api.subscribe({
       onJob: (j) => {
@@ -1602,22 +1589,9 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
           const next = ts.slice(); next[i] = j; return next;
         });
       },
-      onSession: (s) => {
-        if (s.deleted) {
-          setSessions(ss => ss.filter(x => x.id !== s.id));
-          if (activeRef.current === s.id) setActiveId(null);
-          return;
-        }
-        if (projectId && s.projectId !== projectId) return;
-        setSessions(ss => {
-          const i = ss.findIndex(x => x.id === s.id);
-          const next = i === -1 ? [s, ...ss] : ss.map(x => (x.id === s.id ? s : x));
-          return [...next].sort((a, b) => b.updatedAt - a.updatedAt);
-        });
-      },
     });
     return unsub;
-  }, [projectId]);
+  }, []);
 
   // Stick to the bottom while streaming unless the user scrolled up.
   const [atBottom, setAtBottom] = React.useState(true);
@@ -1637,6 +1611,8 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
     if (el && stickBottom.current) el.scrollTop = el.scrollHeight;
   }, [turns]);
 
+  React.useEffect(() => { if (autoFocus) taRef.current?.focus(); }, [autoFocus]);
+
   const lastTurn = turns.length ? turns[turns.length - 1] : null;
   const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending');
 
@@ -1654,18 +1630,22 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
         ...(run.engine ? { engine: run.engine as EngineId } : {}),
         ...(run.model ? { model: run.model } : {}),
       });
-      setSessions(ss => (ss.some(s => s.id === resp.session.id) ? ss : [resp.session, ...ss]));
-      if (activeRef.current !== resp.session.id) setActiveId(resp.session.id);
-      else setTurns(ts => [...ts.filter(x => x.id !== resp.job.id), resp.job].sort((a, b) => a.createdAt - b.createdAt));
+      if (activeRef.current !== resp.session.id) {
+        activeRef.current = resp.session.id; // match the streamed job immediately
+        setActiveId(resp.session.id);
+        setTurns([resp.job]);
+        onSessionCreated?.(resp.session);
+      } else {
+        setTurns(ts => [...ts.filter(x => x.id !== resp.job.id), resp.job].sort((a, b) => a.createdAt - b.createdAt));
+      }
       return true;
     } catch (e) {
       setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
       return false;
     }
-  }, [projectId, modelChoice, effort, planMode]);
+  }, [projectId, modelChoice, effort, planMode, onSessionCreated]);
 
   // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
-  // Stable identity so React.memo(AssistantTurn) can skip settled turns.
   const sendText = React.useCallback((raw: string) => {
     const t = raw.trim();
     if (!t || !projectId) return;
@@ -1712,14 +1692,180 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
 
   const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
 
-  const newChat = () => { setActiveId(null); setTurns([]); setText(''); taRef.current?.focus(); };
+  const autoGrow = () => {
+    const el = taRef.current; if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = Math.min(150, el.scrollHeight) + 'px';
+  };
+  const fillComposer = (v: string) => { setText(v); taRef.current?.focus(); requestAnimationFrame(autoGrow); };
+
+  // current effort's accent — themes the composer border/glow (MAX = gradient)
+  const effAccent = effort === 'MAX' ? '#9b6bff' : EFFORT_META[effort].tint;
+
+  return (
+    <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)', overflow: 'hidden',
+      ...(flush ? {} : { borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)' }) }}>
+      {/* faint top atmosphere */}
+      <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
+        background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
+      <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', padding: '22px 24px' }}>
+        <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
+          {turns.length === 0 && (
+            <div style={{ padding: '52px 20px 20px', textAlign: 'center' }}>
+              <span style={{ width: 56, height: 56, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
+                background: 'linear-gradient(160deg, color-mix(in srgb, var(--blue) 18%, transparent), color-mix(in srgb, var(--purple) 16%, transparent))',
+                color: 'var(--blue)', boxShadow: '0 8px 22px color-mix(in srgb, var(--blue) 18%, transparent)' }}>
+                <Icon name="terminal" size={27} />
+              </span>
+              <div style={{ font: '700 var(--fs-title1)/1.2 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)', marginBottom: 7 }}>
+                What should we build{project?.name ? ` in ${project.name}` : ''}?
+              </div>
+              <div style={{ font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)', maxWidth: 420, margin: '0 auto 22px' }}>
+                Describe it like you'd tell a teammate. The agent works in this project's folder and streams every step here.
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center', maxWidth: 520, margin: '0 auto' }}>
+                {['Make a simple todo app with a JS frontend + backend', 'Explain how this repo is structured', 'Add tests for the core logic', 'Find and fix any bugs'].map(ex => (
+                  <button key={ex} className="ex-chip" onClick={() => fillComposer(ex)} style={{ padding: '8px 13px', borderRadius: 'var(--r-pill)',
+                    background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', textAlign: 'left' }}>
+                    {ex}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {turns.map((t, i) => (
+            <React.Fragment key={t.id}>
+              <UserBubble text={t.input} />
+              <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+
+      {/* jump-to-latest — appears when scrolled up so new replies aren't missed */}
+      {!atBottom && turns.length > 0 && (
+        <button onClick={jumpToLatest} className="chat-msg" style={{ position: 'absolute', left: '50%', bottom: 92, transform: 'translateX(-50%)', zIndex: 3,
+          display: 'inline-flex', alignItems: 'center', gap: 6, height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', cursor: 'pointer',
+          background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 6px 18px rgba(15,20,50,.16)',
+          font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>
+          {streaming ? 'Jump to latest' : 'Latest'} <Icon name="chevronDown" size={14} />
+        </button>
+      )}
+
+      {/* composer — one floating card */}
+      <div style={{ position: 'relative', zIndex: 2, padding: '0 20px 16px' }}>
+        <div style={{ maxWidth: 760, margin: '0 auto' }}>
+          {sendError && (
+            <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 7, padding: '8px 11px', borderRadius: 10, background: 'color-mix(in srgb, var(--red) 9%, var(--bg-elevated))',
+              font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)' }}><Icon name="alert" size={13} /> {sendError}</div>
+          )}
+          {queue.length > 0 && (
+            <QueuePanel queue={queue} onSendNow={sendQueuedNow} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
+          )}
+          <div className={`composer-card composer-eff${effort === 'MAX' ? ' composer-ultra' : ''}`}
+            style={{ borderRadius: 18, border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)',
+            boxShadow: 'var(--card-shadow)', padding: '10px 10px 8px 14px', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+              <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) void sendNow(text); else sendText(text); } }}
+                placeholder={!projectId ? 'Pick a project first' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent…'}
+                title="Enter to send · Shift+Enter for a new line · while running: Enter queues, ⌘Enter sends now"
+                disabled={!projectId}
+                style={{ flex: 1, resize: 'none', border: 'none', outline: 'none', background: 'transparent',
+                  color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '6px 0',
+                  minHeight: 24, maxHeight: 150, boxSizing: 'content-box' }} />
+              {streaming ? (
+                <>
+                  {text.trim() && (
+                    <button onClick={() => sendText(text)} className="send-fab" title="Queue (Enter) — runs when the agent finishes · ⌘Enter to send now" style={{
+                      width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+                      background: 'var(--blue)', color: '#fff', boxShadow: '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)', cursor: 'pointer' }}>
+                      <Icon name="plus" size={18} stroke={2.6} />
+                    </button>
+                  )}
+                  <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
+                    background: 'color-mix(in srgb, var(--red) 14%, transparent)', color: 'var(--red)', cursor: 'pointer' }}>
+                    <span style={{ width: 12, height: 12, borderRadius: 3.5, background: 'currentColor' }} />
+                  </button>
+                </>
+              ) : (
+                <button onClick={() => { void sendText(text); }} disabled={!text.trim() || !projectId} className="send-fab" title="Send (Enter)" style={{
+                  width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+                  background: text.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: text.trim() ? '#fff' : 'var(--ink-secondary)',
+                  boxShadow: text.trim() ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: text.trim() ? 'pointer' : 'default' }}>
+                  <Icon name="arrowRight" size={18} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
+                </button>
+              )}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 6 }}>
+              <ModelSwitcher compact direction="up" value={modelChoice} onChange={setModelChoice} models={CHAT_MODELS} />
+              <EffortDial compact value={effort} onChange={setEffort} />
+              <button onClick={() => setPlanMode(!planMode)} title={planMode ? 'Plan mode on — propose before building' : 'Plan first — propose a plan before doing the work'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 28, padding: '0 11px', borderRadius: 9, cursor: 'pointer',
+                  background: planMode ? 'color-mix(in srgb, var(--blue) 13%, transparent)' : 'var(--fill-secondary)',
+                  border: planMode ? '1px solid color-mix(in srgb, var(--blue) 45%, transparent)' : '1px solid transparent',
+                  color: planMode ? 'var(--blue)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                <Icon name="map" size={14} /> Plan
+              </button>
+              <span style={{ flex: 1 }} />
+              {streaming
+                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                    <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn?.stage || 'working…'}
+                    <span style={{ color: 'var(--separator-strong)' }}>·</span> ⏎ queue · ⌘⏎ now
+                  </span>
+                : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{planMode ? 'Plan mode · ⏎ to plan' : queue.length ? `${queue.length} queued` : 'Enter to send · Shift+Enter for newline'}</span>}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* Per-project chat: a sessions rail + the shared ChatThread. (The multi-project
+   Workspace screen wires ChatThread into tabs instead.) */
+function ChatPane({ projectId, project }: { projectId: string | null; project: Project | null }) {
+  const location = useLocation();
+  const [sessions, setSessions] = React.useState<ChatSession[]>([]);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [renamingId, setRenamingId] = React.useState<string | null>(null);
+  const [renameVal, setRenameVal] = React.useState('');
+  const activeRef = React.useRef<string | null>(null);
+  activeRef.current = activeId;
+
+  // Sessions for this project (most recent first; open the latest by default).
+  React.useEffect(() => {
+    setActiveId(null);
+    if (!projectId) { setSessions([]); return; }
+    let alive = true;
+    const want = new URLSearchParams(location.search).get('s');
+    api.listSessions(projectId)
+      .then(ss => { if (alive) { setSessions(ss); setActiveId((want && ss.some(x => x.id === want)) ? want : (ss[0]?.id ?? null)); } })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [projectId, location.search]);
+
+  // LIVE: keep the rail's session list current.
+  React.useEffect(() => {
+    const unsub = api.subscribe({
+      onSession: (s) => {
+        if (s.deleted) { setSessions(ss => ss.filter(x => x.id !== s.id)); if (activeRef.current === s.id) setActiveId(null); return; }
+        if (projectId && s.projectId !== projectId) return;
+        setSessions(ss => {
+          const i = ss.findIndex(x => x.id === s.id);
+          const next = i === -1 ? [s, ...ss] : ss.map(x => (x.id === s.id ? s : x));
+          return [...next].sort((a, b) => b.updatedAt - a.updatedAt);
+        });
+      },
+    });
+    return unsub;
+  }, [projectId]);
 
   const removeSession = (id: string) => {
     void api.deleteSession(id).catch(() => {});
     setSessions(ss => ss.filter(s => s.id !== id));
     if (activeRef.current === id) setActiveId(null);
   };
-
   const commitRename = (id: string) => {
     const title = renameVal.trim();
     setRenamingId(null);
@@ -1728,33 +1874,13 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
     void api.renameSession(id, title).catch(() => {});
   };
 
-  const autoGrow = () => {
-    const el = taRef.current; if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = Math.min(150, el.scrollHeight) + 'px';
-  };
-
-  const fillComposer = (v: string) => { setText(v); taRef.current?.focus(); requestAnimationFrame(autoGrow); };
-
-  // ⌘L focuses the composer (like the reference). Ignore when typing in a field.
-  React.useEffect(() => {
-    const h = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'l') { e.preventDefault(); taRef.current?.focus(); }
-    };
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
-  }, []);
-
-  // current effort's accent — themes the composer border/glow (MAX = gradient)
-  const effAccent = effort === 'MAX' ? '#9b6bff' : EFFORT_META[effort].tint;
-
   return (
     <div style={{ display: 'flex', gap: 14, height: 'calc(100vh - 252px)', minHeight: 440 }}>
       {/* sessions rail */}
       <div style={{ width: 236, flexShrink: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-grouped)',
         borderRadius: 18, border: '0.5px solid var(--separator)', overflow: 'hidden', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
         <div style={{ padding: '11px 10px 9px' }}>
-          <button onClick={newChat} className="newchat-btn" title="New chat" style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, height: 36, padding: '0 11px', borderRadius: 11,
+          <button onClick={() => setActiveId(null)} className="newchat-btn" title="New chat" style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, height: 36, padding: '0 11px', borderRadius: 11,
             background: 'var(--fill-secondary)', color: 'var(--ink)', cursor: 'pointer', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
             <Icon name="plus" size={15} stroke={2.4} style={{ color: 'var(--blue)' }} /> New chat
           </button>
@@ -1796,124 +1922,9 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
         </div>
       </div>
 
-      {/* thread + composer */}
-      <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)',
-        borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden' }}>
-        {/* faint top atmosphere */}
-        <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
-          background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
-        <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, overflowY: 'auto', padding: '22px 24px' }}>
-          <div style={{ maxWidth: 720, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
-            {turns.length === 0 && (
-              <div style={{ padding: '52px 20px 20px', textAlign: 'center' }}>
-                <span style={{ width: 56, height: 56, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
-                  background: 'linear-gradient(160deg, color-mix(in srgb, var(--blue) 18%, transparent), color-mix(in srgb, var(--purple) 16%, transparent))',
-                  color: 'var(--blue)', boxShadow: '0 8px 22px color-mix(in srgb, var(--blue) 18%, transparent)' }}>
-                  <Icon name="terminal" size={27} />
-                </span>
-                <div style={{ font: '700 var(--fs-title1)/1.2 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)', marginBottom: 7 }}>
-                  What should we build{project?.name ? ` in ${project.name}` : ''}?
-                </div>
-                <div style={{ font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)', maxWidth: 420, margin: '0 auto 22px' }}>
-                  Describe it like you'd tell a teammate. The agent works in this project's folder and streams every step here.
-                </div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center', maxWidth: 520, margin: '0 auto' }}>
-                  {['Make a simple todo app with a JS frontend + backend', 'Explain how this repo is structured', 'Add tests for the core logic', 'Find and fix any bugs'].map(ex => (
-                    <button key={ex} className="ex-chip" onClick={() => fillComposer(ex)} style={{ padding: '8px 13px', borderRadius: 'var(--r-pill)',
-                      background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', textAlign: 'left' }}>
-                      {ex}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-            {turns.map((t, i) => (
-              <React.Fragment key={t.id}>
-                <UserBubble text={t.input} />
-                <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
-              </React.Fragment>
-            ))}
-          </div>
-        </div>
-
-        {/* jump-to-latest — appears when scrolled up so new replies aren't missed */}
-        {!atBottom && turns.length > 0 && (
-          <button onClick={jumpToLatest} className="chat-msg" style={{ position: 'absolute', left: '50%', bottom: 92, transform: 'translateX(-50%)', zIndex: 3,
-            display: 'inline-flex', alignItems: 'center', gap: 6, height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', cursor: 'pointer',
-            background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 6px 18px rgba(15,20,50,.16)',
-            font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>
-            {streaming ? 'Jump to latest' : 'Latest'} <Icon name="chevronDown" size={14} />
-          </button>
-        )}
-
-        {/* composer — one floating card */}
-        <div style={{ position: 'relative', zIndex: 2, padding: '0 20px 16px' }}>
-          <div style={{ maxWidth: 720, margin: '0 auto' }}>
-            {sendError && (
-              <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 7, padding: '8px 11px', borderRadius: 10, background: 'color-mix(in srgb, var(--red) 9%, var(--bg-elevated))',
-                font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)' }}><Icon name="alert" size={13} /> {sendError}</div>
-            )}
-            {/* queued prompts — collapsible panel; runs in order after the current turn */}
-            {queue.length > 0 && (
-              <QueuePanel queue={queue} onSendNow={sendQueuedNow} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
-            )}
-            <div className={`composer-card composer-eff${effort === 'MAX' ? ' composer-ultra' : ''}`}
-              style={{ borderRadius: 18, border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)',
-              boxShadow: 'var(--card-shadow)', padding: '10px 10px 8px 14px', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
-              <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
-                <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
-                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) void sendNow(text); else sendText(text); } }}
-                  placeholder={!projectId ? 'Pick a project first' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent…'}
-                  title="Enter to send · Shift+Enter for a new line · while running: Enter queues, ⌘Enter sends now · ⌘L to focus"
-                  disabled={!projectId}
-                  style={{ flex: 1, resize: 'none', border: 'none', outline: 'none', background: 'transparent',
-                    color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '6px 0',
-                    minHeight: 24, maxHeight: 150, boxSizing: 'content-box' }} />
-                {streaming ? (
-                  <>
-                    {text.trim() && (
-                      <button onClick={() => sendText(text)} className="send-fab" title="Queue (Enter) — runs when the agent finishes · ⌘Enter to send now" style={{
-                        width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
-                        background: 'var(--blue)', color: '#fff', boxShadow: '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)', cursor: 'pointer' }}>
-                        <Icon name="plus" size={18} stroke={2.6} />
-                      </button>
-                    )}
-                    <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
-                      background: 'color-mix(in srgb, var(--red) 14%, transparent)', color: 'var(--red)', cursor: 'pointer' }}>
-                      <span style={{ width: 12, height: 12, borderRadius: 3.5, background: 'currentColor' }} />
-                    </button>
-                  </>
-                ) : (
-                  <button onClick={() => { void sendText(text); }} disabled={!text.trim() || !projectId} className="send-fab" title="Send (Enter)" style={{
-                    width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
-                    background: text.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: text.trim() ? '#fff' : 'var(--ink-secondary)',
-                    boxShadow: text.trim() ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: text.trim() ? 'pointer' : 'default' }}>
-                    <Icon name="arrowRight" size={18} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
-                  </button>
-                )}
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 6 }}>
-                <ModelSwitcher compact direction="up" value={modelChoice} onChange={setModelChoice} models={CHAT_MODELS} />
-                <EffortDial compact value={effort} onChange={setEffort} />
-                <button onClick={() => setPlanMode(!planMode)} title={planMode ? 'Plan mode on — propose before building' : 'Plan first — propose a plan before doing the work'}
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 28, padding: '0 11px', borderRadius: 9, cursor: 'pointer',
-                    background: planMode ? 'color-mix(in srgb, var(--blue) 13%, transparent)' : 'var(--fill-secondary)',
-                    border: planMode ? '1px solid color-mix(in srgb, var(--blue) 45%, transparent)' : '1px solid transparent',
-                    color: planMode ? 'var(--blue)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-                  <Icon name="map" size={14} /> Plan
-                </button>
-                <span style={{ flex: 1 }} />
-                {streaming
-                  ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-                      <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn?.stage || 'working…'}
-                      <span style={{ color: 'var(--separator-strong)' }}>·</span> ⏎ queue · ⌘⏎ now
-                    </span>
-                  : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{planMode ? 'Plan mode · ⏎ to plan' : queue.length ? `${queue.length} queued` : 'Enter to send · Shift+Enter for newline'}</span>}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
+      {/* thread + composer (shared) */}
+      <ChatThread projectId={projectId} project={project} sessionId={activeId}
+        onSessionCreated={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }} />
     </div>
   );
 }

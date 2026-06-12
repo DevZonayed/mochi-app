@@ -71,6 +71,8 @@ export interface ChatSession {
   id: string; projectId: string; title: string;
   /** Engine continuity: Claude Agent SDK session id (Options.resume) once known. */
   sdkSessionId?: string;
+  /** Pinned to the top of the workspace, across projects. */
+  pinned?: boolean;
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
@@ -408,6 +410,14 @@ export class Store {
   touchSession(sessionId: string): void {
     const s = this.getSession(sessionId);
     if (s) { s.updatedAt = now(); this.save(); }
+  }
+  /** Pin/unpin without bumping updatedAt (pinning must not reorder the list). */
+  setSessionPinned(sessionId: string, pinned: boolean): ChatSession {
+    const s = this.getSession(sessionId);
+    if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
+    s.pinned = pinned || undefined;
+    this.save();
+    return s;
   }
   deleteSession(sessionId: string): void {
     const i = this.data.sessions.findIndex(s => s.id === sessionId);

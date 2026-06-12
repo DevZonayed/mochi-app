@@ -10,6 +10,7 @@ const Onboarding = React.lazy(() => import('./screens/Onboarding'));
 const CommandCenter = React.lazy(() => import('./screens/CommandCenter'));
 const Projects = React.lazy(() => import('./screens/Projects'));
 const ProjectDetail = React.lazy(() => import('./screens/ProjectDetail'));
+const Workspace = React.lazy(() => import('./screens/Workspace'));
 const Templates = React.lazy(() => import('./screens/Templates'));
 const JobMonitor = React.lazy(() => import('./screens/JobMonitor'));
 const SessionTranscript = React.lazy(() => import('./screens/SessionTranscript'));
@@ -44,6 +45,7 @@ export function App() {
           <Route path="/" element={<Navigate to={entryPath()} replace />} />
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/command-center" element={<CommandCenter />} />
+          <Route path="/workspace" element={<Workspace />} />
           <Route path="/projects" element={<Projects />} />
           <Route path="/project-detail" element={<ProjectDetail />} />
           <Route path="/project-detail/:id" element={<ProjectDetail />} />

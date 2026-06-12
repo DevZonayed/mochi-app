@@ -314,6 +314,8 @@ export function buildServer(): FastifyInstance {
   app.post('/api/sessions/:id/rename', async (req, reply) =>
     forward(reply, 'renameSession', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/sessions/:id/delete', async (req, reply) => forward(reply, 'deleteSession', { id: (req.params as { id: string }).id }));
+  app.post('/api/sessions/:id/pin', async (req, reply) =>
+    forward(reply, 'pinSession', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/settings', async (req, reply) => forward(reply, 'setSettings', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/jobs', async (req, reply) => forward(reply, 'createJob', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/jobs/run', async (req, reply) => forward(reply, 'createAndRunJob', (req.body ?? {}) as Record<string, unknown>));
