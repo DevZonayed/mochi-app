@@ -986,7 +986,56 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
   });
 }
 
-/** Block markdown: headings, bullets, paragraphs (with inline bold/code). */
+/* Markdown table helpers. A GFM table is a header row, a `|---|:--:|` separator,
+   then body rows — all pipe-delimited. */
+function splitRow(line: string): string[] {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|')) s = s.slice(0, -1);
+  return s.split('|').map(c => c.trim());
+}
+function isSeparatorRow(line: string): boolean {
+  if (!line.includes('-')) return false;
+  const cells = splitRow(line);
+  return cells.length > 0 && cells.every(c => /^:?-{1,}:?$/.test(c.replace(/\s/g, '')));
+}
+function colAligns(line: string): ('left' | 'center' | 'right')[] {
+  return splitRow(line).map(c => { const t = c.replace(/\s/g, ''); const l = t.startsWith(':'), r = t.endsWith(':'); return l && r ? 'center' : r ? 'right' : 'left'; });
+}
+function MdTable({ header, aligns, rows, kb }: { header: string[]; aligns: ('left' | 'center' | 'right')[]; rows: string[][]; kb: string }) {
+  const cols = header.length;
+  const cell = (c: string | undefined, ci: number, k: string): React.ReactNode => c == null ? '' : renderInline(c, `${k}-${ci}`);
+  return (
+    <div style={{ margin: '10px 0 12px', overflowX: 'auto', borderRadius: 10, border: '0.5px solid var(--separator)' }}>
+      <table style={{ borderCollapse: 'collapse', width: '100%', font: '400 13px/1.5 var(--font-text)' }}>
+        <thead>
+          <tr>
+            {header.map((c, ci) => (
+              <th key={ci} style={{ textAlign: aligns[ci] ?? 'left', padding: '7px 12px', background: 'var(--fill-tertiary)', color: 'var(--ink)',
+                font: '650 12.5px/1.4 var(--font-text)', borderBottom: '0.5px solid var(--separator-strong)', whiteSpace: 'nowrap', ...(ci ? { borderLeft: '0.5px solid var(--separator)' } : {}) }}>
+                {cell(c, ci, `${kb}-h`)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, ri) => (
+            <tr key={ri} style={{ background: ri % 2 ? 'color-mix(in srgb, var(--fill-tertiary) 35%, transparent)' : 'transparent' }}>
+              {Array.from({ length: cols }, (_, ci) => (
+                <td key={ci} style={{ textAlign: aligns[ci] ?? 'left', padding: '6px 12px', color: 'var(--ink-secondary)', verticalAlign: 'top',
+                  borderTop: '0.5px solid var(--separator)', ...(ci ? { borderLeft: '0.5px solid var(--separator)' } : {}) }}>
+                  {cell(r[ci], ci, `${kb}-r${ri}`)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Block markdown: headings, tables, bullet + numbered lists, paragraphs. */
 function renderProse(text: string, keyBase: string): React.ReactNode[] {
   const out: React.ReactNode[] = [];
   const lines = text.split('\n');
@@ -998,13 +1047,36 @@ function renderProse(text: string, keyBase: string): React.ReactNode[] {
     out.push(<p key={`${keyBase}-p${key++}`} style={{ margin: '0 0 10px', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{renderInline(t, `${keyBase}-p${key}`)}</p>);
     para = [];
   };
-  for (const line of lines) {
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    // table: a pipe row immediately followed by a |---|---| separator
+    if (line.includes('|') && i + 1 < lines.length && isSeparatorRow(lines[i + 1])) {
+      flushPara();
+      const header = splitRow(line);
+      const aligns = colAligns(lines[i + 1]);
+      const rows: string[][] = [];
+      let j = i + 2;
+      while (j < lines.length && lines[j].includes('|') && lines[j].trim() && !isSeparatorRow(lines[j])) { rows.push(splitRow(lines[j])); j++; }
+      out.push(<MdTable key={`${keyBase}-tb${key++}`} header={header} aligns={aligns} rows={rows} kb={`${keyBase}-tb${key}`} />);
+      i = j;
+      continue;
+    }
     const h = line.match(/^(#{1,4})\s+(.*)$/);
+    const ol = line.match(/^\s*(\d{1,3})[.)]\s+(.*)$/);
     const li = line.match(/^\s*[-*]\s+(.*)$/);
     if (h) {
       flushPara();
       const lvl = h[1].length;
       out.push(<div key={`${keyBase}-h${key++}`} style={{ margin: lvl <= 2 ? '14px 0 6px' : '11px 0 5px', font: `700 ${lvl <= 2 ? '15px' : '13.5px'}/1.35 var(--font-display)`, letterSpacing: '-0.01em', color: 'var(--ink)' }}>{renderInline(h[2], `${keyBase}-h${key}`)}</div>);
+    } else if (ol) {
+      flushPara();
+      out.push(
+        <div key={`${keyBase}-o${key++}`} style={{ display: 'flex', gap: 8, margin: '0 0 5px', paddingLeft: 4 }}>
+          <span style={{ color: 'var(--ink-tertiary)', flexShrink: 0, minWidth: 17, textAlign: 'right', font: '600 var(--fs-footnote)/1.55 var(--font-mono)' }}>{ol[1]}.</span>
+          <span style={{ minWidth: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{renderInline(ol[2], `${keyBase}-o${key}`)}</span>
+        </div>
+      );
     } else if (li) {
       flushPara();
       out.push(
@@ -1018,6 +1090,7 @@ function renderProse(text: string, keyBase: string): React.ReactNode[] {
     } else {
       para.push(line);
     }
+    i++;
   }
   flushPara();
   return out;
