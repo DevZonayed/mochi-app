@@ -10,6 +10,7 @@
 
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
+import { pathForNav } from '../lib/routes';
 import {
   APP_W, APP_H, useAppScale, useTheme, TrafficLights, Sidebar, Toolbar,
 } from '../lib/appShell';
@@ -543,7 +544,7 @@ export default function ApprovalsCenter() {
   const scale = useAppScale();
   const [theme, setTheme] = useTheme('light');
   const navigate = useNavigate();
-  const onNav = (key: string) => navigate('/' + key);
+  const onNav = (key: string) => navigate(pathForNav(key));
 
   const [gates, setGates] = React.useState<Gate[]>([]);
   const [activeId, setActiveId] = React.useState<string | null>(null);

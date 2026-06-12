@@ -34,3 +34,10 @@ export const SETTINGS_ROUTE: NavRoute = { key: 'settings', path: '/settings', la
 
 /** Every navigable destination (sidebar items + pinned Settings), for active-key lookup. */
 export const ALL_NAV: NavRoute[] = [...NAV_ROUTES, SETTINGS_ROUTE];
+
+/** Nav key → real route path. Keys and paths differ ('jobs' → '/job-monitor');
+    guessing '/' + key sends mismatched keys into the router's catch-all (Home).
+    Every onNav handler must resolve through this. */
+export function pathForNav(key: string): string {
+  return ALL_NAV.find(r => r.key === key)?.path ?? '/' + key;
+}

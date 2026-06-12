@@ -6,7 +6,7 @@
 import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, MaestroMark } from './icons';
-import { NAV_ROUTES, ALL_NAV } from './routes';
+import { NAV_ROUTES, ALL_NAV, pathForNav } from './routes';
 import { api } from './api';
 import { CountUp } from './ui';
 
@@ -388,10 +388,7 @@ export function AppShell({ active, children, onSearch, right, initialTheme = 'li
   const location = useLocation();
   const { hidden } = useSidebar();
   const routeKey = ALL_NAV.find(r => location.pathname === r.path || location.pathname.startsWith(r.path + '/'))?.key;
-  const onNav = (key: string) => {
-    const r = ALL_NAV.find(x => x.key === key);
-    navigate(r ? r.path : '/' + key);
-  };
+  const onNav = (key: string) => navigate(pathForNav(key));
   // ⌘B toggles the sidebar from anywhere in the chrome.
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

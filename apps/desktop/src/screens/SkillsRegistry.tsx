@@ -8,6 +8,7 @@
 
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
+import { pathForNav } from '../lib/routes';
 import { Icon, type IconName } from '../lib/icons';
 import { Spinner } from '../lib/ui';
 import { api, type Skill as ApiSkill } from '../lib/api';
@@ -718,7 +719,7 @@ export default function SkillsRegistry() {
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   }, []);
 
-  const onNav = (key: string) => navigate('/' + key);
+  const onNav = (key: string) => navigate(pathForNav(key));
 
   // Enable/disable a skill -> toggle on the server, then reflect `enabled`
   // (mapped to the row's `installed`) from the returned Skill in state.

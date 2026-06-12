@@ -6,6 +6,7 @@
 
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
+import { pathForNav } from '../lib/routes';
 import { api, type Template as ApiTemplate } from '../lib/api';
 import { Icon, MaestroMark, type IconName } from '../lib/icons';
 import {
@@ -783,7 +784,7 @@ export default function Templates() {
   };
   const onNew = () => openEditor({ name: '', icon: 'spark', tint: 'var(--blue)', ver: '0.1.0', effort: 'BALANCED', review: true, triggers: ['hand'] });
 
-  const onNav = (key: string) => navigate('/' + key);
+  const onNav = (key: string) => navigate(pathForNav(key));
 
   return (
     <>
