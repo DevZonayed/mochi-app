@@ -74,6 +74,12 @@ const PAGE_CSS = `
   .work-bar { transition: background 140ms ease, border-color 140ms ease; }
   .work-bar:hover { background: var(--fill-secondary) !important; border-color: var(--separator-strong) !important; }
 
+  /* question options — quiet until hovered */
+  .opt-row { transition: background 120ms ease; }
+  .opt-row:not(:disabled):hover { background: var(--fill-tertiary) !important; }
+  .opt-chip { transition: background 120ms ease, border-color 120ms ease, transform 120ms ease; }
+  .opt-chip:not(:disabled):hover { border-color: color-mix(in srgb, var(--blue) 55%, var(--separator-strong)) !important; transform: translateY(-1px); }
+
   /* code card — keep a slim scrollbar visible so long lines read as scrollable */
   .code-card pre::-webkit-scrollbar { height: 7px; }
   .code-card pre::-webkit-scrollbar-thumb { background: var(--separator-strong); border-radius: 4px; }
@@ -1078,6 +1084,24 @@ function parseAsk(json?: string): AskQuestion[] {
   } catch { return []; }
 }
 
+/** One option as a compact selectable row (used when options carry descriptions). */
+function OptionRow({ label, description, on, multi, answered, onPick }: { label: string; description?: string; on: boolean; multi: boolean; answered: boolean; onPick: () => void }) {
+  return (
+    <button disabled={answered} onClick={onPick} className="opt-row" style={{
+      display: 'flex', alignItems: description ? 'flex-start' : 'center', gap: 9, width: '100%', padding: '6px 9px', borderRadius: 9, textAlign: 'left',
+      background: on ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent', border: '1px solid transparent', cursor: answered ? 'default' : 'pointer' }}>
+      <span style={{ width: 15, height: 15, borderRadius: multi ? 4 : 8, flexShrink: 0, marginTop: description ? 2 : 0, display: 'grid', placeItems: 'center',
+        border: `1.5px solid ${on ? 'var(--blue)' : 'var(--separator-strong)'}`, background: on ? 'var(--blue)' : 'transparent', color: '#fff', transition: 'all 120ms ease' }}>
+        {on && <Icon name="check" size={9} stroke={3.2} />}
+      </span>
+      <span style={{ minWidth: 0, flex: 1 }}>
+        <span style={{ display: 'block', font: '500 13.5px/1.3 var(--font-text)', color: 'var(--ink)' }}>{label}</span>
+        {description && <span style={{ display: 'block', font: '400 12px/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 1 }}>{description}</span>}
+      </span>
+    </button>
+  );
+}
+
 function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (text: string) => void; answered: boolean }) {
   const questions = parseAsk(ask);
   const [picked, setPicked] = React.useState<Record<number, Set<string>>>({});
@@ -1099,48 +1123,55 @@ function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (te
     if (parts.length) onAnswer(parts.join('\n'));
   };
   const anyPicked = Object.values(picked).some(s => s.size > 0);
+  const needsSubmit = questions.some(q => q.multiSelect) || questions.length > 1;
 
   return (
-    <div style={{ margin: '10px 0', borderRadius: 14, overflow: 'hidden', border: '0.5px solid color-mix(in srgb, var(--orange) 32%, var(--separator))',
-      background: 'color-mix(in srgb, var(--orange) 5%, var(--bg-elevated))', opacity: answered ? 0.62 : 1 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '9px 13px', borderBottom: '0.5px solid color-mix(in srgb, var(--orange) 22%, var(--separator))' }}>
-        <Icon name="enter" size={13} style={{ color: 'var(--orange)' }} />
-        <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--orange)' }}>{answered ? 'Answered' : 'Claude is asking'}</span>
+    <div style={{ margin: '8px 0', borderRadius: 13, padding: '11px 13px', position: 'relative',
+      border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', opacity: answered ? 0.6 : 1 }}>
+      <span style={{ position: 'absolute', left: 0, top: 11, bottom: 11, width: 2.5, borderRadius: 2, background: answered ? 'var(--green)' : 'var(--blue)' }} />
+      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, marginBottom: 7, font: '600 var(--fs-caption)/1 var(--font-text)', color: answered ? 'var(--green)' : 'var(--ink-tertiary)' }}>
+        <Icon name={answered ? 'check' : 'enter'} size={11} stroke={answered ? 2.6 : 2} /> {answered ? 'Answered' : 'Claude is asking'}
       </div>
-      <div style={{ padding: '12px 13px', display: 'flex', flexDirection: 'column', gap: 14 }}>
-        {questions.map((q, qi) => (
-          <div key={qi}>
-            <div style={{ font: '600 14px/1.4 var(--font-text)', color: 'var(--ink)', marginBottom: 9 }}>{q.question}</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {q.options.map((o, oi) => {
-                const on = (picked[qi] ?? new Set()).has(o.label);
-                return (
-                  <button key={oi} disabled={answered}
-                    onClick={() => { if (q.multiSelect) toggle(qi, o.label, true); else { toggle(qi, o.label, false); if (questions.length === 1) onAnswer(o.label); } }}
-                    className="ex-chip" style={{ display: 'flex', alignItems: 'flex-start', gap: 9, padding: '9px 11px', borderRadius: 10, textAlign: 'left',
-                      background: on ? 'color-mix(in srgb, var(--blue) 10%, var(--bg-elevated))' : 'var(--bg-elevated)',
-                      border: `1px solid ${on ? 'var(--blue)' : 'var(--separator)'}`, cursor: answered ? 'default' : 'pointer' }}>
-                    <span style={{ width: 16, height: 16, borderRadius: q.multiSelect ? 4 : 8, flexShrink: 0, marginTop: 1, display: 'grid', placeItems: 'center',
-                      border: `1.5px solid ${on ? 'var(--blue)' : 'var(--separator-strong)'}`, background: on ? 'var(--blue)' : 'transparent', color: '#fff' }}>
-                      {on && <Icon name="check" size={10} stroke={3} />}
-                    </span>
-                    <span style={{ minWidth: 0 }}>
-                      <span style={{ display: 'block', font: '500 13.5px/1.35 var(--font-text)', color: 'var(--ink)' }}>{o.label}</span>
-                      {o.description && <span style={{ display: 'block', font: '400 12px/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{o.description}</span>}
-                    </span>
-                  </button>
-                );
-              })}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
+        {questions.map((q, qi) => {
+          const hasDesc = q.options.some(o => o.description);
+          const sel = picked[qi] ?? new Set<string>();
+          const onPick = (label: string) => { if (q.multiSelect) toggle(qi, label, true); else { toggle(qi, label, false); if (!needsSubmit) onAnswer(label); } };
+          return (
+            <div key={qi}>
+              <div style={{ font: '600 14px/1.35 var(--font-text)', color: 'var(--ink)', marginBottom: 8 }}>{q.question}</div>
+              {hasDesc ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  {q.options.map((o, oi) => <OptionRow key={oi} label={o.label} description={o.description} on={sel.has(o.label)} multi={!!q.multiSelect} answered={answered} onPick={() => onPick(o.label)} />)}
+                </div>
+              ) : (
+                // No descriptions → efficient quick-reply chips.
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {q.options.map((o, oi) => {
+                    const on = sel.has(o.label);
+                    return (
+                      <button key={oi} disabled={answered} onClick={() => onPick(o.label)} className="opt-chip" style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 6, height: 30, padding: '0 12px', borderRadius: 'var(--r-pill)', cursor: answered ? 'default' : 'pointer',
+                        background: on ? 'var(--blue)' : 'var(--bg-elevated)', color: on ? '#fff' : 'var(--ink)',
+                        border: `1px solid ${on ? 'var(--blue)' : 'var(--separator-strong)'}`, font: '600 13px/1 var(--font-text)' }}>
+                        {q.multiSelect && on && <Icon name="check" size={12} stroke={3} />}{o.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-          </div>
-        ))}
-        {!answered && questions.some(q => q.multiSelect || questions.length > 1) && (
-          <button onClick={submit} disabled={!anyPicked} className="send-fab" style={{ alignSelf: 'flex-start', height: 32, padding: '0 16px', borderRadius: 'var(--r-pill)', border: 'none',
-            background: anyPicked ? 'var(--blue)' : 'var(--fill-secondary)', color: anyPicked ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: anyPicked ? 'pointer' : 'default' }}>
+          );
+        })}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 11 }}>
+        {!answered && needsSubmit && (
+          <button onClick={submit} disabled={!anyPicked} className="send-fab" style={{ height: 30, padding: '0 15px', borderRadius: 'var(--r-pill)', border: 'none',
+            background: anyPicked ? 'var(--blue)' : 'var(--fill-secondary)', color: anyPicked ? '#fff' : 'var(--ink-tertiary)', font: '600 13px/1 var(--font-text)', cursor: anyPicked ? 'pointer' : 'default' }}>
             Send answer
           </button>
         )}
-        <div style={{ font: '400 12px/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>{answered ? 'Answered — type below to change your mind.' : '…or just type your own answer below.'}</div>
+        <span style={{ font: '400 11.5px/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>{answered ? 'Type below to change your answer.' : 'or type your own answer below'}</span>
       </div>
     </div>
   );
