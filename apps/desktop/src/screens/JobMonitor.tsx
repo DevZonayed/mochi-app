@@ -9,7 +9,7 @@ import { useNavigate } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { Spinner, CountUp } from '../lib/ui';
 import { AppShell } from '../lib/appShell';
-import { api, type Job as ApiJob, type Project } from '../lib/api';
+import { api, type Job as ApiJob, type Project, type Effort, type EngineId } from '../lib/api';
 
 /* ── page-specific CSS lifted from <Job Monitor.html>'s <style> ── */
 const styles = `
@@ -519,17 +519,39 @@ function transcriptHref(j: Job): string {
   return j.sessionId ? `/project-detail/${j.lane}?s=${encodeURIComponent(j.sessionId)}` : `/session-transcript/${j.id}`;
 }
 
+/* Steer a running session job: type a course-correction, it interrupts the
+   current turn and continues the SAME conversation with your guidance (same
+   semantics as the chat composer's steer). */
+function SteerBar({ onSteer }: { onSteer: (text: string) => void }) {
+  const [v, setV] = React.useState('');
+  const submit = () => { const t = v.trim(); if (!t) return; onSteer(t); setV(''); };
+  return (
+    <div onClick={e => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, padding: '5px 5px 5px 12px', borderRadius: 'var(--r-pill)',
+      background: 'color-mix(in srgb, var(--purple) 7%, var(--bg-elevated))', border: '0.5px solid color-mix(in srgb, var(--purple) 30%, var(--separator))' }}>
+      <Icon name="command" size={14} style={{ color: 'var(--purple)', flexShrink: 0 }} />
+      <input value={v} onChange={e => setV(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } }}
+        placeholder="Steer this run — a course-correction the agent picks up…"
+        style={{ flex: 1, minWidth: 0, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)' }} />
+      <button onClick={submit} disabled={!v.trim()} title="Interrupt & steer" style={{ width: 28, height: 28, borderRadius: '50%', display: 'grid', placeItems: 'center', flexShrink: 0, border: 'none',
+        background: v.trim() ? 'var(--purple)' : 'var(--fill-secondary)', color: v.trim() ? '#fff' : 'var(--ink-tertiary)', cursor: v.trim() ? 'pointer' : 'default' }}>
+        <Icon name="arrowRight" size={14} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} />
+      </button>
+    </div>
+  );
+}
+
 interface ActivityListProps {
   jobs: Job[];
   lanes: Lane[];
   nowMs: number;
   onCancel: (job: Job) => void;
+  onSteer: (job: Job, text: string) => void;
 }
 
 /* One scannable job row: status + title + a live line of what the agent is
    doing, with light meta. Click to expand its recent output inline — no
    slide-over, no drilling through panels just to see what happened. */
-function ActivityRow({ job, lane, nowMs, onCancel, open, onToggle }: { job: Job; lane: Lane; nowMs: number; onCancel: (j: Job) => void; open: boolean; onToggle: () => void }) {
+function ActivityRow({ job, lane, nowMs, onCancel, onSteer, open, onToggle }: { job: Job; lane: Lane; nowMs: number; onCancel: (j: Job) => void; onSteer: (j: Job, text: string) => void; open: boolean; onToggle: () => void }) {
   const navigate = useNavigate();
   const m = STATUS_META[job.status];
   const running = job.status === 'running';
@@ -572,20 +594,21 @@ function ActivityRow({ job, lane, nowMs, onCancel, open, onToggle }: { job: Job;
             </button>
             {running && <button onClick={e => { e.stopPropagation(); onCancel(job); }} className="cancel-btn" style={{ height: 36, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'rgba(255,59,48,0.12)', color: 'var(--red)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Cancel</button>}
           </div>
+          {running && job.sessionId && <SteerBar onSteer={t => onSteer(job, t)} />}
         </div>
       )}
     </div>
   );
 }
 
-function ActivityList({ jobs, lanes, nowMs, onCancel }: ActivityListProps) {
+function ActivityList({ jobs, lanes, nowMs, onCancel, onSteer }: ActivityListProps) {
   const [openId, setOpenId] = React.useState<string | null>(null);
   const sorted = [...jobs].sort((a, b) => (b.endMs ?? nowMs) - (a.endMs ?? nowMs) || b.startMs - a.startMs);
   return (
     <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden',
       backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
       {sorted.map(j => (
-        <ActivityRow key={j.id} job={j} lane={laneOf(lanes, j.lane)} nowMs={nowMs} onCancel={onCancel} open={openId === j.id} onToggle={() => setOpenId(id => (id === j.id ? null : j.id))} />
+        <ActivityRow key={j.id} job={j} lane={laneOf(lanes, j.lane)} nowMs={nowMs} onCancel={onCancel} onSteer={onSteer} open={openId === j.id} onToggle={() => setOpenId(id => (id === j.id ? null : j.id))} />
       ))}
       {sorted.length === 0 && <div style={{ padding: '44px 0', textAlign: 'center', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No jobs yet — run one to see it here.</div>}
     </div>
@@ -599,9 +622,10 @@ interface InspectorProps {
   nowMs: number;
   onClose: () => void;
   onCancel: (job: Job) => void;
+  onSteer: (job: Job, text: string) => void;
 }
 
-function Inspector({ job, lanes, nowMs, onClose, onCancel }: InspectorProps) {
+function Inspector({ job, lanes, nowMs, onClose, onCancel, onSteer }: InspectorProps) {
   const navigate = useNavigate();
   if (!job) return null;
   const lane = laneOf(lanes, job.lane);
@@ -660,15 +684,18 @@ function Inspector({ job, lanes, nowMs, onClose, onCancel }: InspectorProps) {
       </div>
 
       {/* actions */}
-      <div style={{ display: 'flex', gap: 10, padding: 16, borderTop: '0.5px solid var(--separator)' }}>
-        <button onClick={openTranscript} className="primary-cta" style={{ flex: 1, height: 42, borderRadius: 'var(--r-pill)', cursor: 'pointer', border: 'none',
-          display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>
-          <Icon name={job.sessionId ? 'command' : 'terminal'} size={16} /> {job.sessionId ? 'Open chat' : 'Open transcript'}
-        </button>
-        {job.status === 'running' && (
-          <button onClick={() => onCancel(job)} className="cancel-btn" style={{ height: 42, padding: '0 18px', borderRadius: 'var(--r-pill)',
-            background: 'rgba(255,59,48,0.12)', color: 'var(--red)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
-        )}
+      <div style={{ padding: 16, borderTop: '0.5px solid var(--separator)' }}>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button onClick={openTranscript} className="primary-cta" style={{ flex: 1, height: 42, borderRadius: 'var(--r-pill)', cursor: 'pointer', border: 'none',
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>
+            <Icon name={job.sessionId ? 'command' : 'terminal'} size={16} /> {job.sessionId ? 'Open chat' : 'Open transcript'}
+          </button>
+          {job.status === 'running' && (
+            <button onClick={() => onCancel(job)} className="cancel-btn" style={{ height: 42, padding: '0 18px', borderRadius: 'var(--r-pill)',
+              background: 'rgba(255,59,48,0.12)', color: 'var(--red)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
+          )}
+        </div>
+        {job.status === 'running' && job.sessionId && <SteerBar onSteer={t => onSteer(job, t)} />}
       </div>
     </div>
   );
@@ -807,6 +834,24 @@ export default function JobMonitor() {
     void api.cancelJob(job.id).catch(() => { void refetch(); });
   };
 
+  // Steer a running session job: interrupt the current turn, then continue the
+  // SAME conversation with the operator's course-correction (the engine resumes
+  // the session, so it keeps all prior context). Mirrors the chat composer.
+  const doSteer = React.useCallback(async (job: Job, text: string) => {
+    const t = text.trim();
+    if (!t || !job.sessionId) return;
+    setJobs(js => js.map(j => j.id === job.id ? { ...j, last: 'steering…' } : j));
+    try { await api.cancelJob(job.id); } catch { /* already stopping */ }
+    try {
+      await api.sendChat({
+        projectId: job.lane, sessionId: job.sessionId, text: t,
+        effort: job.effort.toLowerCase() as Effort,
+        ...(job.engine ? { engine: job.engine as EngineId } : {}),
+      });
+    } catch { /* surfaced via job events */ }
+    void refetch();
+  }, [refetch]);
+
   return (
     <AppShell active="jobs" onSearch={() => setPaletteOpen(true)}>
       <style>{styles}</style>
@@ -849,11 +894,11 @@ export default function JobMonitor() {
         <div style={{ flex: 1, overflowY: 'auto', paddingBottom: 28 }}>
           {view === 'timeline'
             ? <Timeline jobs={shown} lanes={lanes} nowMs={nowMs} onSelect={setSel} selectedId={sel ? sel.id : null} />
-            : <ActivityList jobs={shown} lanes={lanes} nowMs={nowMs} onCancel={setCancelJob} />}
+            : <ActivityList jobs={shown} lanes={lanes} nowMs={nowMs} onCancel={setCancelJob} onSteer={doSteer} />}
         </div>
       </main>
 
-      <Inspector job={sel} lanes={lanes} nowMs={nowMs} onClose={() => setSel(null)} onCancel={setCancelJob} />
+      <Inspector job={sel} lanes={lanes} nowMs={nowMs} onClose={() => setSel(null)} onCancel={setCancelJob} onSteer={doSteer} />
       <CancelSheet job={cancelJob} onClose={() => setCancelJob(null)} onConfirm={doCancel} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>
