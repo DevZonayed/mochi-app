@@ -1105,7 +1105,9 @@ function OptionRow({ label, description, on, multi, answered, onPick }: { label:
 function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (text: string) => void; answered: boolean }) {
   const questions = parseAsk(ask);
   const [picked, setPicked] = React.useState<Record<number, Set<string>>>({});
+  const [custom, setCustom] = React.useState('');
   if (questions.length === 0) return null;
+  const sendCustom = () => { const v = custom.trim(); if (v) { setCustom(''); onAnswer(v); } };
 
   const toggle = (qi: number, label: string, multi: boolean) => {
     setPicked(p => {
@@ -1164,15 +1166,30 @@ function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (te
           );
         })}
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 11 }}>
-        {!answered && needsSubmit && (
-          <button onClick={submit} disabled={!anyPicked} className="send-fab" style={{ height: 30, padding: '0 15px', borderRadius: 'var(--r-pill)', border: 'none',
-            background: anyPicked ? 'var(--blue)' : 'var(--fill-secondary)', color: anyPicked ? '#fff' : 'var(--ink-tertiary)', font: '600 13px/1 var(--font-text)', cursor: anyPicked ? 'pointer' : 'default' }}>
-            Send answer
-          </button>
-        )}
-        <span style={{ font: '400 11.5px/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>{answered ? 'Type below to change your answer.' : 'or type your own answer below'}</span>
-      </div>
+      {answered ? (
+        <div style={{ marginTop: 10, font: '400 11.5px/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>Send another message to change your answer.</div>
+      ) : (
+        <div style={{ marginTop: 11, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {needsSubmit && (
+            <button onClick={submit} disabled={!anyPicked} className="send-fab" style={{ alignSelf: 'flex-start', height: 30, padding: '0 15px', borderRadius: 'var(--r-pill)', border: 'none',
+              background: anyPicked ? 'var(--blue)' : 'var(--fill-secondary)', color: anyPicked ? '#fff' : 'var(--ink-tertiary)', font: '600 13px/1 var(--font-text)', cursor: anyPicked ? 'pointer' : 'default' }}>
+              Send {[...Object.values(picked)].reduce((n, s) => n + s.size, 0) || ''} answer{[...Object.values(picked)].reduce((n, s) => n + s.size, 0) === 1 ? '' : 's'}
+            </button>
+          )}
+          {/* real, inline "type your own answer" — answers the question directly */}
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <input value={custom} onChange={e => setCustom(e.target.value)} placeholder="Or type your own answer…"
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); sendCustom(); } }}
+              style={{ flex: 1, height: 34, padding: '0 12px', borderRadius: 9, boxSizing: 'border-box',
+                border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)', color: 'var(--ink)', font: '400 13px/1 var(--font-text)' }} />
+            <button onClick={sendCustom} disabled={!custom.trim()} className="send-fab" title="Send your answer" style={{
+              width: 34, height: 34, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+              background: custom.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: custom.trim() ? '#fff' : 'var(--ink-tertiary)', cursor: custom.trim() ? 'pointer' : 'default' }}>
+              <Icon name="arrowRight" size={16} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
