@@ -20,19 +20,34 @@ function parseHHMM(time: string): { h: number; m: number } | null {
   return { h, m: mi };
 }
 
+/* The weekdays a cadence permits, as JS getDay() values (0=Sun..6=Sat).
+   `null` means every day. Tolerant of the engine vocabulary ('daily'/'weekly')
+   AND the labels the Scheduler sheet writes ('Every day'/'Weekdays'/'Mon, Wed').
+   'weekly' stays anchored to the weekday the schedule was created on. This is
+   the single source of truth for WHEN a schedule fires; the desktop calendar
+   mirrors the same semantics so the grid matches reality. */
+export function cadenceDays(s: Schedule): Set<number> | null {
+  const c = (s.cadence || '').toLowerCase().trim();
+  if (!c || c === '*' || c === 'daily' || /every\s*day/.test(c)) return null;
+  if (c === 'weekly') return new Set([new Date(s.createdAt).getDay()]);
+  if (/weekday|mon\s*-\s*fri|monday to friday/.test(c)) return new Set([1, 2, 3, 4, 5]);
+  if (/weekend/.test(c)) return new Set([0, 6]);
+  const map: Record<string, number> = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+  const days = Object.keys(map).filter(k => c.includes(k)).map(k => map[k]);
+  return days.length ? new Set(days) : null;
+}
+
 /** Next occurrence of the schedule strictly after `from`. */
 export function nextOccurrence(s: Schedule, from: number): number | null {
   const hm = parseHHMM(s.time);
   if (!hm) return null;
+  const days = cadenceDays(s);
   const d = new Date(from);
   d.setHours(hm.h, hm.m, 0, 0);
-  if (s.cadence === 'weekly') {
-    const anchorDay = new Date(s.createdAt).getDay();
-    while (d.getDay() !== anchorDay || d.getTime() <= from) d.setTime(d.getTime() + DAY_MS);
-    return d.getTime();
-  }
-  // daily (and any unknown cadence treated as daily)
+  // earliest candidate strictly after `from` (today if HH:MM is still ahead)
   if (d.getTime() <= from) d.setTime(d.getTime() + DAY_MS);
+  // then skip forward to the next allowed weekday (bounded to a week)
+  if (days) { for (let i = 0; i < 7 && !days.has(d.getDay()); i++) d.setTime(d.getTime() + DAY_MS); }
   return d.getTime();
 }
 

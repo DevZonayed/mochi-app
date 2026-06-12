@@ -46,53 +46,66 @@ const SCHEDULER_CSS = `
 
 interface ProjMeta { name: string; color: string }
 
-const SCHED_PROJ: Record<string, ProjMeta> = {
-  atlas:   { name: 'Atlas API',     color: 'var(--blue)' },
-  content: { name: 'Q3 Content',    color: 'var(--purple)' },
-  scan:    { name: 'Market Scan',   color: 'var(--indigo)' },
-  brand:   { name: 'Brand Refresh', color: 'var(--teal)' },
-  infra:   { name: 'Infra / CI',    color: 'var(--orange)' },
-};
+// Grid: a vertical hour scale at ROW_H px/hour. The window defaults to
+// 06:00–22:00 and widens to include any schedule that falls outside it.
+const ROW_H = 48;
+const DEFAULT_GRID_START = 6, DEFAULT_GRID_END = 22;
+const WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const;
 
-// week: Mon Jun 15 – Sun Jun 21 2026, today = Wed (idx 2)
-const WEEK_DAYS = [
-  { d: 'Mon', n: 15 }, { d: 'Tue', n: 16 }, { d: 'Wed', n: 17 }, { d: 'Thu', n: 18 },
-  { d: 'Fri', n: 19 }, { d: 'Sat', n: 20 }, { d: 'Sun', n: 21 },
-];
-const TODAY_IDX = 2;
-const GRID_START = 6, GRID_END = 22, ROW_H = 48; // hours 6..22
+interface WeekDay { d: string; n: number }
 
-interface SchedRule {
-  id: string;
-  proj: string;
-  name: string;
-  time: number;
-  days: number[];
-  trig: 'clock' | 'webhook';
+// The real current week (Mon..Sun containing today) + which column is today.
+function buildWeek(): { weekDays: WeekDay[]; todayIdx: number } {
+  const now = new Date();
+  const todayIdx = (now.getDay() + 6) % 7; // Mon=0 .. Sun=6
+  const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - todayIdx);
+  const weekDays = WEEKDAY_LABELS.map((d, i) => {
+    const dt = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + i);
+    return { d, n: dt.getDate() };
+  });
+  return { weekDays, todayIdx };
 }
 
-// recurring rules → expand to week occurrences
-const SCHED_RULES: SchedRule[] = [
-  { id: 'r1', proj: 'atlas',   name: 'Dependency audit',  time: 6.0,  days: [0,1,2,3,4,5,6], trig: 'clock' },
-  { id: 'r2', proj: 'content', name: 'Weekly report',     time: 8.0,  days: [0],             trig: 'clock' },
-  { id: 'r3', proj: 'scan',    name: 'Market open scan',  time: 9.5,  days: [0,1,2,3,4],     trig: 'clock' },
-  { id: 'r4', proj: 'infra',   name: 'CI hardening',      time: 11.0, days: [1,3],           trig: 'webhook' },
-  { id: 'r5', proj: 'scan',    name: 'Competitor digest', time: 14.0, days: [0,1,2,3,4,5,6], trig: 'clock' },
-  { id: 'r6', proj: 'content', name: 'Newsletter draft',  time: 16.5, days: [0,2,4],         trig: 'clock' },
-  { id: 'r7', proj: 'atlas',   name: 'Nightly tests',     time: 18.0, days: [0,1,2,3,4,5,6], trig: 'clock' },
-  { id: 'r8', proj: 'brand',   name: 'Asset backup',      time: 21.0, days: [0,1,2,3,4,5,6], trig: 'clock' },
-];
+// 'HH:MM' → hour as a float (9.5 = 09:30); null when empty/unparseable.
+function timeToHour(time: string): number | null {
+  const m = (time || '').match(/(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10), mm = parseInt(m[2], 10);
+  if (h > 23 || mm > 59) return null;
+  return h + mm / 60;
+}
 
-interface SchedEvent extends SchedRule { day: number; missed: boolean }
+/* Which grid columns (Mon=0..Sun=6) a schedule fires on — mirrors the cron
+   runner's cadenceDays() exactly so the calendar matches when jobs actually
+   run. JS getDay() for column `col` is (col+1)%7 (Mon=1..Sat=6, Sun=0). */
+function cadenceColumns(s: Schedule): number[] {
+  const c = (s.cadence || '').toLowerCase().trim();
+  let days: Set<number> | null;
+  if (!c || c === '*' || c === 'daily' || /every\s*day/.test(c)) days = null;
+  else if (c === 'weekly') days = new Set([new Date(s.createdAt).getDay()]);
+  else if (/weekday|mon\s*-\s*fri|monday to friday/.test(c)) days = new Set([1, 2, 3, 4, 5]);
+  else if (/weekend/.test(c)) days = new Set([0, 6]);
+  else {
+    const map: Record<string, number> = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+    const d = Object.keys(map).filter(k => c.includes(k)).map(k => map[k]);
+    days = d.length ? new Set(d) : null;
+  }
+  const cols: number[] = [];
+  for (let col = 0; col < 7; col++) { if (!days || days.has((col + 1) % 7)) cols.push(col); }
+  return cols;
+}
 
-function expandWeek(): SchedEvent[] {
-  const ev: SchedEvent[] = [];
-  SCHED_RULES.forEach(r => r.days.forEach(day => {
-    // market scan on Tue (day1) was missed (machine asleep)
-    const missed = (r.id === 'r3' && day === 1);
-    ev.push({ ...r, day, missed });
-  }));
-  return ev;
+// One placed chip: a live schedule on a specific day-column at a specific hour.
+interface CalOccurrence { schedule: Schedule; col: number; hour: number }
+
+function expandSchedules(schedules: Schedule[]): CalOccurrence[] {
+  const out: CalOccurrence[] = [];
+  schedules.forEach(s => {
+    const hour = timeToHour(s.time);
+    if (hour == null) return; // on-demand / no time → not placeable on the grid
+    cadenceColumns(s).forEach(col => out.push({ schedule: s, col, hour }));
+  });
+  return out;
 }
 
 function fmtHour(h: number): string {
@@ -110,13 +123,27 @@ function fmtTime(t: number): string {
 // Calendar view (sc-calendar)
 // ──────────────────────────────────────────────────────────────────────────
 
-interface CalendarViewProps { nowTime: number; onPick: (e: SchedEvent) => void }
+interface CalendarViewProps { schedules: Schedule[]; projMeta: Record<string, ProjMeta>; onPick: (s: Schedule) => void }
 
-function CalendarView({ nowTime, onPick }: CalendarViewProps) {
-  const events = React.useMemo(expandWeek, []);
+function CalendarView({ schedules, projMeta, onPick }: CalendarViewProps) {
+  const { weekDays, todayIdx } = React.useMemo(buildWeek, []);
+  const occ = React.useMemo(() => expandSchedules(schedules), [schedules]);
+  // widen the visible window to include any schedule outside the 6–22 default
+  const gridStart = React.useMemo(() => Math.max(0, occ.reduce((a, o) => Math.min(a, Math.floor(o.hour)), DEFAULT_GRID_START)), [occ]);
+  const gridEnd = React.useMemo(() => Math.min(23, occ.reduce((a, o) => Math.max(a, Math.ceil(o.hour)), DEFAULT_GRID_END)), [occ]);
   const hours: number[] = [];
-  for (let h = GRID_START; h <= GRID_END; h++) hours.push(h);
-  const nowTop = (nowTime - GRID_START) * ROW_H;
+  for (let h = gridStart; h <= gridEnd; h++) hours.push(h);
+
+  // real wall-clock now-line, ticked every 30s
+  const [nowHour, setNowHour] = React.useState(() => { const n = new Date(); return n.getHours() + n.getMinutes() / 60; });
+  React.useEffect(() => {
+    const tick = () => { const n = new Date(); setNowHour(n.getHours() + n.getMinutes() / 60); };
+    const t = setInterval(tick, 30000);
+    return () => clearInterval(t);
+  }, []);
+  const nowVisible = nowHour >= gridStart && nowHour <= gridEnd;
+  const nowTop = (nowHour - gridStart) * ROW_H;
+  const fallback: ProjMeta = { name: 'Workspace', color: 'var(--ink-tertiary)' };
 
   return (
     <div style={{ background: 'var(--bg-elevated)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden', boxShadow: 'var(--card-shadow)',
@@ -124,8 +151,8 @@ function CalendarView({ nowTime, onPick }: CalendarViewProps) {
       {/* day header row */}
       <div style={{ display: 'grid', gridTemplateColumns: `56px repeat(7, 1fr)`, borderBottom: '0.5px solid var(--separator)', flexShrink: 0 }}>
         <div style={{ borderRight: '0.5px solid var(--separator)' }} />
-        {WEEK_DAYS.map((d, i) => {
-          const today = i === TODAY_IDX;
+        {weekDays.map((d, i) => {
+          const today = i === todayIdx;
           return (
             <div key={i} style={{ padding: '10px 0', textAlign: 'center', borderRight: i < 6 ? '0.5px solid var(--separator)' : 'none' }}>
               <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: today ? 'var(--red)' : 'var(--ink-tertiary)', marginBottom: 6 }}>{d.d}</div>
@@ -137,49 +164,62 @@ function CalendarView({ nowTime, onPick }: CalendarViewProps) {
       </div>
 
       {/* scroll grid */}
-      <div style={{ flex: 1, overflowY: 'auto' }} className="cal-scroll">
+      <div style={{ flex: 1, overflowY: 'auto', position: 'relative' }} className="cal-scroll">
         <div style={{ display: 'grid', gridTemplateColumns: `56px repeat(7, 1fr)`, position: 'relative' }}>
           {/* hour gutter */}
           <div style={{ borderRight: '0.5px solid var(--separator)' }}>
             {hours.map(h => (
               <div key={h} style={{ height: ROW_H, position: 'relative' }}>
-                <span style={{ position: 'absolute', top: -7, right: 8, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{h === GRID_START ? '' : fmtHour(h)}</span>
+                <span style={{ position: 'absolute', top: -7, right: 8, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{h === gridStart ? '' : fmtHour(h)}</span>
               </div>
             ))}
           </div>
 
           {/* day columns */}
-          {WEEK_DAYS.map((d, di) => (
+          {weekDays.map((d, di) => (
             <div key={di} style={{ position: 'relative', borderRight: di < 6 ? '0.5px solid var(--separator)' : 'none',
-              background: di === TODAY_IDX ? 'color-mix(in srgb, var(--red) 3%, transparent)' : 'transparent' }}>
+              background: di === todayIdx ? 'color-mix(in srgb, var(--red) 3%, transparent)' : 'transparent' }}>
               {/* hour lines */}
               {hours.map(h => <div key={h} style={{ height: ROW_H, borderBottom: '0.5px solid var(--separator)' }} />)}
-              {/* events */}
-              {events.filter(e => e.day === di).map((e, i) => {
-                const p = SCHED_PROJ[e.proj];
-                const top = (e.time - GRID_START) * ROW_H;
+              {/* live schedule chips */}
+              {occ.filter(o => o.col === di).map((o, i) => {
+                const p = (o.schedule.projectId && projMeta[o.schedule.projectId]) || fallback;
+                const top = (o.hour - gridStart) * ROW_H;
+                const dim = !o.schedule.enabled;
                 return (
-                  <button key={i} onClick={() => onPick(e)} className="sched-chip" style={{
+                  <button key={o.schedule.id + ':' + i} onClick={() => onPick(o.schedule)} className="sched-chip" style={{
                     position: 'absolute', top: top + 2, left: 3, right: 3, height: 30, borderRadius: 7, display: 'flex', alignItems: 'center', gap: 5, padding: '0 7px',
-                    background: e.missed ? 'transparent' : `color-mix(in srgb, ${p.color} 14%, var(--bg-elevated))`,
-                    border: e.missed ? '1.5px dashed var(--orange)' : `1px solid color-mix(in srgb, ${p.color} 35%, transparent)`,
-                    borderLeft: e.missed ? '1.5px dashed var(--orange)' : `3px solid ${p.color}`, textAlign: 'left', overflow: 'hidden' }}
-                    title={e.missed ? 'Missed — fired on wake (policy: fire-now)' : `${e.name} · ${fmtTime(e.time)}`}>
-                    <Icon name={e.missed ? 'alert' : (e.trig === 'webhook' ? 'bolt' : 'clock')} size={11} style={{ color: e.missed ? 'var(--orange)' : p.color, flexShrink: 0 }} />
-                    <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-caption)/1.1 var(--font-text)', color: e.missed ? 'var(--orange)' : 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{e.name}</span>
+                    background: `color-mix(in srgb, ${p.color} 14%, var(--bg-elevated))`,
+                    border: `1px solid color-mix(in srgb, ${p.color} 35%, transparent)`,
+                    borderLeft: `3px solid ${p.color}`, textAlign: 'left', overflow: 'hidden', opacity: dim ? 0.45 : 1 }}
+                    title={`${o.schedule.title}${dim ? ' · paused' : ''} · ${fmtTime(o.hour)}`}>
+                    <Icon name="clock" size={11} style={{ color: p.color, flexShrink: 0 }} />
+                    <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-caption)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{o.schedule.title}</span>
                   </button>
                 );
               })}
             </div>
           ))}
 
-          {/* red now-line across grid (today) */}
-          <div className="cal-nowline" style={{ position: 'absolute', left: 56, right: 0, top: nowTop, height: 0, zIndex: 5, pointerEvents: 'none' }}>
-            <div style={{ position: 'relative', borderTop: '1.5px solid var(--red)' }}>
-              <span style={{ position: 'absolute', left: `calc(${TODAY_IDX} / 7 * 100%)`, top: -4, width: 9, height: 9, borderRadius: '50%', background: 'var(--red)' }} />
+          {/* real red now-line across grid */}
+          {nowVisible && (
+            <div className="cal-nowline" style={{ position: 'absolute', left: 56, right: 0, top: nowTop, height: 0, zIndex: 5, pointerEvents: 'none' }}>
+              <div style={{ position: 'relative', borderTop: '1.5px solid var(--red)' }}>
+                <span style={{ position: 'absolute', left: `calc(${todayIdx} / 7 * 100%)`, top: -4, width: 9, height: 9, borderRadius: '50%', background: 'var(--red)' }} />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* honest empty state — no schedules this week */}
+        {occ.length === 0 && (
+          <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', pointerEvents: 'none', padding: 24 }}>
+            <div style={{ textAlign: 'center', maxWidth: 320 }}>
+              <div style={{ font: '600 var(--fs-callout)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>Nothing scheduled this week</div>
+              <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 4 }}>Create a schedule and it appears here on its day &amp; time.</div>
             </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );
@@ -332,36 +372,24 @@ function Stepper({ value, set, min = 0, max = 10, suffix }: StepperProps) {
   );
 }
 
-function SheetPick({ icon, label, value, tint, last }: { icon: IconName; label: string; value: string; tint: string; last?: boolean }) {
-  return (
-    <button className="sheet-pick" style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', minHeight: 52, padding: '10px 14px', textAlign: 'left',
-      borderBottom: last ? 'none' : '0.5px solid var(--separator)' }}>
-      <span style={{ width: 30, height: 30, borderRadius: 8, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${tint} 14%, transparent)`, color: tint }}><Icon name={icon} size={16} /></span>
-      <span style={{ flex: 1 }}>
-        <span style={{ display: 'block', font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginBottom: 3 }}>{label}</span>
-        <span style={{ display: 'block', font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink)' }}>{value}</span>
-      </span>
-      <Icon name="chevronDown" size={16} style={{ color: 'var(--ink-tertiary)' }} />
-    </button>
-  );
-}
-
 interface ScheduleSheetProps {
   open: boolean;
   onClose: () => void;
-  onSave: (data: { title: string; time: string; cadence: string }) => void;
-  initial: SchedEvent | SchedRow | null;
+  onSave: (data: { title: string; time: string; cadence: string; projectId?: string }) => void;
+  initial: SchedRow | null;
+  projects: Project[];
 }
 
-function ScheduleSheet({ open, onClose, onSave }: ScheduleSheetProps) {
+function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) {
   const [when, setWhen] = React.useState('every weekday 9am');
+  const [projectId, setProjectId] = React.useState('');
   const [advanced, setAdvanced] = React.useState(false);
   const [misfire, setMisfire] = React.useState('fire');
   const [retries, setRetries] = React.useState(2);
   const [backoff, setBackoff] = React.useState('Exponential');
   const [conc, setConc] = React.useState(1);
   const [cap, setCap] = React.useState<string | number>(0.5);
-  React.useEffect(() => { if (open) { setWhen('every weekday 9am'); setAdvanced(false); setMisfire('fire'); setRetries(2); setConc(1); setCap(0.5); } }, [open]);
+  React.useEffect(() => { if (open) { setWhen('every weekday 9am'); setProjectId(''); setAdvanced(false); setMisfire('fire'); setRetries(2); setConc(1); setCap(0.5); } }, [open]);
   if (!open) return null;
 
   const parsed = parseWhen(when);
@@ -389,12 +417,20 @@ function ScheduleSheet({ open, onClose, onSave }: ScheduleSheetProps) {
         </div>
 
         <div style={{ padding: 20, overflowY: 'auto' }}>
-          {/* 1 project + template */}
-          <SheetSection n="1" title="Project & job">
-            <div style={{ background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)', overflow: 'hidden' }}>
-              <SheetPick icon="layers" label="Project" value="Atlas API" tint="var(--blue)" />
-              <SheetPick icon="terminal" label="Job template" value="Nightly tests" tint="var(--purple)" last />
-            </div>
+          {/* 1 project */}
+          <SheetSection n="1" title="Project">
+            <label className="sheet-pick" style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', minHeight: 52, padding: '10px 14px',
+              background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)' }}>
+              <span style={{ width: 30, height: 30, borderRadius: 8, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 14%, transparent)', color: 'var(--blue)' }}><Icon name="layers" size={16} /></span>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginBottom: 3 }}>Project</span>
+                <select value={projectId} onChange={e => setProjectId(e.target.value)} className="sel" style={{ width: '100%', border: 'none', outline: 'none', background: 'transparent', font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink)' }}>
+                  <option value="">No project (workspace)</option>
+                  {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+              </span>
+              <Icon name="chevronDown" size={16} style={{ color: 'var(--ink-tertiary)' }} />
+            </label>
           </SheetSection>
 
           {/* 2 when */}
@@ -406,7 +442,7 @@ function ScheduleSheet({ open, onClose, onSave }: ScheduleSheetProps) {
             </div>
             <div className="parse-line" key={parsed.summary} style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 9, padding: '0 4px' }}>
               <Icon name="check" size={14} stroke={2.6} style={{ color: 'var(--green)', flexShrink: 0 }} />
-              <span style={{ font: '500 var(--fs-footnote)/1.3 var(--font-mono)', whiteSpace: 'nowrap', color: 'var(--ink-secondary)' }}>{parsed.summary} · next: 17 Jun</span>
+              <span style={{ font: '500 var(--fs-footnote)/1.3 var(--font-mono)', whiteSpace: 'nowrap', color: 'var(--ink-secondary)' }}>{parsed.summary}</span>
             </div>
             <button onClick={() => setAdvanced(a => !a)} className="link-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, marginTop: 10, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--blue)' }}>
               <Icon name="chevronRight" size={13} style={{ transform: advanced ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} /> Advanced cron
@@ -462,7 +498,7 @@ function ScheduleSheet({ open, onClose, onSave }: ScheduleSheetProps) {
             ≈ <b style={{ color: 'var(--ink)', fontWeight: 600 }}>$0.18</b>/run · ≈ <b style={{ color: 'var(--ink)', fontWeight: 600 }}>${monthly}</b>/mo
           </div>
           <button onClick={onClose} style={{ height: 40, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
-          <button onClick={() => onSave({ title: parsed.summary, time: parsed.time, cadence: parsed.label })} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Save schedule</button>
+          <button onClick={() => onSave({ title: parsed.summary, time: parsed.time, cadence: parsed.label, projectId: projectId || undefined })} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Save schedule</button>
         </div>
       </div>
     </div>
@@ -613,9 +649,8 @@ function nextLine(nextRun: number | null): string {
 
 export default function Scheduler() {
   const [view, setView] = React.useState('calendar');
-  const [nowTime, setNowTime] = React.useState(14.62); // 14:37
   const [sheetOpen, setSheetOpen] = React.useState(false);
-  const [editing, setEditing] = React.useState<SchedEvent | SchedRow | null>(null);
+  const [editing, setEditing] = React.useState<SchedRow | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const [schedules, setSchedules] = React.useState<Schedule[]>([]);
   const [projects, setProjects] = React.useState<Project[]>([]);
@@ -679,7 +714,7 @@ export default function Scheduler() {
     }
   }, [schedules]);
 
-  const onCreateSchedule = React.useCallback(async (data: { title: string; time: string; cadence: string }) => {
+  const onCreateSchedule = React.useCallback(async (data: { title: string; time: string; cadence: string; projectId?: string }) => {
     setSheetOpen(false);
     try {
       await api.createSchedule(data);
@@ -687,18 +722,14 @@ export default function Scheduler() {
     } catch { /* fail soft */ }
   }, [loadSchedules]);
 
-  // live now-line
-  React.useEffect(() => {
-    const t = setInterval(() => setNowTime(n => (n < 21.9 ? +(n + 0.0025).toFixed(4) : n)), 1500);
-    return () => clearInterval(t);
-  }, []);
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   }, []);
 
   const openNew = () => { setEditing(null); setSheetOpen(true); };
-  const openEdit = (s: SchedEvent | SchedRow) => { setEditing(s); setSheetOpen(true); };
+  const openEdit = (s: SchedRow) => { setEditing(s); setSheetOpen(true); };
+  const openFromCalendar = () => { setEditing(null); setSheetOpen(true); };
 
   return (
     <AppShell active="scheduler" onSearch={() => setPaletteOpen(true)}>
@@ -726,12 +757,12 @@ export default function Scheduler() {
         {/* body */}
         <div style={{ flex: 1, minHeight: 0, overflowY: view === 'list' ? 'auto' : 'hidden', paddingBottom: view === 'list' ? 28 : 0 }}>
           {view === 'calendar'
-            ? <CalendarView nowTime={nowTime} onPick={openEdit} />
+            ? <CalendarView schedules={schedules} projMeta={projMeta} onPick={openFromCalendar} />
             : <ListView onPick={openEdit} rows={rows} projMeta={projMeta} onToggle={onToggle} onDelete={onDelete} />}
         </div>
       </div>
 
-      <ScheduleSheet open={sheetOpen} onClose={() => setSheetOpen(false)} onSave={onCreateSchedule} initial={editing} />
+      <ScheduleSheet open={sheetOpen} onClose={() => setSheetOpen(false)} onSave={onCreateSchedule} initial={editing} projects={projects} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>
   );
