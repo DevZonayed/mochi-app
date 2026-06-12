@@ -113,6 +113,11 @@ const PAGE_CSS = `
   .q-row .q-act { opacity: 0; transition: opacity 120ms ease; }
   .q-row:hover .q-act, .q-row.q-sel .q-act { opacity: 1; }
   .q-row.q-sel { background: color-mix(in srgb, var(--blue) 9%, transparent) !important; }
+  .q-row .q-grip { opacity: 0; transition: opacity 120ms ease; cursor: grab; }
+  .q-row:hover .q-grip, .q-row.q-sel .q-grip { opacity: 1; }
+  .q-row.q-dragging { opacity: 0.35; }
+  .q-row.q-drop-above { box-shadow: inset 0 2px 0 var(--blue); }
+  .q-row.q-drop-below { box-shadow: inset 0 -2px 0 var(--blue); }
   .kbd { display: inline-flex; align-items: center; height: 16px; padding: 0 5px; border-radius: 5px; background: var(--fill-secondary);
     border: 0.5px solid var(--separator); font: 600 10px/1 var(--font-mono); color: var(--ink-secondary); }
   .send-fab { transition: transform 160ms cubic-bezier(.32,.72,0,1), background 160ms ease, box-shadow 160ms ease; }
@@ -1478,20 +1483,52 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   );
 });
 
-/* Collapsible "N queued messages" panel — keyboard-navigable, with row actions. */
-function QueuePanel({ queue, onSendNow, onRemove, onEdit }: { queue: string[]; onSendNow: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void }) {
+/* Collapsible "N queued messages" panel — keyboard-navigable, with row actions.
+   Rows are drag-and-droppable (and ⌥↑/⌥↓ move the selected one) so the operator
+   can prioritize which task runs next: the drainer always fires queue[0]. */
+function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: string[]; onSendNow: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
   const [collapsed, setCollapsed] = React.useState(false);
   const [sel, setSel] = React.useState(-1);
+  const [dragIdx, setDragIdx] = React.useState(-1);
+  const [dropSlot, setDropSlot] = React.useState(-1); // insertion slot 0..queue.length
+  // Refs mirror the drag/selection state for the event logic: dragover/drop can
+  // fire before React commits the dragstart state, so guards must not lag.
+  const dragRef = React.useRef(-1);
+  const slotRef = React.useRef(-1);
+  const selRef = React.useRef(-1);
   const ref = React.useRef<HTMLDivElement>(null);
-  React.useEffect(() => { if (sel >= queue.length) setSel(queue.length - 1); }, [queue.length, sel]);
+  React.useEffect(() => { if (sel >= queue.length) { setSel(queue.length - 1); selRef.current = queue.length - 1; } }, [queue.length, sel]);
+
+  const select = (i: number) => { selRef.current = i; setSel(i); };
+  const move = (from: number, to: number) => {
+    if (from < 0 || to < 0 || to >= queue.length || from === to) return;
+    onReorder(from, to);
+    select(to);
+  };
 
   const onKey = (e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => Math.min(queue.length - 1, s + 1)); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => Math.max(0, (s < 0 ? queue.length : s) - 1)); }
-    else if (e.key === 'Enter') { e.preventDefault(); if (sel >= 0) onSendNow(sel); }
-    else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); if (sel >= 0) onRemove(sel); }
-    else if (e.key.toLowerCase() === 'e') { e.preventDefault(); if (sel >= 0) onEdit(sel); }
-    else if (e.key === 'Escape') { e.preventDefault(); setSel(-1); ref.current?.blur(); }
+    const s = selRef.current;
+    if (e.altKey && e.key === 'ArrowUp') { e.preventDefault(); if (s > 0) move(s, s - 1); }
+    else if (e.altKey && e.key === 'ArrowDown') { e.preventDefault(); if (s >= 0) move(s, s + 1); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); select(Math.min(queue.length - 1, s + 1)); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); select(Math.max(0, (s < 0 ? queue.length : s) - 1)); }
+    else if (e.key === 'Enter') { e.preventDefault(); if (s >= 0) onSendNow(s); }
+    else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); if (s >= 0) onRemove(s); }
+    else if (e.key.toLowerCase() === 'e') { e.preventDefault(); if (s >= 0) onEdit(s); }
+    else if (e.key === 'Escape') { e.preventDefault(); select(-1); ref.current?.blur(); }
+  };
+
+  const startDrag = (i: number) => { dragRef.current = i; setDragIdx(i); select(i); };
+  const overSlot = (slot: number) => { slotRef.current = slot; setDropSlot(slot); };
+  const endDrag = () => { dragRef.current = -1; slotRef.current = -1; setDragIdx(-1); setDropSlot(-1); };
+  const doDrop = () => {
+    const from = dragRef.current, slot = slotRef.current;
+    if (from >= 0 && slot >= 0) {
+      let to = slot;
+      if (to > from) to -= 1; // removing the dragged row shifts later slots left
+      move(from, to);
+    }
+    endDrag();
   };
 
   const QBtn = ({ title, onClick, color, children }: { title: string; onClick: () => void; color: string; children: React.ReactNode }) => (
@@ -1510,21 +1547,36 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit }: { queue: string[]; o
       {!collapsed && (
         <>
           <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 168, overflowY: 'auto' }}>
-            {queue.map((q, i) => (
-              <div key={i} className={`q-row${sel === i ? ' q-sel' : ''}`} onClick={() => setSel(i)} onDoubleClick={() => onEdit(i)}
-                style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 10px 8px 12px', cursor: 'default' }}>
-                <span style={{ width: 18, height: 18, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 13%, transparent)', color: 'var(--purple)', font: '600 10px/1 var(--font-mono)' }}>{i + 1}</span>
-                <span style={{ flex: 1, minWidth: 0, font: '400 13px/1.35 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{q}</span>
-                <span className="q-act" style={{ display: 'inline-flex', gap: 2 }}>
-                  <QBtn title="Edit (move back to the box)" onClick={() => onEdit(i)} color="var(--ink-tertiary)"><Icon name="arrowLeft" size={13} stroke={2.2} /></QBtn>
-                  <QBtn title="Remove" onClick={() => onRemove(i)} color="var(--ink-tertiary)"><Icon name="x" size={13} stroke={2.4} /></QBtn>
-                  <QBtn title="Send now — interrupt and steer" onClick={() => onSendNow(i)} color="var(--blue)"><Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} /></QBtn>
-                </span>
-              </div>
-            ))}
+            {queue.map((q, i) => {
+              const dropCls = dropSlot === i ? ' q-drop-above' : (dropSlot === i + 1 && i === queue.length - 1) ? ' q-drop-below' : '';
+              return (
+                <div key={i} className={`q-row${sel === i ? ' q-sel' : ''}${dragIdx === i ? ' q-dragging' : ''}${dropCls}`}
+                  onClick={() => select(i)} onDoubleClick={() => onEdit(i)}
+                  draggable
+                  onDragStart={e => { startDrag(i); if (e.dataTransfer) { e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', String(i)); } catch { /* sandbox */ } } }}
+                  onDragEnd={endDrag}
+                  onDragOver={e => { if (dragRef.current < 0) return; e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'; const r = e.currentTarget.getBoundingClientRect(); overSlot(e.clientY < r.top + r.height / 2 ? i : i + 1); }}
+                  onDrop={e => { e.preventDefault(); doDrop(); }}
+                  style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '8px 10px 8px 8px', cursor: 'default' }}>
+                  <span className="q-grip" title="Drag to reorder" style={{ flexShrink: 0, display: 'grid', gridTemplateColumns: 'repeat(2, 3px)', gap: '2.5px 2px', padding: '3px 1px', color: 'var(--ink-tertiary)' }}>
+                    {Array.from({ length: 6 }, (_, d) => <span key={d} style={{ width: 2.5, height: 2.5, borderRadius: 2, background: 'currentColor' }} />)}
+                  </span>
+                  <span style={{ width: 18, height: 18, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 13%, transparent)', color: 'var(--purple)', font: '600 10px/1 var(--font-mono)' }}>{i + 1}</span>
+                  <span style={{ flex: 1, minWidth: 0, font: '400 13px/1.35 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{q}</span>
+                  <span className="q-act" style={{ display: 'inline-flex', gap: 2 }}>
+                    <QBtn title="Move up — runs sooner" onClick={() => move(i, i - 1)} color="var(--ink-tertiary)"><Icon name="chevronDown" size={13} style={{ transform: 'rotate(180deg)' }} /></QBtn>
+                    <QBtn title="Move down — runs later" onClick={() => move(i, i + 1)} color="var(--ink-tertiary)"><Icon name="chevronDown" size={13} /></QBtn>
+                    <QBtn title="Edit (move back to the box)" onClick={() => onEdit(i)} color="var(--ink-tertiary)"><Icon name="arrowLeft" size={13} stroke={2.2} /></QBtn>
+                    <QBtn title="Remove" onClick={() => onRemove(i)} color="var(--ink-tertiary)"><Icon name="x" size={13} stroke={2.4} /></QBtn>
+                    <QBtn title="Send now — interrupt and steer" onClick={() => onSendNow(i)} color="var(--blue)"><Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} /></QBtn>
+                  </span>
+                </div>
+              );
+            })}
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '7px 12px', borderTop: '0.5px solid var(--separator)', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">↑↓</span> navigate</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⌥↑↓</span> reorder</span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">E</span> edit</span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⌫</span> delete</span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⏎</span> send now</span>
@@ -1695,6 +1747,14 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   }, [lastTurn, sendRaw]);
 
   const removeFromQueue = (i: number) => setQueue(q => q.filter((_, j) => j !== i));
+  // Reorder = reprioritize: the drainer always fires queue[0] next.
+  const moveInQueue = (from: number, to: number) => setQueue(q => {
+    if (from === to || from < 0 || to < 0 || from >= q.length || to >= q.length) return q;
+    const next = q.slice();
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    return next;
+  });
   const sendQueuedNow = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); void sendNow(t); };
   const editQueued = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); setText(t); taRef.current?.focus(); requestAnimationFrame(() => autoGrow()); };
 
@@ -1853,7 +1913,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
             )}
             {/* queued prompts — collapsible panel; runs in order after the current turn */}
             {queue.length > 0 && (
-              <QueuePanel queue={queue} onSendNow={sendQueuedNow} onRemove={removeFromQueue} onEdit={editQueued} />
+              <QueuePanel queue={queue} onSendNow={sendQueuedNow} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
             )}
             <div className={`composer-card composer-eff${effort === 'MAX' ? ' composer-ultra' : ''}`}
               style={{ borderRadius: 18, border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)',
