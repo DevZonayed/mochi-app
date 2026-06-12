@@ -64,8 +64,14 @@ const styles = `
    Data model + timeline (swim-lane) view  [from jm-timeline.jsx]
    ──────────────────────────────────────────────────────────────────────── */
 
-// time axis in "minutes": now sits at NOW_MIN; axis spans 0..AXIS_MAX
-const NOW_MIN = 60, AXIS_MAX = 96, PX = 10.6, LANE_LABEL = 158, LANE_H = 60, TRACK_W = AXIS_MAX * PX;
+/* Real time axis. The window spans the earliest job start → max(now, latest
+   end); capsules are positioned by their REAL createdAt/updatedAt and packed
+   into stacked sub-rows per lane so they never overlap, no matter how many
+   jobs cluster at the same moment. */
+const LANE_LABEL = 158, TRACK_W = 1000, LANE_MIN_H = 60;
+const CAP_H = 38, CAP_GAP = 6, LANE_PAD = 11; // capsule height, vertical gap between sub-rows, lane padding
+const MIN_CAP_W = 96, CAP_GAP_X = 8;          // min capsule width + min horizontal gap used by the packer
+const MINUTE = 60_000, HOUR = 3_600_000;
 
 type Status = 'running' | 'gated' | 'queued' | 'failed' | 'done' | 'scheduled' | 'cancelled';
 
@@ -87,14 +93,18 @@ interface Job {
   lane: string;
   name: string;
   status: Status;
-  start: number;
-  end?: number;
-  dur?: number;
+  startMs: number;        // real createdAt
+  endMs: number | null;   // real updatedAt; null = still running (capsule extends to now)
   cost: number;
+  tokens: number;
   shape: string;
   trigger: string;
   effort: string;
   autonomy: string;
+  engine: string;
+  model: string;
+  sessionId?: string;
+  output: string;
   last: string;
   _liveCost?: number;
 }
@@ -110,10 +120,28 @@ const STATUS_META: Record<Status, { label: string; tint: string }> = {
   cancelled: { label: 'Cancelled', tint: 'var(--ink-tertiary)' },
 };
 
-function axisLabel(min: number): string {
-  const d = min - NOW_MIN;
-  if (d === 0) return 'now';
-  return (d > 0 ? '+' : '') + d + 'm';
+/* Human label for an absolute timestamp relative to `now`. */
+function axisLabel(ts: number, now: number): string {
+  const d = ts - now;
+  if (Math.abs(d) < 45_000) return 'now';
+  const sign = d < 0 ? '-' : '+';
+  const a = Math.abs(d);
+  if (a < HOUR) return sign + Math.round(a / MINUTE) + 'm';
+  const h = Math.floor(a / HOUR), m = Math.round((a % HOUR) / MINUTE);
+  return sign + h + 'h' + (m ? ' ' + m + 'm' : '');
+}
+
+/* Compact duration / "ago" formatters shared by the table + inspector. */
+function fmtDur(ms: number): string {
+  if (ms < MINUTE) return Math.max(1, Math.round(ms / 1000)) + 's';
+  if (ms < HOUR) { const m = Math.floor(ms / MINUTE), s = Math.round((ms % MINUTE) / 1000); return m + 'm' + (s ? ' ' + s + 's' : ''); }
+  const h = Math.floor(ms / HOUR), m = Math.round((ms % HOUR) / MINUTE);
+  return h + 'h' + (m ? ' ' + m + 'm' : '');
+}
+function fmtAgo(ms: number): string {
+  if (ms < 0) return 'in ' + fmtDur(-ms);
+  if (ms < MINUTE) return 'just now';
+  return fmtDur(ms) + ' ago';
 }
 
 /* ── live-API → local timeline Job adapter ──
@@ -133,39 +161,25 @@ const SHAPE_BY_EFFORT: Record<string, string> = { fast: 'single', balanced: 'fan
 function mapApiJob(j: ApiJob): Job {
   const status = statusFromApi(j.status);
   const effort = j.effort.toUpperCase();
-  const last = j.error ?? (j.phase || j.stage);
-  // synthetic axis placement (minutes): running spans up to now; done sits in the
-  // past; scheduled/pending sits in the future; failed ends a touch before now.
-  let start: number;
-  let end: number | undefined;
-  let dur: number | undefined;
-  if (status === 'running') {
-    start = Math.max(0, NOW_MIN - 16 - Math.round((1 - Math.min(1, j.progress)) * 8));
-    end = NOW_MIN;
-  } else if (status === 'scheduled') {
-    start = NOW_MIN + 12;
-    dur = 8;
-  } else if (status === 'failed') {
-    start = NOW_MIN - 13;
-    end = NOW_MIN - 11;
-  } else {
-    // done
-    start = NOW_MIN - 32;
-    end = NOW_MIN - 19;
-  }
+  const last = j.error ?? (j.phase || j.stage) ?? '';
   return {
     id: j.id,
     lane: j.projectId,
     name: j.title,
     status,
-    start,
-    end,
-    dur,
+    // real placement: start = when it was created, end = last update (null while running)
+    startMs: j.createdAt,
+    endMs: status === 'running' ? null : j.updatedAt,
     cost: j.cost,
+    tokens: j.tokens,
     shape: SHAPE_BY_EFFORT[j.effort] ?? 'single',
     trigger: 'hand',
     effort: (effort in EFFORT_TINT ? effort : 'BALANCED'),
     autonomy: 'Gated',
+    engine: j.engine ?? 'claude',
+    model: j.model ?? '',
+    sessionId: j.sessionId,
+    output: j.output ?? '',
     last,
     _liveCost: j.cost,
   };
@@ -173,21 +187,19 @@ function mapApiJob(j: ApiJob): Job {
 
 interface CapsuleProps {
   job: Job;
-  nowMin: number;
+  left: number;
+  width: number;
+  top: number;
   onClick: (job: Job) => void;
   selected: boolean;
 }
 
-function Capsule({ job, nowMin, onClick, selected }: CapsuleProps) {
-  const end = job.status === 'running' ? nowMin : (job.end != null ? job.end : job.start + (job.dur ?? 0));
-  const left = job.start * PX;
-  const width = Math.max((end - job.start) * PX, 64);
-  const m = STATUS_META[job.status];
+function Capsule({ job, left, width, top, onClick, selected }: CapsuleProps) {
   const cost = job.status === 'running' ? job._liveCost ?? job.cost : job.cost;
 
-  const base: React.CSSProperties = { position: 'absolute', left, width, top: 10, height: 40, borderRadius: 11,
+  const base: React.CSSProperties = { position: 'absolute', left, width, top, height: CAP_H, borderRadius: 11,
     display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px', cursor: 'pointer', overflow: 'hidden',
-    boxSizing: 'border-box', transition: 'width 800ms linear, box-shadow 140ms ease, transform 140ms ease' };
+    boxSizing: 'border-box', transition: 'width 600ms linear, box-shadow 140ms ease, transform 140ms ease' };
   const fills: Record<Status, React.CSSProperties> = {
     running: { background: 'linear-gradient(120deg, color-mix(in srgb, var(--purple) 26%, var(--bg-elevated)), color-mix(in srgb, var(--purple) 14%, var(--bg-elevated)))',
       border: '1px solid color-mix(in srgb, var(--purple) 45%, transparent)', color: 'var(--ink)' },
@@ -218,60 +230,112 @@ function Capsule({ job, nowMin, onClick, selected }: CapsuleProps) {
 interface TimelineProps {
   jobs: Job[];
   lanes: Lane[];
-  nowMin: number;
+  nowMs: number;
   onSelect: (job: Job) => void;
   selectedId: string | null;
 }
 
-function Timeline({ jobs, lanes, nowMin, onSelect, selectedId }: TimelineProps) {
+/* Greedy interval packing: place each job in the first sub-row whose last
+   capsule's right edge clears this one's left edge (+ a gap). Returns each
+   job's pixel box and the number of sub-rows the lane needs. */
+function packLane(laneJobs: Job[], x: (t: number) => number, nowMs: number) {
+  const sorted = [...laneJobs].sort((a, b) => a.startMs - b.startMs);
+  const rowEdges: number[] = []; // right px edge of the last capsule per row
+  const placed = sorted.map(j => {
+    const left = x(j.startMs);
+    const width = Math.max(MIN_CAP_W, x(j.endMs ?? nowMs) - left);
+    let r = rowEdges.findIndex(edge => left >= edge + CAP_GAP_X);
+    if (r === -1) { r = rowEdges.length; }
+    rowEdges[r] = left + width;
+    return { job: j, left, width, top: LANE_PAD + r * (CAP_H + CAP_GAP) };
+  });
+  return { placed, rows: Math.max(1, rowEdges.length) };
+}
+
+function Timeline({ jobs, lanes, nowMs, onSelect, selectedId }: TimelineProps) {
+  // Open scrolled to "now" (the right edge) — active work matters most; the
+  // user can scroll left through history. One-shot so it never fights scrolling.
+  const scrollRef = React.useRef<HTMLDivElement>(null);
+  const didScroll = React.useRef(false);
+  React.useEffect(() => {
+    if (!didScroll.current && scrollRef.current && jobs.length) {
+      scrollRef.current.scrollLeft = scrollRef.current.scrollWidth;
+      didScroll.current = true;
+    }
+  }, [jobs.length]);
+
+  // real time window across all shown jobs (+ now), floored + padded
+  const starts = jobs.map(j => j.startMs);
+  const ends = jobs.map(j => j.endMs ?? nowMs);
+  let t0 = starts.length ? Math.min(...starts) : nowMs - HOUR;
+  let t1 = Math.max(nowMs, ...(ends.length ? ends : [nowMs]));
+  if (t1 - t0 < 5 * MINUTE) t0 = t1 - 5 * MINUTE; // keep short single runs from being hairlines
+  const pad = (t1 - t0) * 0.04;
+  t0 -= pad; t1 += pad;
+  const span = (t1 - t0) || 1;
+  const x = (t: number) => ((t - t0) / span) * TRACK_W;
+
+  const TICKS = 6;
   const ticks: number[] = [];
-  for (let m = 0; m <= AXIS_MAX; m += 12) ticks.push(m);
+  for (let i = 0; i <= TICKS; i++) ticks.push(t0 + (span * i) / TICKS);
+
+  const laneLayout = lanes.map(lane => {
+    const { placed, rows } = packLane(jobs.filter(j => j.lane === lane.id), x, nowMs);
+    const height = Math.max(LANE_MIN_H, LANE_PAD * 2 + rows * CAP_H + (rows - 1) * CAP_GAP);
+    return { lane, placed, height };
+  });
+
+  const nowX = x(nowMs);
   return (
     <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden',
       backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
       {/* scroll region */}
-      <div style={{ overflowX: 'auto', overflowY: 'hidden' }} className="tl-scroll">
+      <div ref={scrollRef} style={{ overflowX: 'auto', overflowY: 'hidden' }} className="tl-scroll">
         <div style={{ minWidth: LANE_LABEL + TRACK_W, position: 'relative' }}>
           {/* axis header */}
           <div style={{ display: 'flex', height: 34, borderBottom: '0.5px solid var(--separator)', position: 'sticky', top: 0, background: 'var(--bg-grouped)', zIndex: 3 }}>
             <div style={{ width: LANE_LABEL, flexShrink: 0, borderRight: '0.5px solid var(--separator)', display: 'flex', alignItems: 'center', padding: '0 14px',
               font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Project</div>
             <div style={{ position: 'relative', width: TRACK_W, flexShrink: 0 }}>
-              {ticks.map(m => (
-                <span key={m} style={{ position: 'absolute', left: m * PX, top: 0, height: '100%', display: 'flex', alignItems: 'center',
-                  transform: 'translateX(-50%)', font: `${m === NOW_MIN ? 700 : 500} var(--fs-caption)/1 var(--font-mono)`,
-                  color: m === NOW_MIN ? 'var(--blue)' : 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{axisLabel(m)}</span>
-              ))}
+              {ticks.map((t, i) => {
+                const near = Math.abs(t - nowMs) < span / TICKS / 2;
+                return (
+                  <span key={i} style={{ position: 'absolute', left: x(t), top: 0, height: '100%', display: 'flex', alignItems: 'center',
+                    transform: 'translateX(-50%)', font: `${near ? 700 : 500} var(--fs-caption)/1 var(--font-mono)`,
+                    color: near ? 'var(--blue)' : 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{axisLabel(t, nowMs)}</span>
+                );
+              })}
             </div>
           </div>
 
           {/* lanes */}
           <div style={{ position: 'relative' }}>
             {/* now-line spanning all lanes */}
-            <div className="now-line" style={{ position: 'absolute', left: LANE_LABEL + nowMin * PX, top: 0, bottom: 0, width: 2, zIndex: 2,
-              background: 'var(--blue)', transition: 'left 800ms linear' }}>
-              <span className="now-dot" style={{ position: 'absolute', top: -4, left: -4, width: 10, height: 10, borderRadius: '50%', background: 'var(--blue)' }} />
-            </div>
+            {nowX >= 0 && nowX <= TRACK_W && (
+              <div className="now-line" style={{ position: 'absolute', left: LANE_LABEL + nowX, top: 0, bottom: 0, width: 2, zIndex: 2, background: 'var(--blue)' }}>
+                <span className="now-dot" style={{ position: 'absolute', top: -4, left: -4, width: 10, height: 10, borderRadius: '50%', background: 'var(--blue)' }} />
+              </div>
+            )}
 
-            {lanes.map(lane => {
-              const laneJobs = jobs.filter(j => j.lane === lane.id);
-              return (
-                <div key={lane.id} style={{ display: 'flex', height: LANE_H, borderBottom: '0.5px solid var(--separator)' }}>
-                  {/* label */}
-                  <div style={{ width: LANE_LABEL, flexShrink: 0, borderRight: '0.5px solid var(--separator)', borderLeft: `3px solid ${lane.color}`,
-                    display: 'flex', alignItems: 'center', gap: 9, padding: '0 14px', position: 'sticky', left: 0, background: 'var(--bg-grouped)', zIndex: 1 }}>
-                    <span style={{ width: 8, height: 8, borderRadius: 4, background: lane.color, flexShrink: 0 }} />
-                    <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{lane.name}</span>
-                    {lane.capped && <span title="Budget cap reached" style={{ display: 'inline-flex', alignItems: 'center', gap: 3, height: 18, padding: '0 6px', borderRadius: 'var(--r-pill)',
-                      background: 'rgba(255,59,48,0.14)', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)', flexShrink: 0 }}><Icon name="lock" size={10} /> Cap</span>}
-                  </div>
-                  {/* track */}
-                  <div style={{ position: 'relative', width: TRACK_W, flexShrink: 0, opacity: lane.capped ? 0.62 : 1 }}>
-                    {laneJobs.map(j => <Capsule key={j.id} job={j} nowMin={nowMin} onClick={onSelect} selected={selectedId === j.id} />)}
-                  </div>
+            {laneLayout.map(({ lane, placed, height }) => (
+              <div key={lane.id} style={{ display: 'flex', minHeight: height, borderBottom: '0.5px solid var(--separator)' }}>
+                {/* label */}
+                <div style={{ width: LANE_LABEL, flexShrink: 0, borderRight: '0.5px solid var(--separator)', borderLeft: `3px solid ${lane.color}`,
+                  display: 'flex', alignItems: 'center', gap: 9, padding: '0 14px', position: 'sticky', left: 0, background: 'var(--bg-grouped)', zIndex: 1 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 4, background: lane.color, flexShrink: 0 }} />
+                  <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{lane.name}</span>
                 </div>
-              );
-            })}
+                {/* track */}
+                <div style={{ position: 'relative', width: TRACK_W, flexShrink: 0 }}>
+                  {placed.map(({ job, left, width, top }) => (
+                    <Capsule key={job.id} job={job} left={left} width={width} top={top} onClick={onSelect} selected={selectedId === job.id} />
+                  ))}
+                </div>
+              </div>
+            ))}
+            {laneLayout.length === 0 && (
+              <div style={{ padding: '40px 0', textAlign: 'center', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No jobs yet.</div>
+            )}
           </div>
         </div>
       </div>
@@ -454,12 +518,13 @@ function MonStatus({ status }: { status: Status }) {
 interface MonTableProps {
   jobs: Job[];
   lanes: Lane[];
+  nowMs: number;
   onSelect: (job: Job) => void;
   selectedId: string | null;
   onCancel: (job: Job) => void;
 }
 
-function MonTable({ jobs, lanes, onSelect, selectedId, onCancel }: MonTableProps) {
+function MonTable({ jobs, lanes, nowMs, onSelect, selectedId, onCancel }: MonTableProps) {
   const cols = '1.1fr 1.8fr 1.1fr 0.7fr 1fr 0.8fr 0.7fr 0.8fr 0.7fr 64px';
   return (
     <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden',
@@ -473,8 +538,8 @@ function MonTable({ jobs, lanes, onSelect, selectedId, onCancel }: MonTableProps
       </div>
       {jobs.map((j, i) => {
         const lane = laneOf(lanes, j.lane);
-        const dur = j.status === 'scheduled' ? `~${j.dur}m` : j.end != null ? `${j.end - j.start}m` : '—';
-        const started = j.status === 'scheduled' ? `in ${j.start - NOW_MIN}m` : `${NOW_MIN - j.start}m ago`;
+        const dur = j.endMs != null ? fmtDur(j.endMs - j.startMs) : (j.status === 'running' ? fmtDur(nowMs - j.startMs) : '—');
+        const started = fmtAgo(nowMs - j.startMs);
         return (
           <div key={j.id} onClick={() => onSelect(j)} className="mon-row" style={{ display: 'grid', gridTemplateColumns: cols, alignItems: 'center', gap: 12,
             padding: '12px 16px', borderBottom: i < jobs.length - 1 ? '0.5px solid var(--separator)' : 'none', cursor: 'pointer',
@@ -509,90 +574,80 @@ function MonTable({ jobs, lanes, onSelect, selectedId, onCancel }: MonTableProps
 interface InspectorProps {
   job: Job | null;
   lanes: Lane[];
+  nowMs: number;
   onClose: () => void;
   onCancel: (job: Job) => void;
 }
 
-function Inspector({ job, lanes, onClose, onCancel }: InspectorProps) {
+function Inspector({ job, lanes, nowMs, onClose, onCancel }: InspectorProps) {
   const navigate = useNavigate();
   if (!job) return null;
   const lane = laneOf(lanes, job.lane);
   const m = STATUS_META[job.status];
   const cost = job.status === 'running' ? job._liveCost ?? job.cost : job.cost;
-  const cap = job.lane === 'scan' ? 30 : 50;
+  const elapsedMs = (job.endMs ?? nowMs) - job.startMs;
+  const out = (job.output || '').trim();
+  const tail = out.length > 6000 ? '…' + out.slice(-6000) : out;
+  const modelShort = job.model.replace(/^claude-/, '').replace(/-\d{8}$/, '');
+  const openTranscript = () => {
+    if (job.sessionId) navigate(`/project-detail/${job.lane}?s=${job.sessionId}`);
+    else navigate(`/session-transcript/${job.id}`);
+  };
   return (
-    <div className="inspector inspector-in" data-open="true" style={{ position: 'absolute', top: 0, right: 0, bottom: 0, width: 380, zIndex: 40,
+    <div className="inspector inspector-in" data-open="true" style={{ position: 'absolute', top: 0, right: 0, bottom: 0, width: 400, zIndex: 40,
       background: 'var(--bg-elevated)',
       borderLeft: '0.5px solid var(--separator)', boxShadow: '-12px 0 40px rgba(10,15,40,0.18)', display: 'flex', flexDirection: 'column' }}>
-      <React.Fragment>
-          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '20px 18px 16px', borderBottom: '0.5px solid var(--separator)' }}>
-            <span style={{ width: 8, height: 8, borderRadius: 4, background: lane.color, flexShrink: 0, marginTop: 7 }} />
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ font: '700 var(--fs-title2)/1.2 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)', textWrap: 'pretty' }}>{job.name}</div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
-                <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{lane.name}</span>
-                <span style={{ color: 'var(--ink-tertiary)' }}>·</span>
-                <MonStatus status={job.status} />
-              </div>
-            </div>
-            <button onClick={onClose} className="tb-icon" style={{ width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0 }}>
-              <Icon name="x" size={17} />
-            </button>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '20px 18px 16px', borderBottom: '0.5px solid var(--separator)' }}>
+        <span style={{ width: 8, height: 8, borderRadius: 4, background: lane.color, flexShrink: 0, marginTop: 7 }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ font: '700 var(--fs-title2)/1.2 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)', textWrap: 'pretty' }}>{job.name}</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+            <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{lane.name}</span>
+            <span style={{ color: 'var(--ink-tertiary)' }}>·</span>
+            <MonStatus status={job.status} />
           </div>
+        </div>
+        <button onClick={onClose} className="tb-icon" style={{ width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0 }}>
+          <Icon name="x" size={17} />
+        </button>
+      </div>
 
-          <div style={{ flex: 1, overflowY: 'auto', padding: 18, display: 'flex', flexDirection: 'column', gap: 18 }}>
-            {/* chips */}
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              <Tag icon="bolt" tint={EFFORT_TINT[job.effort]}>{job.effort}</Tag>
-              <Tag icon="shield" tint="var(--blue)">{job.autonomy}</Tag>
-              <Tag icon={MON_TRIG_ICON[job.trigger]} tint="var(--ink-secondary)">{job.trigger}</Tag>
-              <ShapeChip shape={job.shape} />
-            </div>
+      <div style={{ flex: 1, overflowY: 'auto', padding: 18, display: 'flex', flexDirection: 'column', gap: 16, minHeight: 0 }}>
+        {/* chips: real effort + engine/model */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          <Tag icon="bolt" tint={EFFORT_TINT[job.effort]}>{job.effort}</Tag>
+          <Tag icon="terminal" tint="var(--ink-secondary)">{job.engine === 'codex' ? 'Codex' : 'Claude Code'}{modelShort ? ` · ${modelShort}` : ''}</Tag>
+        </div>
 
-            {/* live last line */}
-            <div>
-              <Label>Live output</Label>
-              <div style={{ background: 'var(--bg-elevated)', borderRadius: 10, border: '0.5px solid var(--separator)', padding: '12px 14px',
-                font: '400 var(--fs-footnote)/1.5 var(--font-mono)', color: 'var(--ink-secondary)' }}>
-                <span style={{ color: m.tint, marginRight: 6 }}>›</span>{job.last}
-                {job.status === 'running' && <span className="cursor-blink" style={{ marginLeft: 2 }}>▍</span>}
-              </div>
-            </div>
+        {/* real run stats */}
+        <div style={{ display: 'flex', gap: 10 }}>
+          <Stat label="Cost" value={cost > 0 ? `$${cost.toFixed(2)}` : '—'} />
+          <Stat label="Tokens" value={job.tokens > 0 ? job.tokens.toLocaleString() : '—'} />
+          <Stat label={job.status === 'running' ? 'Elapsed' : 'Duration'} value={fmtDur(Math.max(0, elapsedMs))} />
+        </div>
 
-            {/* budget mini-meter */}
-            <div>
-              <Label>Project budget</Label>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div style={{ flex: 1, height: 8, borderRadius: 4, background: 'var(--fill-secondary)', overflow: 'hidden' }}>
-                  <div style={{ width: `${Math.min(100, (cost + (job.lane === 'scan' ? 28.8 : 22) ) / cap * 100)}%`, height: '100%', borderRadius: 4,
-                    background: job.lane === 'scan' ? 'var(--red)' : 'var(--green)' }} />
-                </div>
-                <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', whiteSpace: 'nowrap' }}>
-                  ${(cost + (job.lane === 'scan' ? 28.8 : 22)).toFixed(2)} / ${cap}
-                </span>
-              </div>
-              {job.lane === 'scan' && <div style={{ font: '500 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--red)', marginTop: 7 }}>Project cap reached — jobs are blocked.</div>}
-            </div>
-
-            {/* this run cost */}
-            <div style={{ display: 'flex', gap: 10 }}>
-              <Stat label="This run" value={cost > 0 ? `$${cost.toFixed(2)}` : '—'} />
-              <Stat label={job.status === 'scheduled' ? 'Starts in' : 'Elapsed'} value={job.status === 'scheduled' ? `${job.start - NOW_MIN}m` : `${NOW_MIN - job.start}m`} />
-            </div>
+        {/* real output preview */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+          <Label>{job.status === 'running' ? 'Live output' : 'Output'}</Label>
+          <div className="inspector" style={{ flex: 1, minHeight: 120, overflowY: 'auto', background: 'var(--bg-grouped)', borderRadius: 10, border: '0.5px solid var(--separator)', padding: '12px 14px',
+            font: '400 var(--fs-footnote)/1.55 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {tail ? tail : <span style={{ color: 'var(--ink-tertiary)' }}>{job.last || (job.status === 'running' ? 'Working…' : 'No output recorded.')}</span>}
+            {job.status === 'running' && <span className="cursor-blink" style={{ marginLeft: 2, color: m.tint }}>▍</span>}
           </div>
+        </div>
+      </div>
 
-          {/* actions */}
-          <div style={{ display: 'flex', gap: 10, padding: 16, borderTop: '0.5px solid var(--separator)' }}>
-            <a onClick={() => navigate('/session-transcript')} className="primary-cta" style={{ flex: 1, height: 42, borderRadius: 'var(--r-pill)', textDecoration: 'none', cursor: 'pointer',
-              display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>
-              <Icon name="terminal" size={16} /> Open transcript
-            </a>
-            {(job.status === 'running' || job.status === 'gated') && (
-              <button onClick={() => onCancel(job)} className="cancel-btn" style={{ height: 42, padding: '0 18px', borderRadius: 'var(--r-pill)',
-                background: 'rgba(255,59,48,0.12)', color: 'var(--red)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
-            )}
-          </div>
-        </React.Fragment>
+      {/* actions */}
+      <div style={{ display: 'flex', gap: 10, padding: 16, borderTop: '0.5px solid var(--separator)' }}>
+        <button onClick={openTranscript} className="primary-cta" style={{ flex: 1, height: 42, borderRadius: 'var(--r-pill)', cursor: 'pointer', border: 'none',
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>
+          <Icon name={job.sessionId ? 'command' : 'terminal'} size={16} /> {job.sessionId ? 'Open chat' : 'Open transcript'}
+        </button>
+        {job.status === 'running' && (
+          <button onClick={() => onCancel(job)} className="cancel-btn" style={{ height: 42, padding: '0 18px', borderRadius: 'var(--r-pill)',
+            background: 'rgba(255,59,48,0.12)', color: 'var(--red)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
+        )}
+      </div>
     </div>
   );
 }
@@ -674,7 +729,7 @@ export default function JobMonitor() {
   const [filter, setFilter] = React.useState('all');
   const [jobs, setJobs] = React.useState<Job[]>([]);
   const [lanes, setLanes] = React.useState<Lane[]>([]);
-  const [nowMin, setNowMin] = React.useState(NOW_MIN);
+  const [nowMs, setNowMs] = React.useState(() => Date.now());
   const [sel, setSel] = React.useState<Job | null>(null);
   const [cancelJob, setCancelJob] = React.useState<Job | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
@@ -684,7 +739,10 @@ export default function JobMonitor() {
     try {
       const [apiProjects, apiJobs] = await Promise.all([api.listProjects(), api.listJobs()]);
       setLanes(lanesFromProjects(apiProjects));
-      setJobs(apiJobs.map(mapApiJob));
+      const mapped = apiJobs.map(mapApiJob);
+      setJobs(mapped);
+      // keep the open inspector live (cost/output/status) as job events stream in
+      setSel(s => s ? (mapped.find(x => x.id === s.id) ?? null) : null);
     } catch {
       /* fail soft — leave whatever we have */
     }
@@ -698,11 +756,9 @@ export default function JobMonitor() {
     return unsubscribe;
   }, [refetch]);
 
-  // live drift: advance the now-line only (cost is real, streamed from the engine)
+  // real now-line: advance the wall clock so running capsules + elapsed tick
   React.useEffect(() => {
-    const t = setInterval(() => {
-      setNowMin(n => (n < 67 ? +(n + 0.08).toFixed(2) : n));
-    }, 900);
+    const t = setInterval(() => setNowMs(Date.now()), 5000);
     return () => clearInterval(t);
   }, []);
 
@@ -724,7 +780,7 @@ export default function JobMonitor() {
     setCancelJob(null);
     // Real cancel: abort the run on the Mac. The job event refetches the board
     // into its true 'cancelled' state; optimistically reflect it meanwhile.
-    setJobs(js => js.map(j => j.id === job.id ? { ...j, status: 'cancelled', end: Math.round(nowMin), last: 'cancelling…' } : j));
+    setJobs(js => js.map(j => j.id === job.id ? { ...j, status: 'cancelled', endMs: Date.now(), last: 'cancelling…' } : j));
     setSel(s => s && s.id === job.id ? { ...s, status: 'cancelled', last: 'cancelling…' } : s);
     void api.cancelJob(job.id).catch(() => { void refetch(); });
   };
@@ -770,12 +826,12 @@ export default function JobMonitor() {
         {/* board */}
         <div style={{ flex: 1, overflowY: 'auto', paddingBottom: 28 }}>
           {view === 'timeline'
-            ? <Timeline jobs={shown} lanes={lanes} nowMin={nowMin} onSelect={setSel} selectedId={sel && sel.id} />
-            : <MonTable jobs={shown} lanes={lanes} onSelect={setSel} selectedId={sel && sel.id} onCancel={setCancelJob} />}
+            ? <Timeline jobs={shown} lanes={lanes} nowMs={nowMs} onSelect={setSel} selectedId={sel ? sel.id : null} />
+            : <MonTable jobs={shown} lanes={lanes} nowMs={nowMs} onSelect={setSel} selectedId={sel ? sel.id : null} onCancel={setCancelJob} />}
         </div>
       </main>
 
-      <Inspector job={sel} lanes={lanes} onClose={() => setSel(null)} onCancel={setCancelJob} />
+      <Inspector job={sel} lanes={lanes} nowMs={nowMs} onClose={() => setSel(null)} onCancel={setCancelJob} />
       <CancelSheet job={cancelJob} onClose={() => setCancelJob(null)} onConfirm={doCancel} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>

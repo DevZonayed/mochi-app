@@ -6,7 +6,7 @@
    preserved exactly. Cross-page navigation uses react-router. */
 
 import React from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams, useLocation } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import {
   GroupedList,
@@ -1479,6 +1479,7 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit }: { queue: string[]; o
 }
 
 function ChatPane({ projectId, project }: { projectId: string | null; project: Project | null }) {
+  const location = useLocation();
   const [sessions, setSessions] = React.useState<ChatSession[]>([]);
   const [activeId, setActiveId] = React.useState<string | null>(null);
   const [turns, setTurns] = React.useState<Job[]>([]);
@@ -1517,11 +1518,14 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
     setQueue([]);
     if (!projectId) { setSessions([]); return; }
     let alive = true;
+    // Deep-link: /project-detail/<id>?s=<sessionId> opens that thread directly
+    // (used by the Jobs inspector's "Open chat"); else open the latest.
+    const want = new URLSearchParams(location.search).get('s');
     api.listSessions(projectId)
-      .then(ss => { if (alive) { setSessions(ss); setActiveId(ss[0]?.id ?? null); } })
+      .then(ss => { if (alive) { setSessions(ss); setActiveId((want && ss.some(x => x.id === want)) ? want : (ss[0]?.id ?? null)); } })
       .catch(() => {});
     return () => { alive = false; };
-  }, [projectId]);
+  }, [projectId, location.search]);
 
   // Turns of the open session (ascending — a chat thread). Queue is per-session.
   React.useEffect(() => {
