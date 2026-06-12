@@ -7,8 +7,9 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
-import { api, type Project, type ChatSession } from '../lib/api';
+import { api, type Project, type ChatSession, type ProjectKind } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
+import type { IconName } from '../lib/icons';
 
 const PAGE_CSS = `
   .ws-row { transition: background 120ms ease; }
@@ -40,6 +41,18 @@ function relTime(ts: number): string {
   const d = Math.floor(h / 24); return d < 7 ? `${d}d ago` : `${Math.floor(d / 7)}w ago`;
 }
 const projColor = (p?: Project): string => (p?.color ? `var(--${p.color})` : 'var(--blue)');
+const projKind = (p?: Project): ProjectKind => (p?.kind ?? 'general');
+
+const KIND_FILTER_KEY = 'maestro.workspace.kind';
+type KindFilter = ProjectKind | 'all';
+const KIND_META: { key: KindFilter; label: string; icon: IconName; tint: string }[] = [
+  { key: 'all', label: 'All', icon: 'layers', tint: 'var(--ink-secondary)' },
+  { key: 'coding', label: 'Code', icon: 'terminal', tint: 'var(--blue)' },
+  { key: 'content', label: 'Content', icon: 'clapper', tint: 'var(--purple)' },
+  { key: 'research', label: 'Research', icon: 'telescope', tint: 'var(--indigo)' },
+  { key: 'general', label: 'General', icon: 'command', tint: 'var(--ink-secondary)' },
+];
+const kindOf = (k: KindFilter) => KIND_META.find(m => m.key === k) ?? KIND_META[0];
 
 export default function Workspace() {
   const navigate = useNavigate();
@@ -52,6 +65,11 @@ export default function Workspace() {
   });
   const [renamingId, setRenamingId] = React.useState<string | null>(null);
   const [renameVal, setRenameVal] = React.useState('');
+  const [kindFilter, setKindFilterState] = React.useState<KindFilter>(() => {
+    try { const v = localStorage.getItem(KIND_FILTER_KEY); return (v && KIND_META.some(m => m.key === v)) ? v as KindFilter : 'all'; } catch { return 'all'; }
+  });
+  const setKindFilter = (k: KindFilter) => { setKindFilterState(k); try { localStorage.setItem(KIND_FILTER_KEY, k); } catch { /* ignore */ } };
+  const [query, setQuery] = React.useState('');
   const newCounter = React.useRef(0);
   const restored = React.useRef(false);
 
@@ -152,8 +170,19 @@ export default function Workspace() {
     void api.renameSession(id, title).catch(() => {});
   };
 
-  const pinned = sessions.filter(s => s.pinned).sort((a, b) => b.updatedAt - a.updatedAt);
-  const sessionsByProject = (pid: string) => sessions.filter(s => s.projectId === pid).sort((a, b) => b.updatedAt - a.updatedAt);
+  // Filtering: by project kind + a fuzzy name search over projects AND chats.
+  const q = query.trim().toLowerCase();
+  const kindMatch = (p?: Project) => kindFilter === 'all' || projKind(p) === kindFilter;
+  const chatHit = (s: ChatSession) => !q || s.title.toLowerCase().includes(q);
+  const projHit = (p: Project) => !q || p.name.toLowerCase().includes(q) || sessions.some(s => s.projectId === p.id && s.title.toLowerCase().includes(q));
+
+  const kindCount = (k: KindFilter) => (k === 'all' ? projects.length : projects.filter(p => projKind(p) === k).length);
+  const visibleProjects = projects.filter(p => kindMatch(p) && projHit(p));
+  const sessionsByProject = (pid: string) => {
+    const p = projById[pid];
+    return sessions.filter(s => s.projectId === pid && (!q || chatHit(s) || (p && p.name.toLowerCase().includes(q)))).sort((a, b) => b.updatedAt - a.updatedAt);
+  };
+  const pinned = sessions.filter(s => s.pinned && kindMatch(projById[s.projectId]) && (chatHit(s) || (projById[s.projectId]?.name.toLowerCase().includes(q) ?? false))).sort((a, b) => b.updatedAt - a.updatedAt);
 
   // a session row in the tree
   const SessionRow = ({ s, indent }: { s: ChatSession; indent: number }) => {
@@ -204,6 +233,35 @@ export default function Workspace() {
               <Icon name="layers" size={15} />
             </button>
           </div>
+
+          {/* search + kind filter — narrow to a type, or find a project/chat by name */}
+          {projects.length > 0 && (
+            <div style={{ padding: '0 12px 10px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7, height: 32, padding: '0 10px', borderRadius: 9, background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)' }}>
+                <Icon name="search" size={14} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} />
+                <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Filter projects & chats…"
+                  style={{ flex: 1, minWidth: 0, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }} />
+                {query && <button onClick={() => setQuery('')} title="Clear" style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}><Icon name="x" size={11} stroke={2.4} /></button>}
+              </div>
+              <div className="ws-tabs" style={{ display: 'flex', gap: 5, overflowX: 'auto' }}>
+                {KIND_META.map(m => {
+                  const on = kindFilter === m.key;
+                  const n = kindCount(m.key);
+                  if (m.key !== 'all' && n === 0) return null;
+                  return (
+                    <button key={m.key} onClick={() => setKindFilter(m.key)} title={`${m.label} · ${n}`} style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 5, height: 26, padding: '0 9px', borderRadius: 'var(--r-pill)', flexShrink: 0, cursor: 'pointer',
+                      background: on ? `color-mix(in srgb, ${m.tint} 16%, transparent)` : 'var(--fill-secondary)',
+                      border: on ? `1px solid color-mix(in srgb, ${m.tint} 45%, transparent)` : '1px solid transparent',
+                      color: on ? m.tint : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                      <Icon name={m.icon} size={12} /> {m.label} <span style={{ opacity: 0.7 }}>{n}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <div className="ws-tree" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '0 8px 12px' }}>
             {projects.length === 0 && (
               <div style={{ padding: '40px 14px', textAlign: 'center', font: '400 var(--fs-footnote)/1.55 var(--font-text)', color: 'var(--ink-tertiary)' }}>
@@ -219,10 +277,16 @@ export default function Workspace() {
               </>
             )}
 
-            {projects.length > 0 && sectionLabel('Projects')}
-            {projects.map(p => {
-              const isOpen = expanded.has(p.id);
+            {visibleProjects.length > 0 && sectionLabel(kindFilter === 'all' ? 'Projects' : `${kindOf(kindFilter).label} projects`)}
+            {projects.length > 0 && visibleProjects.length === 0 && (
+              <div style={{ padding: '24px 14px', textAlign: 'center', font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                No {kindFilter === 'all' ? '' : kindOf(kindFilter).label.toLowerCase() + ' '}projects{q ? ' match' : ''}.
+                {(q || kindFilter !== 'all') && <button onClick={() => { setQuery(''); setKindFilter('all'); }} style={{ display: 'block', margin: '10px auto 0', height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Clear filters</button>}
+              </div>
+            )}
+            {visibleProjects.map(p => {
               const chats = sessionsByProject(p.id);
+              const isOpen = expanded.has(p.id) || (!!q && chats.length > 0);
               return (
                 <div key={p.id} className="ws-proj">
                   <div className="ws-row" onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
