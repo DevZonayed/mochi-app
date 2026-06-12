@@ -39,11 +39,12 @@ export interface ChatSession {
   updatedAt: number;
 }
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result';
+  kind: 'text' | 'tool' | 'result' | 'ask';
   text: string;
   name?: string;
   toolStatus?: 'running' | 'done' | 'error';
   durMs?: number;
+  ask?: string;
   ts: number;
 }
 export interface Job {
@@ -444,7 +445,7 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; effort?: Effort }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; effort?: Effort; plan?: boolean }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   renameSession: (id: string, title: string) =>

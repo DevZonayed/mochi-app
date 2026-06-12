@@ -117,9 +117,11 @@ app.whenReady().then(() => {
     return { ok: true, data: await dispatch('inspectFolder', { path: res.filePaths[0] }) };
   });
 
-  // Reveal a project's folder in Finder — desktop-only, path-guarded.
+  // Reveal a path in Finder — desktop-only, path-guarded. Expands a leading ~.
   ipcMain.handle('maestro:revealPath', async (_e, p: string) => {
-    if (typeof p === 'string' && p && existsSync(p)) { shell.showItemInFolder(p); return { ok: true }; }
+    if (typeof p !== 'string' || !p) return { ok: false, error: 'no path' };
+    const abs = p.startsWith('~/') || p === '~' ? path.join(app.getPath('home'), p.slice(1)) : p;
+    if (existsSync(abs)) { shell.showItemInFolder(abs); return { ok: true }; }
     return { ok: false, error: 'path not found' };
   });
 

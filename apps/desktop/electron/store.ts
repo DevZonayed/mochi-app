@@ -40,13 +40,15 @@ export interface Project {
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
     final result. The chat renders these as separate blocks with timings. */
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result';
-  /** text/result: the content. tool: short detail (command, file, query…). */
+  kind: 'text' | 'tool' | 'result' | 'ask';
+  /** text/result: the content. tool: short detail (command, file, query…). ask: prompt. */
   text: string;
   /** tool only */
   name?: string;
   toolStatus?: 'running' | 'done' | 'error';
   durMs?: number;
+  /** ask only: JSON of the AskUserQuestion input ({ questions:[{question,header,options,multiSelect}] }). */
+  ask?: string;
   ts: number;
 }
 

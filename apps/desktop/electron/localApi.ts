@@ -173,7 +173,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const job = store.createJob(projectId, text, text.slice(0, 60), p.effort as Effort | undefined, session.id);
         emit('job', job);
         // Fire the run async — the reply streams in over job events.
-        void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model) });
+        void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model), plan: p.plan === true });
         return { session, job };
       }
 

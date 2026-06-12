@@ -67,6 +67,10 @@ function toolDetail(input: unknown): string {
 const proseOf = (items: TranscriptItem[]): string =>
   items.filter(i => i.kind === 'text').map(i => i.text.trim()).filter(Boolean).join('\n\n');
 
+function safeJson(v: unknown): string {
+  try { return JSON.stringify(v); } catch { return ''; }
+}
+
 class CancelledError extends Error {
   constructor() { super('cancelled'); this.name = 'CancelledError'; }
 }
@@ -139,7 +143,7 @@ function abortControllerFromSignal(signal: AbortSignal): AbortController {
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
-  resume?: string, modelOverride?: string,
+  resume?: string, modelOverride?: string, plan?: boolean,
 ): Promise<EngineRun> {
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -149,7 +153,8 @@ async function runClaude(
     options: {
       cwd,
       maxTurns: maxTurnsOverride ?? EFFORT_TURNS[effort] ?? 4,
-      permissionMode: 'bypassPermissions',
+      // Plan mode → propose a plan, no execution. Otherwise run freely on this Mac.
+      permissionMode: plan ? 'plan' : 'bypassPermissions',
       includePartialMessages: !!hooks.onProgress,
       ...(modelOverride ? { model: modelOverride } : {}),
       ...(resume ? { resume } : {}),
@@ -199,6 +204,10 @@ async function runClaude(
           if (b.type === 'text' && typeof b.text === 'string') {
             if (openText) { openText.text = b.text; openText = null; }
             else if (b.text.trim()) items.push({ kind: 'text', text: b.text, ts: Date.now() });
+          } else if (b.type === 'tool_use' && b.name === 'AskUserQuestion') {
+            // Surface the agent's question as an interactive card, not a tool chip.
+            openText = null;
+            items.push({ kind: 'ask', name: 'AskUserQuestion', text: '', ask: safeJson(b.input), ts: Date.now() });
           } else if (b.type === 'tool_use') {
             openText = null;
             const t: TranscriptItem = { kind: 'tool', name: b.name ?? 'tool', text: toolDetail(b.input), toolStatus: 'running', ts: Date.now() };
@@ -403,7 +412,7 @@ export class LocalEngine {
   }
 
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
-  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string } = {}): Promise<Job> {
+  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string; plan?: boolean } = {}): Promise<Job> {
     const job = this.store.getJob(jobId);
     if (!job) throw Object.assign(new Error('job not found'), { statusCode: 404 });
     const project = this.store.getProject(job.projectId);
@@ -477,8 +486,9 @@ export class LocalEngine {
         onProgress: flush,
         onChild: (child) => { handle.child = child; },
       };
+      // Plan mode only applies to Claude (codex has no read-only planning mode).
       const main = master === 'claude'
-        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks, resumeId, opts.model)
+        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks, resumeId, opts.model, opts.plan)
         : await runCodex(prompt, cwd, hooks, false, opts.model);
 
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {

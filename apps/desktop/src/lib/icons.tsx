@@ -68,6 +68,7 @@ export type IconName =
   | 'check'
   | 'arrowRight'
   | 'arrowLeft'
+  | 'map'
   | 'folder'
   | 'lock'
   | 'key'
@@ -133,6 +134,7 @@ export function Icon({ name, size = 18, stroke = 1.75, style }: IconProps) {
     lock: <><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></>,
     key: <><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.5 12.5 8.5-8.5"/><path d="m15 6 3 3"/><path d="m18 3 3 3"/></>,
     gauge: <><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></>,
+    map: <><path d="M14.1 5.55a2 2 0 0 0 1.8 0l3.66-1.83A1 1 0 0 1 21 4.62v12.76a1 1 0 0 1-.55.9l-4.55 2.27a2 2 0 0 1-1.8 0l-4.2-2.1a2 2 0 0 0-1.8 0l-3.66 1.83A1 1 0 0 1 3 19.38V6.62a1 1 0 0 1 .55-.9L8.1 3.45a2 2 0 0 1 1.8 0Z"/><path d="M15 5.76v15"/><path d="M9 3.24v15"/></>,
     smartphone: <><rect x="6" y="2" width="12" height="20" rx="2"/><line x1="11" y1="18" x2="13" y2="18"/></>,
     sun: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></>,
     moon: <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>,

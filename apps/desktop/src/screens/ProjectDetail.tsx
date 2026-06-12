@@ -888,21 +888,54 @@ function CodeCard({ code, lang, keyId }: { code: string; lang?: string; keyId: s
         <span style={{ flex: 1, font: '600 var(--fs-caption)/1 var(--font-mono)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{lang || 'code'}</span>
         <CopyButton text={code} className="code-copy" />
       </div>
-      <pre style={{ margin: 0, padding: '11px 13px', overflowX: 'auto', font: '400 var(--fs-caption)/1.6 var(--font-mono)', color: 'var(--ink)' }}>{code}</pre>
+      <pre style={{ margin: 0, padding: '11px 13px', overflowX: 'auto', font: '400 12.5px/1.6 var(--font-mono)', color: 'var(--ink)' }}>{code}</pre>
     </div>
   );
 }
 
-/** Inline markdown: **bold** and `code` spans. */
+/* Path detection — absolute mac paths, ~ paths, and dotted relative files.
+   Returned paths are clickable → reveal in Finder. */
+const PATH_RE = /(~\/[^\s`'"()<>]+|\/(?:Users|private|tmp|var|opt|usr|home|Applications|System|Library)\/[^\s`'"()<>]+|\b[\w.-]+\/[\w./-]+\.[A-Za-z0-9]{1,6})/g;
+const looksLikePath = (s: string): boolean => { PATH_RE.lastIndex = 0; const m = PATH_RE.exec(s.trim()); return !!m && m[0] === s.trim(); };
+
+function PathLink({ path, mono = true }: { path: string; mono?: boolean }) {
+  return (
+    <button onClick={() => { void api.revealPath(path); }} title="Reveal in Finder" style={{
+      display: 'inline', padding: '0 2px', margin: '0 -2px', borderRadius: 4, background: 'transparent', cursor: 'pointer',
+      color: 'var(--blue)', font: mono ? '500 0.92em var(--font-mono)' : 'inherit', textDecorationLine: 'underline',
+      textDecorationColor: 'color-mix(in srgb, var(--blue) 40%, transparent)', textUnderlineOffset: 2, wordBreak: 'break-all' }}>
+      {path}
+    </button>
+  );
+}
+
+/** Split a plain text run, linkifying any file paths inside it. */
+function linkifyText(text: string, keyBase: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  let last = 0, key = 0;
+  PATH_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PATH_RE.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(<PathLink key={`${keyBase}-pl${key++}`} path={m[0]} mono={false} />);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out.length ? out : [text];
+}
+
+/** Inline markdown: **bold**, `code`, and clickable paths. */
 function renderInline(text: string, keyBase: string): React.ReactNode[] {
-  return text.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/g).map((seg, i) => {
+  return text.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/g).flatMap((seg, i): React.ReactNode[] => {
     if (seg.startsWith('`') && seg.endsWith('`')) {
-      return <code key={`${keyBase}-${i}`} style={{ padding: '1px 5px', borderRadius: 5, background: 'var(--fill-tertiary)', font: '500 0.92em var(--font-mono)' }}>{seg.slice(1, -1)}</code>;
+      const inner = seg.slice(1, -1);
+      if (looksLikePath(inner)) return [<PathLink key={`${keyBase}-${i}`} path={inner} />];
+      return [<code key={`${keyBase}-${i}`} style={{ padding: '1px 5px', borderRadius: 5, background: 'var(--fill-tertiary)', font: '500 0.92em var(--font-mono)' }}>{inner}</code>];
     }
     if (seg.startsWith('**') && seg.endsWith('**')) {
-      return <b key={`${keyBase}-${i}`} style={{ fontWeight: 650 }}>{seg.slice(2, -2)}</b>;
+      return [<b key={`${keyBase}-${i}`} style={{ fontWeight: 650 }}>{seg.slice(2, -2)}</b>];
     }
-    return seg;
+    return linkifyText(seg, `${keyBase}-${i}`);
   });
 }
 
@@ -924,7 +957,7 @@ function renderProse(text: string, keyBase: string): React.ReactNode[] {
     if (h) {
       flushPara();
       const lvl = h[1].length;
-      out.push(<div key={`${keyBase}-h${key++}`} style={{ margin: lvl <= 2 ? '15px 0 7px' : '12px 0 6px', font: `700 ${lvl <= 2 ? 'var(--fs-headline)' : 'var(--fs-callout)'}/1.3 var(--font-display)`, letterSpacing: '-0.01em', color: 'var(--ink)' }}>{renderInline(h[2], `${keyBase}-h${key}`)}</div>);
+      out.push(<div key={`${keyBase}-h${key++}`} style={{ margin: lvl <= 2 ? '14px 0 6px' : '11px 0 5px', font: `700 ${lvl <= 2 ? '15px' : '13.5px'}/1.35 var(--font-display)`, letterSpacing: '-0.01em', color: 'var(--ink)' }}>{renderInline(h[2], `${keyBase}-h${key}`)}</div>);
     } else if (li) {
       flushPara();
       out.push(
@@ -1016,6 +1049,110 @@ function ToolGroup({ items }: { items: TranscriptItem[] }) {
   );
 }
 
+/* ── Claude asks a question → a real, answerable card ─────────────────── */
+interface AskOption { label: string; description?: string }
+interface AskQuestion { question: string; header?: string; multiSelect?: boolean; options: AskOption[] }
+
+function parseAsk(json?: string): AskQuestion[] {
+  if (!json) return [];
+  try {
+    const raw = JSON.parse(json) as Record<string, unknown>;
+    const list = Array.isArray(raw.questions) ? raw.questions
+      : raw.question ? [raw] : [];
+    return (list as Record<string, unknown>[]).map(q => ({
+      question: String(q.question ?? q.header ?? 'Pick an option'),
+      header: typeof q.header === 'string' ? q.header : undefined,
+      multiSelect: q.multiSelect === true || q.allowMultiple === true,
+      options: (Array.isArray(q.options) ? q.options : []).map((o): AskOption =>
+        typeof o === 'string' ? { label: o } : { label: String((o as AskOption).label ?? ''), description: (o as AskOption).description }),
+    })).filter(q => q.options.length > 0 || q.question);
+  } catch { return []; }
+}
+
+function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (text: string) => void; answered: boolean }) {
+  const questions = parseAsk(ask);
+  const [picked, setPicked] = React.useState<Record<number, Set<string>>>({});
+  if (questions.length === 0) return null;
+
+  const toggle = (qi: number, label: string, multi: boolean) => {
+    setPicked(p => {
+      const cur = new Set(p[qi] ?? []);
+      if (multi) { cur.has(label) ? cur.delete(label) : cur.add(label); }
+      else { cur.clear(); cur.add(label); }
+      return { ...p, [qi]: cur };
+    });
+  };
+  const submit = () => {
+    const parts = questions.map((q, qi) => {
+      const sel = [...(picked[qi] ?? [])];
+      return sel.length ? `${q.header ?? q.question}: ${sel.join(', ')}` : '';
+    }).filter(Boolean);
+    if (parts.length) onAnswer(parts.join('\n'));
+  };
+  const anyPicked = Object.values(picked).some(s => s.size > 0);
+
+  return (
+    <div style={{ margin: '10px 0', borderRadius: 14, overflow: 'hidden', border: '0.5px solid color-mix(in srgb, var(--orange) 32%, var(--separator))',
+      background: 'color-mix(in srgb, var(--orange) 5%, var(--bg-elevated))', opacity: answered ? 0.62 : 1 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '9px 13px', borderBottom: '0.5px solid color-mix(in srgb, var(--orange) 22%, var(--separator))' }}>
+        <Icon name="enter" size={13} style={{ color: 'var(--orange)' }} />
+        <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--orange)' }}>{answered ? 'Answered' : 'Claude is asking'}</span>
+      </div>
+      <div style={{ padding: '12px 13px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+        {questions.map((q, qi) => (
+          <div key={qi}>
+            <div style={{ font: '600 14px/1.4 var(--font-text)', color: 'var(--ink)', marginBottom: 9 }}>{q.question}</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {q.options.map((o, oi) => {
+                const on = (picked[qi] ?? new Set()).has(o.label);
+                return (
+                  <button key={oi} disabled={answered}
+                    onClick={() => { if (q.multiSelect) toggle(qi, o.label, true); else { toggle(qi, o.label, false); if (questions.length === 1) onAnswer(o.label); } }}
+                    className="ex-chip" style={{ display: 'flex', alignItems: 'flex-start', gap: 9, padding: '9px 11px', borderRadius: 10, textAlign: 'left',
+                      background: on ? 'color-mix(in srgb, var(--blue) 10%, var(--bg-elevated))' : 'var(--bg-elevated)',
+                      border: `1px solid ${on ? 'var(--blue)' : 'var(--separator)'}`, cursor: answered ? 'default' : 'pointer' }}>
+                    <span style={{ width: 16, height: 16, borderRadius: q.multiSelect ? 4 : 8, flexShrink: 0, marginTop: 1, display: 'grid', placeItems: 'center',
+                      border: `1.5px solid ${on ? 'var(--blue)' : 'var(--separator-strong)'}`, background: on ? 'var(--blue)' : 'transparent', color: '#fff' }}>
+                      {on && <Icon name="check" size={10} stroke={3} />}
+                    </span>
+                    <span style={{ minWidth: 0 }}>
+                      <span style={{ display: 'block', font: '500 13.5px/1.35 var(--font-text)', color: 'var(--ink)' }}>{o.label}</span>
+                      {o.description && <span style={{ display: 'block', font: '400 12px/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{o.description}</span>}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+        {!answered && questions.some(q => q.multiSelect || questions.length > 1) && (
+          <button onClick={submit} disabled={!anyPicked} className="send-fab" style={{ alignSelf: 'flex-start', height: 32, padding: '0 16px', borderRadius: 'var(--r-pill)', border: 'none',
+            background: anyPicked ? 'var(--blue)' : 'var(--fill-secondary)', color: anyPicked ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: anyPicked ? 'pointer' : 'default' }}>
+            Send answer
+          </button>
+        )}
+        {!answered && <div style={{ font: '400 12px/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>…or just type your own answer below.</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ── Collapsible "work" summary shown once a turn is done ──────────────── */
+function WorkBar({ toolCount, elapsed, expanded, onToggle, children }: { toolCount: number; elapsed: string; expanded: boolean; onToggle: () => void; children: React.ReactNode }) {
+  return (
+    <div style={{ margin: '2px 0 4px' }}>
+      <button onClick={onToggle} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 26, padding: '0 10px 0 8px', borderRadius: 'var(--r-pill)',
+        background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', cursor: 'pointer', color: 'var(--ink-secondary)',
+        font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+        <Icon name="chevronRight" size={13} style={{ transform: expanded ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)', color: 'var(--ink-tertiary)' }} />
+        <Icon name="check" size={12} stroke={2.6} style={{ color: 'var(--green)' }} />
+        Worked {elapsed}{toolCount > 0 ? ` · ${toolCount} ${toolCount === 1 ? 'tool' : 'tools'}` : ''}
+      </button>
+      {expanded && <div style={{ marginTop: 8, paddingLeft: 11, borderLeft: '1.5px solid var(--separator)', opacity: 0.7 }}>{children}</div>}
+    </div>
+  );
+}
+
 const fmtDuration = (ms: number): string => {
   const s = Math.max(0, Math.round(ms / 1000));
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
@@ -1024,9 +1161,9 @@ const fmtDuration = (ms: number): string => {
 function UserBubble({ text }: { text: string }) {
   return (
     <div className="chat-msg" style={{ display: 'flex', justifyContent: 'flex-end' }}>
-      <div style={{ maxWidth: '78%', padding: '11px 15px', borderRadius: '18px 18px 5px 18px',
+      <div style={{ maxWidth: '78%', padding: '10px 14px', borderRadius: '18px 18px 5px 18px',
         background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
-        color: '#fff', font: '400 var(--fs-body)/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+        color: '#fff', font: '400 14px/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
         boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
         {text}
       </div>
@@ -1042,14 +1179,41 @@ function MetaPill({ children }: { children: React.ReactNode }) {
   );
 }
 
-function AssistantTurn({ job, onRetry }: { job: Job; onRetry: (input: string) => void }) {
+/** Render a slice of transcript items into blocks (text→prose, tool runs→group,
+    ask→question card). Used both live (full) and collapsed (work only). */
+function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { caretAt?: number; onAnswer?: (t: string) => void; answered?: boolean }): React.ReactNode[] {
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+  while (i < items.length) {
+    const it = items[i];
+    if (it.kind === 'tool') {
+      const run: TranscriptItem[] = [];
+      while (i < items.length && items[i].kind === 'tool') { run.push(items[i]); i++; }
+      blocks.push(<ToolGroup key={`${keyPrefix}g${i}`} items={run} />);
+    } else if (it.kind === 'ask') {
+      blocks.push(<QuestionCard key={`${keyPrefix}q${i}`} ask={it.ask} onAnswer={opts.onAnswer ?? (() => {})} answered={!!opts.answered} />);
+      i++;
+    } else {
+      const idx = i;
+      blocks.push(
+        <div key={`${keyPrefix}b${idx}`} style={{ margin: idx > 0 ? '4px 0 0' : 0 }}>
+          {renderChatBody(it.text, `${keyPrefix}${it.kind === 'result' ? 'r' : 't'}${idx}`)}
+          {opts.caretAt === idx && <span className="chat-caret" />}
+        </div>
+      );
+      i++;
+    }
+  }
+  return blocks;
+}
+
+function AssistantTurn({ job, onRetry, onAnswer, isLast }: { job: Job; onRetry: (input: string) => void; onAnswer: (text: string) => void; isLast: boolean }) {
   const live = job.status === 'running' || job.status === 'pending';
   const engineLabel = job.engine === 'codex' ? 'Codex' : 'Claude Code';
   const provider = job.engine === 'codex' ? 'openai' as const : 'anthropic' as const;
   const transcript = job.transcript ?? [];
   const hasBody = transcript.length > 0 || !!(job.output && job.output.length > 0);
 
-  // Live elapsed clock while the turn runs (the "time" the user watches).
   const [, tick] = React.useReducer((x: number) => x + 1, 0);
   React.useEffect(() => {
     if (!live) return;
@@ -1058,44 +1222,47 @@ function AssistantTurn({ job, onRetry }: { job: Job; onRetry: (input: string) =>
   }, [live]);
   const elapsed = fmtDuration((live ? Date.now() : job.updatedAt) - job.createdAt);
 
-  const lastIdx = transcript.length - 1;
-  const caretOn = (i: number) => live && i === lastIdx && (transcript[i].kind === 'text' || transcript[i].kind === 'result');
-
-  // Group consecutive tool steps so a burst of activity reads as one sequence.
-  const blocks: React.ReactNode[] = [];
-  if (transcript.length > 0) {
-    let i = 0;
-    while (i < transcript.length) {
-      const it = transcript[i];
-      if (it.kind === 'tool') {
-        const run: TranscriptItem[] = [];
-        while (i < transcript.length && transcript[i].kind === 'tool') { run.push(transcript[i]); i++; }
-        blocks.push(<ToolGroup key={`g${i}`} items={run} />);
-      } else {
-        const idx = i;
-        const isResult = it.kind === 'result';
-        blocks.push(
-          <div key={`b${idx}`} style={{ margin: idx > 0 ? '4px 0 0' : 0 }}>
-            {renderChatBody(it.text, isResult ? `r${idx}` : `t${idx}`)}
-            {caretOn(idx) && <span className="chat-caret" />}
-          </div>
-        );
-        i++;
-      }
-    }
-  }
-
-  const body = transcript.length > 0 ? (
-    <div style={{ font: '400 var(--fs-body)/1.6 var(--font-text)', color: 'var(--ink)' }}>{blocks}</div>
-  ) : hasBody ? (
-    <div style={{ font: '400 var(--fs-body)/1.6 var(--font-text)', color: 'var(--ink)' }}>
-      {renderChatBody(job.output ?? '')}
-      {live && <span className="chat-caret" />}
-    </div>
-  ) : null;
+  // The final answer = last text/result block. Everything before it is "work"
+  // (narration + tools) that collapses once the turn is done. A turn that ends
+  // in a question stays fully expanded — questions are never hidden.
+  const hasAsk = transcript.some(t => t.kind === 'ask');
+  let finalIdx = -1;
+  for (let k = transcript.length - 1; k >= 0; k--) { if (transcript[k].kind === 'text' || transcript[k].kind === 'result') { finalIdx = k; break; } }
+  const collapsible = !live && !hasAsk && finalIdx > 0 && transcript.slice(0, finalIdx).some(t => t.kind === 'tool' || t.kind === 'text');
+  const [expanded, setExpanded] = React.useState(false);
 
   const toolCount = transcript.filter(t => t.kind === 'tool').length;
-  const replyText = transcript.filter(t => t.kind === 'text' || t.kind === 'result').map(t => t.text).join('\n\n') || job.output || '';
+  const replyText = (finalIdx >= 0 ? transcript[finalIdx].text : '') || job.output || '';
+  const lastIdx = transcript.length - 1;
+
+  let body: React.ReactNode = null;
+  if (transcript.length > 0) {
+    if (collapsible) {
+      const work = transcript.slice(0, finalIdx);
+      const workTools = work.filter(t => t.kind === 'tool').length;
+      body = (
+        <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
+          <WorkBar toolCount={workTools} elapsed={elapsed} expanded={expanded} onToggle={() => setExpanded(e => !e)}>
+            <div style={{ font: '400 13px/1.55 var(--font-text)' }}>{renderTranscript(work, 'w', { answered: true })}</div>
+          </WorkBar>
+          <div style={{ marginTop: 6 }}>{renderChatBody(transcript[finalIdx].text, 'fa')}</div>
+        </div>
+      );
+    } else {
+      body = (
+        <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
+          {renderTranscript(transcript, 'a', { caretAt: live ? lastIdx : undefined, onAnswer, answered: !isLast })}
+        </div>
+      );
+    }
+  } else if (hasBody) {
+    body = (
+      <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
+        {renderChatBody(job.output ?? '')}
+        {live && <span className="chat-caret" />}
+      </div>
+    );
+  }
 
   return (
     <div className="chat-msg" style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
@@ -1120,7 +1287,7 @@ function AssistantTurn({ job, onRetry }: { job: Job; onRetry: (input: string) =>
         </div>
         {body}
         {!hasBody && live && (
-          <div style={{ font: '500 var(--fs-body)/1.5 var(--font-text)' }}>
+          <div style={{ font: '500 14px/1.5 var(--font-text)' }}>
             <span className="think-shimmer">{job.stage || 'Thinking…'}</span>
           </div>
         )}
@@ -1172,6 +1339,9 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
     try { localStorage.setItem('maestro.chat.model', id); } catch { /* storage unavailable */ }
   };
   const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
+  // Plan mode: agent proposes a plan first (no execution). Persisted per app.
+  const [planMode, setPlanModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.plan') === '1'; } catch { return false; } });
+  const setPlanMode = (on: boolean) => { setPlanModeState(on); try { localStorage.setItem('maestro.chat.plan', on ? '1' : '0'); } catch { /* ignore */ } };
   const [renamingId, setRenamingId] = React.useState<string | null>(null);
   const [renameVal, setRenameVal] = React.useState('');
   const [sendError, setSendError] = React.useState('');
@@ -1257,7 +1427,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
       const run = chatModelToRun(modelChoice);
       const resp = await api.sendChat({
         projectId, text: t, sessionId: activeRef.current ?? undefined,
-        effort: EFFORT_TO_API[effort],
+        effort: EFFORT_TO_API[effort], plan: planMode,
         ...(run.engine ? { engine: run.engine as EngineId } : {}),
         ...(run.model ? { model: run.model } : {}),
       });
@@ -1375,10 +1545,12 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
                 </div>
               </div>
             )}
-            {turns.map(t => (
+            {turns.map((t, i) => (
               <React.Fragment key={t.id}>
                 <UserBubble text={t.input} />
-                <AssistantTurn job={t} onRetry={(input) => { void sendText(input); }} />
+                <AssistantTurn job={t} isLast={i === turns.length - 1}
+                  onRetry={(input) => { void sendText(input); }}
+                  onAnswer={(ans) => { void sendText(ans); }} />
               </React.Fragment>
             ))}
           </div>
@@ -1396,7 +1568,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
               <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
                 <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
                   onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendText(text); } }}
-                  placeholder={projectId ? `Message the agent…` : 'Pick a project first'}
+                  placeholder={!projectId ? 'Pick a project first' : planMode ? 'Describe a goal — I\'ll plan it first…' : 'Message the agent…'}
                   disabled={!projectId}
                   style={{ flex: 1, resize: 'none', border: 'none', outline: 'none', background: 'transparent',
                     color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '6px 0',
@@ -1418,12 +1590,19 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
               <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 6 }}>
                 <ModelSwitcher compact direction="up" value={modelChoice} onChange={setModelChoice} models={CHAT_MODELS} />
                 <EffortDial compact value={effort} onChange={setEffort} />
+                <button onClick={() => setPlanMode(!planMode)} title={planMode ? 'Plan mode on — propose before building' : 'Plan first — propose a plan before doing the work'}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 28, padding: '0 11px', borderRadius: 9, cursor: 'pointer',
+                    background: planMode ? 'color-mix(in srgb, var(--blue) 13%, transparent)' : 'var(--fill-secondary)',
+                    border: planMode ? '1px solid color-mix(in srgb, var(--blue) 45%, transparent)' : '1px solid transparent',
+                    color: planMode ? 'var(--blue)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                  <Icon name="map" size={14} /> Plan
+                </button>
                 <span style={{ flex: 1 }} />
                 {streaming && lastTurn
                   ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
                       <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn.stage || 'working…'}
                     </span>
-                  : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Enter to send · Shift+Enter for newline</span>}
+                  : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{planMode ? 'Plan mode · ⏎ to plan' : 'Enter to send · Shift+Enter for newline'}</span>}
               </div>
             </div>
           </div>
