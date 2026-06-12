@@ -12,6 +12,7 @@ import React from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { EffortDial, CountUp } from '../lib/ui';
+import { FileChip, IS_WRITE_TOOL } from '../lib/fileChip';
 import { AppShell } from '../lib/appShell';
 import { api, type Job, type Effort, type TranscriptItem } from '../lib/api';
 
@@ -127,13 +128,16 @@ function ToolStep({ item }: { item: TranscriptItem }) {
   const error = item.toolStatus === 'error';
   const { icon, tint } = toolMeta(item.name ?? '');
   const accent = error ? 'var(--red)' : tint;
+  const isWrite = IS_WRITE_TOOL(item.name ?? '') && !!item.text;
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 9, maxWidth: 720, padding: '7px 11px 7px 8px', borderRadius: 11,
       background: error ? 'color-mix(in srgb, var(--red) 8%, var(--bg-elevated))' : `color-mix(in srgb, ${tint} 9%, var(--bg-elevated))`,
       border: `0.5px solid color-mix(in srgb, ${accent} 30%, var(--separator))` }}>
       <span style={{ width: 22, height: 22, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${accent} 18%, transparent)`, color: accent }}><Icon name={icon} size={13} /></span>
       <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{item.name}</span>
-      {item.text && <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text}</span>}
+      {isWrite
+        ? <FileChip path={item.text} preview={item.preview} />
+        : item.text && <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text}</span>}
       <span style={{ flexShrink: 0, marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5 }}>
         {running ? <span className="breathe" style={{ width: 8, height: 8, borderRadius: 4, background: tint }} />
           : error ? <Icon name="x" size={12} stroke={2.6} style={{ color: 'var(--red)' }} />

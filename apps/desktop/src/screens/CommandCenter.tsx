@@ -206,6 +206,15 @@ function fmtElapsed(createdAt: number, updatedAt: number): string {
   return `${m}:${String(s % 60).padStart(2, '0')}`;
 }
 
+/* The agent's latest live line — what it's actually doing/saying right now,
+   not the generic stage label. Falls back to stage while output is empty. */
+function liveLine(j: ApiJob): string {
+  const lines = (j.output || '').split('\n').map(l => l.trim()).filter(Boolean);
+  const last = lines[lines.length - 1] || '';
+  const cleaned = last.replace(/^[#>\-*\s]+/, '').replace(/\*\*|__|[`*_]/g, '').trim();
+  return (cleaned || j.stage || 'Working…').slice(0, 200);
+}
+
 function jobToView(j: ApiJob, projects: ProjMap): Job {
   const review = /review/i.test(j.phase) || (j.status === 'done');
   const tint = projects[j.projectId]?.color ?? 'var(--purple)';
@@ -222,7 +231,7 @@ function jobToView(j: ApiJob, projects: ProjMap): Job {
     costNum: j.cost,
     elapsed: fmtElapsed(j.createdAt, j.updatedAt),
     review,
-    stream: j.stage ? [j.stage] : [''],
+    stream: [liveLine(j)],
   };
 }
 
