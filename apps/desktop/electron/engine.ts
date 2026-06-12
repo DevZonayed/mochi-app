@@ -153,6 +153,11 @@ async function runClaude(
     options: {
       cwd,
       maxTurns: maxTurnsOverride ?? EFFORT_TURNS[effort] ?? 4,
+      // Run a CLEAN coding agent: load the project's own CLAUDE.md / .claude
+      // config, but NOT the operator's global ~/.claude settings — otherwise the
+      // user's personal plugins/hooks/skills (continuum bootstrap, brainstorming,
+      // etc.) fire inside every Maestro project instead of just doing the task.
+      settingSources: ['project'],
       // Plan mode → propose a plan, no execution. Otherwise run freely on this Mac.
       permissionMode: plan ? 'plan' : 'bypassPermissions',
       includePartialMessages: !!hooks.onProgress,
@@ -235,9 +240,13 @@ async function runClaude(
     const detail = stderrTail.trim();
     throw new Error(`${e instanceof Error ? e.message : String(e)}${detail ? `\n${detail}` : ''}`);
   }
+  // Any tool left 'running' (no matching tool_result before the stream ended)
+  // would otherwise spin forever in the UI — settle it.
+  for (const t of items) if (t.kind === 'tool' && t.toolStatus === 'running') { t.toolStatus = 'done'; t.durMs = Date.now() - t.ts; }
   // The result usually repeats the last text block — only add it when it's new.
   const lastText = [...items].reverse().find(i => i.kind === 'text')?.text.trim();
   if (resultText && resultText.trim() !== lastText) items.push({ kind: 'result', text: resultText, ts: Date.now() });
+  hooks.onProgress?.(proseOf(items), items); // final flush so the last tokens are never stranded
   const prose = proseOf(items);
   return {
     text: resultText || prose || '(no output)',
@@ -337,6 +346,8 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
         reject(Object.assign(new Error(`Codex exited ${code ?? sig}: ${stderr.slice(0, 300) || 'no output'}`), { statusCode: 500 }));
         return;
       }
+      // Codex has no per-tool completion event — settle anything still 'running'.
+      for (const t of items) if (t.kind === 'tool' && t.toolStatus === 'running') { t.toolStatus = 'done'; t.durMs = Date.now() - t.ts; }
       const lastText = [...items].reverse().find(i => i.kind === 'text')?.text.trim();
       if (text && text !== lastText) items.push({ kind: 'result', text, ts: Date.now() });
       // Subscription run — Codex doesn't bill per-token, so cost stays 0.
@@ -452,7 +463,7 @@ export class LocalEngine {
       if (t - lastFlush < STREAM_THROTTLE_MS) return;
       lastFlush = t;
       const u = this.store.updateJob(jobId, {
-        output, transcript: transcript.slice(-150),
+        output, transcript: transcript.slice(-250),
         progress: Math.min(70, 20 + Math.floor(output.length / 80)),
       });
       this.emit('job', u);
@@ -528,7 +539,7 @@ export class LocalEngine {
 
       const done = this.store.updateJob(jobId, {
         status: 'done', phase: 'Done', progress: 100, stage: '',
-        output, tokens, cost, model, transcript: main.transcript.slice(-200),
+        output, tokens, cost, model, transcript: main.transcript.slice(-400),
       });
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
@@ -556,7 +567,7 @@ export class LocalEngine {
           const c = this.store.updateJob(jobId, {
             status: 'cancelled', phase: 'Cancelled', stage: '', error: null,
             output: pendingRef.out ?? existing.output,
-            ...(pendingRef.tr.length ? { transcript: pendingRef.tr.slice(-150) } : {}),
+            ...(pendingRef.tr.length ? { transcript: pendingRef.tr.slice(-250) } : {}),
           });
           this.emit('job', c);
           this.store.pushEvent({ kind: 'job-cancelled', title: `Cancelled: ${c.title}`, projectId: c.projectId, jobId });

@@ -777,10 +777,12 @@ export class Store {
     const slimJob = (j: Job): Job => {
       const out = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
       // Remotes get a trimmed run log: last 60 items, long text blocks truncated.
-      const transcript = j.transcript
-        ? j.transcript.slice(-60).map(t => (t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t))
-        : undefined;
-      return out === j.output && !j.transcript ? j : { ...j, output: out, transcript };
+      // Skip the allocation entirely when nothing actually needs trimming.
+      const tr = j.transcript;
+      const transcript = !tr ? undefined
+        : (tr.length <= 60 && !tr.some(t => t.text.length > 4000)) ? tr
+        : tr.slice(-60).map(t => (t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t));
+      return out === j.output && transcript === tr ? j : { ...j, output: out, transcript };
     };
     const slimAsset = (a: Asset) => ({
       id: a.id, projectId: a.projectId, source: a.source, kind: a.kind, stage: a.stage,

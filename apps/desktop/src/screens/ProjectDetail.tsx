@@ -66,9 +66,18 @@ const PAGE_CSS = `
   .chat-msg:hover .turn-copy { opacity: 1; }
   .turn-copy:hover { color: var(--ink) !important; }
 
-  /* example prompt chips (empty state) */
+  /* example prompt chips (empty state) + question options — never hover when disabled */
   .ex-chip { transition: border-color 150ms ease, background 150ms ease, transform 150ms ease; cursor: pointer; }
-  .ex-chip:hover { border-color: color-mix(in srgb, var(--blue) 55%, var(--separator)) !important; background: color-mix(in srgb, var(--blue) 7%, var(--bg-elevated)) !important; transform: translateY(-1px); }
+  .ex-chip:not(:disabled):hover { border-color: color-mix(in srgb, var(--blue) 55%, var(--separator)) !important; background: color-mix(in srgb, var(--blue) 7%, var(--bg-elevated)) !important; transform: translateY(-1px); }
+
+  /* collapsible "work" toggle — clearly clickable */
+  .work-bar { transition: background 140ms ease, border-color 140ms ease; }
+  .work-bar:hover { background: var(--fill-secondary) !important; border-color: var(--separator-strong) !important; }
+
+  /* code card — keep a slim scrollbar visible so long lines read as scrollable */
+  .code-card pre::-webkit-scrollbar { height: 7px; }
+  .code-card pre::-webkit-scrollbar-thumb { background: var(--separator-strong); border-radius: 4px; }
+  .code-card pre::-webkit-scrollbar-track { background: transparent; }
 
   /* composer — focus glow ring */
   .composer-card { transition: border-color 180ms ease, box-shadow 180ms ease; }
@@ -903,7 +912,7 @@ function PathLink({ path, mono = true }: { path: string; mono?: boolean }) {
     <button onClick={() => { void api.revealPath(path); }} title="Reveal in Finder" style={{
       display: 'inline', padding: '0 2px', margin: '0 -2px', borderRadius: 4, background: 'transparent', cursor: 'pointer',
       color: 'var(--blue)', font: mono ? '500 0.92em var(--font-mono)' : 'inherit', textDecorationLine: 'underline',
-      textDecorationColor: 'color-mix(in srgb, var(--blue) 40%, transparent)', textUnderlineOffset: 2, wordBreak: 'break-all' }}>
+      textDecorationColor: 'color-mix(in srgb, var(--blue) 68%, transparent)', textUnderlineOffset: 2, wordBreak: 'break-all' }}>
       {path}
     </button>
   );
@@ -1019,10 +1028,10 @@ function ToolNode({ item, connect }: { item: TranscriptItem; connect: boolean })
     <div style={{ position: 'relative' }}>
       {connect && <span style={{ position: 'absolute', left: 17, top: -7, width: 1.5, height: 7, background: 'var(--separator-strong)' }} />}
       <div className="tool-node" style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px 7px 8px', borderRadius: 11,
-        background: error ? 'color-mix(in srgb, var(--red) 6%, var(--bg-elevated))' : `color-mix(in srgb, ${tint} 4.5%, var(--bg-elevated))`,
-        border: `0.5px solid color-mix(in srgb, ${accent} 26%, var(--separator))` }}>
+        background: error ? 'color-mix(in srgb, var(--red) 8%, var(--bg-elevated))' : `color-mix(in srgb, ${tint} 9%, var(--bg-elevated))`,
+        border: `0.5px solid color-mix(in srgb, ${accent} 30%, var(--separator))` }}>
         <span style={{ width: 22, height: 22, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center',
-          background: `color-mix(in srgb, ${accent} 14%, transparent)`, color: accent }}>
+          background: `color-mix(in srgb, ${accent} 18%, transparent)`, color: accent }}>
           <Icon name={icon} size={13} />
         </span>
         <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{item.name}</span>
@@ -1065,7 +1074,7 @@ function parseAsk(json?: string): AskQuestion[] {
       multiSelect: q.multiSelect === true || q.allowMultiple === true,
       options: (Array.isArray(q.options) ? q.options : []).map((o): AskOption =>
         typeof o === 'string' ? { label: o } : { label: String((o as AskOption).label ?? ''), description: (o as AskOption).description }),
-    })).filter(q => q.options.length > 0 || q.question);
+    })).filter(q => q.options.length > 0);
   } catch { return []; }
 }
 
@@ -1131,7 +1140,7 @@ function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (te
             Send answer
           </button>
         )}
-        {!answered && <div style={{ font: '400 12px/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>…or just type your own answer below.</div>}
+        <div style={{ font: '400 12px/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>{answered ? 'Answered — type below to change your mind.' : '…or just type your own answer below.'}</div>
       </div>
     </div>
   );
@@ -1141,7 +1150,7 @@ function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (te
 function WorkBar({ toolCount, elapsed, expanded, onToggle, children }: { toolCount: number; elapsed: string; expanded: boolean; onToggle: () => void; children: React.ReactNode }) {
   return (
     <div style={{ margin: '2px 0 4px' }}>
-      <button onClick={onToggle} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 26, padding: '0 10px 0 8px', borderRadius: 'var(--r-pill)',
+      <button onClick={onToggle} className="work-bar" title={expanded ? 'Hide the steps' : 'Show the steps'} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 26, padding: '0 11px 0 8px', borderRadius: 'var(--r-pill)',
         background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', cursor: 'pointer', color: 'var(--ink-secondary)',
         font: '600 var(--fs-caption)/1 var(--font-text)' }}>
         <Icon name="chevronRight" size={13} style={{ transform: expanded ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)', color: 'var(--ink-tertiary)' }} />
@@ -1207,7 +1216,10 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
   return blocks;
 }
 
-function AssistantTurn({ job, onRetry, onAnswer, isLast }: { job: Job; onRetry: (input: string) => void; onAnswer: (text: string) => void; isLast: boolean }) {
+/* React.memo so a ChatPane re-render (typing in the composer, a job event for
+   ANOTHER turn) doesn't re-parse the markdown of every settled turn. Only turns
+   whose job object actually changed re-render; onRetry/onAnswer are stable. */
+const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer, isLast }: { job: Job; onRetry: (input: string) => void; onAnswer: (text: string) => void; isLast: boolean }) {
   const live = job.status === 'running' || job.status === 'pending';
   const engineLabel = job.engine === 'codex' ? 'Codex' : 'Claude Code';
   const provider = job.engine === 'codex' ? 'openai' as const : 'anthropic' as const;
@@ -1320,7 +1332,7 @@ function AssistantTurn({ job, onRetry, onAnswer, isLast }: { job: Job; onRetry: 
       </div>
     </div>
   );
-}
+});
 
 function ChatPane({ projectId, project }: { projectId: string | null; project: Project | null }) {
   const [sessions, setSessions] = React.useState<ChatSession[]>([]);
@@ -1404,9 +1416,17 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   }, [projectId]);
 
   // Stick to the bottom while streaming unless the user scrolled up.
+  const [atBottom, setAtBottom] = React.useState(true);
   const onScroll = () => {
     const el = scrollRef.current; if (!el) return;
-    stickBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+    const bottom = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+    stickBottom.current = bottom;
+    setAtBottom(bottom);
+  };
+  const jumpToLatest = () => {
+    const el = scrollRef.current; if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    stickBottom.current = true; setAtBottom(true);
   };
   React.useEffect(() => {
     const el = scrollRef.current;
@@ -1416,7 +1436,9 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   const lastTurn = turns.length ? turns[turns.length - 1] : null;
   const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending');
 
-  const sendText = async (raw: string) => {
+  // Stable identity so React.memo(AssistantTurn) can skip settled turns — it's
+  // passed down as onRetry/onAnswer. Changes only when the run config does.
+  const sendText = React.useCallback(async (raw: string) => {
     const t = raw.trim();
     if (!t || !projectId || streaming) return;
     setText('');
@@ -1438,7 +1460,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
       setText(raw); // nothing lost — restore the draft
       setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
     }
-  };
+  }, [projectId, streaming, modelChoice, effort, planMode]);
 
   const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
 
@@ -1548,13 +1570,21 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
             {turns.map((t, i) => (
               <React.Fragment key={t.id}>
                 <UserBubble text={t.input} />
-                <AssistantTurn job={t} isLast={i === turns.length - 1}
-                  onRetry={(input) => { void sendText(input); }}
-                  onAnswer={(ans) => { void sendText(ans); }} />
+                <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
               </React.Fragment>
             ))}
           </div>
         </div>
+
+        {/* jump-to-latest — appears when scrolled up so new replies aren't missed */}
+        {!atBottom && turns.length > 0 && (
+          <button onClick={jumpToLatest} className="chat-msg" style={{ position: 'absolute', left: '50%', bottom: 92, transform: 'translateX(-50%)', zIndex: 3,
+            display: 'inline-flex', alignItems: 'center', gap: 6, height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', cursor: 'pointer',
+            background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 6px 18px rgba(15,20,50,.16)',
+            font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>
+            {streaming ? 'Jump to latest' : 'Latest'} <Icon name="chevronDown" size={14} />
+          </button>
+        )}
 
         {/* composer — one floating card */}
         <div style={{ position: 'relative', zIndex: 2, padding: '0 20px 16px' }}>
@@ -1569,6 +1599,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
                 <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
                   onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendText(text); } }}
                   placeholder={!projectId ? 'Pick a project first' : planMode ? 'Describe a goal — I\'ll plan it first…' : 'Message the agent…'}
+                  title="Enter to send · Shift+Enter for a new line"
                   disabled={!projectId}
                   style={{ flex: 1, resize: 'none', border: 'none', outline: 'none', background: 'transparent',
                     color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '6px 0',
@@ -1581,7 +1612,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
                 ) : (
                   <button onClick={() => { void sendText(text); }} disabled={!text.trim() || !projectId} className="send-fab" title="Send (Enter)" style={{
                     width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
-                    background: text.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: text.trim() ? '#fff' : 'var(--ink-tertiary)',
+                    background: text.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: text.trim() ? '#fff' : 'var(--ink-secondary)',
                     boxShadow: text.trim() ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: text.trim() ? 'pointer' : 'default' }}>
                     <Icon name="arrowRight" size={18} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
                   </button>
