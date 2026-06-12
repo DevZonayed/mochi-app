@@ -235,20 +235,7 @@ interface SchedRow {
   name: string;
   cron: string;
   next: string;
-  conc: number;
-  misfire: string;
   paused: boolean;
-  blocked?: boolean;
-}
-
-function MisfireChip({ policy }: { policy: string }) {
-  const tint = ({ 'Fire now': 'var(--blue)', 'Skip': 'var(--ink-secondary)', 'Coalesce': 'var(--teal)' } as Record<string, string>)[policy];
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)',
-      background: `color-mix(in srgb, ${tint} 12%, transparent)`, color: tint, font: '600 var(--fs-caption)/1 var(--font-text)', whiteSpace: 'nowrap' }}>
-      <Icon name="refresh" size={11} /> {policy}
-    </span>
-  );
 }
 
 interface ScheduleRowProps { s: SchedRow; last: boolean; onPick: (s: SchedRow) => void; projMeta: ProjMeta; onToggle: (id: string, nextEnabled: boolean) => void; onDelete: (id: string) => void }
@@ -259,22 +246,14 @@ function ScheduleRow({ s, last, onPick, projMeta, onToggle, onDelete }: Schedule
   React.useEffect(() => { setPaused(s.paused); }, [s.paused]);
   const p = projMeta;
   return (
-    <div className="sched-row" onClick={() => onPick(s)} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)} style={{ display: 'grid', gridTemplateColumns: '1.7fr 1.5fr 1fr 0.9fr 1.1fr 88px', alignItems: 'center', gap: 14,
+    <div className="sched-row" onClick={() => onPick(s)} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)} style={{ display: 'grid', gridTemplateColumns: '1.7fr 1.5fr 1fr 88px', alignItems: 'center', gap: 14,
       padding: '13px 16px', borderBottom: last ? 'none' : '0.5px solid var(--separator)', cursor: 'pointer', opacity: paused ? 0.6 : 1, transition: 'opacity 200ms ease' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
         <span style={{ width: 9, height: 9, borderRadius: 5, background: p.color, flexShrink: 0 }} />
         <span style={{ font: '600 var(--fs-callout)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
       </div>
       <span style={{ font: '400 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink-secondary)' }}>{s.cron}</span>
-      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        {s.blocked
-          ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)', background: 'rgba(255,59,48,0.14)', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)' }}><Icon name="lock" size={11} /> Blocked — cap</span>
-          : <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', whiteSpace: 'nowrap', color: paused ? 'var(--ink-tertiary)' : 'var(--ink)' }}>{s.next.startsWith('in') ? s.next : `in ${s.next}`}</span>}
-      </span>
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>
-        <Icon name="layers" size={13} style={{ color: 'var(--ink-tertiary)' }} /> {s.conc}×
-      </span>
-      <span><MisfireChip policy={s.misfire} /></span>
+      <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', whiteSpace: 'nowrap', color: paused ? 'var(--ink-tertiary)' : 'var(--ink)' }}>{s.next === '—' ? '—' : s.next.startsWith('in') ? s.next : `in ${s.next}`}</span>
       <span style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8 }} onClick={e => e.stopPropagation()}>
         <button title="Remove schedule" onClick={() => onDelete(s.id)} style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center',
           background: 'transparent', color: 'var(--ink-tertiary)', opacity: hover ? 1 : 0, transition: 'opacity 140ms ease', cursor: 'pointer' }}>
@@ -360,18 +339,6 @@ function SheetSection({ n, title, children }: { n: string; title: string; childr
   );
 }
 
-interface StepperProps { value: number; set: (v: number) => void; min?: number; max?: number; suffix?: string }
-
-function Stepper({ value, set, min = 0, max = 10, suffix }: StepperProps) {
-  return (
-    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, padding: 2, background: 'var(--fill-secondary)', borderRadius: 9 }}>
-      <button onClick={() => set(Math.max(min, value - 1))} className="step-btn" style={{ width: 30, height: 30, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink)', font: '600 18px/1 var(--font-text)' }}>−</button>
-      <span style={{ minWidth: 46, textAlign: 'center', font: '600 var(--fs-callout)/1 var(--font-mono)', color: 'var(--ink)' }}>{value}{suffix}</span>
-      <button onClick={() => set(Math.min(max, value + 1))} className="step-btn" style={{ width: 30, height: 30, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink)', font: '600 18px/1 var(--font-text)' }}>+</button>
-    </div>
-  );
-}
-
 interface ScheduleSheetProps {
   open: boolean;
   onClose: () => void;
@@ -384,23 +351,10 @@ function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) 
   const [when, setWhen] = React.useState('every weekday 9am');
   const [projectId, setProjectId] = React.useState('');
   const [advanced, setAdvanced] = React.useState(false);
-  const [misfire, setMisfire] = React.useState('fire');
-  const [retries, setRetries] = React.useState(2);
-  const [backoff, setBackoff] = React.useState('Exponential');
-  const [conc, setConc] = React.useState(1);
-  const [cap, setCap] = React.useState<string | number>(0.5);
-  React.useEffect(() => { if (open) { setWhen('every weekday 9am'); setProjectId(''); setAdvanced(false); setMisfire('fire'); setRetries(2); setConc(1); setCap(0.5); } }, [open]);
+  React.useEffect(() => { if (open) { setWhen('every weekday 9am'); setProjectId(''); setAdvanced(false); } }, [open]);
   if (!open) return null;
 
   const parsed = parseWhen(when);
-  const perMonthRuns = parsed.label === 'Weekdays' ? 22 : parsed.label === 'Every day' ? 30 : 4;
-  const monthly = (0.18 * perMonthRuns).toFixed(2);
-  const misfireOpts = [
-    { key: 'fire', label: 'Fire now', hint: 'Run immediately when the Mac wakes.' },
-    { key: 'skip', label: 'Skip', hint: 'Drop the missed run; wait for the next.' },
-    { key: 'coalesce', label: 'Coalesce', hint: 'Collapse multiple misses into one run.' },
-  ];
-  const mi = misfireOpts.findIndex(o => o.key === misfire);
 
   return (
     <div onMouseDown={onClose} style={{ position: 'absolute', inset: 0, zIndex: 80, display: 'grid', placeItems: 'center', padding: 32,
@@ -411,7 +365,7 @@ function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) 
         <div style={{ display: 'flex', alignItems: 'center', padding: '18px 20px', borderBottom: '0.5px solid var(--separator)' }}>
           <div style={{ flex: 1 }}>
             <h2 style={{ margin: 0, font: '700 var(--fs-title2)/1.1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>New schedule</h2>
-            <p style={{ margin: '3px 0 0', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>Durable — it survives sleep, restarts, and resumes from checkpoint.</p>
+            <p style={{ margin: '3px 0 0', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>Fires on this Mac at its time — missed times roll forward to the next occurrence.</p>
           </div>
           <button onClick={onClose} className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="x" size={18} /></button>
         </div>
@@ -455,48 +409,19 @@ function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) 
             )}
           </SheetSection>
 
-          {/* 3 durability */}
-          <SheetSection n="3" title="Durability">
-            <div style={{ background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)', padding: 14 }}>
-              <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 9 }}>Misfire policy</div>
-              <div style={{ position: 'relative', display: 'flex', padding: 2, background: 'var(--fill-secondary)', borderRadius: 9, marginBottom: 8 }}>
-                <div style={{ position: 'absolute', top: 2, bottom: 2, left: `calc(${mi} * (100% - 4px) / 3 + 2px)`, width: `calc((100% - 4px) / 3)`, background: 'var(--bg-elevated)', borderRadius: 7, boxShadow: '0 1px 3px rgba(0,0,0,0.14)', transition: 'left 240ms var(--spring)' }} />
-                {misfireOpts.map(o => (
-                  <button key={o.key} onClick={() => setMisfire(o.key)} style={{ flex: 1, position: 'relative', zIndex: 1, padding: '7px 0', font: '600 var(--fs-footnote)/1 var(--font-text)', color: misfire === o.key ? 'var(--ink)' : 'var(--ink-secondary)' }}>{o.label}</button>
-                ))}
-              </div>
-              <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 16 }}>{misfireOpts[mi].hint}</div>
-
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, paddingTop: 14, borderTop: '0.5px solid var(--separator)' }}>
-                <span style={{ flex: 1, font: '500 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink)' }}>Retries</span>
-                <Stepper value={retries} set={setRetries} min={0} max={5} />
-                <select value={backoff} onChange={e => setBackoff(e.target.value)} className="sel" style={{ height: 34, padding: '0 10px', borderRadius: 8, border: '0.5px solid var(--separator)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }}>
-                  <option>Exponential</option><option>Linear</option><option>Fixed</option>
-                </select>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 12 }}>
-                <span style={{ flex: 1, font: '500 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink)' }}>Concurrency limit</span>
-                <Stepper value={conc} set={setConc} min={1} max={8} />
-              </div>
+          {/* 3 what fires */}
+          <SheetSection n="3" title="What runs">
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '12px 14px', background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)' }}>
+              <Icon name="shield" size={15} style={{ color: 'var(--green)', flexShrink: 0, marginTop: 1 }} />
+              <span style={{ font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                Each firing creates a real job and runs it through your engine routing on this Mac — it shows up in Jobs and on your phone like any hand-started run, and its cost lands in Costs.
+              </span>
             </div>
-          </SheetSection>
-
-          {/* 4 budget */}
-          <SheetSection n="4" title="Budget">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, height: 46, padding: '0 14px', background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)' }}>
-              <span style={{ font: '500 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink)', flex: 1 }}>Per-run cap</span>
-              <span style={{ font: '500 22px/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>$</span>
-              <input value={cap} onChange={e => setCap(e.target.value)} style={{ width: 56, border: 'none', outline: 'none', background: 'transparent', textAlign: 'right', font: '600 22px/1 var(--font-mono)', color: 'var(--ink)' }} />
-            </div>
-            <div style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 8, padding: '0 4px' }}>Project has <b style={{ color: 'var(--ink)', fontWeight: 600 }}>$31.40</b> left this month.</div>
           </SheetSection>
         </div>
 
         {/* footer */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 20px', borderTop: '0.5px solid var(--separator)' }}>
-          <div style={{ flex: 1, font: '500 var(--fs-footnote)/1.3 var(--font-mono)', color: 'var(--ink-secondary)' }}>
-            ≈ <b style={{ color: 'var(--ink)', fontWeight: 600 }}>$0.18</b>/run · ≈ <b style={{ color: 'var(--ink)', fontWeight: 600 }}>${monthly}</b>/mo
-          </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 14, padding: '14px 20px', borderTop: '0.5px solid var(--separator)' }}>
           <button onClick={onClose} style={{ height: 40, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
           <button onClick={() => onSave({ title: parsed.summary, time: parsed.time, cadence: parsed.label, projectId: projectId || undefined })} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Save schedule</button>
         </div>
@@ -638,7 +563,7 @@ function cronLine(s: Schedule): string {
 function nextLine(nextRun: number | null): string {
   if (!nextRun) return '—';
   const ms = nextRun - Date.now();
-  if (ms <= 0) return 'in 7m';
+  if (ms <= 0) return 'due now';
   const mins = Math.round(ms / 60000);
   if (mins < 60) return `${mins}m`;
   const hrs = Math.floor(mins / 60);
@@ -689,8 +614,6 @@ export default function Scheduler() {
     name: s.title,
     cron: cronLine(s),
     next: nextLine(s.nextRun),
-    conc: 1,
-    misfire: 'Fire now',
     paused: !s.enabled,
   })), [schedules]);
 
@@ -751,7 +674,7 @@ export default function Scheduler() {
         {/* durability reassurance */}
         <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: 18, font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
           <Icon name="shield" size={14} style={{ color: 'var(--green)' }} />
-          Schedules run even while you sleep — if the Mac sleeps too, the job resumes from checkpoint on wake.
+          Schedules fire on this Mac while Maestro is running — a missed time rolls forward to the next occurrence.
         </div>
 
         {/* body */}
