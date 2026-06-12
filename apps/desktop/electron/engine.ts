@@ -23,7 +23,10 @@ const require = createRequire(__filename);
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
 // coding agent needs real headroom — 4 turns dies mid-`ls`.
 const EFFORT_TURNS: Record<string, number> = { fast: 8, balanced: 24, deep: 48, max: 96 };
-const STREAM_THROTTLE_MS = 800;
+/* Streaming cadences: local windows get a frame every ≤50ms (perceptually
+   realtime); disk + relay get a checkpoint every ~1s. */
+const STREAM_THROTTLE_MS = 50;
+const CHECKPOINT_MS = 1000;
 
 export interface EngineStatus {
   engine: EngineId;
@@ -427,7 +430,7 @@ export class LocalEngine {
   /** jobId → live cancel handle (abort for claude, child for codex). */
   private running = new Map<string, { ac: AbortController; child?: ChildProcess }>();
 
-  constructor(private store: Store, private emit: (name: string, data: unknown) => void, private providers?: Providers) {}
+  constructor(private store: Store, private emit: (name: string, data: unknown, opts?: { live?: boolean }) => void, private providers?: Providers) {}
 
   /** Is this engine actually runnable right now, and if not, exactly why. */
   status(engine: EngineId): EngineStatus {
@@ -517,23 +520,46 @@ export class LocalEngine {
     });
     this.emit('job', cur);
 
-    // Throttled live writer: prose + structured transcript, at most every STREAM_THROTTLE_MS.
-    let lastFlush = 0;
-    const pendingRef: { out: string | null; tr: TranscriptItem[] } = { out: null, tr: [] };
+    /* Live writer at two cadences. Every frame (≤STREAM_THROTTLE_MS apart) goes
+       to the local windows in-memory — that's what makes streaming feel
+       realtime. Every CHECKPOINT_MS one of those frames also persists to disk
+       and feeds the relay/phone. A trailing timer guarantees the tail of a
+       burst lands even if no further delta arrives. */
+    let lastFrame = 0;
+    let lastCheckpoint = 0;
+    let trailer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+    const pendingRef: { out: string | null; tr: TranscriptItem[]; usage?: LiveUsage } = { out: null, tr: [] };
+    const sendFrame = () => {
+      if (settled || pendingRef.out === null) return;
+      const t = Date.now();
+      lastFrame = t;
+      const patch = {
+        output: pendingRef.out, transcript: pendingRef.tr.slice(-250),
+        progress: Math.min(70, 20 + Math.floor(pendingRef.out.length / 80)),
+        // Live cost/token counters so the UI ticks them up during the run.
+        ...(pendingRef.usage ? { tokens: pendingRef.usage.tokens, cost: pendingRef.usage.cost } : {}),
+      };
+      if (t - lastCheckpoint >= CHECKPOINT_MS) {
+        lastCheckpoint = t;
+        this.emit('job', this.store.updateJob(jobId, patch)); // persist + relay
+      } else {
+        this.emit('job', this.store.updateJobLive(jobId, patch), { live: true }); // local frame
+      }
+    };
     const flush = (output: string, transcript: TranscriptItem[], usage?: LiveUsage) => {
       pendingRef.out = output;
       pendingRef.tr = transcript;
-      const t = Date.now();
-      if (t - lastFlush < STREAM_THROTTLE_MS) return;
-      lastFlush = t;
-      const u = this.store.updateJob(jobId, {
-        output, transcript: transcript.slice(-250),
-        progress: Math.min(70, 20 + Math.floor(output.length / 80)),
-        // Live cost/token counters so the UI ticks them up during the run.
-        ...(usage ? { tokens: usage.tokens, cost: usage.cost } : {}),
-      });
-      this.emit('job', u);
+      pendingRef.usage = usage;
+      const wait = STREAM_THROTTLE_MS - (Date.now() - lastFrame);
+      if (wait <= 0) {
+        if (trailer) { clearTimeout(trailer); trailer = null; }
+        sendFrame();
+      } else if (!trailer) {
+        trailer = setTimeout(() => { trailer = null; sendFrame(); }, wait);
+      }
     };
+    const settleStream = () => { settled = true; if (trailer) { clearTimeout(trailer); trailer = null; } };
 
     try {
       const effort = opts.effort ?? cur.effort;
@@ -567,6 +593,7 @@ export class LocalEngine {
       const main = master === 'claude'
         ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks, resumeId, opts.model, opts.plan)
         : await runCodex(prompt, cwd, hooks, false, opts.model);
+      settleStream(); // stream is over — no trailing frame may race the final states below
 
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {
         try { this.store.updateSession(session.id, { sdkSessionId: main.sdkSessionId }); } catch { /* session deleted mid-run */ }
@@ -626,6 +653,7 @@ export class LocalEngine {
       }
       return done;
     } catch (e) {
+      settleStream();
       this.running.delete(jobId);
       if (e instanceof CancelledError || ac.signal.aborted) {
         const existing = this.store.getJob(jobId);

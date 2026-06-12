@@ -1313,6 +1313,11 @@ const fmtDuration = (ms: number): string => {
   const s = Math.max(0, Math.round(ms / 1000));
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 };
+/* Live variant: tenths of a second so the running clock feels realtime. */
+const fmtDurationLive = (ms: number): string => {
+  const s = Math.max(0, ms / 1000);
+  return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${(s % 60).toFixed(1)}s`;
+};
 
 function UserBubble({ text }: { text: string }) {
   return (
@@ -1385,10 +1390,11 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   const [, tick] = React.useReducer((x: number) => x + 1, 0);
   React.useEffect(() => {
     if (!live) return;
-    const t = setInterval(tick, 1000);
+    const t = setInterval(tick, 100); // tenth-of-a-second clock while running
     return () => clearInterval(t);
   }, [live]);
-  const elapsed = fmtDuration((live ? Date.now() : job.updatedAt) - job.createdAt);
+  const elapsedMs = (live ? Date.now() : job.updatedAt) - job.createdAt;
+  const elapsed = live ? fmtDurationLive(elapsedMs) : fmtDuration(elapsedMs);
 
   // The final answer = last text/result block. Everything before it is "work"
   // (narration + tools) that collapses once the turn is done. A turn that ends

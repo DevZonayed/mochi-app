@@ -298,8 +298,16 @@ export class Store {
       this.save();
     }
   }
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private save(): void {
+    if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = null; }
     try { writeFileSync(this.file, JSON.stringify(this.data, null, 2)); } catch { /* disk hiccup — retry next save */ }
+  }
+  /** Debounced save for high-frequency live updates: at most one disk write per
+      window; any direct save() flushes immediately and cancels the timer. */
+  private saveSoon(ms = 1200): void {
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => { this.saveTimer = null; this.save(); }, ms);
   }
 
   get deck(): { deckId: string; deckSecret: string } {
@@ -433,6 +441,16 @@ export class Store {
     if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });
     this.save();
+    return cur;
+  }
+  /** Streaming-frame variant: updates memory + defers the disk write (debounced).
+      Used by the engine's high-frequency live flush; terminal states always go
+      through updateJob so they persist immediately. */
+  updateJobLive(jobId: string, patch: Partial<Pick<Job, 'progress' | 'output' | 'cost' | 'tokens' | 'stage' | 'transcript'>>): Job {
+    const cur = this.getJob(jobId);
+    if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
+    Object.assign(cur, patch, { updatedAt: now() });
+    this.saveSoon();
     return cur;
   }
   deleteJob(jobId: string): void {

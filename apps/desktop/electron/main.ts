@@ -62,10 +62,13 @@ app.whenReady().then(() => {
 
   let relay: RelayClient | null = null;
   let telegram: TelegramBot | null = null;
-  const emit = (name: string, data: unknown) => {
+  const emit = (name: string, data: unknown, opts?: { live?: boolean }) => {
     for (const w of BrowserWindow.getAllWindows()) {
       try { w.webContents.send('maestro:event', { name, data }); } catch { /* window closing */ }
     }
+    // Streaming frames (50ms cadence) are local-only: the relay/phone gets the
+    // ~1s checkpoint updates instead of a snapshot push per frame.
+    if (opts?.live) return;
     if (name === 'settings' && data && typeof data === 'object') applyLoginItem(!!(data as { openAtLogin?: boolean }).openAtLogin);
     // A new pending approval (e.g. reviewer NEEDS WORK) → push to Telegram gates.
     if (name === 'approval' && telegram && (data as Approval)?.status === 'pending') telegram.notifyApproval(data as Approval);
