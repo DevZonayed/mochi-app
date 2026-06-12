@@ -347,3 +347,48 @@ export const EFFORT_EST: Record<EffortStop, { cost: string; mins: string }> = {
   DEEP:     { cost: '1.80', mins: '36' },
   MAX:      { cost: '3.00', mins: '72' },
 };
+
+/* Smoothly animated number. Tweens from the value it is CURRENTLY showing to
+   the new target (never restarts from 0), so live counters — tokens, cost,
+   spend — roll up smoothly instead of snapping. `format` controls how the
+   interpolated value is rendered (default: rounded with thousands separators).
+   Honors prefers-reduced-motion. */
+export interface CountUpProps {
+  value: number;
+  format?: (n: number) => string;
+  duration?: number;
+  className?: string;
+  style?: React.CSSProperties;
+}
+
+export function CountUp({ value, format, duration = 650, className, style }: CountUpProps) {
+  const [shown, setShown] = React.useState(value);
+  const shownRef = React.useRef(value);
+  const rafRef = React.useRef<number | null>(null);
+
+  React.useEffect(() => {
+    const from = shownRef.current;
+    const to = value;
+    if (Math.abs(to - from) < 1e-6) { shownRef.current = to; setShown(to); return; }
+    const reduce = typeof window !== 'undefined' && window.matchMedia
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce) { shownRef.current = to; setShown(to); return; }
+    let start: number | null = null;
+    const ease = (t: number) => 1 - Math.pow(1 - t, 3); // easeOutCubic — fast then settles
+    const tick = (ts: number) => {
+      if (start === null) start = ts;
+      const p = Math.min(1, (ts - start) / duration);
+      const cur = from + (to - from) * ease(p);
+      shownRef.current = cur;
+      setShown(cur);
+      if (p < 1) rafRef.current = requestAnimationFrame(tick);
+      else { shownRef.current = to; setShown(to); rafRef.current = null; }
+    };
+    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(tick);
+    return () => { if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; } };
+  }, [value, duration]);
+
+  const fmt = format ?? ((n: number) => Math.round(n).toLocaleString());
+  return <span className={className} style={style}>{fmt(shown)}</span>;
+}

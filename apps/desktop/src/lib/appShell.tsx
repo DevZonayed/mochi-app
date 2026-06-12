@@ -8,6 +8,7 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, MaestroMark } from './icons';
 import { NAV_ROUTES, ALL_NAV } from './routes';
 import { api } from './api';
+import { CountUp } from './ui';
 
 export const APP_W = 1320, APP_H = 860;
 
@@ -291,8 +292,8 @@ export function BudgetChip() {
       borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)', cursor: 'pointer',
     }}>
       <span style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--green)', flexShrink: 0 }} />
-      <span className="count-up" style={{ font: '600 var(--fs-subhead)/1 var(--font-mono)', color: 'var(--ink)' }}>
-        {month === null ? '—' : `$${month.toFixed(2)}`}
+      <span style={{ font: '600 var(--fs-subhead)/1 var(--font-mono)', color: 'var(--ink)' }}>
+        {month === null ? '—' : <CountUp value={month} format={n => '$' + n.toFixed(2)} />}
       </span>
       <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>this month</span>
     </button>

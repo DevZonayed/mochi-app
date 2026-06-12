@@ -18,6 +18,7 @@ import {
   EFFORT_META,
   ModelSwitcher,
   ProviderGlyph,
+  CountUp,
   CHAT_MODELS,
   chatModelToRun,
   type EffortStop,
@@ -1253,7 +1254,6 @@ function UserBubble({ text }: { text: string }) {
   );
 }
 
-const fmtTok = (n: number): string => (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
 
 /** A small quiet stat pill — `live` tints it while the counter is still ticking. */
 function MetaPill({ children, live }: { children: React.ReactNode; live?: boolean }) {
@@ -1383,9 +1383,9 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
         {live && (
           <div style={{ marginTop: 9, display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
             <MetaPill live><Icon name="clock" size={10} /> {elapsed}</MetaPill>
-            {job.tokens > 0 && <MetaPill live>{fmtTok(job.tokens)} tok</MetaPill>}
-            {job.cost > 0 && <MetaPill live>~${job.cost.toFixed(job.cost < 1 ? 3 : 2)}</MetaPill>}
-            {toolCount > 0 && <MetaPill live><Icon name="command" size={10} /> {toolCount} {toolCount === 1 ? 'tool' : 'tools'}</MetaPill>}
+            {job.tokens > 0 && <MetaPill live><CountUp value={job.tokens} /> tok</MetaPill>}
+            {job.cost > 0 && <MetaPill live>~$<CountUp value={job.cost} format={n => n.toFixed(job.cost < 1 ? 3 : 2)} /></MetaPill>}
+            {toolCount > 0 && <MetaPill live><Icon name="command" size={10} /> <CountUp value={toolCount} /> {toolCount === 1 ? 'tool' : 'tools'}</MetaPill>}
           </div>
         )}
         {job.status === 'failed' && (
@@ -1409,8 +1409,8 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
         {job.status === 'done' && (
           <div style={{ marginTop: 9, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
             <MetaPill><Icon name="clock" size={10} /> {elapsed}</MetaPill>
-            {job.tokens > 0 && <MetaPill>{fmtTok(job.tokens)} tok</MetaPill>}
-            {job.cost > 0 && <MetaPill>${job.cost.toFixed(job.cost < 1 ? 3 : 2)}</MetaPill>}
+            {job.tokens > 0 && <MetaPill><CountUp value={job.tokens} /> tok</MetaPill>}
+            {job.cost > 0 && <MetaPill>$<CountUp value={job.cost} format={n => n.toFixed(job.cost < 1 ? 3 : 2)} /></MetaPill>}
             {toolCount > 0 && <MetaPill><Icon name="command" size={10} /> {toolCount} {toolCount === 1 ? 'tool' : 'tools'}</MetaPill>}
           </div>
         )}

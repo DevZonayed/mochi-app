@@ -11,7 +11,7 @@
 import React from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
-import { EffortDial } from '../lib/ui';
+import { EffortDial, CountUp } from '../lib/ui';
 import { AppShell } from '../lib/appShell';
 import { api, type Job, type Effort, type TranscriptItem } from '../lib/api';
 
@@ -179,7 +179,7 @@ function transcriptBlocks(job: Job | null, live: boolean): React.ReactNode[] {
 
 interface RailMeterProps {
   label: string;
-  value: string;
+  value: React.ReactNode;
   tint?: string;
 }
 
@@ -204,7 +204,7 @@ function EffortPill({ v }: { v: 'FAST' | 'BALANCED' | 'DEEP' | 'MAX' }) {
 
 interface RightRailProps {
   cost: number;
-  tokens: string;
+  tokens: number;
   elapsed: string;
   effort: 'FAST' | 'BALANCED' | 'DEEP' | 'MAX';
   engine?: string;
@@ -220,8 +220,8 @@ function RightRail({ cost, tokens, elapsed, effort, engine, model, live, onCance
       background: 'var(--bg-grouped)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
       {/* real meters */}
       <div style={{ display: 'flex', gap: 10 }}>
-        <RailMeter label="Cost" value={`$${cost.toFixed(2)}`} />
-        <RailMeter label="Tokens" value={tokens} />
+        <RailMeter label="Cost" value={<CountUp value={cost} format={n => '$' + n.toFixed(2)} />} />
+        <RailMeter label="Tokens" value={<CountUp value={tokens} />} />
       </div>
       <RailMeter label="Elapsed" value={elapsed} />
 
@@ -361,8 +361,6 @@ function statusToRunState(s: Job['status']): RunState {
 
 const ENGINE_LABEL: Record<string, string> = { claude: 'Claude Code', codex: 'Codex' };
 
-const fmtTokens = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
-
 const EFFORT_TO_PILL: Record<Effort, 'FAST' | 'BALANCED' | 'DEEP' | 'MAX'> = {
   fast: 'FAST',
   balanced: 'BALANCED',
@@ -374,8 +372,8 @@ export default function SessionTranscript() {
   const navigate = useNavigate();
   const { id: routeId } = useParams<{ id: string }>();
   const [runState, setRunState] = React.useState<RunState>('live');
-  const [cost, setCost] = React.useState(0.42);
-  const [tokens, setTokens] = React.useState('31.8k');
+  const [cost, setCost] = React.useState(0);
+  const [tokens, setTokens] = React.useState(0);
   const [elapsed, setElapsed] = React.useState(252); // seconds
   const [atBottom, setAtBottom] = React.useState(true);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
@@ -402,7 +400,7 @@ export default function SessionTranscript() {
         setJob(j);
         setRunState(statusToRunState(j.status));
         setCost(j.cost);
-        setTokens(fmtTokens(j.tokens));
+        setTokens(j.tokens);
         // Derive elapsed from the job's own timestamps (createdAt → updatedAt).
         setElapsed(Math.max(0, Math.round((j.updatedAt - j.createdAt) / 1000)));
         try {
@@ -429,7 +427,7 @@ export default function SessionTranscript() {
         setJob(j);
         setRunState(statusToRunState(j.status));
         setCost(j.cost);
-        setTokens(fmtTokens(j.tokens));
+        setTokens(j.tokens);
         setElapsed(Math.max(0, Math.round((j.updatedAt - j.createdAt) / 1000)));
       },
     });

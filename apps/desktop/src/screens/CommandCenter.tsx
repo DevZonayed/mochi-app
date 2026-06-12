@@ -5,7 +5,7 @@
 import React from 'react';
 import { AppShell } from '../lib/appShell';
 import { Icon, type IconName } from '../lib/icons';
-import { Spinner } from '../lib/ui';
+import { Spinner, CountUp } from '../lib/ui';
 import { api, type DashboardData, type Approval, type Job as ApiJob } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from <Page>.html) ───────────────────────── */
@@ -186,6 +186,8 @@ interface Job {
   progress: number;
   tokens: string;
   cost: string;
+  tokensNum: number;
+  costNum: number;
   elapsed: string;
   review?: boolean;
   stream: string[];
@@ -216,6 +218,8 @@ function jobToView(j: ApiJob, projects: ProjMap): Job {
     progress: j.progress,
     tokens: fmtTokens(j.tokens),
     cost: j.cost.toFixed(2),
+    tokensNum: j.tokens,
+    costNum: j.cost,
     elapsed: fmtElapsed(j.createdAt, j.updatedAt),
     review,
     stream: j.stage ? [j.stage] : [''],
@@ -255,8 +259,8 @@ function ActiveJobs({ tick, jobs, projects }: { tick: number; jobs: Job[]; proje
                   <div style={{ width: `${j.progress}%`, height: '100%', borderRadius: 2,
                     background: j.review ? 'var(--orange)' : 'var(--blue)', transition: 'width 600ms var(--spring)' }} />
                 </div>
-                <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>{j.tokens} tok</span>
-                <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink)', whiteSpace: 'nowrap' }}>${j.cost}</span>
+                <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}><CountUp value={j.tokensNum} /> tok</span>
+                <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink)', whiteSpace: 'nowrap' }}><CountUp value={j.costNum} format={n => '$' + n.toFixed(2)} /></span>
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>
                   <Icon name="clock" size={12} /> {j.elapsed}
                 </span>

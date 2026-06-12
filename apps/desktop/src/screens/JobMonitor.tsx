@@ -7,7 +7,7 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
-import { Spinner } from '../lib/ui';
+import { Spinner, CountUp } from '../lib/ui';
 import { AppShell } from '../lib/appShell';
 import { api, type Job as ApiJob, type Project } from '../lib/api';
 
@@ -553,7 +553,7 @@ function ActivityRow({ job, lane, nowMs, onCancel, open, onToggle }: { job: Job;
         </span>
         <span style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, maxWidth: 140, overflow: 'hidden' }}><span style={{ width: 7, height: 7, borderRadius: 4, background: lane.color, flexShrink: 0 }} /><span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{lane.name}</span></span>
-          {job.cost > 0 && <span style={{ color: 'var(--ink-secondary)' }}>${job.cost.toFixed(2)}</span>}
+          {job.cost > 0 && <span style={{ color: 'var(--ink-secondary)' }}><CountUp value={job.cost} format={n => '$' + n.toFixed(2)} /></span>}
           <span>{fmtAgo(nowMs - when)}</span>
           <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)', transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
         </span>
@@ -643,8 +643,8 @@ function Inspector({ job, lanes, nowMs, onClose, onCancel }: InspectorProps) {
 
         {/* real run stats */}
         <div style={{ display: 'flex', gap: 10 }}>
-          <Stat label="Cost" value={cost > 0 ? `$${cost.toFixed(2)}` : '—'} />
-          <Stat label="Tokens" value={job.tokens > 0 ? job.tokens.toLocaleString() : '—'} />
+          <Stat label="Cost" value={cost > 0 ? <CountUp value={cost} format={n => '$' + n.toFixed(2)} /> : '—'} />
+          <Stat label="Tokens" value={job.tokens > 0 ? <CountUp value={job.tokens} /> : '—'} />
           <Stat label={job.status === 'running' ? 'Elapsed' : 'Duration'} value={fmtDur(Math.max(0, elapsedMs))} />
         </div>
 
@@ -685,7 +685,7 @@ function Tag({ icon, tint, children }: { icon: IconName; tint: string; children?
 function Label({ children }: { children?: React.ReactNode }) {
   return <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 8 }}>{children}</div>;
 }
-function Stat({ label, value }: { label: string; value: string }) {
+function Stat({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div style={{ flex: 1, background: 'var(--bg-elevated)', borderRadius: 10, border: '0.5px solid var(--separator)', padding: '10px 12px' }}>
       <div style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginBottom: 5 }}>{label}</div>
