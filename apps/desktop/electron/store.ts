@@ -47,6 +47,8 @@ export interface TranscriptItem {
   name?: string;
   toolStatus?: 'running' | 'done' | 'error';
   durMs?: number;
+  /** file-writing tools only: a capped snapshot of the content written, for the hover preview. */
+  preview?: string;
   /** ask only: JSON of the AskUserQuestion input ({ questions:[{question,header,options,multiSelect}] }). */
   ask?: string;
   ts: number;

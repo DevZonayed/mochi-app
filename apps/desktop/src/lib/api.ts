@@ -44,6 +44,8 @@ export interface TranscriptItem {
   name?: string;
   toolStatus?: 'running' | 'done' | 'error';
   durMs?: number;
+  /** file-writing tools only: capped snapshot of the written content (hover preview). */
+  preview?: string;
   ask?: string;
   ts: number;
 }

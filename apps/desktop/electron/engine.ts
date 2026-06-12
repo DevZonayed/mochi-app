@@ -83,6 +83,22 @@ function toolDetail(input: unknown): string {
   return typeof first === 'string' ? first.slice(0, 110) : '';
 }
 
+const PREVIEW_CAP = 8000;
+/** For file-writing tools, a capped snapshot of the content written, so the
+    chat can show a file chip + hover preview. Undefined for non-write tools. */
+function toolPreview(name: string, input: unknown): string | undefined {
+  if (!input || typeof input !== 'object') return undefined;
+  if (!/write|edit|create|patch|notebook/i.test(name || '')) return undefined;
+  const i = input as Record<string, unknown>;
+  let content: string | undefined;
+  if (typeof i.content === 'string') content = i.content;                 // Write
+  else if (typeof i.new_string === 'string') content = i.new_string;      // Edit
+  else if (typeof i.new_str === 'string') content = i.new_str;            // apply_patch variants
+  else if (Array.isArray(i.edits)) content = (i.edits as Record<string, unknown>[]).map(e => (typeof e?.new_string === 'string' ? e.new_string : '')).filter(Boolean).join('\n\n'); // MultiEdit
+  if (typeof content !== 'string') return undefined;
+  return content.length > PREVIEW_CAP ? content.slice(0, PREVIEW_CAP) + '\n… (truncated)' : content;
+}
+
 const proseOf = (items: TranscriptItem[]): string =>
   items.filter(i => i.kind === 'text').map(i => i.text.trim()).filter(Boolean).join('\n\n');
 
@@ -256,6 +272,8 @@ async function runClaude(
           } else if (b.type === 'tool_use') {
             openText = null;
             const t: TranscriptItem = { kind: 'tool', name: b.name ?? 'tool', text: toolDetail(b.input), toolStatus: 'running', ts: Date.now() };
+            const preview = toolPreview(b.name ?? '', b.input);
+            if (preview !== undefined) t.preview = preview;
             items.push(t);
             if (b.id) toolById.set(b.id, t);
           }
