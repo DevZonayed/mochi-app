@@ -344,26 +344,8 @@ function Timeline({ jobs, lanes, nowMs, onSelect, selectedId }: TimelineProps) {
 }
 
 /* ────────────────────────────────────────────────────────────────────────
-   Shared atoms borrowed by this page (ShapeChip from pd-jobs, Segmented from
-   pj-cards) — inlined because they are not exported by the shared library.
+   Segmented control (inlined from pj-cards — not exported by the shared lib).
    ──────────────────────────────────────────────────────────────────────── */
-
-const SHAPES: Record<string, { label: string; tint: string }> = {
-  single:   { label: 'Single',      tint: 'var(--ink-secondary)' },
-  pbr:      { label: 'Plan→Build→Review', tint: 'var(--blue)' },
-  fanout:   { label: 'Fan-out',     tint: 'var(--purple)' },
-  pipeline: { label: 'Pipeline',    tint: 'var(--teal)' },
-};
-function ShapeChip({ shape }: { shape: string }) {
-  const s = SHAPES[shape] || SHAPES.single;
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)',
-      background: `color-mix(in srgb, ${s.tint} 13%, transparent)`, color: s.tint,
-      font: '600 var(--fs-caption)/1 var(--font-text)', whiteSpace: 'nowrap', flexShrink: 0 }}>
-      <span style={{ width: 5, height: 5, borderRadius: 3, background: s.tint }} />{s.label}
-    </span>
-  );
-}
 
 interface SegmentedOption {
   key: string;
@@ -494,7 +476,6 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
    ──────────────────────────────────────────────────────────────────────── */
 
 const EFFORT_TINT: Record<string, string> = { FAST: 'var(--green)', BALANCED: 'var(--blue)', DEEP: 'var(--orange)', MAX: 'var(--red)' };
-const MON_TRIG_ICON: Record<string, IconName> = { hand: 'play', clock: 'clock', chat: 'command', webhook: 'bolt' };
 
 function laneOf(lanes: Lane[], id: string): Lane {
   return lanes.find(l => l.id === id) ?? { id, name: 'Unassigned', color: 'var(--ink-secondary)' };
@@ -515,57 +496,98 @@ function MonStatus({ status }: { status: Status }) {
   );
 }
 
-interface MonTableProps {
+/* A human one-liner of what the agent is actually doing / did — the thing you
+   want to see without clicking in. Running → its latest live line; done → a
+   concise lead from the result; failed → the error. Real output, not stats. */
+function cleanLine(s: string): string {
+  return s.replace(/^[#>\-*\s]+/, '').replace(/\*\*|__|[`*_]/g, '').trim();
+}
+function activityLine(j: Job): string {
+  const lines = (j.output || '').split('\n').map(l => l.trim()).filter(Boolean);
+  if (j.status === 'failed') return cleanLine((j.last || lines[0] || 'Run failed')).slice(0, 240) || 'Run failed';
+  if (j.status === 'running') return (cleanLine(lines[lines.length - 1] || j.last || '') || 'Working…').slice(0, 240);
+  if (j.status === 'done') {
+    const lead = lines.find(l => !/^[#`]/.test(l) && cleanLine(l).length > 1) || lines[0] || '';
+    return (cleanLine(lead) || 'Completed').slice(0, 240);
+  }
+  if (j.status === 'cancelled') return 'Cancelled';
+  return j.last || 'Queued';
+}
+/** Where a job's transcript lives: a chat thread for session jobs, else the
+    read-only transcript screen. */
+function transcriptHref(j: Job): string {
+  return j.sessionId ? `/project-detail/${j.lane}?s=${encodeURIComponent(j.sessionId)}` : `/session-transcript/${j.id}`;
+}
+
+interface ActivityListProps {
   jobs: Job[];
   lanes: Lane[];
   nowMs: number;
-  onSelect: (job: Job) => void;
-  selectedId: string | null;
   onCancel: (job: Job) => void;
 }
 
-function MonTable({ jobs, lanes, nowMs, onSelect, selectedId, onCancel }: MonTableProps) {
-  const cols = '1.1fr 1.8fr 1.1fr 0.7fr 1fr 0.8fr 0.7fr 0.8fr 0.7fr 64px';
+/* One scannable job row: status + title + a live line of what the agent is
+   doing, with light meta. Click to expand its recent output inline — no
+   slide-over, no drilling through panels just to see what happened. */
+function ActivityRow({ job, lane, nowMs, onCancel, open, onToggle }: { job: Job; lane: Lane; nowMs: number; onCancel: (j: Job) => void; open: boolean; onToggle: () => void }) {
+  const navigate = useNavigate();
+  const m = STATUS_META[job.status];
+  const running = job.status === 'running';
+  const when = job.endMs ?? nowMs;
+  const out = (job.output || '').trim();
+  const tail = out.length > 5000 ? '…' + out.slice(-5000) : out;
+  return (
+    <div style={{ borderBottom: '0.5px solid var(--separator)' }}>
+      <div onClick={onToggle} className="mon-row" style={{ display: 'flex', alignItems: 'center', gap: 13, padding: '13px 16px', cursor: 'pointer' }}>
+        <span style={{ width: 26, height: 26, borderRadius: 8, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${m.tint} 14%, transparent)`, color: m.tint }}>
+          {running ? <Spinner size={13} color={m.tint} /> : job.status === 'failed' ? <Icon name="x" size={14} stroke={2.6} /> : job.status === 'done' ? <Icon name="check" size={14} stroke={2.8} /> : <Icon name="clock" size={13} />}
+        </span>
+        <span style={{ flex: 1, minWidth: 0 }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{job.name}</span>
+            <span style={{ flexShrink: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: m.tint }}>{m.label}</span>
+          </span>
+          <span style={{ display: 'block', marginTop: 3, font: `400 var(--fs-footnote)/1.35 var(--font-${running ? 'mono' : 'text'})`, color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {activityLine(job)}{running && <span className="cursor-blink" style={{ marginLeft: 2 }}>▍</span>}
+          </span>
+        </span>
+        <span style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, maxWidth: 140, overflow: 'hidden' }}><span style={{ width: 7, height: 7, borderRadius: 4, background: lane.color, flexShrink: 0 }} /><span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{lane.name}</span></span>
+          {job.cost > 0 && <span style={{ color: 'var(--ink-secondary)' }}>${job.cost.toFixed(2)}</span>}
+          <span>{fmtAgo(nowMs - when)}</span>
+          <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)', transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+        </span>
+      </div>
+      {open && (
+        <div style={{ padding: '0 16px 14px 55px' }}>
+          <div className="tl-scroll" style={{ maxHeight: 300, overflowY: 'auto', background: 'var(--bg-grouped)', borderRadius: 10, border: '0.5px solid var(--separator)', padding: '12px 14px',
+            font: '400 var(--fs-footnote)/1.55 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {tail || (running ? 'Working…' : 'No output recorded.')}
+            {running && <span className="cursor-blink" style={{ marginLeft: 2, color: m.tint }}>▍</span>}
+          </div>
+          <div style={{ display: 'flex', gap: 9, marginTop: 10 }}>
+            <button onClick={e => { e.stopPropagation(); navigate(transcriptHref(job)); }} className="primary-cta" style={{ height: 36, padding: '0 15px', borderRadius: 'var(--r-pill)', border: 'none', cursor: 'pointer',
+              display: 'inline-flex', alignItems: 'center', gap: 7, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+              <Icon name={job.sessionId ? 'command' : 'terminal'} size={14} /> {job.sessionId ? 'Open chat' : 'Open transcript'}
+            </button>
+            {running && <button onClick={e => { e.stopPropagation(); onCancel(job); }} className="cancel-btn" style={{ height: 36, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'rgba(255,59,48,0.12)', color: 'var(--red)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Cancel</button>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ActivityList({ jobs, lanes, nowMs, onCancel }: ActivityListProps) {
+  const [openId, setOpenId] = React.useState<string | null>(null);
+  const sorted = [...jobs].sort((a, b) => (b.endMs ?? nowMs) - (a.endMs ?? nowMs) || b.startMs - a.startMs);
   return (
     <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden',
       backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: cols, alignItems: 'center', gap: 12, padding: '11px 16px',
-        borderBottom: '0.5px solid var(--separator)', background: 'var(--fill-tertiary)' }}>
-        {['Project', 'Job', 'Shape', 'Trigger', 'Status', 'Effort', 'Cost', 'Started', 'Duration', ''].map((h, i) => (
-          <span key={i} style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)',
-            textAlign: i === 6 ? 'right' : 'left' }}>{h}</span>
-        ))}
-      </div>
-      {jobs.map((j, i) => {
-        const lane = laneOf(lanes, j.lane);
-        const dur = j.endMs != null ? fmtDur(j.endMs - j.startMs) : (j.status === 'running' ? fmtDur(nowMs - j.startMs) : '—');
-        const started = fmtAgo(nowMs - j.startMs);
-        return (
-          <div key={j.id} onClick={() => onSelect(j)} className="mon-row" style={{ display: 'grid', gridTemplateColumns: cols, alignItems: 'center', gap: 12,
-            padding: '12px 16px', borderBottom: i < jobs.length - 1 ? '0.5px solid var(--separator)' : 'none', cursor: 'pointer',
-            background: selectedId === j.id ? 'var(--fill-tertiary)' : 'transparent' }}>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
-              <span style={{ width: 8, height: 8, borderRadius: 4, background: lane.color, flexShrink: 0 }} />
-              <span style={{ font: '500 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{lane.name}</span>
-            </span>
-            <span style={{ font: '600 var(--fs-callout)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{j.name}</span>
-            <span><ShapeChip shape={j.shape} /></span>
-            <span title={j.trigger} style={{ color: 'var(--ink-tertiary)' }}><Icon name={MON_TRIG_ICON[j.trigger]} size={15} /></span>
-            <span><MonStatus status={j.status} /></span>
-            <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.03em', color: EFFORT_TINT[j.effort] }}>{j.effort}</span>
-            <span style={{ textAlign: 'right', font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)' }}>{j.cost > 0 ? '$' + j.cost.toFixed(2) : '—'}</span>
-            <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{started}</span>
-            <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{dur}</span>
-            <span style={{ display: 'inline-flex', gap: 4, justifyContent: 'flex-end' }}>
-              {(j.status === 'running' || j.status === 'gated') && (
-                <button onClick={e => { e.stopPropagation(); onCancel(j); }} className="row-act" title="Cancel" style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}>
-                  <Icon name="x" size={14} />
-                </button>
-              )}
-            </span>
-          </div>
-        );
-      })}
+      {sorted.map(j => (
+        <ActivityRow key={j.id} job={j} lane={laneOf(lanes, j.lane)} nowMs={nowMs} onCancel={onCancel} open={openId === j.id} onToggle={() => setOpenId(id => (id === j.id ? null : j.id))} />
+      ))}
+      {sorted.length === 0 && <div style={{ padding: '44px 0', textAlign: 'center', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No jobs yet — run one to see it here.</div>}
     </div>
   );
 }
@@ -725,7 +747,7 @@ function CounterPill({ n, label, tint }: { n: number; label: string; tint: strin
 }
 
 export default function JobMonitor() {
-  const [view, setView] = React.useState('timeline');
+  const [view, setView] = React.useState('list');
   const [filter, setFilter] = React.useState('all');
   const [jobs, setJobs] = React.useState<Job[]>([]);
   const [lanes, setLanes] = React.useState<Lane[]>([]);
@@ -799,7 +821,7 @@ export default function JobMonitor() {
           </div>
           <span style={{ flex: 1 }} />
           <Segmented value={view} onChange={setView}
-            options={[{ key: 'timeline', label: 'Timeline', icon: 'sliders' }, { key: 'table', label: 'Table', icon: 'jobs' }]} />
+            options={[{ key: 'list', label: 'Activity', icon: 'jobs' }, { key: 'timeline', label: 'Timeline', icon: 'sliders' }]} />
         </div>
 
         {/* filters */}
@@ -827,7 +849,7 @@ export default function JobMonitor() {
         <div style={{ flex: 1, overflowY: 'auto', paddingBottom: 28 }}>
           {view === 'timeline'
             ? <Timeline jobs={shown} lanes={lanes} nowMs={nowMs} onSelect={setSel} selectedId={sel ? sel.id : null} />
-            : <MonTable jobs={shown} lanes={lanes} nowMs={nowMs} onSelect={setSel} selectedId={sel ? sel.id : null} onCancel={setCancelJob} />}
+            : <ActivityList jobs={shown} lanes={lanes} nowMs={nowMs} onCancel={setCancelJob} />}
         </div>
       </main>
 
