@@ -66,6 +66,67 @@ export function useTheme(_initial: Theme = 'light'): [Theme, React.Dispatch<Reac
   return [resolvedTheme(), setTheme];
 }
 
+/* Persisted, app-wide sidebar geometry (width + hidden). One module-level source
+   so it survives navigation/relaunch and every AppShell instance stays in sync —
+   same pattern as the theme above. */
+export const SIDEBAR_MIN = 200, SIDEBAR_MAX = 440, SIDEBAR_DEFAULT = 260;
+const SIDEBAR_COLLAPSE_AT = 130; // drag narrower than this → hide
+const SB_W_KEY = 'maestro.sidebar.width';
+const SB_HIDDEN_KEY = 'maestro.sidebar.hidden';
+const sbListeners = new Set<() => void>();
+function notifySb() { for (const l of sbListeners) l(); }
+function clampW(w: number, min = SIDEBAR_MIN): number { return Math.max(min, Math.min(SIDEBAR_MAX, Math.round(w))); }
+let sidebarWidth = (() => { try { const v = Number(localStorage.getItem(SB_W_KEY)); return v ? clampW(v) : SIDEBAR_DEFAULT; } catch { return SIDEBAR_DEFAULT; } })();
+let sidebarHidden = (() => { try { return localStorage.getItem(SB_HIDDEN_KEY) === '1'; } catch { return false; } })();
+
+export function getSidebarWidth(): number { return sidebarWidth; }
+export function getSidebarHidden(): boolean { return sidebarHidden; }
+/** Set width during a drag (rawDuring lets it go below MIN while dragging). */
+export function setSidebarWidth(w: number, rawDuring = false): void {
+  sidebarWidth = rawDuring ? Math.max(0, Math.min(SIDEBAR_MAX, Math.round(w))) : clampW(w);
+  notifySb();
+}
+export function persistSidebarWidth(): void { try { localStorage.setItem(SB_W_KEY, String(sidebarWidth)); } catch { /* ignore */ } }
+export function setSidebarHidden(h: boolean): void {
+  sidebarHidden = h;
+  try { localStorage.setItem(SB_HIDDEN_KEY, h ? '1' : '0'); } catch { /* ignore */ }
+  notifySb();
+}
+export function toggleSidebar(): void { setSidebarHidden(!sidebarHidden); }
+
+let sidebarDragging = false;
+export function getSidebarDragging(): boolean { return sidebarDragging; }
+
+/* Drag to resize (from the right-edge handle) OR reveal (from the hidden left
+   edge): the sidebar starts at window x=0, so its width follows the cursor X.
+   Drag narrower than the threshold and it collapses; release wider clamps to
+   [MIN, MAX]. Shared by the handle and the edge hot-zone. */
+export function startSidebarDrag(e: React.MouseEvent, opts: { reveal?: boolean } = {}): void {
+  e.preventDefault();
+  if (opts.reveal) setSidebarHidden(false);
+  sidebarDragging = true; notifySb();
+  document.body.style.cursor = 'col-resize';
+  document.body.style.userSelect = 'none';
+  const onMove = (ev: MouseEvent) => setSidebarWidth(ev.clientX, true);
+  const onUp = (ev: MouseEvent) => {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    document.body.style.cursor = ''; document.body.style.userSelect = '';
+    sidebarDragging = false;
+    if (ev.clientX < SIDEBAR_COLLAPSE_AT) { sidebarWidth = SIDEBAR_DEFAULT; setSidebarHidden(true); }
+    else setSidebarWidth(ev.clientX);
+    persistSidebarWidth();
+  };
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}
+
+export function useSidebar() {
+  const [, force] = React.useReducer((x: number) => x + 1, 0);
+  React.useEffect(() => { sbListeners.add(force); return () => { sbListeners.delete(force); }; }, []);
+  return { width: sidebarWidth, hidden: sidebarHidden, dragging: sidebarDragging, setWidth: setSidebarWidth, setHidden: setSidebarHidden, toggle: toggleSidebar };
+}
+
 /** Default workspace name until the live one loads (and for fresh installs). */
 export const WORKSPACE = 'Maestro';
 
@@ -138,24 +199,31 @@ export interface SidebarProps {
 export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
   const pending = usePendingApprovals();
   const workspaceName = useWorkspaceName();
+  const { width, dragging, toggle } = useSidebar();
   return (
     <aside className="win-drag" style={{
-      width: 260, flexShrink: 0, height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', zIndex: 2,
+      width, flexShrink: 0, height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', zIndex: 2,
       background: 'var(--bg-grouped)', backdropFilter: 'blur(40px) saturate(180%)', WebkitBackdropFilter: 'blur(40px) saturate(180%)',
-      borderRight: '0.5px solid var(--separator)',
+      borderRight: '0.5px solid var(--separator)', transition: dragging ? 'none' : 'width 200ms cubic-bezier(.32,.72,0,1)', overflow: 'hidden',
     }}>
       {/* workspace header */}
-      <button onClick={onWorkspace} style={{
-        display: 'flex', alignItems: 'center', gap: 10, margin: '46px 10px 10px', padding: '8px 10px',
-        borderRadius: 10, textAlign: 'left',
-      }} className="ws-header">
-        <MaestroMark size={30} />
-        <span style={{ flex: 1, minWidth: 0 }}>
-          <span style={{ display: 'block', font: '700 var(--fs-callout)/1.1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>{workspaceName}</span>
-          <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 1 }}>Workspace</span>
-        </span>
-        <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)' }} />
-      </button>
+      <div style={{ display: 'flex', alignItems: 'center', margin: '46px 6px 10px 10px' }}>
+        <button onClick={onWorkspace} style={{
+          flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', borderRadius: 10, textAlign: 'left',
+        }} className="ws-header win-no-drag">
+          <MaestroMark size={30} />
+          <span style={{ flex: 1, minWidth: 0 }}>
+            <span style={{ display: 'block', font: '700 var(--fs-callout)/1.1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{workspaceName}</span>
+            <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 1 }}>Workspace</span>
+          </span>
+          <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)' }} />
+        </button>
+        <button onClick={toggle} title="Hide sidebar (⌘B)" className="tb-icon win-no-drag" style={{
+          width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0,
+        }}>
+          <Icon name="sidebar" size={17} />
+        </button>
+      </div>
 
       {/* nav */}
       <nav style={{ flex: 1, overflow: 'auto', padding: '6px 10px', display: 'flex', flexDirection: 'column', gap: 1 }}>
@@ -194,6 +262,11 @@ export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
           <Icon name="settings" size={18} /> Settings
         </button>
       </div>
+
+      {/* drag-to-resize handle on the right edge */}
+      <div onMouseDown={(e) => startSidebarDrag(e)} className="win-no-drag sb-resize" title="Drag to resize" style={{
+        position: 'absolute', top: 0, right: -3, width: 7, height: '100%', cursor: 'col-resize', zIndex: 5,
+      }} />
     </aside>
   );
 }
@@ -231,17 +304,29 @@ export interface ToolbarProps {
   theme: Theme;
   setTheme: React.Dispatch<React.SetStateAction<Theme>>;
   right?: React.ReactNode;
+  /** When the sidebar is hidden, the toolbar shows a button to bring it back. */
+  sidebarHidden?: boolean;
 }
 
-export function Toolbar({ onSearch, theme, setTheme, right }: ToolbarProps) {
+export function Toolbar({ onSearch, theme, setTheme, right, sidebarHidden }: ToolbarProps) {
   const navigate = useNavigate();
   const pending = usePendingApprovals();
   return (
     <header className="win-drag" style={{
-      height: 56, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 14, padding: '0 16px 0 18px',
+      height: 56, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 14,
+      padding: sidebarHidden ? '0 16px 0 78px' : '0 16px 0 18px',
       background: 'var(--bg-grouped)', backdropFilter: 'blur(40px) saturate(180%)', WebkitBackdropFilter: 'blur(40px) saturate(180%)',
       borderBottom: '0.5px solid var(--separator)', position: 'relative', zIndex: 20,
+      transition: 'padding-left 200ms cubic-bezier(.32,.72,0,1)',
     }}>
+      {sidebarHidden && (
+        <button onClick={() => setSidebarHidden(false)} title="Show sidebar (⌘B)" aria-label="Show sidebar" className="tb-icon win-no-drag" style={{
+          width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0,
+        }}>
+          <Icon name="sidebar" size={19} />
+        </button>
+      )}
+
       {/* search */}
       <button onClick={onSearch} style={{
         flex: 1, maxWidth: 420, display: 'flex', alignItems: 'center', gap: 9, height: 34, padding: '0 12px',
@@ -300,11 +385,20 @@ export function AppShell({ active, children, onSearch, right, initialTheme = 'li
   const [theme, setTheme] = useTheme(initialTheme);
   const navigate = useNavigate();
   const location = useLocation();
+  const { hidden } = useSidebar();
   const routeKey = ALL_NAV.find(r => location.pathname === r.path || location.pathname.startsWith(r.path + '/'))?.key;
   const onNav = (key: string) => {
     const r = ALL_NAV.find(x => x.key === key);
     navigate(r ? r.path : '/' + key);
   };
+  // ⌘B toggles the sidebar from anywhere in the chrome.
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); toggleSidebar(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
       <div style={{
@@ -313,14 +407,41 @@ export function AppShell({ active, children, onSearch, right, initialTheme = 'li
       }}>
         <div className="app-wallpaper" aria-hidden="true" />
         <TrafficLights />
-        <Sidebar active={active ?? routeKey} onNav={onNav} onWorkspace={onWorkspace} />
+        {!hidden && <Sidebar active={active ?? routeKey} onNav={onNav} onWorkspace={onWorkspace} />}
+        {hidden && <SidebarRevealZone />}
         <div style={{ flex: 1, minWidth: 0, height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', zIndex: 1 }}>
-          <Toolbar onSearch={onSearch} theme={theme} setTheme={setTheme} right={right} />
+          <Toolbar onSearch={onSearch} theme={theme} setTheme={setTheme} right={right} sidebarHidden={hidden} />
           <main style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
             {children}
           </main>
         </div>
       </div>
+    </div>
+  );
+}
+
+/* When the sidebar is hidden, a thin invisible strip hugs the window's left
+   edge. Click it (or the toolbar button) to bring the sidebar back; press-drag
+   from it slides the sidebar out at whatever width you release at — exactly the
+   "drag from the edge to reveal with resize" gesture. A faint handle pip fades
+   in on hover so the affordance is discoverable. */
+function SidebarRevealZone() {
+  const [hot, setHot] = React.useState(false);
+  return (
+    <div
+      className="win-no-drag"
+      onMouseEnter={() => setHot(true)}
+      onMouseLeave={() => setHot(false)}
+      onMouseDown={(e) => startSidebarDrag(e, { reveal: true })}
+      onClick={() => setSidebarHidden(false)}
+      title="Show sidebar (⌘B) · drag to reveal"
+      style={{ position: 'absolute', top: 0, left: 0, width: 14, height: '100%', cursor: 'col-resize', zIndex: 30 }}
+    >
+      <div style={{
+        position: 'absolute', top: '50%', left: 4, transform: 'translateY(-50%)',
+        width: 4, height: 46, borderRadius: 3, background: 'var(--ink-quaternary, var(--ink-tertiary))',
+        opacity: hot ? 0.9 : 0, transition: 'opacity 160ms ease',
+      }} />
     </div>
   );
 }

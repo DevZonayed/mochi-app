@@ -29,3 +29,31 @@ label,
 .win-no-drag {
   -webkit-app-region: no-drag;
 }
+
+/* Sidebar resize handle: invisible hit-strip with a hairline that lights up on
+   hover/drag so the resize affordance is discoverable. Lives globally so it
+   works on every screen (the chrome wraps all routes). */
+.sb-resize::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 3px;
+  width: 1px;
+  height: 100%;
+  background: var(--accent, #3b82f6);
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+.sb-resize:hover::after {
+  opacity: 0.55;
+}
+
+/* Base chrome icon-button feedback (screens also inject this; defined globally
+   so the sidebar toggle + reveal button respond even before a screen mounts). */
+.tb-icon {
+  transition: background 120ms ease, color 120ms ease;
+}
+.tb-icon:hover {
+  background: var(--fill-secondary);
+  color: var(--ink);
+}
