@@ -1417,6 +1417,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   const [renamingId, setRenamingId] = React.useState<string | null>(null);
   const [renameVal, setRenameVal] = React.useState('');
   const [sendError, setSendError] = React.useState('');
+  const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
   const activeRef = React.useRef<string | null>(null);
   activeRef.current = activeId;
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -1429,6 +1430,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   React.useEffect(() => {
     setActiveId(null);
     setTurns([]);
+    setQueue([]);
     if (!projectId) { setSessions([]); return; }
     let alive = true;
     api.listSessions(projectId)
@@ -1437,8 +1439,9 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
     return () => { alive = false; };
   }, [projectId]);
 
-  // Turns of the open session (ascending — a chat thread).
+  // Turns of the open session (ascending — a chat thread). Queue is per-session.
   React.useEffect(() => {
+    setQueue([]);
     if (!activeId) { setTurns([]); return; }
     let alive = true;
     api.listJobs(undefined, activeId)
@@ -1496,14 +1499,11 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   const lastTurn = turns.length ? turns[turns.length - 1] : null;
   const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending');
 
-  // Stable identity so React.memo(AssistantTurn) can skip settled turns — it's
-  // passed down as onRetry/onAnswer. Changes only when the run config does.
-  const sendText = React.useCallback(async (raw: string) => {
+  // The actual send — no guards. Used directly, by the queue drainer, and by steer.
+  const sendRaw = React.useCallback(async (raw: string): Promise<boolean> => {
     const t = raw.trim();
-    if (!t || !projectId || streaming) return;
-    setText('');
+    if (!t || !projectId) return false;
     setSendError('');
-    if (taRef.current) taRef.current.style.height = 'auto';
     stickBottom.current = true;
     try {
       const run = chatModelToRun(modelChoice);
@@ -1516,11 +1516,48 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
       setSessions(ss => (ss.some(s => s.id === resp.session.id) ? ss : [resp.session, ...ss]));
       if (activeRef.current !== resp.session.id) setActiveId(resp.session.id);
       else setTurns(ts => [...ts.filter(x => x.id !== resp.job.id), resp.job].sort((a, b) => a.createdAt - b.createdAt));
+      return true;
     } catch (e) {
-      setText(raw); // nothing lost — restore the draft
       setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
+      return false;
     }
-  }, [projectId, streaming, modelChoice, effort, planMode]);
+  }, [projectId, modelChoice, effort, planMode]);
+
+  // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
+  // Stable identity so React.memo(AssistantTurn) can skip settled turns.
+  const sendText = React.useCallback((raw: string) => {
+    const t = raw.trim();
+    if (!t || !projectId) return;
+    setText('');
+    if (taRef.current) taRef.current.style.height = 'auto';
+    if (streaming) { setQueue(q => [...q, t]); return; }
+    void sendRaw(t).then(ok => { if (!ok) setText(raw); });
+  }, [projectId, streaming, sendRaw]);
+
+  // STEER: interrupt the running turn and send right now (session resumes with context).
+  const sendNow = React.useCallback(async (raw: string) => {
+    const t = raw.trim();
+    if (!t) return;
+    setText('');
+    if (taRef.current) taRef.current.style.height = 'auto';
+    if (lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending')) {
+      try { await api.cancelJob(lastTurn.id); } catch { /* already gone */ }
+    }
+    const ok = await sendRaw(t);
+    if (!ok) setText(raw);
+  }, [lastTurn, sendRaw]);
+
+  const removeFromQueue = (i: number) => setQueue(q => q.filter((_, j) => j !== i));
+
+  // Drain the queue: when the agent goes idle and items are waiting, fire the next.
+  const drainingRef = React.useRef(false);
+  React.useEffect(() => {
+    if (streaming || queue.length === 0 || drainingRef.current) return;
+    drainingRef.current = true;
+    const next = queue[0];
+    setQueue(q => q.slice(1));
+    void sendRaw(next).finally(() => { drainingRef.current = false; });
+  }, [streaming, queue, sendRaw]);
 
   const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
 
@@ -1653,22 +1690,50 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
               <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 7, padding: '8px 11px', borderRadius: 10, background: 'color-mix(in srgb, var(--red) 9%, var(--bg-elevated))',
                 font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)' }}><Icon name="alert" size={13} /> {sendError}</div>
             )}
+            {/* queued prompts — run in order after the current turn; ▸ steers one in now */}
+            {queue.length > 0 && (
+              <div style={{ marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {queue.map((q, i) => (
+                  <div key={i} className="chat-msg" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 7px 6px 10px', borderRadius: 11,
+                    background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)' }}>
+                    <span style={{ width: 18, height: 18, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)', font: '600 10px/1 var(--font-mono)' }}>{i + 1}</span>
+                    <span style={{ flex: 1, minWidth: 0, font: '400 13px/1.3 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{q}</span>
+                    <span style={{ flexShrink: 0, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>queued</span>
+                    <button title="Send now — interrupt and steer" onClick={() => { removeFromQueue(i); void sendNow(q); }} style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--blue)', cursor: 'pointer', flexShrink: 0 }}>
+                      <Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} />
+                    </button>
+                    <button title="Remove from queue" onClick={() => removeFromQueue(i)} style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+                      <Icon name="x" size={13} stroke={2.4} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="composer-card" style={{ borderRadius: 18, border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)',
               boxShadow: 'var(--card-shadow)', padding: '10px 10px 8px 14px' }}>
               <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
                 <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
-                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendText(text); } }}
-                  placeholder={!projectId ? 'Pick a project first' : planMode ? 'Describe a goal — I\'ll plan it first…' : 'Message the agent…'}
-                  title="Enter to send · Shift+Enter for a new line"
+                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) void sendNow(text); else sendText(text); } }}
+                  placeholder={!projectId ? 'Pick a project first' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : 'Message the agent…'}
+                  title="Enter to send · Shift+Enter for a new line · while running: Enter queues, ⌘Enter sends now"
                   disabled={!projectId}
                   style={{ flex: 1, resize: 'none', border: 'none', outline: 'none', background: 'transparent',
                     color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '6px 0',
                     minHeight: 24, maxHeight: 150, boxSizing: 'content-box' }} />
                 {streaming ? (
-                  <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
-                    background: 'color-mix(in srgb, var(--red) 14%, transparent)', color: 'var(--red)', cursor: 'pointer' }}>
-                    <span style={{ width: 12, height: 12, borderRadius: 3.5, background: 'currentColor' }} />
-                  </button>
+                  <>
+                    {text.trim() && (
+                      <button onClick={() => sendText(text)} className="send-fab" title="Queue (Enter) — runs when the agent finishes · ⌘Enter to send now" style={{
+                        width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+                        background: 'var(--blue)', color: '#fff', boxShadow: '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)', cursor: 'pointer' }}>
+                        <Icon name="plus" size={18} stroke={2.6} />
+                      </button>
+                    )}
+                    <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
+                      background: 'color-mix(in srgb, var(--red) 14%, transparent)', color: 'var(--red)', cursor: 'pointer' }}>
+                      <span style={{ width: 12, height: 12, borderRadius: 3.5, background: 'currentColor' }} />
+                    </button>
+                  </>
                 ) : (
                   <button onClick={() => { void sendText(text); }} disabled={!text.trim() || !projectId} className="send-fab" title="Send (Enter)" style={{
                     width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
@@ -1689,11 +1754,12 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
                   <Icon name="map" size={14} /> Plan
                 </button>
                 <span style={{ flex: 1 }} />
-                {streaming && lastTurn
-                  ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-                      <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn.stage || 'working…'}
+                {streaming
+                  ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                      <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn?.stage || 'working…'}
+                      <span style={{ color: 'var(--separator-strong)' }}>·</span> ⏎ queue · ⌘⏎ now
                     </span>
-                  : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{planMode ? 'Plan mode · ⏎ to plan' : 'Enter to send · Shift+Enter for newline'}</span>}
+                  : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{planMode ? 'Plan mode · ⏎ to plan' : queue.length ? `${queue.length} queued` : 'Enter to send · Shift+Enter for newline'}</span>}
               </div>
             </div>
           </div>
