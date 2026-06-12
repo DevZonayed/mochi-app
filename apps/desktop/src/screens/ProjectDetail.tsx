@@ -15,6 +15,7 @@ import {
   Spinner,
   EffortDial,
   EFFORT_EST,
+  EFFORT_META,
   ModelSwitcher,
   ProviderGlyph,
   CHAT_MODELS,
@@ -85,9 +86,33 @@ const PAGE_CSS = `
   .code-card pre::-webkit-scrollbar-thumb { background: var(--separator-strong); border-radius: 4px; }
   .code-card pre::-webkit-scrollbar-track { background: transparent; }
 
-  /* composer — focus glow ring */
-  .composer-card { transition: border-color 180ms ease, box-shadow 180ms ease; }
-  .composer-card:focus-within { border-color: color-mix(in srgb, var(--blue) 50%, var(--separator-strong)); box-shadow: 0 0 0 4px color-mix(in srgb, var(--blue) 12%, transparent), var(--card-shadow); }
+  /* composer — focus glow ring, tinted by the current EFFORT (--eff-accent) */
+  .composer-card { position: relative; transition: border-color 200ms ease, box-shadow 200ms ease; }
+  .composer-eff { border-color: color-mix(in srgb, var(--eff-accent) 30%, var(--separator-strong)) !important; }
+  .composer-eff:focus-within { border-color: color-mix(in srgb, var(--eff-accent) 60%, var(--separator-strong)) !important;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--eff-accent) 14%, transparent), var(--card-shadow); }
+  /* MAX effort → animated rainbow gradient border (the "ultra" tier) */
+  @keyframes ultraHue { to { filter: hue-rotate(360deg); } }
+  .composer-ultra { border-color: transparent !important; }
+  .composer-ultra::before {
+    content: ''; position: absolute; inset: 0; border-radius: inherit; padding: 1.6px; pointer-events: none;
+    background: conic-gradient(from 0deg, #ff5d5d, #ffb44b, #f4e04b, #6bd49a, #41c8d4, #5b8cff, #9b6bff, #ff6b9f, #ff5d5d);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0); -webkit-mask-composite: xor;
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0); mask-composite: exclude;
+    animation: ultraHue 6s linear infinite; }
+  .composer-ultra:focus-within { box-shadow: 0 0 0 4px color-mix(in srgb, #9b6bff 16%, transparent), var(--card-shadow); }
+
+  /* queued-prompts panel */
+  .q-panel { transition: box-shadow 160ms ease; }
+  .q-head { transition: background 140ms ease; }
+  .q-head:hover { background: var(--fill-tertiary) !important; }
+  .q-row { transition: background 120ms ease; }
+  .q-row:hover { background: var(--fill-tertiary) !important; }
+  .q-row .q-act { opacity: 0; transition: opacity 120ms ease; }
+  .q-row:hover .q-act, .q-row.q-sel .q-act { opacity: 1; }
+  .q-row.q-sel { background: color-mix(in srgb, var(--blue) 9%, transparent) !important; }
+  .kbd { display: inline-flex; align-items: center; height: 16px; padding: 0 5px; border-radius: 5px; background: var(--fill-secondary);
+    border: 0.5px solid var(--separator); font: 600 10px/1 var(--font-mono); color: var(--ink-secondary); }
   .send-fab { transition: transform 160ms cubic-bezier(.32,.72,0,1), background 160ms ease, box-shadow 160ms ease; }
   .send-fab:not(:disabled):hover { transform: scale(1.06); }
   .send-fab:not(:disabled):active { transform: scale(.94); }
@@ -1394,6 +1419,65 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   );
 });
 
+/* Collapsible "N queued messages" panel — keyboard-navigable, with row actions. */
+function QueuePanel({ queue, onSendNow, onRemove, onEdit }: { queue: string[]; onSendNow: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void }) {
+  const [collapsed, setCollapsed] = React.useState(false);
+  const [sel, setSel] = React.useState(-1);
+  const ref = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => { if (sel >= queue.length) setSel(queue.length - 1); }, [queue.length, sel]);
+
+  const onKey = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => Math.min(queue.length - 1, s + 1)); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => Math.max(0, (s < 0 ? queue.length : s) - 1)); }
+    else if (e.key === 'Enter') { e.preventDefault(); if (sel >= 0) onSendNow(sel); }
+    else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); if (sel >= 0) onRemove(sel); }
+    else if (e.key.toLowerCase() === 'e') { e.preventDefault(); if (sel >= 0) onEdit(sel); }
+    else if (e.key === 'Escape') { e.preventDefault(); setSel(-1); ref.current?.blur(); }
+  };
+
+  const QBtn = ({ title, onClick, color, children }: { title: string; onClick: () => void; color: string; children: React.ReactNode }) => (
+    <button title={title} onClick={e => { e.stopPropagation(); onClick(); }} style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center', color, cursor: 'pointer', flexShrink: 0 }}>{children}</button>
+  );
+
+  return (
+    <div ref={ref} tabIndex={0} onKeyDown={onKey} className="q-panel" style={{ marginBottom: 8, borderRadius: 14, outline: 'none', overflow: 'hidden',
+      border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', boxShadow: 'var(--card-shadow)' }}>
+      <button className="q-head" onClick={() => setCollapsed(c => !c)} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: 'transparent', cursor: 'pointer',
+        borderBottom: collapsed ? 'none' : '0.5px solid var(--separator)' }}>
+        <Icon name="layers" size={13} style={{ color: 'var(--purple)' }} />
+        <span style={{ flex: 1, textAlign: 'left', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{queue.length} queued message{queue.length === 1 ? '' : 's'}</span>
+        <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)', transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+      </button>
+      {!collapsed && (
+        <>
+          <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 168, overflowY: 'auto' }}>
+            {queue.map((q, i) => (
+              <div key={i} className={`q-row${sel === i ? ' q-sel' : ''}`} onClick={() => setSel(i)} onDoubleClick={() => onEdit(i)}
+                style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 10px 8px 12px', cursor: 'default' }}>
+                <span style={{ width: 18, height: 18, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 13%, transparent)', color: 'var(--purple)', font: '600 10px/1 var(--font-mono)' }}>{i + 1}</span>
+                <span style={{ flex: 1, minWidth: 0, font: '400 13px/1.35 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{q}</span>
+                <span className="q-act" style={{ display: 'inline-flex', gap: 2 }}>
+                  <QBtn title="Edit (move back to the box)" onClick={() => onEdit(i)} color="var(--ink-tertiary)"><Icon name="arrowLeft" size={13} stroke={2.2} /></QBtn>
+                  <QBtn title="Remove" onClick={() => onRemove(i)} color="var(--ink-tertiary)"><Icon name="x" size={13} stroke={2.4} /></QBtn>
+                  <QBtn title="Send now — interrupt and steer" onClick={() => onSendNow(i)} color="var(--blue)"><Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} /></QBtn>
+                </span>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '7px 12px', borderTop: '0.5px solid var(--separator)', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">↑↓</span> navigate</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">E</span> edit</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⌫</span> delete</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⏎</span> send now</span>
+            <span style={{ flex: 1 }} />
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">Esc</span> exit</span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function ChatPane({ projectId, project }: { projectId: string | null; project: Project | null }) {
   const [sessions, setSessions] = React.useState<ChatSession[]>([]);
   const [activeId, setActiveId] = React.useState<string | null>(null);
@@ -1548,6 +1632,8 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   }, [lastTurn, sendRaw]);
 
   const removeFromQueue = (i: number) => setQueue(q => q.filter((_, j) => j !== i));
+  const sendQueuedNow = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); void sendNow(t); };
+  const editQueued = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); setText(t); taRef.current?.focus(); requestAnimationFrame(() => autoGrow()); };
 
   // Drain the queue: when the agent goes idle and items are waiting, fire the next.
   const drainingRef = React.useRef(false);
@@ -1584,6 +1670,18 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   };
 
   const fillComposer = (v: string) => { setText(v); taRef.current?.focus(); requestAnimationFrame(autoGrow); };
+
+  // ⌘L focuses the composer (like the reference). Ignore when typing in a field.
+  React.useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'l') { e.preventDefault(); taRef.current?.focus(); }
+    };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, []);
+
+  // current effort's accent — themes the composer border/glow (MAX = gradient)
+  const effAccent = effort === 'MAX' ? '#9b6bff' : EFFORT_META[effort].tint;
 
   return (
     <div style={{ display: 'flex', gap: 14, height: 'calc(100vh - 252px)', minHeight: 440 }}>
@@ -1690,32 +1788,18 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
               <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 7, padding: '8px 11px', borderRadius: 10, background: 'color-mix(in srgb, var(--red) 9%, var(--bg-elevated))',
                 font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)' }}><Icon name="alert" size={13} /> {sendError}</div>
             )}
-            {/* queued prompts — run in order after the current turn; ▸ steers one in now */}
+            {/* queued prompts — collapsible panel; runs in order after the current turn */}
             {queue.length > 0 && (
-              <div style={{ marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {queue.map((q, i) => (
-                  <div key={i} className="chat-msg" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 7px 6px 10px', borderRadius: 11,
-                    background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)' }}>
-                    <span style={{ width: 18, height: 18, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)', font: '600 10px/1 var(--font-mono)' }}>{i + 1}</span>
-                    <span style={{ flex: 1, minWidth: 0, font: '400 13px/1.3 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{q}</span>
-                    <span style={{ flexShrink: 0, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>queued</span>
-                    <button title="Send now — interrupt and steer" onClick={() => { removeFromQueue(i); void sendNow(q); }} style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--blue)', cursor: 'pointer', flexShrink: 0 }}>
-                      <Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} />
-                    </button>
-                    <button title="Remove from queue" onClick={() => removeFromQueue(i)} style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
-                      <Icon name="x" size={13} stroke={2.4} />
-                    </button>
-                  </div>
-                ))}
-              </div>
+              <QueuePanel queue={queue} onSendNow={sendQueuedNow} onRemove={removeFromQueue} onEdit={editQueued} />
             )}
-            <div className="composer-card" style={{ borderRadius: 18, border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)',
-              boxShadow: 'var(--card-shadow)', padding: '10px 10px 8px 14px' }}>
+            <div className={`composer-card composer-eff${effort === 'MAX' ? ' composer-ultra' : ''}`}
+              style={{ borderRadius: 18, border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)',
+              boxShadow: 'var(--card-shadow)', padding: '10px 10px 8px 14px', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
               <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
                 <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
                   onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) void sendNow(text); else sendText(text); } }}
-                  placeholder={!projectId ? 'Pick a project first' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : 'Message the agent…'}
-                  title="Enter to send · Shift+Enter for a new line · while running: Enter queues, ⌘Enter sends now"
+                  placeholder={!projectId ? 'Pick a project first' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent…'}
+                  title="Enter to send · Shift+Enter for a new line · while running: Enter queues, ⌘Enter sends now · ⌘L to focus"
                   disabled={!projectId}
                   style={{ flex: 1, resize: 'none', border: 'none', outline: 'none', background: 'transparent',
                     color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '6px 0',
