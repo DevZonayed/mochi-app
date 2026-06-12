@@ -1211,11 +1211,14 @@ function UserBubble({ text }: { text: string }) {
   );
 }
 
-/** A small quiet stat pill used in the done-meta row. */
-function MetaPill({ children }: { children: React.ReactNode }) {
+const fmtTok = (n: number): string => (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
+
+/** A small quiet stat pill — `live` tints it while the counter is still ticking. */
+function MetaPill({ children, live }: { children: React.ReactNode; live?: boolean }) {
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 20, padding: '0 8px', borderRadius: 'var(--r-pill)',
-      background: 'var(--fill-tertiary)', font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{children}</span>
+      background: live ? 'color-mix(in srgb, var(--purple) 12%, transparent)' : 'var(--fill-tertiary)',
+      font: '500 var(--fs-caption)/1 var(--font-mono)', color: live ? 'var(--purple)' : 'var(--ink-secondary)' }}>{children}</span>
   );
 }
 
@@ -1322,7 +1325,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
           {live && (
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)' }}>
               <span className="breathe" style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--purple)' }} />
-              {hasBody ? 'streaming' : 'thinking'} · {elapsed}
+              {hasBody ? 'streaming' : 'thinking'}
             </span>
           )}
           <span style={{ flex: 1 }} />
@@ -1332,6 +1335,15 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
         {!hasBody && live && (
           <div style={{ font: '500 14px/1.5 var(--font-text)' }}>
             <span className="think-shimmer">{job.stage || 'Thinking…'}</span>
+          </div>
+        )}
+        {/* live HUD — time / tokens / spend / tools all count up in real time */}
+        {live && (
+          <div style={{ marginTop: 9, display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+            <MetaPill live><Icon name="clock" size={10} /> {elapsed}</MetaPill>
+            {job.tokens > 0 && <MetaPill live>{fmtTok(job.tokens)} tok</MetaPill>}
+            {job.cost > 0 && <MetaPill live>~${job.cost.toFixed(job.cost < 1 ? 3 : 2)}</MetaPill>}
+            {toolCount > 0 && <MetaPill live><Icon name="command" size={10} /> {toolCount} {toolCount === 1 ? 'tool' : 'tools'}</MetaPill>}
           </div>
         )}
         {job.status === 'failed' && (
@@ -1354,9 +1366,9 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
         )}
         {job.status === 'done' && (
           <div style={{ marginTop: 9, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            {job.cost > 0 && <MetaPill>${job.cost.toFixed(2)}</MetaPill>}
-            {job.tokens > 0 && <MetaPill>{job.tokens >= 1000 ? (job.tokens / 1000).toFixed(1) + 'k' : job.tokens} tok</MetaPill>}
             <MetaPill><Icon name="clock" size={10} /> {elapsed}</MetaPill>
+            {job.tokens > 0 && <MetaPill>{fmtTok(job.tokens)} tok</MetaPill>}
+            {job.cost > 0 && <MetaPill>${job.cost.toFixed(job.cost < 1 ? 3 : 2)}</MetaPill>}
             {toolCount > 0 && <MetaPill><Icon name="command" size={10} /> {toolCount} {toolCount === 1 ? 'tool' : 'tools'}</MetaPill>}
           </div>
         )}

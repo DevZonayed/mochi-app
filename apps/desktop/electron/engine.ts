@@ -45,12 +45,31 @@ interface EngineRun {
   transcript: TranscriptItem[];
 }
 
+/** Running totals streamed during a run so the UI counts cost/tokens live. */
+export interface LiveUsage { tokens: number; cost: number }
+
 interface RunHooks {
-  /** Live progress: prose-so-far + the structured transcript. Throttled by the caller. */
-  onProgress?: (output: string, transcript: TranscriptItem[]) => void;
+  /** Live progress: prose-so-far + the structured transcript + running usage. Throttled by the caller. */
+  onProgress?: (output: string, transcript: TranscriptItem[], usage?: LiveUsage) => void;
   signal?: AbortSignal;
   /** Receives the child process for codex so the caller can kill it on cancel. */
   onChild?: (child: ChildProcess) => void;
+}
+
+/* Per-1M-token prices for a live cost ESTIMATE (the SDK's exact total_cost_usd
+   replaces it when the run finishes). Standard Anthropic pricing; cache reads
+   ~10% of input, cache writes ~25% over input. */
+interface Price { in: number; out: number; cacheRead: number; cacheWrite: number }
+const MODEL_PRICE: Record<'opus' | 'sonnet' | 'haiku', Price> = {
+  opus:   { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+  sonnet: { in: 3,  out: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  haiku:  { in: 1,  out: 5,  cacheRead: 0.1, cacheWrite: 1.25 },
+};
+function priceFor(model: string): Price {
+  const m = model.toLowerCase();
+  if (m.includes('opus')) return MODEL_PRICE.opus;
+  if (m.includes('haiku')) return MODEL_PRICE.haiku;
+  return MODEL_PRICE.sonnet; // sensible mid default (also covers 'claude'/sonnet ids)
 }
 
 /** Human-sized summary of a tool invocation's input for the chat chip. */
@@ -176,13 +195,26 @@ async function runClaude(
   const items: TranscriptItem[] = [];
   let openText: TranscriptItem | null = null;
   const toolById = new Map<string, TranscriptItem>();
-  const progress = () => hooks.onProgress?.(proseOf(items), items);
 
   let resultText = '';
   let usage: { input_tokens?: number; output_tokens?: number } | null = null;
   let cost = 0;
   let model = 'claude';
   let sdkSessionId: string | undefined;
+  // Live usage: count GENERATED (output) tokens — monotonic, unlike input which
+  // collapses once context is cached. Track per-message boundaries from the
+  // stream (message_start/delta/stop) so the counter never dips between steps.
+  // Cost is output-dominated on a cached agent run (input is mostly cheap cache
+  // reads), so estimate from output × the model's output price; the SDK's exact
+  // total_cost_usd replaces it the instant the run finishes.
+  let committedOut = 0, curOut = 0;
+  let finalCost: number | null = null;
+  const liveUsage = (): LiveUsage => {
+    const tokens = committedOut + curOut;
+    const cost = finalCost != null ? finalCost : (tokens * priceFor(model).out) / 1e6;
+    return { tokens, cost: Math.round(cost * 1000) / 1000 };
+  };
+  const progress = () => hooks.onProgress?.(proseOf(items), items, liveUsage());
   try {
     for await (const raw of it as AsyncIterable<Record<string, unknown>>) {
       if (hooks.signal?.aborted) throw new CancelledError();
@@ -191,7 +223,7 @@ async function runClaude(
         session_id?: string;
         parent_tool_use_id?: string | null;
         message?: { content?: { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; is_error?: boolean }[]; model?: string };
-        event?: { type?: string; delta?: { type?: string; text?: string } };
+        event?: { type?: string; delta?: { type?: string; text?: string }; usage?: { output_tokens?: number } };
         usage?: { input_tokens?: number; output_tokens?: number };
         total_cost_usd?: number; result?: unknown;
       };
@@ -202,6 +234,14 @@ async function runClaude(
       if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
         if (!openText) { openText = { kind: 'text', text: '', ts: Date.now() }; items.push(openText); }
         openText.text += m.event.delta.text ?? '';
+        progress();
+      } else if (m.type === 'stream_event' && m.event?.type === 'message_start') {
+        curOut = 0; // a new message begins
+      } else if (m.type === 'stream_event' && m.event?.type === 'message_delta' && m.event.usage) {
+        curOut = m.event.usage.output_tokens ?? curOut; // cumulative for the current message
+        progress();
+      } else if (m.type === 'stream_event' && m.event?.type === 'message_stop') {
+        committedOut += curOut; curOut = 0; // lock in this message's output
         progress();
       } else if (m.type === 'assistant' && m.message?.content) {
         model = m.message.model ?? model;
@@ -233,6 +273,9 @@ async function runClaude(
         usage = m.usage ?? usage;
         cost = m.total_cost_usd ?? 0;
         if (typeof m.result === 'string') resultText = m.result;
+        // Snap the live counters to the SDK's authoritative totals.
+        if (usage?.output_tokens != null) { committedOut = usage.output_tokens; curOut = 0; }
+        if (m.total_cost_usd != null) finalCost = m.total_cost_usd;
       }
     }
   } catch (e) {
@@ -246,12 +289,13 @@ async function runClaude(
   // The result usually repeats the last text block — only add it when it's new.
   const lastText = [...items].reverse().find(i => i.kind === 'text')?.text.trim();
   if (resultText && resultText.trim() !== lastText) items.push({ kind: 'result', text: resultText, ts: Date.now() });
-  hooks.onProgress?.(proseOf(items), items); // final flush so the last tokens are never stranded
+  hooks.onProgress?.(proseOf(items), items, liveUsage()); // final flush so the last tokens are never stranded
   const prose = proseOf(items);
   return {
     text: resultText || prose || '(no output)',
-    tokens: (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0),
-    cost: Math.round(cost * 1000) / 1000,
+    // Final figures match what ticked live: generated tokens + reconciled cost.
+    tokens: committedOut || (usage?.output_tokens ?? 0),
+    cost: Math.round((finalCost ?? cost) * 1000) / 1000,
     model,
     sdkSessionId,
     transcript: items,
@@ -276,9 +320,10 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
     let stdout = '';
     let stderr = '';
     let buf = '';
+    let liveTokens = 0; // accumulated from turn.completed events; codex is $0 (subscription)
     const items: TranscriptItem[] = [];
     const toolById = new Map<string, TranscriptItem>();
-    const progress = () => hooks.onProgress?.(proseOf(items), items);
+    const progress = () => hooks.onProgress?.(proseOf(items), items, { tokens: liveTokens, cost: 0 });
     const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 30 * 60 * 1000);
     const onAbort = () => { try { child.kill('SIGTERM'); } catch { /* gone */ } };
     if (hooks.signal) {
@@ -289,7 +334,8 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
       const t = line.trim();
       if (!t) return;
       try {
-        const ev = JSON.parse(t) as { type?: string; item?: { id?: string; type?: string; text?: string; content?: string; command?: string; path?: string; status?: string } };
+        const ev = JSON.parse(t) as { type?: string; usage?: { input_tokens?: number; output_tokens?: number }; item?: { id?: string; type?: string; text?: string; content?: string; command?: string; path?: string; status?: string } };
+        if (ev.type === 'turn.completed' && ev.usage) { liveTokens += (ev.usage.input_tokens ?? 0) + (ev.usage.output_tokens ?? 0); progress(); }
         const item = ev.item;
         if (!item) return;
         // Best-effort codex event mapping: message text → text blocks,
@@ -456,7 +502,7 @@ export class LocalEngine {
     // Throttled live writer: prose + structured transcript, at most every STREAM_THROTTLE_MS.
     let lastFlush = 0;
     const pendingRef: { out: string | null; tr: TranscriptItem[] } = { out: null, tr: [] };
-    const flush = (output: string, transcript: TranscriptItem[]) => {
+    const flush = (output: string, transcript: TranscriptItem[], usage?: LiveUsage) => {
       pendingRef.out = output;
       pendingRef.tr = transcript;
       const t = Date.now();
@@ -465,6 +511,8 @@ export class LocalEngine {
       const u = this.store.updateJob(jobId, {
         output, transcript: transcript.slice(-250),
         progress: Math.min(70, 20 + Math.floor(output.length / 80)),
+        // Live cost/token counters so the UI ticks them up during the run.
+        ...(usage ? { tokens: usage.tokens, cost: usage.cost } : {}),
       });
       this.emit('job', u);
     };
