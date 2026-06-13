@@ -15,7 +15,7 @@ import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import type { Store, Job, Effort, EngineId, TranscriptItem } from './store.js';
+import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice } from './store.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import type { Providers } from './providers.js';
 
@@ -490,13 +490,17 @@ export class LocalEngine {
   }
 
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
-  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string; plan?: boolean } = {}): Promise<Job> {
+  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; plan?: boolean } = {}): Promise<Job> {
     const job = this.store.getJob(jobId);
     if (!job) throw Object.assign(new Error('job not found'), { statusCode: 404 });
     const project = this.store.getProject(job.projectId);
     const routing = this.store.routing();
+    const roles = this.store.getRoles();
 
-    let master: EngineId = opts.engine ?? routing.master;
+    // Primary: an explicit per-job override wins; otherwise the workspace role
+    // default (engine + model). Reviewer resolves the same way.
+    let master: EngineId = opts.engine ?? roles.primary.engine ?? routing.master;
+    const masterModel: string | undefined = opts.engine ? opts.model : (opts.model ?? roles.primary.model);
     if (!this.available(master)) {
       const other: EngineId = master === 'claude' ? 'codex' : 'claude';
       if (!opts.engine && this.available(other)) {
@@ -515,7 +519,7 @@ export class LocalEngine {
 
     let cur = this.store.updateJob(jobId, {
       status: 'running', phase: 'Working', progress: 20, output: '', error: null, engine: master,
-      ...(opts.model ? { model: opts.model } : {}),
+      ...(masterModel ? { model: masterModel } : {}),
       stage: `running on this Mac via ${ENGINE_LABEL[master]}…`,
     });
     this.emit('job', cur);
@@ -591,8 +595,8 @@ export class LocalEngine {
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
       const main = master === 'claude'
-        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks, resumeId, opts.model, opts.plan)
-        : await runCodex(prompt, cwd, hooks, false, opts.model);
+        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks, resumeId, masterModel, opts.plan)
+        : await runCodex(prompt, cwd, hooks, false, masterModel);
       settleStream(); // stream is over — no trailing frame may race the final states below
 
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {
@@ -607,7 +611,9 @@ export class LocalEngine {
       // Reviewer pass — a REAL second opinion from the configured engine.
       // Skipped for chat turns: a conversation wants fast back-and-forth, not a
       // second engine appending verdicts to every reply.
-      const reviewer = routing.reviewer;
+      const reviewerChoice: RoleChoice | 'off' = opts.reviewer ?? roles.reviewer;
+      const reviewer: EngineId | 'off' = reviewerChoice === 'off' ? 'off' : reviewerChoice.engine;
+      const reviewerModel = reviewerChoice === 'off' ? undefined : reviewerChoice.model;
       let reviewVerdict: 'approved' | 'needs-work' | null = null;
       if (reviewer !== 'off' && !isChat && this.available(reviewer) && !ac.signal.aborted) {
         cur = this.store.updateJob(jobId, { progress: 85, stage: `reviewer pass via ${ENGINE_LABEL[reviewer]}…` });
@@ -618,8 +624,8 @@ export class LocalEngine {
             `then end with exactly one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".\n\n` +
             `## Task\n${cur.input}\n\n## Result\n${output.slice(0, 12000)}`;
           const review = reviewer === 'claude'
-            ? await runClaude(reviewPrompt, cwd, 'fast', this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined, 1, {})
-            : await runCodex(reviewPrompt, cwd, {}, true);
+            ? await runClaude(reviewPrompt, cwd, 'fast', this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined, 1, {}, undefined, reviewerModel)
+            : await runCodex(reviewPrompt, cwd, {}, true, reviewerModel);
           output += `\n\n―― Reviewer (${ENGINE_LABEL[reviewer]}) ――\n${review.text}`;
           tokens += review.tokens;
           cost = Math.round((cost + review.cost) * 1000) / 1000;

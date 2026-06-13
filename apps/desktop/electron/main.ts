@@ -10,6 +10,7 @@ import { TelegramBot } from './telegram.js';
 import { Providers } from './providers.js';
 import type { Approval } from './store.js';
 import { createDispatch } from './localApi.js';
+import { buildModelGroups } from './models.js';
 import { RelayClient } from './relay.js';
 import { CronRunner } from './cron.js';
 
@@ -91,7 +92,7 @@ app.whenReady().then(() => {
     deckId: store.deck.deckId,
     deckSecret: store.deck.deckSecret,
     accessToken: store.accessToken,
-    getSnapshot: () => ({ ...store.snapshot(providers.list()), engineStatus: engine.statuses(), mediaRates: media.rates() }),
+    getSnapshot: () => ({ ...store.snapshot(providers.list()), engineStatus: engine.statuses(), mediaRates: media.rates(), models: buildModelGroups(engine.statuses()) }),
     onCommand: (method, params) => dispatch(method, params),
   });
   relay.start();

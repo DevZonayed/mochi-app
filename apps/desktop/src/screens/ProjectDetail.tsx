@@ -20,10 +20,9 @@ import {
   ModelSwitcher,
   ProviderGlyph,
   CountUp,
-  CHAT_MODELS,
-  chatModelToRun,
   type EffortStop,
 } from '../lib/ui';
+import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem } from '../lib/api';
 
@@ -1629,11 +1628,28 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
   const [turns, setTurns] = React.useState<Job[]>([]);
   const [activeId, setActiveId] = React.useState<string | null>(sessionId);
   const [text, setText] = React.useState('');
-  // Remember the last model across the whole app — fewer clicks next time.
-  const [modelChoice, setModelChoiceState] = React.useState(() => {
-    try { const v = localStorage.getItem('maestro.chat.model'); return v && CHAT_MODELS.some(m => m.id === v) ? v : 'auto'; } catch { return 'auto'; }
+  // Primary (coding) + reviewer model. Remembered across the app via localStorage;
+  // seeded from the workspace role defaults when the user hasn't chosen yet.
+  const modelGroups = useModelGroups();
+  const [primaryKey, setPrimaryKeyState] = React.useState<string>(() => { try { return localStorage.getItem('maestro.chat.primary') || ''; } catch { return ''; } });
+  const [reviewerKey, setReviewerKeyState] = React.useState<string>(() => { try { return localStorage.getItem('maestro.chat.reviewer') || ''; } catch { return ''; } });
+  const setPrimaryKey = (k: string) => { setPrimaryKeyState(k); try { localStorage.setItem('maestro.chat.primary', k); } catch { /* storage unavailable */ } };
+  const setReviewerKey = (k: string) => { setReviewerKeyState(k); try { localStorage.setItem('maestro.chat.reviewer', k); } catch { /* storage unavailable */ } };
+  const [favorites, setFavorites] = React.useState<string[]>([]);
+  React.useEffect(() => { api.getSettings().then(s => setFavorites(s.favoriteModels ?? [])).catch(() => {}); }, []);
+  const toggleFavorite = (key: string) => setFavorites(prev => {
+    const next = prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key];
+    api.setSettings({ favoriteModels: next }).catch(() => {});
+    return next;
   });
-  const setModelChoice = (id: string) => { setModelChoiceState(id); try { localStorage.setItem('maestro.chat.model', id); } catch { /* storage unavailable */ } };
+  // Seed from the workspace defaults once the catalog is known (if unset).
+  React.useEffect(() => {
+    if (!modelGroups.length || (primaryKey && reviewerKey)) return;
+    api.getRoles().then(roles => {
+      if (!primaryKey) setPrimaryKeyState(keyForRoleChoice(modelGroups, roles.primary));
+      if (!reviewerKey) setReviewerKeyState(roles.reviewer === 'off' ? 'off' : keyForRoleChoice(modelGroups, roles.reviewer));
+    }).catch(() => {});
+  }, [modelGroups]); // eslint-disable-line react-hooks/exhaustive-deps
   const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
   // Plan mode: agent proposes a plan first (no execution). Persisted per app.
   const [planMode, setPlanModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.plan') === '1'; } catch { return false; } });
@@ -1705,12 +1721,11 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
     setSendError('');
     stickBottom.current = true;
     try {
-      const run = chatModelToRun(modelChoice);
       const resp = await api.sendChat({
         projectId, text: t, sessionId: activeRef.current ?? undefined,
         effort: EFFORT_TO_API[effort], plan: planMode,
-        ...(run.engine ? { engine: run.engine as EngineId } : {}),
-        ...(run.model ? { model: run.model } : {}),
+        ...(primaryKey ? { modelKey: primaryKey } : {}),
+        ...(reviewerKey ? { reviewerKey } : {}),
       });
       if (activeRef.current !== resp.session.id) {
         activeRef.current = resp.session.id; // match the streamed job immediately
@@ -1725,7 +1740,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
       setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
       return false;
     }
-  }, [projectId, modelChoice, effort, planMode, onSessionCreated]);
+  }, [projectId, primaryKey, reviewerKey, effort, planMode, onSessionCreated]);
 
   // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
   const sendText = React.useCallback((raw: string) => {
@@ -1883,7 +1898,8 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
               )}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 6 }}>
-              <ModelSwitcher compact direction="up" value={modelChoice} onChange={setModelChoice} models={CHAT_MODELS} />
+              <ModelPicker compact direction="up" value={primaryKey} onChange={setPrimaryKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
+              <ModelPicker compact direction="up" allowOff triggerLabel="Review" value={reviewerKey || 'off'} onChange={setReviewerKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
               <EffortDial compact value={effort} onChange={setEffort} />
               <button onClick={() => setPlanMode(!planMode)} title={planMode ? 'Plan mode on — propose before building' : 'Plan first — propose a plan before doing the work'}
                 style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 28, padding: '0 11px', borderRadius: 9, cursor: 'pointer',

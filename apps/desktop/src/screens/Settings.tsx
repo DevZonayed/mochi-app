@@ -16,7 +16,8 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, TrafficLights, Sidebar, Toolbar,
   type Theme,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type PairingInfo, type EngineStatuses, type AppSettings, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, IS_LOCAL } from '../lib/api';
+import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -217,28 +218,29 @@ function GeneralPane({ theme, setTheme, workspace }: {
 }
 
 /* ── Engines pane — which engine plays which role ───────────────────── */
-type RoleKey = 'master' | 'reviewer' | 'image' | 'video';
-const ROLE_ROWS: { key: RoleKey; label: string; sub: string; offOption?: boolean }[] = [
-  { key: 'master', label: 'Master agent', sub: 'Runs your jobs end-to-end.' },
-  { key: 'reviewer', label: 'Reviewer', sub: 'Second pass appended to every result.', offOption: true },
+const STUDIO_ROLE_ROWS: { key: 'image' | 'video'; label: string; sub: string }[] = [
   { key: 'image', label: 'Image generation', sub: 'Used by Media Studio (preview).' },
   { key: 'video', label: 'Video generation', sub: 'Used by Media Studio (preview).' },
 ];
 const ENGINE_OPTIONS = ['Claude Code', 'Codex'] as const;
-const labelToEngine = (l: string): 'claude' | 'codex' | 'off' => (l === 'Claude Code' ? 'claude' : l === 'Codex' ? 'codex' : 'off');
-const engineToLabel = (e: string): string => (e === 'claude' ? 'Claude Code' : e === 'codex' ? 'Codex' : 'Off');
+const labelToEngine = (l: string): 'claude' | 'codex' => (l === 'Codex' ? 'codex' : 'claude');
+const engineToLabel = (e: string): string => (e === 'codex' ? 'Codex' : 'Claude Code');
 
 function EnginesPane() {
   const [routing, setRouting] = React.useState<Routing | null>(null);
   const [engines, setEngines] = React.useState<EngineStatuses | null>(null);
+  const [roles, setRolesState] = React.useState<Roles | null>(null);
+  const groups = useModelGroups();
+  const [favorites, setFavorites] = React.useState<string[]>([]);
 
   const refetch = React.useCallback(() => {
-    Promise.all([api.getRouting(), api.engineStatus()])
-      .then(([r, e]) => { setRouting(r); setEngines(e); })
+    Promise.all([api.getRouting(), api.engineStatus(), api.getRoles()])
+      .then(([r, e, ro]) => { setRouting(r); setEngines(e); setRolesState(ro); })
       .catch(() => {});
   }, []);
   React.useEffect(() => {
     refetch();
+    api.getSettings().then(s => setFavorites(s.favoriteModels ?? [])).catch(() => {});
     // Engine status can change out-of-band (user runs `claude login` in a
     // terminal); re-check when jobs move and on a slow poll while the pane is open.
     const unsub = api.subscribe({ onJob: () => refetch() });
@@ -246,7 +248,16 @@ function EnginesPane() {
     return () => { unsub(); clearInterval(t); };
   }, [refetch]);
 
-  const setRole = (key: RoleKey, label: string) => {
+  const toggleFav = (key: string) => setFavorites(prev => {
+    const next = prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key];
+    api.setSettings({ favoriteModels: next }).catch(() => {});
+    return next;
+  });
+  const primaryKey = roles ? keyForRoleChoice(groups, roles.primary) : '';
+  const reviewerKey = roles ? (roles.reviewer === 'off' ? 'off' : keyForRoleChoice(groups, roles.reviewer)) : 'off';
+  const setPrimary = (key: string) => { void api.setRoles({ primaryKey: key }).then(setRolesState).catch(() => {}); };
+  const setReviewer = (key: string) => { void api.setRoles({ reviewerKey: key }).then(setRolesState).catch(() => {}); };
+  const setStudioRole = (key: 'image' | 'video', label: string) => {
     const value = labelToEngine(label);
     setRouting(r => (r ? { ...r, [key]: value } as Routing : r));
     void api.setRouting({ [key]: value } as Partial<Routing>).then(setRouting).catch(() => {});
@@ -258,33 +269,48 @@ function EnginesPane() {
     { id: 'claude', label: 'Claude Code' },
     { id: 'codex', label: 'Codex' },
   ];
+  const cursorGroup = groups.find(g => g.provider === 'cursor');
 
   return (
     <div>
-      <PaneHead sub="Pick which engine plays each role. Both run locally on this Mac, on your own sign-ins.">Engines</PaneHead>
+      <PaneHead sub="Pick the model for each role. Claude & Codex run locally on your sign-ins; the reviewer can be turned off.">Engines</PaneHead>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
-        <GroupedList footer="Master + Reviewer are active today. Image & video routing applies to Media Studio when the pipeline ships.">
-          {ROLE_ROWS.map((r, i) => (
-            <Row key={r.key} last={i === ROLE_ROWS.length - 1}>
+        <GroupedList footer="Primary writes the code; the reviewer is a second model that checks it (or Off). Per-chat overrides live in the composer.">
+          <Row>
+            <span style={{ flex: 1 }}>
+              <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Primary (coding)</span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Writes your code end-to-end.</span>
+            </span>
+            {roles ? <ModelPicker align="right" value={primaryKey} onChange={setPrimary} favorites={favorites} onToggleFavorite={toggleFav} /> : <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</span>}
+          </Row>
+          <Row last>
+            <span style={{ flex: 1 }}>
+              <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Reviewer</span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>A second model reviews the result, or Off.</span>
+            </span>
+            {roles ? <ModelPicker align="right" allowOff value={reviewerKey} onChange={setReviewer} favorites={favorites} onToggleFavorite={toggleFav} /> : <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</span>}
+          </Row>
+        </GroupedList>
+
+        <GroupedList header="Media (preview)" footer="Image & video routing applies to Media Studio when the pipeline ships.">
+          {STUDIO_ROLE_ROWS.map((r, i) => (
+            <Row key={r.key} last={i === STUDIO_ROLE_ROWS.length - 1}>
               <span style={{ flex: 1 }}>
                 <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>{r.label}</span>
                 <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{r.sub}</span>
               </span>
               {routing
-                ? <Seg
-                    options={r.offOption ? ['Off', ...ENGINE_OPTIONS] : [...ENGINE_OPTIONS]}
-                    value={engineToLabel(routing[r.key])}
-                    onChange={v => setRole(r.key, v)} />
+                ? <Seg options={[...ENGINE_OPTIONS]} value={engineToLabel(routing[r.key])} onChange={v => setStudioRole(r.key, v)} />
                 : <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</span>}
             </Row>
           ))}
         </GroupedList>
-        <GroupedList header="Engine status" footer="Engines use your own sign-ins on this Mac — Claude Code (`claude login`) and Codex (ChatGPT).">
-          {ENGINE_STATUS_ROWS.map((row, i) => {
+        <GroupedList header="Engine status" footer="Engines use your own sign-ins on this Mac — Claude Code (`claude login`) and Codex (ChatGPT). Cursor needs its agent CLI installed.">
+          {ENGINE_STATUS_ROWS.map((row) => {
             const s = engines?.[row.id];
             const ok = !!s?.available;
             return (
-              <Row key={row.id} last={i === ENGINE_STATUS_ROWS.length - 1}>
+              <Row key={row.id}>
                 <span style={{ flex: 1, minWidth: 0 }}>
                   <span style={{ display: 'block', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>{row.label}</span>
                   {s && !ok && s.reason
@@ -297,6 +323,18 @@ function EnginesPane() {
               </Row>
             );
           })}
+          {/* Cursor — runnable only when its agent CLI is present (from the catalog). */}
+          <Row last>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: 'block', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Cursor</span>
+              {cursorGroup && !cursorGroup.runnable
+                ? <span style={{ display: 'block', font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 3 }}>{cursorGroup.reason}</span>
+                : null}
+            </span>
+            <span style={{ flexShrink: 0, font: '500 var(--fs-footnote)/1 var(--font-text)', color: !cursorGroup ? 'var(--ink-tertiary)' : cursorGroup.runnable ? 'var(--green)' : 'var(--red)' }}>
+              {!cursorGroup ? '…' : cursorGroup.runnable ? 'Ready' : 'Not installed'}
+            </span>
+          </Row>
         </GroupedList>
       </div>
     </div>
