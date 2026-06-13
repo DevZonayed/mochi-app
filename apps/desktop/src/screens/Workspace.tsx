@@ -155,6 +155,7 @@ export default function Workspace() {
   const [ovfOpen, setOvfOpen] = React.useState(false);
   // active chat's turns, lifted from each ChatThread, for the "Changed files" panel
   const [turnsByTab, setTurnsByTab] = React.useState<Record<string, Job[]>>({});
+  const [addOpen, setAddOpen] = React.useState(false); // add-project menu
 
   const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
 
@@ -232,6 +233,20 @@ export default function Workspace() {
     }
     return out;
   }, [turnsByTab, activeKey, activeProject]);
+
+  // Add-project: open a local folder as a coding project (native picker).
+  const openLocalFolder = async () => {
+    setAddOpen(false);
+    try {
+      const r = await api.pickFolder();
+      if (!r || !r.ok || !r.path) return;
+      const name = r.path.split('/').filter(Boolean).pop() ?? 'Project';
+      const proj = await api.createProject({ name, kind: 'coding', path: r.path, instructions: '', color: 'blue' });
+      setProjects(ps => (ps.some(x => x.id === proj.id) ? ps : [proj, ...ps]));
+      setExpanded(e => new Set(e).add(proj.id));
+    } catch { /* cancelled or failed */ }
+  };
+  const recents = projects.filter(p => p.path).slice(0, 5);
 
   // keep the active tab in view + recompute whether the strip overflows
   React.useLayoutEffect(() => {
@@ -349,9 +364,42 @@ export default function Workspace() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 14px 10px' }}>
             <Icon name="terminal" size={16} style={{ color: 'var(--blue)' }} />
             <span style={{ flex: 1, font: '700 var(--fs-callout)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Workspace</span>
-            <button onClick={() => navigate('/projects')} title="Manage projects" className="ws-newbtn" style={{ width: 28, height: 28, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)' }}>
-              <Icon name="layers" size={15} />
-            </button>
+            <div style={{ position: 'relative' }}>
+              <button onClick={() => setAddOpen(o => !o)} title="Add a project" className="ws-newbtn" style={{ width: 28, height: 28, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'transparent', color: addOpen ? 'var(--ink)' : 'var(--ink-tertiary)' }}>
+                <Icon name="plus" size={16} stroke={2.4} />
+              </button>
+              {addOpen && (
+                <>
+                  <div onClick={() => setAddOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
+                  <div style={{ position: 'absolute', top: '100%', right: 0, zIndex: 41, marginTop: 4, width: 232, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.24))', padding: 5 }}>
+                    {([
+                      { icon: 'folder', label: 'Open project', sub: 'A local folder on this Mac', act: openLocalFolder },
+                      { icon: 'terminal', label: 'Open GitHub project', sub: 'Clone a repository', act: () => { setAddOpen(false); navigate('/projects'); } },
+                      { icon: 'plus', label: 'New project', sub: 'Start from scratch', act: () => { setAddOpen(false); navigate('/projects'); } },
+                    ] as { icon: IconName; label: string; sub: string; act: () => void }[]).map(it => (
+                      <button key={it.label} onClick={it.act} className="ws-ovf-item" style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', textAlign: 'left', padding: '8px 9px', borderRadius: 8, cursor: 'pointer' }}>
+                        <Icon name={it.icon} size={15} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+                        <span style={{ flex: 1, minWidth: 0 }}>
+                          <span style={{ display: 'block', font: '600 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)' }}>{it.label}</span>
+                          <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 1 }}>{it.sub}</span>
+                        </span>
+                      </button>
+                    ))}
+                    {recents.length > 0 && (
+                      <div style={{ borderTop: '0.5px solid var(--separator)', margin: '5px 0 0', paddingTop: 5 }}>
+                        <div style={{ padding: '2px 9px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Recents</div>
+                        {recents.map(p => (
+                          <button key={p.id} onClick={() => { setAddOpen(false); setExpanded(e => new Set(e).add(p.id)); }} className="ws-ovf-item" title={p.path} style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '6px 9px', borderRadius: 8, cursor: 'pointer' }}>
+                            <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                            <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
           </div>
 
           {/* search + kind filter — narrow to a type, or find a project/chat by name */}

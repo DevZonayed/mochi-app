@@ -345,6 +345,7 @@ const REAL_PROVIDERS: { id: ProviderId; name: string; tint: string; glyph: strin
   { id: 'anthropic', name: 'Anthropic', tint: '#D97757', glyph: 'A', meta: 'Claude · coding & reasoning', hint: 'sk-ant-…' },
   { id: 'openai', name: 'OpenAI', tint: 'var(--ink)', glyph: 'O', meta: 'GPT · media & vision', hint: 'sk-…' },
   { id: 'fal', name: 'fal.ai', tint: 'var(--purple)', glyph: 'f', meta: 'Media · image, video, voice', hint: 'key_id:key_secret' },
+  { id: 'github', name: 'GitHub', tint: 'var(--ink)', glyph: 'G', meta: 'Repos · clone & create', hint: 'ghp_… (Personal Access Token)' },
 ];
 const OTHER_PROVIDERS = [
   { name: 'Replicate', tint: 'var(--teal)', glyph: 'R' },

@@ -17,6 +17,7 @@ import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice } from './store.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
+import { ensureBranch, branchSlug } from './git.js';
 import type { Providers } from './providers.js';
 
 const require = createRequire(__filename);
@@ -30,6 +31,24 @@ const GOAL_DIRECTIVE =
   `completion. Don't stop to ask for confirmation on routine steps; plan, implement, ` +
   `test, and self-correct in a loop until the goal is fully met or you are genuinely ` +
   `blocked. If blocked, state precisely what's needed.`;
+// SP3 — primary↔reviewer loop: how many review→fix→re-review rounds at most.
+const REVIEW_MAX_ROUNDS = 2;
+const IS_WRITE_TOOL_RE = /write|edit|create|patch|notebook/i;
+/** Build the reviewer's context from the files the primary wrote (path + the
+    captured content snapshot), capped so the review prompt stays bounded. */
+function changedFilesContext(items: TranscriptItem[]): string {
+  const parts: string[] = [];
+  let total = 0;
+  for (const it of items) {
+    if (it.kind === 'tool' && IS_WRITE_TOOL_RE.test(it.name ?? '') && it.preview) {
+      const block = `### ${it.text || it.name}\n${it.preview}`;
+      total += block.length;
+      if (total > 14000) break;
+      parts.push(block);
+    }
+  }
+  return parts.join('\n\n') || '(file contents not captured — review the working tree directly)';
+}
 /* Streaming cadences: local windows get a frame every ≤50ms (perceptually
    realtime); disk + relay get a checkpoint every ~1s. */
 const STREAM_THROTTLE_MS = 50;
@@ -583,6 +602,14 @@ export class LocalEngine {
       // (full context incl. tool use); codex gets recent turns stitched in.
       const session = cur.sessionId ? this.store.getSession(cur.sessionId) : undefined;
       const isChat = !!session;
+      // SP4 — branch-per-chat: isolate each chat on its own git branch
+      // (Conductor-style). Best-effort; if the repo is dirty or not a git repo,
+      // the chat just runs on the current branch.
+      if (session && project?.path) {
+        const want = session.branch ?? `mochi/${branchSlug(session.title)}-${session.id.slice(0, 4)}`;
+        const res = ensureBranch(cwd, want);
+        if (res.ok && session.branch !== want) { try { this.store.updateSession(session.id, { branch: want }); } catch { /* gone */ } }
+      }
       const resumeId = isChat && master === 'claude' ? session.sdkSessionId : undefined;
       const base = project?.instructions ? `${project.instructions}\n\n---\n\n` : '';
       let prompt: string;
@@ -607,8 +634,6 @@ export class LocalEngine {
       const main = master === 'claude'
         ? await runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan)
         : await runCodex(prompt, cwd, hooks, false, masterModel);
-      settleStream(); // stream is over — no trailing frame may race the final states below
-
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {
         try { this.store.updateSession(session.id, { sdkSessionId: main.sdkSessionId }); } catch { /* session deleted mid-run */ }
       }
@@ -617,38 +642,61 @@ export class LocalEngine {
       let tokens = main.tokens;
       let cost = main.cost;
       const model = main.model;
+      const allItems: TranscriptItem[] = [...main.transcript];
+      let primaryResume = main.sdkSessionId; // resume the primary's session for fix rounds
 
-      // Reviewer pass — a REAL second opinion from the configured engine.
-      // Skipped for chat turns: a conversation wants fast back-and-forth, not a
-      // second engine appending verdicts to every reply.
+      /* SP3 — primary↔reviewer loop. A reviewer engine (e.g. Codex) checks the
+         primary's (e.g. Opus) changes for security/weak code/bugs; if it flags
+         problems AND the turn actually changed files, the primary fixes them and
+         the reviewer re-verifies — up to REVIEW_MAX_ROUNDS. Now runs for chat too. */
       const reviewerChoice: RoleChoice | 'off' = opts.reviewer ?? roles.reviewer;
       const reviewer: EngineId | 'off' = reviewerChoice === 'off' ? 'off' : reviewerChoice.engine;
       const reviewerModel = reviewerChoice === 'off' ? undefined : reviewerChoice.model;
+      const wroteFiles = allItems.some(it => it.kind === 'tool' && IS_WRITE_TOOL_RE.test(it.name ?? ''));
+      const reviewerKey = () => (this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined);
       let reviewVerdict: 'approved' | 'needs-work' | null = null;
-      if (reviewer !== 'off' && !isChat && this.available(reviewer) && !ac.signal.aborted) {
-        cur = this.store.updateJob(jobId, { progress: 85, stage: `reviewer pass via ${ENGINE_LABEL[reviewer]}…` });
-        this.emit('job', cur);
-        try {
-          const reviewPrompt =
-            `You are the reviewer. Briefly review the result below for correctness and completeness (3-5 tight bullets), ` +
-            `then end with exactly one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".\n\n` +
-            `## Task\n${cur.input}\n\n## Result\n${output.slice(0, 12000)}`;
-          const review = reviewer === 'claude'
-            ? await runClaude(reviewPrompt, cwd, 'fast', this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined, 1, {}, undefined, reviewerModel)
-            : await runCodex(reviewPrompt, cwd, {}, true, reviewerModel);
-          output += `\n\n―― Reviewer (${ENGINE_LABEL[reviewer]}) ――\n${review.text}`;
-          tokens += review.tokens;
-          cost = Math.round((cost + review.cost) * 1000) / 1000;
+
+      if (reviewer !== 'off' && this.available(reviewer) && (wroteFiles || !isChat) && !ac.signal.aborted) {
+        for (let round = 0; round < REVIEW_MAX_ROUNDS; round++) {
+          cur = this.store.updateJob(jobId, { progress: 88, stage: `reviewer (${ENGINE_LABEL[reviewer]}) checking…` });
+          this.emit('job', cur);
+          const reviewPrompt = wroteFiles
+            ? `You are a senior code reviewer. The user asked:\n${cur.input}\n\nThe coding agent made these changes:\n\n${changedFilesContext(allItems)}\n\nReview ONLY for real problems — security vulnerabilities, broken or weak logic, and correctness bugs. List each as a short, specific, actionable finding (file + what's wrong). If it's solid, say so in one line. End with EXACTLY one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".`
+            : `You are the reviewer. Briefly review the result below for correctness and completeness (3-5 tight bullets), then end with exactly one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".\n\n## Task\n${cur.input}\n\n## Result\n${output.slice(0, 12000)}`;
+          let review: EngineRun;
+          try {
+            review = reviewer === 'claude'
+              ? await runClaude(reviewPrompt, cwd, 'fast', reviewerKey(), 3, {}, undefined, reviewerModel)
+              : await runCodex(reviewPrompt, cwd, {}, true, reviewerModel);
+          } catch (re) { if (re instanceof CancelledError) throw re; break; }
           reviewVerdict = /verdict:\s*needs\s*work/i.test(review.text) ? 'needs-work' : 'approved';
-        } catch (re) {
-          if (re instanceof CancelledError) throw re;
-          output += `\n\n―― Reviewer (${ENGINE_LABEL[reviewer]}) ――\n(review failed: ${re instanceof Error ? re.message : String(re)})`;
+          allItems.push({ kind: 'review', name: ENGINE_LABEL[reviewer], text: review.text, verdict: reviewVerdict, ts: Date.now() });
+          tokens += review.tokens; cost = Math.round((cost + review.cost) * 1000) / 1000;
+          this.emit('job', this.store.updateJob(jobId, { transcript: allItems.slice(-400), tokens, cost, progress: 92 }));
+          if (reviewVerdict === 'approved' || !wroteFiles || round + 1 >= REVIEW_MAX_ROUNDS) break;
+          // Feed the findings back to the primary to fix — streamed live.
+          cur = this.store.updateJob(jobId, { progress: 93, stage: 'fixing the reviewer’s findings…' });
+          this.emit('job', cur);
+          const fixPrompt = `A code reviewer (${ENGINE_LABEL[reviewer]}) reviewed your changes and flagged issues. Fix them now, editing the files as needed. Don't re-explain — just make the corrections.\n\n${review.text}`;
+          const fixHooks: RunHooks = { signal: ac.signal, onProgress: (_p, items, usage) => { const merged = [...allItems, ...items]; flush(proseOf(merged), merged, usage); }, onChild: (c) => { handle.child = c; } };
+          let fix: EngineRun;
+          try {
+            fix = master === 'claude'
+              ? await runClaude(fixPrompt, cwd, effort, anthropicKey, undefined, fixHooks, primaryResume, masterModel)
+              : await runCodex(fixPrompt, cwd, fixHooks, false, masterModel);
+          } catch (fe) { if (fe instanceof CancelledError) throw fe; break; }
+          allItems.push(...fix.transcript);
+          if (fix.sdkSessionId) { primaryResume = fix.sdkSessionId; if (isChat) { try { this.store.updateSession(session.id, { sdkSessionId: fix.sdkSessionId }); } catch { /* gone */ } } }
+          output = fix.text || output;
+          tokens += fix.tokens; cost = Math.round((cost + fix.cost) * 1000) / 1000;
+          this.emit('job', this.store.updateJob(jobId, { output, transcript: allItems.slice(-400), tokens, cost }));
         }
       }
+      settleStream(); // stream is over — no trailing frame may race the final states below
 
       const done = this.store.updateJob(jobId, {
         status: 'done', phase: 'Done', progress: 100, stage: '',
-        output, tokens, cost, model, transcript: main.transcript.slice(-400),
+        output, tokens, cost, model, transcript: allItems.slice(-400),
       });
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);

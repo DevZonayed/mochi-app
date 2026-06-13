@@ -267,12 +267,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'listProviders': return providers.list();
       case 'connectProvider': {
         const prov = String(p.provider ?? '');
-        if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal') bad('unsupported provider');
+        if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal' && prov !== 'github') bad('unsupported provider');
         return providers.connect(prov as ProviderId, String(p.apiKey ?? ''));
       }
       case 'disconnectProvider': {
         const prov = String(p.provider ?? '');
-        if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal') bad('unsupported provider');
+        if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal' && prov !== 'github') bad('unsupported provider');
         providers.disconnect(prov as ProviderId);
         return { ok: true };
       }

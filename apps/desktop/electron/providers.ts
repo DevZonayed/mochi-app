@@ -12,7 +12,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Store } from './store.js';
 
-export type ProviderId = 'anthropic' | 'openai' | 'fal';
+export type ProviderId = 'anthropic' | 'openai' | 'fal' | 'github';
 
 export interface ProviderConn {
   provider: ProviderId;
@@ -99,6 +99,13 @@ export class Providers {
         const res = await fetch('https://queue.fal.run/fal-ai/flux/schnell/requests/00000000-0000-0000-0000-000000000000/status', { headers: { authorization: `Key ${key}` } });
         if (res.status === 401 || res.status === 403) return { valid: false, error: 'Invalid fal API key' };
         return { valid: true };
+      }
+      if (provider === 'github') {
+        // Validate a Personal Access Token against the authenticated-user endpoint.
+        const res = await fetch('https://api.github.com/user', { headers: { authorization: `Bearer ${key}`, accept: 'application/vnd.github+json', 'user-agent': 'maestro' } });
+        if (res.ok) return { valid: true };
+        if (res.status === 401 || res.status === 403) return { valid: false, error: 'Invalid GitHub token' };
+        return { valid: false, error: `GitHub returned ${res.status}` };
       }
       const res = provider === 'anthropic'
         ? await fetch('https://api.anthropic.com/v1/models?limit=1', { headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' } })

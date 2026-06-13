@@ -42,10 +42,11 @@ export interface ChatSession {
   updatedAt: number;
 }
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result' | 'ask';
+  kind: 'text' | 'tool' | 'result' | 'ask' | 'review';
   text: string;
   name?: string;
   toolStatus?: 'running' | 'done' | 'error';
+  verdict?: 'approved' | 'needs-work';
   durMs?: number;
   /** file-writing tools only: capped snapshot of the written content (hover preview). */
   preview?: string;
@@ -122,7 +123,7 @@ export interface BudgetData {
   spent: number;
   byProject: { projectId: string; name: string; color: string; spent: number }[];
 }
-export type ProviderId = 'anthropic' | 'openai' | 'fal';
+export type ProviderId = 'anthropic' | 'openai' | 'fal' | 'github';
 export interface ProviderConn {
   provider: ProviderId;
   method: 'subscription' | 'apiKey';

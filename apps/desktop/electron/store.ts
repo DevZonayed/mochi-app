@@ -40,12 +40,14 @@ export interface Project {
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
     final result. The chat renders these as separate blocks with timings. */
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result' | 'ask';
-  /** text/result: the content. tool: short detail (command, file, query…). ask: prompt. */
+  kind: 'text' | 'tool' | 'result' | 'ask' | 'review';
+  /** text/result: the content. tool: short detail (command, file, query…). ask: prompt. review: the findings. */
   text: string;
-  /** tool only */
+  /** tool: tool name. review: the reviewer engine's label. */
   name?: string;
   toolStatus?: 'running' | 'done' | 'error';
+  /** review only: the reviewer's verdict. */
+  verdict?: 'approved' | 'needs-work';
   durMs?: number;
   /** file-writing tools only: a capped snapshot of the content written, for the hover preview. */
   preview?: string;
@@ -76,6 +78,8 @@ export interface ChatSession {
   /** Per-chat model overrides; absent = the workspace role defaults apply. */
   primary?: RoleChoice;
   reviewer?: RoleChoice | 'off';
+  /** Isolated git branch for this chat (Conductor-style), once checked out. */
+  branch?: string;
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
@@ -444,7 +448,7 @@ export class Store {
     this.data.sessions.push(s); this.save();
     return s;
   }
-  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer'>>): ChatSession {
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch'>>): ChatSession {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     Object.assign(s, patch, { updatedAt: now() });
