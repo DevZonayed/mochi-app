@@ -497,7 +497,7 @@ export default function Workspace() {
 
           {/* panes (chat or file — all kept mounted) + the right-side files panel */}
           <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
-            <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex' }}>
+            <div style={{ flex: 1, minWidth: 340, position: 'relative', display: 'flex' }}>
               {tabs.length === 0 && (
                 <div style={{ flex: 1, display: 'grid', placeItems: 'center', textAlign: 'center', padding: 40 }}>
                   <div>

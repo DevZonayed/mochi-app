@@ -1934,7 +1934,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       {/* faint top atmosphere */}
       <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
         background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
-      <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', padding: '22px 24px' }}>
+      <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
         <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
           {turns.length === 0 && (
             <div style={{ padding: '52px 20px 20px', textAlign: 'center' }}>

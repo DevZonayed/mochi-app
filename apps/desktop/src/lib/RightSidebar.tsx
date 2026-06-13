@@ -187,7 +187,7 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
   const failing = checks.filter(c => c.verdict === 'needs-work').length;
 
   return (
-    <div style={{ width, flexShrink: 0, position: 'relative', borderLeft: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+    <div style={{ width, flexShrink: 1, minWidth: 200, position: 'relative', borderLeft: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
       {/* drag handle to resize the panel */}
       <div onMouseDown={startResize} title="Drag to resize" style={{ position: 'absolute', left: -3, top: 0, bottom: 0, width: 7, cursor: 'col-resize', zIndex: 6 }} />
       {/* top: tabs + actions */}
