@@ -71,6 +71,7 @@ export interface Job {
   stage: string;
   engine?: EngineId;
   model?: string;
+  goal?: boolean;
   createdAt: number;
   updatedAt: number;
 }

@@ -1490,6 +1490,11 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
           {job.model && job.model !== job.engine && (
             <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{job.model}</span>
           )}
+          {job.goal && (
+            <span title="Ran in goal mode — pursued the request autonomously" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, font: '700 9px/1 var(--font-text)', letterSpacing: '0.04em', color: 'var(--purple)', background: 'color-mix(in srgb, var(--purple) 14%, transparent)', padding: '2px 6px', borderRadius: 5 }}>
+              <Icon name="target" size={10} /> GOAL
+            </span>
+          )}
           {live && (
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)' }}>
               <span className="breathe" style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--purple)' }} />
@@ -2042,7 +2047,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                 </button>
               )}
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 7, rowGap: 6, marginTop: 6 }}>
               <ModelPicker compact direction="up" value={primaryKey} onChange={setPrimaryKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
               <ModelPicker compact direction="up" allowOff triggerLabel="Review" value={reviewerKey || 'off'} onChange={setReviewerKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
               <EffortDial compact value={effort} onChange={setEffort} />

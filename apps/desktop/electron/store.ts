@@ -60,6 +60,8 @@ export interface Job {
   id: string; projectId: string; title: string; status: JobStatus; phase: string; progress: number;
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
   engine?: EngineId; model?: string;
+  /** Goal mode: this turn ran autonomously toward the goal (SP2). */
+  goal?: boolean;
   /** Chat turn: set when this job is one turn of a project chat session. */
   sessionId?: string;
   /** Structured run log (assistant text blocks, tool calls, result) — capped. */
@@ -494,7 +496,7 @@ export class Store {
     this.data.jobs.push(j); this.save();
     return j;
   }
-  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'transcript'>>): Job {
+  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript'>>): Job {
     const cur = this.getJob(jobId);
     if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });

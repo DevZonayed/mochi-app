@@ -154,6 +154,17 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
   const [q, setQ] = React.useState('');
   const [searching, setSearching] = React.useState(false);
   const [dockOpen, setDockOpen] = React.useState(false);
+  // Resizable width (drag the left edge), persisted.
+  const [width, setWidth] = React.useState(() => { try { const v = Number(localStorage.getItem('maestro.workspace.sidebar.w')); return v >= 220 && v <= 620 ? v : 290; } catch { return 290; } });
+  const widthRef = React.useRef(width); widthRef.current = width;
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX; const startW = widthRef.current;
+    const onMove = (ev: MouseEvent) => setWidth(Math.min(620, Math.max(220, startW + (startX - ev.clientX))));
+    const onUp = () => { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); document.body.style.cursor = ''; try { localStorage.setItem('maestro.workspace.sidebar.w', String(widthRef.current)); } catch { /* ignore */ } };
+    document.body.style.cursor = 'col-resize';
+    document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp);
+  };
 
   const loadRoot = React.useCallback(() => {
     setRoot(null); setErr('');
@@ -176,7 +187,9 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
   const failing = checks.filter(c => c.verdict === 'needs-work').length;
 
   return (
-    <div style={{ width: 290, flexShrink: 0, borderLeft: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+    <div style={{ width, flexShrink: 0, position: 'relative', borderLeft: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      {/* drag handle to resize the panel */}
+      <div onMouseDown={startResize} title="Drag to resize" style={{ position: 'absolute', left: -3, top: 0, bottom: 0, width: 7, cursor: 'col-resize', zIndex: 6 }} />
       {/* top: tabs + actions */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 2, height: 42, flexShrink: 0, padding: '0 6px', borderBottom: '0.5px solid var(--separator)' }}>
         {([['files', 'All files', 0], ['changes', 'Changes', changed.length], ['checks', 'Checks', checks.length]] as [TopTab, string, number][]).map(([k, label, n]) => (

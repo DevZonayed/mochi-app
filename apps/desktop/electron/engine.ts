@@ -595,6 +595,7 @@ export class LocalEngine {
       const goalMode = opts.goal === true && !opts.plan; // goal + plan are mutually exclusive
       let effort = opts.effort ?? cur.effort;
       if (goalMode && (effort === 'fast' || effort === 'balanced')) effort = 'deep'; // goal mode wants depth
+      if (goalMode) { cur = this.store.updateJob(jobId, { goal: true }); this.emit('job', cur); } // record + surface goal mode on the turn
       const cwd = workDirFor(project);
       const anthropicKey = this.status(master).method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined;
 
