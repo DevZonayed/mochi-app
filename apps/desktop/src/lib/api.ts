@@ -42,7 +42,7 @@ export interface ChatSession {
   updatedAt: number;
 }
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result' | 'ask' | 'review';
+  kind: 'text' | 'tool' | 'result' | 'ask' | 'review' | 'image';
   text: string;
   name?: string;
   toolStatus?: 'running' | 'done' | 'error';
@@ -51,6 +51,14 @@ export interface TranscriptItem {
   /** file-writing tools only: capped snapshot of the written content (hover preview). */
   preview?: string;
   ask?: string;
+  /** image only: the Asset id (resolved to bytes on the Mac via api.assetImage; never sent to the relay). */
+  assetId?: string;
+  /** image only: absolute Mac-local path (reveal-in-Finder/copy; stripped from the relay snapshot). */
+  imagePath?: string;
+  /** image only: alt text / the generation prompt. */
+  alt?: string;
+  width?: number;
+  height?: number;
   ts: number;
 }
 export interface Job {
@@ -291,6 +299,7 @@ interface Bridge {
   pickFolder?: () => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   revealPath?: (p: string) => Promise<{ ok: boolean; error?: string }>;
   importAsset?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  assetImage?: (assetId: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   readFile?: (projectId: string, p: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   listDir?: (projectId: string, p?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   runCommand?: (projectId: string, command: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
@@ -433,6 +442,13 @@ export const api = {
   },
   /** Reveal a local path in Finder — desktop only; no-op in the browser. */
   revealPath: async (p: string): Promise<void> => { if (bridge?.revealPath) await bridge.revealPath(p); },
+  /** Resolve a generated-image Asset to a data URL for inline display — desktop only; null on web/phone. */
+  assetImage: async (assetId: string): Promise<string | null> => {
+    if (!bridge?.assetImage) return null;
+    const r = await bridge.assetImage(assetId);
+    if (!r.ok) return null;
+    return (r.data as { dataUrl?: string })?.dataUrl ?? null;
+  },
   /** Read a file's text — desktop only, confined to the project folder; null in the browser. */
   readFile: async (projectId: string, p: string): Promise<{ path: string; text: string; bytes: number; truncated: boolean } | null> => {
     if (!bridge?.readFile) return null;

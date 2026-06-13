@@ -158,6 +158,30 @@ export class MediaEngine {
     }
   }
 
+  /** Generate and BLOCK until the asset reaches a terminal state. The coding
+      agent's generate_image tool needs the finished local file, not a queued
+      handle — so we submit, then watch the store (the poll ticker drives the
+      actual fal polling + download) until done/failed/cancelled. */
+  async generateAndWait(args: GenArgs, timeoutMs = 3 * 60 * 1000): Promise<Asset> {
+    const first = await this.generate(args);
+    if (first.status === 'failed') throw Object.assign(new Error(first.error || 'image generation failed'), { statusCode: 502 });
+    const start = Date.now();
+    for (;;) {
+      await new Promise(r => setTimeout(r, 700));
+      const a = this.store.getAsset(first.id);
+      if (!a) throw new Error('asset disappeared mid-generation');
+      if (a.status === 'done') return a;
+      if (a.status === 'failed') throw Object.assign(new Error(a.error || 'image generation failed'), { statusCode: 502 });
+      if (a.status === 'cancelled') throw Object.assign(new Error('image generation was cancelled'), { statusCode: 499 });
+      if (Date.now() - start > timeoutMs) {
+        // Stop the in-flight fal job + poll ticker so it can't complete later and
+        // surface a "phantom" image the chat already reported as failed.
+        try { await this.cancel(first.id); } catch { /* best effort */ }
+        throw Object.assign(new Error('image generation timed out'), { statusCode: 504 });
+      }
+    }
+  }
+
   /** Cancel an in-flight generation. */
   async cancel(assetId: string): Promise<Asset> {
     const asset = this.store.getAsset(assetId);

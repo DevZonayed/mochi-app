@@ -12,10 +12,12 @@
 
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, readdirSync, statSync, lstatSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
+import { z } from 'zod';
 import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice } from './store.js';
+import type { PublishingEngine } from './publishing.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { ensureBranch, branchSlug } from './git.js';
 import type { Providers } from './providers.js';
@@ -33,6 +35,47 @@ const GOAL_DIRECTIVE =
   `blocked. If blocked, state precisely what's needed.`;
 // SP3 — primary↔reviewer loop: how many review→fix→re-review rounds at most.
 const REVIEW_MAX_ROUNDS = 2;
+// Codex already ships a native built-in `image_gen` skill (rides the ChatGPT
+// sign-in, no key). When the message reads like an image request, nudge codex to
+// use it (not SVG) and copy the final PNG into the workspace so we can harvest it.
+const IMAGE_INTENT_RE = /\b(image|picture|photo|logo|icon|illustration|render|drawing|draw|png|jpe?g|graphic|artwork|wallpaper|avatar|sprite|mockup|poster|thumbnail)\b/i;
+const CODEX_IMAGE_NUDGE =
+  `\n\n---\n\n[Image output] If this involves generating or editing an image, use your ` +
+  `built-in image_gen skill (NOT an SVG, NOT ASCII art). After generating, COPY the final ` +
+  `selected image into the current workspace directory with a clear name like ` +
+  `generated-<short>.png so it becomes a project asset, and state the saved path.`;
+const IMG_FILE_RE = /\.(png|jpe?g|webp|gif)$/i;
+// The nudge tells codex to save generated images as `generated-<short>.png`. We
+// only auto-show workspace images matching this, so a normal coding turn that
+// merely edits existing images isn't mistaken for a fresh generation.
+const GENERATED_NAME_RE = /(^|[-_/])generated[-_]/i;
+/* Bounded walk of a workspace for image files written/modified at or after
+   `since`. This is the RELIABLE way to find what codex's image_gen produced: the
+   skill copies the final image into the workspace, but usually via a shell
+   command that carries no file-path event, so we can't rely on the JSONL stream. */
+function recentImagesUnder(dir: string, since: number): string[] {
+  const out: string[] = [];
+  const SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.next', 'vendor', '.venv', 'venv', '__pycache__', '.cache', 'target', 'coverage']);
+  let budget = 800;
+  const walk = (d: string, lvl: number): void => {
+    if (lvl > 3 || budget <= 0 || out.length >= 12) return;
+    let names: string[] = [];
+    try { names = readdirSync(d); } catch { return; }
+    for (const name of names) {
+      if (budget <= 0 || out.length >= 12) break;
+      budget--;
+      const fp = path.join(d, name);
+      try {
+        const st = lstatSync(fp); // lstat — never follow a symlink out of the workspace
+        if (st.isSymbolicLink()) continue;
+        if (st.isDirectory()) { if (!SKIP.has(name) && !name.startsWith('.')) walk(fp, lvl + 1); }
+        else if (IMG_FILE_RE.test(name) && st.mtimeMs >= since) out.push(fp);
+      } catch { /* gone mid-walk */ }
+    }
+  };
+  walk(dir, 0);
+  return out;
+}
 const IS_WRITE_TOOL_RE = /write|edit|create|patch|notebook/i;
 /** Build the reviewer's context from the files the primary wrote (path + the
     captured content snapshot), capped so the review prompt stays bounded. */
@@ -72,7 +115,16 @@ interface EngineRun {
   sdkSessionId?: string;
   /** Structured run log: text blocks, tool calls (with timings), result. */
   transcript: TranscriptItem[];
+  /** Codex native image_gen: images harvested into the project + persisted as Assets. */
+  images?: { assetId: string; imagePath: string; width?: number; height?: number }[];
 }
+
+/** A finished image: a real raster file on this Mac + the Asset it was saved as. */
+export interface ImageGenResult { path: string; assetId?: string; alt?: string; width?: number; height?: number }
+/** The pluggable image-generation backend the Claude `generate_image` tool calls.
+    Satisfied by fal (MediaEngine) or a codex-delegation impl — wired in main.ts,
+    never via the relay dispatch, so no key/bytes touch the server. */
+export type ImageGenFn = (prompt: string, opts: { aspect?: string; projectId?: string | null }) => Promise<ImageGenResult>;
 
 /** Running totals streamed during a run so the UI counts cost/tokens live. */
 export interface LiveUsage { tokens: number; cost: number }
@@ -208,10 +260,49 @@ async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
   resume?: string, modelOverride?: string, plan?: boolean,
+  imageGen?: ImageGenFn, projectId?: string | null,
 ): Promise<EngineRun> {
-  const { query } = await import('@anthropic-ai/claude-agent-sdk');
+  const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
   let stderrTail = '';
+  /* Give Claude a real image capability. Claude Code ships no text→image tool,
+     so without this it improvises (hand-written SVG). The in-process MCP tool's
+     handler runs in THIS process (so it can call fal/MediaEngine via the injected
+     backend), pushes a kind:'image' transcript item into the SAME items[] the run
+     already streams (inline display), and returns only a short text + local path
+     to the model — never base64, keeping context + the relay snapshot small.
+     Disabled in plan mode (no execution / no spend during planning). It references
+     `items`/`progress` (declared below) by closure — only ever invoked mid-stream,
+     well after they're initialized. */
+  const imageServer = (imageGen && !plan)
+    ? createSdkMcpServer({
+        name: 'maestro',
+        version: '1.0.0',
+        tools: [
+          tool(
+            'generate_image',
+            'Generate a real raster image (PNG) from a text description and save it to the project. ' +
+            'Use this WHENEVER the user asks to create, draw, render, or generate an image, logo, icon, ' +
+            'illustration, picture, sprite, mockup, or photo. Do NOT hand-write SVG or ASCII art for these ' +
+            'requests — call this tool. The saved PNG is shown inline in the chat automatically; just ' +
+            'reference the returned path in your reply.',
+            { prompt: z.string().describe('A detailed description of the image to generate.'),
+              aspect: z.enum(['1:1', '16:9', '9:16']).optional().describe('Aspect ratio. Default 1:1.') },
+            async (args) => {
+              try {
+                const res = await imageGen(args.prompt, { aspect: args.aspect, projectId });
+                items.push({ kind: 'image', text: args.prompt.slice(0, 200), imagePath: res.path,
+                  assetId: res.assetId, alt: res.alt ?? args.prompt.slice(0, 200), width: res.width, height: res.height, ts: Date.now() });
+                progress();
+                return { content: [{ type: 'text' as const, text: `Generated and saved the image to ${res.path}. It is now displayed in the chat.` }] };
+              } catch (e) {
+                return { isError: true, content: [{ type: 'text' as const, text: `Image generation failed: ${e instanceof Error ? e.message : String(e)}` }] };
+              }
+            },
+          ),
+        ],
+      })
+    : null;
   const it = query({
     prompt,
     options: {
@@ -225,6 +316,10 @@ async function runClaude(
       // Plan mode → propose a plan, no execution. Otherwise run freely on this Mac.
       permissionMode: plan ? 'plan' : 'bypassPermissions',
       includePartialMessages: !!hooks.onProgress,
+      // generate_image: in-process MCP server + auto-allow its fully-qualified name.
+      // Under 'bypassPermissions' tools auto-run; allowedTools future-proofs any
+      // non-bypass mode. In plan mode imageServer is null so the tool is absent.
+      ...(imageServer ? { mcpServers: { maestro: imageServer }, allowedTools: ['mcp__maestro__generate_image'] } : {}),
       ...(modelOverride ? { model: modelOverride } : {}),
       ...(resume ? { resume } : {}),
       ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
@@ -350,7 +445,8 @@ async function runClaude(
 }
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
-function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string): Promise<EngineRun> {
+function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
+  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean }): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex CLI not found on this Mac'), { statusCode: 503 }));
   const outFile = path.join(tmpdir(), `maestro-codex-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
@@ -370,6 +466,10 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
     let liveTokens = 0; // accumulated from turn.completed events; codex is $0 (subscription)
     const items: TranscriptItem[] = [];
     const toolById = new Map<string, TranscriptItem>();
+    // Codex's native image_gen writes PNGs — record the ones it wrote into the
+    // workspace this run so we can harvest + display them inline (see harvest below).
+    const runStart = Date.now();
+    const imgCandidates = new Set<string>();
     const progress = () => hooks.onProgress?.(proseOf(items), items, { tokens: liveTokens, cost: 0 });
     const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 30 * 60 * 1000);
     const onAbort = () => { try { child.kill('SIGTERM'); } catch { /* gone */ } };
@@ -392,6 +492,21 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
           items.push({ kind: 'text', text: item.text ?? item.content ?? '', ts: Date.now() });
           progress();
         } else if (item.type && /command|exec|file_change|patch|tool/.test(item.type)) {
+          // Find images the native image_gen skill produced. Two signals: a file path
+          // on the event, and (more reliably) image paths inside the shell command it
+          // ran — e.g. `cp <codex-home>/ig_*.png generated-x.png`. Confine candidates
+          // to the workspace or ~/.codex/generated_images so we never grab a stray path.
+          const codexImgRoot = path.join(homedir(), '.codex', 'generated_images') + path.sep;
+          const addCand = (raw: string) => {
+            const tok = raw.replace(/^['"]+|['"]+$/g, '');
+            if (!tok || !IMG_FILE_RE.test(tok)) return;
+            const abs = path.isAbsolute(tok) ? tok : path.join(cwd, tok);
+            const rel = path.relative(cwd, abs);
+            const inCwd = !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+            if (inCwd || abs.startsWith(codexImgRoot)) imgCandidates.add(abs);
+          };
+          if (item.path) addCand(item.path);
+          for (const m of (item.command ?? '').match(/\S+\.(?:png|jpe?g|webp|gif)\b/gi) ?? []) addCand(m);
           const key = item.id ?? `${item.type}-${items.length}`;
           const started = ev.type?.endsWith('started');
           const existing = toolById.get(key);
@@ -443,8 +558,55 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
       for (const t of items) if (t.kind === 'tool' && t.toolStatus === 'running') { t.toolStatus = 'done'; t.durMs = Date.now() - t.ts; }
       const lastText = [...items].reverse().find(i => i.kind === 'text')?.text.trim();
       if (text && text !== lastText) items.push({ kind: 'result', text, ts: Date.now() });
+      // Harvest images the native image_gen skill produced and register them as
+      // Assets so the chat can show them inline (and they land in Media Studio).
+      // Gated to image-intent primary turns (never the read-only reviewer) so a
+      // normal coding turn that touches images isn't mistaken for a generation.
+      let images: EngineRun['images'];
+      if (ctx?.imageIntent && !readOnly && ctx.publishing) {
+        const out: NonNullable<EngineRun['images']> = [];
+        const seenSize = new Set<number>(); // dedup the same image arriving via two paths
+        const take = (abs: string) => {
+          if (out.length >= 6 || !existsSync(abs)) return;
+          let size = -1;
+          try { const st = lstatSync(abs); if (st.isSymbolicLink()) return; size = st.size; } catch { return; }
+          if (size <= 0 || seenSize.has(size)) return;
+          seenSize.add(size);
+          try { const a = ctx.publishing!.importAsset(abs, ctx.projectId); out.push({ assetId: a.id, imagePath: a.localPath ?? abs, width: a.width, height: a.height }); }
+          catch { seenSize.delete(size); /* unreadable — let another candidate try */ }
+        };
+        // (a) image paths parsed from codex's file events + shell commands. Take only
+        //     in-workspace copies that match the nudge's generated-* naming (so a
+        //     mere reference to a pre-existing repo image, e.g. `cat assets/hero.png`,
+        //     is NOT mistaken for a fresh generation). Prefer these stable copies.
+        const codexImgRoot = path.join(homedir(), '.codex', 'generated_images') + path.sep;
+        const cands = [...imgCandidates];
+        for (const c of cands) if (!c.startsWith(codexImgRoot) && GENERATED_NAME_RE.test(path.basename(c))) take(c);
+        // (b) workspace images written this run, named per the nudge (generated-*).
+        const recent = recentImagesUnder(cwd, runStart);
+        for (const fp of recent) if (GENERATED_NAME_RE.test(path.basename(fp))) take(fp);
+        // (c) the ~/.codex source path codex referenced, if no workspace copy landed.
+        for (const c of cands) if (c.startsWith(codexImgRoot)) take(c);
+        // (d) last fallback: a fresh ~/.codex/generated_images copy, scanned by mtime.
+        if (out.length === 0) {
+          try {
+            const root = path.join(homedir(), '.codex', 'generated_images');
+            for (const uuid of readdirSync(root)) {
+              const sub = path.join(root, uuid);
+              let entries: string[] = [];
+              try { entries = readdirSync(sub); } catch { continue; }
+              for (const f of entries) {
+                if (!/^ig_.*\.png$/i.test(f)) continue;
+                const fp = path.join(sub, f);
+                try { if (statSync(fp).mtimeMs >= runStart) take(fp); } catch { /* gone */ }
+              }
+            }
+          } catch { /* no codex home / none generated */ }
+        }
+        images = out.length ? out : undefined;
+      }
       // Subscription run — Codex doesn't bill per-token, so cost stays 0.
-      resolve({ text: text || proseOf(items) || '(no output)', tokens, cost: 0, model: model ?? 'codex', transcript: items });
+      resolve({ text: text || proseOf(items) || '(no output)', tokens, cost: 0, model: model ?? 'codex', transcript: items, images });
     });
   });
 }
@@ -457,6 +619,15 @@ export class LocalEngine {
   private running = new Map<string, { ac: AbortController; child?: ChildProcess }>();
 
   constructor(private store: Store, private emit: (name: string, data: unknown, opts?: { live?: boolean }) => void, private providers?: Providers) {}
+
+  /* Image generation is injected from main.ts AFTER MediaEngine/PublishingEngine
+     are built — via setters, so the constructor signature (and the relay dispatch
+     that never receives these) stays untouched. imageGen backs Claude's
+     generate_image tool; publishing registers codex-produced PNGs as Assets. */
+  private imageGen?: ImageGenFn;
+  setImageGen(fn: ImageGenFn) { this.imageGen = fn; }
+  private publishing?: PublishingEngine;
+  setPublishing(p: PublishingEngine) { this.publishing = p; }
 
   /** Is this engine actually runnable right now, and if not, exactly why. */
   status(engine: EngineId): EngineStatus {
@@ -625,6 +796,9 @@ export class LocalEngine {
         prompt = `${base}${cur.input}`;
       }
       if (goalMode) prompt += GOAL_DIRECTIVE;
+      // Codex ships a native image_gen skill — nudge it to use that (not SVG) and
+      // drop the PNG in the workspace so we can harvest + display it inline.
+      if (master === 'codex' && IMAGE_INTENT_RE.test(cur.input)) prompt += CODEX_IMAGE_NUDGE;
 
       const hooks: RunHooks = {
         signal: ac.signal,
@@ -632,9 +806,10 @@ export class LocalEngine {
         onChild: (child) => { handle.child = child; },
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
+      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input) };
       const main = master === 'claude'
-        ? await runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan)
-        : await runCodex(prompt, cwd, hooks, false, masterModel);
+        ? await runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId)
+        : await runCodex(prompt, cwd, hooks, false, masterModel, imageCtx);
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {
         try { this.store.updateSession(session.id, { sdkSessionId: main.sdkSessionId }); } catch { /* session deleted mid-run */ }
       }
@@ -644,6 +819,20 @@ export class LocalEngine {
       let cost = main.cost;
       const model = main.model;
       const allItems: TranscriptItem[] = [...main.transcript];
+      // Codex's harvested images aren't in its transcript — fold them in as inline
+      // image items and surface the new Assets in Media Studio. (Claude's tool
+      // already pushed image items into main.transcript itself.) Dedup by assetId so
+      // an image that resurfaces in a review-fix round isn't shown twice.
+      const foldedImageIds = new Set<string>();
+      const foldImages = (imgs?: EngineRun['images']) => {
+        for (const im of imgs ?? []) {
+          if (foldedImageIds.has(im.assetId)) continue;
+          foldedImageIds.add(im.assetId);
+          allItems.push({ kind: 'image', text: 'Generated image', imagePath: im.imagePath, assetId: im.assetId, width: im.width, height: im.height, ts: Date.now() });
+          const a = this.store.getAsset(im.assetId); if (a) this.emit('asset', a);
+        }
+      };
+      foldImages(main.images);
       let primaryResume = main.sdkSessionId; // resume the primary's session for fix rounds
 
       /* SP3 — primary↔reviewer loop. A reviewer engine (e.g. Codex) checks the
@@ -683,10 +872,11 @@ export class LocalEngine {
           let fix: EngineRun;
           try {
             fix = master === 'claude'
-              ? await runClaude(fixPrompt, cwd, effort, anthropicKey, undefined, fixHooks, primaryResume, masterModel)
-              : await runCodex(fixPrompt, cwd, fixHooks, false, masterModel);
+              ? await runClaude(fixPrompt, cwd, effort, anthropicKey, undefined, fixHooks, primaryResume, masterModel, false, this.imageGen, job.projectId)
+              : await runCodex(fixPrompt, cwd, fixHooks, false, masterModel, imageCtx);
           } catch (fe) { if (fe instanceof CancelledError) throw fe; break; }
           allItems.push(...fix.transcript);
+          foldImages(fix.images);
           if (fix.sdkSessionId) { primaryResume = fix.sdkSessionId; if (isChat) { try { this.store.updateSession(session.id, { sdkSessionId: fix.sdkSessionId }); } catch { /* gone */ } } }
           output = fix.text || output;
           tokens += fix.tokens; cost = Math.round((cost + fix.cost) * 1000) / 1000;

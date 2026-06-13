@@ -1388,6 +1388,44 @@ function ReviewCard({ item }: { item: TranscriptItem }) {
   );
 }
 
+/* A generated image, shown inline in the chat. The bytes live on this Mac; the
+   renderer resolves the trusted Asset id to a data URL via a desktop-only IPC
+   (never the relay), so the phone/web shows an honest placeholder instead. */
+function InlineImage({ item }: { item: TranscriptItem }) {
+  const [src, setSrc] = React.useState<string | null>(null);
+  const [failed, setFailed] = React.useState(false);
+  React.useEffect(() => {
+    let alive = true;
+    if (IS_LOCAL && item.assetId) {
+      api.assetImage(item.assetId)
+        .then(d => { if (alive) { d ? setSrc(d) : setFailed(true); } })
+        .catch(() => { if (alive) setFailed(true); });
+    }
+    return () => { alive = false; };
+  }, [item.assetId]);
+  const caption = item.alt || item.text || 'Generated image';
+  const reveal = () => { if (item.imagePath) void api.revealPath(item.imagePath); };
+  const clickable = IS_LOCAL && !!item.imagePath;
+  return (
+    <div style={{ margin: '8px 0 2px', border: '0.5px solid var(--separator)', borderRadius: 12, background: 'var(--bg-elevated)', overflow: 'hidden', maxWidth: 480 }}>
+      {src
+        ? <img src={src} alt={caption} onClick={reveal} title={clickable ? 'Reveal in Finder' : caption}
+            style={{ display: 'block', width: '100%', maxHeight: 380, objectFit: 'contain', background: 'var(--bg-grouped)', cursor: clickable ? 'pointer' : 'default' }} />
+        : <div style={{ minHeight: 150, display: 'grid', placeItems: 'center', gap: 9, padding: 16, background: 'var(--bg-grouped)', color: 'var(--ink-tertiary)' }}>
+            {failed || !IS_LOCAL
+              ? <><Icon name="image" size={22} /><span style={{ font: '400 var(--fs-caption)/1.35 var(--font-text)', textAlign: 'center', maxWidth: 280 }}>{IS_LOCAL ? 'Image saved on this Mac' : 'Image generated on the Mac — open Maestro to view it'}</span></>
+              : <Spinner size={16} color="var(--purple)" />}
+          </div>}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 8px 7px 12px', borderTop: '0.5px solid var(--separator)' }}>
+        <Icon name="image" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} />
+        <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{caption}</span>
+        {clickable && <button onClick={reveal} title="Reveal in Finder" style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'transparent', border: 'none', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}><Icon name="folder" size={13} /></button>}
+        {item.imagePath && <CopyButton text={item.imagePath} label="Path" />}
+      </div>
+    </div>
+  );
+}
+
 /* Smooth streaming. The Claude Agent SDK (and Codex even more so) hands us text
    in coarse ~70-char bursts every ~0.4–0.7s, not token-by-token — so a faithful
    render steps in half-second jumps that read as "updates every second", not a
@@ -1445,6 +1483,9 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
     } else if (it.kind === 'review') {
       blocks.push(<ReviewCard key={`${keyPrefix}rv${i}`} item={it} />);
       i++;
+    } else if (it.kind === 'image') {
+      blocks.push(<InlineImage key={`${keyPrefix}im${i}`} item={it} />);
+      i++;
     } else {
       const idx = i;
       blocks.push(
@@ -1484,9 +1525,12 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   // (narration + tools) that collapses once the turn is done. A turn that ends
   // in a question stays fully expanded — questions are never hidden.
   const hasAsk = transcript.some(t => t.kind === 'ask');
+  // A generated image is never "work" to be collapsed away — keep image turns fully
+  // expanded so the picture (and anything after it) always renders.
+  const hasImage = transcript.some(t => t.kind === 'image');
   let finalIdx = -1;
   for (let k = transcript.length - 1; k >= 0; k--) { if (transcript[k].kind === 'text' || transcript[k].kind === 'result') { finalIdx = k; break; } }
-  const collapsible = !live && !hasAsk && finalIdx > 0 && transcript.slice(0, finalIdx).some(t => t.kind === 'tool' || t.kind === 'text');
+  const collapsible = !live && !hasAsk && !hasImage && finalIdx > 0 && transcript.slice(0, finalIdx).some(t => t.kind === 'tool' || t.kind === 'text');
   const [expanded, setExpanded] = React.useState(false);
 
   const toolCount = transcript.filter(t => t.kind === 'tool').length;

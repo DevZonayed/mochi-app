@@ -75,7 +75,11 @@ app.whenReady().then(() => {
     if (name === 'settings' && data && typeof data === 'object') applyLoginItem(!!(data as { openAtLogin?: boolean }).openAtLogin);
     // A new pending approval (e.g. reviewer NEEDS WORK) → push to Telegram gates.
     if (name === 'approval' && telegram && (data as Approval)?.status === 'pending') telegram.notifyApproval(data as Approval);
-    relay?.event(name, data);
+    // The relay is a pure conduit to the phone — never hand it the Mac-local path,
+    // the base64 thumbnail, the content hash, or the fal queue URLs an Asset carries.
+    // (Desktop windows above already got the full object; only the relay is slimmed.)
+    const relayData = name === 'asset' && data && typeof data === 'object' ? store.slimAssetForRelay(data as import('./store.js').Asset) : data;
+    relay?.event(name, relayData);
     relay?.pushSnapshot();
   };
 
@@ -84,6 +88,17 @@ app.whenReady().then(() => {
   media.resumeOnBoot();
   const research = new ResearchEngine(store, engine, emit);
   const publishing = new PublishingEngine(store, emit);
+  // Give the coding agent a real image capability (it had none → it improvised SVG).
+  // This is the ONLY place MediaEngine/publishing meet the coding engine; the relay
+  // dispatch (createDispatch below) never receives them, so no key/bytes hit the server.
+  // Claude's generate_image tool runs on fal flux-schnell (~$0.003, fast); the Codex
+  // engine uses its own free native image_gen skill directly (harvested via publishing).
+  engine.setPublishing(publishing);
+  engine.setImageGen(async (prompt, opts) => {
+    const asset = await media.generateAndWait({ modelKey: 'flux-schnell', prompt, projectId: opts.projectId ?? null, aspect: opts.aspect });
+    if (!asset.localPath) throw new Error('image was generated but saving it locally failed — please try again');
+    return { path: asset.localPath, assetId: asset.id, alt: prompt.slice(0, 200), width: asset.width, height: asset.height };
+  });
   telegram = new TelegramBot(store, engine, providers, emit);
   telegram.resumeOnBoot();
   const dispatch = createDispatch(store, engine, media, research, publishing, telegram, providers, emit, RELAY_URL);
@@ -139,6 +154,23 @@ app.whenReady().then(() => {
     if (res.canceled || !res.filePaths[0]) return { ok: true, data: null };
     try { return { ok: true, data: await dispatch('importAsset', { path: res.filePaths[0], projectId: projectId ?? null }) }; }
     catch (e) { const err = e as { message?: string }; return { ok: false, error: err?.message ?? 'import failed' }; }
+  });
+
+  // Inline image bytes for the chat — DESKTOP-ONLY, keyed by a TRUSTED Asset id
+  // (the renderer never supplies a path, so there's no traversal surface). NOT in
+  // the relay dispatch, so phone/web remotes can never pull Mac-local image bytes.
+  const IMG_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
+  ipcMain.handle('maestro:assetImage', async (_e, assetId: string) => {
+    try {
+      const a = store.getAsset(String(assetId));
+      if (!a?.localPath || !existsSync(a.localPath)) return { ok: false, error: 'no local image' };
+      const st = await fsp.stat(a.localPath);
+      if (st.size > 12 * 1024 * 1024) return { ok: false, error: 'image too large to preview' };
+      const ext = (a.localPath.split('.').pop() ?? 'png').toLowerCase();
+      const mime = IMG_MIME[ext] ?? 'application/octet-stream';
+      const b64 = (await fsp.readFile(a.localPath)).toString('base64');
+      return { ok: true, data: { dataUrl: `data:${mime};base64,${b64}` } };
+    } catch (e) { return { ok: false, error: (e as Error)?.message ?? 'read failed' }; }
   });
 
   /* Resolve `rel` to a canonical path that is provably INSIDE the project root.

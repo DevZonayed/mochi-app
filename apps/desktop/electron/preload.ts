@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('maestro', {
   pickFolder: (): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:pickFolder'),
   revealPath: (p: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('maestro:revealPath', p),
   importAsset: (projectId: string | null): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:importAsset', projectId),
+  // Inline image bytes for the chat, keyed by Asset id. Desktop-only; never relayed.
+  assetImage: (assetId: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:assetImage', assetId),
   // Read-only filesystem access for the in-app file viewer. Confined to the
   // project's own folder on the main side; intentionally NOT in the relay
   // dispatch, so the phone/web remotes can never read local files.

@@ -30,6 +30,12 @@ export class PublishingEngine {
   importAsset(filePath: string, projectId: string | null): Asset {
     if (!filePath || !existsSync(filePath)) throw Object.assign(new Error('file not found'), { statusCode: 404 });
     const buf = readFileSync(filePath);
+    const sha = createHash('sha256').update(buf).digest('hex');
+    // Idempotent by content: re-importing identical bytes for the same project
+    // returns the existing Asset (keeps the codex harvest dedup'd across a turn's
+    // main + review-fix rounds, and a manual re-import a no-op).
+    const dup = this.store.listAssets().find(a => a.sha256 === sha && a.projectId === projectId);
+    if (dup) return dup;
     const kind = kindFromExt(filePath);
     let thumbDataUrl: string | undefined; let width: number | undefined; let height: number | undefined;
     if (kind === 'image') {
@@ -43,7 +49,7 @@ export class PublishingEngine {
     const asset = this.store.createAsset({
       source: 'import', kind, status: 'done', projectId,
       name: path.basename(filePath), localPath: filePath, bytes: buf.byteLength,
-      sha256: createHash('sha256').update(buf).digest('hex'), thumbDataUrl, width, height, cost: 0,
+      sha256: sha, thumbDataUrl, width, height, cost: 0,
     });
     this.emit('asset', asset);
     this.store.pushEvent({ kind: 'asset', title: `Imported ${asset.name}`, projectId });

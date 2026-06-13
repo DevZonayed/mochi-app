@@ -40,8 +40,8 @@ export interface Project {
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
     final result. The chat renders these as separate blocks with timings. */
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result' | 'ask' | 'review';
-  /** text/result: the content. tool: short detail (command, file, query…). ask: prompt. review: the findings. */
+  kind: 'text' | 'tool' | 'result' | 'ask' | 'review' | 'image';
+  /** text/result: the content. tool: short detail (command, file, query…). ask: prompt. review: the findings. image: a short caption (the prompt). */
   text: string;
   /** tool: tool name. review: the reviewer engine's label. */
   name?: string;
@@ -53,6 +53,15 @@ export interface TranscriptItem {
   preview?: string;
   /** ask only: JSON of the AskUserQuestion input ({ questions:[{question,header,options,multiSelect}] }). */
   ask?: string;
+  /** image only: the Asset id this image was registered as (resolved to bytes on the Mac via the maestro:assetImage IPC — never sent to the relay). */
+  assetId?: string;
+  /** image only: absolute local path on this Mac (used for reveal-in-Finder/copy; STRIPPED from the relay snapshot). */
+  imagePath?: string;
+  /** image only: alt text / the generation prompt. */
+  alt?: string;
+  /** image only: pixel dimensions, when known. */
+  width?: number;
+  height?: number;
   ts: number;
 }
 
@@ -611,6 +620,18 @@ export class Store {
     return all.slice(0, 200);
   }
   getAsset(assetId: string): Asset | undefined { return this.data.assets.find(a => a.id === assetId); }
+  /** Relay-safe projection of an Asset: drops the Mac-local path, the base64
+      thumbnail, the content hash, and the fal queue URLs. Used for BOTH the
+      snapshot and the live 'asset' event so none of those ever cross the relay. */
+  slimAssetForRelay(a: Asset): Partial<Asset> {
+    return {
+      id: a.id, projectId: a.projectId, source: a.source, kind: a.kind, stage: a.stage,
+      prompt: a.prompt ? a.prompt.slice(0, 200) : undefined, model: a.model, status: a.status,
+      url: a.url, name: a.name, bytes: a.bytes, tint: a.tint, cost: a.cost,
+      durationS: a.durationS, width: a.width, height: a.height, error: a.error,
+      createdAt: a.createdAt, updatedAt: a.updatedAt,
+    };
+  }
   createAsset(args: Partial<Asset> & { source: Asset['source']; kind: AssetKind; status: AssetStatus }): Asset {
     const t = now();
     const a: Asset = {
@@ -881,18 +902,18 @@ export class Store {
       // Remotes get a trimmed run log: last 60 items, long text blocks truncated.
       // Skip the allocation entirely when nothing actually needs trimming.
       const tr = j.transcript;
+      // Image items carry a Mac-local path the phone can't read — strip it so it
+      // never leaves this Mac (the bytes are only served on-device via IPC).
+      const slimItem = (t: TranscriptItem): TranscriptItem => {
+        if (t.kind === 'image') { const { imagePath: _omit, ...rest } = t; return rest; }
+        return t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t;
+      };
       const transcript = !tr ? undefined
-        : (tr.length <= 60 && !tr.some(t => t.text.length > 4000)) ? tr
-        : tr.slice(-60).map(t => (t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t));
+        : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image')) ? tr
+        : tr.slice(-60).map(slimItem);
       return out === j.output && transcript === tr ? j : { ...j, output: out, transcript };
     };
-    const slimAsset = (a: Asset) => ({
-      id: a.id, projectId: a.projectId, source: a.source, kind: a.kind, stage: a.stage,
-      prompt: a.prompt ? a.prompt.slice(0, 200) : undefined, model: a.model, status: a.status,
-      url: a.url, name: a.name, bytes: a.bytes, tint: a.tint, cost: a.cost,
-      durationS: a.durationS, width: a.width, height: a.height, error: a.error,
-      createdAt: a.createdAt, updatedAt: a.updatedAt,
-    });
+    const slimAsset = (a: Asset) => this.slimAssetForRelay(a);
     const dashboard = this.dashboard();
     return {
       workspace: this.data.workspace,
