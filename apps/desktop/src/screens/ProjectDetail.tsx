@@ -1763,7 +1763,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   }, [modelGroups, primaryKey]);
   const [sendError, setSendError] = React.useState('');
   const [slashSel, setSlashSel] = React.useState(0);
-  const [schedOpen, setSchedOpen] = React.useState(false);
+  const [optsOpen, setOptsOpen] = React.useState(false); // reviewer + schedule popover
   const [schedNote, setSchedNote] = React.useState('');
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
   const activeRef = React.useRef<string | null>(activeId);
@@ -1907,7 +1907,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const fillComposer = (v: string) => { setText(v); taRef.current?.focus(); requestAnimationFrame(autoGrow); };
   // Wait-&-check: schedule a one-shot follow-up that pokes this chat after a delay.
   const scheduleCheck = (delayMs: number, label: string) => {
-    setSchedOpen(false);
+    setOptsOpen(false);
     if (!projectId) return;
     void api.scheduleCheck({ projectId, sessionId: activeRef.current ?? undefined, prompt: text.trim() || undefined, delayMs })
       .then(() => { setSchedNote(`Check scheduled in ${label}`); setTimeout(() => setSchedNote(''), 3500); })
@@ -2047,54 +2047,61 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                 </button>
               )}
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 7, rowGap: 6, marginTop: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, rowGap: 6, marginTop: 6 }}>
+              {/* core: which model · how hard · the two run modes */}
               <ModelPicker compact direction="up" value={primaryKey} onChange={setPrimaryKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
-              <ModelPicker compact direction="up" allowOff triggerLabel="Review" value={reviewerKey || 'off'} onChange={setReviewerKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
               <EffortDial compact value={effort} onChange={setEffort} />
+              <span style={{ width: 1, height: 18, background: 'var(--separator)', margin: '0 1px' }} />
               <button onClick={() => setPlanMode(!planMode)} title={planMode ? 'Plan mode on — propose before building' : 'Plan first — propose a plan before doing the work'}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 28, padding: '0 11px', borderRadius: 9, cursor: 'pointer',
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9, cursor: 'pointer',
                   background: planMode ? 'color-mix(in srgb, var(--blue) 13%, transparent)' : 'var(--fill-secondary)',
                   border: planMode ? '1px solid color-mix(in srgb, var(--blue) 45%, transparent)' : '1px solid transparent',
                   color: planMode ? 'var(--blue)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                 <Icon name="map" size={14} /> Plan
               </button>
               <button onClick={() => setGoalMode(!goalMode)} title={goalMode ? 'Goal mode on — pursue autonomously to completion' : 'Goal mode — pursue the request autonomously over a long run'}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 28, padding: '0 11px', borderRadius: 9, cursor: 'pointer',
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9, cursor: 'pointer',
                   background: goalMode ? 'color-mix(in srgb, var(--purple) 14%, transparent)' : 'var(--fill-secondary)',
                   border: goalMode ? '1px solid color-mix(in srgb, var(--purple) 45%, transparent)' : '1px solid transparent',
                   color: goalMode ? 'var(--purple)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                 <Icon name="target" size={14} /> {primaryProvider === 'codex' ? 'Pursue goal' : 'Goal'}
               </button>
+              {/* secondary options — reviewer model + schedule — tucked behind one button to keep the bar clean */}
               <div style={{ position: 'relative' }}>
-                <button onClick={() => setSchedOpen(o => !o)} title="Schedule a follow-up check — pokes this chat on time"
-                  style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 30, height: 28, borderRadius: 9, cursor: 'pointer',
-                    background: schedOpen ? 'var(--fill-tertiary)' : 'var(--fill-secondary)', border: '1px solid transparent', color: 'var(--ink-secondary)' }}>
-                  <Icon name="clock" size={14} />
+                <button onClick={() => setOptsOpen(o => !o)} title="Reviewer & schedule"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 9px', borderRadius: 9, cursor: 'pointer',
+                    background: optsOpen ? 'var(--fill-tertiary)' : 'var(--fill-secondary)', border: '1px solid transparent', color: 'var(--ink-secondary)' }}>
+                  <Icon name="sliders" size={14} />
+                  {reviewerKey && reviewerKey !== 'off' && <span title="Reviewer on" style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--green)' }} />}
                 </button>
-                {schedOpen && (
+                {optsOpen && (
                   <>
-                    <div onClick={() => setSchedOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
-                    <div style={{ position: 'absolute', bottom: 'calc(100% + 6px)', left: 0, zIndex: 41, width: 184,
-                      background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 11, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.24))', padding: 5 }}>
-                      <div style={{ padding: '4px 9px 5px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Check back in…</div>
-                      {[{ label: '15 min', ms: 15 * 60_000 }, { label: '1 hour', ms: 60 * 60_000 }, { label: '3 hours', ms: 3 * 60 * 60_000 }, { label: '6 hours', ms: 6 * 60 * 60_000 }].map(o => (
-                        <button key={o.label} onClick={() => scheduleCheck(o.ms, o.label)} className="mm-row"
-                          style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 7, cursor: 'pointer', font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>
-                          {o.label}
-                        </button>
-                      ))}
+                    <div onClick={() => setOptsOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
+                    <div style={{ position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 41, width: 266,
+                      background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.26))', padding: 11 }}>
+                      <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 7 }}>Reviewer model</div>
+                      <ModelPicker direction="up" allowOff value={reviewerKey || 'off'} onChange={setReviewerKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
+                      <div style={{ height: '0.5px', background: 'var(--separator)', margin: '12px -11px' }} />
+                      <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 7 }}>Schedule a check</div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                        {[{ label: '15 min', ms: 15 * 60_000 }, { label: '1 hour', ms: 60 * 60_000 }, { label: '3 hours', ms: 3 * 60 * 60_000 }, { label: '6 hours', ms: 6 * 60 * 60_000 }].map(o => (
+                          <button key={o.label} onClick={() => scheduleCheck(o.ms, o.label)} className="mm-row"
+                            style={{ height: 28, padding: '0 11px', borderRadius: 'var(--r-pill)', cursor: 'pointer', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }}>
+                            {o.label}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   </>
                 )}
               </div>
-              {schedNote && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)', display: 'inline-flex', alignItems: 'center', gap: 5 }}><Icon name="check" size={12} /> {schedNote}</span>}
-              <span style={{ flex: 1 }} />
+              {schedNote && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)', display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}><Icon name="check" size={12} /> {schedNote}</span>}
+              <span style={{ flex: 1, minWidth: 6 }} />
               {streaming
-                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>
                     <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn?.stage || 'working…'}
-                    <span style={{ color: 'var(--separator-strong)' }}>·</span> ⏎ queue · ⌘⏎ now
                   </span>
-                : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{planMode ? 'Plan mode · ⏎ to plan' : queue.length ? `${queue.length} queued` : 'Enter to send · Shift+Enter for newline'}</span>}
+                : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{planMode ? 'Plan · ⏎' : goalMode ? 'Goal · ⏎' : queue.length ? `${queue.length} queued` : '⏎ to send'}</span>}
             </div>
           </div>
         </div>
