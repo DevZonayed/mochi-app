@@ -1388,6 +1388,48 @@ function ReviewCard({ item }: { item: TranscriptItem }) {
   );
 }
 
+/* Smooth streaming. The Claude Agent SDK (and Codex even more so) hands us text
+   in coarse ~70-char bursts every ~0.4–0.7s, not token-by-token — so a faithful
+   render steps in half-second jumps that read as "updates every second", not a
+   stream. This types the buffered text out at a steady, adaptive cadence: each
+   frame we reveal a few more chars, draining the backlog over ~0.45s, with a
+   lively floor and a bound on how far behind we ever fall (so a big Codex block
+   shows quickly instead of crawling). Settled turns render full text directly —
+   this component is only mounted for the one live, growing block. */
+const STREAM_MIN_CPS = 80;     // chars/sec floor — keep it alive on a trickle
+const STREAM_MAX_CPS = 1400;   // ceiling so big blocks don't machine-gun
+const STREAM_DRAIN_S = 0.45;   // aim to empty the current backlog this fast
+const STREAM_MAX_LAG = 1800;   // never trail the buffer by more than this (chars)
+function StreamingBody({ text, keyBase }: { text: string; keyBase: string }): React.ReactElement {
+  const [shownLen, setShownLen] = React.useState(text.length);
+  const shownRef = React.useRef(text.length);
+  const targetRef = React.useRef(text.length);
+  targetRef.current = text.length; // picked up by the rAF loop without re-subscribing
+  React.useEffect(() => {
+    let raf = 0;
+    let last = performance.now();
+    const tick = (now: number) => {
+      const dt = Math.min(64, now - last); last = now;
+      const target = targetRef.current;
+      let cur = shownRef.current;
+      if (cur > target) cur = target; // text replaced with something shorter — resync
+      if (cur < target) {
+        let backlog = target - cur;
+        if (backlog > STREAM_MAX_LAG) { cur = target - STREAM_MAX_LAG; backlog = STREAM_MAX_LAG; }
+        const cps = Math.min(STREAM_MAX_CPS, Math.max(STREAM_MIN_CPS, backlog / STREAM_DRAIN_S));
+        const add = Math.max(1, Math.ceil((cps * dt) / 1000));
+        cur = Math.min(target, cur + add);
+        shownRef.current = cur;
+        setShownLen(cur);
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+  return <>{renderChatBody(text.slice(0, shownLen), keyBase)}</>;
+}
+
 function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { caretAt?: number; onAnswer?: (t: string) => void; answered?: boolean }): React.ReactNode[] {
   const blocks: React.ReactNode[] = [];
   let i = 0;
@@ -1407,7 +1449,9 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
       const idx = i;
       blocks.push(
         <div key={`${keyPrefix}b${idx}`} style={{ margin: idx > 0 ? '4px 0 0' : 0 }}>
-          {renderChatBody(it.text, `${keyPrefix}${it.kind === 'result' ? 'r' : 't'}${idx}`)}
+          {opts.caretAt === idx
+            ? <StreamingBody text={it.text} keyBase={`${keyPrefix}t${idx}`} />
+            : renderChatBody(it.text, `${keyPrefix}${it.kind === 'result' ? 'r' : 't'}${idx}`)}
           {opts.caretAt === idx && <span className="chat-caret" />}
         </div>
       );
@@ -1472,7 +1516,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   } else if (hasBody) {
     body = (
       <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
-        {renderChatBody(job.output ?? '')}
+        {live ? <StreamingBody text={job.output ?? ''} keyBase="b" /> : renderChatBody(job.output ?? '')}
         {live && <span className="chat-caret" />}
       </div>
     );
