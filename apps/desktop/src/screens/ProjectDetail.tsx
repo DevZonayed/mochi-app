@@ -186,8 +186,8 @@ const PAGE_CSS = `
   @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
   @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
 
-  main::-webkit-scrollbar { width: 9px; }
-  main::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  main::-webkit-scrollbar { width: 11px; }
+  main::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
   textarea::placeholder { color: var(--ink-tertiary); }
   ::selection { background: rgba(0,122,255,0.22); }
 `;
@@ -1139,6 +1139,41 @@ const TOOL_META = (name: string): { icon: IconName; tint: string } => {
 };
 const fmtToolDur = (ms?: number): string => (ms == null ? '' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`);
 
+/** A human verb for the tool the agent is running right now. */
+const TOOL_VERB = (name: string): string => {
+  const n = name.toLowerCase();
+  if (/generate_image|imagegen/.test(n)) return 'Generating image';
+  if (/bash|shell|command|exec|terminal|run/.test(n)) return 'Running';
+  if (/write|edit|create|patch|notebook|apply|multiedit/.test(n)) return 'Editing';
+  if (/read|view|cat|glob|ls|open/.test(n)) return 'Reading';
+  if (/grep|search/.test(n)) return 'Searching';
+  if (/web|fetch|browser/.test(n)) return 'Browsing';
+  if (/skill|task|agent|subagent/.test(n)) return 'Working';
+  return 'Running';
+};
+/** What the agent is doing RIGHT NOW — derived live from the streamed transcript
+    and the engine's phase, so a run never feels frozen or "blank" between steps. */
+function liveActivity(job: Job, transcript: TranscriptItem[]): string {
+  const stage = (job.stage || '').trim();
+  // The engine's review-loop phases are the most informative — surface them verbatim.
+  if (/review|fixing|reviewer/i.test(stage)) return stage.replace(/…+$/, '') + '…';
+  const last = transcript.length ? transcript[transcript.length - 1] : null;
+  if (last) {
+    if (last.kind === 'tool') {
+      if (last.toolStatus === 'running') {
+        const what = (last.text || '').replace(/\s+/g, ' ').trim();
+        const verb = TOOL_VERB(last.name ?? '');
+        return what ? `${verb} ${what.length > 54 ? what.slice(0, 54) + '…' : what}` : `${verb}…`;
+      }
+      return 'Thinking…'; // tool finished — the model is deciding the next step
+    }
+    if (last.kind === 'image') return 'Saving image…';
+    if (last.kind === 'ask') return 'Waiting for your answer…';
+    if ((last.kind === 'text' || last.kind === 'result') && last.text.trim()) return 'Responding…';
+  }
+  return 'Thinking…';
+}
+
 /** One step in the agent's tool sequence — a crisp, tinted, monospace card. */
 function ToolNode({ item, connect }: { item: TranscriptItem; connect: boolean }) {
   const running = item.toolStatus === 'running';
@@ -1594,9 +1629,13 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
           {job.status === 'done' && replyText && <CopyButton text={replyText} className="turn-copy" />}
         </div>
         {body}
-        {!hasBody && live && (
-          <div style={{ font: '500 14px/1.5 var(--font-text)' }}>
-            <span className="think-shimmer">{job.stage || 'Thinking…'}</span>
+        {/* Always-on "what it's doing right now" heartbeat while the turn runs —
+           a spinner + the live activity (current tool / thinking / responding /
+           reviewing), so the run never feels blank between steps. */}
+        {live && (
+          <div style={{ marginTop: hasBody ? 9 : 1, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Spinner size={12} color="var(--purple)" />
+            <span className="think-shimmer" style={{ font: '500 13.5px/1.4 var(--font-text)' }}>{liveActivity(job, transcript)}</span>
           </div>
         )}
         {job.status === 'failed' && (
@@ -2187,7 +2226,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               <span style={{ flex: 1, minWidth: 6 }} />
               {streaming
                 ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>
-                    <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn?.stage || 'working…'}
+                    <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn ? liveActivity(lastTurn, lastTurn.transcript ?? []) : 'Working…'}
                   </span>
                 : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{planMode ? 'Plan · ⏎' : goalMode ? 'Goal · ⏎' : queue.length ? `${queue.length} queued` : '⏎ to send'}</span>}
             </div>

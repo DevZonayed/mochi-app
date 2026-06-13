@@ -26,9 +26,9 @@ const PAGE_CSS = `
   .ws-newbtn:hover { background: var(--fill-secondary) !important; }
   .ws-tabs::-webkit-scrollbar { height: 0; }
   .ws-kinds::-webkit-scrollbar { height: 0; }
-  .ws-tree::-webkit-scrollbar { width: 9px; }
-  .ws-tree::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
-  .ws-tree:hover::-webkit-scrollbar-thumb { background: var(--separator-strong); background-clip: padding-box; }
+  .ws-tree::-webkit-scrollbar { width: 11px; }
+  .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+  .ws-tree:hover::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 40%, transparent); background-clip: padding-box; }
   .ws-proj:hover .ws-newchat { opacity: 1; }
   .ws-newchat { opacity: 0; transition: opacity 120ms ease; }
   /* project header sticks to the top of the scroll area while you read its
