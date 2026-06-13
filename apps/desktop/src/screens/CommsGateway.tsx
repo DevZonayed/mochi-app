@@ -1,13 +1,22 @@
-/* Comms Gateway — a real Telegram remote control. Connect a bot (token from
-   @BotFather, validated + stored encrypted on this Mac, never in the relay).
-   Chats that message the bot land in Pending; bind one (project + permissions)
-   and it can /run jobs and approve gates from Telegram — all executing here.
-   WhatsApp is an honest preview (not wired). */
+/* Comms Gateway — remote control + message capture across channels.
+   • Telegram: a real remote control. Connect a bot (token from @BotFather,
+     validated + stored encrypted on this Mac). Bind a chat (project +
+     permissions) and it can /run jobs and approve gates — all executing here.
+   • WhatsApp: a real channel over WhatsApp Web (Baileys, running on this Mac).
+     Scan the QR under Channels to link; from then on EVERY message is captured
+     into a per-chat history you can browse under History. Capture-only in v1.
+
+   CommsPanel is the chrome-less body; the default export wraps it in AppShell
+   for the standalone /comms route, and Settings embeds the same panel as a pane. */
 
 import React from 'react';
-import { Icon, type IconName } from '../lib/icons';
+import QRCode from 'qrcode';
+import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
-import { api, type CommsStatus, type ChatBinding, type PendingChat, type CommEvent, type Project, type ChatPermissions, ApiError, IS_LOCAL } from '../lib/api';
+import {
+  api, type CommsStatus, type ChatBinding, type PendingChat, type CommEvent, type Project, type ChatPermissions,
+  type WaChat, type WaMessage, type WaMsgKind, ApiError, IS_LOCAL,
+} from '../lib/api';
 
 const CSS = `
   .tab-fade { animation: tfade 240ms var(--spring); }
@@ -79,15 +88,182 @@ function ChannelsTab({ status, onChanged }: { status: CommsStatus | null; onChan
         ) : <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Connect the Telegram bot from the desktop app.</div>}
       </div>
 
-      {/* WhatsApp — honest preview */}
-      <div style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 22, opacity: 0.7 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-          <span style={{ width: 44, height: 44, borderRadius: 12, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--green) 16%, transparent)', color: 'var(--green)' }}><WhatsAppGlyph /></span>
-          <div style={{ flex: 1 }}>
-            <div style={{ font: '700 var(--fs-title2)/1.1 var(--font-display)', color: 'var(--ink)' }}>WhatsApp</div>
-            <div style={{ font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Coming next — Telegram is the supported channel today.</div>
+      {/* WhatsApp — real channel (capture + history) */}
+      <WhatsAppCard status={status} onChanged={onChanged} />
+    </div>
+  );
+}
+
+// ── WhatsApp connect card (QR pairing) ──────────────────────────────────────
+function WaQR({ qr }: { qr: string }) {
+  const [src, setSrc] = React.useState('');
+  React.useEffect(() => {
+    let alive = true;
+    QRCode.toDataURL(qr, { margin: 1, width: 240, errorCorrectionLevel: 'M' }).then(d => { if (alive) setSrc(d); }).catch(() => {});
+    return () => { alive = false; };
+  }, [qr]);
+  return (
+    <div style={{ width: 220, height: 220, display: 'grid', placeItems: 'center', background: '#fff', borderRadius: 14, border: '0.5px solid var(--separator)', flexShrink: 0 }}>
+      {src ? <img src={src} width={196} height={196} alt="WhatsApp linking QR code" style={{ display: 'block' }} />
+        : <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: '#888' }}>…</span>}
+    </div>
+  );
+}
+
+function WhatsAppCard({ status, onChanged }: { status: CommsStatus | null; onChanged: () => void }) {
+  const wa = status?.whatsapp;
+  const [busy, setBusy] = React.useState(false);
+  const [linking, setLinking] = React.useState(false);
+  const [err, setErr] = React.useState('');
+
+  // Once a QR appears or we're connected, the "starting…" phase is over.
+  React.useEffect(() => { if (wa?.qr || wa?.connected) setLinking(false); }, [wa?.qr, wa?.connected]);
+
+  const connect = async () => {
+    setBusy(true); setErr(''); setLinking(true);
+    try { await api.connectWhatsApp(); onChanged(); }
+    catch (e) { setErr(e instanceof ApiError ? e.message : 'Could not start linking'); setLinking(false); }
+    finally { setBusy(false); }
+  };
+  const disconnect = async () => { setBusy(true); try { await api.disconnectWhatsApp(); setLinking(false); onChanged(); } finally { setBusy(false); } };
+
+  const connected = !!wa?.connected;
+  const showQR = !connected && !!wa?.qr;
+
+  return (
+    <div style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 22 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: connected || showQR || linking ? 16 : 0 }}>
+        <span style={{ width: 44, height: 44, borderRadius: 12, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--green) 16%, transparent)', color: 'var(--green)' }}><WhatsAppGlyph /></span>
+        <div style={{ flex: 1 }}>
+          <div style={{ font: '700 var(--fs-title2)/1.1 var(--font-display)', color: 'var(--ink)' }}>WhatsApp</div>
+          <div style={{ font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
+            {connected
+              ? <>Linked as <b style={{ color: 'var(--ink)' }}>{wa?.name || wa?.jid?.split(':')[0] || 'this device'}</b> · {wa?.chats ?? 0} chat{(wa?.chats ?? 0) !== 1 ? 's' : ''} captured</>
+              : 'Link your WhatsApp to capture every message into a searchable history.'}
           </div>
-          <span style={{ height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink-tertiary)', font: '600 var(--fs-caption)/26px var(--font-text)' }}>Soon</span>
+        </div>
+        {connected && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'rgba(52,199,89,0.14)', color: 'var(--green)', font: '600 var(--fs-caption)/1 var(--font-text)' }}><span style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--green)' }} /> Live</span>}
+      </div>
+
+      {connected ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Messages are being saved on this Mac. Browse them under the History tab.</div>
+          <button onClick={disconnect} disabled={busy} style={{ height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Disconnect</button>
+        </div>
+      ) : !IS_LOCAL ? (
+        <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Link WhatsApp from the desktop app.</div>
+      ) : showQR ? (
+        <div style={{ display: 'flex', gap: 20, alignItems: 'center' }}>
+          <WaQR qr={wa!.qr!} />
+          <div style={{ flex: 1 }}>
+            <div style={{ font: '600 var(--fs-callout)/1.3 var(--font-text)', color: 'var(--ink)', marginBottom: 8 }}>Scan to link this device</div>
+            <ol style={{ margin: 0, paddingLeft: 18, font: '400 var(--fs-footnote)/1.6 var(--font-text)', color: 'var(--ink-secondary)' }}>
+              <li>Open WhatsApp on your phone</li>
+              <li>Tap <b>Settings → Linked Devices</b></li>
+              <li>Tap <b>Link a Device</b> and scan this code</li>
+            </ol>
+            <button onClick={disconnect} disabled={busy} style={{ marginTop: 14, height: 34, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Cancel</button>
+          </div>
+        </div>
+      ) : linking ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>
+          <span style={{ width: 16, height: 16, borderRadius: '50%', border: '2px solid var(--separator)', borderTopColor: 'var(--green)', animation: 'spin 0.7s linear infinite' }} /> Generating QR code…
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+        </div>
+      ) : (
+        <>
+          <button onClick={connect} disabled={busy} style={{ height: 42, padding: '0 20px', borderRadius: 11, background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{busy ? 'Starting…' : 'Link WhatsApp'}</button>
+          <p style={{ margin: '10px 0 0', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Connects over WhatsApp Web on this Mac. Your session stays here and is never sent to the relay.</p>
+          {err && <div style={{ marginTop: 10, font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--red)' }}>{err}</div>}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── WhatsApp History ────────────────────────────────────────────────────────
+const KIND_LABEL: Record<WaMsgKind, string> = {
+  text: '', system: '', image: '🖼 Photo', video: '🎬 Video', audio: '🎙 Voice message', document: '📄 Document', location: '📍 Location', poll: '📊 Poll',
+};
+function bubbleText(m: WaMessage): string {
+  if (m.kind === 'text' || m.kind === 'system') return m.text;
+  const label = m.kind === 'document' && m.media?.fileName ? `📄 ${m.media.fileName}` : KIND_LABEL[m.kind];
+  return m.text ? `${label} · ${m.text}` : label;
+}
+const clockTime = (sec: number) => { const d = new Date(sec * 1000); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+const dayLabel = (sec: number) => new Date(sec * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+
+function WhatsAppHistory({ connected, hasChats }: { connected: boolean; hasChats: boolean }) {
+  const [chats, setChats] = React.useState<WaChat[]>([]);
+  const [sel, setSel] = React.useState<string | null>(null);
+  const [msgs, setMsgs] = React.useState<WaMessage[]>([]);
+  const threadRef = React.useRef<HTMLDivElement>(null);
+
+  const loadChats = React.useCallback(() => { api.listWaChats().then(setChats).catch(() => {}); }, []);
+  React.useEffect(() => { loadChats(); const unsub = api.subscribe({ onComms: loadChats }); return () => unsub(); }, [loadChats]);
+  React.useEffect(() => { if (!sel && chats.length) setSel(chats[0].chatId); }, [chats, sel]);
+  React.useEffect(() => {
+    if (!sel) { setMsgs([]); return; }
+    let alive = true;
+    const load = () => api.listWaMessages(sel).then(m => { if (alive) setMsgs(m); }).catch(() => {});
+    load();
+    const unsub = api.subscribe({ onComms: load });
+    return () => { alive = false; unsub(); };
+  }, [sel]);
+  React.useEffect(() => { const el = threadRef.current; if (el) el.scrollTop = el.scrollHeight; }, [msgs]);
+
+  if (!connected && !hasChats) {
+    return <div style={{ padding: '48px 0', textAlign: 'center', background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', font: '400 var(--fs-callout)/1.5 var(--font-text)', color: 'var(--ink-tertiary)', maxWidth: 760 }}>Link WhatsApp under <b>Channels</b> to start capturing message history.</div>;
+  }
+  if (chats.length === 0) {
+    return <div style={{ padding: '48px 0', textAlign: 'center', background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', font: '400 var(--fs-callout)/1.5 var(--font-text)', color: 'var(--ink-tertiary)', maxWidth: 760 }}>No messages captured yet. Conversations will appear here as they arrive.</div>;
+  }
+
+  const selChat = chats.find(c => c.chatId === sel);
+  let lastDay = '';
+  return (
+    <div style={{ display: 'flex', gap: 0, maxWidth: 860, height: 520, background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden' }}>
+      {/* chat list */}
+      <div style={{ width: 240, flexShrink: 0, borderRight: '0.5px solid var(--separator)', overflow: 'auto' }}>
+        {chats.map(c => {
+          const on = c.chatId === sel;
+          const title = c.name || c.chatId.split('@')[0];
+          const initial = (title.trim()[0] || '?').toUpperCase();
+          return (
+            <button key={c.chatId} onClick={() => setSel(c.chatId)} className={on ? '' : 'row-hover'} style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', padding: '11px 14px', textAlign: 'left', borderBottom: '0.5px solid var(--separator)', background: on ? 'var(--fill-secondary)' : 'transparent' }}>
+              <span style={{ width: 34, height: 34, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', background: c.kind === 'group' ? 'color-mix(in srgb, var(--blue) 16%, transparent)' : 'color-mix(in srgb, var(--green) 16%, transparent)', color: c.kind === 'group' ? 'var(--blue)' : 'var(--green)', font: '700 var(--fs-footnote)/1 var(--font-display)' }}>
+                {initial}
+              </span>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', font: '600 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{title}</span>
+                <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-tertiary)' }}>{c.kind === 'group' ? 'Group · ' : ''}{c.count} message{c.count !== 1 ? 's' : ''}</span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      {/* thread */}
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+        <div style={{ flexShrink: 0, padding: '12px 16px', borderBottom: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {selChat?.name || selChat?.chatId.split('@')[0] || 'Chat'}
+        </div>
+        <div ref={threadRef} style={{ flex: 1, overflow: 'auto', padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {msgs.map(m => {
+            const day = dayLabel(m.ts);
+            const showDay = day !== lastDay; lastDay = day;
+            return (
+              <React.Fragment key={m.msgId}>
+                {showDay && <div style={{ alignSelf: 'center', margin: '8px 0 4px', padding: '3px 10px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{day}</div>}
+                <div style={{ alignSelf: m.fromMe ? 'flex-end' : 'flex-start', maxWidth: '78%' }}>
+                  {!m.fromMe && selChat?.kind === 'group' && m.senderName && <span style={{ display: 'block', font: '600 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--blue)', margin: '0 0 2px 2px' }}>{m.senderName}</span>}
+                  <div style={{ padding: '7px 11px', borderRadius: 12, background: m.fromMe ? 'var(--blue)' : 'var(--bg-elevated)', color: m.fromMe ? '#fff' : 'var(--ink)', border: m.fromMe ? 'none' : '0.5px solid var(--separator)', font: '400 var(--fs-footnote)/1.4 var(--font-text)', wordBreak: 'break-word' }}>
+                    {bubbleText(m) || <span style={{ opacity: 0.6 }}>·</span>}
+                    <span style={{ display: 'inline-block', marginLeft: 8, font: '500 var(--fs-caption)/1 var(--font-mono)', color: m.fromMe ? 'rgba(255,255,255,0.7)' : 'var(--ink-tertiary)', verticalAlign: 'baseline' }}>{clockTime(m.ts)}</span>
+                  </div>
+                </div>
+              </React.Fragment>
+            );
+          })}
         </div>
       </div>
     </div>
@@ -211,9 +387,11 @@ function ActivityTab({ events }: { events: CommEvent[] }) {
   );
 }
 
-const TABS: [string, string][] = [['channels', 'Channels'], ['bindings', 'Bindings'], ['activity', 'Activity']];
+const TABS: [string, string][] = [['channels', 'Channels'], ['history', 'History'], ['bindings', 'Bindings'], ['activity', 'Activity']];
 
-export default function CommsGateway() {
+/** Chrome-less Comms body. Used standalone (wrapped in AppShell below) and
+    embedded as a Settings pane. */
+export function CommsPanel({ embedded = false }: { embedded?: boolean } = {}) {
   const [tab, setTab] = React.useState('channels');
   const [status, setStatus] = React.useState<CommsStatus | null>(null);
   const [bindings, setBindings] = React.useState<ChatBinding[]>([]);
@@ -236,26 +414,33 @@ export default function CommsGateway() {
   }, [refetch]);
 
   return (
-    <AppShell active="comms" onSearch={() => {}}>
+    <div style={{ padding: embedded ? 0 : '24px 28px 36px' }}>
       <style>{CSS}</style>
-      <div style={{ padding: '24px 28px 36px' }}>
-        <h1 style={{ margin: '0 0 4px', font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Comms</h1>
-        <p style={{ margin: '0 0 20px', font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Drive Maestro from a Telegram chat — jobs and approvals run on this Mac.</p>
+      <h1 style={{ margin: '0 0 4px', font: `700 ${embedded ? 'var(--fs-title1)' : 'var(--fs-large-title)'}/1 var(--font-display)`, letterSpacing: '-0.02em', color: 'var(--ink)' }}>Comms</h1>
+      <p style={{ margin: '0 0 20px', font: '400 var(--fs-subhead)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>Drive Maestro from Telegram, and capture your WhatsApp history — all on this Mac.</p>
 
-        <div style={{ display: 'inline-flex', padding: 3, background: 'var(--fill-secondary)', borderRadius: 11, marginBottom: 22 }}>
-          {TABS.map(([k, label]) => (
-            <button key={k} onClick={() => setTab(k)} style={{ width: 116, padding: '8px 0', textAlign: 'center', borderRadius: 8, font: `${tab === k ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`, color: tab === k ? 'var(--ink)' : 'var(--ink-secondary)', background: tab === k ? 'var(--bg-elevated)' : 'transparent', boxShadow: tab === k ? '0 1px 3px rgba(0,0,0,0.14)' : 'none' }}>
-              {label}{k === 'bindings' && pending.length > 0 ? ` · ${pending.length}` : ''}
-            </button>
-          ))}
-        </div>
-
-        <div key={tab} className="tab-fade">
-          {tab === 'channels' && <ChannelsTab status={status} onChanged={refetch} />}
-          {tab === 'bindings' && <BindingsTab bindings={bindings} pending={pending} projects={projects} onChanged={refetch} />}
-          {tab === 'activity' && <ActivityTab events={events} />}
-        </div>
+      <div style={{ display: 'inline-flex', padding: 3, background: 'var(--fill-secondary)', borderRadius: 11, marginBottom: 22 }}>
+        {TABS.map(([k, label]) => (
+          <button key={k} onClick={() => setTab(k)} style={{ width: 110, padding: '8px 0', textAlign: 'center', borderRadius: 8, font: `${tab === k ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`, color: tab === k ? 'var(--ink)' : 'var(--ink-secondary)', background: tab === k ? 'var(--bg-elevated)' : 'transparent', boxShadow: tab === k ? '0 1px 3px rgba(0,0,0,0.14)' : 'none' }}>
+            {label}{k === 'bindings' && pending.length > 0 ? ` · ${pending.length}` : ''}
+          </button>
+        ))}
       </div>
+
+      <div key={tab} className="tab-fade">
+        {tab === 'channels' && <ChannelsTab status={status} onChanged={refetch} />}
+        {tab === 'history' && <WhatsAppHistory connected={!!status?.whatsapp.connected} hasChats={(status?.whatsapp.chats ?? 0) > 0} />}
+        {tab === 'bindings' && <BindingsTab bindings={bindings} pending={pending} projects={projects} onChanged={refetch} />}
+        {tab === 'activity' && <ActivityTab events={events} />}
+      </div>
+    </div>
+  );
+}
+
+export default function CommsGateway() {
+  return (
+    <AppShell active="comms" onSearch={() => {}}>
+      <CommsPanel />
     </AppShell>
   );
 }

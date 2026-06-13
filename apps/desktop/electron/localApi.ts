@@ -8,6 +8,7 @@ import type { MediaEngine } from './media.js';
 import type { ResearchEngine } from './research.js';
 import type { PublishingEngine } from './publishing.js';
 import type { TelegramBot } from './telegram.js';
+import type { WhatsAppBot } from './whatsapp.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable } from './git.js';
 
@@ -26,7 +27,7 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -316,6 +317,17 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return telegram.connect(p.token as string);
       }
       case 'disconnectTelegram': { telegram.disconnect(); return { ok: true }; }
+
+      // ── Comms (WhatsApp / Baileys) — capture + history ─────────
+      case 'connectWhatsApp': { await whatsapp.connect(); return store.commsStatus(); }
+      case 'disconnectWhatsApp': { await whatsapp.disconnect(); return { ok: true }; }
+      case 'listWaChats': return store.listWaChats();
+      case 'listWaMessages': {
+        if (!p.chatId || typeof p.chatId !== 'string') bad('chatId required');
+        const limit = typeof p.limit === 'number' ? p.limit : undefined;
+        const before = typeof p.before === 'number' ? p.before : undefined;
+        return store.getWaMessages(p.chatId as string, { limit, before });
+      }
       case 'bindChat': {
         if (!p.chatId) bad('chatId required');
         const pending = store.listPendingChats().find(c => c.chatId === String(p.chatId));

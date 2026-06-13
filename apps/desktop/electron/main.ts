@@ -7,6 +7,7 @@ import { MediaEngine } from './media.js';
 import { ResearchEngine } from './research.js';
 import { PublishingEngine } from './publishing.js';
 import { TelegramBot } from './telegram.js';
+import { WhatsAppBot } from './whatsapp.js';
 import { Providers } from './providers.js';
 import type { Approval } from './store.js';
 import { createDispatch } from './localApi.js';
@@ -63,6 +64,7 @@ app.whenReady().then(() => {
 
   let relay: RelayClient | null = null;
   let telegram: TelegramBot | null = null;
+  let whatsapp: WhatsAppBot | null = null;
   const emit = (name: string, data: unknown, opts?: { live?: boolean }) => {
     for (const w of BrowserWindow.getAllWindows()) {
       try { w.webContents.send('maestro:event', { name, data }); } catch { /* window closing */ }
@@ -84,7 +86,9 @@ app.whenReady().then(() => {
   const publishing = new PublishingEngine(store, emit);
   telegram = new TelegramBot(store, engine, providers, emit);
   telegram.resumeOnBoot();
-  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, providers, emit, RELAY_URL);
+  whatsapp = new WhatsAppBot(store, emit);
+  whatsapp.resumeOnBoot();
+  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL);
 
   relay = new RelayClient({
     url: RELAY_URL,
@@ -98,7 +102,7 @@ app.whenReady().then(() => {
 
   const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs));
   cron.start();
-  app.on('before-quit', () => { cron.stop(); relay?.stop(); telegram?.stop(); });
+  app.on('before-quit', () => { cron.stop(); relay?.stop(); telegram?.stop(); whatsapp?.stop(); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {

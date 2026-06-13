@@ -6,8 +6,11 @@
    Ported to ES-module TypeScript React — visual output unchanged. */
 
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
+import { CommsPanel } from './CommsGateway';
+import { BudgetPanel } from './BudgetDashboard';
+import { pathForNav } from '../lib/routes';
 import {
   GroupedList, Row, Switch, EffortDial, ModelSwitcher,
   type EffortStop,
@@ -137,12 +140,17 @@ const SET_NAV: SetNavItem[] = [
   { key: 'general', icon: 'settings', label: 'General', tint: 'var(--ink-secondary)' },
   { key: 'engines', icon: 'cpu', label: 'Engines', tint: 'var(--purple)' },
   { key: 'accounts', icon: 'key', label: 'Accounts & keys', tint: 'var(--blue)' },
+  { key: 'comms', icon: 'command', label: 'Comms', tint: 'var(--teal)' },
+  { key: 'costs', icon: 'gauge', label: 'Costs', tint: 'var(--green)' },
   { key: 'security', icon: 'shield', label: 'Security', tint: 'var(--green)' },
   { key: 'devices', icon: 'smartphone', label: 'Devices', tint: 'var(--teal)' },
   { key: 'power', icon: 'bolt', label: 'Power & reliability', tint: 'var(--orange)' },
   { key: 'updates', icon: 'refresh', label: 'Updates', tint: 'var(--indigo)' },
   { key: 'danger', icon: 'alert', label: 'Danger zone', tint: 'var(--red)' },
 ];
+/* Panes that bring their own page-scale layout and need the full pane width
+   (not the 640px reading column the form panes use). */
+const WIDE_PANES = new Set(['comms', 'costs']);
 
 /* ───────────────────────── pane primitives ───────────────────────── */
 function PaneHead({ children, sub }: { children?: React.ReactNode; sub?: React.ReactNode }) {
@@ -542,29 +550,17 @@ function ResetSheet({ onClose }: { onClose: () => void }) {
 }
 
 /* ───────────────────────── page root ───────────────────────── */
-// cross-page nav routing → react-router (mirrors the prototype's navTo map)
-const NAV_ROUTES: Record<string, string> = {
-  home: '/command-center',
-  projects: '/projects',
-  jobs: '/job-monitor',
-  approvals: '/approvals',
-  scheduler: '/scheduler',
-  skills: '/skills-registry',
-  templates: '/templates',
-  trends: '/trends',
-  studio: '/media-studio',
-  publishing: '/publishing',
-  budget: '/budget',
-  settings: '/settings',
-};
-
 export default function Settings() {
   const scale = useAppScale();
   const [theme, setTheme] = useTheme('light');
-  const [sec, setSec] = React.useState('general');
+  const navigate = useNavigate();
+  const location = useLocation();
+  // Deep-link into a section, e.g. the toolbar Costs chip → navigate('/settings',
+  // { state: { section: 'costs' } }). Falls back to General.
+  const initialSec = (location.state as { section?: string } | null)?.section;
+  const [sec, setSec] = React.useState(initialSec && typeof initialSec === 'string' ? initialSec : 'general');
   const [reset, setReset] = React.useState(false);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
-  const navigate = useNavigate();
 
   // Live workspace (first one) backing the name row. Fail-soft on error.
   const [workspace, setWorkspace] = React.useState<Workspace | null>(null);
@@ -575,7 +571,9 @@ export default function Settings() {
     return () => { alive = false; };
   }, []);
 
-  const navTo = (key: string) => { const r = NAV_ROUTES[key]; if (r) navigate(r); };
+  // Shared route registry resolves every sidebar key (incl. Workspace, and the
+  // Comms/Costs destinations) — no duplicate map to drift out of sync.
+  const navTo = (key: string) => navigate(pathForNav(key));
 
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
@@ -586,6 +584,8 @@ export default function Settings() {
     general: <GeneralPane theme={theme} setTheme={setTheme} workspace={workspace} />,
     engines: <EnginesPane />,
     accounts: <AccountsPane />,
+    comms: <CommsPanel embedded />,
+    costs: <BudgetPanel embedded />,
     security: <SecurityPane onExportAudit={() => navigate('/audit')} />,
     devices: <DevicesPane onPair={() => navigate('/device-pairing')} />,
     power: <PowerPane />,
@@ -624,7 +624,7 @@ export default function Settings() {
             </aside>
             {/* pane */}
             <main style={{ flex: 1, overflowY: 'auto', padding: '28px 32px 40px' }}>
-              <div key={sec} className="pane-fade" style={{ maxWidth: 640 }}>{panes[sec]}</div>
+              <div key={sec} className="pane-fade" style={{ maxWidth: WIDE_PANES.has(sec) ? 980 : 640 }}>{panes[sec]}</div>
             </main>
           </div>
         </div>

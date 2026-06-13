@@ -8,8 +8,8 @@
    remote controls. */
 
 import { app } from 'electron';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, appendFileSync, existsSync, readdirSync, rmSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export const id = (): string => randomUUID();
@@ -159,9 +159,32 @@ export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
 export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
 export interface TelegramState { offset: number; botUsername: string | null; connectedAt: number | null }
+
+/* WhatsApp — connection state persisted in the store; the live QR string is
+   held in memory only (never written to disk). */
+export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; connectedAt: number | null }
+export type WaMsgKind = 'text' | 'image' | 'video' | 'audio' | 'document' | 'location' | 'poll' | 'system';
+export interface WaMedia { mimetype: string | null; fileName: string | null; sizeBytes: number | null }
+/* A normalized WhatsApp message — the record stored per-chat in messages.jsonl. */
+export interface WaMessage {
+  msgId: string;
+  chatId: string;
+  fromMe: boolean;
+  senderId: string;
+  senderName: string;
+  ts: number;          // epoch seconds
+  kind: WaMsgKind;
+  text: string;
+  media: WaMedia | null;
+  replyTo: string | null;
+  source: 'live' | 'backfill';
+}
+/* A chat summary for the history list (derived from each chat's cursor + meta). */
+export interface WaChat { chatId: string; name: string | null; kind: 'dm' | 'group'; count: number; newestTs: number; oldestTs: number }
+
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
-  whatsapp: { connected: false };
+  whatsapp: { connected: boolean; jid: string | null; name: string | null; connectedAt: number | null; chats: number; qr: string | null };
 }
 
 export interface AppSettings {
@@ -221,6 +244,7 @@ interface StoreData {
   pendingChats: PendingChat[];
   commEvents: CommEvent[];
   telegram: TelegramState;
+  whatsapp: WhatsAppState;
   /** Locally (safeStorage-)encrypted provider API keys, base64. Never leaves this Mac. */
   providerKeys: Record<string, { cipherB64: string; last4: string; createdAt: number }>;
 }
@@ -234,6 +258,12 @@ const ASSET_TINTS = ['#5b8cff', '#9b6bff', '#41c8d4', '#ff9f6b', '#6bd49a', '#ff
 export class Store {
   private file: string;
   private data!: StoreData;
+  /** Live WhatsApp pairing QR (raw string from Baileys). In-memory only — never
+      persisted; cleared once the link goes 'open' or on disconnect. */
+  private waQr: string | null = null;
+  /** Per-chat seen msgId cache so appendWaMessage dedupes in O(1) instead of
+      re-reading the whole messages.jsonl on every capture. Keyed by chat dir. */
+  private waSeen = new Map<string, Set<string>>();
 
   constructor() {
     const dir = app.getPath('userData');
@@ -262,6 +292,7 @@ export class Store {
       if (!this.data.pendingChats) { this.data.pendingChats = []; dirty = true; }
       if (!this.data.commEvents) { this.data.commEvents = []; dirty = true; }
       if (!this.data.telegram) { this.data.telegram = { offset: 0, botUsername: null, connectedAt: null }; dirty = true; }
+      if (!this.data.whatsapp) { this.data.whatsapp = { connected: false, jid: null, name: null, connectedAt: null }; dirty = true; }
 
       // One-time demo-data purge: only fires on the full seed fingerprint so a
       // real project that happens to share a name never gets wiped.
@@ -295,6 +326,7 @@ export class Store {
         assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
         chatBindings: [], pendingChats: [], commEvents: [],
         telegram: { offset: 0, botUsername: null, connectedAt: null },
+        whatsapp: { connected: false, jid: null, name: null, connectedAt: null },
         providerKeys: {},
       };
       this.save();
@@ -717,6 +749,7 @@ export class Store {
   commsStatus(): CommsStatus {
     const key = this.providerKeyMeta('telegram');
     const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+    const wa = this.data.whatsapp;
     return {
       telegram: {
         connected: !!key,
@@ -726,8 +759,125 @@ export class Store {
         bindings: this.data.chatBindings.length,
         pending: this.data.pendingChats.length,
       },
-      whatsapp: { connected: false },
+      whatsapp: {
+        connected: wa.connected,
+        jid: wa.jid,
+        name: wa.name,
+        connectedAt: wa.connectedAt,
+        chats: this.countWaChats(),
+        qr: this.waQr,
+      },
     };
+  }
+
+  // ── WhatsApp (Baileys) — connection state + file-based message history ─
+  /* Connection state is small and persisted in the JSON store. Message history
+     is NOT: every message is appended to a per-chat messages.jsonl under
+     userData/comms/whatsapp/<account>/<chatDir>/ so a long history never bloats
+     (or rewrites) the single store blob. */
+  private static readonly WA_ACCOUNT = 'default';
+  private static readonly WA_HISTORY_CAP = 500; // messages returned per getWaMessages page
+
+  whatsappState(): WhatsAppState { return { ...this.data.whatsapp }; }
+  setWhatsappState(patch: Partial<WhatsAppState>): WhatsAppState {
+    this.data.whatsapp = { ...this.data.whatsapp, ...patch };
+    this.save();
+    return this.whatsappState();
+  }
+  /** Set/clear the live pairing QR (in-memory only). */
+  setWhatsappQr(qr: string | null): void { this.waQr = qr; }
+
+  private waRoot(): string { return join(dirname(this.file), 'comms', 'whatsapp', Store.WA_ACCOUNT); }
+  /** Folder-safe segment for a JID. The real chatId is stored in meta.json, so
+      this need only be deterministic + path-traversal-safe, not reversible. */
+  private waChatDir(chatId: string): string {
+    const seg = chatId.replace(/[^A-Za-z0-9._@=-]/g, '_').replace(/\.\.+/g, '_') || '_';
+    return join(this.waRoot(), seg);
+  }
+  private countWaChats(): number {
+    try { return readdirSync(this.waRoot(), { withFileTypes: true }).filter(d => d.isDirectory()).length; }
+    catch { return 0; }
+  }
+  private readWaChatMeta(dir: string): { chatId: string; name: string | null; kind: 'dm' | 'group'; count: number; newestTs: number; oldestTs: number } | null {
+    try {
+      const v = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8'));
+      if (v && typeof v === 'object') return v;
+    } catch { /* missing/corrupt */ }
+    return null;
+  }
+
+  /** Append one captured message to its chat's history (deduped by msgId).
+      Returns true when actually written (false on duplicate). */
+  appendWaMessage(msg: WaMessage): boolean {
+    if (!msg.chatId || !msg.msgId) return false;
+    const dir = this.waChatDir(msg.chatId);
+    const file = join(dir, 'messages.jsonl');
+    // Dedupe by msgId (tier-1 identity, as in the reference). The seen-id set is
+    // read from disk once per chat, then kept warm in memory for the session.
+    let seen = this.waSeen.get(dir);
+    if (!seen) { seen = this.readWaMessageIds(file); this.waSeen.set(dir, seen); }
+    if (seen.has(msg.msgId)) return false;
+    seen.add(msg.msgId);
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(file, JSON.stringify(msg) + '\n');
+    // Refresh the per-chat meta (name/kind/count/newest/oldest) for the list.
+    const meta = this.readWaChatMeta(dir) ?? { chatId: msg.chatId, name: null, kind: 'dm' as const, count: 0, newestTs: 0, oldestTs: 0 };
+    meta.chatId = msg.chatId;
+    meta.kind = msg.chatId.endsWith('@g.us') ? 'group' : 'dm';
+    // Best-effort DM name from an inbound message's pushName (never our own).
+    if (meta.kind === 'dm' && !msg.fromMe && !meta.name && msg.senderName?.trim()) meta.name = msg.senderName.trim();
+    meta.count += 1;
+    if (msg.ts >= meta.newestTs) meta.newestTs = msg.ts;
+    if (!meta.oldestTs || msg.ts <= meta.oldestTs) meta.oldestTs = msg.ts;
+    try { writeFileSync(join(dir, 'meta.json'), JSON.stringify(meta)); } catch { /* disk hiccup */ }
+    return true;
+  }
+  private readWaMessageIds(file: string): Set<string> {
+    const ids = new Set<string>();
+    if (!existsSync(file)) return ids;
+    try {
+      for (const line of readFileSync(file, 'utf8').split('\n')) {
+        if (!line) continue;
+        try { const m = JSON.parse(line) as WaMessage; if (m.msgId) ids.add(m.msgId); } catch { /* skip bad line */ }
+      }
+    } catch { /* unreadable */ }
+    return ids;
+  }
+  /** All known WhatsApp chats, newest activity first (from per-chat meta). */
+  listWaChats(): WaChat[] {
+    const root = this.waRoot();
+    if (!existsSync(root)) return [];
+    const out: WaChat[] = [];
+    for (const d of readdirSync(root, { withFileTypes: true })) {
+      if (!d.isDirectory()) continue;
+      const meta = this.readWaChatMeta(join(root, d.name));
+      if (!meta) continue;
+      out.push({ chatId: meta.chatId, name: meta.name ?? null, kind: meta.kind ?? 'dm', count: meta.count ?? 0, newestTs: meta.newestTs ?? 0, oldestTs: meta.oldestTs ?? 0 });
+    }
+    out.sort((a, b) => (b.newestTs || 0) - (a.newestTs || 0));
+    return out;
+  }
+  /** A page of one chat's messages, oldest→newest, capped server-side.
+      `before` (epoch seconds) pages older history; omit for the latest page. */
+  getWaMessages(chatId: string, opts: { limit?: number; before?: number } = {}): WaMessage[] {
+    const file = join(this.waChatDir(chatId), 'messages.jsonl');
+    if (!existsSync(file)) return [];
+    let msgs: WaMessage[] = [];
+    try {
+      for (const line of readFileSync(file, 'utf8').split('\n')) {
+        if (!line) continue;
+        try { msgs.push(JSON.parse(line) as WaMessage); } catch { /* skip bad line */ }
+      }
+    } catch { return []; }
+    msgs.sort((a, b) => (a.ts || 0) - (b.ts || 0) || a.msgId.localeCompare(b.msgId));
+    if (opts.before != null) msgs = msgs.filter(m => (m.ts || 0) < opts.before!);
+    const cap = Math.min(opts.limit ?? Store.WA_HISTORY_CAP, Store.WA_HISTORY_CAP);
+    return msgs.slice(-cap); // newest `cap` within the window, still oldest→newest
+  }
+  /** Wipe all stored WhatsApp history (on unlink). */
+  clearWaHistory(): void {
+    this.waSeen.clear();
+    try { rmSync(this.waRoot(), { recursive: true, force: true }); } catch { /* nothing to clear */ }
   }
 
   // ── Provider keys (local, encrypted) ───────────────────────────────
