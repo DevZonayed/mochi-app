@@ -47,8 +47,14 @@ const CLAUDE_MODELS: ModelDescriptor[] = [
   { key: 'claude:sonnet',  id: 'sonnet',         label: 'Sonnet 4.6', provider: 'claude', family: 'Sonnet', tierNote: 'Balanced speed & depth' },
   { key: 'claude:haiku',   id: 'haiku',          label: 'Haiku 4.5', provider: 'claude', family: 'Haiku',  tierNote: 'Fastest' },
 ];
+/* Codex runs on the ChatGPT login via `codex exec -m <model>`. These are the
+   models the Codex CLI accepts; gpt-5.5 is the CLI's own configured default.
+   An unavailable model surfaces as an honest run error (same as Claude). */
 const CODEX_MODELS: ModelDescriptor[] = [
-  { key: 'codex:default',  id: '',               label: 'Codex',     provider: 'codex',  family: 'GPT',    tierNote: 'Your ChatGPT default' },
+  { key: 'codex:gpt-5.5',     id: 'gpt-5.5',      label: 'GPT-5.5',     provider: 'codex', family: 'GPT', badge: 'NEW', tierNote: 'Codex default' },
+  { key: 'codex:gpt-5.4',     id: 'gpt-5.4',      label: 'GPT-5.4',     provider: 'codex', family: 'GPT' },
+  { key: 'codex:gpt-5-codex', id: 'gpt-5-codex',  label: 'GPT-5 Codex', provider: 'codex', family: 'GPT', tierNote: 'Coding-tuned' },
+  { key: 'codex:o3',          id: 'o3',           label: 'o3',          provider: 'codex', family: 'o-series', tierNote: 'Reasoning' },
 ];
 const CURSOR_MODELS: ModelDescriptor[] = [
   { key: 'cursor:composer', id: 'composer',      label: 'Composer',  provider: 'cursor', family: 'Composer', external: true, tierNote: 'Cursor agent' },
@@ -72,7 +78,7 @@ export function resolveModelKey(key: string | undefined): { engine?: EngineId; m
 
 /** Reverse: an engine + model id → the picker key, to show the current selection. */
 export function keyForRun(engine: EngineId | undefined, model: string | undefined): string {
-  if (engine === 'codex') return 'codex:default';
+  if (engine === 'codex') { const d = CODEX_MODELS.find(m => m.id === model); return d?.key ?? 'codex:gpt-5.5'; }
   const d = CLAUDE_MODELS.find(m => m.id === model);
   return d?.key ?? 'claude:opus';
 }
