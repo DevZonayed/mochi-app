@@ -22,6 +22,7 @@ const PAGE_CSS = `
   .ws-tab:hover .ws-tab-x, .ws-tab.on .ws-tab-x { opacity: 1; }
   .ws-newbtn:hover { background: var(--fill-secondary) !important; }
   .ws-tabs::-webkit-scrollbar { height: 0; }
+  .ws-kinds::-webkit-scrollbar { height: 0; }
   .ws-tree::-webkit-scrollbar { width: 9px; }
   .ws-tree::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
   .ws-tree:hover::-webkit-scrollbar-thumb { background: var(--separator-strong); background-clip: padding-box; }
@@ -269,14 +270,17 @@ export default function Workspace() {
                   style={{ flex: 1, minWidth: 0, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }} />
                 {query && <button onClick={() => setQuery('')} title="Clear" style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}><Icon name="x" size={11} stroke={2.4} /></button>}
               </div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+              {/* single horizontal row — the vertical mouse wheel scrolls it
+                  sideways so every category is reachable without wrapping */}
+              <div className="ws-kinds" onWheel={e => { const el = e.currentTarget; if (Math.abs(e.deltaY) >= Math.abs(e.deltaX)) el.scrollLeft += e.deltaY; }}
+                style={{ display: 'flex', gap: 5, overflowX: 'auto', WebkitMaskImage: 'linear-gradient(to right, #000 calc(100% - 16px), transparent)', maskImage: 'linear-gradient(to right, #000 calc(100% - 16px), transparent)' }}>
                 {KIND_META.map(m => {
                   const on = kindFilter === m.key;
                   const n = kindCount(m.key);
                   if (m.key !== 'all' && n === 0) return null;
                   return (
                     <button key={m.key} onClick={() => setKindFilter(m.key)} title={`${m.label} · ${n}`} style={{
-                      display: 'inline-flex', alignItems: 'center', gap: 4, height: 25, padding: '0 8px', borderRadius: 'var(--r-pill)', flexShrink: 0, cursor: 'pointer',
+                      display: 'inline-flex', alignItems: 'center', gap: 5, height: 26, padding: '0 9px', borderRadius: 'var(--r-pill)', flexShrink: 0, cursor: 'pointer',
                       background: on ? `color-mix(in srgb, ${m.tint} 16%, transparent)` : 'var(--fill-secondary)',
                       border: on ? `1px solid color-mix(in srgb, ${m.tint} 45%, transparent)` : '1px solid transparent',
                       color: on ? m.tint : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
