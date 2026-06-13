@@ -2,7 +2,8 @@
    (over IPC) and remote controls (phone/web via the relay). Every command
    executes locally on this Mac against the local store + local engine. */
 
-import type { Store, Effort, ApprovalStatus, EngineId, Routing, AppSettings, ProjectKind, AssetStatus } from './store.js';
+import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus } from './store.js';
+import { resolveModelKey, buildModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
 import type { ResearchEngine } from './research.js';
@@ -48,6 +49,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (p.defaultEngine === 'auto' || p.defaultEngine === 'claude' || p.defaultEngine === 'codex') patch.defaultEngine = p.defaultEngine;
         if (typeof p.openAtLogin === 'boolean') patch.openAtLogin = p.openAtLogin;
         if (p.rescanCadence === 'daily' || p.rescanCadence === 'weekly' || p.rescanCadence === 'onchange') patch.rescanCadence = p.rescanCadence;
+        if (Array.isArray(p.favoriteModels)) patch.favoriteModels = (p.favoriteModels as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 40);
         if (Object.keys(patch).length === 0) bad('no valid settings fields');
         const next = store.setSettings(patch);
         emit('settings', next);
@@ -176,10 +178,27 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           session = store.createSession(projectId, text);
           emit('session', session);
         }
+        // Resolve the chosen primary + reviewer. A picker key (modelKey /
+        // reviewerKey) is resolved provider-side; legacy engine/model still works.
+        const primary = p.modelKey !== undefined
+          ? resolveModelKey(String(p.modelKey))
+          : { engine: asEngine(p.engine), model: asModel(p.model) };
+        let reviewer: RoleChoice | 'off' | undefined;
+        if (p.reviewerKey === 'off') reviewer = 'off';
+        else if (typeof p.reviewerKey === 'string' && p.reviewerKey) {
+          const r = resolveModelKey(p.reviewerKey);
+          if (r.engine) reviewer = { engine: r.engine, model: r.model };
+        }
+        // Persist per-chat overrides so the chat restores them on reopen.
+        const sessPatch: { primary?: RoleChoice; reviewer?: RoleChoice | 'off' } = {};
+        if (primary.engine) sessPatch.primary = { engine: primary.engine, model: primary.model };
+        if (reviewer !== undefined) sessPatch.reviewer = reviewer;
+        if (Object.keys(sessPatch).length) { session = store.updateSession(session.id, sessPatch); emit('session', session); }
+
         const job = store.createJob(projectId, text, text.slice(0, 60), p.effort as Effort | undefined, session.id);
         emit('job', job);
         // Fire the run async — the reply streams in over job events.
-        void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model), plan: p.plan === true });
+        void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true });
         return { session, job };
       }
 
@@ -223,6 +242,19 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'toggleSchedule': { store.setScheduleEnabled(String(p.id ?? ''), Boolean(p.enabled)); return { ok: true }; }
       case 'deleteSchedule': { store.deleteSchedule(String(p.id ?? '')); return { ok: true }; }
+      // Wait-&-check: schedule a one-shot follow-up that pokes a chat after delayMs.
+      case 'scheduleCheck': {
+        const delayMs = Number(p.delayMs);
+        if (!Number.isFinite(delayMs) || delayMs < 30_000) bad('delayMs must be at least 30000');
+        const prompt = typeof p.prompt === 'string' && p.prompt.trim() ? p.prompt.trim().slice(0, 4000) : 'Check on the task and continue where you left off.';
+        const sched = store.createSchedule({
+          projectId: p.projectId ? String(p.projectId) : null,
+          sessionId: p.sessionId ? String(p.sessionId) : undefined,
+          title: prompt.slice(0, 50), prompt, fireAt: Date.now() + delayMs,
+        });
+        emit('schedule', sched);
+        return sched;
+      }
 
       // ── Skills / Templates ─────────────────────────────────────
       case 'listSkills': return store.listSkills();
@@ -350,6 +382,36 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
       // ── Engine status (THE single source of truth) ────────────
       case 'engineStatus': return engine.statuses();
+
+      // ── Model registry (provider-owned catalog) ───────────────
+      case 'listModels': return buildModelGroups(engine.statuses());
+
+      // ── Roles (model-level primary / reviewer) ─────────────────
+      case 'getRoles': return store.getRoles();
+      case 'setRoles': {
+        const patch: Partial<Roles> = {};
+        if (typeof p.primaryKey === 'string') {
+          const r = resolveModelKey(p.primaryKey);
+          if (r.engine) patch.primary = { engine: r.engine, model: r.model };
+        } else if (p.primary && typeof p.primary === 'object') {
+          const pr = p.primary as { engine?: unknown; model?: unknown };
+          const e = asEngine(pr.engine);
+          if (e) patch.primary = { engine: e, model: asModel(pr.model) };
+        }
+        if (p.reviewerKey === 'off' || p.reviewer === 'off') patch.reviewer = 'off';
+        else if (typeof p.reviewerKey === 'string') {
+          const r = resolveModelKey(p.reviewerKey);
+          if (r.engine) patch.reviewer = { engine: r.engine, model: r.model };
+        } else if (p.reviewer && typeof p.reviewer === 'object') {
+          const rv = p.reviewer as { engine?: unknown; model?: unknown };
+          const e = asEngine(rv.engine);
+          if (e) patch.reviewer = { engine: e, model: asModel(rv.model) };
+        }
+        if (Object.keys(patch).length === 0) bad('no valid role fields');
+        const next = store.setRoles(patch);
+        emit('routing', store.routing());
+        return next;
+      }
 
       // ── Engine routing (which engine plays which role) ─────────
       case 'getRouting': return store.routing();

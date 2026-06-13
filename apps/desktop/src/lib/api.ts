@@ -36,6 +36,8 @@ export interface ChatSession {
   title: string;
   sdkSessionId?: string;
   pinned?: boolean;
+  primary?: RoleChoice;
+  reviewer?: RoleChoice | 'off';
   createdAt: number;
   updatedAt: number;
 }
@@ -92,6 +94,9 @@ export interface Schedule {
   enabled: boolean;
   nextRun: number | null;
   createdAt: number;
+  fireAt?: number;
+  sessionId?: string;
+  prompt?: string;
 }
 export interface Skill {
   id: string;
@@ -127,11 +132,35 @@ export interface ProviderConn {
   createdAt: number;
 }
 export type EngineId = 'claude' | 'codex';
+export interface RoleChoice { engine: EngineId; model?: string }
+export interface Roles {
+  primary: RoleChoice;
+  reviewer: RoleChoice | 'off';
+}
 export interface Routing {
   master: EngineId;
   reviewer: EngineId | 'off';
   image: EngineId;
   video: EngineId;
+  roles?: Roles;
+}
+export type ModelProviderId = 'claude' | 'codex' | 'cursor';
+export interface ModelDescriptor {
+  key: string;
+  id: string;
+  label: string;
+  provider: ModelProviderId;
+  family?: string;
+  badge?: 'NEW';
+  tierNote?: string;
+  external?: boolean;
+}
+export interface ModelGroup {
+  provider: ModelProviderId;
+  label: string;
+  runnable: boolean;
+  reason: string;
+  models: ModelDescriptor[];
 }
 export interface PairingInfo {
   token: string;
@@ -156,6 +185,7 @@ export interface AppSettings {
   defaultEngine: EngineId | 'auto';
   openAtLogin: boolean;
   rescanCadence: 'daily' | 'weekly' | 'onchange';
+  favoriteModels?: string[];
 }
 export interface CostsData {
   today: number;
@@ -458,7 +488,7 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; effort?: Effort; plan?: boolean }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   renameSession: (id: string, title: string) =>
@@ -502,6 +532,10 @@ export const api = {
   createSchedule: (input: { title: string; projectId?: string; time?: string; cadence?: string }) =>
     call<Schedule>('createSchedule', { ...input }, () =>
       req<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(input) })),
+  // Wait-&-check: poke a chat with a one-shot follow-up after delayMs.
+  scheduleCheck: (input: { projectId?: string | null; sessionId?: string; prompt?: string; delayMs: number }) =>
+    call<Schedule>('scheduleCheck', { ...input }, () =>
+      req<Schedule>('/api/schedules/check', { method: 'POST', body: JSON.stringify(input) })),
   toggleSchedule: (id: string, enabled: boolean) =>
     call<{ ok: boolean }>('toggleSchedule', { id, enabled }, () =>
       req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) })),
@@ -531,6 +565,16 @@ export const api = {
   setRouting: (patch: Partial<Routing>) =>
     call<Routing>('setRouting', { ...patch }, () =>
       req<Routing>('/api/routing', { method: 'POST', body: JSON.stringify(patch) })),
+
+  // Model registry (provider-owned catalog) + per-role (primary/reviewer) model defaults
+  listModels: () => call<ModelGroup[]>('listModels', {}, () => req<ModelGroup[]>('/api/models')),
+  getRoles: () => call<Roles>('getRoles', {}, async () => {
+    const r = await req<Routing>('/api/routing');
+    return r.roles ?? { primary: { engine: 'claude', model: 'opus' }, reviewer: 'off' };
+  }),
+  setRoles: (patch: { primaryKey?: string; reviewerKey?: string }) =>
+    call<Roles>('setRoles', { ...patch }, () =>
+      req<Roles>('/api/roles', { method: 'POST', body: JSON.stringify(patch) })),
 
   // Pairing (desktop-only — the code remotes must enter)
   getPairing: () =>

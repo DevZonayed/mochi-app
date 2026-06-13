@@ -45,6 +45,7 @@ interface Snapshot {
   routing?: unknown;
   settings?: unknown;
   engineStatus?: unknown;
+  models?: unknown;
   at?: number;
 }
 
@@ -300,6 +301,7 @@ export function buildServer(): FastifyInstance {
   app.get('/api/templates', async () => st()?.templates ?? []);
   app.get('/api/providers', async () => st()?.providers ?? []);
   app.get('/api/routing', async () => (st() as { routing?: unknown } | null)?.routing ?? { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex' });
+  app.get('/api/models', async () => (st() as { models?: unknown } | null)?.models ?? []);
 
   // ── Writes — forwarded to the Mac, executed there ──────────────────
   app.post('/api/workspaces', async (req, reply) => forward(reply, 'createWorkspace', (req.body ?? {}) as Record<string, unknown>));
@@ -326,6 +328,7 @@ export function buildServer(): FastifyInstance {
   app.post('/api/approvals/:id/approve', async (req, reply) => forward(reply, 'approveApproval', { id: (req.params as { id: string }).id }));
   app.post('/api/approvals/:id/deny', async (req, reply) => forward(reply, 'denyApproval', { id: (req.params as { id: string }).id }));
   app.post('/api/schedules', async (req, reply) => forward(reply, 'createSchedule', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/schedules/check', async (req, reply) => forward(reply, 'scheduleCheck', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/schedules/:id/toggle', async (req, reply) =>
     forward(reply, 'toggleSchedule', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/schedules/:id/delete', async (req, reply) => forward(reply, 'deleteSchedule', { id: (req.params as { id: string }).id }));
@@ -335,6 +338,7 @@ export function buildServer(): FastifyInstance {
   app.post('/api/providers/:provider/disconnect', async (req, reply) =>
     forward(reply, 'disconnectProvider', { ...(req.body ?? {}) as Record<string, unknown>, provider: (req.params as { provider: string }).provider }));
   app.post('/api/routing', async (req, reply) => forward(reply, 'setRouting', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/roles', async (req, reply) => forward(reply, 'setRoles', (req.body ?? {}) as Record<string, unknown>));
 
   // ── SSE stream (host events relayed to web clients) ────────────────
   app.get('/api/stream', (req, reply) => {

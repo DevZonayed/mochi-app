@@ -73,25 +73,45 @@ export interface ChatSession {
   sdkSessionId?: string;
   /** Pinned to the top of the workspace, across projects. */
   pinned?: boolean;
+  /** Per-chat model overrides; absent = the workspace role defaults apply. */
+  primary?: RoleChoice;
+  reviewer?: RoleChoice | 'off';
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
   id: string; projectId: string | null; kind: ApprovalKind; title: string; subtitle: string; detail: string;
   status: ApprovalStatus; jobId?: string | null; createdAt: number; resolvedAt: number | null;
 }
-export interface Schedule { id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean; nextRun: number | null; lastRun?: number | null; createdAt: number }
+export interface Schedule {
+  id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean;
+  nextRun: number | null; lastRun?: number | null; createdAt: number;
+  /** One-shot "wait & check": fire once at this absolute time, into a chat. */
+  fireAt?: number; sessionId?: string; prompt?: string;
+}
 
 export type EngineId = 'claude' | 'codex';
+/** A model-level role choice: which engine + (optional) model id runs the role.
+    `model` omitted = the engine's own default (Claude plan default / Codex default). */
+export interface RoleChoice { engine: EngineId; model?: string }
+export interface Roles {
+  /** Primary / coding model — writes the code. */
+  primary: RoleChoice;
+  /** Reviewer model — reviews it, or 'off'. */
+  reviewer: RoleChoice | 'off';
+}
+export const DEFAULT_ROLES: Roles = { primary: { engine: 'claude', model: 'opus' }, reviewer: 'off' };
 export interface Routing {
-  /** Master agent — runs jobs. */
+  /** Master agent — runs jobs. Mirrors roles.primary.engine for back-compat. */
   master: EngineId;
-  /** Reviewer — optional second pass appended to job output. */
+  /** Reviewer — mirrors roles.reviewer (engine, or 'off'). */
   reviewer: EngineId | 'off';
   /** Legacy studio routing (media now runs on fal; kept for store compat). */
   image: EngineId;
   video: EngineId;
+  /** Model-level primary/reviewer roles (SP1). */
+  roles?: Roles;
 }
-export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex' };
+export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex', roles: { ...DEFAULT_ROLES } };
 
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
@@ -192,8 +212,10 @@ export interface AppSettings {
   defaultEngine: EngineId | 'auto';
   openAtLogin: boolean;
   rescanCadence: 'daily' | 'weekly' | 'onchange';
+  /** Picker keys the user starred — surfaced first in the model picker. */
+  favoriteModels?: string[];
 }
-export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange' };
+export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [] };
 
 export interface BudgetData { cap: number; spent: number; byProject: { projectId: string; name: string; color: string; spent: number }[] }
 export interface CostsData {
@@ -280,7 +302,17 @@ export class Store {
       // migrations for stores written by older builds (dirty-flag pattern)
       if (!this.data.accessToken) { this.data.accessToken = newPairingToken(); dirty = true; }
       if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
+      // SP1: seed model-level roles on older stores from the engine-level fields.
+      if (this.data.routing && !this.data.routing.roles) {
+        const r = this.data.routing;
+        this.data.routing.roles = {
+          primary: { engine: r.master ?? 'claude', model: (r.master ?? 'claude') === 'claude' ? 'opus' : undefined },
+          reviewer: r.reviewer && r.reviewer !== 'off' ? { engine: r.reviewer } : 'off',
+        };
+        dirty = true;
+      }
       if (!this.data.settings) { this.data.settings = { ...DEFAULT_SETTINGS }; dirty = true; }
+      if (this.data.settings && !this.data.settings.favoriteModels) { this.data.settings.favoriteModels = []; dirty = true; }
       if (!this.data.sessions) { this.data.sessions = []; dirty = true; }
       if (!this.data.assets) { this.data.assets = []; dirty = true; }
       if (!this.data.publishDrafts) { this.data.publishDrafts = []; dirty = true; }
@@ -354,6 +386,18 @@ export class Store {
     this.data.routing = { ...this.data.routing, ...patch };
     this.save();
     return this.routing();
+  }
+
+  getRoles(): Roles { return this.data.routing.roles ? { ...this.data.routing.roles } : { ...DEFAULT_ROLES }; }
+  setRoles(patch: Partial<Roles>): Roles {
+    const cur = this.data.routing.roles ?? { ...DEFAULT_ROLES };
+    const next: Roles = { ...cur, ...patch };
+    this.data.routing.roles = next;
+    // Keep the legacy engine-level fields consistent (cron + older callers read them).
+    this.data.routing.master = next.primary.engine;
+    this.data.routing.reviewer = next.reviewer === 'off' ? 'off' : next.reviewer.engine;
+    this.save();
+    return next;
   }
 
   getSettings(): AppSettings { return { ...this.data.settings }; }
@@ -432,7 +476,7 @@ export class Store {
     this.data.sessions.push(s); this.save();
     return s;
   }
-  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId'>>): ChatSession {
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer'>>): ChatSession {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     Object.assign(s, patch, { updatedAt: now() });
@@ -542,10 +586,16 @@ export class Store {
 
   // ── Schedules ───────────────────────────────────────────────────────
   listSchedules(): Schedule[] { return [...this.data.schedules].sort((a, b) => a.time.localeCompare(b.time)); }
-  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string }): Schedule {
+  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string }): Schedule {
+    const at = s.fireAt ? new Date(s.fireAt) : null;
+    const time = s.time ?? (at ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}` : '');
     const rec: Schedule = {
-      id: id(), projectId: s.projectId ?? null, title: s.title, time: s.time ?? '', cadence: s.cadence ?? 'daily',
-      enabled: true, nextRun: null, createdAt: now(),
+      id: id(), projectId: s.projectId ?? null, title: s.title, time,
+      cadence: s.fireAt ? 'once' : (s.cadence ?? 'daily'),
+      enabled: true, nextRun: s.fireAt ?? null, createdAt: now(),
+      ...(s.fireAt ? { fireAt: s.fireAt } : {}),
+      ...(s.sessionId ? { sessionId: s.sessionId } : {}),
+      ...(s.prompt ? { prompt: s.prompt } : {}),
     };
     this.data.schedules.push(rec); this.save();
     return rec;

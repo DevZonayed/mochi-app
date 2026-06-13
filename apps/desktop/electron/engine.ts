@@ -15,7 +15,7 @@ import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import type { Store, Job, Effort, EngineId, TranscriptItem } from './store.js';
+import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice } from './store.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import type { Providers } from './providers.js';
 
@@ -23,6 +23,13 @@ const require = createRequire(__filename);
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
 // coding agent needs real headroom — 4 turns dies mid-`ls`.
 const EFFORT_TURNS: Record<string, number> = { fast: 8, balanced: 24, deep: 48, max: 96 };
+// Goal mode: pursue the goal autonomously over a long horizon — far more turns.
+const GOAL_MAX_TURNS = 240;
+const GOAL_DIRECTIVE =
+  `\n\n---\n\n[Goal mode] Pursue the request above as a goal: work autonomously to ` +
+  `completion. Don't stop to ask for confirmation on routine steps; plan, implement, ` +
+  `test, and self-correct in a loop until the goal is fully met or you are genuinely ` +
+  `blocked. If blocked, state precisely what's needed.`;
 /* Streaming cadences: local windows get a frame every ≤50ms (perceptually
    realtime); disk + relay get a checkpoint every ~1s. */
 const STREAM_THROTTLE_MS = 50;
@@ -490,13 +497,17 @@ export class LocalEngine {
   }
 
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
-  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string; plan?: boolean } = {}): Promise<Job> {
+  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; plan?: boolean; goal?: boolean } = {}): Promise<Job> {
     const job = this.store.getJob(jobId);
     if (!job) throw Object.assign(new Error('job not found'), { statusCode: 404 });
     const project = this.store.getProject(job.projectId);
     const routing = this.store.routing();
+    const roles = this.store.getRoles();
 
-    let master: EngineId = opts.engine ?? routing.master;
+    // Primary: an explicit per-job override wins; otherwise the workspace role
+    // default (engine + model). Reviewer resolves the same way.
+    let master: EngineId = opts.engine ?? roles.primary.engine ?? routing.master;
+    const masterModel: string | undefined = opts.engine ? opts.model : (opts.model ?? roles.primary.model);
     if (!this.available(master)) {
       const other: EngineId = master === 'claude' ? 'codex' : 'claude';
       if (!opts.engine && this.available(other)) {
@@ -515,7 +526,7 @@ export class LocalEngine {
 
     let cur = this.store.updateJob(jobId, {
       status: 'running', phase: 'Working', progress: 20, output: '', error: null, engine: master,
-      ...(opts.model ? { model: opts.model } : {}),
+      ...(masterModel ? { model: masterModel } : {}),
       stage: `running on this Mac via ${ENGINE_LABEL[master]}…`,
     });
     this.emit('job', cur);
@@ -562,7 +573,9 @@ export class LocalEngine {
     const settleStream = () => { settled = true; if (trailer) { clearTimeout(trailer); trailer = null; } };
 
     try {
-      const effort = opts.effort ?? cur.effort;
+      const goalMode = opts.goal === true && !opts.plan; // goal + plan are mutually exclusive
+      let effort = opts.effort ?? cur.effort;
+      if (goalMode && (effort === 'fast' || effort === 'balanced')) effort = 'deep'; // goal mode wants depth
       const cwd = workDirFor(project);
       const anthropicKey = this.status(master).method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined;
 
@@ -583,6 +596,7 @@ export class LocalEngine {
       } else {
         prompt = `${base}${cur.input}`;
       }
+      if (goalMode) prompt += GOAL_DIRECTIVE;
 
       const hooks: RunHooks = {
         signal: ac.signal,
@@ -591,8 +605,8 @@ export class LocalEngine {
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
       const main = master === 'claude'
-        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks, resumeId, opts.model, opts.plan)
-        : await runCodex(prompt, cwd, hooks, false, opts.model);
+        ? await runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan)
+        : await runCodex(prompt, cwd, hooks, false, masterModel);
       settleStream(); // stream is over — no trailing frame may race the final states below
 
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {
@@ -607,7 +621,9 @@ export class LocalEngine {
       // Reviewer pass — a REAL second opinion from the configured engine.
       // Skipped for chat turns: a conversation wants fast back-and-forth, not a
       // second engine appending verdicts to every reply.
-      const reviewer = routing.reviewer;
+      const reviewerChoice: RoleChoice | 'off' = opts.reviewer ?? roles.reviewer;
+      const reviewer: EngineId | 'off' = reviewerChoice === 'off' ? 'off' : reviewerChoice.engine;
+      const reviewerModel = reviewerChoice === 'off' ? undefined : reviewerChoice.model;
       let reviewVerdict: 'approved' | 'needs-work' | null = null;
       if (reviewer !== 'off' && !isChat && this.available(reviewer) && !ac.signal.aborted) {
         cur = this.store.updateJob(jobId, { progress: 85, stage: `reviewer pass via ${ENGINE_LABEL[reviewer]}…` });
@@ -618,8 +634,8 @@ export class LocalEngine {
             `then end with exactly one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".\n\n` +
             `## Task\n${cur.input}\n\n## Result\n${output.slice(0, 12000)}`;
           const review = reviewer === 'claude'
-            ? await runClaude(reviewPrompt, cwd, 'fast', this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined, 1, {})
-            : await runCodex(reviewPrompt, cwd, {}, true);
+            ? await runClaude(reviewPrompt, cwd, 'fast', this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined, 1, {}, undefined, reviewerModel)
+            : await runCodex(reviewPrompt, cwd, {}, true, reviewerModel);
           output += `\n\n―― Reviewer (${ENGINE_LABEL[reviewer]}) ――\n${review.text}`;
           tokens += review.tokens;
           cost = Math.round((cost + review.cost) * 1000) / 1000;

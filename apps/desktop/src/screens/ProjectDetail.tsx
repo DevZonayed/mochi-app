@@ -20,10 +20,9 @@ import {
   ModelSwitcher,
   ProviderGlyph,
   CountUp,
-  CHAT_MODELS,
-  chatModelToRun,
   type EffortStop,
 } from '../lib/ui';
+import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem } from '../lib/api';
 
@@ -133,6 +132,8 @@ const PAGE_CSS = `
   .kbd { display: inline-flex; align-items: center; height: 16px; padding: 0 5px; border-radius: 5px; background: var(--fill-secondary);
     border: 0.5px solid var(--separator); font: 600 10px/1 var(--font-mono); color: var(--ink-secondary); }
 
+  .mm-row { transition: background 120ms ease; }
+  .mm-row:hover { background: var(--fill-tertiary); }
   .sess-row { transition: background 140ms ease; }
   .sess-row:hover { background: var(--fill-tertiary); }
   .sess-row .sess-x { opacity: 0; transition: opacity 120ms ease; }
@@ -1618,6 +1619,73 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: 
    chat); on the first send we create a session and report it via
    onSessionCreated so the parent (the project view OR the multi-project
    Workspace tabs) can adopt it. Fills its parent — only the thread scrolls. */
+
+/* Composer slash-commands — type `/` to scaffold a coding instruction. These are
+   Maestro's own prompt commands (they work the same whichever engine runs the
+   chat), shown in a menu like Claude Code's. */
+const SLASH_COMMANDS: { cmd: string; desc: string; template: string }[] = [
+  { cmd: 'plan', desc: 'Plan the work before building', template: 'Make a step-by-step plan for: ' },
+  { cmd: 'explain', desc: 'Explain how something works', template: 'Explain how this works: ' },
+  { cmd: 'fix', desc: 'Find and fix a bug', template: 'Find and fix this bug: ' },
+  { cmd: 'test', desc: 'Write tests', template: 'Write tests for: ' },
+  { cmd: 'refactor', desc: 'Clean up code, no behavior change', template: 'Refactor this for clarity (no behavior change): ' },
+  { cmd: 'review', desc: 'Review code for issues', template: 'Review this code for bugs, security, and clarity: ' },
+  { cmd: 'document', desc: 'Write documentation', template: 'Write clear documentation for: ' },
+  { cmd: 'optimize', desc: 'Improve performance', template: 'Profile and optimize the performance of: ' },
+];
+
+/* Conversation minimap — a slim right-edge rail with one tick per user message.
+   Hover reveals a fly-over listing every prompt + the files it touched; clicking
+   a tick or a row jumps to that turn. Makes a long chat navigable at a glance. */
+function ChatMinimap({ turns, scrollRef }: { turns: Job[]; scrollRef: React.RefObject<HTMLDivElement | null> }) {
+  const [hover, setHover] = React.useState(false);
+  if (turns.length < 2) return null;
+  const scrollTo = (id: string) => { scrollRef.current?.querySelector(`[data-turn="${id}"]`)?.scrollIntoView({ block: 'start', behavior: 'smooth' }); };
+  const fileRefs = (t: Job): string[] => {
+    const out: string[] = [];
+    for (const it of t.transcript ?? []) {
+      if (it.kind === 'tool' && IS_WRITE_TOOL(it.name ?? '') && it.text) {
+        const base = (it.text.split('/').pop() ?? '').split(/\s/)[0];
+        if (base && !out.includes(base)) out.push(base);
+      }
+    }
+    return out.slice(0, 6);
+  };
+  return (
+    <div onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
+      style={{ position: 'absolute', right: 2, top: 86, bottom: 124, zIndex: 4, display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-end' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5, alignItems: 'flex-end', padding: '2px 5px' }}>
+        {turns.map(t => (
+          <button key={t.id} onClick={() => scrollTo(t.id)} title={t.input.slice(0, 90)}
+            style={{ width: hover ? 20 : 14, height: 2.5, borderRadius: 2, background: 'var(--separator-strong)', cursor: 'pointer', transition: 'width 140ms ease, background 140ms ease' }} />
+        ))}
+      </div>
+      {hover && (
+        <div style={{ position: 'absolute', right: 24, top: 0, width: 290, maxHeight: '100%', overflowY: 'auto',
+          background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.26))', padding: 6 }}>
+          {turns.map((t, i) => {
+            const files = fileRefs(t);
+            return (
+              <button key={t.id} onClick={() => scrollTo(t.id)} className="mm-row"
+                style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, cursor: 'pointer' }}>
+                <span style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
+                  <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', flexShrink: 0 }}>{i + 1}</span>
+                  <span style={{ font: '500 var(--fs-footnote)/1.35 var(--font-text)', color: 'var(--ink)', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{t.input}</span>
+                </span>
+                {files.length > 0 && (
+                  <span style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 5, paddingLeft: 18 }}>
+                    {files.map(f => <span key={f} style={{ font: '500 10px/1 var(--font-mono)', color: 'var(--blue)', background: 'color-mix(in srgb, var(--blue) 10%, transparent)', padding: '2px 5px', borderRadius: 4 }}>{f}</span>)}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ChatThread({ projectId, project, sessionId, onSessionCreated, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
@@ -1629,16 +1697,44 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
   const [turns, setTurns] = React.useState<Job[]>([]);
   const [activeId, setActiveId] = React.useState<string | null>(sessionId);
   const [text, setText] = React.useState('');
-  // Remember the last model across the whole app — fewer clicks next time.
-  const [modelChoice, setModelChoiceState] = React.useState(() => {
-    try { const v = localStorage.getItem('maestro.chat.model'); return v && CHAT_MODELS.some(m => m.id === v) ? v : 'auto'; } catch { return 'auto'; }
+  // Primary (coding) + reviewer model. Remembered across the app via localStorage;
+  // seeded from the workspace role defaults when the user hasn't chosen yet.
+  const modelGroups = useModelGroups();
+  const [primaryKey, setPrimaryKeyState] = React.useState<string>(() => { try { return localStorage.getItem('maestro.chat.primary') || ''; } catch { return ''; } });
+  const [reviewerKey, setReviewerKeyState] = React.useState<string>(() => { try { return localStorage.getItem('maestro.chat.reviewer') || ''; } catch { return ''; } });
+  const setPrimaryKey = (k: string) => { setPrimaryKeyState(k); try { localStorage.setItem('maestro.chat.primary', k); } catch { /* storage unavailable */ } };
+  const setReviewerKey = (k: string) => { setReviewerKeyState(k); try { localStorage.setItem('maestro.chat.reviewer', k); } catch { /* storage unavailable */ } };
+  const [favorites, setFavorites] = React.useState<string[]>([]);
+  React.useEffect(() => { api.getSettings().then(s => setFavorites(s.favoriteModels ?? [])).catch(() => {}); }, []);
+  const toggleFavorite = (key: string) => setFavorites(prev => {
+    const next = prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key];
+    api.setSettings({ favoriteModels: next }).catch(() => {});
+    return next;
   });
-  const setModelChoice = (id: string) => { setModelChoiceState(id); try { localStorage.setItem('maestro.chat.model', id); } catch { /* storage unavailable */ } };
+  // Seed from the workspace defaults once the catalog is known (if unset).
+  React.useEffect(() => {
+    if (!modelGroups.length || (primaryKey && reviewerKey)) return;
+    api.getRoles().then(roles => {
+      if (!primaryKey) setPrimaryKeyState(keyForRoleChoice(modelGroups, roles.primary));
+      if (!reviewerKey) setReviewerKeyState(roles.reviewer === 'off' ? 'off' : keyForRoleChoice(modelGroups, roles.reviewer));
+    }).catch(() => {});
+  }, [modelGroups]); // eslint-disable-line react-hooks/exhaustive-deps
   const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
   // Plan mode: agent proposes a plan first (no execution). Persisted per app.
   const [planMode, setPlanModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.plan') === '1'; } catch { return false; } });
-  const setPlanMode = (on: boolean) => { setPlanModeState(on); try { localStorage.setItem('maestro.chat.plan', on ? '1' : '0'); } catch { /* ignore */ } };
+  // Goal mode: pursue the request autonomously over a long horizon. Mutually
+  // exclusive with Plan. Label depends on the primary engine (Codex = "Pursue goal").
+  const [goalMode, setGoalModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.goal') === '1'; } catch { return false; } });
+  const setPlanMode = (on: boolean) => { setPlanModeState(on); try { localStorage.setItem('maestro.chat.plan', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setGoalModeState(false); try { localStorage.setItem('maestro.chat.goal', '0'); } catch { /* ignore */ } } };
+  const setGoalMode = (on: boolean) => { setGoalModeState(on); try { localStorage.setItem('maestro.chat.goal', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setPlanModeState(false); try { localStorage.setItem('maestro.chat.plan', '0'); } catch { /* ignore */ } } };
+  const primaryProvider = React.useMemo(() => {
+    for (const g of modelGroups) { const d = g.models.find(m => m.key === primaryKey); if (d) return d.provider; }
+    return 'claude';
+  }, [modelGroups, primaryKey]);
   const [sendError, setSendError] = React.useState('');
+  const [slashSel, setSlashSel] = React.useState(0);
+  const [schedOpen, setSchedOpen] = React.useState(false);
+  const [schedNote, setSchedNote] = React.useState('');
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
   const activeRef = React.useRef<string | null>(activeId);
   activeRef.current = activeId;
@@ -1705,12 +1801,11 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
     setSendError('');
     stickBottom.current = true;
     try {
-      const run = chatModelToRun(modelChoice);
       const resp = await api.sendChat({
         projectId, text: t, sessionId: activeRef.current ?? undefined,
-        effort: EFFORT_TO_API[effort], plan: planMode,
-        ...(run.engine ? { engine: run.engine as EngineId } : {}),
-        ...(run.model ? { model: run.model } : {}),
+        effort: EFFORT_TO_API[effort], plan: planMode, goal: goalMode,
+        ...(primaryKey ? { modelKey: primaryKey } : {}),
+        ...(reviewerKey ? { reviewerKey } : {}),
       });
       if (activeRef.current !== resp.session.id) {
         activeRef.current = resp.session.id; // match the streamed job immediately
@@ -1725,7 +1820,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
       setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
       return false;
     }
-  }, [projectId, modelChoice, effort, planMode, onSessionCreated]);
+  }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, onSessionCreated]);
 
   // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
   const sendText = React.useCallback((raw: string) => {
@@ -1780,9 +1875,25 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
     el.style.height = Math.min(150, el.scrollHeight) + 'px';
   };
   const fillComposer = (v: string) => { setText(v); taRef.current?.focus(); requestAnimationFrame(autoGrow); };
+  // Wait-&-check: schedule a one-shot follow-up that pokes this chat after a delay.
+  const scheduleCheck = (delayMs: number, label: string) => {
+    setSchedOpen(false);
+    if (!projectId) return;
+    void api.scheduleCheck({ projectId, sessionId: activeRef.current ?? undefined, prompt: text.trim() || undefined, delayMs })
+      .then(() => { setSchedNote(`Check scheduled in ${label}`); setTimeout(() => setSchedNote(''), 3500); })
+      .catch(() => {});
+  };
 
   // current effort's accent — themes the composer border/glow (MAX = gradient)
   const effAccent = effort === 'MAX' ? '#9b6bff' : EFFORT_META[effort].tint;
+
+  // Slash-command menu: open while the composer holds just a `/word` token.
+  const slashMatch = text.match(/^\/([a-zA-Z]*)$/);
+  const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : null;
+  const slashList = slashQuery !== null ? SLASH_COMMANDS.filter(c => c.cmd.startsWith(slashQuery)) : [];
+  const slashOpen = slashQuery !== null && slashList.length > 0;
+  const slashIdx = Math.min(slashSel, Math.max(0, slashList.length - 1));
+  const applySlash = (c: { template: string }) => { setText(c.template); requestAnimationFrame(() => { taRef.current?.focus(); autoGrow(); }); };
 
   return (
     <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)', overflow: 'hidden',
@@ -1819,13 +1930,16 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
             </div>
           )}
           {turns.map((t, i) => (
-            <React.Fragment key={t.id}>
+            <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
               <UserBubble text={t.input} />
               <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
-            </React.Fragment>
+            </div>
           ))}
         </div>
       </div>
+
+      {/* conversation minimap — one tick per message; hover for the prompt + file list, click to jump */}
+      <ChatMinimap turns={turns} scrollRef={scrollRef} />
 
       {/* jump-to-latest — appears when scrolled up so new replies aren't missed */}
       {!atBottom && turns.length > 0 && (
@@ -1847,12 +1961,33 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
           {queue.length > 0 && (
             <QueuePanel queue={queue} onSendNow={sendQueuedNow} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
           )}
+          {slashOpen && (
+            <div style={{ marginBottom: 8, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.22))', overflow: 'hidden', padding: 5 }}>
+              <div style={{ padding: '4px 9px 5px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: 'var(--ink-tertiary)', textTransform: 'uppercase' }}>Commands</div>
+              {slashList.map((c, i) => (
+                <button key={c.cmd} onMouseEnter={() => setSlashSel(i)} onClick={() => applySlash(c)}
+                  style={{ display: 'flex', alignItems: 'baseline', gap: 9, width: '100%', textAlign: 'left', padding: '7px 10px', borderRadius: 8, cursor: 'pointer',
+                    background: i === slashIdx ? 'var(--fill-tertiary)' : 'transparent' }}>
+                  <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--blue)', flexShrink: 0 }}>/{c.cmd}</span>
+                  <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>{c.desc}</span>
+                </button>
+              ))}
+            </div>
+          )}
           <div className={`composer-card composer-eff${effort === 'MAX' ? ' composer-ultra' : ''}`}
             style={{ borderRadius: 18, border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)',
             boxShadow: 'var(--card-shadow)', padding: '10px 10px 8px 14px', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
               <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) void sendNow(text); else sendText(text); } }}
+                onKeyDown={e => {
+                  if (slashOpen) {
+                    if (e.key === 'ArrowDown') { e.preventDefault(); setSlashSel((slashIdx + 1) % slashList.length); return; }
+                    if (e.key === 'ArrowUp') { e.preventDefault(); setSlashSel((slashIdx - 1 + slashList.length) % slashList.length); return; }
+                    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); applySlash(slashList[slashIdx]); return; }
+                    if (e.key === 'Escape') { e.preventDefault(); setText(''); return; }
+                  }
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) void sendNow(text); else sendText(text); }
+                }}
                 placeholder={!projectId ? 'Pick a project first' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent…'}
                 title="Enter to send · Shift+Enter for a new line · while running: Enter queues, ⌘Enter sends now"
                 disabled={!projectId}
@@ -1883,7 +2018,8 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
               )}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginTop: 6 }}>
-              <ModelSwitcher compact direction="up" value={modelChoice} onChange={setModelChoice} models={CHAT_MODELS} />
+              <ModelPicker compact direction="up" value={primaryKey} onChange={setPrimaryKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
+              <ModelPicker compact direction="up" allowOff triggerLabel="Review" value={reviewerKey || 'off'} onChange={setReviewerKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
               <EffortDial compact value={effort} onChange={setEffort} />
               <button onClick={() => setPlanMode(!planMode)} title={planMode ? 'Plan mode on — propose before building' : 'Plan first — propose a plan before doing the work'}
                 style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 28, padding: '0 11px', borderRadius: 9, cursor: 'pointer',
@@ -1892,6 +2028,36 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, fl
                   color: planMode ? 'var(--blue)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                 <Icon name="map" size={14} /> Plan
               </button>
+              <button onClick={() => setGoalMode(!goalMode)} title={goalMode ? 'Goal mode on — pursue autonomously to completion' : 'Goal mode — pursue the request autonomously over a long run'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 28, padding: '0 11px', borderRadius: 9, cursor: 'pointer',
+                  background: goalMode ? 'color-mix(in srgb, var(--purple) 14%, transparent)' : 'var(--fill-secondary)',
+                  border: goalMode ? '1px solid color-mix(in srgb, var(--purple) 45%, transparent)' : '1px solid transparent',
+                  color: goalMode ? 'var(--purple)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                <Icon name="target" size={14} /> {primaryProvider === 'codex' ? 'Pursue goal' : 'Goal'}
+              </button>
+              <div style={{ position: 'relative' }}>
+                <button onClick={() => setSchedOpen(o => !o)} title="Schedule a follow-up check — pokes this chat on time"
+                  style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 30, height: 28, borderRadius: 9, cursor: 'pointer',
+                    background: schedOpen ? 'var(--fill-tertiary)' : 'var(--fill-secondary)', border: '1px solid transparent', color: 'var(--ink-secondary)' }}>
+                  <Icon name="clock" size={14} />
+                </button>
+                {schedOpen && (
+                  <>
+                    <div onClick={() => setSchedOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
+                    <div style={{ position: 'absolute', bottom: 'calc(100% + 6px)', left: 0, zIndex: 41, width: 184,
+                      background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 11, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.24))', padding: 5 }}>
+                      <div style={{ padding: '4px 9px 5px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Check back in…</div>
+                      {[{ label: '15 min', ms: 15 * 60_000 }, { label: '1 hour', ms: 60 * 60_000 }, { label: '3 hours', ms: 3 * 60 * 60_000 }, { label: '6 hours', ms: 6 * 60 * 60_000 }].map(o => (
+                        <button key={o.label} onClick={() => scheduleCheck(o.ms, o.label)} className="mm-row"
+                          style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 7, cursor: 'pointer', font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>
+                          {o.label}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+              {schedNote && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)', display: 'inline-flex', alignItems: 'center', gap: 5 }}><Icon name="check" size={12} /> {schedNote}</span>}
               <span style={{ flex: 1 }} />
               {streaming
                 ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
