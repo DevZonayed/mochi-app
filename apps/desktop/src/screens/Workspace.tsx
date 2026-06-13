@@ -7,9 +7,10 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type ChatSession, type ProjectKind, type Job, type DirEntry } from '../lib/api';
+import { api, IS_LOCAL, type Project, type ChatSession, type ProjectKind, type Job } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
 import { FileViewer } from '../lib/CodeView';
+import { RightSidebar, type CheckItem } from '../lib/RightSidebar';
 import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
 
@@ -40,71 +41,6 @@ const PAGE_CSS = `
 `;
 
 interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file'; filePath?: string }
-
-/* A lazily-loaded node in the codebase tree. A directory fetches its children on
-   first expand (api.listDir); a file opens as a tab via onOpenFile. */
-function DirNode({ projectId, entry, depth, onOpenFile }: { projectId: string; entry: DirEntry; depth: number; onOpenFile: (path: string) => void }) {
-  const [open, setOpen] = React.useState(false);
-  const [children, setChildren] = React.useState<DirEntry[] | null>(null);
-  const [loading, setLoading] = React.useState(false);
-  const toggle = () => {
-    if (entry.kind !== 'dir') { onOpenFile(entry.path); return; }
-    const next = !open; setOpen(next);
-    if (next && children === null) {
-      setLoading(true);
-      api.listDir(projectId, entry.path).then(r => setChildren(r?.entries ?? [])).catch(() => setChildren([])).finally(() => setLoading(false));
-    }
-  };
-  return (
-    <div>
-      <button onClick={toggle} className="ws-row" title={entry.name} style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left', padding: `4px 8px 4px ${10 + depth * 12}px`, borderRadius: 6, cursor: 'pointer' }}>
-        {entry.kind === 'dir'
-          ? <Icon name="chevronRight" size={12} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 140ms var(--spring)' }} />
-          : <Icon name="file" size={12} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} />}
-        <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-caption)/1.45 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{entry.name}</span>
-      </button>
-      {open && (
-        <div>
-          {loading && <div style={{ padding: `2px 8px 2px ${10 + (depth + 1) * 12}px`, font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</div>}
-          {children?.map(c => <DirNode key={c.path} projectId={projectId} entry={c} depth={depth + 1} onOpenFile={onOpenFile} />)}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* Right-side panel: files the active chat changed + a lazy codebase tree. */
-function RightPanel({ project, changed, onOpenFile }: { project: Project; changed: string[]; onOpenFile: (path: string) => void }) {
-  const [root, setRoot] = React.useState<DirEntry[] | null>(null);
-  const [err, setErr] = React.useState('');
-  React.useEffect(() => {
-    let alive = true; setRoot(null); setErr('');
-    api.listDir(project.id, '').then(r => { if (alive) setRoot(r?.entries ?? []); }).catch(e => { if (alive) setErr(e instanceof Error ? e.message : 'Could not read folder'); });
-    return () => { alive = false; };
-  }, [project.id]);
-  return (
-    <div style={{ width: 250, flexShrink: 0, borderLeft: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      {changed.length > 0 && (
-        <div style={{ flexShrink: 0, maxHeight: '42%', overflowY: 'auto', borderBottom: '0.5px solid var(--separator)', paddingBottom: 6 }}>
-          <div style={{ padding: '10px 12px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Changed files</div>
-          {changed.map(p => (
-            <button key={p} onClick={() => onOpenFile(p)} className="ws-row" title={p} style={{ display: 'flex', alignItems: 'center', gap: 7, width: '100%', textAlign: 'left', padding: '5px 12px', cursor: 'pointer' }}>
-              <span style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--green)', flexShrink: 0 }} />
-              <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.split('/').pop()}</span>
-            </button>
-          ))}
-        </div>
-      )}
-      <div style={{ flexShrink: 0, padding: '10px 12px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Files</div>
-      <div className="ws-tree" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '0 4px 12px' }}>
-        {err ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>{err}</div>
-          : root === null ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Loading…</div>
-          : root.length === 0 ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Empty folder.</div>
-          : root.map(e => <DirNode key={e.path} projectId={project.id} entry={e} depth={0} onOpenFile={onOpenFile} />)}
-      </div>
-    </div>
-  );
-}
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
@@ -156,6 +92,8 @@ export default function Workspace() {
   // active chat's turns, lifted from each ChatThread, for the "Changed files" panel
   const [turnsByTab, setTurnsByTab] = React.useState<Record<string, Job[]>>({});
   const [addOpen, setAddOpen] = React.useState(false); // add-project menu
+  const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => { try { return localStorage.getItem('maestro.workspace.sidebar') === '0'; } catch { return false; } });
+  const toggleSidebar = () => setSidebarCollapsed(c => { const n = !c; try { localStorage.setItem('maestro.workspace.sidebar', n ? '0' : '1'); } catch { /* ignore */ } return n; });
 
   const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
 
@@ -233,6 +171,15 @@ export default function Workspace() {
     }
     return out;
   }, [turnsByTab, activeKey, activeProject]);
+  // Reviewer verdicts for the active chat → the "Checks" tab.
+  const checks = React.useMemo<CheckItem[]>(() => {
+    const jobs = turnsByTab[activeKey ?? ''] ?? [];
+    const out: CheckItem[] = [];
+    for (const job of jobs) for (const it of job.transcript ?? []) {
+      if (it.kind === 'review' && it.verdict) out.unshift({ id: `${job.id}-${it.ts}`, title: it.name ? `Reviewer · ${it.name}` : 'Review', verdict: it.verdict, text: it.text });
+    }
+    return out;
+  }, [turnsByTab, activeKey]);
 
   // Add-project: open a local folder as a coding project (native picker).
   const openLocalFolder = async () => {
@@ -575,7 +522,9 @@ export default function Workspace() {
               ))}
             </div>
             {IS_LOCAL && activeProject?.path && (
-              <RightPanel project={activeProject} changed={changedFiles} onOpenFile={p => openFile(activeProject.id, p)} />
+              <RightSidebar project={activeProject} changed={changedFiles} checks={checks}
+                onOpenFile={p => openFile(activeProject.id, p)}
+                collapsed={sidebarCollapsed} onToggleCollapse={toggleSidebar} />
             )}
           </div>
         </div>

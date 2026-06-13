@@ -28,4 +28,12 @@ contextBridge.exposeInMainWorld('maestro', {
   // dispatch, so the phone/web remotes can never read local files.
   readFile: (projectId: string, p: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:readFile', projectId, p),
   listDir: (projectId: string, p?: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:listDir', projectId, p ?? ''),
+  // Run / Terminal — run a shell command in the project folder, stream output.
+  runCommand: (projectId: string, command: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:runCommand', projectId, command),
+  killCommand: (runId: string): Promise<{ ok: boolean }> => ipcRenderer.invoke('maestro:killCommand', runId),
+  onCmdOutput: (cb: (p: { runId: string; stream: string; chunk: string; code?: number }) => void): (() => void) => {
+    const l = (_e: unknown, payload: { runId: string; stream: string; chunk: string; code?: number }) => cb(payload);
+    ipcRenderer.on('maestro:cmd-output', l);
+    return () => ipcRenderer.removeListener('maestro:cmd-output', l);
+  },
 });

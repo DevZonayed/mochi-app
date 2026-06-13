@@ -1674,15 +1674,15 @@ function ChatMinimap({ turns, scrollRef }: { turns: Job[]; scrollRef: React.RefO
   };
   return (
     <div onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
-      style={{ position: 'absolute', right: 2, top: 86, bottom: 124, zIndex: 4, display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-end' }}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 5, alignItems: 'flex-end', padding: '2px 5px' }}>
+      style={{ position: 'absolute', left: 2, top: 86, bottom: 124, zIndex: 4, display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-start' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5, alignItems: 'flex-start', padding: '2px 5px' }}>
         {turns.map(t => (
           <button key={t.id} onClick={() => scrollTo(t.id)} title={t.input.slice(0, 90)}
             style={{ width: hover ? 20 : 14, height: 2.5, borderRadius: 2, background: 'var(--separator-strong)', cursor: 'pointer', transition: 'width 140ms ease, background 140ms ease' }} />
         ))}
       </div>
       {hover && (
-        <div style={{ position: 'absolute', right: 24, top: 0, width: 290, maxHeight: '100%', overflowY: 'auto',
+        <div style={{ position: 'absolute', left: 24, top: 0, width: 290, maxHeight: '100%', overflowY: 'auto',
           background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.26))', padding: 6 }}>
           {turns.map((t, i) => {
             const files = fileRefs(t);

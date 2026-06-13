@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import path from 'node:path';
 import { existsSync, realpathSync, promises as fsp } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { Store } from './store.js';
 import { LocalEngine } from './engine.js';
 import { MediaEngine } from './media.js';
@@ -192,6 +193,32 @@ app.whenReady().then(() => {
         .sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'dir' ? -1 : 1));
       return { ok: true, data: { path: real, entries } };
     } catch (e) { return { ok: false, error: (e as Error)?.message ?? 'list failed' }; }
+  });
+
+  // Run/Terminal: spawn a shell command in the project folder and stream output
+  // back over 'maestro:cmd-output'. DESKTOP-ONLY (renderer↔main) — never on the
+  // relay, so remotes can't run commands on this Mac.
+  const runningCmds = new Map<string, ChildProcess>();
+  ipcMain.handle('maestro:runCommand', async (e, projectId: string, command: string) => {
+    try {
+      const root = store.getProject(String(projectId))?.path;
+      if (!root) return { ok: false, error: 'this project has no folder' };
+      if (typeof command !== 'string' || !command.trim()) return { ok: false, error: 'command required' };
+      const runId = `${Date.now().toString(36)}-${process.hrtime.bigint().toString(36)}`;
+      const child = spawn('/bin/zsh', ['-lc', command], { cwd: root, env: { ...process.env } });
+      runningCmds.set(runId, child);
+      const send = (stream: string, chunk: string, code?: number) => { try { e.sender.send('maestro:cmd-output', { runId, stream, chunk, code }); } catch { /* window gone */ } };
+      child.stdout?.on('data', (d: Buffer) => send('out', String(d)));
+      child.stderr?.on('data', (d: Buffer) => send('err', String(d)));
+      child.on('close', (code) => { runningCmds.delete(runId); send('exit', '', code ?? 0); });
+      child.on('error', (err) => { runningCmds.delete(runId); send('err', err.message + '\n'); send('exit', '', 1); });
+      return { ok: true, data: { runId } };
+    } catch (err) { return { ok: false, error: (err as Error)?.message ?? 'run failed' }; }
+  });
+  ipcMain.handle('maestro:killCommand', async (_e, runId: string) => {
+    const c = runningCmds.get(String(runId));
+    if (c) { try { c.kill('SIGTERM'); } catch { /* gone */ } runningCmds.delete(String(runId)); }
+    return { ok: true };
   });
 
   createWindow();

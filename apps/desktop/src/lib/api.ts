@@ -292,8 +292,12 @@ interface Bridge {
   importAsset?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   readFile?: (projectId: string, p: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   listDir?: (projectId: string, p?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  runCommand?: (projectId: string, command: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  killCommand?: (runId: string) => Promise<{ ok: boolean }>;
+  onCmdOutput?: (cb: (p: CmdOutput) => void) => () => void;
 }
 export interface DirEntry { name: string; path: string; kind: 'file' | 'dir' | 'other' }
+export interface CmdOutput { runId: string; stream: 'out' | 'err' | 'exit' | string; chunk: string; code?: number }
 const bridge: Bridge | undefined =
   typeof window !== 'undefined' ? (window as unknown as { maestro?: Bridge }).maestro : undefined;
 
@@ -442,6 +446,15 @@ export const api = {
     if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'list failed');
     return r.data as { path: string; entries: DirEntry[] };
   },
+  /** Run / Terminal — run a shell command in the project folder (desktop only). */
+  runCommand: async (projectId: string, command: string): Promise<{ runId: string } | null> => {
+    if (!bridge?.runCommand) return null;
+    const r = await bridge.runCommand(projectId, command);
+    if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'run failed');
+    return r.data as { runId: string };
+  },
+  killCommand: async (runId: string): Promise<void> => { await bridge?.killCommand?.(runId); },
+  onCmdOutput: (cb: (p: CmdOutput) => void): (() => void) => (bridge?.onCmdOutput ? bridge.onCmdOutput(cb) : () => {}),
 
   // Media Studio (real fal generation, on the Mac's fal key)
   mediaRates: () => call<MediaRate[]>('mediaRates', {}, () => req<MediaRate[]>('/api/media/rates')),
