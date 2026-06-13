@@ -22,10 +22,18 @@ const PAGE_CSS = `
   .ws-tab:hover .ws-tab-x, .ws-tab.on .ws-tab-x { opacity: 1; }
   .ws-newbtn:hover { background: var(--fill-secondary) !important; }
   .ws-tabs::-webkit-scrollbar { height: 0; }
-  .ws-tree::-webkit-scrollbar { width: 8px; }
+  .ws-tree::-webkit-scrollbar { width: 9px; }
   .ws-tree::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  .ws-tree:hover::-webkit-scrollbar-thumb { background: var(--separator-strong); background-clip: padding-box; }
   .ws-proj:hover .ws-newchat { opacity: 1; }
   .ws-newchat { opacity: 0; transition: opacity 120ms ease; }
+  /* project header sticks to the top of the scroll area while you read its
+     chats, so the project you're in (and its collapse/new-chat controls) is
+     always reachable in a long list */
+  .ws-proj-head { position: sticky; top: 0; z-index: 2; background: var(--bg-grouped); }
+  /* overflow menu of open tabs — so every open chat is one click away even
+     when the tab strip is scrolled past the edge */
+  .ws-ovf-item:hover { background: var(--fill-tertiary); }
 `;
 
 interface Tab { key: string; projectId: string; sessionId: string | null; title: string }
@@ -72,6 +80,11 @@ export default function Workspace() {
   const [query, setQuery] = React.useState('');
   const newCounter = React.useRef(0);
   const restored = React.useRef(false);
+  // tab strip: scroll the active tab into view, surface an overflow menu of
+  // every open chat when the strip is too narrow to show them all.
+  const tabStripRef = React.useRef<HTMLDivElement>(null);
+  const [tabsOverflow, setTabsOverflow] = React.useState(false);
+  const [ovfOpen, setOvfOpen] = React.useState(false);
 
   const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
 
@@ -125,6 +138,19 @@ export default function Workspace() {
   }, []);
 
   const activeTab = tabs.find(t => t.key === activeKey) ?? null;
+
+  // keep the active tab in view + recompute whether the strip overflows
+  React.useLayoutEffect(() => {
+    const el = tabStripRef.current;
+    if (!el) return;
+    const measure = () => setTabsOverflow(el.scrollWidth > el.clientWidth + 1);
+    measure();
+    const node = activeKey ? el.querySelector(`[data-tabkey="${(window.CSS && CSS.escape) ? CSS.escape(activeKey) : activeKey}"]`) : null;
+    (node as HTMLElement | null)?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [tabs, activeKey]);
 
   const openSession = (s: ChatSession) => {
     const existing = tabs.find(t => t.sessionId === s.id);
@@ -243,14 +269,14 @@ export default function Workspace() {
                   style={{ flex: 1, minWidth: 0, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }} />
                 {query && <button onClick={() => setQuery('')} title="Clear" style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}><Icon name="x" size={11} stroke={2.4} /></button>}
               </div>
-              <div className="ws-tabs" style={{ display: 'flex', gap: 5, overflowX: 'auto' }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
                 {KIND_META.map(m => {
                   const on = kindFilter === m.key;
                   const n = kindCount(m.key);
                   if (m.key !== 'all' && n === 0) return null;
                   return (
                     <button key={m.key} onClick={() => setKindFilter(m.key)} title={`${m.label} · ${n}`} style={{
-                      display: 'inline-flex', alignItems: 'center', gap: 5, height: 26, padding: '0 9px', borderRadius: 'var(--r-pill)', flexShrink: 0, cursor: 'pointer',
+                      display: 'inline-flex', alignItems: 'center', gap: 4, height: 25, padding: '0 8px', borderRadius: 'var(--r-pill)', flexShrink: 0, cursor: 'pointer',
                       background: on ? `color-mix(in srgb, ${m.tint} 16%, transparent)` : 'var(--fill-secondary)',
                       border: on ? `1px solid color-mix(in srgb, ${m.tint} 45%, transparent)` : '1px solid transparent',
                       color: on ? m.tint : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
@@ -289,8 +315,8 @@ export default function Workspace() {
               const isOpen = expanded.has(p.id) || (!!q && chats.length > 0);
               return (
                 <div key={p.id} className="ws-proj">
-                  <div className="ws-row" onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
-                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px 6px 6px', borderRadius: 8, cursor: 'pointer' }}>
+                  <div className="ws-row ws-proj-head" onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
+                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer' }}>
                     <Icon name="chevronRight" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
                     <span style={{ width: 8, height: 8, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
                     <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
@@ -319,13 +345,15 @@ export default function Workspace() {
         <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
           {/* tab bar */}
           <div style={{ display: 'flex', alignItems: 'stretch', height: 42, flexShrink: 0, borderBottom: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
-            <div className="ws-tabs" style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'stretch', overflowX: 'auto' }}>
+            <div ref={tabStripRef} className="ws-tabs"
+              onWheel={e => { const el = tabStripRef.current; if (el && Math.abs(e.deltaY) > Math.abs(e.deltaX)) el.scrollLeft += e.deltaY; }}
+              style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'stretch', overflowX: 'auto' }}>
               {tabs.map(t => {
                 const on = t.key === activeKey;
                 const p = projById[t.projectId];
                 return (
-                  <div key={t.key} className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)}
-                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, cursor: 'pointer', position: 'relative',
+                  <div key={t.key} data-tabkey={t.key} className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
                       borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
                     {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: projColor(p) }} />}
                     <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
@@ -337,6 +365,36 @@ export default function Workspace() {
                 );
               })}
             </div>
+            {tabsOverflow && tabs.length > 0 && (
+              <div style={{ position: 'relative', flexShrink: 0 }}>
+                <button onClick={() => setOvfOpen(o => !o)} title="All open chats" className="ws-newbtn"
+                  style={{ width: 34, height: '100%', display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: ovfOpen ? 'var(--ink)' : 'var(--ink-secondary)', background: 'transparent', cursor: 'pointer' }}>
+                  <Icon name="chevronDown" size={15} />
+                </button>
+                {ovfOpen && (
+                  <>
+                    <div onClick={() => setOvfOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
+                    <div style={{ position: 'absolute', top: '100%', right: 0, zIndex: 41, marginTop: 4, minWidth: 230, maxHeight: 340, overflowY: 'auto', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--card-shadow)', padding: 5 }}>
+                      {tabs.map(t => {
+                        const on = t.key === activeKey;
+                        const p = projById[t.projectId];
+                        return (
+                          <div key={t.key} className="ws-ovf-item" onClick={() => { setActiveKey(t.key); setOvfOpen(false); }}
+                            style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 9px', borderRadius: 8, cursor: 'pointer', background: on ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
+                            <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                            <span style={{ flex: 1, minWidth: 0, font: `${on ? 600 : 500} var(--fs-footnote)/1.25 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
+                            {p && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', flexShrink: 0, maxWidth: 70, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>}
+                            <button title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+                              <Icon name="x" size={11} stroke={2.4} />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
             <button onClick={() => newChat(activeTab?.projectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
               title="New chat" className="ws-newbtn" style={{ width: 40, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: tabs.length ? '0.5px solid var(--separator)' : 'none', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
               <Icon name="plus" size={16} stroke={2.4} />
