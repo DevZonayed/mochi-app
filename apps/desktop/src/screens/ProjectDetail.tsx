@@ -1686,15 +1686,19 @@ function ChatMinimap({ turns, scrollRef }: { turns: Job[]; scrollRef: React.RefO
   );
 }
 
-export function ChatThread({ projectId, project, sessionId, onSessionCreated, flush, autoFocus }: {
+export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
   sessionId: string | null;
   onSessionCreated?: (session: ChatSession) => void;
+  /** Lifts this chat's turns (jobs) to the parent — used by the Workspace's
+      "Changed files" panel to read the write-tool activity. */
+  onTurns?: (jobs: Job[]) => void;
   flush?: boolean;
   autoFocus?: boolean;
 }) {
   const [turns, setTurns] = React.useState<Job[]>([]);
+  React.useEffect(() => { onTurns?.(turns); }, [turns]); // eslint-disable-line react-hooks/exhaustive-deps
   const [activeId, setActiveId] = React.useState<string | null>(sessionId);
   const [text, setText] = React.useState('');
   // Primary (coding) + reviewer model. Remembered across the app via localStorage;

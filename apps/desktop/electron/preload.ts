@@ -23,4 +23,9 @@ contextBridge.exposeInMainWorld('maestro', {
   pickFolder: (): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:pickFolder'),
   revealPath: (p: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('maestro:revealPath', p),
   importAsset: (projectId: string | null): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:importAsset', projectId),
+  // Read-only filesystem access for the in-app file viewer. Confined to the
+  // project's own folder on the main side; intentionally NOT in the relay
+  // dispatch, so the phone/web remotes can never read local files.
+  readFile: (projectId: string, p: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:readFile', projectId, p),
+  listDir: (projectId: string, p?: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:listDir', projectId, p ?? ''),
 });

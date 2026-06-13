@@ -7,8 +7,10 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
-import { api, type Project, type ChatSession, type ProjectKind } from '../lib/api';
+import { api, IS_LOCAL, type Project, type ChatSession, type ProjectKind, type Job, type DirEntry } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
+import { FileViewer } from '../lib/CodeView';
+import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
 
 const PAGE_CSS = `
@@ -37,7 +39,72 @@ const PAGE_CSS = `
   .ws-ovf-item:hover { background: var(--fill-tertiary); }
 `;
 
-interface Tab { key: string; projectId: string; sessionId: string | null; title: string }
+interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file'; filePath?: string }
+
+/* A lazily-loaded node in the codebase tree. A directory fetches its children on
+   first expand (api.listDir); a file opens as a tab via onOpenFile. */
+function DirNode({ projectId, entry, depth, onOpenFile }: { projectId: string; entry: DirEntry; depth: number; onOpenFile: (path: string) => void }) {
+  const [open, setOpen] = React.useState(false);
+  const [children, setChildren] = React.useState<DirEntry[] | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const toggle = () => {
+    if (entry.kind !== 'dir') { onOpenFile(entry.path); return; }
+    const next = !open; setOpen(next);
+    if (next && children === null) {
+      setLoading(true);
+      api.listDir(projectId, entry.path).then(r => setChildren(r?.entries ?? [])).catch(() => setChildren([])).finally(() => setLoading(false));
+    }
+  };
+  return (
+    <div>
+      <button onClick={toggle} className="ws-row" title={entry.name} style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left', padding: `4px 8px 4px ${10 + depth * 12}px`, borderRadius: 6, cursor: 'pointer' }}>
+        {entry.kind === 'dir'
+          ? <Icon name="chevronRight" size={12} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 140ms var(--spring)' }} />
+          : <Icon name="file" size={12} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} />}
+        <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-caption)/1.45 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{entry.name}</span>
+      </button>
+      {open && (
+        <div>
+          {loading && <div style={{ padding: `2px 8px 2px ${10 + (depth + 1) * 12}px`, font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</div>}
+          {children?.map(c => <DirNode key={c.path} projectId={projectId} entry={c} depth={depth + 1} onOpenFile={onOpenFile} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* Right-side panel: files the active chat changed + a lazy codebase tree. */
+function RightPanel({ project, changed, onOpenFile }: { project: Project; changed: string[]; onOpenFile: (path: string) => void }) {
+  const [root, setRoot] = React.useState<DirEntry[] | null>(null);
+  const [err, setErr] = React.useState('');
+  React.useEffect(() => {
+    let alive = true; setRoot(null); setErr('');
+    api.listDir(project.id, '').then(r => { if (alive) setRoot(r?.entries ?? []); }).catch(e => { if (alive) setErr(e instanceof Error ? e.message : 'Could not read folder'); });
+    return () => { alive = false; };
+  }, [project.id]);
+  return (
+    <div style={{ width: 250, flexShrink: 0, borderLeft: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      {changed.length > 0 && (
+        <div style={{ flexShrink: 0, maxHeight: '42%', overflowY: 'auto', borderBottom: '0.5px solid var(--separator)', paddingBottom: 6 }}>
+          <div style={{ padding: '10px 12px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Changed files</div>
+          {changed.map(p => (
+            <button key={p} onClick={() => onOpenFile(p)} className="ws-row" title={p} style={{ display: 'flex', alignItems: 'center', gap: 7, width: '100%', textAlign: 'left', padding: '5px 12px', cursor: 'pointer' }}>
+              <span style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--green)', flexShrink: 0 }} />
+              <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.split('/').pop()}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      <div style={{ flexShrink: 0, padding: '10px 12px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Files</div>
+      <div className="ws-tree" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '0 4px 12px' }}>
+        {err ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>{err}</div>
+          : root === null ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Loading…</div>
+          : root.length === 0 ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Empty folder.</div>
+          : root.map(e => <DirNode key={e.path} projectId={project.id} entry={e} depth={0} onOpenFile={onOpenFile} />)}
+      </div>
+    </div>
+  );
+}
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
@@ -86,6 +153,8 @@ export default function Workspace() {
   const tabStripRef = React.useRef<HTMLDivElement>(null);
   const [tabsOverflow, setTabsOverflow] = React.useState(false);
   const [ovfOpen, setOvfOpen] = React.useState(false);
+  // active chat's turns, lifted from each ChatThread, for the "Changed files" panel
+  const [turnsByTab, setTurnsByTab] = React.useState<Record<string, Job[]>>({});
 
   const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
 
@@ -139,6 +208,30 @@ export default function Workspace() {
   }, []);
 
   const activeTab = tabs.find(t => t.key === activeKey) ?? null;
+  const activeProject = activeTab ? projById[activeTab.projectId] : undefined;
+
+  // Open a file as a tab (deduped on its path).
+  const openFile = (projectId: string, filePath: string) => {
+    const existing = tabs.find(t => t.kind === 'file' && t.filePath === filePath);
+    if (existing) { setActiveKey(existing.key); return; }
+    const key = 'file:' + filePath;
+    setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: filePath.split('/').pop() ?? filePath, kind: 'file', filePath }]));
+    setActiveKey(key);
+  };
+  // Files the active chat wrote (from its turns' write-tool steps), newest first.
+  const changedFiles = React.useMemo(() => {
+    const jobs = turnsByTab[activeKey ?? ''] ?? [];
+    const rootPath = activeProject?.path;
+    const seen = new Set<string>(); const out: string[] = [];
+    for (const job of jobs) for (const it of job.transcript ?? []) {
+      if (it.kind === 'tool' && IS_WRITE_TOOL(it.name ?? '') && it.text) {
+        let p = it.text.trim();
+        if (!p.startsWith('/') && rootPath) p = rootPath.replace(/\/$/, '') + '/' + p;
+        if (!seen.has(p)) { seen.add(p); out.unshift(p); }
+      }
+    }
+    return out;
+  }, [turnsByTab, activeKey, activeProject]);
 
   // keep the active tab in view + recompute whether the strip overflows
   React.useLayoutEffect(() => {
@@ -360,7 +453,9 @@ export default function Workspace() {
                     style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
                       borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
                     {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: projColor(p) }} />}
-                    <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                    {t.kind === 'file'
+                      ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+                      : <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />}
                     <span style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
                     <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
                       <Icon name="x" size={11} stroke={2.6} />
@@ -405,28 +500,35 @@ export default function Workspace() {
             </button>
           </div>
 
-          {/* chat panes — all open tabs stay mounted; only the active one shows */}
-          <div style={{ flex: 1, minHeight: 0, position: 'relative', display: 'flex' }}>
-            {tabs.length === 0 && (
-              <div style={{ flex: 1, display: 'grid', placeItems: 'center', textAlign: 'center', padding: 40 }}>
-                <div>
-                  <span style={{ width: 60, height: 60, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
-                    background: 'linear-gradient(160deg, color-mix(in srgb, var(--blue) 16%, transparent), color-mix(in srgb, var(--purple) 14%, transparent))', color: 'var(--blue)' }}>
-                    <Icon name="terminal" size={28} />
-                  </span>
-                  <div style={{ font: '700 var(--fs-title2)/1.2 var(--font-display)', color: 'var(--ink)', marginBottom: 6 }}>Open a chat to start coding</div>
-                  <div style={{ font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)', maxWidth: 380 }}>
-                    Pick a project on the left and start a chat — keep several open as tabs and jump between them.
+          {/* panes (chat or file — all kept mounted) + the right-side files panel */}
+          <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+            <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex' }}>
+              {tabs.length === 0 && (
+                <div style={{ flex: 1, display: 'grid', placeItems: 'center', textAlign: 'center', padding: 40 }}>
+                  <div>
+                    <span style={{ width: 60, height: 60, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
+                      background: 'linear-gradient(160deg, color-mix(in srgb, var(--blue) 16%, transparent), color-mix(in srgb, var(--purple) 14%, transparent))', color: 'var(--blue)' }}>
+                      <Icon name="terminal" size={28} />
+                    </span>
+                    <div style={{ font: '700 var(--fs-title2)/1.2 var(--font-display)', color: 'var(--ink)', marginBottom: 6 }}>Open a chat to start coding</div>
+                    <div style={{ font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)', maxWidth: 380 }}>
+                      Pick a project on the left and start a chat — keep several open as tabs and jump between them.
+                    </div>
                   </div>
                 </div>
-              </div>
+              )}
+              {tabs.map(t => (
+                <div key={t.key} style={{ position: 'absolute', inset: 0, display: t.key === activeKey ? 'flex' : 'none' }}>
+                  {t.kind === 'file' && t.filePath
+                    ? <FileViewer projectId={t.projectId} filePath={t.filePath} />
+                    : <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
+                        sessionId={t.sessionId} onSessionCreated={onSessionCreated(t.key)} onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))} />}
+                </div>
+              ))}
+            </div>
+            {IS_LOCAL && activeProject?.path && (
+              <RightPanel project={activeProject} changed={changedFiles} onOpenFile={p => openFile(activeProject.id, p)} />
             )}
-            {tabs.map(t => (
-              <div key={t.key} style={{ position: 'absolute', inset: 0, display: t.key === activeKey ? 'flex' : 'none' }}>
-                <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
-                  sessionId={t.sessionId} onSessionCreated={onSessionCreated(t.key)} />
-              </div>
-            ))}
           </div>
         </div>
       </div>

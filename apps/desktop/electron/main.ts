@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import path from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync, promises as fsp } from 'node:fs';
 import { Store } from './store.js';
 import { LocalEngine } from './engine.js';
 import { MediaEngine } from './media.js';
@@ -138,6 +138,60 @@ app.whenReady().then(() => {
     if (res.canceled || !res.filePaths[0]) return { ok: true, data: null };
     try { return { ok: true, data: await dispatch('importAsset', { path: res.filePaths[0], projectId: projectId ?? null }) }; }
     catch (e) { const err = e as { message?: string }; return { ok: false, error: err?.message ?? 'import failed' }; }
+  });
+
+  /* Resolve `rel` to a canonical path that is provably INSIDE the project root.
+     Defends against `..` escapes and symlinks pointing out of the repo. Accepts
+     either a path relative to the root or an absolute path that lands inside it. */
+  const resolveInsideRoot = (rawRoot: string, rel: string): string => {
+    const root = rawRoot.startsWith('~/') || rawRoot === '~' ? path.join(app.getPath('home'), rawRoot.slice(1)) : rawRoot;
+    const rootReal = realpathSync(path.resolve(root));
+    const target = path.resolve(rootReal, String(rel ?? ''));
+    const relToRoot = path.relative(rootReal, target);
+    if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) throw new Error('path escapes project');
+    const real = realpathSync(target);
+    const relReal = path.relative(rootReal, real);
+    if (relReal.startsWith('..') || path.isAbsolute(relReal)) throw new Error('symlink escapes project');
+    return real;
+  };
+  const projectRoot = (projectId: unknown): string => {
+    const root = store.getProject(String(projectId))?.path;
+    if (!root) throw new Error('this project has no folder on disk');
+    return root;
+  };
+
+  // Read a file's text — DESKTOP-ONLY, confined to the project folder. Never
+  // added to the relay dispatch, so remotes can't read local files.
+  ipcMain.handle('maestro:readFile', async (_e, projectId: string, rel: string) => {
+    try {
+      const real = resolveInsideRoot(projectRoot(projectId), rel);
+      const st = await fsp.stat(real);
+      if (!st.isFile()) return { ok: false, error: 'not a file' };
+      if (st.size > 2 * 1024 * 1024) {
+        const fd = await fsp.open(real, 'r');
+        try { const buf = Buffer.alloc(512 * 1024); const { bytesRead } = await fd.read(buf, 0, buf.length, 0); return { ok: true, data: { path: real, text: buf.subarray(0, bytesRead).toString('utf8'), bytes: st.size, truncated: true } }; }
+        finally { await fd.close(); }
+      }
+      const text = await fsp.readFile(real, 'utf8');
+      if (text.includes('\u0000')) return { ok: false, error: 'binary file' };
+      return { ok: true, data: { path: real, text, bytes: st.size, truncated: false } };
+    } catch (e) { return { ok: false, error: (e as Error)?.message ?? 'read failed' }; }
+  });
+
+  // List a directory's immediate entries — DESKTOP-ONLY, confined to the project.
+  ipcMain.handle('maestro:listDir', async (_e, projectId: string, rel: string) => {
+    try {
+      const real = resolveInsideRoot(projectRoot(projectId), rel);
+      const st = await fsp.stat(real);
+      if (!st.isDirectory()) return { ok: false, error: 'not a directory' };
+      const dirents = await fsp.readdir(real, { withFileTypes: true });
+      const entries = dirents
+        .filter(d => d.name !== '.git' && d.name !== 'node_modules' && d.name !== '.DS_Store')
+        .slice(0, 5000)
+        .map(d => ({ name: d.name, path: path.join(real, d.name), kind: d.isDirectory() ? 'dir' : d.isFile() ? 'file' : 'other' }))
+        .sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'dir' ? -1 : 1));
+      return { ok: true, data: { path: real, entries } };
+    } catch (e) { return { ok: false, error: (e as Error)?.message ?? 'list failed' }; }
   });
 
   createWindow();

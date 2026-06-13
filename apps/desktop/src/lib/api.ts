@@ -289,7 +289,10 @@ interface Bridge {
   pickFolder?: () => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   revealPath?: (p: string) => Promise<{ ok: boolean; error?: string }>;
   importAsset?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  readFile?: (projectId: string, p: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  listDir?: (projectId: string, p?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
 }
+export interface DirEntry { name: string; path: string; kind: 'file' | 'dir' | 'other' }
 const bridge: Bridge | undefined =
   typeof window !== 'undefined' ? (window as unknown as { maestro?: Bridge }).maestro : undefined;
 
@@ -424,6 +427,20 @@ export const api = {
   },
   /** Reveal a local path in Finder — desktop only; no-op in the browser. */
   revealPath: async (p: string): Promise<void> => { if (bridge?.revealPath) await bridge.revealPath(p); },
+  /** Read a file's text — desktop only, confined to the project folder; null in the browser. */
+  readFile: async (projectId: string, p: string): Promise<{ path: string; text: string; bytes: number; truncated: boolean } | null> => {
+    if (!bridge?.readFile) return null;
+    const r = await bridge.readFile(projectId, p);
+    if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'read failed');
+    return r.data as { path: string; text: string; bytes: number; truncated: boolean };
+  },
+  /** List a directory inside the project — desktop only; null in the browser. */
+  listDir: async (projectId: string, p?: string): Promise<{ path: string; entries: DirEntry[] } | null> => {
+    if (!bridge?.listDir) return null;
+    const r = await bridge.listDir(projectId, p);
+    if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'list failed');
+    return r.data as { path: string; entries: DirEntry[] };
+  },
 
   // Media Studio (real fal generation, on the Mac's fal key)
   mediaRates: () => call<MediaRate[]>('mediaRates', {}, () => req<MediaRate[]>('/api/media/rates')),
