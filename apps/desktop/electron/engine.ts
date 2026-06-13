@@ -45,6 +45,17 @@ const CODEX_IMAGE_NUDGE =
   `selected image into the current workspace directory with a clear name like ` +
   `generated-<short>.png so it becomes a project asset, and state the saved path.`;
 const IMG_FILE_RE = /\.(png|jpe?g|webp|gif)$/i;
+/* Identify an image by its MAGIC BYTES, not a (possibly wrong) client-supplied
+   mime. Returns one of the four media types Anthropic vision accepts, or null —
+   so a HEIC/BMP/SVG/etc. attachment is dropped rather than mislabeled as PNG
+   (which would 400 the whole turn). */
+function sniffImageMime(buf: Buffer): 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' | null {
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.length >= 6 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'image/gif'; // GIF
+  if (buf.length >= 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'image/webp'; // RIFF…WEBP
+  return null;
+}
 // The nudge tells codex to save generated images as `generated-<short>.png`. We
 // only auto-show workspace images matching this, so a normal coding turn that
 // merely edits existing images isn't mistaken for a fresh generation.
@@ -261,6 +272,7 @@ async function runClaude(
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
   resume?: string, modelOverride?: string, plan?: boolean,
   imageGen?: ImageGenFn, projectId?: string | null,
+  images?: { mime: string; b64: string }[],
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -303,8 +315,28 @@ async function runClaude(
         ],
       })
     : null;
+  /* Vision input: when the user attached images, the prompt becomes a streamed
+     user message carrying text + base64 image blocks (a plain string can't hold
+     images). Verified the SDK accepts this with resume/abort. Otherwise the
+     simple string prompt path is unchanged. */
+  const VALID_MEDIA = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+  const promptArg = (images && images.length)
+    ? (async function* () {
+        yield {
+          type: 'user' as const,
+          parent_tool_use_id: null,
+          message: {
+            role: 'user' as const,
+            content: [
+              { type: 'text' as const, text: prompt },
+              ...images.map(im => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: (VALID_MEDIA.has(im.mime) ? im.mime : 'image/png'), data: im.b64 } })),
+            ],
+          },
+        };
+      })() as unknown as Parameters<typeof query>[0]['prompt']
+    : prompt;
   const it = query({
-    prompt,
+    prompt: promptArg,
     options: {
       cwd,
       maxTurns: maxTurnsOverride ?? EFFORT_TURNS[effort] ?? 4,
@@ -446,7 +478,8 @@ async function runClaude(
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
 function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
-  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean }): Promise<EngineRun> {
+  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean },
+  imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex CLI not found on this Mac'), { statusCode: 503 }));
   const outFile = path.join(tmpdir(), `maestro-codex-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
@@ -454,6 +487,7 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
     'exec', '--json', '--ephemeral', '--skip-git-repo-check',
     '-s', readOnly ? 'read-only' : 'workspace-write',
     ...(model ? ['-m', model] : []),
+    ...(imageFiles ?? []).flatMap(f => ['-i', f]), // vision input — codex attaches the image(s)
     '-C', cwd, '-o', outFile,
     prompt,
   ];
@@ -799,6 +833,18 @@ export class LocalEngine {
       // Codex ships a native image_gen skill — nudge it to use that (not SVG) and
       // drop the PNG in the workspace so we can harvest + display it inline.
       if (master === 'codex' && IMAGE_INTENT_RE.test(cur.input)) prompt += CODEX_IMAGE_NUDGE;
+      // Vision input: images the user attached to this message. Read + sniff each
+      // ONCE from disk; keep only real png/jpeg/gif/webp (ignore a wrong client
+      // mime, and never relabel — a bad type would 400 the whole Claude turn).
+      // Claude gets base64 blocks; codex attaches the files via -i.
+      const isClaudeMaster = master === 'claude';
+      const resolvedImages = (cur.inputImages ?? [])
+        .filter(im => im.imagePath && existsSync(im.imagePath))
+        .map(im => { try { const buf = readFileSync(im.imagePath); const mime = sniffImageMime(buf); return mime ? { path: im.imagePath, mime: mime as string, b64: isClaudeMaster ? buf.toString('base64') : '' } : null; } catch { return null; } })
+        .filter((x): x is { path: string; mime: string; b64: string } => !!x);
+      if (resolvedImages.length && !cur.input.trim()) prompt += 'Take a look at the attached image(s) and respond.';
+      const claudeImages = isClaudeMaster ? resolvedImages.map(r => ({ mime: r.mime, b64: r.b64 })) : [];
+      const codexImageFiles = master === 'codex' ? resolvedImages.map(r => r.path) : [];
 
       const hooks: RunHooks = {
         signal: ac.signal,
@@ -808,8 +854,8 @@ export class LocalEngine {
       // Plan mode only applies to Claude (codex has no read-only planning mode).
       const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input) };
       const main = master === 'claude'
-        ? await runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId)
-        : await runCodex(prompt, cwd, hooks, false, masterModel, imageCtx);
+        ? await runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages)
+        : await runCodex(prompt, cwd, hooks, false, masterModel, imageCtx, codexImageFiles);
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {
         try { this.store.updateSession(session.id, { sdkSessionId: main.sdkSessionId }); } catch { /* session deleted mid-run */ }
       }

@@ -9,7 +9,7 @@ import { ResearchEngine } from './research.js';
 import { PublishingEngine } from './publishing.js';
 import { TelegramBot } from './telegram.js';
 import { Providers } from './providers.js';
-import type { Approval } from './store.js';
+import type { Approval, Job } from './store.js';
 import { createDispatch } from './localApi.js';
 import { buildModelGroups } from './models.js';
 import { RelayClient } from './relay.js';
@@ -78,7 +78,9 @@ app.whenReady().then(() => {
     // The relay is a pure conduit to the phone — never hand it the Mac-local path,
     // the base64 thumbnail, the content hash, or the fal queue URLs an Asset carries.
     // (Desktop windows above already got the full object; only the relay is slimmed.)
-    const relayData = name === 'asset' && data && typeof data === 'object' ? store.slimAssetForRelay(data as import('./store.js').Asset) : data;
+    const relayData = name === 'asset' && data && typeof data === 'object' ? store.slimAssetForRelay(data as import('./store.js').Asset)
+      : name === 'job' && data && typeof data === 'object' ? store.slimJobForRelay(data as Job)
+      : data;
     relay?.event(name, relayData);
     relay?.pushSnapshot();
   };
@@ -109,7 +111,18 @@ app.whenReady().then(() => {
     deckSecret: store.deck.deckSecret,
     accessToken: store.accessToken,
     getSnapshot: () => ({ ...store.snapshot(providers.list()), engineStatus: engine.statuses(), mediaRates: media.rates(), models: buildModelGroups(engine.statuses()) }),
-    onCommand: (method, params) => dispatch(method, params),
+    // Relay command results can be Job-shaped (sendChat → {session,job}, getJob,
+    // listJobs…) — slim any Job before it crosses back to the phone so the
+    // Mac-local image path never rides the response either. (Desktop IPC at
+    // maestro:call calls dispatch directly and keeps the full job for reveal.)
+    onCommand: async (method, params) => {
+      const r = await dispatch(method, params);
+      const isJob = (x: unknown): x is Job => !!x && typeof x === 'object' && 'input' in x && 'status' in x && 'phase' in x && 'projectId' in x;
+      if (isJob(r)) return store.slimJobForRelay(r);
+      if (Array.isArray(r)) return r.map(x => (isJob(x) ? store.slimJobForRelay(x) : x));
+      if (r && typeof r === 'object' && isJob((r as { job?: unknown }).job)) return { ...r, job: store.slimJobForRelay((r as { job: Job }).job) };
+      return r;
+    },
   });
   relay.start();
 

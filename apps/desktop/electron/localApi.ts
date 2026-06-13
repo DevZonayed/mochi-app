@@ -2,7 +2,7 @@
    (over IPC) and remote controls (phone/web via the relay). Every command
    executes locally on this Mac against the local store + local engine. */
 
-import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus } from './store.js';
+import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage } from './store.js';
 import { resolveModelKey, buildModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
@@ -169,7 +169,8 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'sendChat': {
         const projectId = String(p.projectId ?? '');
         const text = String(p.text ?? '').trim();
-        if (!projectId || !text) bad('projectId and text required');
+        const rawImages = Array.isArray(p.images) ? p.images as Array<{ dataB64?: string; mime?: string; name?: string }> : [];
+        if (!projectId || (!text && !rawImages.length)) bad('projectId and a message or image required');
         if (!store.getProject(projectId)) bad('project not found', 404);
         let session = p.sessionId ? store.getSession(String(p.sessionId)) : undefined;
         if (p.sessionId && !session) bad('session not found', 404);
@@ -194,7 +195,25 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (reviewer !== undefined) sessPatch.reviewer = reviewer;
         if (Object.keys(sessPatch).length) { session = store.updateSession(session.id, sessPatch); emit('session', session); }
 
-        const job = store.createJob(projectId, text, text.slice(0, 60), p.effort as Effort | undefined, session.id);
+        // Ingest pasted/dropped images as Assets (vision input). The bytes stay on
+        // the Mac; the job carries only asset refs. Capped to bound payload + spend.
+        const inputImages: ChatImage[] = [];
+        const seenAssets = new Set<string>();
+        for (const im of rawImages.slice(0, 8)) {
+          const b64 = String(im?.dataB64 ?? '');
+          if (!b64) continue;
+          let buf: Buffer;
+          try { buf = Buffer.from(b64, 'base64'); } catch { continue; }
+          if (!buf.length || buf.length > 16 * 1024 * 1024) continue;
+          try {
+            const asset = publishing.importAssetBytes(buf, String(im?.name ?? 'pasted.png'), projectId);
+            if (seenAssets.has(asset.id)) continue; // identical bytes attached twice → one entry
+            seenAssets.add(asset.id);
+            inputImages.push({ assetId: asset.id, imagePath: asset.localPath ?? '', mime: String(im?.mime ?? 'image/png'), name: asset.name, width: asset.width, height: asset.height });
+          } catch { /* skip an unreadable image */ }
+        }
+
+        const job = store.createJob(projectId, text, text.slice(0, 60), p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined);
         emit('job', job);
         // Fire the run async — the reply streams in over job events.
         void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true });

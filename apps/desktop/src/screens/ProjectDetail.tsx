@@ -24,7 +24,7 @@ import {
 } from '../lib/ui';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -1373,15 +1373,41 @@ const fmtDurationLive = (ms: number): string => {
   return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${(s % 60).toFixed(1)}s`;
 };
 
-function UserBubble({ text }: { text: string }) {
+/** A small thumbnail of an image the user attached — loaded on-device by assetId. */
+function UserImageThumb({ img }: { img: ChatImage }) {
+  const [src, setSrc] = React.useState<string | null>(null);
+  React.useEffect(() => {
+    let alive = true;
+    if (IS_LOCAL && img.assetId) api.assetImage(img.assetId).then(d => { if (alive) setSrc(d); }).catch(() => {});
+    return () => { alive = false; };
+  }, [img.assetId]);
+  const clickable = IS_LOCAL && !!img.imagePath;
   return (
-    <div className="chat-msg" style={{ display: 'flex', justifyContent: 'flex-end' }}>
-      <div style={{ maxWidth: '78%', padding: '10px 14px', borderRadius: '18px 18px 5px 18px',
-        background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
-        color: '#fff', font: '400 14px/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-        boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
-        {text}
-      </div>
+    <div onClick={() => { if (img.imagePath) void api.revealPath(img.imagePath); }} title={clickable ? (img.name || 'Reveal in Finder') : (img.name || 'image')}
+      style={{ width: 158, maxWidth: '100%', borderRadius: 12, overflow: 'hidden', border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', cursor: clickable ? 'pointer' : 'default' }}>
+      {src
+        ? <img src={src} alt={img.name || 'attached image'} style={{ display: 'block', width: '100%', maxHeight: 200, objectFit: 'cover' }} />
+        : <div style={{ height: 92, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}><Icon name="image" size={18} /></div>}
+    </div>
+  );
+}
+
+function UserBubble({ text, images }: { text: string; images?: ChatImage[] }) {
+  return (
+    <div className="chat-msg" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+      {images && images.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: '78%' }}>
+          {images.map((im, i) => <UserImageThumb key={`${im.assetId}-${i}`} img={im} />)}
+        </div>
+      )}
+      {text && (
+        <div style={{ maxWidth: '78%', padding: '10px 14px', borderRadius: '18px 18px 5px 18px',
+          background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
+          color: '#fff', font: '400 14px/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
+          {text}
+        </div>
+      )}
     </div>
   );
 }
@@ -1893,6 +1919,11 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [optsOpen, setOptsOpen] = React.useState(false); // reviewer + schedule popover
   const [schedNote, setSchedNote] = React.useState('');
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
+  const [attachments, setAttachments] = React.useState<{ id: string; name: string; mime: string; dataUrl: string }[]>([]); // pasted/dropped images
+  const [dragOver, setDragOver] = React.useState(false);
+  const fileRef = React.useRef<HTMLInputElement>(null);
+  const attachmentsRef = React.useRef(attachments);
+  attachmentsRef.current = attachments; // fresh count for addFiles' over-cap notice
   const activeRef = React.useRef<string | null>(activeId);
   activeRef.current = activeId;
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -1952,9 +1983,10 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending');
 
   // The actual send — no guards. Used directly, by the queue drainer, and by steer.
-  const sendRaw = React.useCallback(async (raw: string): Promise<boolean> => {
+  const sendRaw = React.useCallback(async (raw: string, images?: { id: string; name: string; mime: string; dataUrl: string }[]): Promise<boolean> => {
     const t = raw.trim();
-    if (!t || !projectId) return false;
+    const imgs = (images ?? []).map(a => ({ name: a.name, mime: a.mime, dataB64: a.dataUrl.includes(',') ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : a.dataUrl }));
+    if ((!t && !imgs.length) || !projectId) return false;
     setSendError('');
     stickBottom.current = true;
     try {
@@ -1963,6 +1995,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
         effort: EFFORT_TO_API[effort], plan: planMode, goal: goalMode,
         ...(primaryKey ? { modelKey: primaryKey } : {}),
         ...(reviewerKey ? { reviewerKey } : {}),
+        ...(imgs.length ? { images: imgs } : {}),
       });
       if (activeRef.current !== resp.session.id) {
         activeRef.current = resp.session.id; // match the streamed job immediately
@@ -1990,17 +2023,68 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   }, [projectId, streaming, sendRaw]);
 
   // STEER: interrupt the running turn and send right now (session resumes with context).
-  const sendNow = React.useCallback(async (raw: string) => {
+  const sendNow = React.useCallback(async (raw: string, images?: { id: string; name: string; mime: string; dataUrl: string }[]): Promise<boolean> => {
     const t = raw.trim();
-    if (!t) return;
+    if (!t && !(images?.length)) return false;
     setText('');
     if (taRef.current) taRef.current.style.height = 'auto';
     if (lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending')) {
       try { await api.cancelJob(lastTurn.id); } catch { /* already gone */ }
     }
-    const ok = await sendRaw(t);
+    const ok = await sendRaw(t, images);
     if (!ok) setText(raw);
+    return ok;
   }, [lastTurn, sendRaw]);
+
+  // ── Image attachments: paste, drop, or pick (vision input) ──────────
+  const MAX_ATTACH = 8;
+  const SUPPORTED_IMG = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']; // what both engines accept
+  const addFiles = React.useCallback((files: FileList | File[] | null) => {
+    if (!files) return;
+    const all = Array.from(files).filter(f => f.type.startsWith('image/'));
+    if (all.some(f => !SUPPORTED_IMG.includes(f.type))) setSendError('Only PNG, JPEG, GIF, or WebP images are supported.');
+    const sized = all.filter(f => SUPPORTED_IMG.includes(f.type));
+    if (sized.some(f => f.size > 16 * 1024 * 1024)) setSendError('Each image must be under 16 MB.');
+    const ok = sized.filter(f => f.size <= 16 * 1024 * 1024);
+    const remaining = Math.max(0, MAX_ATTACH - attachmentsRef.current.length);
+    if (ok.length > remaining) setSendError(`Up to ${MAX_ATTACH} images per message — ${ok.length - remaining} skipped.`);
+    for (const f of ok.slice(0, remaining)) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = String(reader.result || '');
+        if (!dataUrl.startsWith('data:image/')) return;
+        setSendError('');
+        setAttachments(a => a.length >= MAX_ATTACH ? a : [...a, { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, name: f.name || 'pasted.png', mime: f.type || 'image/png', dataUrl }]);
+      };
+      reader.readAsDataURL(f);
+    }
+  }, []);
+  const onPasteImages = React.useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items; if (!items) return;
+    const imgs: File[] = [];
+    for (const it of Array.from(items)) if (it.kind === 'file' && it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) imgs.push(f); }
+    if (imgs.length) { e.preventDefault(); addFiles(imgs); }
+  }, [addFiles]);
+  const removeAttachment = (id: string) => { setSendError(''); setAttachments(a => a.filter(x => x.id !== id)); };
+  const canSend = !!text.trim() || attachments.length > 0;
+
+  // Compose-and-send: text-only follows the normal queue/idle path; a message with
+  // images sends now (interrupting a running turn so turns never overlap mid-stream).
+  // On failure the text + images are restored so nothing is lost.
+  const sendComposed = React.useCallback(() => {
+    const t = text.trim(); const imgs = attachments;
+    if ((!t && !imgs.length) || !projectId) return;
+    if (!imgs.length) { sendText(text); return; }
+    setText(''); setAttachments([]); if (taRef.current) taRef.current.style.height = 'auto';
+    if (streaming) void sendNow(t, imgs).then(ok => { if (!ok) setAttachments(imgs); });
+    else void sendRaw(t, imgs).then(ok => { if (!ok) { setText(t); setAttachments(imgs); } });
+  }, [text, attachments, projectId, streaming, sendText, sendNow, sendRaw]);
+  const sendComposedNow = React.useCallback(() => {
+    const t = text.trim(); const imgs = attachments;
+    if ((!t && !imgs.length) || !projectId) return;
+    setAttachments([]);
+    void sendNow(t, imgs.length ? imgs : undefined).then(ok => { if (!ok) setAttachments(imgs); });
+  }, [text, attachments, projectId, sendNow]);
 
   const removeFromQueue = (i: number) => setQueue(q => q.filter((_, j) => j !== i));
   // Reorder = reprioritize: the drainer always fires queue[0] next.
@@ -2088,7 +2172,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
           )}
           {turns.map((t, i) => (
             <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
-              <UserBubble text={t.input} />
+              <UserBubble text={t.input} images={t.inputImages} />
               <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
             </div>
           ))}
@@ -2132,10 +2216,27 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
             </div>
           )}
           <div className={`composer-card composer-eff${effort === 'MAX' ? ' composer-ultra' : ''}`}
-            style={{ borderRadius: 18, border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)',
-            boxShadow: 'var(--card-shadow)', padding: '10px 10px 8px 14px', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
+            onDragOver={e => { if (Array.from(e.dataTransfer?.types ?? []).includes('Files')) { e.preventDefault(); setDragOver(true); } }}
+            onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false); }}
+            onDrop={e => { e.preventDefault(); setDragOver(false); addFiles(e.dataTransfer?.files ?? null); }}
+            style={{ borderRadius: 18, border: `1px solid ${dragOver ? 'var(--blue)' : 'var(--separator-strong)'}`, background: 'var(--bg-elevated)',
+            boxShadow: dragOver ? '0 0 0 3px color-mix(in srgb, var(--blue) 22%, transparent)' : 'var(--card-shadow)', padding: '10px 10px 8px 14px',
+            transition: 'border-color 120ms ease, box-shadow 120ms ease', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
+            {attachments.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 9 }}>
+                {attachments.map(a => (
+                  <div key={a.id} style={{ position: 'relative', width: 58, height: 58, borderRadius: 10, overflow: 'hidden', border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0 }}>
+                    <img src={a.dataUrl} alt={a.name} title={a.name} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+                    <button onClick={() => removeAttachment(a.id)} title="Remove" style={{ position: 'absolute', top: 2, right: 2, width: 18, height: 18, borderRadius: '50%', border: 'none', display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.6)', color: '#fff', cursor: 'pointer', padding: 0 }}>
+                      <Icon name="x" size={11} stroke={2.8} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
               <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
+                onPaste={onPasteImages}
                 onKeyDown={e => {
                   if (slashOpen) {
                     if (e.key === 'ArrowDown') { e.preventDefault(); setSlashSel((slashIdx + 1) % slashList.length); return; }
@@ -2143,9 +2244,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                     if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); applySlash(slashList[slashIdx]); return; }
                     if (e.key === 'Escape') { e.preventDefault(); setText(''); return; }
                   }
-                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) void sendNow(text); else sendText(text); }
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) sendComposedNow(); else sendComposed(); }
                 }}
-                placeholder={!projectId ? 'Pick a project first' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent…'}
+                placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent…'}
                 title="Enter to send · Shift+Enter for a new line · while running: Enter queues, ⌘Enter sends now"
                 disabled={!projectId}
                 style={{ flex: 1, resize: 'none', border: 'none', outline: 'none', background: 'transparent',
@@ -2153,11 +2254,11 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   minHeight: 24, maxHeight: 150, boxSizing: 'content-box' }} />
               {streaming ? (
                 <>
-                  {text.trim() && (
-                    <button onClick={() => sendText(text)} className="send-fab" title="Queue (Enter) — runs when the agent finishes · ⌘Enter to send now" style={{
+                  {canSend && (
+                    <button onClick={sendComposed} className="send-fab" title={attachments.length ? 'Send now — interrupts the current run' : 'Queue (Enter) — runs when the agent finishes · ⌘Enter to send now'} style={{
                       width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
                       background: 'var(--blue)', color: '#fff', boxShadow: '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)', cursor: 'pointer' }}>
-                      <Icon name="plus" size={18} stroke={2.6} />
+                      <Icon name={attachments.length ? 'arrowRight' : 'plus'} size={18} stroke={2.6} style={attachments.length ? { transform: 'rotate(-90deg)' } : undefined} />
                     </button>
                   )}
                   <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
@@ -2166,15 +2267,23 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   </button>
                 </>
               ) : (
-                <button onClick={() => { void sendText(text); }} disabled={!text.trim() || !projectId} className="send-fab" title="Send (Enter)" style={{
+                <button onClick={sendComposed} disabled={!canSend || !projectId} className="send-fab" title="Send (Enter)" style={{
                   width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
-                  background: text.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: text.trim() ? '#fff' : 'var(--ink-secondary)',
-                  boxShadow: text.trim() ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: text.trim() ? 'pointer' : 'default' }}>
+                  background: canSend ? 'var(--blue)' : 'var(--fill-secondary)', color: canSend ? '#fff' : 'var(--ink-secondary)',
+                  boxShadow: canSend ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: canSend ? 'pointer' : 'default' }}>
                   <Icon name="arrowRight" size={18} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
                 </button>
               )}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, rowGap: 6, marginTop: 6 }}>
+              {/* attach an image (also: paste or drag-drop onto the composer) */}
+              <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple style={{ display: 'none' }}
+                onChange={e => { addFiles(e.target.files); if (e.target) e.target.value = ''; }} />
+              <button onClick={() => fileRef.current?.click()} disabled={!projectId} title="Attach an image (or paste / drag-drop)" className="tb-icon" style={{
+                width: 30, height: 30, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+                background: 'transparent', color: 'var(--ink-secondary)', opacity: projectId ? 1 : 0.4, cursor: projectId ? 'pointer' : 'default' }}>
+                <Icon name="image" size={16} />
+              </button>
               {/* core: which model · how hard · the two run modes */}
               <ModelPicker compact direction="up" value={primaryKey} onChange={setPrimaryKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
               <EffortDial compact value={effort} onChange={setEffort} />

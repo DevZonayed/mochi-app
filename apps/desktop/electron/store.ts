@@ -65,6 +65,11 @@ export interface TranscriptItem {
   ts: number;
 }
 
+/** An image attached to a user message (pasted, dropped, or picked) — vision
+    input for the agent. Stored as an Asset; the bytes stay on the Mac (imagePath
+    is stripped from the relay snapshot). */
+export interface ChatImage { assetId: string; imagePath: string; mime: string; name?: string; width?: number; height?: number }
+
 export interface Job {
   id: string; projectId: string; title: string; status: JobStatus; phase: string; progress: number;
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
@@ -73,6 +78,8 @@ export interface Job {
   goal?: boolean;
   /** Chat turn: set when this job is one turn of a project chat session. */
   sessionId?: string;
+  /** Images attached to the user's message (vision input). */
+  inputImages?: ChatImage[];
   /** Structured run log (assistant text blocks, tool calls, result) — capped. */
   transcript?: TranscriptItem[];
   createdAt: number; updatedAt: number;
@@ -494,12 +501,13 @@ export class Store {
     return projectId ? all.filter(j => j.projectId === projectId) : all.slice(0, 200);
   }
   getJob(jobId: string): Job | undefined { return this.data.jobs.find(j => j.id === jobId); }
-  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string): Job {
+  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[]): Job {
     const t = now();
     const j: Job = {
-      id: id(), projectId, title: title || input.slice(0, 60), status: 'pending', phase: 'Queued', progress: 0,
+      id: id(), projectId, title: title || input.slice(0, 60) || 'Image', status: 'pending', phase: 'Queued', progress: 0,
       input, output: null, error: null, effort: effort ?? this.data.settings.defaultEffort, cost: 0, tokens: 0, stage: '',
       sessionId,
+      ...(inputImages && inputImages.length ? { inputImages } : {}),
       createdAt: t, updatedAt: t,
     };
     this.data.jobs.push(j); this.save();
@@ -631,6 +639,25 @@ export class Store {
       durationS: a.durationS, width: a.width, height: a.height, error: a.error,
       createdAt: a.createdAt, updatedAt: a.updatedAt,
     };
+  }
+  /** Relay-safe projection of a Job: truncate long output, trim the run log, and
+      strip every Mac-local image path (attached inputImages AND transcript image
+      items) so the phone never learns a filesystem path. Used by BOTH the snapshot
+      and the live 'job' event / command results, so no channel can leak it. */
+  slimJobForRelay(j: Job): Job {
+    const out = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
+    const tr = j.transcript;
+    const slimItem = (t: TranscriptItem): TranscriptItem => {
+      if (t.kind === 'image') { const { imagePath: _omit, ...rest } = t; return rest; }
+      return t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t;
+    };
+    const transcript = !tr ? undefined
+      : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image')) ? tr
+      : tr.slice(-60).map(slimItem);
+    const needsImgStrip = j.inputImages?.some(im => im.imagePath !== undefined);
+    const inputImages = needsImgStrip ? j.inputImages!.map(({ imagePath: _omit, ...rest }) => rest as ChatImage) : j.inputImages;
+    if (out === j.output && transcript === tr && inputImages === j.inputImages) return j;
+    return { ...j, output: out, transcript, ...(inputImages !== j.inputImages ? { inputImages } : {}) };
   }
   createAsset(args: Partial<Asset> & { source: Asset['source']; kind: AssetKind; status: AssetStatus }): Asset {
     const t = now();
@@ -897,22 +924,7 @@ export class Store {
   /** Full snapshot pushed to the relay so phone/web remotes can mirror this Mac.
       Slimmed: queue/file paths and thumbs never leave the Mac; long outputs truncate. */
   snapshot(providers: unknown): Record<string, unknown> {
-    const slimJob = (j: Job): Job => {
-      const out = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
-      // Remotes get a trimmed run log: last 60 items, long text blocks truncated.
-      // Skip the allocation entirely when nothing actually needs trimming.
-      const tr = j.transcript;
-      // Image items carry a Mac-local path the phone can't read — strip it so it
-      // never leaves this Mac (the bytes are only served on-device via IPC).
-      const slimItem = (t: TranscriptItem): TranscriptItem => {
-        if (t.kind === 'image') { const { imagePath: _omit, ...rest } = t; return rest; }
-        return t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t;
-      };
-      const transcript = !tr ? undefined
-        : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image')) ? tr
-        : tr.slice(-60).map(slimItem);
-      return out === j.output && transcript === tr ? j : { ...j, output: out, transcript };
-    };
+    const slimJob = (j: Job): Job => this.slimJobForRelay(j);
     const slimAsset = (a: Asset) => this.slimAssetForRelay(a);
     const dashboard = this.dashboard();
     return {

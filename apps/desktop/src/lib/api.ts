@@ -61,6 +61,11 @@ export interface TranscriptItem {
   height?: number;
   ts: number;
 }
+/** An image attached to a user message (pasted/dropped/picked) — vision input.
+    imagePath is Mac-local (stripped from the relay snapshot); the bytes are
+    resolved on the desktop via api.assetImage(assetId). */
+export interface ChatImage { assetId: string; imagePath?: string; mime: string; name?: string; width?: number; height?: number }
+
 export interface Job {
   id: string;
   projectId: string;
@@ -70,6 +75,7 @@ export interface Job {
   progress: number;
   sessionId?: string;
   transcript?: TranscriptItem[];
+  inputImages?: ChatImage[];
   input: string;
   output: string | null;
   error: string | null;
@@ -526,7 +532,7 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; images?: { name?: string; mime: string; dataB64: string }[] }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   renameSession: (id: string, title: string) =>

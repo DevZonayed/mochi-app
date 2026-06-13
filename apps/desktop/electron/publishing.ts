@@ -56,6 +56,24 @@ export class PublishingEngine {
     return asset;
   }
 
+  /** Register raw bytes (a pasted/dropped image) as an Asset — writes them under
+      ~/Maestro/<project>/attachments/ then reuses importAsset (thumbnail + sha +
+      content dedup). Used for vision input attached to a chat message. */
+  importAssetBytes(buf: Buffer, name: string, projectId: string | null): Asset {
+    const sha = createHash('sha256').update(buf).digest('hex');
+    const dup = this.store.listAssets().find(a => a.sha256 === sha && a.projectId === projectId);
+    if (dup) return dup;
+    const projName = (projectId ? this.store.getProject(projectId)?.name : '') || 'default';
+    const safeProj = projName.replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
+    const dir = path.join(homedir(), 'Maestro', safeProj, 'attachments');
+    mkdirSync(dir, { recursive: true });
+    const ext = (path.extname(name).slice(1) || 'png').toLowerCase().replace('jpeg', 'jpg');
+    const base = safeName(path.basename(name, path.extname(name))) || 'pasted';
+    const file = path.join(dir, `${base}-${sha.slice(0, 8)}.${ext}`);
+    writeFileSync(file, buf);
+    return this.importAsset(file, projectId);
+  }
+
   /** Create a draft from an approved/done asset. */
   createDraft(args: { assetId: string; caption?: string; platforms?: string[] }): PublishDraft {
     const asset = this.store.getAsset(args.assetId);
