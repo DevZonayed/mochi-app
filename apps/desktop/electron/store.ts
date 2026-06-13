@@ -82,7 +82,12 @@ export interface Approval {
   id: string; projectId: string | null; kind: ApprovalKind; title: string; subtitle: string; detail: string;
   status: ApprovalStatus; jobId?: string | null; createdAt: number; resolvedAt: number | null;
 }
-export interface Schedule { id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean; nextRun: number | null; lastRun?: number | null; createdAt: number }
+export interface Schedule {
+  id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean;
+  nextRun: number | null; lastRun?: number | null; createdAt: number;
+  /** One-shot "wait & check": fire once at this absolute time, into a chat. */
+  fireAt?: number; sessionId?: string; prompt?: string;
+}
 
 export type EngineId = 'claude' | 'codex';
 /** A model-level role choice: which engine + (optional) model id runs the role.
@@ -549,10 +554,16 @@ export class Store {
 
   // ── Schedules ───────────────────────────────────────────────────────
   listSchedules(): Schedule[] { return [...this.data.schedules].sort((a, b) => a.time.localeCompare(b.time)); }
-  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string }): Schedule {
+  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string }): Schedule {
+    const at = s.fireAt ? new Date(s.fireAt) : null;
+    const time = s.time ?? (at ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}` : '');
     const rec: Schedule = {
-      id: id(), projectId: s.projectId ?? null, title: s.title, time: s.time ?? '', cadence: s.cadence ?? 'daily',
-      enabled: true, nextRun: null, createdAt: now(),
+      id: id(), projectId: s.projectId ?? null, title: s.title, time,
+      cadence: s.fireAt ? 'once' : (s.cadence ?? 'daily'),
+      enabled: true, nextRun: s.fireAt ?? null, createdAt: now(),
+      ...(s.fireAt ? { fireAt: s.fireAt } : {}),
+      ...(s.sessionId ? { sessionId: s.sessionId } : {}),
+      ...(s.prompt ? { prompt: s.prompt } : {}),
     };
     this.data.schedules.push(rec); this.save();
     return rec;

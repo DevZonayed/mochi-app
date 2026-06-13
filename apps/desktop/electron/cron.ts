@@ -61,7 +61,7 @@ export class CronRunner {
     // Initialise nextRun for display, forward-only from now.
     const now = Date.now();
     for (const s of this.store.listSchedules()) {
-      this.store.setScheduleNextRun(s.id, s.enabled ? nextOccurrence(s, now) : null);
+      this.store.setScheduleNextRun(s.id, s.enabled ? (s.fireAt ?? nextOccurrence(s, now)) : null);
     }
     this.timer = setInterval(() => this.tick(), TICK_MS);
   }
@@ -77,6 +77,15 @@ export class CronRunner {
     try { this.firePublish?.(now); } catch { /* non-fatal */ }
     for (const s of this.store.listSchedules()) {
       if (!s.enabled) { this.store.setScheduleNextRun(s.id, null); continue; }
+      // One-shot "wait & check": fire once at fireAt, then disable.
+      if (s.fireAt) {
+        if (s.fireAt > now) { this.store.setScheduleNextRun(s.id, s.fireAt); continue; }
+        if (s.lastRun) { this.store.setScheduleEnabled(s.id, false); continue; }
+        this.store.markScheduleRun(s.id, now, null);
+        this.store.setScheduleEnabled(s.id, false);
+        this.fire(s);
+        continue;
+      }
       let next = s.nextRun ?? nextOccurrence(s, now);
       if (next == null) continue;
       if (next > now) { this.store.setScheduleNextRun(s.id, next); continue; }
@@ -91,9 +100,15 @@ export class CronRunner {
   private fire(s: Schedule): void {
     const project = (s.projectId ? this.store.getProject(s.projectId) : undefined) ?? this.store.listProjects()[0];
     if (!project) return;
-    const job = this.store.createJob(project.id, s.title, `Scheduled: ${s.title}`, 'balanced');
+    // A wait-&-check fires its prompt into the originating chat, on that chat's model.
+    const session = s.sessionId ? this.store.getSession(s.sessionId) : undefined;
+    const input = s.prompt && s.prompt.trim() ? s.prompt : s.title;
+    const job = this.store.createJob(project.id, input, `Scheduled: ${s.title}`, 'balanced', session?.id);
     this.emit('job', job);
+    const opts = session?.primary
+      ? { engine: session.primary.engine, model: session.primary.model, reviewer: session.reviewer }
+      : {};
     // Fire-and-forget: the engine updates + emits job state as it progresses.
-    void this.engine.run(job.id).catch(() => { /* engine already recorded the failure on the job */ });
+    void this.engine.run(job.id, opts).catch(() => { /* engine already recorded the failure on the job */ });
   }
 }

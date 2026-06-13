@@ -99,6 +99,7 @@ export type IconName =
   | 'brush'
   | 'play'
   | 'telescope'
+  | 'target'
   | 'checkCircle'
   | 'xCircle'
   | 'more'
@@ -163,6 +164,7 @@ export function Icon({ name, size = 18, stroke = 1.75, style }: IconProps) {
     brush: <><path d="M9.5 14.5 4 20"/><path d="M14 4 20 10l-7.5 7.5a3.5 3.5 0 0 1-5-5L14 4Z"/><path d="m13 5 6 6"/></>,
     play: <polygon points="6 4 20 12 6 20 6 4"/>,
     telescope: <><path d="m3 14 7-2 2 5-7 2-2-5Z"/><path d="m10 12 8.5-2.4a1 1 0 0 0 .7-1.2l-.5-2a1 1 0 0 0-1.2-.7L9 8"/><path d="M9 17v4M7 21h4"/></>,
+    target: <><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4"/></>,
     checkCircle: <><circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-5"/></>,
     xCircle: <><circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/></>,
     more: <><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></>,

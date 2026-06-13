@@ -197,7 +197,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const job = store.createJob(projectId, text, text.slice(0, 60), p.effort as Effort | undefined, session.id);
         emit('job', job);
         // Fire the run async — the reply streams in over job events.
-        void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true });
+        void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true });
         return { session, job };
       }
 
@@ -241,6 +241,19 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'toggleSchedule': { store.setScheduleEnabled(String(p.id ?? ''), Boolean(p.enabled)); return { ok: true }; }
       case 'deleteSchedule': { store.deleteSchedule(String(p.id ?? '')); return { ok: true }; }
+      // Wait-&-check: schedule a one-shot follow-up that pokes a chat after delayMs.
+      case 'scheduleCheck': {
+        const delayMs = Number(p.delayMs);
+        if (!Number.isFinite(delayMs) || delayMs < 30_000) bad('delayMs must be at least 30000');
+        const prompt = typeof p.prompt === 'string' && p.prompt.trim() ? p.prompt.trim().slice(0, 4000) : 'Check on the task and continue where you left off.';
+        const sched = store.createSchedule({
+          projectId: p.projectId ? String(p.projectId) : null,
+          sessionId: p.sessionId ? String(p.sessionId) : undefined,
+          title: prompt.slice(0, 50), prompt, fireAt: Date.now() + delayMs,
+        });
+        emit('schedule', sched);
+        return sched;
+      }
 
       // ── Skills / Templates ─────────────────────────────────────
       case 'listSkills': return store.listSkills();

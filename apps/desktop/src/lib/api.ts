@@ -94,6 +94,9 @@ export interface Schedule {
   enabled: boolean;
   nextRun: number | null;
   createdAt: number;
+  fireAt?: number;
+  sessionId?: string;
+  prompt?: string;
 }
 export interface Skill {
   id: string;
@@ -475,7 +478,7 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   renameSession: (id: string, title: string) =>
@@ -519,6 +522,10 @@ export const api = {
   createSchedule: (input: { title: string; projectId?: string; time?: string; cadence?: string }) =>
     call<Schedule>('createSchedule', { ...input }, () =>
       req<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(input) })),
+  // Wait-&-check: poke a chat with a one-shot follow-up after delayMs.
+  scheduleCheck: (input: { projectId?: string | null; sessionId?: string; prompt?: string; delayMs: number }) =>
+    call<Schedule>('scheduleCheck', { ...input }, () =>
+      req<Schedule>('/api/schedules/check', { method: 'POST', body: JSON.stringify(input) })),
   toggleSchedule: (id: string, enabled: boolean) =>
     call<{ ok: boolean }>('toggleSchedule', { id, enabled }, () =>
       req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) })),

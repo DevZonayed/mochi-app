@@ -23,6 +23,13 @@ const require = createRequire(__filename);
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
 // coding agent needs real headroom — 4 turns dies mid-`ls`.
 const EFFORT_TURNS: Record<string, number> = { fast: 8, balanced: 24, deep: 48, max: 96 };
+// Goal mode: pursue the goal autonomously over a long horizon — far more turns.
+const GOAL_MAX_TURNS = 240;
+const GOAL_DIRECTIVE =
+  `\n\n---\n\n[Goal mode] Pursue the request above as a goal: work autonomously to ` +
+  `completion. Don't stop to ask for confirmation on routine steps; plan, implement, ` +
+  `test, and self-correct in a loop until the goal is fully met or you are genuinely ` +
+  `blocked. If blocked, state precisely what's needed.`;
 /* Streaming cadences: local windows get a frame every ≤50ms (perceptually
    realtime); disk + relay get a checkpoint every ~1s. */
 const STREAM_THROTTLE_MS = 50;
@@ -490,7 +497,7 @@ export class LocalEngine {
   }
 
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
-  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; plan?: boolean } = {}): Promise<Job> {
+  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; plan?: boolean; goal?: boolean } = {}): Promise<Job> {
     const job = this.store.getJob(jobId);
     if (!job) throw Object.assign(new Error('job not found'), { statusCode: 404 });
     const project = this.store.getProject(job.projectId);
@@ -566,7 +573,9 @@ export class LocalEngine {
     const settleStream = () => { settled = true; if (trailer) { clearTimeout(trailer); trailer = null; } };
 
     try {
-      const effort = opts.effort ?? cur.effort;
+      const goalMode = opts.goal === true && !opts.plan; // goal + plan are mutually exclusive
+      let effort = opts.effort ?? cur.effort;
+      if (goalMode && (effort === 'fast' || effort === 'balanced')) effort = 'deep'; // goal mode wants depth
       const cwd = workDirFor(project);
       const anthropicKey = this.status(master).method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined;
 
@@ -587,6 +596,7 @@ export class LocalEngine {
       } else {
         prompt = `${base}${cur.input}`;
       }
+      if (goalMode) prompt += GOAL_DIRECTIVE;
 
       const hooks: RunHooks = {
         signal: ac.signal,
@@ -595,7 +605,7 @@ export class LocalEngine {
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
       const main = master === 'claude'
-        ? await runClaude(prompt, cwd, effort, anthropicKey, undefined, hooks, resumeId, masterModel, opts.plan)
+        ? await runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan)
         : await runCodex(prompt, cwd, hooks, false, masterModel);
       settleStream(); // stream is over — no trailing frame may race the final states below
 
