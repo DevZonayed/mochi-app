@@ -239,6 +239,10 @@ export interface AppSettings {
       inherit cookies/logins/passwords from. Empty/undefined = isolated per-project
       profiles (Maestro-managed). */
   chromeProfile?: string;
+  /** How a chosen Chrome profile is used: 'copy' (default) warm-starts Maestro's
+      own browser from a one-time copy of the profile's logins; 'live' drives the
+      real Chrome profile (requires the user's Chrome to be quit). */
+  chromeProfileMode?: 'copy' | 'live';
 }
 export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [] };
 

@@ -262,6 +262,10 @@ function EnginesPane() {
     setAppSettings(s => (s ? { ...s, chromeProfile: dir } : s));
     void api.setSettings({ chromeProfile: dir }).then(setAppSettings).catch(() => {});
   };
+  const setChromeProfileMode = (mode: 'copy' | 'live') => {
+    setAppSettings(s => (s ? { ...s, chromeProfileMode: mode } : s));
+    void api.setSettings({ chromeProfileMode: mode }).then(setAppSettings).catch(() => {});
+  };
 
   const refetch = React.useCallback(() => {
     Promise.all([api.getRouting(), api.engineStatus(), api.getRoles()])
@@ -352,11 +356,11 @@ function EnginesPane() {
               : <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</span>}
           </Row>
           {chromeProfiles.length > 0 && (
-            <Row last>
+            <Row last={!appSettings?.chromeProfile}>
               <span style={{ flex: 1, minWidth: 0 }}>
                 <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Chrome profile</span>
                 <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
-                  {appSettings?.chromeProfile ? 'Inherits this profile’s logins, history & saved passwords. Quit Chrome first to use it.' : 'Isolated: a fresh profile per project (no sign-ins carried over).'}
+                  {appSettings?.chromeProfile ? 'Maestro inherits this profile’s logins & history — never touching your real Chrome.' : 'Isolated: a fresh browser per project (no sign-ins carried over).'}
                 </span>
               </span>
               <select value={appSettings?.chromeProfile || ''} onChange={e => setChromeProfile(e.target.value)}
@@ -364,6 +368,19 @@ function EnginesPane() {
                 <option value="">Isolated (per project)</option>
                 {chromeProfiles.map(p => <option key={p.dir} value={p.dir}>{p.name}</option>)}
               </select>
+            </Row>
+          )}
+          {chromeProfiles.length > 0 && appSettings?.chromeProfile && (
+            <Row last>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>How to use it</span>
+                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
+                  {(appSettings?.chromeProfileMode ?? 'copy') === 'live'
+                    ? 'Live: drives your real Chrome profile (always in sync) — quit Chrome before running.'
+                    : 'Copy: Maestro’s own browser, warm-started from a one-time copy of this profile. Your Chrome stays untouched.'}
+                </span>
+              </span>
+              <Seg options={['Copy', 'Live']} value={(appSettings?.chromeProfileMode ?? 'copy') === 'live' ? 'Live' : 'Copy'} onChange={v => setChromeProfileMode(v === 'Live' ? 'live' : 'copy')} />
             </Row>
           )}
         </GroupedList>

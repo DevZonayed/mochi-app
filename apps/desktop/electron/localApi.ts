@@ -55,6 +55,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           const v = p.chromeProfile.slice(0, 64);
           if (v === '' || listChromeProfiles().some(c => c.dir === v)) patch.chromeProfile = v;
         }
+        if (p.chromeProfileMode === 'copy' || p.chromeProfileMode === 'live') patch.chromeProfileMode = p.chromeProfileMode;
         if (Object.keys(patch).length === 0) bad('no valid settings fields');
         const next = store.setSettings(patch);
         emit('settings', next);

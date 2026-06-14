@@ -213,6 +213,8 @@ export interface AppSettings {
   favoriteModels?: string[];
   /** Chrome profile dir the browser inherits cookies/logins from ('' = isolated). */
   chromeProfile?: string;
+  /** 'copy' = warm-start the app's own browser from the profile; 'live' = drive the real Chrome profile. */
+  chromeProfileMode?: 'copy' | 'live';
 }
 export interface ChromeProfile { dir: string; name: string }
 export interface CostsData {

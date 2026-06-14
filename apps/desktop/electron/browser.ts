@@ -14,12 +14,31 @@
    step in for a CAPTCHA / login (the whole point of a real, trusted browser). */
 
 import { app } from 'electron';
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, cpSync } from 'node:fs';
 import path from 'node:path';
 import type { BrowserContext, Page, ConsoleMessage } from 'playwright-core';
 import type { Store } from './store.js';
 import type { PublishingEngine } from './publishing.js';
 import { chromeUserDataDir } from './chrome-profiles.js';
+
+/** Warm-start Maestro's OWN browser profile from a real Chrome profile: a ONE-TIME
+    copy of the session/login files so the app's browser starts signed in — without
+    ever opening, locking, or modifying the user's real Chrome. Cookies/passwords
+    decrypt because we drive the same Chrome binary as the same macOS user (the
+    "Chrome Safe Storage" keychain key is shared, not bound to the profile path).
+    Best-effort: any locked/unreadable file is skipped. */
+function seedFromChromeProfile(destUserDataDir: string, profileDir: string): void {
+  const srcProfile = path.join(chromeUserDataDir(), profileDir);
+  if (!existsSync(srcProfile)) return;
+  const destDefault = path.join(destUserDataDir, 'Default');
+  mkdirSync(destDefault, { recursive: true });
+  // Session/login/history-bearing files (skip the heavy caches + GB-scale extras).
+  for (const item of ['Cookies', 'Network', 'Login Data', 'Login Data For Account', 'Web Data', 'Local Storage', 'Session Storage', 'IndexedDB', 'Preferences', 'History', 'Bookmarks']) {
+    const s = path.join(srcProfile, item);
+    if (!existsSync(s)) continue;
+    try { cpSync(s, path.join(destDefault, item), { recursive: true, force: true, errorOnExist: false }); } catch { /* locked / unreadable — skip */ }
+  }
+}
 
 /* ── Public result shapes (what the tools return to the model) ─────────── */
 export interface BrowserState { open: boolean; url: string; title: string; tabs: number; activeTab: number }
@@ -65,8 +84,10 @@ interface Session {
   lastTitle: string;
 }
 
-/** How a project's browser should be launched, resolved from Settings. */
-interface ProfilePlan { key: string; userDataDir: string; extraArgs: string[]; managed: boolean }
+/** How a project's browser should be launched, resolved from Settings.
+    managed = Maestro-owned dir (its OWN browser); seedFrom = copy a profile's
+    logins into it on first run; profileDir = drive the REAL Chrome profile live. */
+interface ProfilePlan { key: string; userDataDir: string; managed: boolean; seedFrom?: string; profileDir?: string }
 
 /** What a screenshot needs from publishing — registers bytes as a displayable Asset. */
 type ShotSink = Pick<PublishingEngine, 'importAssetBytes'>;
@@ -93,21 +114,27 @@ export class BrowserController {
     return (projectId && String(projectId)) || '__noproject__';
   }
 
-  /** Decide which Chrome profile a project's browser uses. Default: an isolated,
-      Maestro-owned profile PER PROJECT (cookies shared across that project's
-      chats). If the operator picked a real Chrome profile in Settings, use the
-      REAL Chrome user-data-dir + --profile-directory so the browser inherits that
-      profile's cookies / history / saved passwords / bot-trust — which means ONE
-      shared session (a real Chrome profile can't be opened twice). */
+  /** Decide which Chrome profile a project's browser uses, from Settings:
+      - No profile → an isolated, Maestro-owned profile PER PROJECT (the default;
+        the app's own fresh browser, cookies shared across that project's chats).
+      - Profile + 'copy' (default for a chosen profile) → still the app's OWN
+        browser, but warm-started from a one-time COPY of that profile's logins.
+        Never opens, locks, or modifies the user's real Chrome.
+      - Profile + 'live' → drive the REAL Chrome profile (live sessions/passwords);
+        requires the user's Chrome to be quit (a profile can't open twice). */
   private resolveProfile(projectId: string | null | undefined): ProfilePlan {
-    const profile = this.store.getSettings().chromeProfile;
-    if (profile && profile.trim()) {
-      const safeProfile = profile.replace(/[^a-zA-Z0-9 _-]/g, '');
-      return { key: `real:${safeProfile}`, userDataDir: chromeUserDataDir(), extraArgs: [`--profile-directory=${safeProfile}`], managed: false };
+    const settings = this.store.getSettings();
+    const profile = settings.chromeProfile ? settings.chromeProfile.replace(/[^a-zA-Z0-9 _-]/g, '').trim() : '';
+    if (profile) {
+      if (settings.chromeProfileMode === 'live') {
+        return { key: `live:${profile}`, userDataDir: chromeUserDataDir(), managed: false, profileDir: profile };
+      }
+      const dirSafe = profile.replace(/[^a-zA-Z0-9_-]/g, '') || 'profile';
+      return { key: `profile:${profile}`, userDataDir: path.join(app.getPath('userData'), 'browser-profiles', `seeded-${dirSafe}`), managed: true, seedFrom: profile };
     }
     const k = this.key(projectId);
     const safe = k.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
-    return { key: k, userDataDir: path.join(app.getPath('userData'), 'browser-profiles', safe), extraArgs: [], managed: true };
+    return { key: k, userDataDir: path.join(app.getPath('userData'), 'browser-profiles', safe), managed: true };
   }
 
   /** Lazily launch (or reuse) the persistent Chrome for a project. Concurrent
@@ -137,6 +164,12 @@ export class BrowserController {
     if (!this.chromePath) throw Object.assign(new Error('Google Chrome not found — install it from google.com/chrome'), { statusCode: 503 });
 
     mkdirSync(userDataDir, { recursive: true });
+    // First run with a chosen profile in 'copy' mode → warm-start from a one-time
+    // copy of that profile's logins (only if our dir hasn't been seeded already).
+    if (plan.seedFrom) {
+      const alreadySeeded = existsSync(path.join(userDataDir, 'Default', 'Cookies')) || existsSync(path.join(userDataDir, 'Default', 'Network', 'Cookies'));
+      if (!alreadySeeded) seedFromChromeProfile(userDataDir, plan.seedFrom);
+    }
 
     const { chromium } = await import('playwright-core');
     const opts = {
@@ -144,12 +177,18 @@ export class BrowserController {
       headless: false,                                   // visible — the operator can watch / solve CAPTCHAs
       viewport: { width: 1280, height: 800 },
       acceptDownloads: true,
+      // Let Chrome use its own sandbox (don't pass --no-sandbox) so there's no
+      // "unsupported command-line flag" banner, and drop the "controlled by
+      // automated software" infobar — the browser should feel native to the user.
+      chromiumSandbox: true,
+      ignoreDefaultArgs: ['--enable-automation'],
       // This Playwright runs IN the Electron main process — let Electron own the
       // app's signals (otherwise Playwright force-exits on SIGINT/TERM, skipping
       // our before-quit cleanup). The unconditional process.on('exit') killer
       // still SIGKILLs Chrome on real exit, so orphan protection is unchanged.
       handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false,
-      args: ['--no-first-run', '--no-default-browser-check', '--disable-features=Translate,MediaRouter', ...plan.extraArgs],
+      args: ['--no-first-run', '--no-default-browser-check', '--disable-features=Translate,MediaRouter',
+        ...(plan.profileDir ? [`--profile-directory=${plan.profileDir}`] : [])],
     };
     let ctx: BrowserContext;
     try {
@@ -168,7 +207,7 @@ export class BrowserController {
         try { ctx = await chromium.launchPersistentContext(userDataDir, opts); }
         catch (e2) { throw Object.assign(new Error(`Couldn't start the browser: ${e2 instanceof Error ? e2.message : String(e2)}`), { statusCode: 500 }); }
       } else if (singleton) {
-        throw Object.assign(new Error('Google Chrome is currently open on this profile — quit Chrome and retry, or pick "Isolated" in Settings → Browser.'), { statusCode: 409 });
+        throw Object.assign(new Error('Google Chrome is open on this profile — Live mode needs it closed. Quit Chrome and retry, or switch this profile to “Copy” in Settings → Browser (uses Maestro’s own browser, no need to quit Chrome).'), { statusCode: 409 });
       } else {
         throw Object.assign(new Error(`Couldn't start the browser: ${msg}`), { statusCode: 500 });
       }
