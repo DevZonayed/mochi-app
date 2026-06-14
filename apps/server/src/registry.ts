@@ -14,6 +14,7 @@ import type { FastifyInstance } from 'fastify';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { pipeline, env, type FeatureExtractionPipeline } from '@xenova/transformers';
 
 export interface RegistrySkill {
   id: string; owner: string; repo: string; skill: string; rank: number;
@@ -70,20 +71,86 @@ const summary = (s: RegistrySkill) => ({
   installCmd: s.installCmd, rank: s.rank,
 });
 
+/* ── Semantic search (embeddings) ──────────────────────────────────────────
+   Precomputed int8 vectors (scripts/embed-skills.mjs) + a tiny local model
+   (all-MiniLM-L6-v2) embed the QUERY at request time → cosine top-K. Only the
+   top few results are returned, so it scales to thousands of skills with a tiny
+   context footprint. The relay is plain Node, so the model loads cleanly here
+   (it does NOT in Electron's main process). Falls back to keyword search until
+   the model is warm or if anything fails. */
+const MODEL = 'Xenova/all-MiniLM-L6-v2';
+interface Vectors { dim: number; scale: number; ids: string[]; mat: Int8Array }
+
+function loadVectors(): Vectors | null {
+  const candidates = [
+    join(__dirname, '..', 'registry', 'skills-vectors.json'),
+    join(__dirname, '..', '..', 'registry', 'skills-vectors.json'),
+    join(process.cwd(), 'registry', 'skills-vectors.json'),
+  ];
+  for (const p of candidates) {
+    if (!existsSync(p)) continue;
+    try {
+      const j = JSON.parse(readFileSync(p, 'utf8')) as { dim: number; scale: number; ids: string[]; data: string };
+      return { dim: j.dim, scale: j.scale || 127, ids: j.ids, mat: new Int8Array(Buffer.from(j.data, 'base64').buffer) };
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+let extractorP: Promise<FeatureExtractionPipeline> | null = null;
+function ensureExtractor(): Promise<FeatureExtractionPipeline> {
+  if (!extractorP) {
+    env.allowLocalModels = false;
+    extractorP = pipeline('feature-extraction', MODEL, { quantized: true })
+      .catch((e: unknown) => { extractorP = null; throw e; }) as Promise<FeatureExtractionPipeline>;
+  }
+  return extractorP;
+}
+async function embedQuery(q: string): Promise<Float32Array> {
+  const ex = await ensureExtractor();
+  const o = await ex(q, { pooling: 'mean', normalize: true });
+  return o.data as Float32Array;
+}
+function semanticTopK(v: Vectors, qVec: Float32Array, byId: Map<string, RegistrySkill>, limit: number): RegistrySkill[] {
+  const { dim, scale, ids, mat } = v;
+  const scored: { id: string; score: number }[] = new Array(ids.length);
+  for (let i = 0; i < ids.length; i++) {
+    let dot = 0; const base = i * dim;
+    for (let d = 0; d < dim; d++) dot += qVec[d] * mat[base + d];
+    scored[i] = { id: ids[i], score: dot / scale };
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const out: RegistrySkill[] = [];
+  for (const x of scored) { const s = byId.get(x.id); if (s) out.push(s); if (out.length >= limit) break; }
+  return out;
+}
+const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T | null> =>
+  Promise.race([p, new Promise<null>(r => setTimeout(() => r(null), ms))]);
+
 export function registerRegistry(app: FastifyInstance): void {
   const manifest = loadManifest();
   const byId = new Map(manifest.skills.map(s => [s.id, s]));
   const contentCache = new Map<string, { name: string; skillMd: string }>();
+  const vectors = loadVectors();
+  if (vectors) ensureExtractor().catch(() => { /* pre-warm; falls back to keyword until ready */ });
 
   app.get('/registry/meta', async () => ({
     count: manifest.count, generatedAt: manifest.generatedAt, source: manifest.source, note: manifest.note,
+    semantic: !!vectors,
   }));
 
-  // Search / list — the discovery surface the agent + UI hit.
+  // Search / list — the discovery surface the agent + UI hit. Semantic (embedding)
+  // ranking when a query + vectors are available; keyword otherwise / until warm.
   app.get('/registry/skills', async (req) => {
     const { q = '', limit } = (req.query ?? {}) as { q?: string; limit?: string };
     const n = Math.min(Math.max(Number(limit) || 30, 1), 100);
-    return { count: manifest.count, results: search(manifest.skills, q, n).map(summary) };
+    if (q && vectors) {
+      try {
+        const qVec = await withTimeout(embedQuery(q), 8000);
+        if (qVec) return { count: manifest.count, mode: 'semantic', results: semanticTopK(vectors, qVec, byId, n).map(summary) };
+      } catch { /* fall through to keyword */ }
+    }
+    return { count: manifest.count, mode: 'keyword', results: search(manifest.skills, q, n).map(summary) };
   });
 
   // Full record for one skill.

@@ -142,7 +142,7 @@ async function pool(items, n, worker) {
   console.log(`  ${candidates.length} candidates (popularity-ordered).`);
 
   const kept = [];
-  let scanned = 0, noContent = 0, insecure = 0, noAudit = 0;
+  let scanned = 0, noContent = 0, insecure = 0, unrated = 0;
   const stamp = new Date().toISOString();
 
   await pool(candidates, CONCURRENCY, async (c) => {
@@ -150,9 +150,13 @@ async function pool(items, n, worker) {
     scanned++;
     const [content, security] = await Promise.all([resolveContent(c), fetchSecurity(c)]);
     if (!content) { noContent++; return; }
-    if (security == null) { noAudit++; return; }      // require an audit verdict
-    if (!security.secure) { insecure++; return; }
+    // Drop ONLY explicitly-unsafe skills (a `fail` verdict or HIGH/CRITICAL risk).
+    // Skills with no audit verdict are kept but flagged UNRATED so the agent/operator
+    // can weigh them — keeping the catalog broad (thousands) while still safe.
+    if (security && security.secure === false) { insecure++; return; }
     if (kept.length >= TARGET) return;
+    const sec = (security && security.secure) ? { risk: security.risk, providers: security.providers } : { risk: 'UNRATED', providers: [] };
+    if (!sec.providers.length) unrated++;
 
     const { fm, body } = parseFrontmatter(content.md);
     const name = fm.name || c.skill;
@@ -164,7 +168,7 @@ async function pool(items, n, worker) {
       name, description,
       license: fm.license || '',
       tags: (fm.tags || fm.category || '').split(/[,\s]+/).filter(Boolean).slice(0, 8),
-      security: { risk: security.risk, providers: security.providers },
+      security: sec,
       source: `https://github.com/${c.owner}/${c.repo}`,
       directory: `https://www.skills.sh/${c.id}`,
       installCmd: `npx skills add https://github.com/${c.owner}/${c.repo} --skill ${c.skill}`,
@@ -180,14 +184,14 @@ async function pool(items, n, worker) {
   const manifest = {
     generatedAt: stamp,
     source: 'skills.sh (sitemap, popularity-ordered) + GitHub raw + skills.sh public audit API',
-    note: 'Curated reference index: secure (audit-passing, no HIGH/CRITICAL) and widely-used (top of the install-ordered sitemap). Content is fetched from each author\'s GitHub repo on install; this index stores only metadata + links.',
-    filter: { secureOnly: true, popularityProxy: 'sitemap install-rank', scanned: SCAN, target: TARGET },
+    note: 'Reference index ordered by install popularity (top of the install-ordered sitemap). Explicitly-unsafe skills (fail / HIGH / CRITICAL) are dropped; unaudited skills are kept and flagged security.risk="UNRATED". Content is fetched from each author\'s GitHub repo on install; this index stores only metadata + links.',
+    filter: { dropExplicitlyUnsafe: true, keepUnratedFlagged: true, popularityProxy: 'sitemap install-rank', scanned: SCAN, target: TARGET },
     count: kept.length,
     skills: kept,
   };
   writeFileSync(OUT_FILE, JSON.stringify(manifest, null, 2));
-  console.log(`\nKept ${kept.length} secure+popular skills -> ${OUT_FILE}`);
-  console.log(`  scanned ${scanned} · skipped: ${noContent} no-SKILL.md, ${insecure} insecure, ${noAudit} no-audit`);
+  console.log(`\nKept ${kept.length} skills (${kept.length - unrated} audited, ${unrated} unrated) -> ${OUT_FILE}`);
+  console.log(`  scanned ${scanned} · skipped: ${noContent} no-SKILL.md, ${insecure} explicitly-unsafe`);
   console.log(`  sample:`);
   for (const s of kept.slice(0, 8)) console.log(`   #${s.rank} ${s.id}  [${s.security.risk}]  — ${s.name}`);
 })();
