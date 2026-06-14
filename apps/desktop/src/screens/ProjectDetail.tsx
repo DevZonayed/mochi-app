@@ -24,7 +24,7 @@ import {
 } from '../lib/ui';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -1407,12 +1407,25 @@ function UserImageThumb({ img }: { img: ChatImage }) {
   );
 }
 
-function UserBubble({ text, images }: { text: string; images?: ChatImage[] }) {
+function UserBubble({ text, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
   return (
     <div className="chat-msg" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
       {images && images.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: '78%' }}>
           {images.map((im, i) => <UserImageThumb key={`${im.assetId}-${i}`} img={im} />)}
+        </div>
+      )}
+      {files && files.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: '78%' }}>
+          {files.map((f, i) => (
+            <div key={i} title={f.name} style={{ display: 'flex', alignItems: 'center', gap: 8, maxWidth: 240, height: 42, padding: '0 12px 0 9px', borderRadius: 11, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-elevated)' }}>
+              <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={14} /></span>
+              <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+                <span style={{ font: '600 var(--fs-caption)/1.15 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{f.name === 'Pasted text.txt' ? 'Pasted text' : f.name}</span>
+                <span style={{ font: '400 9px/1.1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{f.kind === 'text' ? 'text' : (f.mime || 'file')} · {fmtBytes(f.bytes)}</span>
+              </span>
+            </div>
+          ))}
         </div>
       )}
       {text && (
@@ -1887,6 +1900,18 @@ function ChatMinimap({ turns, scrollRef }: { turns: Job[]; scrollRef: React.RefO
   );
 }
 
+/* A composer attachment before send: an image (vision), a text blob (pasted text
+   or a code/text file — inlined for the agent), or any other file (saved + read). */
+type Attach =
+  | { id: string; kind: 'image'; name: string; mime: string; dataUrl: string }
+  | { id: string; kind: 'text'; name: string; content: string }
+  | { id: string; kind: 'file'; name: string; mime: string; dataB64: string; size: number };
+const SUPPORTED_IMG = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+const TEXT_EXT = /\.(txt|md|markdown|mdx|rst|json|jsonc|ya?ml|toml|ini|cfg|conf|csv|tsv|log|xml|html?|svg|css|scss|sass|less|js|jsx|ts|tsx|mjs|cjs|py|rb|go|rs|java|kt|kts|c|h|cc|cpp|hpp|cs|php|swift|m|mm|sh|bash|zsh|fish|sql|graphql|gql|env|gitignore|dockerfile|makefile|gradle|properties|vue|svelte|astro|r|lua|pl|pm|dart|ex|exs|erl|clj|scala|tf|proto)$/i;
+const isTextFile = (f: File): boolean =>
+  f.type.startsWith('text/') || /json|xml|javascript|typescript|ecmascript|csv|yaml|x-sh|x-python|x-ruby|toml|markdown/.test(f.type) || TEXT_EXT.test(f.name) || (!f.type && f.size <= 512 * 1024);
+const fmtBytes = (n?: number): string => (n == null ? '' : n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
+
 export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, onOpenImage, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
@@ -1948,7 +1973,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [optsOpen, setOptsOpen] = React.useState(false); // reviewer + schedule popover
   const [schedNote, setSchedNote] = React.useState('');
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
-  const [attachments, setAttachments] = React.useState<{ id: string; name: string; mime: string; dataUrl: string }[]>([]); // pasted/dropped images
+  const [attachments, setAttachments] = React.useState<Attach[]>([]); // images / text / files
   const [dragOver, setDragOver] = React.useState(false);
   const fileRef = React.useRef<HTMLInputElement>(null);
   const attachmentsRef = React.useRef(attachments);
@@ -2012,10 +2037,15 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending');
 
   // The actual send — no guards. Used directly, by the queue drainer, and by steer.
-  const sendRaw = React.useCallback(async (raw: string, images?: { id: string; name: string; mime: string; dataUrl: string }[]): Promise<boolean> => {
+  const sendRaw = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
     const t = raw.trim();
-    const imgs = (images ?? []).map(a => ({ name: a.name, mime: a.mime, dataB64: a.dataUrl.includes(',') ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : a.dataUrl }));
-    if ((!t && !imgs.length) || !projectId) return false;
+    const list = atts ?? [];
+    const imgs = list.filter((a): a is Extract<Attach, { kind: 'image' }> => a.kind === 'image')
+      .map(a => ({ name: a.name, mime: a.mime, dataB64: a.dataUrl.includes(',') ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : a.dataUrl }));
+    const files = list.filter(a => a.kind !== 'image').map(a => a.kind === 'text'
+      ? { name: a.name, kind: 'text' as const, content: a.content }
+      : { name: a.name, kind: 'file' as const, mime: (a as Extract<Attach, { kind: 'file' }>).mime, dataB64: (a as Extract<Attach, { kind: 'file' }>).dataB64 });
+    if ((!t && !imgs.length && !files.length) || !projectId) return false;
     setSendError('');
     stickBottom.current = true;
     try {
@@ -2025,6 +2055,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
         ...(primaryKey ? { modelKey: primaryKey } : {}),
         ...(reviewerKey ? { reviewerKey } : {}),
         ...(imgs.length ? { images: imgs } : {}),
+        ...(files.length ? { files } : {}),
       });
       if (activeRef.current !== resp.session.id) {
         activeRef.current = resp.session.id; // match the streamed job immediately
@@ -2052,48 +2083,56 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   }, [projectId, streaming, sendRaw]);
 
   // STEER: interrupt the running turn and send right now (session resumes with context).
-  const sendNow = React.useCallback(async (raw: string, images?: { id: string; name: string; mime: string; dataUrl: string }[]): Promise<boolean> => {
+  const sendNow = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
     const t = raw.trim();
-    if (!t && !(images?.length)) return false;
+    if (!t && !(atts?.length)) return false;
     setText('');
     if (taRef.current) taRef.current.style.height = 'auto';
     if (lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending')) {
       try { await api.cancelJob(lastTurn.id); } catch { /* already gone */ }
     }
-    const ok = await sendRaw(t, images);
+    const ok = await sendRaw(t, atts);
     if (!ok) setText(raw);
     return ok;
   }, [lastTurn, sendRaw]);
 
-  // ── Image attachments: paste, drop, or pick (vision input) ──────────
+  // ── Attachments: paste, drop, or pick — images (vision), text/code (inlined),
+  //    or any other file (saved + read by the agent). ─────────────────────────
   const MAX_ATTACH = 8;
-  const SUPPORTED_IMG = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']; // what both engines accept
+  const newId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const pushAttach = React.useCallback((a: Attach) => { setSendError(''); setAttachments(arr => arr.length >= MAX_ATTACH ? arr : [...arr, a]); }, []);
   const addFiles = React.useCallback((files: FileList | File[] | null) => {
     if (!files) return;
-    const all = Array.from(files).filter(f => f.type.startsWith('image/'));
-    if (all.some(f => !SUPPORTED_IMG.includes(f.type))) setSendError('Only PNG, JPEG, GIF, or WebP images are supported.');
-    const sized = all.filter(f => SUPPORTED_IMG.includes(f.type));
-    if (sized.some(f => f.size > 16 * 1024 * 1024)) setSendError('Each image must be under 16 MB.');
-    const ok = sized.filter(f => f.size <= 16 * 1024 * 1024);
+    const all = Array.from(files);
     const remaining = Math.max(0, MAX_ATTACH - attachmentsRef.current.length);
-    if (ok.length > remaining) setSendError(`Up to ${MAX_ATTACH} images per message — ${ok.length - remaining} skipped.`);
-    for (const f of ok.slice(0, remaining)) {
+    if (all.length > remaining) setSendError(`Up to ${MAX_ATTACH} attachments per message — ${all.length - remaining} skipped.`);
+    for (const f of all.slice(0, remaining)) {
+      if (f.size > 30 * 1024 * 1024) { setSendError(`"${f.name || 'file'}" is too large (max 30 MB).`); continue; }
       const reader = new FileReader();
-      reader.onload = () => {
-        const dataUrl = String(reader.result || '');
-        if (!dataUrl.startsWith('data:image/')) return;
-        setSendError('');
-        setAttachments(a => a.length >= MAX_ATTACH ? a : [...a, { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, name: f.name || 'pasted.png', mime: f.type || 'image/png', dataUrl }]);
-      };
-      reader.readAsDataURL(f);
+      if (f.type.startsWith('image/') && SUPPORTED_IMG.includes(f.type)) {
+        reader.onload = () => { const dataUrl = String(reader.result || ''); if (dataUrl.startsWith('data:image/')) pushAttach({ id: newId(), kind: 'image', name: f.name || 'pasted.png', mime: f.type || 'image/png', dataUrl }); };
+        reader.readAsDataURL(f);
+      } else if (isTextFile(f)) {
+        reader.onload = () => { const content = String(reader.result || ''); if (content) pushAttach({ id: newId(), kind: 'text', name: f.name || 'pasted.txt', content }); };
+        reader.readAsText(f);
+      } else {
+        reader.onload = () => { const du = String(reader.result || ''); const b64 = du.includes(',') ? du.slice(du.indexOf(',') + 1) : ''; if (b64) pushAttach({ id: newId(), kind: 'file', name: f.name || 'file', mime: f.type || '', dataB64: b64, size: f.size }); };
+        reader.readAsDataURL(f);
+      }
     }
-  }, []);
-  const onPasteImages = React.useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = e.clipboardData?.items; if (!items) return;
+  }, [pushAttach]);
+  const onPaste = React.useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
     const imgs: File[] = [];
-    for (const it of Array.from(items)) if (it.kind === 'file' && it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) imgs.push(f); }
-    if (imgs.length) { e.preventDefault(); addFiles(imgs); }
-  }, [addFiles]);
+    if (items) for (const it of Array.from(items)) if (it.kind === 'file' && it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) imgs.push(f); }
+    if (imgs.length) { e.preventDefault(); addFiles(imgs); return; }
+    // A long paste becomes a "Pasted text" attachment instead of flooding the box.
+    const txt = e.clipboardData?.getData('text/plain') ?? '';
+    if (txt.length > 1500 || txt.split('\n').length > 28) {
+      e.preventDefault();
+      pushAttach({ id: newId(), kind: 'text', name: 'Pasted text.txt', content: txt });
+    }
+  }, [addFiles, pushAttach]);
   const removeAttachment = (id: string) => { setSendError(''); setAttachments(a => a.filter(x => x.id !== id)); };
   const canSend = !!text.trim() || attachments.length > 0;
 
@@ -2202,7 +2241,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
           <ImageOpenContext.Provider value={openImageStable}>
             {turns.map((t, i) => (
               <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
-                <UserBubble text={t.input} images={t.inputImages} />
+                <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />
                 <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
               </div>
             ))}
@@ -2255,11 +2294,22 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
             transition: 'border-color 120ms ease, box-shadow 120ms ease', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
             {attachments.length > 0 && (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 9 }}>
-                {attachments.map(a => (
+                {attachments.map(a => a.kind === 'image' ? (
                   <div key={a.id} style={{ position: 'relative', width: 58, height: 58, borderRadius: 10, overflow: 'hidden', border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0 }}>
                     <img src={a.dataUrl} alt={a.name} title={a.name} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
                     <button onClick={() => removeAttachment(a.id)} title="Remove" style={{ position: 'absolute', top: 2, right: 2, width: 18, height: 18, borderRadius: '50%', border: 'none', display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.6)', color: '#fff', cursor: 'pointer', padding: 0 }}>
                       <Icon name="x" size={11} stroke={2.8} />
+                    </button>
+                  </div>
+                ) : (
+                  <div key={a.id} title={a.name} style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: 8, maxWidth: 220, height: 40, padding: '0 30px 0 9px', borderRadius: 10, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0 }}>
+                    <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={14} /></span>
+                    <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+                      <span style={{ font: '600 var(--fs-caption)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.kind === 'text' ? (a.name === 'Pasted text.txt' ? 'Pasted text' : a.name) : a.name}</span>
+                      <span style={{ font: '400 9px/1.1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{a.kind === 'text' ? `${a.content.split('\n').length} lines · ${fmtBytes(a.content.length)}` : fmtBytes(a.size)}</span>
+                    </span>
+                    <button onClick={() => removeAttachment(a.id)} title="Remove" style={{ position: 'absolute', top: 11, right: 8, width: 18, height: 18, borderRadius: '50%', border: 'none', display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', cursor: 'pointer', padding: 0 }}>
+                      <Icon name="x" size={10} stroke={2.8} />
                     </button>
                   </div>
                 ))}
@@ -2267,7 +2317,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
             )}
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
               <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
-                onPaste={onPasteImages}
+                onPaste={onPaste}
                 onKeyDown={e => {
                   if (slashOpen) {
                     if (e.key === 'ArrowDown') { e.preventDefault(); setSlashSel((slashIdx + 1) % slashList.length); return; }
@@ -2307,13 +2357,13 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               )}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, rowGap: 6, marginTop: 6 }}>
-              {/* attach an image (also: paste or drag-drop onto the composer) */}
-              <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple style={{ display: 'none' }}
+              {/* attach a file — image, text/code, or any file (also: paste or drag-drop) */}
+              <input ref={fileRef} type="file" multiple style={{ display: 'none' }}
                 onChange={e => { addFiles(e.target.files); if (e.target) e.target.value = ''; }} />
-              <button onClick={() => fileRef.current?.click()} disabled={!projectId} title="Attach an image (or paste / drag-drop)" className="tb-icon" style={{
+              <button onClick={() => fileRef.current?.click()} disabled={!projectId} title="Attach a file — image, text, or any file (or paste / drag-drop)" className="tb-icon" style={{
                 width: 30, height: 30, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
                 background: 'transparent', color: 'var(--ink-secondary)', opacity: projectId ? 1 : 0.4, cursor: projectId ? 'pointer' : 'default' }}>
-                <Icon name="image" size={16} />
+                <Icon name="paperclip" size={16} />
               </button>
               {/* core: which model · how hard · the two run modes */}
               <ModelPicker compact direction="up" value={primaryKey} onChange={setPrimaryKey} favorites={favorites} onToggleFavorite={toggleFavorite} />

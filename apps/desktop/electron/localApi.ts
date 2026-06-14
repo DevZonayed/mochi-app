@@ -2,7 +2,7 @@
    (over IPC) and remote controls (phone/web via the relay). Every command
    executes locally on this Mac against the local store + local engine. */
 
-import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage } from './store.js';
+import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile } from './store.js';
 import { resolveModelKey, buildModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
@@ -170,7 +170,8 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const projectId = String(p.projectId ?? '');
         const text = String(p.text ?? '').trim();
         const rawImages = Array.isArray(p.images) ? p.images as Array<{ dataB64?: string; mime?: string; name?: string }> : [];
-        if (!projectId || (!text && !rawImages.length)) bad('projectId and a message or image required');
+        const rawFiles = Array.isArray(p.files) ? p.files as Array<{ name?: string; mime?: string; kind?: string; content?: string; dataB64?: string }> : [];
+        if (!projectId || (!text && !rawImages.length && !rawFiles.length)) bad('projectId and a message, image, or file required');
         if (!store.getProject(projectId)) bad('project not found', 404);
         let session = p.sessionId ? store.getSession(String(p.sessionId)) : undefined;
         if (p.sessionId && !session) bad('session not found', 404);
@@ -213,7 +214,30 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           } catch { /* skip an unreadable image */ }
         }
 
-        const job = store.createJob(projectId, text, text.slice(0, 60), p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined);
+        // Ingest non-image attachments. Text (pasted text / code files) is inlined
+        // into the prompt; other files are saved on the Mac and referenced by path.
+        const inputFiles: ChatFile[] = [];
+        for (const f of rawFiles.slice(0, 12)) {
+          const name = String(f?.name ?? 'file').slice(0, 200);
+          if (f?.kind === 'text') {
+            const content = String(f?.content ?? '');
+            if (!content.trim()) continue;
+            const capped = content.slice(0, 256 * 1024); // bound the prompt
+            inputFiles.push({ name, kind: 'text', bytes: content.length, content: capped, preview: content.slice(0, 160).replace(/\s+/g, ' ').trim() });
+          } else {
+            const b64 = String(f?.dataB64 ?? '');
+            if (!b64) continue;
+            let buf: Buffer;
+            try { buf = Buffer.from(b64, 'base64'); } catch { continue; }
+            if (!buf.length || buf.length > 30 * 1024 * 1024) continue;
+            try {
+              const savedPath = publishing.saveAttachmentFile(buf, name, projectId);
+              inputFiles.push({ name, kind: 'file', mime: String(f?.mime ?? ''), bytes: buf.length, path: savedPath, preview: name });
+            } catch { /* skip an unwritable file */ }
+          }
+        }
+
+        const job = store.createJob(projectId, text, text.slice(0, 60), p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined);
         emit('job', job);
         // Fire the run async — the reply streams in over job events.
         void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true });

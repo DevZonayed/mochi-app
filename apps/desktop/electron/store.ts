@@ -70,6 +70,23 @@ export interface TranscriptItem {
     is stripped from the relay snapshot). */
 export interface ChatImage { assetId: string; imagePath: string; mime: string; name?: string; width?: number; height?: number }
 
+/** A non-image file attached to a user message. 'text' (pasted text or a code/
+    text file) carries its content inline (the engine inlines it; content is
+    stripped from the relay snapshot). 'file' (any binary, e.g. a PDF) is saved on
+    the Mac and the engine references its path (also stripped from the relay). */
+export interface ChatFile {
+  name: string;
+  kind: 'text' | 'file';
+  mime?: string;
+  bytes?: number;
+  /** text only: the file's content, inlined into the prompt. Stripped from the relay. */
+  content?: string;
+  /** file only: Mac-local saved path. Stripped from the relay. */
+  path?: string;
+  /** short display preview (first chars / filename). */
+  preview?: string;
+}
+
 export interface Job {
   id: string; projectId: string; title: string; status: JobStatus; phase: string; progress: number;
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
@@ -80,6 +97,8 @@ export interface Job {
   sessionId?: string;
   /** Images attached to the user's message (vision input). */
   inputImages?: ChatImage[];
+  /** Non-image files attached to the user's message (text inlined, files referenced). */
+  inputFiles?: ChatFile[];
   /** Structured run log (assistant text blocks, tool calls, result) — capped. */
   transcript?: TranscriptItem[];
   createdAt: number; updatedAt: number;
@@ -501,13 +520,14 @@ export class Store {
     return projectId ? all.filter(j => j.projectId === projectId) : all.slice(0, 200);
   }
   getJob(jobId: string): Job | undefined { return this.data.jobs.find(j => j.id === jobId); }
-  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[]): Job {
+  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[], inputFiles?: ChatFile[]): Job {
     const t = now();
     const j: Job = {
-      id: id(), projectId, title: title || input.slice(0, 60) || 'Image', status: 'pending', phase: 'Queued', progress: 0,
+      id: id(), projectId, title: title || input.slice(0, 60) || (inputImages?.length ? 'Image' : inputFiles?.length ? inputFiles[0].name : 'Message'), status: 'pending', phase: 'Queued', progress: 0,
       input, output: null, error: null, effort: effort ?? this.data.settings.defaultEffort, cost: 0, tokens: 0, stage: '',
       sessionId,
       ...(inputImages && inputImages.length ? { inputImages } : {}),
+      ...(inputFiles && inputFiles.length ? { inputFiles } : {}),
       createdAt: t, updatedAt: t,
     };
     this.data.jobs.push(j); this.save();
@@ -656,8 +676,12 @@ export class Store {
       : tr.slice(-60).map(slimItem);
     const needsImgStrip = j.inputImages?.some(im => im.imagePath !== undefined);
     const inputImages = needsImgStrip ? j.inputImages!.map(({ imagePath: _omit, ...rest }) => rest as ChatImage) : j.inputImages;
-    if (out === j.output && transcript === tr && inputImages === j.inputImages) return j;
-    return { ...j, output: out, transcript, ...(inputImages !== j.inputImages ? { inputImages } : {}) };
+    // Attached files: strip the inlined text content + the Mac-local path; the
+    // phone keeps only name/kind/mime/bytes/preview.
+    const needsFileStrip = j.inputFiles?.some(f => f.content !== undefined || f.path !== undefined);
+    const inputFiles = needsFileStrip ? j.inputFiles!.map(({ content: _c, path: _p, ...rest }) => rest as ChatFile) : j.inputFiles;
+    if (out === j.output && transcript === tr && inputImages === j.inputImages && inputFiles === j.inputFiles) return j;
+    return { ...j, output: out, transcript, ...(inputImages !== j.inputImages ? { inputImages } : {}), ...(inputFiles !== j.inputFiles ? { inputFiles } : {}) };
   }
   createAsset(args: Partial<Asset> & { source: Asset['source']; kind: AssetKind; status: AssetStatus }): Asset {
     const t = now();

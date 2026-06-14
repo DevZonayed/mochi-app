@@ -869,6 +869,20 @@ export class LocalEngine {
       const claudeImages = isClaudeMaster ? resolvedImages.map(r => ({ mime: r.mime, b64: r.b64 })) : [];
       const codexImageFiles = master === 'codex' ? resolvedImages.map(r => r.path) : [];
 
+      // Attached non-image files: inline text content; reference binaries by path.
+      const fileParts: string[] = [];
+      let fileBudget = 400 * 1024; // total inlined-text cap
+      for (const f of cur.inputFiles ?? []) {
+        if (f.kind === 'text' && f.content) {
+          const body = f.content.length > fileBudget ? f.content.slice(0, fileBudget) + '\n…(truncated)' : f.content;
+          fileBudget -= Math.min(f.content.length, fileBudget);
+          fileParts.push(`### Attached file: ${f.name}\n\`\`\`\n${body}\n\`\`\``);
+        } else if (f.kind === 'file' && f.path && existsSync(f.path)) {
+          fileParts.push(`The user attached the file \`${f.name}\` (saved at ${f.path}). Read it with your tools if it's relevant.`);
+        }
+      }
+      if (fileParts.length) prompt += `\n\n---\n\nThe user attached the following file(s):\n\n${fileParts.join('\n\n')}`;
+
       const hooks: RunHooks = {
         signal: ac.signal,
         onProgress: flush,

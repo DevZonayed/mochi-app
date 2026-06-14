@@ -66,6 +66,10 @@ export interface TranscriptItem {
     resolved on the desktop via api.assetImage(assetId). */
 export interface ChatImage { assetId: string; imagePath?: string; mime: string; name?: string; width?: number; height?: number }
 
+/** A non-image file attached to a message — text inlined for the agent, other
+    files saved on the Mac. content/path are stripped from the relay snapshot. */
+export interface ChatFile { name: string; kind: 'text' | 'file'; mime?: string; bytes?: number; content?: string; path?: string; preview?: string }
+
 export interface Job {
   id: string;
   projectId: string;
@@ -76,6 +80,7 @@ export interface Job {
   sessionId?: string;
   transcript?: TranscriptItem[];
   inputImages?: ChatImage[];
+  inputFiles?: ChatFile[];
   input: string;
   output: string | null;
   error: string | null;
@@ -532,7 +537,7 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; images?: { name?: string; mime: string; dataB64: string }[] }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; images?: { name?: string; mime: string; dataB64: string }[]; files?: { name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   renameSession: (id: string, title: string) =>
