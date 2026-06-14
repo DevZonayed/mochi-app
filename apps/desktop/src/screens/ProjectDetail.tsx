@@ -55,6 +55,15 @@ export const COMPOSER_CSS = `
   .send-fab { transition: transform 160ms cubic-bezier(.32,.72,0,1), background 160ms ease, box-shadow 160ms ease; }
   .send-fab:not(:disabled):hover { transform: scale(1.06); }
   .send-fab:not(:disabled):active { transform: scale(.94); }
+  .att-chip { transition: border-color 120ms ease, background 120ms ease; }
+  .att-chip:hover { border-color: color-mix(in srgb, var(--blue) 45%, var(--separator-strong)) !important; background: var(--surface) !important; }
+  .att-card { animation: attIn 130ms cubic-bezier(.32,.72,0,1); }
+  @keyframes attIn { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+  .att-scroll { scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: var(--fill-secondary) transparent; overscroll-behavior: contain; }
+  .att-scroll::-webkit-scrollbar { width: 11px; height: 11px; }
+  .att-scroll::-webkit-scrollbar-track { background: transparent; }
+  .att-scroll::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 9px; border: 3px solid transparent; background-clip: padding-box; }
+  .att-scroll::-webkit-scrollbar-thumb:hover { background: var(--ink-quaternary, var(--ink-tertiary)); background-clip: padding-box; }
 `;
 
 /* ───────────────── page-specific CSS (from Project Detail.html <style>) ───────────────── */
@@ -2071,6 +2080,13 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [schedNote, setSchedNote] = React.useState('');
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
   const [attachments, setAttachments] = React.useState<Attach[]>([]); // images / text / files
+  // Hover preview for a text attachment — a smooth, scrollable peek of the content.
+  const [hoverAtt, setHoverAtt] = React.useState<{ id: string; rect: DOMRect } | null>(null);
+  const hoverTimer = React.useRef<number | undefined>(undefined);
+  const openPreview = (id: string, el: HTMLElement) => { window.clearTimeout(hoverTimer.current); setHoverAtt({ id, rect: el.getBoundingClientRect() }); };
+  const keepPreview = () => window.clearTimeout(hoverTimer.current);
+  const closePreviewSoon = () => { window.clearTimeout(hoverTimer.current); hoverTimer.current = window.setTimeout(() => setHoverAtt(null), 180); };
+  React.useEffect(() => () => window.clearTimeout(hoverTimer.current), []);
   const [dragOver, setDragOver] = React.useState(false);
   const fileRef = React.useRef<HTMLInputElement>(null);
   const attachmentsRef = React.useRef(attachments);
@@ -2399,7 +2415,10 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                     </button>
                   </div>
                 ) : (
-                  <div key={a.id} title={a.name} style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: 8, maxWidth: 220, height: 40, padding: '0 30px 0 9px', borderRadius: 10, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0 }}>
+                  <div key={a.id} title={a.kind === 'text' ? 'Hover to preview' : a.name} className={a.kind === 'text' ? 'att-chip' : undefined}
+                    onMouseEnter={a.kind === 'text' ? (e => openPreview(a.id, e.currentTarget)) : undefined}
+                    onMouseLeave={a.kind === 'text' ? closePreviewSoon : undefined}
+                    style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: 8, maxWidth: 220, height: 40, padding: '0 30px 0 9px', borderRadius: 10, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0, cursor: a.kind === 'text' ? 'zoom-in' : 'default' }}>
                     <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={14} /></span>
                     <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
                       <span style={{ font: '600 var(--fs-caption)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.kind === 'text' ? (a.name === 'Pasted text.txt' ? 'Pasted text' : a.name) : a.name}</span>
@@ -2412,6 +2431,26 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                 ))}
               </div>
             )}
+            {hoverAtt && (() => {
+              const a = attachments.find(x => x.id === hoverAtt.id);
+              if (!a || a.kind !== 'text') return null;
+              const r = hoverAtt.rect;
+              const W = Math.min(560, window.innerWidth - 32);
+              const left = Math.max(16, Math.min(r.left, window.innerWidth - W - 16));
+              const maxH = Math.max(140, Math.min(440, r.top - 24));
+              const body = a.content.length > 20000 ? a.content.slice(0, 20000) + '\n\n…(preview truncated — full text is sent)' : a.content;
+              return (
+                <div className="att-card" onMouseEnter={keepPreview} onMouseLeave={closePreviewSoon}
+                  style={{ position: 'fixed', left, bottom: Math.max(8, window.innerHeight - r.top + 6), width: W, maxHeight: maxH, zIndex: 1200, display: 'flex', flexDirection: 'column', borderRadius: 12, overflow: 'hidden', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 16px 48px rgba(0,0,0,0.34)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', borderBottom: '0.5px solid var(--separator)', flexShrink: 0 }}>
+                    <span style={{ width: 22, height: 22, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={12} /></span>
+                    <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.name === 'Pasted text.txt' ? 'Pasted text' : a.name}</span>
+                    <span style={{ flexShrink: 0, font: '500 9px/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{a.content.split('\n').length} lines · {fmtBytes(a.content.length)}</span>
+                  </div>
+                  <pre className="att-scroll" style={{ margin: 0, flex: 1, minHeight: 0, overflow: 'auto', padding: '10px 13px', font: '400 11.5px/1.55 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: 'var(--bg-grouped)' }}>{body}</pre>
+                </div>
+              );
+            })()}
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
               <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
                 onPaste={onPaste}
