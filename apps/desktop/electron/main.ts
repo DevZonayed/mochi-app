@@ -1,6 +1,6 @@
-import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, shell, protocol } from 'electron';
 import path from 'node:path';
-import { existsSync, realpathSync, promises as fsp } from 'node:fs';
+import { existsSync, realpathSync, mkdirSync, promises as fsp } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { Store } from './store.js';
 import { LocalEngine } from './engine.js';
@@ -29,6 +29,27 @@ const PRELOAD = ['preload.mjs', 'preload.js']
   .find((p) => existsSync(p)) ?? path.join(__dirname, 'preload.mjs');
 
 let win: BrowserWindow | null = null;
+
+/* The Design genre's live preview serves a project's folder over a private,
+   standard scheme so the artifact (design/index.html) + its images/fonts resolve
+   inside a sandboxed <iframe>. Must be registered BEFORE app ready. Read-only,
+   path-guarded to the project root in the handler below. */
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'maestro-design', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true } },
+]);
+const DESIGN_MIME: Record<string, string> = {
+  '.html': 'text/html', '.htm': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript',
+  '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.avif': 'image/avif', '.ico': 'image/x-icon',
+  '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.otf': 'font/otf', '.mp4': 'video/mp4', '.webm': 'video/webm',
+};
+const DESIGN_PLACEHOLDER = `<!doctype html><meta charset="utf8"><style>
+  html,body{margin:0;height:100%;font:400 15px/1.6 -apple-system,system-ui,sans-serif;background:#0b0b0f;color:#9aa0ad;
+  display:grid;place-items:center;text-align:center}.c{max-width:340px;padding:24px}
+  .d{width:40px;height:40px;margin:0 auto 16px;border-radius:11px;background:linear-gradient(135deg,#6366f1,#a855f7)}
+  h1{font-size:17px;color:#e8eaf0;margin:0 0 6px;font-weight:600}</style>
+  <div class="c"><div class="d"></div><h1>Your design will appear here</h1>
+  <p>Describe what you want in the chat — the agent builds a live, self-contained design you can refine and hand off to code.</p></div>`;
 
 function createWindow() {
   win = new BrowserWindow({
@@ -72,6 +93,38 @@ app.whenReady().then(() => {
   const store = new Store();
   store.settleOrphanedRuns(); // jobs from a previous app instance can't finish — settle them honestly
   const providers = new Providers(store);
+
+  /* Serve a design project's folder for the live preview iframe:
+     maestro-design://<projectId>/design/index.html → ~/Maestro/<project>/design/…
+     Read-only + path-guarded to the project root (no traversal, no symlink escape). */
+  const projectRootFor = (projectId: string): string | null => {
+    const p = store.getProject(projectId);
+    if (!p) return null;
+    if (p.path && existsSync(p.path)) return p.path;
+    const safe = (p.name || 'default').replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
+    return path.join(app.getPath('home'), 'Maestro', safe);
+  };
+  protocol.handle('maestro-design', async (req) => {
+    try {
+      const u = new URL(req.url);
+      const root = projectRootFor(u.hostname);
+      if (!root) return new Response('no such project', { status: 404 });
+      try { mkdirSync(path.join(root, 'design'), { recursive: true }); } catch { /* exists */ }
+      const rel = decodeURIComponent(u.pathname).replace(/^\/+/, '') || 'design/index.html';
+      const rootReal = realpathSync(path.resolve(root));
+      const target = path.resolve(rootReal, rel);
+      const relToRoot = path.relative(rootReal, target);
+      if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) return new Response('forbidden', { status: 403 });
+      if (!existsSync(target)) {
+        // Friendly placeholder until the agent writes the artifact.
+        if (rel === 'design/index.html') return new Response(DESIGN_PLACEHOLDER, { headers: { 'content-type': 'text/html' } });
+        return new Response('not found', { status: 404 });
+      }
+      const buf = await fsp.readFile(realpathSync(target));
+      const mime = DESIGN_MIME[path.extname(target).toLowerCase()] ?? 'application/octet-stream';
+      return new Response(new Uint8Array(buf), { headers: { 'content-type': mime, 'cache-control': 'no-cache' } });
+    } catch { return new Response('error', { status: 500 }); }
+  });
 
   // Apply the persisted "open at login" preference, and re-apply whenever it changes.
   const applyLoginItem = (openAtLogin: boolean) => { try { app.setLoginItemSettings({ openAtLogin }); } catch { /* unsupported */ } };

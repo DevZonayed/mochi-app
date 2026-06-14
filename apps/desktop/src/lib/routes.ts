@@ -18,6 +18,7 @@ export interface NavRoute {
 export const NAV_ROUTES: NavRoute[] = [
   { key: 'home', path: '/command-center', label: 'Home', icon: 'home' },
   { key: 'workspace', path: '/workspace', label: 'Workspace', icon: 'terminal' },
+  { key: 'design', path: '/design-workspace', label: 'Design', icon: 'brush' },
   { key: 'projects', path: '/projects', label: 'Projects', icon: 'layers' },
   { key: 'jobs', path: '/job-monitor', label: 'Jobs', icon: 'jobs' },
   { key: 'approvals', path: '/approvals', label: 'Approvals', icon: 'shield' },
@@ -40,6 +41,12 @@ export const ALL_NAV: NavRoute[] = [...NAV_ROUTES, SETTINGS_ROUTE];
     order. The media/content surfaces (Studio, Publishing, Trends, Comms) belong
     to the Design/Video genres and are hidden here. Drives the CodingShell top-nav. */
 export const CODING_NAV: NavRoute[] = (['workspace', 'home', 'projects', 'jobs', 'approvals', 'scheduler', 'skills', 'templates', 'budget'] as const)
+  .map(k => NAV_ROUTES.find(r => r.key === k))
+  .filter((r): r is NavRoute => !!r);
+
+/** Design-genre navigation — the design canvas plus the surfaces a designer needs
+    (projects, the media Studio, trends, costs). Drives the DesignShell top-nav. */
+export const DESIGN_NAV: NavRoute[] = (['design', 'projects', 'studio', 'trends', 'budget'] as const)
   .map(k => NAV_ROUTES.find(r => r.key === k))
   .filter((r): r is NavRoute => !!r);
 

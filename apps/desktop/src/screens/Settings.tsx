@@ -198,7 +198,7 @@ function GeneralPane({ theme, setTheme, workspace }: {
   const labelToPurpose = (l: string): Purpose => (l === 'Coding' ? 'coding' : l === 'Design' ? 'design' : l === 'Video' ? 'video' : 'general');
   const PURPOSE_SUB: Record<Purpose, string> = {
     coding: 'Workspace-focused: no sidebar, a slim top nav, the coding workspace front and centre.',
-    design: 'A design-focused layout is coming — for now this looks like General.',
+    design: 'An agent-native design canvas: describe it, the agent builds a live, self-contained design you can refine and hand off to code.',
     video: 'A video-focused layout is coming — for now this looks like General.',
     general: 'The classic layout: full sidebar with every surface.',
   };

@@ -6,7 +6,7 @@
 import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, MaestroMark } from './icons';
-import { NAV_ROUTES, ALL_NAV, CODING_NAV, pathForNav } from './routes';
+import { NAV_ROUTES, ALL_NAV, CODING_NAV, DESIGN_NAV, pathForNav } from './routes';
 import { api } from './api';
 import { CountUp } from './ui';
 
@@ -227,9 +227,9 @@ export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
   const workspaceName = useWorkspaceName();
   const { width, dragging, toggle } = useSidebar();
   const purpose = usePurpose();
-  // Coding genre has no left sidebar — screens that hand-roll their chrome (and
-  // render <Sidebar/> directly) get the slim top nav via <Toolbar/> instead.
-  if (purpose === 'coding') return null;
+  // Genre modes (coding/design) have no left sidebar — screens that hand-roll
+  // their chrome (and render <Sidebar/>) get the slim top nav via <Toolbar/>.
+  if (isGenreShell(purpose)) return null;
   return (
     <aside className="win-drag" style={{
       width, flexShrink: 0, height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', zIndex: 2,
@@ -343,10 +343,10 @@ export function Toolbar({ onSearch, theme, setTheme, right, sidebarHidden }: Too
   const location = useLocation();
   const pending = usePendingApprovals();
   const purpose = usePurpose();
-  // Coding genre: the hand-rolled-chrome screens render <Toolbar/> as their top
-  // bar — give them the same slim icon-nav the CodingShell uses, so the genre
+  // Genre modes: the hand-rolled-chrome screens render <Toolbar/> as their top
+  // bar — give them the same slim icon-nav the genre shell uses, so the genre
   // chrome is truly global (no screen falls back to the classic sidebar+toolbar).
-  if (purpose === 'coding') {
+  if (isGenreShell(purpose)) {
     const routeKey = ALL_NAV.find(r => location.pathname === r.path || location.pathname.startsWith(r.path + '/'))?.key;
     return <CodingTopNav active={routeKey} onNav={(k) => navigate(pathForNav(k))} onSearch={onSearch} theme={theme} setTheme={setTheme} right={right} />;
   }
@@ -419,9 +419,14 @@ export interface AppShellProps {
    sidebar for a full-bleed workspace with a slim top icon-nav; everything else
    keeps the classic frosted sidebar + toolbar. Delegates to a dedicated shell so
    switching purpose cleanly unmounts/mounts (no hook-order hazard). */
+/** The genre top-nav list for the current purpose. */
+function navForPurpose(p: Purpose) { return p === 'design' ? DESIGN_NAV : CODING_NAV; }
+/** Genres that use the slim top-nav chrome (no left sidebar). */
+const isGenreShell = (p: Purpose) => p === 'coding' || p === 'design';
+
 export function AppShell(props: AppShellProps) {
   const purpose = usePurpose();
-  return purpose === 'coding' ? <CodingShell {...props} /> : <GeneralShell {...props} />;
+  return isGenreShell(purpose) ? <CodingShell {...props} /> : <GeneralShell {...props} />;
 }
 
 /* Full desktop chrome: scaled macOS window + frosted sidebar + toolbar wrapper.
@@ -514,6 +519,7 @@ function CodingNavButton({ route, on, pending, onNav }: { route: typeof CODING_N
 
 function CodingTopNav({ active, onNav, onSearch, theme, setTheme, right }: { active?: string; onNav: (k: string) => void; onSearch?: () => void; theme: Theme; setTheme: React.Dispatch<React.SetStateAction<Theme>>; right?: React.ReactNode }) {
   const pending = usePendingApprovals();
+  const nav = navForPurpose(usePurpose());
   const iconBtn = { width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' } as const;
   return (
     <header className="win-drag" style={{
@@ -524,7 +530,7 @@ function CodingTopNav({ active, onNav, onSearch, theme, setTheme, right }: { act
     }}>
       <MaestroMark size={22} />
       <nav style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-        {CODING_NAV.map(r => <CodingNavButton key={r.key} route={r} on={active === r.key} pending={pending} onNav={onNav} />)}
+        {nav.map(r => <CodingNavButton key={r.key} route={r} on={active === r.key} pending={pending} onNav={onNav} />)}
       </nav>
       <div style={{ flex: 1 }} />
       {right}

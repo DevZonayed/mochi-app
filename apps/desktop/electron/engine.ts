@@ -33,6 +33,26 @@ const EFFORT_TURNS: Record<string, number> = { fast: 8, balanced: 24, deep: 48, 
 const GOAL_MAX_TURNS = 240;
 // How many times to silently retry a transient engine crash before failing the run.
 const ENGINE_MAX_RETRIES = 2;
+// Design mode (the Design genre): steer the agent to produce ONE self-contained,
+// live-previewable HTML artifact — the OpenDesign "agent-native design" model, but
+// on Maestro's own engines + image-gen. Prepended to every turn of a design project.
+const DESIGN_DIRECTIVE =
+  `\n\n---\n\n[Design mode] You are a senior product designer working in a live design ` +
+  `canvas. Build and iteratively refine ONE self-contained artifact at \`design/index.html\` ` +
+  `(create the \`design/\` folder if needed). Rules:\n` +
+  `• Self-contained & live-previewable: all CSS in a single <style> block, web fonts via ` +
+  `Google Fonts <link>, no build step and no local JS frameworks. It must render correctly ` +
+  `opened on its own.\n` +
+  `• Distinctive, production-grade visual design — intentional type scale, spacing, colour, ` +
+  `hierarchy and motion. Avoid generic/templated AI aesthetics. Honour the project's design ` +
+  `system / brand if one is given in the instructions.\n` +
+  `• Imagery: when you need a photo/illustration/icon/texture, CALL the generate_image tool, ` +
+  `then save/reference the file under \`design/\` and link it with a ROOT-ABSOLUTE path ` +
+  `(e.g. \`/design/hero.png\`) so the live preview resolves it. Prefer CSS/SVG for simple shapes.\n` +
+  `• Iterate in place: EDIT \`design/index.html\` for changes — don't spawn new files per tweak. ` +
+  `Keep it the single source of truth. After a change, briefly say what you changed.\n` +
+  `• This artifact is real, hand-off-able front-end code: write clean, semantic HTML so it can ` +
+  `later become a coding project.`;
 const GOAL_DIRECTIVE =
   `\n\n---\n\n[Goal mode] Pursue the request above as a goal: work autonomously to ` +
   `completion. Don't stop to ask for confirmation on routine steps; plan, implement, ` +
@@ -982,6 +1002,8 @@ export class LocalEngine {
         prompt = `${base}${cur.input}`;
       }
       if (goalMode) prompt += GOAL_DIRECTIVE;
+      // Design genre: steer the turn toward the live, self-contained design artifact.
+      if (project?.kind === 'design') prompt += DESIGN_DIRECTIVE;
       // Codex ships a native image_gen skill — nudge it to use that (not SVG) and
       // drop the PNG in the workspace so we can harvest + display it inline.
       if (master === 'codex' && IMAGE_INTENT_RE.test(cur.input)) prompt += CODEX_IMAGE_NUDGE;

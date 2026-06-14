@@ -29,7 +29,7 @@ export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
-export type ProjectKind = 'coding' | 'content' | 'research' | 'general';
+export type ProjectKind = 'coding' | 'design' | 'content' | 'research' | 'general';
 
 export interface Workspace { id: string; name: string; budgetCap: number; createdAt: number }
 export interface Project {

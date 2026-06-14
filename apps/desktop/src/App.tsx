@@ -11,6 +11,7 @@ const CommandCenter = React.lazy(() => import('./screens/CommandCenter'));
 const Projects = React.lazy(() => import('./screens/Projects'));
 const ProjectDetail = React.lazy(() => import('./screens/ProjectDetail'));
 const Workspace = React.lazy(() => import('./screens/Workspace'));
+const DesignWorkspace = React.lazy(() => import('./screens/DesignWorkspace'));
 const Templates = React.lazy(() => import('./screens/Templates'));
 const JobMonitor = React.lazy(() => import('./screens/JobMonitor'));
 const SessionTranscript = React.lazy(() => import('./screens/SessionTranscript'));
@@ -28,10 +29,12 @@ const Settings = React.lazy(() => import('./screens/Settings'));
 const DevicePairing = React.lazy(() => import('./screens/DevicePairing'));
 const AuditHistory = React.lazy(() => import('./screens/AuditHistory'));
 
-/** Where the app should land: first-run setup, or straight into the cockpit. */
+/** Where the app should land: first-run setup, or straight into the cockpit —
+    the Design genre opens on its canvas, everything else on the Command Center. */
 function entryPath(): string {
   try {
-    return localStorage.getItem('maestro.onboarded') === '1' ? '/command-center' : '/onboarding';
+    if (localStorage.getItem('maestro.onboarded') !== '1') return '/onboarding';
+    return localStorage.getItem('maestro.purpose') === 'design' ? '/design-workspace' : '/command-center';
   } catch {
     return '/onboarding';
   }
@@ -46,6 +49,7 @@ export function App() {
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/command-center" element={<CommandCenter />} />
           <Route path="/workspace" element={<Workspace />} />
+          <Route path="/design-workspace" element={<DesignWorkspace />} />
           <Route path="/projects" element={<Projects />} />
           <Route path="/project-detail" element={<ProjectDetail />} />
           <Route path="/project-detail/:id" element={<ProjectDetail />} />
