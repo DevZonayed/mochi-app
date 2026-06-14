@@ -1121,7 +1121,11 @@ export class LocalEngine {
         for (let round = 0; round < REVIEW_MAX_ROUNDS; round++) {
           cur = this.store.updateJob(jobId, { progress: 88, stage: `reviewer (${ENGINE_LABEL[reviewer]}) checking…` });
           this.emit('job', cur);
-          const reviewPrompt = wroteFiles
+          const isDesign = project?.kind === 'design';
+          const reviewPrompt = isDesign
+            // Design genre: review it as a DESIGNER (craft), not a code reviewer.
+            ? `You are a senior product designer reviewing a live, self-contained design (\`design/index.html\`). The user asked:\n${cur.input}\n\nHere is what the agent produced:\n\n${changedFilesContext(allItems)}\n\nReview it as a DESIGN, not as code. Judge: visual hierarchy & layout, type scale & readability, colour palette & contrast (incl. accessibility), spacing & rhythm, responsiveness (does it hold up at phone width?), real vs placeholder content, interactive states & polish (hover/focus, shadows, motion), and overall craft — does it look genuinely premium and intentional, or templated/generic? Give each issue as a short, specific, actionable DESIGN fix. If it's genuinely strong, say so in one line. End with EXACTLY one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".`
+            : wroteFiles
             ? `You are a senior code reviewer. The user asked:\n${cur.input}\n\nThe coding agent made these changes:\n\n${changedFilesContext(allItems)}\n\nReview ONLY for real problems — security vulnerabilities, broken or weak logic, and correctness bugs. List each as a short, specific, actionable finding (file + what's wrong). If it's solid, say so in one line. End with EXACTLY one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".`
             : `You are the reviewer. Briefly review the result below for correctness and completeness (3-5 tight bullets), then end with exactly one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".\n\n## Task\n${cur.input}\n\n## Result\n${output.slice(0, 12000)}`;
           let review: EngineRun;
@@ -1138,7 +1142,9 @@ export class LocalEngine {
           // Feed the findings back to the primary to fix — streamed live.
           cur = this.store.updateJob(jobId, { progress: 93, stage: 'fixing the reviewer’s findings…' });
           this.emit('job', cur);
-          const fixPrompt = `A code reviewer (${ENGINE_LABEL[reviewer]}) reviewed your changes and flagged issues. Fix them now, editing the files as needed. Don't re-explain — just make the corrections.\n\n${review.text}`;
+          const fixPrompt = isDesign
+            ? `A senior designer reviewed your design and flagged improvements. Apply them now by EDITING \`design/index.html\` — make the design genuinely better (hierarchy, type, colour, spacing, responsiveness, polish). Don't re-explain — just improve the design.${DESIGN_DIRECTIVE}\n\nReviewer's notes:\n${review.text}`
+            : `A code reviewer (${ENGINE_LABEL[reviewer]}) reviewed your changes and flagged issues. Fix them now, editing the files as needed. Don't re-explain — just make the corrections.\n\n${review.text}`;
           const fixHooks: RunHooks = { signal: ac.signal, onProgress: (_p, items, usage) => { const merged = [...allItems, ...items]; flush(proseOf(merged), merged, usage); }, onChild: (c) => { handle.child = c; } };
           let fix: EngineRun;
           try {

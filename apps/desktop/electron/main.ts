@@ -109,10 +109,14 @@ app.whenReady().then(() => {
   const designRootFor = (projectId: string): string | null => {
     const p = store.getProject(projectId);
     if (!p || p.kind !== 'design') return null;
-    if (p.path && existsSync(p.path)) return p.path;
     const safe = (p.name || 'default').replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
-    const dir = path.join(app.getPath('home'), 'Maestro', safe);
-    return existsSync(dir) ? dir : null;
+    // The engine's write-dir (workDirFor) and this serve-dir must agree. Prefer
+    // whichever candidate ACTUALLY holds the artifact (recovers a project whose
+    // stored path + on-disk folder diverged), else the first that exists.
+    const candidates = [p.path, path.join(app.getPath('home'), 'Maestro', safe)].filter((c): c is string => !!c);
+    for (const c of candidates) if (existsSync(path.join(c, 'design', 'index.html'))) return c;
+    for (const c of candidates) if (existsSync(c)) return c;
+    return candidates[0] ?? null;
   };
   // A restrictive CSP for served design documents (no exfiltration: connect-src
   // 'none', form-action 'none') — the design can still load its own assets/fonts.
