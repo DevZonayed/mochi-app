@@ -372,6 +372,43 @@ export class BrowserController {
     return this.exclusive(projectId, async (_s, p) => { await p.mouse.wheel(opts.dx ?? 0, opts.dy ?? 600); return { ok: true as const }; });
   }
 
+  /** Upload file(s) to a web form. Intercepts the file chooser so NO native OS
+      dialog ever appears (the agent can't operate one) — it clicks the trigger
+      (a button's selector or visible text, e.g. "Photo/video") and sets the files
+      programmatically. Falls back to setting a direct <input type=file>. */
+  async upload(projectId: string | null | undefined, opts: { paths: string[]; selector?: string; text?: string }): Promise<{ ok: true; files: number }> {
+    return this.exclusive(projectId, async (_s, p) => {
+      const paths = (opts.paths ?? []).filter(Boolean);
+      if (!paths.length) throw Object.assign(new Error('upload needs at least one file path'), { statusCode: 400 });
+      const trigger = opts.selector ? p.locator(opts.selector).first() : opts.text ? p.getByText(opts.text, { exact: false }).first() : null;
+      try {
+        const [chooser] = await Promise.all([
+          p.waitForEvent('filechooser', { timeout: ACTION_TIMEOUT }),
+          trigger ? trigger.click({ timeout: ACTION_TIMEOUT }) : Promise.resolve(),
+        ]);
+        await chooser.setFiles(paths);
+      } catch (e) {
+        // The click didn't open a chooser — maybe `selector` IS the file input.
+        if (opts.selector) await p.setInputFiles(opts.selector, paths, { timeout: ACTION_TIMEOUT });
+        else throw e;
+      }
+      return { ok: true as const, files: paths.length };
+    });
+  }
+
+  /** Choose option(s) in a <select> dropdown (matches by value or visible label). */
+  async selectOption(projectId: string | null | undefined, opts: { selector: string; values: string[] }): Promise<{ ok: true }> {
+    return this.exclusive(projectId, async (_s, p) => {
+      await p.locator(opts.selector).first().selectOption(opts.values ?? [], { timeout: ACTION_TIMEOUT });
+      return { ok: true as const };
+    });
+  }
+
+  /** Hover an element (reveals hover menus / tooltips). */
+  async hover(projectId: string | null | undefined, t: ClickTarget): Promise<{ ok: true }> {
+    return this.exclusive(projectId, async (_s, p) => { await this.locator(p, t).hover({ timeout: ACTION_TIMEOUT }); return { ok: true as const }; });
+  }
+
   /** Wait for a selector / text / fixed delay before the next step. */
   async waitFor(projectId: string | null | undefined, opts: { selector?: string; text?: string; ms?: number }): Promise<{ ok: true }> {
     return this.exclusive(projectId, async (_s, p) => {

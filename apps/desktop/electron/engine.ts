@@ -356,6 +356,18 @@ async function runClaude(
             tool('browser_scroll', 'Scroll the page vertically. Positive `dy` scrolls down, negative up (default 600).',
               { dy: z.number().optional() },
               wrap(async (a: { dy?: number }) => { await browser!.scroll(pid, { dy: a.dy }); return txt('Scrolled.'); })),
+            tool('browser_upload',
+              'Upload local file(s) to a web form (e.g. a "Photo/video", "Attach", or "Choose file" button). This is the ONLY way to attach files — do NOT click the upload button with browser_click (that opens the OS file dialog you can\'t operate). Pass the visible button `text` (or a `selector`) plus the absolute file `paths`; the files are attached programmatically with no dialog.',
+              { paths: z.array(z.string()).describe('Absolute file path(s) to upload.'),
+                text: z.string().optional().describe('Visible text of the upload button (e.g. "Photo/video").'),
+                selector: z.string().optional().describe('Selector for the upload button or the <input type=file>.') },
+              wrap(async (a: { paths: string[]; text?: string; selector?: string }) => { const r = await browser!.upload(pid, a); return txt(`Attached ${r.files} file(s).`); })),
+            tool('browser_select', 'Choose option(s) in a <select> dropdown, by value or visible label.',
+              { selector: z.string().describe('Selector for the <select>.'), values: z.array(z.string()).describe('Option value(s) or label(s) to choose.') },
+              wrap(async (a: { selector: string; values: string[] }) => { await browser!.selectOption(pid, a); return txt('Selected.'); })),
+            tool('browser_hover', 'Hover an element (reveals hover menus / tooltips). Target by `selector` or visible `text`.',
+              { selector: z.string().optional(), text: z.string().optional() },
+              wrap(async (a: { selector?: string; text?: string }) => { await browser!.hover(pid, a); return txt('Hovered.'); })),
             tool('browser_wait', 'Wait for an element (`selector` or `text`) to appear, or a fixed `ms` delay, before the next step.',
               { selector: z.string().optional(), text: z.string().optional(), ms: z.number().optional() },
               wrap(async (a: { selector?: string; text?: string; ms?: number }) => { await browser!.waitFor(pid, a); return txt('Done waiting.'); })),
@@ -379,7 +391,7 @@ async function runClaude(
     : null;
   const maestroAllowed = [
     ...(imageGen ? ['generate_image'] : []),
-    ...(browser ? ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_press', 'browser_scroll', 'browser_wait', 'browser_evaluate', 'browser_console', 'browser_back', 'browser_forward', 'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab'] : []),
+    ...(browser ? ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_press', 'browser_scroll', 'browser_upload', 'browser_select', 'browser_hover', 'browser_wait', 'browser_evaluate', 'browser_console', 'browser_back', 'browser_forward', 'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab'] : []),
   ].map(n => `mcp__maestro__${n}`);
   /* Vision input: when the user attached images, the prompt becomes a streamed
      user message carrying text + base64 image blocks (a plain string can't hold

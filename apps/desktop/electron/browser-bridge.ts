@@ -38,7 +38,8 @@ export interface BrowserRunRegistration {
 
 const TOOL_NAMES = [
   'browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click',
-  'browser_type', 'browser_press', 'browser_scroll', 'browser_wait',
+  'browser_type', 'browser_press', 'browser_scroll', 'browser_upload',
+  'browser_select', 'browser_hover', 'browser_wait',
   'browser_evaluate', 'browser_console', 'browser_back', 'browser_forward',
   'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab',
 ] as const;
@@ -136,6 +137,9 @@ export class BrowserBridge {
       case 'browser_type': { const r = await b.type(pid, { selector: s(a.selector), text: String(a.text ?? ''), submit: !!a.submit, clear: !!a.clear }); return txt(`Typed${a.submit ? ' and submitted' : ''}. Now at ${r.url}`); }
       case 'browser_press': { await b.press(pid, String(a.keys ?? '')); return txt(`Pressed ${a.keys}.`); }
       case 'browser_scroll': { await b.scroll(pid, { dy: n(a.dy) }); return txt('Scrolled.'); }
+      case 'browser_upload': { const r = await b.upload(pid, { paths: Array.isArray(a.paths) ? (a.paths as unknown[]).map(String) : [], selector: s(a.selector), text: s(a.text) }); return txt(`Attached ${r.files} file(s).`); }
+      case 'browser_select': { await b.selectOption(pid, { selector: String(a.selector ?? ''), values: Array.isArray(a.values) ? (a.values as unknown[]).map(String) : [] }); return txt('Selected.'); }
+      case 'browser_hover': { await b.hover(pid, { selector: s(a.selector), text: s(a.text) }); return txt('Hovered.'); }
       case 'browser_wait': { await b.waitFor(pid, { selector: s(a.selector), text: s(a.text), ms: n(a.ms) }); return txt('Done waiting.'); }
       case 'browser_evaluate': { const r = await b.evaluate(pid, String(a.expression ?? '')); return txt(r.result); }
       case 'browser_console': { const r = await b.console(pid); return txt(r.messages.slice(-40).join('\n') || '(no console output)'); }
@@ -175,6 +179,9 @@ const SHIM_TOOLS = JSON.stringify([
   { name: 'browser_type', description: 'Type into an input/textarea. Target with `selector` (defaults to the first field). `submit` presses Enter; `clear` empties first.', inputSchema: { type: 'object', properties: { selector: { type: 'string' }, text: { type: 'string' }, submit: { type: 'boolean' }, clear: { type: 'boolean' } }, required: ['text'] } },
   { name: 'browser_press', description: 'Press a key or chord (e.g. "Enter", "Escape", "Control+a").', inputSchema: { type: 'object', properties: { keys: { type: 'string' } }, required: ['keys'] } },
   { name: 'browser_scroll', description: 'Scroll vertically. Positive dy down, negative up (default 600).', inputSchema: { type: 'object', properties: { dy: { type: 'number' } } } },
+  { name: 'browser_upload', description: 'Upload local file(s) to a web form (e.g. a "Photo/video" or "Attach" button). The ONLY way to attach files — do NOT click the upload button with browser_click (that opens an OS dialog you can\'t use). Pass the button text/selector + absolute file paths; files attach with no dialog.', inputSchema: { type: 'object', properties: { paths: { type: 'array', items: { type: 'string' } }, text: { type: 'string' }, selector: { type: 'string' } }, required: ['paths'] } },
+  { name: 'browser_select', description: 'Choose option(s) in a <select> dropdown, by value or visible label.', inputSchema: { type: 'object', properties: { selector: { type: 'string' }, values: { type: 'array', items: { type: 'string' } } }, required: ['selector', 'values'] } },
+  { name: 'browser_hover', description: 'Hover an element (reveals hover menus / tooltips). Target by selector or visible text.', inputSchema: { type: 'object', properties: { selector: { type: 'string' }, text: { type: 'string' } } } },
   { name: 'browser_wait', description: 'Wait for an element (selector or text) to appear, or a fixed ms delay.', inputSchema: { type: 'object', properties: { selector: { type: 'string' }, text: { type: 'string' }, ms: { type: 'number' } } } },
   { name: 'browser_evaluate', description: 'Run a JS expression in the page and return its value (JSON, truncated).', inputSchema: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] } },
   { name: 'browser_console', description: 'Read recent console messages and page errors (most recent last).', inputSchema: { type: 'object', properties: {} } },
