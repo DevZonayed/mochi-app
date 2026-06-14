@@ -48,11 +48,15 @@ export default function DesignWorkspace() {
     return () => { on = false; };
   }, [activeId]);
 
-  // live preview: reload when a job for this project finishes (the agent edited the artifact)
+  // live preview: reload when a job for this project FINISHES (the agent edited
+  // the artifact), debounced so a burst of completions coalesces into one reload.
   React.useEffect(() => {
     if (!activeId) return;
-    const unsub = api.subscribe({ onJob: (j) => { if (j.projectId === activeId && (j.status === 'done' || j.status === 'running')) setNonce(n => n + 1); } });
-    return () => unsub();
+    let t: number | undefined;
+    const unsub = api.subscribe({ onJob: (j) => {
+      if (j.projectId === activeId && j.status === 'done') { if (t) window.clearTimeout(t); t = window.setTimeout(() => setNonce(n => n + 1), 450); }
+    } });
+    return () => { if (t) window.clearTimeout(t); unsub(); };
   }, [activeId]);
 
   const createDesign = async (presetName?: string) => {

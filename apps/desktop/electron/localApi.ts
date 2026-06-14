@@ -14,7 +14,7 @@ import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
 
@@ -114,10 +114,18 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'createProject': {
         if (!p.name || typeof p.name !== 'string') bad('name required');
         const kind = (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') ? (p.kind as ProjectKind) : undefined;
+        let projPath = typeof p.path === 'string' && p.path ? p.path : undefined;
+        // Design projects get a UNIQUE folder (id-suffixed) so two similarly-named
+        // designs never share a folder/preview/memory/git (name-only dirs collide).
+        if (!projPath && kind === 'design') {
+          const safe = (p.name as string).replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'design';
+          projPath = nodePath.join(homedir(), 'Maestro', `${safe}-${Math.random().toString(36).slice(2, 8)}`);
+          try { mkdirSync(nodePath.join(projPath, 'design'), { recursive: true }); } catch { /* best effort */ }
+        }
         const proj = store.createProject({
           name: p.name as string, template: p.template as string | undefined, instructions: p.instructions as string | undefined,
           color: p.color as string | undefined, kind,
-          path: typeof p.path === 'string' && p.path ? p.path : undefined,
+          path: projPath,
           repoUrl: typeof p.repoUrl === 'string' && p.repoUrl ? p.repoUrl : undefined,
         });
         emit('project', proj);

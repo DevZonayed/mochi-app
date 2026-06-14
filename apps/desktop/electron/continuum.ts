@@ -26,7 +26,7 @@ export function readContinuumContext(projectRoot: string, k = 4): string {
     if (!existsSync(root)) return '';
     const parts: string[] = [];
     const statePath = path.join(root, 'STATE.md');
-    if (existsSync(statePath)) { const s = readFileSync(statePath, 'utf8').trim(); if (s) parts.push(`STATE.md (the project's durable memory):\n${s.slice(0, STATE_CAP)}`); }
+    if (existsSync(statePath)) { const s = readFileSync(statePath, 'utf8').trim(); if (s) parts.push(`STATE.md (the project's durable memory):\n${s.length > STATE_CAP ? s.slice(0, STATE_CAP) + '\n…(truncated — STATE.md exceeds the cap; consider compacting it)' : s}`); }
     const ids = linkIds(projectRoot).slice(-k).reverse();
     const links: string[] = [];
     for (const id of ids) {

@@ -97,32 +97,42 @@ app.whenReady().then(() => {
   /* Serve a design project's folder for the live preview iframe:
      maestro-design://<projectId>/design/index.html → ~/Maestro/<project>/design/…
      Read-only + path-guarded to the project root (no traversal, no symlink escape). */
-  const projectRootFor = (projectId: string): string | null => {
+  // Only DESIGN projects expose a folder over this scheme, and only their own
+  // root — resolved once here (no dir creation on the read path).
+  const designRootFor = (projectId: string): string | null => {
     const p = store.getProject(projectId);
-    if (!p) return null;
+    if (!p || p.kind !== 'design') return null;
     if (p.path && existsSync(p.path)) return p.path;
     const safe = (p.name || 'default').replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
-    return path.join(app.getPath('home'), 'Maestro', safe);
+    const dir = path.join(app.getPath('home'), 'Maestro', safe);
+    return existsSync(dir) ? dir : null;
   };
+  // A restrictive CSP for served design documents (no exfiltration: connect-src
+  // 'none', form-action 'none') — the design can still load its own assets/fonts.
+  const DESIGN_CSP = "default-src 'self' data: blob: https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; connect-src 'none'; form-action 'none'";
   protocol.handle('maestro-design', async (req) => {
     try {
       const u = new URL(req.url);
-      const root = projectRootFor(u.hostname);
-      if (!root) return new Response('no such project', { status: 404 });
-      try { mkdirSync(path.join(root, 'design'), { recursive: true }); } catch { /* exists */ }
+      const root = designRootFor(u.hostname);
+      if (!root) return new Response('no such design project', { status: 404 });
       const rel = decodeURIComponent(u.pathname).replace(/^\/+/, '') || 'design/index.html';
       const rootReal = realpathSync(path.resolve(root));
       const target = path.resolve(rootReal, rel);
-      const relToRoot = path.relative(rootReal, target);
-      if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) return new Response('forbidden', { status: 403 });
       if (!existsSync(target)) {
         // Friendly placeholder until the agent writes the artifact.
-        if (rel === 'design/index.html') return new Response(DESIGN_PLACEHOLDER, { headers: { 'content-type': 'text/html' } });
+        if (rel === 'design/index.html') return new Response(DESIGN_PLACEHOLDER, { headers: { 'content-type': 'text/html', 'content-security-policy': DESIGN_CSP } });
         return new Response('not found', { status: 404 });
       }
-      const buf = await fsp.readFile(realpathSync(target));
-      const mime = DESIGN_MIME[path.extname(target).toLowerCase()] ?? 'application/octet-stream';
-      return new Response(new Uint8Array(buf), { headers: { 'content-type': mime, 'cache-control': 'no-cache' } });
+      // Resolve symlinks and RE-VALIDATE the real path is still inside the project
+      // root (a lexical `..` check alone misses a symlink that points outside).
+      const real = realpathSync(target);
+      const relReal = path.relative(rootReal, real);
+      if (relReal.startsWith('..') || path.isAbsolute(relReal)) return new Response('forbidden', { status: 403 });
+      const buf = await fsp.readFile(real);
+      const mime = DESIGN_MIME[path.extname(real).toLowerCase()] ?? 'application/octet-stream';
+      const headers: Record<string, string> = { 'content-type': mime, 'cache-control': 'no-cache' };
+      if (mime === 'text/html') headers['content-security-policy'] = DESIGN_CSP;
+      return new Response(new Uint8Array(buf), { headers });
     } catch { return new Response('error', { status: 500 }); }
   });
 
@@ -204,7 +214,13 @@ app.whenReady().then(() => {
       // answer over the relay, even though dispatch is shared with the local IPC
       // surface. getPairing returns the raw access token; listChromeProfiles
       // returns the operator's Chrome profile display names (often their real name).
-      if (method === 'getPairing' || method === 'listChromeProfiles') throw Object.assign(new Error('not available remotely'), { statusCode: 403 });
+      // getPairing/listChromeProfiles leak local secrets/personal data; the
+      // *ProjectMemory + snapshotProject methods read/write project files and run
+      // git on the Mac — none may answer over the relay (phone/web are read-mostly
+      // remote controls, not local-execution surfaces).
+      if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject') {
+        throw Object.assign(new Error('not available remotely'), { statusCode: 403 });
+      }
       const r = await dispatch(method, params);
       const isJob = (x: unknown): x is Job => !!x && typeof x === 'object' && 'input' in x && 'status' in x && 'phase' in x && 'projectId' in x;
       if (isJob(r)) return store.slimJobForRelay(r);
