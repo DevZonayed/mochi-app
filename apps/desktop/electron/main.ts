@@ -7,6 +7,8 @@ import { LocalEngine } from './engine.js';
 import { MediaEngine } from './media.js';
 import { ResearchEngine } from './research.js';
 import { PublishingEngine } from './publishing.js';
+import { BrowserController } from './browser.js';
+import { BrowserBridge } from './browser-bridge.js';
 import { TelegramBot } from './telegram.js';
 import { Providers } from './providers.js';
 import type { Approval, Job } from './store.js';
@@ -54,6 +56,18 @@ function createWindow() {
    Everything lives and executes on this Mac. The relay connection exists only
    so the phone/web remotes can mirror state and send commands here. */
 
+/** A page's origin (scheme+host) — the only part of a URL safe to mirror to the
+    phone. The query string / fragment can carry session tokens (OAuth callbacks,
+    magic-links, presigned URLs), so they must never cross the relay. */
+function originOf(u: unknown): string {
+  if (typeof u !== 'string' || !u) return '';
+  try { return new URL(u).origin; } catch { return ''; }
+}
+/** Strip a browser-state event down to what's safe to mirror to the phone. */
+function slimBrowserForRelay(d: Record<string, unknown>): Record<string, unknown> {
+  return { projectId: d.projectId ?? null, url: originOf(d.url), title: d.title ?? '', tabs: d.tabs ?? 0, activeTab: d.activeTab ?? 0, open: d.open ?? false };
+}
+
 app.whenReady().then(() => {
   const store = new Store();
   store.settleOrphanedRuns(); // jobs from a previous app instance can't finish — settle them honestly
@@ -80,6 +94,9 @@ app.whenReady().then(() => {
     // (Desktop windows above already got the full object; only the relay is slimmed.)
     const relayData = name === 'asset' && data && typeof data === 'object' ? store.slimAssetForRelay(data as import('./store.js').Asset)
       : name === 'job' && data && typeof data === 'object' ? store.slimJobForRelay(data as Job)
+      // Browser state streams continuously — give the phone the origin + title only,
+      // never the full URL (which can carry session tokens in its query string).
+      : name === 'browser' && data && typeof data === 'object' ? slimBrowserForRelay(data as Record<string, unknown>)
       : data;
     relay?.event(name, relayData);
     relay?.pushSnapshot();
@@ -97,6 +114,16 @@ app.whenReady().then(() => {
   // FREE native image_gen skill (no fal credits); otherwise fal flux-schnell (fast,
   // ~$0.003, uses your fal balance). The Codex *engine* always uses its own skill.
   engine.setPublishing(publishing);
+  // Native browser automation — one real Chrome per project, owned here on the Mac.
+  // Both engines reach this SAME controller (Claude via in-process MCP tools, Codex
+  // via a stdio shim → dispatch). Not handed to the relay dispatch as a controller;
+  // only its slimmed state/url crosses to the phone (see emit() below).
+  const browser = new BrowserController(store, publishing, emit);
+  engine.setBrowser(browser);
+  // Codex parity: a local stdio-MCP bridge codex connects to (the SAME controller).
+  const browserBridge = new BrowserBridge(browser, store);
+  browserBridge.start();
+  engine.setBrowserBridge(browserBridge);
   engine.setImageGen(async (prompt, opts) => {
     if (store.routing().image === 'codex' && engine.status('codex').available) {
       return engine.imageViaCodex(prompt, opts); // free, native — no fal credits needed
@@ -107,7 +134,7 @@ app.whenReady().then(() => {
   });
   telegram = new TelegramBot(store, engine, providers, emit);
   telegram.resumeOnBoot();
-  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, providers, emit, RELAY_URL);
+  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, providers, emit, RELAY_URL, browser);
 
   relay = new RelayClient({
     url: RELAY_URL,
@@ -120,11 +147,23 @@ app.whenReady().then(() => {
     // Mac-local image path never rides the response either. (Desktop IPC at
     // maestro:call calls dispatch directly and keeps the full job for reveal.)
     onCommand: async (method, params) => {
+      // Desktop-only methods that expose local secrets / personal data must never
+      // answer over the relay, even though dispatch is shared with the local IPC
+      // surface. getPairing returns the raw access token; listChromeProfiles
+      // returns the operator's Chrome profile display names (often their real name).
+      if (method === 'getPairing' || method === 'listChromeProfiles') throw Object.assign(new Error('not available remotely'), { statusCode: 403 });
       const r = await dispatch(method, params);
       const isJob = (x: unknown): x is Job => !!x && typeof x === 'object' && 'input' in x && 'status' in x && 'phase' in x && 'projectId' in x;
       if (isJob(r)) return store.slimJobForRelay(r);
       if (Array.isArray(r)) return r.map(x => (isJob(x) ? store.slimJobForRelay(x) : x));
       if (r && typeof r === 'object' && isJob((r as { job?: unknown }).job)) return { ...r, job: store.slimJobForRelay((r as { job: Job }).job) };
+      // Browser command results carry the FULL current URL (browserState/Navigate/
+      // Screenshot) — slim it to origin-only on the relay path, mirroring the event
+      // path, so a token-bearing URL never reaches the phone. The local IPC surface
+      // (maestro:call) bypasses onCommand and keeps the full URL for the in-app pane.
+      if (typeof method === 'string' && method.startsWith('browser') && r && typeof r === 'object' && typeof (r as { url?: unknown }).url === 'string') {
+        return { ...(r as Record<string, unknown>), url: originOf((r as { url: string }).url) };
+      }
       return r;
     },
   });
@@ -132,7 +171,7 @@ app.whenReady().then(() => {
 
   const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs));
   cron.start();
-  app.on('before-quit', () => { cron.stop(); relay?.stop(); telegram?.stop(); });
+  app.on('before-quit', () => { cron.stop(); relay?.stop(); telegram?.stop(); browserBridge.stop(); void browser.dispose(); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {
@@ -188,6 +227,13 @@ app.whenReady().then(() => {
       const b64 = (await fsp.readFile(a.localPath)).toString('base64');
       return { ok: true, data: { dataUrl: `data:${mime};base64,${b64}` } };
     } catch (e) { return { ok: false, error: (e as Error)?.message ?? 'read failed' }; }
+  });
+
+  // Live browser preview frame for the in-app Browser tab — DESKTOP-ONLY (raw PNG
+  // bytes, never an Asset, never relayed). The phone only ever sees slimmed state.
+  ipcMain.handle('maestro:browserView', async (_e, projectId: string | null) => {
+    try { return { ok: true, data: await browser.view(projectId ? String(projectId) : null) }; }
+    catch (e) { return { ok: false, error: (e as Error)?.message ?? 'browser view failed' }; }
   });
 
   /* Resolve `rel` to a canonical path that is provably INSIDE the project root.

@@ -8,9 +8,11 @@ import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
 import type { ResearchEngine } from './research.js';
 import type { PublishingEngine } from './publishing.js';
+import type { BrowserController } from './browser.js';
 import type { TelegramBot } from './telegram.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable } from './git.js';
+import { listChromeProfiles } from './chrome-profiles.js';
 
 type Params = Record<string, unknown>;
 
@@ -27,7 +29,7 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '') {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', browser?: BrowserController) {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -49,6 +51,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (typeof p.openAtLogin === 'boolean') patch.openAtLogin = p.openAtLogin;
         if (p.rescanCadence === 'daily' || p.rescanCadence === 'weekly' || p.rescanCadence === 'onchange') patch.rescanCadence = p.rescanCadence;
         if (Array.isArray(p.favoriteModels)) patch.favoriteModels = (p.favoriteModels as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 40);
+        if (typeof p.chromeProfile === 'string') { // '' = isolated; otherwise must be a real installed profile dir
+          const v = p.chromeProfile.slice(0, 64);
+          if (v === '' || listChromeProfiles().some(c => c.dir === v)) patch.chromeProfile = v;
+        }
         if (Object.keys(patch).length === 0) bad('no valid settings fields');
         const next = store.setSettings(patch);
         emit('settings', next);
@@ -456,10 +462,35 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (image) patch.image = image;
         const video = asEngine(p.video);
         if (video) patch.video = video;
+        if (p.browser === 'on' || p.browser === 'off') patch.browser = p.browser;
         if (Object.keys(patch).length === 0) bad('no valid routing fields');
         const next = store.setRouting(patch);
         emit('routing', next);
         return next;
+      }
+
+      // ── Native browser automation (one real Chrome per project) ──
+      // Results never carry a local filesystem path — screenshots come back as an
+      // Asset id, fetched as bytes only over the desktop-only maestro:assetImage IPC.
+      case 'browserAvailable': return browser ? browser.available() : { ok: false, reason: 'browser unavailable' };
+      case 'listChromeProfiles': return listChromeProfiles();
+      case 'browserState': return browser ? browser.state(p.projectId ? String(p.projectId) : null) : { open: false, url: '', title: '', tabs: 0, activeTab: 0 };
+      case 'browserNavigate': {
+        if (!browser) bad('browser unavailable', 503);
+        return browser!.navigate(p.projectId ? String(p.projectId) : null, String(p.url ?? ''));
+      }
+      case 'browserScreenshot': {
+        if (!browser) bad('browser unavailable', 503);
+        const r = await browser!.screenshot(p.projectId ? String(p.projectId) : null, { fullPage: !!p.fullPage });
+        return { assetId: r.assetId, width: r.width, height: r.height, url: r.url, title: r.title }; // no local path crosses dispatch
+      }
+      case 'browserClose': {
+        if (!browser) bad('browser unavailable', 503);
+        return browser!.close(p.projectId ? String(p.projectId) : null);
+      }
+      case 'browserFocus': {
+        if (!browser) bad('browser unavailable', 503);
+        return browser!.focus(p.projectId ? String(p.projectId) : null);
       }
 
       // ── Pairing (desktop-only; never enters relay snapshots) ──

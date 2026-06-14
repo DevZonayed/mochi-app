@@ -151,8 +151,11 @@ export interface Routing {
   video: EngineId;
   /** Model-level primary/reviewer roles (SP1). */
   roles?: Roles;
+  /** Native browser automation — 'on' makes a real Chrome available to whichever
+      engine runs the job (Claude + Codex alike); 'off' withholds the tools. */
+  browser?: 'on' | 'off';
 }
-export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex', roles: { ...DEFAULT_ROLES } };
+export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex', roles: { ...DEFAULT_ROLES }, browser: 'on' };
 
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
@@ -232,6 +235,10 @@ export interface AppSettings {
   rescanCadence: 'daily' | 'weekly' | 'onchange';
   /** Picker keys the user starred — surfaced first in the model picker. */
   favoriteModels?: string[];
+  /** Chrome profile directory (e.g. 'Default', 'Profile 1') the browser should
+      inherit cookies/logins/passwords from. Empty/undefined = isolated per-project
+      profiles (Maestro-managed). */
+  chromeProfile?: string;
 }
 export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [] };
 
@@ -313,6 +320,8 @@ export class Store {
       // migrations for stores written by older builds (dirty-flag pattern)
       if (!this.data.accessToken) { this.data.accessToken = newPairingToken(); dirty = true; }
       if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
+      // Native browser automation — default-on for stores written before it existed.
+      if (this.data.routing && !this.data.routing.browser) { this.data.routing.browser = 'on'; dirty = true; }
       // SP1: seed model-level roles on older stores from the engine-level fields.
       if (this.data.routing && !this.data.routing.roles) {
         const r = this.data.routing;

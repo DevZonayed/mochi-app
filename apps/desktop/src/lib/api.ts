@@ -164,7 +164,11 @@ export interface Routing {
   image: EngineId;
   video: EngineId;
   roles?: Roles;
+  /** Native browser automation available to whichever engine runs the job. */
+  browser?: 'on' | 'off';
 }
+export interface BrowserState { open: boolean; url: string; title: string; tabs: number; activeTab: number }
+export interface BrowserShotRef { assetId: string; width?: number; height?: number; url: string; title: string }
 export type ModelProviderId = 'claude' | 'codex' | 'cursor';
 export interface ModelDescriptor {
   key: string;
@@ -207,7 +211,10 @@ export interface AppSettings {
   openAtLogin: boolean;
   rescanCadence: 'daily' | 'weekly' | 'onchange';
   favoriteModels?: string[];
+  /** Chrome profile dir the browser inherits cookies/logins from ('' = isolated). */
+  chromeProfile?: string;
 }
+export interface ChromeProfile { dir: string; name: string }
 export interface CostsData {
   today: number;
   thisMonth: number;
@@ -311,6 +318,7 @@ interface Bridge {
   revealPath?: (p: string) => Promise<{ ok: boolean; error?: string }>;
   importAsset?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   assetImage?: (assetId: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  browserView?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   readFile?: (projectId: string, p: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   listDir?: (projectId: string, p?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   runCommand?: (projectId: string, command: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
@@ -459,6 +467,13 @@ export const api = {
     const r = await bridge.assetImage(assetId);
     if (!r.ok) return null;
     return (r.data as { dataUrl?: string })?.dataUrl ?? null;
+  },
+  /** Live browser preview frame (PNG data URL) for the in-app Browser tab — desktop only; null on web/phone. */
+  browserView: async (projectId: string | null): Promise<{ open: boolean; dataUrl?: string; url: string; title: string } | null> => {
+    if (!bridge?.browserView) return null;
+    const r = await bridge.browserView(projectId);
+    if (!r.ok) return null;
+    return r.data as { open: boolean; dataUrl?: string; url: string; title: string };
   },
   /** Read a file's text — desktop only, confined to the project folder; null in the browser. */
   readFile: async (projectId: string, p: string): Promise<{ path: string; text: string; bytes: number; truncated: boolean } | null> => {
@@ -614,6 +629,15 @@ export const api = {
   setRouting: (patch: Partial<Routing>) =>
     call<Routing>('setRouting', { ...patch }, () =>
       req<Routing>('/api/routing', { method: 'POST', body: JSON.stringify(patch) })),
+
+  // Native browser automation (one real Chrome per project; engine-agnostic).
+  browserAvailable: () => call<{ ok: boolean; reason?: string }>('browserAvailable', {}, () => req<{ ok: boolean; reason?: string }>('/api/browser/available')),
+  listChromeProfiles: () => call<ChromeProfile[]>('listChromeProfiles', {}, () => req<ChromeProfile[]>('/api/browser/profiles')),
+  browserState: (projectId: string | null) => call<BrowserState>('browserState', { projectId }, () => req<BrowserState>(`/api/browser/state?projectId=${projectId ?? ''}`)),
+  browserNavigate: (projectId: string | null, url: string) => call<{ url: string; title: string }>('browserNavigate', { projectId, url }, () => req<{ url: string; title: string }>('/api/browser/navigate', { method: 'POST', body: JSON.stringify({ projectId, url }) })),
+  browserScreenshot: (projectId: string | null, fullPage = false) => call<BrowserShotRef>('browserScreenshot', { projectId, fullPage }, () => req<BrowserShotRef>('/api/browser/screenshot', { method: 'POST', body: JSON.stringify({ projectId, fullPage }) })),
+  browserFocus: (projectId: string | null) => call<{ ok: boolean }>('browserFocus', { projectId }, () => req<{ ok: boolean }>('/api/browser/focus', { method: 'POST', body: JSON.stringify({ projectId }) })),
+  browserClose: (projectId: string | null) => call<{ ok: boolean }>('browserClose', { projectId }, () => req<{ ok: boolean }>('/api/browser/close', { method: 'POST', body: JSON.stringify({ projectId }) })),
 
   // Model registry (provider-owned catalog) + per-role (primary/reviewer) model defaults
   listModels: () => call<ModelGroup[]>('listModels', {}, () => req<ModelGroup[]>('/api/models')),

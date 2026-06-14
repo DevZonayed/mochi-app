@@ -18,6 +18,8 @@ import path from 'node:path';
 import { z } from 'zod';
 import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice } from './store.js';
 import type { PublishingEngine } from './publishing.js';
+import type { BrowserController } from './browser.js';
+import type { BrowserBridge } from './browser-bridge.js';
 import { assetsDirFor } from './media.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { ensureBranch, branchSlug } from './git.js';
@@ -274,6 +276,7 @@ async function runClaude(
   resume?: string, modelOverride?: string, plan?: boolean,
   imageGen?: ImageGenFn, projectId?: string | null,
   images?: { mime: string; b64: string }[],
+  browser?: BrowserController,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -287,12 +290,24 @@ async function runClaude(
      Disabled in plan mode (no execution / no spend during planning). It references
      `items`/`progress` (declared below) by closure — only ever invoked mid-stream,
      well after they're initialized. */
-  const imageServer = (imageGen && !plan)
+  /* Browser automation: when a real Chrome is available, give Claude a full set of
+     browser tools on the SAME `maestro` MCP server. They drive ONE persistent
+     Chrome per project (cookies/logins shared across the project's chats) via the
+     injected BrowserController — navigate, read (accessibility snapshot), act
+     (click/type/scroll), screenshot (shown inline like generate_image), inspect
+     (evaluate/console), history, and tabs. The model decides selectors from the
+     snapshot it reads. Disabled in plan mode (no execution during planning). */
+  const txt = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
+  const toolErr = (e: unknown) => ({ isError: true as const, content: [{ type: 'text' as const, text: e instanceof Error ? e.message : String(e) }] });
+  const wrap = <A,>(fn: (a: A) => Promise<{ content: { type: 'text'; text: string }[] }>) =>
+    async (a: A) => { try { return await fn(a); } catch (e) { return toolErr(e); } };
+  const pid = projectId ?? null;
+  const maestroServer = ((imageGen || browser) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
         tools: [
-          tool(
+          ...(imageGen ? [tool(
             'generate_image',
             'Generate a real raster image (PNG) from a text description and save it to the project. ' +
             'Use this WHENEVER the user asks to create, draw, render, or generate an image, logo, icon, ' +
@@ -301,21 +316,71 @@ async function runClaude(
             'reference the returned path in your reply.',
             { prompt: z.string().describe('A detailed description of the image to generate.'),
               aspect: z.enum(['1:1', '16:9', '9:16']).optional().describe('Aspect ratio. Default 1:1.') },
-            async (args) => {
-              try {
-                const res = await imageGen(args.prompt, { aspect: args.aspect, projectId });
-                items.push({ kind: 'image', text: args.prompt.slice(0, 200), imagePath: res.path,
-                  assetId: res.assetId, alt: res.alt ?? args.prompt.slice(0, 200), width: res.width, height: res.height, ts: Date.now() });
+            wrap(async (args: { prompt: string; aspect?: '1:1' | '16:9' | '9:16' }) => {
+              const res = await imageGen!(args.prompt, { aspect: args.aspect, projectId });
+              items.push({ kind: 'image', text: args.prompt.slice(0, 200), imagePath: res.path,
+                assetId: res.assetId, alt: res.alt ?? args.prompt.slice(0, 200), width: res.width, height: res.height, ts: Date.now() });
+              progress();
+              return txt(`Generated and saved the image to ${res.path}. It is now displayed in the chat.`);
+            }),
+          )] : []),
+          ...(browser ? [
+            tool('browser_navigate',
+              'Open a URL in this project\'s real Chrome browser (a persistent session — logins and cookies carry across the project\'s chats). Use this to browse the web, test a running web app, check docs, or reproduce something. Returns the final URL + page title.',
+              { url: z.string().describe('The URL to open (https:// assumed if no scheme).') },
+              wrap(async (a: { url: string }) => { const r = await browser!.navigate(pid, a.url); return txt(`Opened ${r.url} — "${r.title}"`); })),
+            tool('browser_snapshot',
+              'Read the current page as a structured accessibility snapshot (roles, names, headings, links, form fields). This is your PRIMARY way to SEE the page and decide what to click or type. Call it after navigating or after an action changes the page.',
+              {},
+              wrap(async () => { const r = await browser!.snapshot(pid); return txt(`${r.url} — ${r.title}\n\n${r.aria}`); })),
+            tool('browser_screenshot',
+              'Capture a PNG screenshot of the current page. It is shown inline in the chat automatically (use when the user wants to SEE the page, or to verify a visual result). Prefer browser_snapshot for reading content/deciding actions — it is cheaper.',
+              { fullPage: z.boolean().optional().describe('Capture the full scrollable page rather than just the viewport.') },
+              wrap(async (a: { fullPage?: boolean }) => {
+                const r = await browser!.screenshot(pid, { fullPage: a.fullPage });
+                items.push({ kind: 'image', text: `Screenshot — ${r.title || r.url}`, imagePath: r.path, assetId: r.assetId, alt: r.title || r.url, width: r.width, height: r.height, ts: Date.now() });
                 progress();
-                return { content: [{ type: 'text' as const, text: `Generated and saved the image to ${res.path}. It is now displayed in the chat.` }] };
-              } catch (e) {
-                return { isError: true, content: [{ type: 'text' as const, text: `Image generation failed: ${e instanceof Error ? e.message : String(e)}` }] };
-              }
-            },
-          ),
+                return txt(`Captured a screenshot of ${r.url}. It is shown in the chat.`);
+              })),
+            tool('browser_click',
+              'Click an element. Target it by `selector` (a Playwright/CSS selector, e.g. `button#submit`, `text=Sign in`, `role=link[name="Docs"]`) or by visible `text`. Auto-waits for the element. Returns the page URL/title after the click.',
+              { selector: z.string().optional().describe('Playwright/CSS selector.'), text: z.string().optional().describe('Visible text to click (alternative to selector).'), nth: z.number().optional().describe('0-based index when several match.') },
+              wrap(async (a: { selector?: string; text?: string; nth?: number }) => { const r = await browser!.click(pid, a); return txt(`Clicked. Now at ${r.url} — "${r.title}"`); })),
+            tool('browser_type',
+              'Type text into an input/textarea/contenteditable. Target with `selector` (defaults to the first text field). Set `submit` to press Enter after (e.g. search boxes), `clear` to empty it first.',
+              { selector: z.string().optional().describe('Selector for the field.'), text: z.string().describe('Text to type.'), submit: z.boolean().optional(), clear: z.boolean().optional() },
+              wrap(async (a: { selector?: string; text: string; submit?: boolean; clear?: boolean }) => { const r = await browser!.type(pid, a); return txt(`Typed${a.submit ? ' and submitted' : ''}. Now at ${r.url}`); })),
+            tool('browser_press', 'Press a keyboard key or chord on the page (e.g. "Enter", "Escape", "Control+a", "PageDown").',
+              { keys: z.string().describe('Key or chord, Playwright syntax.') },
+              wrap(async (a: { keys: string }) => { await browser!.press(pid, a.keys); return txt(`Pressed ${a.keys}.`); })),
+            tool('browser_scroll', 'Scroll the page vertically. Positive `dy` scrolls down, negative up (default 600).',
+              { dy: z.number().optional() },
+              wrap(async (a: { dy?: number }) => { await browser!.scroll(pid, { dy: a.dy }); return txt('Scrolled.'); })),
+            tool('browser_wait', 'Wait for an element (`selector` or `text`) to appear, or a fixed `ms` delay, before the next step.',
+              { selector: z.string().optional(), text: z.string().optional(), ms: z.number().optional() },
+              wrap(async (a: { selector?: string; text?: string; ms?: number }) => { await browser!.waitFor(pid, a); return txt('Done waiting.'); })),
+            tool('browser_evaluate', 'Run a JavaScript expression in the page and return its value (JSON-stringified, truncated). Use for reading data the snapshot doesn\'t show, or precise DOM queries.',
+              { expression: z.string().describe('A JS expression, e.g. `document.title` or `[...document.querySelectorAll("a")].map(a=>a.href)`.') },
+              wrap(async (a: { expression: string }) => { const r = await browser!.evaluate(pid, a.expression); return txt(r.result); })),
+            tool('browser_console', 'Read recent console messages and page errors from the current session (most recent last).', {},
+              wrap(async () => { const r = await browser!.console(pid); return txt(r.messages.slice(-40).join('\n') || '(no console output)'); })),
+            tool('browser_back', 'Go back in history.', {}, wrap(async () => { const r = await browser!.back(pid); return txt(`Back at ${r.url} — "${r.title}"`); })),
+            tool('browser_forward', 'Go forward in history.', {}, wrap(async () => { const r = await browser!.forward(pid); return txt(`Forward at ${r.url} — "${r.title}"`); })),
+            tool('browser_reload', 'Reload the current page.', {}, wrap(async () => { const r = await browser!.reload(pid); return txt(`Reloaded ${r.url}`); })),
+            tool('browser_tabs', 'List the open tabs in this session (index, title, url; * marks the active one).', {},
+              wrap(async () => { const r = await browser!.listTabs(pid); return txt(r.tabs.map(t => `[${t.index}]${t.active ? '*' : ' '} ${t.title} — ${t.url}`).join('\n') || '(no tabs)'); })),
+            tool('browser_new_tab', 'Open a new tab (optionally at a URL) and switch to it.', { url: z.string().optional() },
+              wrap(async (a: { url?: string }) => { const r = await browser!.newTab(pid, a.url); return txt(`New tab at ${r.url}`); })),
+            tool('browser_select_tab', 'Switch to a tab by its index (from browser_tabs).', { index: z.number() },
+              wrap(async (a: { index: number }) => { const r = await browser!.selectTab(pid, a.index); return txt(`Switched to ${r.url} — "${r.title}"`); })),
+          ] : []),
         ],
       })
     : null;
+  const maestroAllowed = [
+    ...(imageGen ? ['generate_image'] : []),
+    ...(browser ? ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_press', 'browser_scroll', 'browser_wait', 'browser_evaluate', 'browser_console', 'browser_back', 'browser_forward', 'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab'] : []),
+  ].map(n => `mcp__maestro__${n}`);
   /* Vision input: when the user attached images, the prompt becomes a streamed
      user message carrying text + base64 image blocks (a plain string can't hold
      images). Verified the SDK accepts this with resume/abort. Otherwise the
@@ -352,7 +417,7 @@ async function runClaude(
       // generate_image: in-process MCP server + auto-allow its fully-qualified name.
       // Under 'bypassPermissions' tools auto-run; allowedTools future-proofs any
       // non-bypass mode. In plan mode imageServer is null so the tool is absent.
-      ...(imageServer ? { mcpServers: { maestro: imageServer }, allowedTools: ['mcp__maestro__generate_image'] } : {}),
+      ...(maestroServer ? { mcpServers: { maestro: maestroServer }, allowedTools: maestroAllowed } : {}),
       ...(modelOverride ? { model: modelOverride } : {}),
       ...(resume ? { resume } : {}),
       ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
@@ -479,14 +544,23 @@ async function runClaude(
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
 function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
-  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean },
+  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; browserBridge?: BrowserBridge },
   imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex CLI not found on this Mac'), { statusCode: 503 }));
   const outFile = path.join(tmpdir(), `maestro-codex-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
+  // Native browser for codex (parity with Claude): register a per-run stdio MCP
+  // that forwards to the SAME BrowserController. Codex's sandbox auto-cancels MCP
+  // tool calls unless it's at danger-full-access + approval_policy=never (probe-
+  // proven), so a browser-enabled run relaxes the sandbox — matching Claude, which
+  // already runs bypassPermissions. Never on the read-only reviewer pass.
+  const bridge = (!readOnly && ctx?.browserBridge) ? ctx.browserBridge : undefined;
+  const browserReg = bridge ? bridge.register(ctx!.projectId ?? null) : undefined;
+  const sandbox = browserReg ? 'danger-full-access' : (readOnly ? 'read-only' : 'workspace-write');
   const args = [
     'exec', '--json', '--ephemeral', '--skip-git-repo-check',
-    '-s', readOnly ? 'read-only' : 'workspace-write',
+    '-s', sandbox,
+    ...(browserReg ? ['-c', 'approval_policy=never', '-c', browserReg.mcpServerConfig] : []),
     ...(model ? ['-m', model] : []),
     ...(imageFiles ?? []).flatMap(f => ['-i', f]), // vision input — codex attaches the image(s)
     '-C', cwd, '-o', outFile,
@@ -569,9 +643,10 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
       while ((nl = buf.indexOf('\n')) >= 0) { consumeLine(buf.slice(0, nl)); buf = buf.slice(nl + 1); }
     });
     child.stderr.on('data', (d: Buffer) => { stderr += String(d); });
-    child.on('error', (e) => { clearTimeout(killer); reject(Object.assign(new Error(`Codex failed to start: ${e.message}`), { statusCode: 500 })); });
+    child.on('error', (e) => { clearTimeout(killer); browserReg?.release(); reject(Object.assign(new Error(`Codex failed to start: ${e.message}`), { statusCode: 500 })); });
     child.on('close', (code, sig) => {
       clearTimeout(killer);
+      browserReg?.release(); // invalidate the run's browser token (codex has exited)
       if (hooks.signal?.aborted) { reject(new CancelledError()); return; }
       let tokens = 0;
       for (const line of stdout.split('\n')) {
@@ -640,6 +715,11 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
         }
         images = out.length ? out : undefined;
       }
+      // Browser screenshots codex took this run → fold in as inline images too.
+      if (bridge && browserReg) {
+        const shots = bridge.collectShots(browserReg.shots);
+        if (shots.length) images = [...(images ?? []), ...shots];
+      }
       // Subscription run — Codex doesn't bill per-token, so cost stays 0.
       resolve({ text: text || proseOf(items) || '(no output)', tokens, cost: 0, model: model ?? 'codex', transcript: items, images });
     });
@@ -663,6 +743,26 @@ export class LocalEngine {
   setImageGen(fn: ImageGenFn) { this.imageGen = fn; }
   private publishing?: PublishingEngine;
   setPublishing(p: PublishingEngine) { this.publishing = p; }
+  /* Native browser automation — one real Chrome per project, driven by Playwright.
+     A global capability available to WHICHEVER engine runs the job (not routed to
+     one). Claude reaches it via in-process MCP tools (below); codex via a stdio
+     shim that forwards to this same controller. Injected from main.ts. */
+  private browser?: BrowserController;
+  setBrowser(b: BrowserController) { this.browser = b; }
+  /** Codex parity: a stdio-MCP bridge to the SAME BrowserController. */
+  private browserBridge?: BrowserBridge;
+  setBrowserBridge(b: BrowserBridge) { this.browserBridge = b; }
+  /** The browser backend to hand a run, honouring Settings (routing.browser) and
+      that a real Chrome is actually present. Undefined → no browser tools this run. */
+  private browserFor(): BrowserController | undefined {
+    if (!this.browser) return undefined;
+    if (this.store.routing().browser === 'off') return undefined;
+    return this.browser.available().ok ? this.browser : undefined;
+  }
+  /** The codex-side bridge, enabled under the same gate as browserFor(). */
+  private browserBridgeFor(): BrowserBridge | undefined {
+    return this.browserFor() ? this.browserBridge : undefined;
+  }
 
   /** Generate an image via Codex's FREE native image_gen skill (no fal credits).
       Backs the generate_image tool when Settings → Image generation = Codex. Runs
@@ -889,9 +989,9 @@ export class LocalEngine {
         onChild: (child) => { handle.child = child; },
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
-      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input) };
+      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input), browserBridge: this.browserBridgeFor() };
       const main = master === 'claude'
-        ? await runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages)
+        ? await runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, this.browserFor())
         : await runCodex(prompt, cwd, hooks, false, masterModel, imageCtx, codexImageFiles);
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {
         try { this.store.updateSession(session.id, { sdkSessionId: main.sdkSessionId }); } catch { /* session deleted mid-run */ }
@@ -955,7 +1055,7 @@ export class LocalEngine {
           let fix: EngineRun;
           try {
             fix = master === 'claude'
-              ? await runClaude(fixPrompt, cwd, effort, anthropicKey, undefined, fixHooks, primaryResume, masterModel, false, this.imageGen, job.projectId)
+              ? await runClaude(fixPrompt, cwd, effort, anthropicKey, undefined, fixHooks, primaryResume, masterModel, false, this.imageGen, job.projectId, undefined, this.browserFor())
               : await runCodex(fixPrompt, cwd, fixHooks, false, masterModel, imageCtx);
           } catch (fe) { if (fe instanceof CancelledError) throw fe; break; }
           allItems.push(...fix.transcript);

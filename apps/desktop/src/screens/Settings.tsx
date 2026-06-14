@@ -16,7 +16,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, TrafficLights, Sidebar, Toolbar,
   type Theme,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ChromeProfile, IS_LOCAL } from '../lib/api';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
@@ -232,6 +232,18 @@ function EnginesPane() {
   const [roles, setRolesState] = React.useState<Roles | null>(null);
   const groups = useModelGroups();
   const [favorites, setFavorites] = React.useState<string[]>([]);
+  const [browserAvail, setBrowserAvail] = React.useState<{ ok: boolean; reason?: string } | null>(null);
+  const [appSettings, setAppSettings] = React.useState<AppSettings | null>(null);
+  const [chromeProfiles, setChromeProfiles] = React.useState<ChromeProfile[]>([]);
+  React.useEffect(() => {
+    void api.browserAvailable().then(setBrowserAvail).catch(() => setBrowserAvail({ ok: false }));
+    void api.getSettings().then(setAppSettings).catch(() => {});
+    void api.listChromeProfiles().then(setChromeProfiles).catch(() => {});
+  }, []);
+  const setChromeProfile = (dir: string) => {
+    setAppSettings(s => (s ? { ...s, chromeProfile: dir } : s));
+    void api.setSettings({ chromeProfile: dir }).then(setAppSettings).catch(() => {});
+  };
 
   const refetch = React.useCallback(() => {
     Promise.all([api.getRouting(), api.engineStatus(), api.getRoles()])
@@ -261,6 +273,10 @@ function EnginesPane() {
     const value = labelToEngine(label);
     setRouting(r => (r ? { ...r, [key]: value } as Routing : r));
     void api.setRouting({ [key]: value } as Partial<Routing>).then(setRouting).catch(() => {});
+  };
+  const setBrowserMode = (mode: 'on' | 'off') => {
+    setRouting(r => (r ? { ...r, browser: mode } : r));
+    void api.setRouting({ browser: mode }).then(setRouting).catch(() => {});
   };
 
   // ONE source of truth: the same status the run path uses, so the pane can
@@ -305,6 +321,35 @@ function EnginesPane() {
             </Row>
           ))}
         </GroupedList>
+        <GroupedList header="Browser" footer="One browser per project — shared across the project's chats (logins & cookies carry over), driven by whichever engine runs the job. When on, Codex runs with full access (matching how Claude already runs) so it can use the browser too.">
+          <Row last={chromeProfiles.length === 0}>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Browser automation</span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: browserAvail && !browserAvail.ok ? 'var(--orange, #d9821b)' : 'var(--ink-secondary)', marginTop: 2 }}>
+                {browserAvail ? (browserAvail.ok ? 'A real Chrome is ready for your agents to drive.' : (browserAvail.reason ?? 'Google Chrome not found.')) : 'Checking for Chrome…'}
+              </span>
+            </span>
+            {routing
+              ? <Seg options={['On', 'Off']} value={routing.browser === 'off' ? 'Off' : 'On'} onChange={v => setBrowserMode(v === 'On' ? 'on' : 'off')} />
+              : <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</span>}
+          </Row>
+          {chromeProfiles.length > 0 && (
+            <Row last>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Chrome profile</span>
+                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
+                  {appSettings?.chromeProfile ? 'Inherits this profile’s logins, history & saved passwords. Quit Chrome first to use it.' : 'Isolated: a fresh profile per project (no sign-ins carried over).'}
+                </span>
+              </span>
+              <select value={appSettings?.chromeProfile || ''} onChange={e => setChromeProfile(e.target.value)}
+                style={{ height: 30, maxWidth: 200, padding: '0 8px', borderRadius: 8, border: '1px solid var(--hairline)', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
+                <option value="">Isolated (per project)</option>
+                {chromeProfiles.map(p => <option key={p.dir} value={p.dir}>{p.name}</option>)}
+              </select>
+            </Row>
+          )}
+        </GroupedList>
+
         <GroupedList header="Engine status" footer="Engines use your own sign-ins on this Mac — Claude Code (`claude login`) and Codex (ChatGPT). Cursor needs its agent CLI installed.">
           {ENGINE_STATUS_ROWS.map((row) => {
             const s = engines?.[row.id];
