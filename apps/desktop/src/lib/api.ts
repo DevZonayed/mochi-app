@@ -47,6 +47,8 @@ export interface TranscriptItem {
   name?: string;
   toolStatus?: 'running' | 'done' | 'error';
   verdict?: 'approved' | 'needs-work';
+  /** review only: the primary fixed the flagged findings → show as resolved. */
+  resolved?: boolean;
   durMs?: number;
   /** file-writing tools only: capped snapshot of the written content (hover preview). */
   preview?: string;
@@ -219,6 +221,16 @@ export interface AppSettings {
 export interface ChromeProfile { dir: string; name: string }
 /** Per-project .continuum memory: the durable STATE + checkpoint chain (newest first). */
 export interface ProjectMemory { state: string; checkpoints: { id: number; summary: string }[] }
+/** A note anchored to a specific element of a live design (by CSS selector). */
+export interface DesignComment {
+  id: string;
+  projectId: string;
+  selector: string;
+  label: string;
+  note: string;
+  status: 'open' | 'resolved';
+  createdAt: number;
+}
 export interface CostsData {
   today: number;
   thisMonth: number;
@@ -456,6 +468,15 @@ export const api = {
   /** Commit a referable snapshot of the project (design + attachments). */
   snapshotProject: (id: string, message?: string) =>
     call<{ ok: boolean; hash?: string; reason?: string }>('snapshotProject', { id, message }, () => req<{ ok: boolean; hash?: string; reason?: string }>(`/api/projects/${encodeURIComponent(id)}/snapshot`, { method: 'POST', body: JSON.stringify({ message }) })),
+  // Per-element design comments (Mochi-style commenting over the live preview). Desktop-only.
+  listDesignComments: (id: string) =>
+    call<{ comments: DesignComment[] }>('listDesignComments', { id }, () => Promise.reject(new Error('desktop only'))),
+  addDesignComment: (id: string, input: { selector: string; label: string; note: string }) =>
+    call<{ comment: DesignComment }>('addDesignComment', { id, ...input }, () => Promise.reject(new Error('desktop only'))),
+  setDesignCommentStatus: (id: string, commentId: string, status: 'open' | 'resolved') =>
+    call<{ ok: true }>('setDesignCommentStatus', { id, commentId, status }, () => Promise.reject(new Error('desktop only'))),
+  deleteDesignComment: (id: string, commentId: string) =>
+    call<{ ok: true }>('deleteDesignComment', { id, commentId }, () => Promise.reject(new Error('desktop only'))),
 
   // Coding agent: clone a repo / open a folder / inspect git (desktop owns git)
   gitAvailable: () => call<{ available: boolean }>('gitAvailable', {}, () => Promise.resolve({ available: false })),

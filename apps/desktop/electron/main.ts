@@ -58,6 +58,69 @@ const DESIGN_PLACEHOLDER = `<!doctype html><meta charset="utf8"><style>
   <div class="c"><div class="d"></div><h1>Your design will appear here</h1>
   <p>Describe what you want in the chat — the agent builds a live, self-contained design you can refine and hand off to code.</p></div>`;
 
+/* Comment harness injected into every served design page (Mochi-style commenting).
+   Runs inside the iframe; talks to the DesignWorkspace via postMessage. When the
+   parent enables "comment mode", hovering highlights the element under the cursor
+   and a click captures a robust CSS selector + a human label, posted back to the
+   parent. The parent persists the note and feeds the comment list to the design
+   agent. The parent also pushes the existing comments so we draw numbered pins.
+   Inert (no DOM interception) until comment mode is turned on. */
+const DESIGN_COMMENT_HARNESS = `(function(){
+  if (window.__maestroComments) return; window.__maestroComments = true;
+  var mode=false, hover=null, markers=[];
+  var box=document.createElement('div');
+  box.style.cssText='position:fixed;z-index:2147483646;pointer-events:none;border:2px solid #2f81f7;background:rgba(47,129,247,.12);border-radius:4px;display:none;box-sizing:border-box';
+  var pins=document.createElement('div');
+  pins.style.cssText='position:fixed;inset:0;z-index:2147483645;pointer-events:none';
+  function ready(){ try{ document.body.appendChild(box); document.body.appendChild(pins); }catch(_){} }
+  if (document.body) ready(); else document.addEventListener('DOMContentLoaded', ready);
+  function esc(s){ try{ return CSS.escape(s); }catch(_){ return s; } }
+  function cssPath(el){
+    if(!(el instanceof Element)) return '';
+    if(el.id) return '#'+esc(el.id);
+    var parts=[];
+    while(el && el.nodeType===1 && el!==document.body && parts.length<6){
+      var sel=el.nodeName.toLowerCase(), p=el.parentNode;
+      if(p){ var sibs=Array.prototype.filter.call(p.children,function(c){return c.nodeName===el.nodeName;});
+        if(sibs.length>1) sel+=':nth-of-type('+(Array.prototype.indexOf.call(sibs,el)+1)+')'; }
+      parts.unshift(sel); el=el.parentElement;
+    }
+    return parts.join(' > ');
+  }
+  function label(el){
+    var tag=el.nodeName.toLowerCase();
+    var t=(el.textContent||'').replace(/\\s+/g,' ').trim().slice(0,42);
+    return tag+(t?' \\u00b7 \\u201c'+t+'\\u201d':'');
+  }
+  function frame(el){ var r=el.getBoundingClientRect(); box.style.display='block'; box.style.left=r.left+'px'; box.style.top=r.top+'px'; box.style.width=r.width+'px'; box.style.height=r.height+'px'; }
+  function onMove(e){ if(!mode) return; var el=document.elementFromPoint(e.clientX,e.clientY); if(!el||el===box||el===pins) return; hover=el; frame(el); }
+  function onClick(e){ if(!mode) return; e.preventDefault(); e.stopPropagation(); var el=hover||document.elementFromPoint(e.clientX,e.clientY); if(!el) return; parent.postMessage({__maestroDesign:true,type:'comment-pick',selector:cssPath(el),label:label(el)},'*'); return false; }
+  document.addEventListener('mousemove',onMove,true);
+  document.addEventListener('click',onClick,true);
+  document.addEventListener('keydown',function(e){ if(mode&&e.key==='Escape'){ setMode(false); parent.postMessage({__maestroDesign:true,type:'comment-cancel'},'*'); } },true);
+  function setMode(on){ mode=on; try{ document.documentElement.style.cursor=on?'crosshair':''; }catch(_){} if(!on) box.style.display='none'; }
+  function renderPins(){
+    pins.innerHTML='';
+    markers.forEach(function(m){
+      try{ var el=document.querySelector(m.selector); if(!el) return; var r=el.getBoundingClientRect();
+        var pin=document.createElement('div');
+        pin.style.cssText='position:absolute;transform:translate(-50%,-50%) rotate(45deg);width:20px;height:20px;border-radius:50% 50% 50% 0;background:'+(m.status==='resolved'?'#2da44e':'#fb8500')+';border:2px solid #fff;box-shadow:0 1px 5px rgba(0,0,0,.45)';
+        var s=document.createElement('span'); s.textContent=m.n; s.style.cssText='display:block;transform:rotate(-45deg);color:#fff;font:700 11px/16px system-ui;text-align:center;width:100%';
+        pin.appendChild(s); pin.style.left=(r.left+9)+'px'; pin.style.top=(r.top+9)+'px'; pins.appendChild(pin);
+      }catch(_){}
+    });
+  }
+  window.addEventListener('scroll',renderPins,true);
+  window.addEventListener('resize',renderPins,true);
+  setInterval(renderPins,700);
+  window.addEventListener('message',function(e){
+    var d=e.data; if(!d||!d.__maestro) return;
+    if(d.type==='comment-mode') setMode(!!d.on);
+    if(d.type==='comment-markers'){ markers=Array.isArray(d.items)?d.items:[]; renderPins(); }
+    if(d.type==='flash'&&d.selector){ try{ var el=document.querySelector(d.selector); if(el){ el.scrollIntoView({behavior:'smooth',block:'center'}); frame(el); setTimeout(function(){ if(!mode) box.style.display='none'; },1300); } }catch(_){} }
+  });
+})();`;
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1320,
@@ -142,7 +205,15 @@ app.whenReady().then(() => {
       const buf = await fsp.readFile(real);
       const mime = DESIGN_MIME[path.extname(real).toLowerCase()] ?? 'application/octet-stream';
       const headers: Record<string, string> = { 'content-type': mime, 'cache-control': 'no-cache' };
-      if (mime === 'text/html') headers['content-security-policy'] = DESIGN_CSP;
+      if (mime === 'text/html') {
+        headers['content-security-policy'] = DESIGN_CSP;
+        // Inject the Mochi-style comment harness so the operator can annotate
+        // specific elements of the live design (selectors → notes → the agent).
+        let html = buf.toString('utf8');
+        const tag = `<script>${DESIGN_COMMENT_HARNESS}</script>`;
+        html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, tag + '</body>') : html + tag;
+        return new Response(html, { headers });
+      }
       return new Response(new Uint8Array(buf), { headers });
     } catch { return new Response('error', { status: 500 }); }
   });
@@ -229,7 +300,8 @@ app.whenReady().then(() => {
       // *ProjectMemory + snapshotProject methods read/write project files and run
       // git on the Mac — none may answer over the relay (phone/web are read-mostly
       // remote controls, not local-execution surfaces).
-      if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject') {
+      if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject'
+        || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment') {
         throw Object.assign(new Error('not available remotely'), { statusCode: 403 });
       }
       const r = await dispatch(method, params);

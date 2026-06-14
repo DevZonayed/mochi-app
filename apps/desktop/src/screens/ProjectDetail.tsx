@@ -1462,15 +1462,20 @@ function TurnMeta({ job, elapsed, toolCount, live }: { job: Job; elapsed: string
 /* A reviewer's verdict block (SP3): the second engine's findings + APPROVED /
    NEEDS WORK, tinted green/orange. Fix rounds stream in as normal turns after. */
 function ReviewCard({ item }: { item: TranscriptItem }) {
-  const needsWork = item.verdict === 'needs-work';
+  // The primary addressed a needs-work review → show it as RESOLVED (green), not a
+  // lingering "needs work", so the finished thread reads as solved.
+  const resolved = !!item.resolved;
+  const needsWork = item.verdict === 'needs-work' && !resolved;
   const tint = needsWork ? 'var(--orange)' : 'var(--green)';
+  const label = resolved ? 'Resolved' : needsWork ? 'Needs work' : 'Approved';
   return (
     <div style={{ margin: '8px 0 2px', border: `0.5px solid color-mix(in srgb, ${tint} 38%, var(--separator))`, borderRadius: 12, background: `color-mix(in srgb, ${tint} 6%, var(--bg-elevated))`, overflow: 'hidden' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: '0.5px solid var(--separator)' }}>
-        <Icon name="shield" size={14} style={{ color: tint, flexShrink: 0 }} />
+        <Icon name={resolved ? 'checkCircle' : 'shield'} size={14} style={{ color: tint, flexShrink: 0 }} />
         <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Reviewer · {item.name ?? 'review'}</span>
+        {resolved && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>· addressed by the agent</span>}
         <span style={{ flex: 1 }} />
-        <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: tint, textTransform: 'uppercase' }}>{needsWork ? 'Needs work' : 'Approved'}</span>
+        <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: tint, textTransform: 'uppercase' }}>{label}</span>
       </div>
       <div style={{ padding: '6px 12px 8px' }}>{renderChatBody(item.text, 'rvb')}</div>
     </div>
@@ -1686,7 +1691,6 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
             </span>
           )}
           <span style={{ flex: 1 }} />
-          {(live || job.tokens > 0 || job.cost > 0) && <TurnMeta job={job} elapsed={elapsed} toolCount={toolCount} live={live} />}
           {job.status === 'done' && replyText && <CopyButton text={replyText} className="turn-copy" />}
         </div>
         {body}
@@ -1715,6 +1719,13 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
         {job.status === 'cancelled' && (
           <div style={{ marginTop: 5, display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
             <Icon name="x" size={11} stroke={2.4} /> Stopped
+          </div>
+        )}
+        {/* Timing / tokens / cost at the BOTTOM of the message so it stays visible
+            no matter how long the reply scrolls. */}
+        {(live || job.tokens > 0 || job.cost > 0) && (
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: hasBody ? 8 : 4 }}>
+            <TurnMeta job={job} elapsed={elapsed} toolCount={toolCount} live={live} />
           </div>
         )}
       </div>

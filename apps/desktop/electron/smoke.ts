@@ -126,6 +126,20 @@ export async function runSmoke(ctx: Ctx): Promise<number> {
     return `committed ${r.hash}`;
   });
 
+  await T('design comments (add → list → resolve → delete)', async () => {
+    const added = await dispatch('addDesignComment', { id: designProj?.id, selector: 'header h1', label: 'h1 · "Brew"', note: 'Make the headline larger.' }) as any;
+    if (!added?.comment?.id) throw new Error('addDesignComment returned no comment');
+    let list = (await dispatch('listDesignComments', { id: designProj?.id }) as any).comments;
+    if (!Array.isArray(list) || list.length !== 1 || list[0].status !== 'open') throw new Error('comment did not persist as open');
+    await dispatch('setDesignCommentStatus', { id: designProj?.id, commentId: added.comment.id, status: 'resolved' });
+    list = (await dispatch('listDesignComments', { id: designProj?.id }) as any).comments;
+    if (list[0].status !== 'resolved') throw new Error('resolve did not stick');
+    await dispatch('deleteDesignComment', { id: designProj?.id, commentId: added.comment.id });
+    list = (await dispatch('listDesignComments', { id: designProj?.id }) as any).comments;
+    if (list.length !== 0) throw new Error('delete did not remove the comment');
+    return 'add/list/resolve/delete OK';
+  });
+
   const pass = results.filter(r => r.ok).length;
   console.log('\n══════════ RESULTS ══════════');
   for (const r of results) console.log(`${r.ok ? '✅' : '❌'} ${r.name}${r.ok ? `  ·  ${r.detail}` : `  —  ${r.detail}`}`);

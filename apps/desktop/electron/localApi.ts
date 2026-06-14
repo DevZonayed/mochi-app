@@ -111,6 +111,26 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!proj) return bad('project not found', 404);
         return snapshotProject(projectRootOf(proj), typeof p.message === 'string' ? p.message : 'snapshot');
       }
+      // Per-element design comments (Mochi-style commenting over the live preview).
+      case 'listDesignComments': {
+        return { comments: store.listDesignComments(String(p.id ?? '')) };
+      }
+      case 'addDesignComment': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (!proj) return bad('project not found', 404);
+        const c = store.addDesignComment(proj.id, {
+          selector: String(p.selector ?? ''), label: String(p.label ?? ''), note: String(p.note ?? ''),
+        });
+        return { comment: c };
+      }
+      case 'setDesignCommentStatus': {
+        store.setDesignCommentStatus(String(p.id ?? ''), String(p.commentId ?? ''), p.status === 'resolved' ? 'resolved' : 'open');
+        return { ok: true };
+      }
+      case 'deleteDesignComment': {
+        store.deleteDesignComment(String(p.id ?? ''), String(p.commentId ?? ''));
+        return { ok: true };
+      }
       case 'createProject': {
         if (!p.name || typeof p.name !== 'string') bad('name required');
         const kind = (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') ? (p.kind as ProjectKind) : undefined;

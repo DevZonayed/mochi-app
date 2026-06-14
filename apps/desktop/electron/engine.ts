@@ -1135,7 +1135,8 @@ export class LocalEngine {
               : await runCodex(reviewPrompt, cwd, {}, true, reviewerModel);
           } catch (re) { if (re instanceof CancelledError) throw re; break; }
           reviewVerdict = /verdict:\s*needs\s*work/i.test(review.text) ? 'needs-work' : 'approved';
-          allItems.push({ kind: 'review', name: ENGINE_LABEL[reviewer], text: review.text, verdict: reviewVerdict, ts: Date.now() });
+          const reviewItem: TranscriptItem = { kind: 'review', name: ENGINE_LABEL[reviewer], text: review.text, verdict: reviewVerdict, ts: Date.now() };
+          allItems.push(reviewItem);
           tokens += review.tokens; cost = Math.round((cost + review.cost) * 1000) / 1000;
           this.emit('job', this.store.updateJob(jobId, { transcript: allItems.slice(-400), tokens, cost, progress: 92 }));
           if (reviewVerdict === 'approved' || !wroteFiles || round + 1 >= REVIEW_MAX_ROUNDS) break;
@@ -1152,6 +1153,7 @@ export class LocalEngine {
               ? await runClaude(fixPrompt, cwd, effort, anthropicKey, undefined, fixHooks, primaryResume, masterModel, false, this.imageGen, job.projectId, undefined, this.browserFor())
               : await runCodex(fixPrompt, cwd, fixHooks, false, masterModel, imageCtx);
           } catch (fe) { if (fe instanceof CancelledError) throw fe; break; }
+          reviewItem.resolved = true; // the primary went on to address these findings
           allItems.push(...fix.transcript);
           foldImages(fix.images);
           if (fix.sdkSessionId) { primaryResume = fix.sdkSessionId; if (isChat) { try { this.store.updateSession(session.id, { sdkSessionId: fix.sdkSessionId }); } catch { /* gone */ } } }

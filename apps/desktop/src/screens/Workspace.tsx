@@ -226,7 +226,7 @@ export default function Workspace() {
       setExpanded(e => new Set(e).add(proj.id));
     } catch { /* cancelled or failed */ }
   };
-  const recents = projects.filter(p => p.path).slice(0, 5);
+  const recents = projects.filter(p => p.path && projKind(p) !== 'design').slice(0, 5);
 
   // keep the active tab in view + recompute whether the strip overflows
   React.useLayoutEffect(() => {
@@ -291,13 +291,15 @@ export default function Workspace() {
   const chatHit = (s: ChatSession) => !q || s.title.toLowerCase().includes(q);
   const projHit = (p: Project) => !q || p.name.toLowerCase().includes(q) || sessions.some(s => s.projectId === p.id && s.title.toLowerCase().includes(q));
 
-  const kindCount = (k: KindFilter) => (k === 'all' ? projects.length : projects.filter(p => projKind(p) === k).length);
-  const visibleProjects = projects.filter(p => kindMatch(p) && projHit(p));
+  // CodeSpace shows coding work only — design projects live in the Design tab.
+  const codeProjects = projects.filter(p => projKind(p) !== 'design');
+  const kindCount = (k: KindFilter) => (k === 'all' ? codeProjects.length : codeProjects.filter(p => projKind(p) === k).length);
+  const visibleProjects = codeProjects.filter(p => kindMatch(p) && projHit(p));
   const sessionsByProject = (pid: string) => {
     const p = projById[pid];
     return sessions.filter(s => s.projectId === pid && (!q || chatHit(s) || (p && p.name.toLowerCase().includes(q)))).sort((a, b) => b.updatedAt - a.updatedAt);
   };
-  const pinned = sessions.filter(s => s.pinned && kindMatch(projById[s.projectId]) && (chatHit(s) || (projById[s.projectId]?.name.toLowerCase().includes(q) ?? false))).sort((a, b) => b.updatedAt - a.updatedAt);
+  const pinned = sessions.filter(s => s.pinned && projKind(projById[s.projectId]) !== 'design' && kindMatch(projById[s.projectId]) && (chatHit(s) || (projById[s.projectId]?.name.toLowerCase().includes(q) ?? false))).sort((a, b) => b.updatedAt - a.updatedAt);
 
   // a session row in the tree
   const SessionRow = ({ s, indent }: { s: ChatSession; indent: number }) => {
@@ -343,7 +345,7 @@ export default function Workspace() {
         <div style={{ width: 260, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 14px 10px' }}>
             <Icon name="terminal" size={16} style={{ color: 'var(--blue)' }} />
-            <span style={{ flex: 1, font: '700 var(--fs-callout)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Workspace</span>
+            <span style={{ flex: 1, font: '700 var(--fs-callout)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>CodeSpace</span>
             <div style={{ position: 'relative' }}>
               <button onClick={() => setAddOpen(o => !o)} title="Add a project" className="ws-newbtn" style={{ width: 28, height: 28, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'transparent', color: addOpen ? 'var(--ink)' : 'var(--ink-tertiary)' }}>
                 <Icon name="plus" size={16} stroke={2.4} />

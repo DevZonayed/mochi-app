@@ -17,7 +17,7 @@ export interface NavRoute {
 
 export const NAV_ROUTES: NavRoute[] = [
   { key: 'home', path: '/command-center', label: 'Home', icon: 'home' },
-  { key: 'workspace', path: '/workspace', label: 'Workspace', icon: 'terminal' },
+  { key: 'workspace', path: '/workspace', label: 'CodeSpace', icon: 'terminal' },
   { key: 'design', path: '/design-workspace', label: 'Design', icon: 'brush' },
   { key: 'projects', path: '/projects', label: 'Projects', icon: 'layers' },
   { key: 'jobs', path: '/job-monitor', label: 'Jobs', icon: 'jobs' },

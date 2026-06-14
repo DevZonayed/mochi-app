@@ -3,13 +3,16 @@
    self-contained, live-previewable HTML artifact, refines it in place, pulls in
    generated imagery, and you can hand the result off to code. Left = the design
    conversation (the shared ChatThread, in design mode via the project's kind);
-   right = a live preview served over the maestro-design:// protocol. */
+   right = a live preview served over the maestro-design:// protocol. The split is
+   draggable (like the CodeSpace), the preview can go full-screen, and generated
+   images open in an in-place modal (there's no tab system on this surface). */
 
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AppShell } from '../lib/appShell';
 import { Icon } from '../lib/icons';
-import { api, IS_LOCAL, type Project, type ChatSession } from '../lib/api';
+import { ImageViewer } from '../lib/CodeView';
+import { api, IS_LOCAL, type Project, type ChatSession, type DesignComment } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
 
 const DEVICES = [
@@ -17,6 +20,20 @@ const DEVICES = [
   { key: 'tablet', label: 'Tablet', w: 834, icon: 'smartphone' as const },
   { key: 'phone', label: 'Phone', w: 390, icon: 'smartphone' as const },
 ];
+
+/* Smoother, thinner scrollbar for the preview + image modal — the OS default
+   scrollbar reads as chunky inside the canvas. Scoped via the .ds-scroll class. */
+const DS_SCROLL_CSS = `
+.ds-scroll { scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: var(--fill-secondary) transparent; }
+.ds-scroll::-webkit-scrollbar { width: 11px; height: 11px; }
+.ds-scroll::-webkit-scrollbar-track { background: transparent; }
+.ds-scroll::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 9px; border: 3px solid transparent; background-clip: padding-box; }
+.ds-scroll::-webkit-scrollbar-thumb:hover { background: var(--ink-quaternary, var(--fill-strong, var(--ink-tertiary))); background-clip: padding-box; }
+.ds-splitter { transition: background .12s ease; }
+.ds-splitter:hover, .ds-splitter.dragging { background: var(--blue); }
+@keyframes dsPulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.7); } }
+.ds-pulse { animation: dsPulse 1.1s ease-in-out infinite; }
+`;
 
 export default function DesignWorkspace() {
   const navigate = useNavigate();
@@ -29,6 +46,28 @@ export default function DesignWorkspace() {
   const [creating, setCreating] = React.useState(false);
   const [newName, setNewName] = React.useState('');
   const [snap, setSnap] = React.useState<string | null>(null); // last snapshot result (toast)
+  const [running, setRunning] = React.useState(false);  // a run is in flight for the active design
+  const [fsActive, setFsActive] = React.useState(false); // preview is in real full-screen
+  // A generated/attached image opened from chat — shown in a modal (this surface
+  // has no tab system, unlike the CodeSpace).
+  const [modalImg, setModalImg] = React.useState<{ assetId?: string; name: string; imagePath?: string } | null>(null);
+  // Resizable chat/preview split, persisted (mirrors the CodeSpace behaviour).
+  const [chatW, setChatW] = React.useState<number>(() => {
+    try { const v = Number(localStorage.getItem('maestro.design.chatW')); return v >= 320 && v <= 900 ? v : 460; } catch { return 460; }
+  });
+  const [dragging, setDragging] = React.useState(false);
+  const previewRef = React.useRef<HTMLDivElement>(null);
+  const iframeRef = React.useRef<HTMLIFrameElement>(null);
+  // Mochi-style commenting over the live preview.
+  const [comments, setComments] = React.useState<DesignComment[]>([]);
+  const [commentMode, setCommentMode] = React.useState(false);
+  const [showComments, setShowComments] = React.useState(false);
+  const [pick, setPick] = React.useState<{ selector: string; label: string } | null>(null);
+  const [noteText, setNoteText] = React.useState('');
+  const [sending, setSending] = React.useState(false);
+  // Refs so the iframe onLoad handler always reads the latest mode/markers.
+  const commentModeRef = React.useRef(commentMode); commentModeRef.current = commentMode;
+  const commentsRef = React.useRef(comments); commentsRef.current = comments;
 
   const designProjects = projects.filter(p => p.kind === 'design');
   const active = designProjects.find(p => p.id === activeId) ?? null;
@@ -48,16 +87,39 @@ export default function DesignWorkspace() {
     return () => { on = false; };
   }, [activeId]);
 
-  // live preview: reload when a job for this project FINISHES (the agent edited
-  // the artifact), debounced so a burst of completions coalesces into one reload.
+  // Live preview: track whether a run is in flight (so we can poll-refresh while
+  // the agent writes the artifact) AND reload once it FINISHES — debounced so a
+  // burst of completions coalesces into one reload. This is what makes the
+  // preview auto-appear the moment a design is done, with no manual reload.
   React.useEffect(() => {
-    if (!activeId) return;
+    if (!activeId) { setRunning(false); return; }
     let t: number | undefined;
     const unsub = api.subscribe({ onJob: (j) => {
-      if (j.projectId === activeId && j.status === 'done') { if (t) window.clearTimeout(t); t = window.setTimeout(() => setNonce(n => n + 1), 450); }
+      if (j.projectId !== activeId) return;
+      if (j.status === 'running' || j.status === 'pending') setRunning(true);
+      else {
+        setRunning(false);
+        if (j.status === 'done') { if (t) window.clearTimeout(t); t = window.setTimeout(() => setNonce(n => n + 1), 450); }
+      }
     } });
     return () => { if (t) window.clearTimeout(t); unsub(); };
   }, [activeId]);
+
+  // While a run is active, refresh the preview periodically so the design appears
+  // to build live (the agent writes design/index.html incrementally).
+  React.useEffect(() => {
+    if (!running) return;
+    const iv = window.setInterval(() => setNonce(n => n + 1), 3500);
+    return () => window.clearInterval(iv);
+  }, [running]);
+
+  // Keep the full-screen toggle's icon in sync with the browser's actual state
+  // (Esc exits full-screen without going through our button).
+  React.useEffect(() => {
+    const onFs = () => setFsActive(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onFs);
+    return () => document.removeEventListener('fullscreenchange', onFs);
+  }, []);
 
   const createDesign = async (presetName?: string) => {
     const name = (presetName || newName).trim() || `Design ${designProjects.length + 1}`;
@@ -73,12 +135,115 @@ export default function DesignWorkspace() {
     catch { setSnap('snapshot failed'); }
     window.setTimeout(() => setSnap(null), 4000);
   };
+  const toggleFullscreen = () => {
+    const el = previewRef.current; if (!el) return;
+    if (document.fullscreenElement) document.exitFullscreen?.();
+    else el.requestFullscreen?.();
+  };
+  // Drag the splitter to resize the chat panel; persist the final width.
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX, startW = chatW; let latest = startW;
+    setDragging(true);
+    document.body.style.cursor = 'col-resize';
+    const onMove = (ev: MouseEvent) => { latest = Math.max(320, Math.min(900, startW + (ev.clientX - startX))); setChatW(latest); };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      setDragging(false);
+      try { localStorage.setItem('maestro.design.chatW', String(latest)); } catch { /* storage unavailable */ }
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  // ── Commenting ───────────────────────────────────────────────────────────
+  const postToPreview = (msg: Record<string, unknown>) => {
+    try { iframeRef.current?.contentWindow?.postMessage({ __maestro: true, ...msg }, '*'); } catch { /* iframe gone */ }
+  };
+  const markerItems = React.useCallback((list: DesignComment[]) =>
+    list.map((c, i) => ({ selector: c.selector, n: i + 1, status: c.status })), []);
+  // Re-sync mode + pins into the (possibly freshly-reloaded) preview.
+  const syncPreview = React.useCallback(() => {
+    postToPreview({ type: 'comment-markers', items: markerItems(commentsRef.current) });
+    postToPreview({ type: 'comment-mode', on: commentModeRef.current });
+  }, [markerItems]);
+
+  // Load this design's comments whenever the active project changes.
+  React.useEffect(() => {
+    setComments([]); setShowComments(false); setCommentMode(false); setPick(null);
+    if (!activeId) return;
+    let on = true;
+    api.listDesignComments(activeId).then(r => { if (on) setComments(r.comments ?? []); }).catch(() => {});
+    return () => { on = false; };
+  }, [activeId]);
+
+  // Push markers/mode into the preview whenever they change.
+  React.useEffect(() => { syncPreview(); }, [comments, commentMode, nonce, syncPreview]);
+
+  // Receive element picks (and Esc-cancel) from the injected harness.
+  React.useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      const d = e.data as { __maestroDesign?: boolean; type?: string; selector?: string; label?: string } | null;
+      if (!d || !d.__maestroDesign) return;
+      if (d.type === 'comment-pick' && d.selector) { setPick({ selector: d.selector, label: d.label || d.selector }); setNoteText(''); }
+      else if (d.type === 'comment-cancel') { setCommentMode(false); }
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, []);
+
+  const toggleCommentMode = () => {
+    const next = !commentMode;
+    setCommentMode(next);
+    if (next) setShowComments(true); else setPick(null);
+    postToPreview({ type: 'comment-mode', on: next });
+  };
+  const savePick = async () => {
+    if (!active || !pick) return;
+    const note = noteText.trim(); if (!note) return;
+    try {
+      const r = await api.addDesignComment(active.id, { selector: pick.selector, label: pick.label, note });
+      setComments(cs => [...cs, r.comment]);
+    } catch { /* surfaced by absence */ }
+    setPick(null); setNoteText('');
+  };
+  const flashComment = (c: DesignComment) => postToPreview({ type: 'flash', selector: c.selector });
+  const resolveComment = async (c: DesignComment) => {
+    if (!active) return;
+    const status = c.status === 'resolved' ? 'open' : 'resolved';
+    setComments(cs => cs.map(x => x.id === c.id ? { ...x, status } : x));
+    try { await api.setDesignCommentStatus(active.id, c.id, status); } catch { /* optimistic */ }
+  };
+  const deleteComment = async (c: DesignComment) => {
+    if (!active) return;
+    setComments(cs => cs.filter(x => x.id !== c.id));
+    try { await api.deleteDesignComment(active.id, c.id); } catch { /* optimistic */ }
+  };
+  const openComments = comments.filter(c => c.status === 'open');
+  const sendCommentsToAgent = async () => {
+    if (!active || !openComments.length || sending) return;
+    setSending(true);
+    const prompt = `I've left ${openComments.length} comment(s) on specific elements of the live design. Please revise design/index.html to address each one, keeping everything else intact, then briefly confirm what you changed.\n\n`
+      + openComments.map((c, i) => `${i + 1}. Element \`${c.selector}\` (${c.label})\n   Requested change: ${c.note}`).join('\n\n');
+    try {
+      const resp = await api.sendChat({ projectId: active.id, text: prompt, sessionId: sessionId ?? undefined });
+      if (resp.session.id !== sessionId) {
+        setSessions(ss => ss.some(x => x.id === resp.session.id) ? ss : [resp.session, ...ss]);
+        setSessionId(resp.session.id);
+      }
+      setCommentMode(false); postToPreview({ type: 'comment-mode', on: false });
+    } catch { /* the chat surfaces send errors */ }
+    setSending(false);
+  };
 
   const previewUrl = active ? `maestro-design://${active.id}/design/index.html?t=${nonce}` : '';
   const dev = DEVICES.find(d => d.key === device) ?? DEVICES[0];
 
   return (
     <AppShell active="design" onSearch={() => {}}>
+      <style>{DS_SCROLL_CSS}</style>
       <div style={{ height: '100%', display: 'flex', minHeight: 0, background: 'var(--bg)' }}>
         {/* left rail — design projects */}
         <aside style={{ width: 200, flexShrink: 0, borderRight: '0.5px solid var(--separator)', display: 'flex', flexDirection: 'column', background: 'var(--bg-grouped)' }}>
@@ -129,15 +294,20 @@ export default function DesignWorkspace() {
           </div>
         ) : (
           <>
-            {/* left: the design conversation */}
-            <div style={{ width: '42%', minWidth: 360, maxWidth: 620, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '0.5px solid var(--separator)', minHeight: 0 }}>
+            {/* left: the design conversation — resizable */}
+            <div style={{ width: chatW, minWidth: 320, maxWidth: 900, flexShrink: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
               <ChatThread key={active.id + ':' + (sessionId ?? 'new')} flush autoFocus projectId={active.id} project={active}
                 sessionId={sessionId} onSessionCreated={(s) => { setSessions(ss => ss.some(x => x.id === s.id) ? ss : [s, ...ss]); setSessionId(s.id); }}
-                onTurns={() => {}} />
+                onTurns={() => {}}
+                onOpenImage={(assetId, name, imagePath) => setModalImg({ assetId, name, imagePath })} />
             </div>
 
-            {/* right: live preview */}
-            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0, background: 'var(--bg-elevated)' }}>
+            {/* draggable splitter */}
+            <div onMouseDown={startResize} title="Drag to resize" className={`ds-splitter${dragging ? ' dragging' : ''}`}
+              style={{ width: 6, flexShrink: 0, cursor: 'col-resize', borderRight: '0.5px solid var(--separator)', background: 'transparent' }} />
+
+            {/* right: live preview (the full-screen target) */}
+            <div ref={previewRef} style={{ position: 'relative', flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0, background: 'var(--bg-elevated)' }}>
               <div style={{ height: 46, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', borderBottom: '0.5px solid var(--separator)' }}>
                 <div style={{ display: 'flex', gap: 2, background: 'var(--fill-tertiary)', borderRadius: 8, padding: 2 }}>
                   {DEVICES.map(d => (
@@ -146,24 +316,102 @@ export default function DesignWorkspace() {
                     </button>
                   ))}
                 </div>
+                {commentMode
+                  ? <span style={{ display: 'flex', alignItems: 'center', gap: 6, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--orange, #fb8500)' }}><Icon name="target" size={13} /> Click an element to comment</span>
+                  : running && <span style={{ display: 'flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--blue)' }}><span className="ds-pulse" style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--blue)' }} /> Building…</span>}
                 {snap && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: snap.includes('failed') ? 'var(--red, #e5484d)' : 'var(--green)' }}>{snap}</span>}
                 <span style={{ flex: 1 }} />
+                <button onClick={toggleCommentMode} title={commentMode ? 'Stop commenting' : 'Comment on a specific element'} className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', background: commentMode ? 'var(--orange, #fb8500)' : 'transparent', color: commentMode ? '#fff' : 'var(--ink-secondary)' }}><Icon name="chat" size={16} /></button>
+                <button onClick={() => setShowComments(s => !s)} title="Comments" className="tb-icon" style={{ position: 'relative', width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', background: showComments ? 'var(--fill-tertiary)' : 'transparent', color: 'var(--ink-secondary)' }}>
+                  <Icon name="layers" size={16} />
+                  {comments.length > 0 && <span style={{ position: 'absolute', top: -2, right: -2, minWidth: 15, height: 15, padding: '0 3px', borderRadius: 8, background: openComments.length ? 'var(--orange, #fb8500)' : 'var(--green)', color: '#fff', font: '700 9px/15px var(--font-text)', textAlign: 'center' }}>{comments.length}</span>}
+                </button>
                 <button onClick={() => setNonce(n => n + 1)} title="Reload preview" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="refresh" size={16} /></button>
+                <button onClick={toggleFullscreen} title={fsActive ? 'Exit full screen' : 'Full screen'} className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: fsActive ? 'var(--blue)' : 'var(--ink-secondary)' }}><Icon name={fsActive ? 'minimize' : 'maximize'} size={16} /></button>
                 <button onClick={() => void doSnapshot()} title="Save a referable snapshot (commit the design + attachments)" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="bookmark" size={16} /></button>
                 {IS_LOCAL && active.path && <button onClick={() => void api.revealPath(active.path!)} title="Reveal design folder" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="folder" size={16} /></button>}
                 <button onClick={() => navigate(`/project-detail/${active.id}`)} title="Hand off to code — open this design as a coding project" style={{ display: 'flex', alignItems: 'center', gap: 7, height: 32, padding: '0 12px', borderRadius: 8, background: 'var(--ink)', color: 'var(--bg)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
                   <Icon name="terminal" size={14} /> Hand off to code
                 </button>
               </div>
-              <div style={{ flex: 1, minHeight: 0, overflow: 'auto', display: 'grid', placeItems: dev.w ? 'start center' : 'stretch', padding: dev.w ? 20 : 0, background: dev.w ? 'var(--fill-tertiary)' : 'transparent' }}>
-                <iframe key={previewUrl} title="Design preview" src={previewUrl}
+              <div className="ds-scroll" style={{ flex: 1, minHeight: 0, overflow: 'auto', display: 'grid', placeItems: dev.w ? 'start center' : 'stretch', padding: dev.w ? 20 : 0, background: dev.w ? 'var(--fill-tertiary)' : 'transparent' }}>
+                <iframe ref={iframeRef} key={previewUrl} title="Design preview" src={previewUrl} onLoad={syncPreview}
                   sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
                   style={{ width: dev.w ? Math.min(dev.w, 1400) : '100%', height: '100%', minHeight: dev.w ? 700 : '100%', border: dev.w ? '0.5px solid var(--separator)' : 'none', borderRadius: dev.w ? 12 : 0, background: '#fff', boxShadow: dev.w ? 'var(--card-shadow)' : 'none' }} />
               </div>
+
+              {/* note composer — appears when an element is picked in comment mode */}
+              {pick && (
+                <div style={{ position: 'absolute', left: '50%', bottom: 18, transform: 'translateX(-50%)', width: 'min(460px, calc(100% - 32px))', zIndex: 40, padding: 12, borderRadius: 14, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 16px 50px rgba(0,0,0,0.35)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 8 }}>
+                    <span style={{ width: 18, height: 18, borderRadius: '50% 50% 50% 0', background: 'var(--orange, #fb8500)', transform: 'rotate(45deg)', flexShrink: 0 }} />
+                    <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-caption)/1.3 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{pick.label}</span>
+                    <button onClick={() => setPick(null)} className="tb-icon" style={{ width: 24, height: 24, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}><Icon name="x" size={13} /></button>
+                  </div>
+                  <textarea autoFocus value={noteText} onChange={e => setNoteText(e.target.value)} placeholder="What should change here?"
+                    onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void savePick(); } if (e.key === 'Escape') setPick(null); }}
+                    style={{ width: '100%', minHeight: 56, resize: 'vertical', padding: '8px 10px', borderRadius: 9, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1.45 var(--font-text)', outline: 'none', boxSizing: 'border-box' }} />
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 }}>
+                    <button onClick={() => setPick(null)} style={{ height: 30, padding: '0 12px', borderRadius: 8, background: 'transparent', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Cancel</button>
+                    <button onClick={() => void savePick()} disabled={!noteText.trim()} style={{ height: 30, padding: '0 14px', borderRadius: 8, background: noteText.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: '#fff', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: noteText.trim() ? 'pointer' : 'default' }}>Add comment</button>
+                  </div>
+                </div>
+              )}
+
+              {/* comments panel — drawer over the preview's right edge */}
+              {showComments && (
+                <div style={{ position: 'absolute', top: 46, right: 0, bottom: 0, width: 300, zIndex: 30, display: 'flex', flexDirection: 'column', background: 'var(--bg-grouped)', borderLeft: '0.5px solid var(--separator)', boxShadow: '-12px 0 30px rgba(0,0,0,0.12)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 12px', borderBottom: '0.5px solid var(--separator)' }}>
+                    <span style={{ font: '700 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Comments</span>
+                    <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{openComments.length} open · {comments.length - openComments.length} resolved</span>
+                    <span style={{ flex: 1 }} />
+                    <button onClick={() => setShowComments(false)} className="tb-icon" style={{ width: 26, height: 26, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}><Icon name="x" size={14} /></button>
+                  </div>
+                  <div className="ds-scroll" style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 10 }}>
+                    {comments.length === 0 ? (
+                      <div style={{ padding: '28px 14px', textAlign: 'center', font: '400 var(--fs-caption)/1.6 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                        <Icon name="chat" size={20} style={{ color: 'var(--ink-quaternary, var(--ink-tertiary))', marginBottom: 8 }} />
+                        <div>No comments yet. Hit <b>Comment</b>, then click any element in the preview to pin a note for the agent.</div>
+                      </div>
+                    ) : comments.map((c, i) => (
+                      <div key={c.id} style={{ display: 'flex', gap: 9, padding: '9px 8px', borderRadius: 10, marginBottom: 4, background: 'var(--surface)', border: '0.5px solid var(--separator)', opacity: c.status === 'resolved' ? 0.6 : 1 }}>
+                        <button onClick={() => flashComment(c)} title="Find in preview" style={{ flexShrink: 0, width: 20, height: 20, borderRadius: '50% 50% 50% 0', transform: 'rotate(45deg)', background: c.status === 'resolved' ? 'var(--green)' : 'var(--orange, #fb8500)', cursor: 'pointer', border: 'none' }}>
+                          <span style={{ display: 'block', transform: 'rotate(-45deg)', color: '#fff', font: '700 10px/20px var(--font-text)', textAlign: 'center' }}>{i + 1}</span>
+                        </button>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ font: '600 var(--fs-caption)/1.3 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{c.label}</div>
+                          <div style={{ font: `400 var(--fs-footnote)/1.4 var(--font-text)`, color: 'var(--ink)', marginTop: 2, textDecoration: c.status === 'resolved' ? 'line-through' : 'none' }}>{c.note}</div>
+                          <div style={{ display: 'flex', gap: 12, marginTop: 5 }}>
+                            <button onClick={() => void resolveComment(c)} style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: c.status === 'resolved' ? 'var(--ink-tertiary)' : 'var(--green)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>{c.status === 'resolved' ? 'Reopen' : 'Resolve'}</button>
+                            <button onClick={() => void deleteComment(c)} style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>Delete</button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ padding: 10, borderTop: '0.5px solid var(--separator)' }}>
+                    <button onClick={() => void sendCommentsToAgent()} disabled={!openComments.length || sending}
+                      style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, width: '100%', height: 36, borderRadius: 9, border: 'none', background: openComments.length && !sending ? 'var(--blue)' : 'var(--fill-secondary)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: openComments.length && !sending ? 'pointer' : 'default' }}>
+                      <Icon name="spark" size={14} /> {sending ? 'Sending…' : `Address ${openComments.length} comment${openComments.length === 1 ? '' : 's'} with the agent`}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </>
         )}
       </div>
+
+      {/* generated-image modal — this surface has no tab system, so chat image
+          chips open here in place */}
+      {modalImg && (
+        <div onClick={() => setModalImg(null)} style={{ position: 'fixed', inset: 0, zIndex: 2000, background: 'rgba(0,0,0,0.62)', backdropFilter: 'blur(4px)', display: 'grid', placeItems: 'center', padding: '5vh 5vw' }}>
+          <div onClick={e => e.stopPropagation()} style={{ position: 'relative', width: 'min(1100px, 92vw)', height: 'min(86vh, 900px)', display: 'flex', flexDirection: 'column', borderRadius: 16, overflow: 'hidden', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 24px 80px rgba(0,0,0,0.45)' }}>
+            <ImageViewer assetId={modalImg.assetId} name={modalImg.name} imagePath={modalImg.imagePath} />
+            <button onClick={() => setModalImg(null)} title="Close" className="tb-icon" style={{ position: 'absolute', top: 8, right: 8, width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', cursor: 'pointer' }}><Icon name="x" size={16} /></button>
+          </div>
+        </div>
+      )}
     </AppShell>
   );
 }

@@ -48,6 +48,8 @@ export interface TranscriptItem {
   toolStatus?: 'running' | 'done' | 'error';
   /** review only: the reviewer's verdict. */
   verdict?: 'approved' | 'needs-work';
+  /** review only: the primary went on to fix the flagged findings → show as resolved. */
+  resolved?: boolean;
   durMs?: number;
   /** file-writing tools only: a capped snapshot of the content written, for the hover preview. */
   preview?: string;
@@ -301,6 +303,21 @@ interface StoreData {
       (selectors, login quirks, where buttons are) so it doesn't re-learn a site
       every visit. Mac-local; never in relay snapshots. */
   browserMemory?: Record<string, { note: string; updatedAt: number }>;
+  /** Per-design element comments (Mochi-style): a CSS selector into the live
+      design artifact + the operator's note. The design agent reads these to
+      revise specific elements. Keyed by projectId. Mac-local; never relayed. */
+  designComments?: Record<string, DesignComment[]>;
+}
+
+/** A note anchored to a specific element of a live design (by CSS selector). */
+export interface DesignComment {
+  id: string;
+  projectId: string;
+  selector: string;
+  label: string;            // human glyph for the element, e.g. `button · "Get started"`
+  note: string;
+  status: 'open' | 'resolved';
+  createdAt: number;
 }
 
 const CATALOG_VERSION = 2;
@@ -331,6 +348,7 @@ export class Store {
       // Native browser automation — default-on for stores written before it existed.
       if (this.data.routing && !this.data.routing.browser) { this.data.routing.browser = 'on'; dirty = true; }
       if (!this.data.browserMemory) { this.data.browserMemory = {}; dirty = true; }
+      if (!this.data.designComments) { this.data.designComments = {}; dirty = true; }
       // SP1: seed model-level roles on older stores from the engine-level fields.
       if (this.data.routing && !this.data.routing.roles) {
         const r = this.data.routing;
@@ -451,6 +469,36 @@ export class Store {
       entries.sort((a, b) => a[1].updatedAt - b[1].updatedAt);
       for (const [k] of entries.slice(0, entries.length - 300)) delete this.data.browserMemory[k];
     }
+    this.save();
+  }
+
+  // ── Design comments (per-element notes the design agent revises against) ──
+  listDesignComments(projectId: string): DesignComment[] {
+    return this.data.designComments?.[projectId] ?? [];
+  }
+  addDesignComment(projectId: string, c: { selector: string; label: string; note: string }): DesignComment {
+    if (!this.data.designComments) this.data.designComments = {};
+    const list = this.data.designComments[projectId] ?? (this.data.designComments[projectId] = []);
+    const comment: DesignComment = {
+      id: id(), projectId,
+      selector: (c.selector || '').slice(0, 600),
+      label: (c.label || '').slice(0, 200),
+      note: (c.note || '').slice(0, 2000),
+      status: 'open', createdAt: Date.now(),
+    };
+    list.push(comment);
+    if (list.length > 200) list.splice(0, list.length - 200); // cap per design
+    this.save();
+    return comment;
+  }
+  setDesignCommentStatus(projectId: string, commentId: string, status: 'open' | 'resolved'): void {
+    const c = this.data.designComments?.[projectId]?.find(x => x.id === commentId);
+    if (!c) return;
+    c.status = status; this.save();
+  }
+  deleteDesignComment(projectId: string, commentId: string): void {
+    const list = this.data.designComments?.[projectId]; if (!list) return;
+    this.data.designComments![projectId] = list.filter(x => x.id !== commentId);
     this.save();
   }
 
