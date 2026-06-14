@@ -14,7 +14,7 @@ import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, cpSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
 
@@ -130,6 +130,27 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'deleteDesignComment': {
         store.deleteDesignComment(String(p.id ?? ''), String(p.commentId ?? ''));
         return { ok: true };
+      }
+      // Hand off a design to code: COPY the design's folder (design/index.html +
+      // assets + .continuum memory) into a NEW coding project so the design lives
+      // in BOTH the Design tab and the CodeSpace. The coding agent then scaffolds
+      // a real app in this copy, with design/index.html as the visual reference.
+      case 'copyDesignToCode': {
+        const design = store.getProject(String(p.id ?? ''));
+        if (!design || design.kind !== 'design') return bad('design project not found', 404);
+        const src = projectRootOf(design);
+        if (!existsSync(src)) return bad('design folder not found', 404);
+        const safe = (design.name || 'design').replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'design';
+        const dest = nodePath.join(homedir(), 'Maestro', `${safe}-code-${Math.random().toString(36).slice(2, 8)}`);
+        mkdirSync(dest, { recursive: true });
+        // Copy everything except heavy/irrelevant trees (node_modules, .git).
+        cpSync(src, dest, { recursive: true, filter: (s) => !/(^|[\\/])(node_modules|\.git)([\\/]|$)/.test(s) });
+        const proj = store.createProject({
+          name: typeof p.name === 'string' && p.name ? p.name : `${design.name} (code)`,
+          template: 'blank', color: 'blue', kind: 'coding', path: dest,
+        });
+        emit('project', proj);
+        return proj;
       }
       case 'createProject': {
         if (!p.name || typeof p.name !== 'string') bad('name required');

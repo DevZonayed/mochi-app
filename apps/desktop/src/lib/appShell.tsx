@@ -534,10 +534,18 @@ function CodingTopNav({ active, onNav, onSearch, theme, setTheme, right }: { act
       </nav>
       <div style={{ flex: 1 }} />
       {right}
+      {/* Approvals demoted to a demand-driven bell: invisible at rest, a red-dot
+          appears only when a gate is actually pending (the reviewer is off by
+          default, so a normal operator essentially never sees this). */}
+      {pending > 0 && (
+        <button onClick={() => onNav('approvals')} title={`${pending} approval${pending === 1 ? '' : 's'} waiting`} aria-label="Approvals" className="tb-icon win-no-drag" style={{ ...iconBtn, position: 'relative' }}>
+          <Icon name="bell" size={18} />
+          <span style={{ position: 'absolute', top: 7, right: 8, width: 7, height: 7, borderRadius: 4, background: 'var(--red)', border: '1.5px solid var(--bg-grouped)' }} />
+        </button>
+      )}
       <button onClick={onSearch} title="Search (⌘K)" aria-label="Search" className="tb-icon win-no-drag" style={iconBtn}>
         <Icon name="search" size={18} />
       </button>
-      <BudgetChip />
       <button onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')} title="Toggle appearance" aria-label="Toggle appearance" className="tb-icon win-no-drag" style={iconBtn}>
         <Icon name={theme === 'light' ? 'moon' : 'sun'} size={18} />
       </button>

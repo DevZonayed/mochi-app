@@ -4,7 +4,7 @@
    real desktop coding app. The chat itself is the shared <ChatThread>. */
 
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type ChatSession, type ProjectKind, type Job } from '../lib/api';
@@ -72,6 +72,8 @@ const kindOf = (k: KindFilter) => KIND_META.find(m => m.key === k) ?? KIND_META[
 
 export default function Workspace() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const seedConsumed = React.useRef(false);
   const [projects, setProjects] = React.useState<Project[]>([]);
   const [sessions, setSessions] = React.useState<ChatSession[]>([]);
   const [tabs, setTabs] = React.useState<Tab[]>([]);
@@ -154,6 +156,22 @@ export default function Workspace() {
     });
     return unsub;
   }, []);
+
+  // Hand-off-from-design: open the freshly-copied coding project + its seeded chat
+  // (the design tab navigated here with these ids). One-shot — cleared after use.
+  React.useEffect(() => {
+    const st = location.state as { seedProjectId?: string; seedSessionId?: string; expand?: boolean } | null;
+    if (!st?.seedProjectId || seedConsumed.current) return;
+    seedConsumed.current = true;
+    const { seedProjectId, seedSessionId } = st;
+    api.listProjects().then(setProjects).catch(() => {}); // pick up the new project immediately
+    if (st.expand) setExpanded(e => new Set(e).add(seedProjectId));
+    if (seedSessionId) {
+      setTabs(ts => ts.some(t => t.sessionId === seedSessionId) ? ts : [...ts, { key: seedSessionId, projectId: seedProjectId, sessionId: seedSessionId, title: 'Building from design…' }]);
+      setActiveKey(seedSessionId);
+    }
+    navigate('.', { replace: true, state: {} }); // clear so back/refresh doesn't re-seed
+  }, [location.state]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const activeTab = tabs.find(t => t.key === activeKey) ?? null;
   const activeProject = activeTab ? projById[activeTab.projectId] : undefined;

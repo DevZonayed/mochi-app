@@ -37,16 +37,21 @@ export const SETTINGS_ROUTE: NavRoute = { key: 'settings', path: '/settings', la
 /** Every navigable destination (sidebar items + pinned Settings), for active-key lookup. */
 export const ALL_NAV: NavRoute[] = [...NAV_ROUTES, SETTINGS_ROUTE];
 
-/** Coding-genre navigation — only the destinations a coder needs, in priority
-    order. The media/content surfaces (Studio, Publishing, Trends, Comms) belong
-    to the Design/Video genres and are hidden here. Drives the CodingShell top-nav. */
-export const CODING_NAV: NavRoute[] = (['workspace', 'home', 'projects', 'jobs', 'approvals', 'scheduler', 'skills', 'templates', 'budget'] as const)
+/** Coding-genre navigation. Both genres now LEAD with the Workspace (CodeSpace)
+    and Design pair so the operator can cross between code and design from either
+    header. Costs and Skills are intentionally NOT here — they live in the Settings
+    page and in each project's settings tabs, not as standing top-nav menus. Home,
+    Projects, Trends and Approvals are hidden too (Approvals surfaces as a bell only
+    when a gate is actually pending). Every route stays registered in App.tsx, so
+    dropping a key here hides the menu without breaking the route. */
+export const CODING_NAV: NavRoute[] = (['workspace', 'design', 'jobs', 'scheduler', 'templates'] as const)
   .map(k => NAV_ROUTES.find(r => r.key === k))
   .filter((r): r is NavRoute => !!r);
 
-/** Design-genre navigation — the design canvas plus the surfaces a designer needs
-    (projects, the media Studio, trends, costs). Drives the DesignShell top-nav. */
-export const DESIGN_NAV: NavRoute[] = (['design', 'projects', 'studio', 'trends', 'budget'] as const)
+/** Design-genre navigation — same Workspace + Design lead, plus the media Studio
+    a designer reaches for. Projects, Trends and Costs are dropped (Costs lives in
+    Settings; Projects/Trends are hidden for now). */
+export const DESIGN_NAV: NavRoute[] = (['workspace', 'design', 'studio'] as const)
   .map(k => NAV_ROUTES.find(r => r.key === k))
   .filter((r): r is NavRoute => !!r);
 

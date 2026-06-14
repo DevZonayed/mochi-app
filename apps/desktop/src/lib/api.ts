@@ -477,6 +477,9 @@ export const api = {
     call<{ ok: true }>('setDesignCommentStatus', { id, commentId, status }, () => Promise.reject(new Error('desktop only'))),
   deleteDesignComment: (id: string, commentId: string) =>
     call<{ ok: true }>('deleteDesignComment', { id, commentId }, () => Promise.reject(new Error('desktop only'))),
+  /** Hand off a design to code: copy its folder into a NEW coding project (lives in both tabs). Desktop-only. */
+  copyDesignToCode: (id: string, name?: string) =>
+    call<Project>('copyDesignToCode', { id, name }, () => Promise.reject(new Error('desktop only'))),
 
   // Coding agent: clone a repo / open a folder / inspect git (desktop owns git)
   gitAvailable: () => call<{ available: boolean }>('gitAvailable', {}, () => Promise.resolve({ available: false })),

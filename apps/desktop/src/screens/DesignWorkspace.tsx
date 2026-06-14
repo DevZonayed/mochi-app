@@ -21,6 +21,37 @@ const DEVICES = [
   { key: 'phone', label: 'Phone', w: 390, icon: 'smartphone' as const },
 ];
 
+// Hand-off-to-code stack options (what the guided sheet asks before scaffolding).
+const FRAMEWORKS = [
+  { key: 'next', label: 'Next.js', hint: 'App Router' },
+  { key: 'react-vite', label: 'React', hint: 'Vite' },
+  { key: 'vue', label: 'Vue', hint: 'Vite' },
+  { key: 'html', label: 'Plain HTML', hint: 'HTML · CSS · JS' },
+];
+const FRAMEWORK_LABEL: Record<string, string> = { next: 'Next.js (App Router)', 'react-vite': 'React (Vite)', vue: 'Vue 3 (Vite)', html: 'plain HTML/CSS/JS' };
+const LANGS = [{ key: 'ts', label: 'TypeScript' }, { key: 'js', label: 'JavaScript' }];
+const STYLINGS = [{ key: 'tailwind', label: 'Tailwind' }, { key: 'css-modules', label: 'CSS Modules' }, { key: 'plain', label: 'Plain CSS' }];
+const PKGS = [{ key: 'pnpm', label: 'pnpm' }, { key: 'npm', label: 'npm' }];
+
+function HoField({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.02em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 7 }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+function HoSeg({ opts, val, onPick }: { opts: { key: string; label: string }[]; val: string; onPick: (k: string) => void }) {
+  return (
+    <div style={{ display: 'flex', gap: 2, background: 'var(--fill-tertiary)', borderRadius: 9, padding: 3 }}>
+      {opts.map(o => {
+        const on = o.key === val;
+        return <button key={o.key} onClick={() => onPick(o.key)} style={{ flex: 1, height: 30, borderRadius: 7, border: 'none', background: on ? 'var(--bg-elevated)' : 'transparent', color: on ? 'var(--ink)' : 'var(--ink-secondary)', font: `${on ? 600 : 500} var(--fs-caption)/1 var(--font-text)`, cursor: 'pointer', boxShadow: on ? '0 1px 2px rgba(0,0,0,.12)' : 'none' }}>{o.label}</button>;
+      })}
+    </div>
+  );
+}
+
 /* Smoother, thinner scrollbar for the preview + image modal — the OS default
    scrollbar reads as chunky inside the canvas. Scoped via the .ds-scroll class. */
 const DS_SCROLL_CSS = `
@@ -33,7 +64,20 @@ const DS_SCROLL_CSS = `
 .ds-splitter:hover, .ds-splitter.dragging { background: var(--blue); }
 @keyframes dsPulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.7); } }
 .ds-pulse { animation: dsPulse 1.1s ease-in-out infinite; }
+.ds-sess .ds-sess-x { opacity: 0; transition: opacity .12s ease; }
+.ds-sess:hover .ds-sess-x { opacity: 1; }
+.ds-sess-x:hover { color: var(--red, #e5484d) !important; }
 `;
+
+/** Compact relative timestamp for the session pills (now / 5m / 3h / 2d / 1w). */
+function relTime(ts: number): string {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return 'now';
+  const m = Math.floor(s / 60); if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60); if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24); if (d < 7) return `${d}d`;
+  return `${Math.floor(d / 7)}w`;
+}
 
 export default function DesignWorkspace() {
   const navigate = useNavigate();
@@ -68,6 +112,13 @@ export default function DesignWorkspace() {
   // Refs so the iframe onLoad handler always reads the latest mode/markers.
   const commentModeRef = React.useRef(commentMode); commentModeRef.current = commentMode;
   const commentsRef = React.useRef(comments); commentsRef.current = comments;
+  // Multi-session chat (a design project hosts many conversations, like the CodeSpace).
+  const [renamingId, setRenamingId] = React.useState<string | null>(null);
+  const [renameVal, setRenameVal] = React.useState('');
+  // Hand-off-to-code: the guided "what should we build?" sheet.
+  const [handoff, setHandoff] = React.useState(false);
+  const [handingOff, setHandingOff] = React.useState(false);
+  const [stack, setStack] = React.useState({ framework: 'next', lang: 'ts', styling: 'tailwind', pkg: 'pnpm', notes: '' });
 
   const designProjects = projects.filter(p => p.kind === 'design');
   const active = designProjects.find(p => p.id === activeId) ?? null;
@@ -85,6 +136,20 @@ export default function DesignWorkspace() {
     let on = true;
     api.listSessions(activeId).then(ss => { if (!on) return; setSessions(ss); setSessionId(ss[0]?.id ?? null); }).catch(() => {});
     return () => { on = false; };
+  }, [activeId]);
+
+  // Keep the session strip live (new/renamed/deleted sessions from any surface).
+  React.useEffect(() => {
+    if (!activeId) return;
+    const unsub = api.subscribe({ onSession: (s) => {
+      if (s.deleted) { setSessions(ss => ss.filter(x => x.id !== s.id)); setSessionId(cur => cur === s.id ? null : cur); return; }
+      if (s.projectId !== activeId) return;
+      setSessions(ss => {
+        const next = ss.some(x => x.id === s.id) ? ss.map(x => x.id === s.id ? s : x) : [s, ...ss];
+        return [...next].sort((a, b) => b.updatedAt - a.updatedAt);
+      });
+    } });
+    return () => unsub();
   }, [activeId]);
 
   // Live preview: track whether a run is in flight (so we can poll-refresh while
@@ -127,6 +192,42 @@ export default function DesignWorkspace() {
       const p = await api.createProject({ name, kind: 'design', template: 'design', color: 'purple' });
       setProjects(ps => [...ps, p]); setActiveId(p.id); setSessionId(null); setCreating(false); setNewName('');
     } catch { /* surfaced by the empty state */ }
+  };
+  const removeSession = async (id: string) => {
+    setSessions(ss => ss.filter(x => x.id !== id));
+    setSessionId(cur => cur === id ? null : cur);
+    try { await api.deleteSession(id); } catch { /* optimistic */ }
+  };
+  const commitRename = async (id: string) => {
+    const t = renameVal.trim(); setRenamingId(null);
+    if (!t) return;
+    setSessions(ss => ss.map(x => x.id === id ? { ...x, title: t } : x));
+    try { await api.renameSession(id, t); } catch { /* optimistic */ }
+  };
+  // Hand off to code: COPY the design into a new coding project, then seed the
+  // first coding turn with the chosen stack + a reference to design/index.html.
+  const createCodingFromDesign = async () => {
+    if (!active || handingOff) return;
+    setHandingOff(true);
+    try {
+      const proj = await api.copyDesignToCode(active.id, `${active.name} (code)`);
+      const fw = FRAMEWORK_LABEL[stack.framework] || stack.framework;
+      const lang = stack.framework === 'html' ? '' : (stack.lang === 'ts' ? 'TypeScript' : 'JavaScript');
+      const styling = stack.styling === 'tailwind' ? 'Tailwind CSS' : stack.styling === 'css-modules' ? 'CSS Modules' : 'plain CSS';
+      const prompt =
+        `Turn the existing design into a production-ready ${fw} app${lang ? ` using ${lang}` : ''} and ${styling}${stack.framework !== 'html' ? ` (package manager: ${stack.pkg})` : ''}.\n\n` +
+        `The reference design is a self-contained artifact at \`design/index.html\` with its assets under \`design/\` (images, fonts, etc.). It is your source of truth for layout, type scale, spacing, colour and components.\n\n` +
+        `Do this in order:\n` +
+        `1. Read \`design/index.html\` first and list the sections/components you'll build.\n` +
+        `2. Scaffold the ${fw} project here in this folder, wiring up tooling.\n` +
+        `3. Faithfully translate the design into real components — match the visuals closely.\n` +
+        `4. Keep \`design/index.html\` in place as the visual reference; do NOT delete it.` +
+        (stack.notes.trim() ? `\n\nAdditional requirements: ${stack.notes.trim()}` : '');
+      const resp = await api.sendChat({ projectId: proj.id, text: prompt });
+      setHandoff(false);
+      navigate('/workspace', { state: { seedProjectId: proj.id, seedSessionId: resp.session.id, expand: true } });
+    } catch { /* error surfaces in the new project's chat once opened */ }
+    setHandingOff(false);
   };
   const doSnapshot = async () => {
     if (!active) return;
@@ -294,12 +395,38 @@ export default function DesignWorkspace() {
           </div>
         ) : (
           <>
-            {/* left: the design conversation — resizable */}
+            {/* left: the design conversation — resizable, with a session switcher */}
             <div style={{ width: chatW, minWidth: 320, maxWidth: 900, flexShrink: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-              <ChatThread key={active.id + ':' + (sessionId ?? 'new')} flush autoFocus projectId={active.id} project={active}
-                sessionId={sessionId} onSessionCreated={(s) => { setSessions(ss => ss.some(x => x.id === s.id) ? ss : [s, ...ss]); setSessionId(s.id); }}
-                onTurns={() => {}}
-                onOpenImage={(assetId, name, imagePath) => setModalImg({ assetId, name, imagePath })} />
+              {/* session strip — one design project, many conversations (like the CodeSpace) */}
+              <div className="ds-scroll" style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, padding: '8px 10px', borderBottom: '0.5px solid var(--separator)', overflowX: 'auto', background: 'var(--bg-grouped)' }}>
+                <button onClick={() => setSessionId(null)} title="New chat about this design" style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 5, height: 28, padding: '0 11px', borderRadius: 'var(--r-pill)', border: '1px dashed var(--separator-strong, var(--separator))', background: sessionId === null ? 'var(--blue)' : 'transparent', color: sessionId === null ? '#fff' : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>
+                  <Icon name="plus" size={13} /> New
+                </button>
+                {sessions.map(s => {
+                  const on = s.id === sessionId;
+                  if (renamingId === s.id) return (
+                    <input key={s.id} autoFocus value={renameVal} onChange={e => setRenameVal(e.target.value)}
+                      onBlur={() => void commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') void commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
+                      style={{ flexShrink: 0, width: 132, height: 28, padding: '0 9px', borderRadius: 'var(--r-pill)', border: '1px solid var(--blue)', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-caption)/1 var(--font-text)', outline: 'none' }} />
+                  );
+                  return (
+                    <div key={s.id} className="ds-sess" onClick={() => setSessionId(s.id)} onDoubleClick={() => { setRenamingId(s.id); setRenameVal(s.title); }}
+                      title={`${s.title || 'Untitled'} — double-click to rename`} style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, height: 28, padding: '0 6px 0 11px', borderRadius: 'var(--r-pill)', maxWidth: 190, cursor: 'pointer',
+                        background: on ? 'var(--blue)' : 'var(--surface)', border: on ? 'none' : '0.5px solid var(--separator)', color: on ? '#fff' : 'var(--ink)' }}>
+                      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', font: `${on ? 600 : 500} var(--fs-caption)/1 var(--font-text)` }}>{s.title || 'Untitled'}</span>
+                      <span style={{ flexShrink: 0, font: '500 9px/1 var(--font-mono)', color: on ? 'rgba(255,255,255,.7)' : 'var(--ink-tertiary)' }}>{relTime(s.updatedAt)}</span>
+                      <button className="ds-sess-x" onClick={e => { e.stopPropagation(); void removeSession(s.id); }} title="Delete chat"
+                        style={{ flexShrink: 0, width: 16, height: 16, borderRadius: 5, display: 'grid', placeItems: 'center', background: 'transparent', border: 'none', color: on ? 'rgba(255,255,255,.85)' : 'var(--ink-tertiary)', cursor: 'pointer' }}><Icon name="x" size={11} /></button>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                <ChatThread key={active.id + ':' + (sessionId ?? 'new')} flush autoFocus projectId={active.id} project={active}
+                  sessionId={sessionId} onSessionCreated={(s) => { setSessions(ss => ss.some(x => x.id === s.id) ? ss : [s, ...ss]); setSessionId(s.id); }}
+                  onTurns={() => {}}
+                  onOpenImage={(assetId, name, imagePath) => setModalImg({ assetId, name, imagePath })} />
+              </div>
             </div>
 
             {/* draggable splitter */}
@@ -330,7 +457,7 @@ export default function DesignWorkspace() {
                 <button onClick={toggleFullscreen} title={fsActive ? 'Exit full screen' : 'Full screen'} className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: fsActive ? 'var(--blue)' : 'var(--ink-secondary)' }}><Icon name={fsActive ? 'minimize' : 'maximize'} size={16} /></button>
                 <button onClick={() => void doSnapshot()} title="Save a referable snapshot (commit the design + attachments)" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="bookmark" size={16} /></button>
                 {IS_LOCAL && active.path && <button onClick={() => void api.revealPath(active.path!)} title="Reveal design folder" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="folder" size={16} /></button>}
-                <button onClick={() => navigate(`/project-detail/${active.id}`)} title="Hand off to code — open this design as a coding project" style={{ display: 'flex', alignItems: 'center', gap: 7, height: 32, padding: '0 12px', borderRadius: 8, background: 'var(--ink)', color: 'var(--bg)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
+                <button onClick={() => setHandoff(true)} title="Hand off to code — copy this design into a coding project" style={{ display: 'flex', alignItems: 'center', gap: 7, height: 32, padding: '0 12px', borderRadius: 8, background: 'var(--ink)', color: 'var(--bg)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
                   <Icon name="terminal" size={14} /> Hand off to code
                 </button>
               </div>
@@ -409,6 +536,53 @@ export default function DesignWorkspace() {
           <div onClick={e => e.stopPropagation()} style={{ position: 'relative', width: 'min(1100px, 92vw)', height: 'min(86vh, 900px)', display: 'flex', flexDirection: 'column', borderRadius: 16, overflow: 'hidden', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 24px 80px rgba(0,0,0,0.45)' }}>
             <ImageViewer assetId={modalImg.assetId} name={modalImg.name} imagePath={modalImg.imagePath} />
             <button onClick={() => setModalImg(null)} title="Close" className="tb-icon" style={{ position: 'absolute', top: 8, right: 8, width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', cursor: 'pointer' }}><Icon name="x" size={16} /></button>
+          </div>
+        </div>
+      )}
+
+      {/* hand-off-to-code sheet — copies the design into a coding project + asks the stack */}
+      {handoff && active && (
+        <div onClick={() => !handingOff && setHandoff(false)} style={{ position: 'fixed', inset: 0, zIndex: 2100, background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(4px)', display: 'grid', placeItems: 'center', padding: '5vh 5vw' }}>
+          <div onClick={e => e.stopPropagation()} className="ds-scroll" style={{ width: 'min(520px, 94vw)', maxHeight: '90vh', overflow: 'auto', display: 'flex', flexDirection: 'column', borderRadius: 18, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 24px 80px rgba(0,0,0,0.45)' }}>
+            <div style={{ padding: '18px 20px 4px', display: 'flex', alignItems: 'flex-start', gap: 11 }}>
+              <div style={{ width: 30, height: 30, flexShrink: 0, borderRadius: 9, background: 'var(--ink)', display: 'grid', placeItems: 'center' }}><Icon name="terminal" size={15} style={{ color: 'var(--bg)' }} /></div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ font: '700 var(--fs-headline)/1.2 var(--font-display)', color: 'var(--ink)' }}>Turn this design into code</div>
+                <div style={{ font: '400 var(--fs-caption)/1.45 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Copies <b>{active.name}</b> into a new coding project in the CodeSpace — the design stays here too, as the visual reference.</div>
+              </div>
+            </div>
+            <div style={{ padding: '14px 20px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <HoField label="Framework">
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                  {FRAMEWORKS.map(f => {
+                    const on = stack.framework === f.key;
+                    return (
+                      <button key={f.key} onClick={() => setStack(s => ({ ...s, framework: f.key }))} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2, height: 46, padding: '0 12px', borderRadius: 10, border: on ? 'none' : '0.5px solid var(--separator)', background: on ? 'var(--blue)' : 'var(--surface)', color: on ? '#fff' : 'var(--ink)', cursor: 'pointer', justifyContent: 'center' }}>
+                        <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{f.label}</span>
+                        <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: on ? 'rgba(255,255,255,.78)' : 'var(--ink-tertiary)' }}>{f.hint}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </HoField>
+              {stack.framework !== 'html' && (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                  <HoField label="Language"><HoSeg opts={LANGS} val={stack.lang} onPick={k => setStack(s => ({ ...s, lang: k }))} /></HoField>
+                  <HoField label="Package manager"><HoSeg opts={PKGS} val={stack.pkg} onPick={k => setStack(s => ({ ...s, pkg: k }))} /></HoField>
+                </div>
+              )}
+              <HoField label="Styling"><HoSeg opts={STYLINGS} val={stack.styling} onPick={k => setStack(s => ({ ...s, styling: k }))} /></HoField>
+              <HoField label="Anything else to build? (optional)">
+                <textarea value={stack.notes} onChange={e => setStack(s => ({ ...s, notes: e.target.value }))} placeholder="Routes, interactions, libraries, API wiring…"
+                  style={{ width: '100%', minHeight: 60, resize: 'vertical', padding: '9px 11px', borderRadius: 10, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1.45 var(--font-text)', outline: 'none', boxSizing: 'border-box' }} />
+              </HoField>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '6px 20px 18px' }}>
+              <button onClick={() => setHandoff(false)} disabled={handingOff} style={{ height: 36, padding: '0 16px', borderRadius: 10, background: 'transparent', color: 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Cancel</button>
+              <button onClick={() => void createCodingFromDesign()} disabled={handingOff} style={{ display: 'flex', alignItems: 'center', gap: 7, height: 36, padding: '0 16px', borderRadius: 10, border: 'none', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: handingOff ? 'default' : 'pointer', opacity: handingOff ? 0.7 : 1 }}>
+                <Icon name="terminal" size={14} /> {handingOff ? 'Copying & starting…' : 'Create coding project & start'}
+              </button>
+            </div>
           </div>
         </div>
       )}

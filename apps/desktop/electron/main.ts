@@ -65,6 +65,20 @@ const DESIGN_PLACEHOLDER = `<!doctype html><meta charset="utf8"><style>
    parent. The parent persists the note and feeds the comment list to the design
    agent. The parent also pushes the existing comments so we draw numbered pins.
    Inert (no DOM interception) until comment mode is turned on. */
+/* A smooth, thin default scrollbar for the design page itself. The preview's
+   visible scrollbar belongs to the design document INSIDE the iframe, so the
+   renderer's container .ds-scroll class can't reach it — this has to live in the
+   served page. Injected at the START of <head> so a design that styles its own
+   scrollbar still overrides it (later rules win the cascade). */
+const DESIGN_SCROLLBAR_CSS = `
+html{scroll-behavior:smooth}
+*{scrollbar-width:thin;scrollbar-color:rgba(140,142,152,.45) transparent}
+::-webkit-scrollbar{width:12px;height:12px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(140,142,152,.45);border-radius:10px;border:3px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background:rgba(140,142,152,.72);background-clip:padding-box}
+`;
+
 const DESIGN_COMMENT_HARNESS = `(function(){
   if (window.__maestroComments) return; window.__maestroComments = true;
   var mode=false, hover=null, markers=[];
@@ -207,9 +221,12 @@ app.whenReady().then(() => {
       const headers: Record<string, string> = { 'content-type': mime, 'cache-control': 'no-cache' };
       if (mime === 'text/html') {
         headers['content-security-policy'] = DESIGN_CSP;
+        let html = buf.toString('utf8');
+        // Smooth scrollbar default at the TOP of <head> (design styles can override).
+        const styleTag = `<style id="maestro-scroll">${DESIGN_SCROLLBAR_CSS}</style>`;
+        html = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, m => m + styleTag) : styleTag + html;
         // Inject the Mochi-style comment harness so the operator can annotate
         // specific elements of the live design (selectors → notes → the agent).
-        let html = buf.toString('utf8');
         const tag = `<script>${DESIGN_COMMENT_HARNESS}</script>`;
         html = /<\/body>/i.test(html) ? html.replace(/<\/body>/i, tag + '</body>') : html + tag;
         return new Response(html, { headers });
@@ -301,7 +318,8 @@ app.whenReady().then(() => {
       // git on the Mac — none may answer over the relay (phone/web are read-mostly
       // remote controls, not local-execution surfaces).
       if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject'
-        || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment') {
+        || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment'
+        || method === 'copyDesignToCode') {
         throw Object.assign(new Error('not available remotely'), { statusCode: 403 });
       }
       const r = await dispatch(method, params);

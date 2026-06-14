@@ -137,6 +137,9 @@ interface SetNavItem { key: string; icon: IconName; label: string; tint: string;
 const SET_NAV: SetNavItem[] = [
   { key: 'general', icon: 'settings', label: 'General', tint: 'var(--ink-secondary)' },
   { key: 'engines', icon: 'cpu', label: 'Engines', tint: 'var(--purple)' },
+  // Skills + Costs are launchers, not top-nav menus — they open the full screens.
+  { key: 'skills', icon: 'spark', label: 'Skills & tools', tint: 'var(--indigo)' },
+  { key: 'costs', icon: 'gauge', label: 'Costs', tint: 'var(--green)' },
   { key: 'accounts', icon: 'key', label: 'Accounts & keys', tint: 'var(--blue)' },
   { key: 'security', icon: 'shield', label: 'Security', tint: 'var(--green)' },
   { key: 'devices', icon: 'smartphone', label: 'Devices', tint: 'var(--teal)' },
@@ -732,7 +735,7 @@ export default function Settings() {
                 {SET_NAV.map(n => {
                   const on = sec === n.key;
                   return (
-                    <button key={n.key} onClick={() => setSec(n.key)} className={on ? '' : 'set-nav'} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 38, padding: '0 10px', borderRadius: 8, textAlign: 'left',
+                    <button key={n.key} onClick={() => n.key === 'skills' ? navigate('/skills-registry') : n.key === 'costs' ? navigate('/budget') : setSec(n.key)} className={on ? '' : 'set-nav'} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 38, padding: '0 10px', borderRadius: 8, textAlign: 'left',
                       background: on ? 'var(--blue)' : 'transparent', color: on ? '#fff' : 'var(--ink)', font: `${on ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`, transition: 'background 140ms ease' }}>
                       <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: on ? 'rgba(255,255,255,0.2)' : `color-mix(in srgb, ${n.tint} 14%, transparent)`, color: on ? '#fff' : n.tint }}><Icon name={n.icon} size={15} /></span>
                       {n.label}
