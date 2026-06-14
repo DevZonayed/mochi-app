@@ -16,6 +16,7 @@ import { createDispatch } from './localApi.js';
 import { buildModelGroups } from './models.js';
 import { RelayClient } from './relay.js';
 import { CronRunner } from './cron.js';
+import { runSmoke } from './smoke.js';
 
 const RENDERER_DIST = path.join(__dirname, '../dist');
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
@@ -29,6 +30,12 @@ const PRELOAD = ['preload.mjs', 'preload.js']
   .find((p) => existsSync(p)) ?? path.join(__dirname, 'preload.mjs');
 
 let win: BrowserWindow | null = null;
+
+// Smoke test (MAESTRO_SMOKE=1): isolate to a throwaway userData so the run never
+// touches real data; the window is skipped + the smoke sequence runs in whenReady.
+if (process.env.MAESTRO_SMOKE) {
+  try { app.setPath('userData', path.join(app.getPath('temp'), 'maestro-smoke-' + Date.now())); } catch { /* pre-ready getPath may vary */ }
+}
 
 /* The Design genre's live preview serves a project's folder over a private,
    standard scheme so the artifact (design/index.html) + its images/fonts resolve
@@ -384,6 +391,16 @@ app.whenReady().then(() => {
     if (c) { try { c.kill('SIGTERM'); } catch { /* gone */ } runningCmds.delete(String(runId)); }
     return { ok: true };
   });
+
+  // Smoke test: run the end-to-end sequence against the fully-wired core, then
+  // exit. No window — everything above (engine + image-gen + browser + dispatch)
+  // is already set up exactly as the app uses it.
+  if (process.env.MAESTRO_SMOKE) {
+    void runSmoke({ dispatch, engine, browser, store })
+      .then(code => { try { void browser.dispose(); browserBridge.stop(); } catch { /* */ } app.exit(code); })
+      .catch(e => { console.error('smoke harness crashed:', e); app.exit(2); });
+    return;
+  }
 
   createWindow();
 });
