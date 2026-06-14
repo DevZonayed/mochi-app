@@ -77,7 +77,7 @@ const PURPOSE_KEY = 'maestro.purpose';
 const purposeListeners = new Set<() => void>();
 function readPurpose(): Purpose {
   try { const v = localStorage.getItem(PURPOSE_KEY); if (v === 'general' || v === 'coding' || v === 'design' || v === 'video') return v; } catch { /* storage unavailable */ }
-  return 'general';
+  return 'coding'; // the default experience — workspace-focused chrome, no sidebar
 }
 let purposePref: Purpose = readPurpose();
 export function getPurpose(): Purpose { return purposePref; }
