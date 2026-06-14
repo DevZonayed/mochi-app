@@ -11,6 +11,7 @@ import { api, IS_LOCAL, type Project, type ChatSession, type ProjectKind, type J
 import { ChatThread } from './ProjectDetail';
 import { FileViewer, ImageViewer } from '../lib/CodeView';
 import { BrowserPane } from '../lib/BrowserPane';
+import { ProjectPanel } from '../lib/ProjectPanel';
 import { RightSidebar, type CheckItem } from '../lib/RightSidebar';
 import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
@@ -41,7 +42,8 @@ const PAGE_CSS = `
   .ws-ovf-item:hover { background: var(--fill-tertiary); }
 `;
 
-interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image' | 'browser'; filePath?: string; imageAssetId?: string; imagePath?: string }
+type ProjectSection = 'settings' | 'instructions' | 'jobs';
+interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image' | 'browser' | 'project'; filePath?: string; imageAssetId?: string; imagePath?: string; projectSection?: ProjectSection }
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
@@ -55,6 +57,7 @@ function relTime(ts: number): string {
 }
 const projColor = (p?: Project): string => (p?.color ? `var(--${p.color})` : 'var(--blue)');
 const projKind = (p?: Project): ProjectKind => (p?.kind ?? 'general');
+const CHAT_PREVIEW = 7; // chats shown per project before "Show all"
 
 const KIND_FILTER_KEY = 'maestro.workspace.kind';
 type KindFilter = ProjectKind | 'all';
@@ -78,6 +81,11 @@ export default function Workspace() {
   });
   const [renamingId, setRenamingId] = React.useState<string | null>(null);
   const [renameVal, setRenameVal] = React.useState('');
+  // Cap chats shown per project so a busy one doesn't bury the others; "Show all"
+  // per project reveals the rest. Searching always shows every match.
+  const [chatsAllOpen, setChatsAllOpen] = React.useState<Set<string>>(new Set());
+  // Per-project "⋯" menu (settings / jobs / instructions / reveal …).
+  const [menuProj, setMenuProj] = React.useState<string | null>(null);
   const [kindFilter, setKindFilterState] = React.useState<KindFilter>(() => {
     try { const v = localStorage.getItem(KIND_FILTER_KEY); return (v && KIND_META.some(m => m.key === v)) ? v as KindFilter : 'all'; } catch { return 'all'; }
   });
@@ -172,6 +180,14 @@ export default function Workspace() {
     const existing = tabs.find(t => t.key === key);
     if (existing) { setActiveKey(existing.key); return; }
     setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: 'Browser', kind: 'browser' }]));
+    setActiveKey(key);
+  };
+  // Open a project hub tab (settings / instructions+memory / jobs) — deduped.
+  const openProject = (projectId: string, section: ProjectSection = 'settings') => {
+    const key = 'project:' + projectId;
+    setTabs(ts => ts.some(t => t.key === key)
+      ? ts.map(t => (t.key === key ? { ...t, projectSection: section } : t))
+      : [...ts, { key, projectId, sessionId: null, title: projById[projectId]?.name ?? 'Project', kind: 'project', projectSection: section }]);
     setActiveKey(key);
   };
   // Files the active chat wrote (from its turns' write-tool steps), newest first.
@@ -425,14 +441,36 @@ export default function Workspace() {
               return (
                 <div key={p.id} className="ws-proj">
                   <div className="ws-row ws-proj-head" onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
-                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer' }}>
+                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer', position: 'relative' }}>
                     <Icon name="chevronRight" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
                     <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p) }} />
                     <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
                     {chats.length > 0 && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{chats.length}</span>}
+                    <button className="ws-newchat" title="Project · settings, jobs, memory" onClick={e => { e.stopPropagation(); setMenuProj(m => m === p.id ? null : p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0, position: 'relative' }}>
+                      <Icon name="more" size={15} />
+                    </button>
                     <button className="ws-newchat" title="New chat here" onClick={e => { e.stopPropagation(); newChat(p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)', flexShrink: 0 }}>
                       <Icon name="plus" size={14} stroke={2.4} />
                     </button>
+                    {menuProj === p.id && (
+                      <>
+                        <div onClick={e => { e.stopPropagation(); setMenuProj(null); }} style={{ position: 'fixed', inset: 0, zIndex: 50 }} />
+                        <div onClick={e => e.stopPropagation()} style={{ position: 'absolute', top: '100%', right: 6, zIndex: 51, marginTop: 2, minWidth: 184, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--card-shadow)', padding: 5 }}>
+                          {[
+                            { key: 'settings', icon: 'settings' as const, label: 'Project settings' },
+                            { key: 'instructions', icon: 'bookmark' as const, label: 'Instructions & memory' },
+                            { key: 'jobs', icon: 'jobs' as const, label: 'Jobs' },
+                          ].map(it => (
+                            <button key={it.key} className="ws-ovf-item" onClick={() => { setMenuProj(null); openProject(p.id, it.key as ProjectSection); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
+                              <Icon name={it.icon} size={15} style={{ color: 'var(--ink-secondary)' }} /> {it.label}
+                            </button>
+                          ))}
+                          <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
+                          {p.path && <button className="ws-ovf-item" onClick={() => { setMenuProj(null); void api.revealPath(p.path!); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="folder" size={15} style={{ color: 'var(--ink-secondary)' }} /> Reveal in Finder</button>}
+                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); navigate('/skills-registry'); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="spark" size={15} style={{ color: 'var(--ink-secondary)' }} /> Skills</button>
+                        </div>
+                      </>
+                    )}
                   </div>
                   {isOpen && (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
@@ -441,7 +479,13 @@ export default function Workspace() {
                           <Icon name="plus" size={12} /> New chat
                         </button>
                       )}
-                      {chats.map(s => <SessionRow key={s.id} s={s} indent={26} />)}
+                      {(q || chatsAllOpen.has(p.id) ? chats : chats.slice(0, CHAT_PREVIEW)).map(s => <SessionRow key={s.id} s={s} indent={26} />)}
+                      {!q && chats.length > CHAT_PREVIEW && (
+                        <button onClick={() => setChatsAllOpen(prev => { const n = new Set(prev); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
+                          style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px 4px 26px', borderRadius: 8, color: 'var(--blue)', font: '600 var(--fs-caption)/1.3 var(--font-text)', cursor: 'pointer' }}>
+                          {chatsAllOpen.has(p.id) ? 'Show less' : `Show all ${chats.length} chats`}
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -471,6 +515,8 @@ export default function Workspace() {
                       ? <Icon name="globe" size={12} style={{ color: 'var(--blue)', flexShrink: 0 }} />
                       : t.kind === 'image'
                       ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
+                      : t.kind === 'project'
+                      ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
                       : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />}
                     <span style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
                     <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
@@ -547,6 +593,8 @@ export default function Workspace() {
                     ? <ImageViewer assetId={t.imageAssetId} name={t.title} imagePath={t.imagePath} />
                     : t.kind === 'browser'
                     ? <BrowserPane projectId={t.projectId} />
+                    : t.kind === 'project'
+                    ? <ProjectPanel projectId={t.projectId} section={t.projectSection} />
                     : <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
                         sessionId={t.sessionId} onSessionCreated={onSessionCreated(t.key)} onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
                         onOpenImage={(assetId, name, imagePath) => openImage(t.projectId, assetId, name, imagePath)} />}
