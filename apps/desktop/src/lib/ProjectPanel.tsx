@@ -5,10 +5,10 @@
 
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type Project, type Job } from './api';
+import { api, type Project, type Job, type ProjectMemory } from './api';
 import { Icon, type IconName } from './icons';
 
-type Section = 'settings' | 'instructions' | 'jobs';
+type Section = 'settings' | 'instructions' | 'jobs' | 'memory';
 
 function relTime(ms: number): string {
   const s = Math.max(0, (Date.now() - ms) / 1000);
@@ -34,6 +34,7 @@ export function ProjectPanel({ projectId, section = 'settings' }: { projectId: s
   const TABS: { key: Section; label: string; icon: IconName }[] = [
     { key: 'settings', label: 'Settings', icon: 'settings' },
     { key: 'instructions', label: 'Instructions', icon: 'bookmark' },
+    { key: 'memory', label: 'Memory', icon: 'spark' },
     { key: 'jobs', label: 'Jobs', icon: 'jobs' },
   ];
 
@@ -61,6 +62,7 @@ export function ProjectPanel({ projectId, section = 'settings' }: { projectId: s
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '18px 16px 28px' }}>
         {tab === 'settings' && project && <SettingsBody project={project} patch={patch} onFull={() => navigate(`/project-detail/${projectId}`)} />}
         {tab === 'instructions' && project && <InstructionsBody project={project} patch={patch} />}
+        {tab === 'memory' && <MemoryBody projectId={projectId} />}
         {tab === 'jobs' && <JobsBody projectId={projectId} />}
       </div>
     </div>
@@ -111,6 +113,41 @@ function InstructionsBody({ project, patch }: { project: Project; patch: (p: Par
       </div>
       <textarea value={val} onChange={e => onChange(e.target.value)} placeholder="e.g. This project uses pnpm. Always run the type-check before finishing. The deploy script is ./scripts/deploy.sh…"
         style={{ flex: 1, minHeight: 240, resize: 'vertical', border: '1px solid var(--hairline)', borderRadius: 10, padding: '12px 14px', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1.6 var(--font-text)', outline: 'none' }} />
+    </div>
+  );
+}
+
+function MemoryBody({ projectId }: { projectId: string }) {
+  const [mem, setMem] = React.useState<ProjectMemory | null>(null);
+  const [state, setState] = React.useState('');
+  const timer = React.useRef<number | undefined>(undefined);
+  React.useEffect(() => {
+    let on = true;
+    api.getProjectMemory(projectId).then(m => { if (!on) return; setMem(m); setState(m.state); }).catch(() => { if (on) setMem({ state: '', checkpoints: [] }); });
+    return () => { on = false; };
+  }, [projectId]);
+  const onChange = (v: string) => { setState(v); if (timer.current) window.clearTimeout(timer.current); timer.current = window.setTimeout(() => void api.setProjectMemory(projectId, v).catch(() => {}), 700); };
+  if (!mem) return <div style={{ color: 'var(--ink-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-text)' }}>Loading…</div>;
+  return (
+    <div style={{ maxWidth: 760, display: 'flex', flexDirection: 'column', gap: 14, height: '100%' }}>
+      <div style={{ font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+        The project’s <strong>durable memory</strong> (<code>.continuum/STATE.md</code>) — loaded into every chat so the agent never re-learns this project. The agent keeps it current as it works; you can edit it directly. Shared across coding & design.
+      </div>
+      <textarea value={state} onChange={e => onChange(e.target.value)} placeholder="Empty for now. The agent will record decisions, structure, conventions and open threads here as it works — or write what it should always remember."
+        style={{ minHeight: 200, resize: 'vertical', border: '1px solid var(--hairline)', borderRadius: 10, padding: '12px 14px', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1.6 var(--font-mono)', outline: 'none' }} />
+      {mem.checkpoints.length > 0 && (
+        <div>
+          <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', margin: '4px 0 8px' }}>Checkpoints</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {mem.checkpoints.map(c => (
+              <div key={c.id} style={{ padding: '9px 12px', borderRadius: 10, border: '0.5px solid var(--separator)', background: 'var(--surface)' }}>
+                <span style={{ font: '700 var(--fs-caption)/1 var(--font-mono)', color: 'var(--blue)' }}>#{c.id}</span>
+                <span style={{ marginLeft: 8, font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink-secondary)' }}>{c.summary.slice(0, 280)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

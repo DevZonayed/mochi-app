@@ -217,6 +217,8 @@ export interface AppSettings {
   chromeProfileMode?: 'copy' | 'live';
 }
 export interface ChromeProfile { dir: string; name: string }
+/** Per-project .continuum memory: the durable STATE + checkpoint chain (newest first). */
+export interface ProjectMemory { state: string; checkpoints: { id: number; summary: string }[] }
 export interface CostsData {
   today: number;
   thisMonth: number;
@@ -446,6 +448,11 @@ export const api = {
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   getProject: (id: string) =>
     call<Project>('getProject', { id }, () => req<Project>(`/api/projects/${encodeURIComponent(id)}`)),
+  // Per-project .continuum memory (STATE.md + checkpoint chain).
+  getProjectMemory: (id: string) =>
+    call<ProjectMemory>('getProjectMemory', { id }, () => req<ProjectMemory>(`/api/projects/${encodeURIComponent(id)}/memory`)),
+  setProjectMemory: (id: string, state: string) =>
+    call<{ ok: true }>('setProjectMemory', { id, state }, () => req<{ ok: true }>(`/api/projects/${encodeURIComponent(id)}/memory`, { method: 'POST', body: JSON.stringify({ state }) })),
 
   // Coding agent: clone a repo / open a folder / inspect git (desktop owns git)
   gitAvailable: () => call<{ available: boolean }>('gitAvailable', {}, () => Promise.resolve({ available: false })),

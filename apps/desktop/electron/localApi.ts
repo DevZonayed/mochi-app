@@ -13,6 +13,10 @@ import type { TelegramBot } from './telegram.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable } from './git.js';
 import { listChromeProfiles } from './chrome-profiles.js';
+import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import nodePath from 'node:path';
 
 type Params = Record<string, unknown>;
 
@@ -21,6 +25,13 @@ const bad = (msg: string, statusCode = 400): never => {
 };
 
 const ENGINE_VALUES = new Set(['claude', 'codex']);
+/** A project's working root on disk — its own folder, or ~/Maestro/<name>. */
+function projectRootOf(proj: { name?: string; path?: string }): string {
+  if (proj.path && existsSync(proj.path)) return proj.path;
+  const safe = (proj.name || 'default').replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
+  return nodePath.join(homedir(), 'Maestro', safe);
+}
+
 function asEngine(v: unknown): EngineId | undefined {
   return typeof v === 'string' && ENGINE_VALUES.has(v) ? (v as EngineId) : undefined;
 }
@@ -81,9 +92,22 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const proj = store.getProject(String(p.id ?? ''));
         return proj ?? bad('project not found', 404);
       }
+      // Per-project .continuum memory (STATE.md + checkpoint chain).
+      case 'getProjectMemory': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (!proj) return bad('project not found', 404);
+        const root = projectRootOf(proj);
+        return { state: readProjectState(root), checkpoints: listCheckpoints(root, 50) };
+      }
+      case 'setProjectMemory': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (!proj) return bad('project not found', 404);
+        writeProjectState(projectRootOf(proj), typeof p.state === 'string' ? p.state : '');
+        return { ok: true };
+      }
       case 'createProject': {
         if (!p.name || typeof p.name !== 'string') bad('name required');
-        const kind = (p.kind === 'coding' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') ? (p.kind as ProjectKind) : undefined;
+        const kind = (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') ? (p.kind as ProjectKind) : undefined;
         const proj = store.createProject({
           name: p.name as string, template: p.template as string | undefined, instructions: p.instructions as string | undefined,
           color: p.color as string | undefined, kind,
@@ -98,7 +122,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl'] as const) {
           if (typeof p[k] === 'string') patch[k] = p[k];
         }
-        if (p.kind === 'coding' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') patch.kind = p.kind;
+        if (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') patch.kind = p.kind;
         if (Object.keys(patch).length === 0) bad('no valid project fields');
         const proj = store.updateProject(String(p.id ?? ''), patch);
         emit('project', proj);

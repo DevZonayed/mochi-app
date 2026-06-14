@@ -23,6 +23,7 @@ import type { BrowserBridge } from './browser-bridge.js';
 import { assetsDirFor } from './media.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { ensureBranch, branchSlug } from './git.js';
+import { readContinuumContext } from './continuum.js';
 import type { Providers } from './providers.js';
 
 const require = createRequire(__filename);
@@ -1033,6 +1034,17 @@ export class LocalEngine {
         }
       }
       if (fileParts.length) prompt += `\n\n---\n\nThe user attached the following file(s):\n\n${fileParts.join('\n\n')}`;
+
+      // Project memory (.continuum): inject the durable STATE + recent checkpoints
+      // so the agent never re-learns the project, and ask it to keep STATE current.
+      // Shared by every genre (coding + design). Uniform across engines (file-based).
+      const projMemory = readContinuumContext(cwd);
+      if (projMemory) {
+        prompt = `[Project memory — loaded at the start of every chat so you never re-explain this project. Read it before responding.]\n\n${projMemory}\n\n` +
+          `When you learn something durable about this project (a decision, the structure, conventions, where things live, an open thread), KEEP \`.continuum/STATE.md\` current — edit/create it with your tools. Keep it concise and high-signal.\n\n---\n\n${prompt}`;
+      } else {
+        prompt += `\n\n[Project memory] If this turn establishes anything worth remembering next time (decisions, structure, conventions, open threads), record it in \`.continuum/STATE.md\` (create it) so future chats start with that context.`;
+      }
 
       const hooks: RunHooks = {
         signal: ac.signal,
