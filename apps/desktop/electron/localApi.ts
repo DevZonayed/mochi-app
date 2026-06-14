@@ -11,7 +11,7 @@ import type { PublishingEngine } from './publishing.js';
 import type { BrowserController } from './browser.js';
 import type { TelegramBot } from './telegram.js';
 import type { Providers, ProviderId } from './providers.js';
-import { cloneRepo, inspectFolder, repoInfo, gitAvailable } from './git.js';
+import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { existsSync } from 'node:fs';
@@ -104,6 +104,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!proj) return bad('project not found', 404);
         writeProjectState(projectRootOf(proj), typeof p.state === 'string' ? p.state : '');
         return { ok: true };
+      }
+      // Commit a referable snapshot of the project (design + attachments).
+      case 'snapshotProject': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (!proj) return bad('project not found', 404);
+        return snapshotProject(projectRootOf(proj), typeof p.message === 'string' ? p.message : 'snapshot');
       }
       case 'createProject': {
         if (!p.name || typeof p.name !== 'string') bad('name required');

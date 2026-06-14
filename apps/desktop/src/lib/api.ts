@@ -453,6 +453,9 @@ export const api = {
     call<ProjectMemory>('getProjectMemory', { id }, () => req<ProjectMemory>(`/api/projects/${encodeURIComponent(id)}/memory`)),
   setProjectMemory: (id: string, state: string) =>
     call<{ ok: true }>('setProjectMemory', { id, state }, () => req<{ ok: true }>(`/api/projects/${encodeURIComponent(id)}/memory`, { method: 'POST', body: JSON.stringify({ state }) })),
+  /** Commit a referable snapshot of the project (design + attachments). */
+  snapshotProject: (id: string, message?: string) =>
+    call<{ ok: boolean; hash?: string; reason?: string }>('snapshotProject', { id, message }, () => req<{ ok: boolean; hash?: string; reason?: string }>(`/api/projects/${encodeURIComponent(id)}/snapshot`, { method: 'POST', body: JSON.stringify({ message }) })),
 
   // Coding agent: clone a repo / open a folder / inspect git (desktop owns git)
   gitAvailable: () => call<{ available: boolean }>('gitAvailable', {}, () => Promise.resolve({ available: false })),

@@ -53,7 +53,12 @@ const DESIGN_DIRECTIVE =
   `• Iterate in place: EDIT \`design/index.html\` for changes — don't spawn new files per tweak. ` +
   `Keep it the single source of truth. After a change, briefly say what you changed.\n` +
   `• This artifact is real, hand-off-able front-end code: write clean, semantic HTML so it can ` +
-  `later become a coding project.`;
+  `later become a coding project.\n` +
+  `• You are fluent in the common design surfaces — landing pages, dashboards & data UIs, mobile ` +
+  `app screens, slide decks, posters, emails, pricing pages, and brand kits. Bring real craft to ` +
+  `whichever the user asks for: a coherent type scale, a considered colour system, a grid, real ` +
+  `content (no lorem ipsum), responsive behaviour, and tasteful detail (states, shadows, motion). ` +
+  `If a brand/design system is recorded in the project memory or instructions, apply it faithfully.`;
 const GOAL_DIRECTIVE =
   `\n\n---\n\n[Goal mode] Pursue the request above as a goal: work autonomously to ` +
   `completion. Don't stop to ask for confirmation on routine steps; plan, implement, ` +

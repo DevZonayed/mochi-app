@@ -28,6 +28,7 @@ export default function DesignWorkspace() {
   const [device, setDevice] = React.useState('desktop');
   const [creating, setCreating] = React.useState(false);
   const [newName, setNewName] = React.useState('');
+  const [snap, setSnap] = React.useState<string | null>(null); // last snapshot result (toast)
 
   const designProjects = projects.filter(p => p.kind === 'design');
   const active = designProjects.find(p => p.id === activeId) ?? null;
@@ -54,12 +55,19 @@ export default function DesignWorkspace() {
     return () => unsub();
   }, [activeId]);
 
-  const createDesign = async () => {
-    const name = newName.trim() || `Design ${designProjects.length + 1}`;
+  const createDesign = async (presetName?: string) => {
+    const name = (presetName || newName).trim() || `Design ${designProjects.length + 1}`;
     try {
       const p = await api.createProject({ name, kind: 'design', template: 'design', color: 'purple' });
       setProjects(ps => [...ps, p]); setActiveId(p.id); setSessionId(null); setCreating(false); setNewName('');
     } catch { /* surfaced by the empty state */ }
+  };
+  const doSnapshot = async () => {
+    if (!active) return;
+    setSnap('Saving snapshot…');
+    try { const r = await api.snapshotProject(active.id, 'Design snapshot'); setSnap(r.ok ? `Snapshot saved · ${r.hash}` : (r.reason || 'snapshot failed')); }
+    catch { setSnap('snapshot failed'); }
+    window.setTimeout(() => setSnap(null), 4000);
   };
 
   const previewUrl = active ? `maestro-design://${active.id}/design/index.html?t=${nonce}` : '';
@@ -105,6 +113,14 @@ export default function DesignWorkspace() {
               <h2 style={{ font: '700 var(--fs-title2)/1.2 var(--font-display)', color: 'var(--ink)', margin: '0 0 8px' }}>Design with an agent</h2>
               <p style={{ font: '400 var(--fs-subhead)/1.55 var(--font-text)', color: 'var(--ink-secondary)', margin: '0 0 18px' }}>Describe what you want — a landing page, dashboard, poster, deck — and the agent builds a live, self-contained design you can refine and hand off to code.</p>
               <button onClick={() => setCreating(true)} style={{ height: 38, padding: '0 18px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-subhead)/1 var(--font-text)', cursor: 'pointer' }}>Start a design</button>
+              <div style={{ marginTop: 22 }}>
+                <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 10 }}>Or start from a skill</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center' }}>
+                  {['Landing page', 'Dashboard', 'Mobile app screen', 'Slide deck', 'Poster', 'Email', 'Pricing page', 'Brand kit'].map(s => (
+                    <button key={s} onClick={() => void createDesign(s)} className="nav-item" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', border: '0.5px solid var(--separator)', background: 'var(--surface)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>{s}</button>
+                  ))}
+                </div>
+              </div>
             </div>
           </div>
         ) : (
@@ -126,8 +142,10 @@ export default function DesignWorkspace() {
                     </button>
                   ))}
                 </div>
+                {snap && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: snap.includes('failed') ? 'var(--red, #e5484d)' : 'var(--green)' }}>{snap}</span>}
                 <span style={{ flex: 1 }} />
                 <button onClick={() => setNonce(n => n + 1)} title="Reload preview" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="refresh" size={16} /></button>
+                <button onClick={() => void doSnapshot()} title="Save a referable snapshot (commit the design + attachments)" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="bookmark" size={16} /></button>
                 {IS_LOCAL && active.path && <button onClick={() => void api.revealPath(active.path!)} title="Reveal design folder" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="folder" size={16} /></button>}
                 <button onClick={() => navigate(`/project-detail/${active.id}`)} title="Hand off to code — open this design as a coding project" style={{ display: 'flex', alignItems: 'center', gap: 7, height: 32, padding: '0 12px', borderRadius: 8, background: 'var(--ink)', color: 'var(--bg)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
                   <Icon name="terminal" size={14} /> Hand off to code
