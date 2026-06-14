@@ -24,6 +24,7 @@ import { assetsDirFor } from './media.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { ensureBranch, branchSlug } from './git.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
+import { registryBase, searchRegistry, fetchSkillContent, installSkillFiles } from './skills-registry.js';
 import type { Providers } from './providers.js';
 
 const require = createRequire(__filename);
@@ -309,6 +310,12 @@ function abortControllerFromSignal(signal: AbortSignal): AbortController {
 }
 
 /* ── Claude (Agent SDK on the subscription login or a connected key) ──── */
+/** Agent-facing skill registry capability (search + self-install), injected into runClaude. */
+interface SkillsCtx {
+  search: (q: string, limit?: number) => Promise<{ count: number; results: { id: string; name: string; description: string; risk: string }[] }>;
+  install: (skillId: string) => Promise<{ name: string; slug: string }>;
+}
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -316,6 +323,7 @@ async function runClaude(
   imageGen?: ImageGenFn, projectId?: string | null,
   images?: { mime: string; b64: string }[],
   browser?: BrowserController,
+  skillsCtx?: SkillsCtx,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -341,7 +349,7 @@ async function runClaude(
   const wrap = <A,>(fn: (a: A) => Promise<{ content: { type: 'text'; text: string }[] }>) =>
     async (a: A) => { try { return await fn(a); } catch (e) { return toolErr(e); } };
   const pid = projectId ?? null;
-  const maestroServer = ((imageGen || browser) && !plan)
+  const maestroServer = ((imageGen || browser || skillsCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
@@ -429,12 +437,30 @@ async function runClaude(
             tool('browser_select_tab', 'Switch to a tab by its index (from browser_tabs).', { index: z.number() },
               wrap(async (a: { index: number }) => { const r = await browser!.selectTab(pid, a.index); return txt(`Switched to ${r.url} — "${r.title}"`); })),
           ] : []),
+          ...(skillsCtx ? [
+            tool('search_skills',
+              'Search the Maestro skill registry — a curated, security-audited catalog of agent skills (from skills.sh) for specialized tasks (PDFs, spreadsheets, specific APIs, frameworks, etc.). Use this BEFORE improvising when a task would benefit from a dedicated skill. Returns matching skills with their id, name and description.',
+              { query: z.string().describe('What you need, e.g. "edit pdf", "google sheets", "stripe", "next.js best practices".'), limit: z.number().optional().describe('Max results (default 8).') },
+              wrap(async (a: { query: string; limit?: number }) => {
+                const r = await skillsCtx.search(a.query, a.limit ?? 8);
+                if (!r.results.length) return txt(`No skills found for "${a.query}".`);
+                return txt(`Found ${r.results.length} skill(s):\n` + r.results.map(s => `- ${s.id} — ${s.name}: ${s.description} [risk: ${s.risk}]`).join('\n') + `\n\nInstall the most relevant one with add_skill_to_project(skillId), then read its SKILL.md.`);
+              })),
+            tool('add_skill_to_project',
+              'Install a skill from the registry into THIS project (writes it to .claude/skills/<slug>/SKILL.md). After installing, READ that SKILL.md and follow it for the task. Use a skillId returned by search_skills.',
+              { skillId: z.string().describe('The skill id from search_skills, e.g. "anthropics/skills/pdf".') },
+              wrap(async (a: { skillId: string }) => {
+                const rec = await skillsCtx.install(a.skillId);
+                return txt(`Installed "${rec.name}" → .claude/skills/${rec.slug}/SKILL.md. Now read that file and follow it.`);
+              })),
+          ] : []),
         ],
       })
     : null;
   const maestroAllowed = [
     ...(imageGen ? ['generate_image'] : []),
     ...(browser ? ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_press', 'browser_scroll', 'browser_upload', 'browser_select', 'browser_hover', 'browser_wait', 'browser_evaluate', 'browser_console', 'browser_remember', 'browser_back', 'browser_forward', 'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab'] : []),
+    ...(skillsCtx ? ['search_skills', 'add_skill_to_project'] : []),
   ].map(n => `mcp__maestro__${n}`);
   /* Vision input: when the user attached images, the prompt becomes a streamed
      user message carrying text + base64 image blocks (a plain string can't hold
@@ -1055,6 +1081,17 @@ export class LocalEngine {
         }
       }
 
+      // Installed skills (.claude/skills): surface what's installed so BOTH engines
+      // know the skill exists. Claude also auto-discovers SKILL.md via settingSources,
+      // but Codex does not — this index tells it to read the file. Reference data.
+      if (job.projectId) {
+        const installed = this.store.listInstalledSkills(job.projectId);
+        if (installed.length) {
+          const list = installed.map(s => `- ${s.name}: ${(s.description || '').slice(0, 160)} (full instructions in .claude/skills/${s.slug}/SKILL.md)`).join('\n');
+          prompt = `<project_skills note="Skills installed in this project. When a task matches one, READ its SKILL.md and follow it. You can also call search_skills / add_skill_to_project to add more.">\n${list}\n</project_skills>\n\n${prompt}`;
+        }
+      }
+
       const hooks: RunHooks = {
         signal: ac.signal,
         onProgress: flush,
@@ -1062,8 +1099,19 @@ export class LocalEngine {
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
       const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input), browserBridge: this.browserBridgeFor() };
+      // Let the agent discover + self-install registry skills mid-run (Claude MCP).
+      const projForSkills = job.projectId;
+      const skillsCtx: SkillsCtx | undefined = (projForSkills && !opts.plan) ? {
+        search: (q, limit) => searchRegistry(registryBase(), q, limit ?? 8),
+        install: async (skillId: string) => {
+          const content = await fetchSkillContent(registryBase(), skillId);
+          const slug = installSkillFiles(cwd, skillId, content.skillMd);
+          const rec = this.store.recordSkillInstall(projForSkills, { id: skillId, slug, name: content.name });
+          return { name: rec.name, slug: rec.slug };
+        },
+      } : undefined;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, this.browserFor())
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, this.browserFor(), skillsCtx)
         : runCodex(prompt, cwd, hooks, false, masterModel, imageCtx, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the

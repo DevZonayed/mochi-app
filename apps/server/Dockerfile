@@ -15,5 +15,7 @@ ENV PORT=8080
 COPY package.json ./
 RUN npm install --omit=dev
 COPY --from=build /app/dist ./dist
+# The scraped skill registry index (served read-only under /registry/*).
+COPY registry ./registry
 EXPOSE 8080
 CMD ["node", "dist/index.js"]

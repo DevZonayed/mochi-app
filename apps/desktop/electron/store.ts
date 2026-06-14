@@ -307,6 +307,21 @@ interface StoreData {
       design artifact + the operator's note. The design agent reads these to
       revise specific elements. Keyed by projectId. Mac-local; never relayed. */
   designComments?: Record<string, DesignComment[]>;
+  /** Skills installed into a project (from the registry). The files live on disk
+      at <project>/.claude/skills/<slug>/; this records the metadata for the UI +
+      Codex prompt-injection. Keyed by projectId. Mac-local. */
+  installedSkills?: Record<string, InstalledSkill[]>;
+}
+
+/** A registry skill installed into a project (metadata mirror of the on-disk folder). */
+export interface InstalledSkill {
+  id: string;          // registry id, e.g. anthropics/skills/frontend-design
+  slug: string;        // on-disk folder name under .claude/skills/
+  name: string;
+  description?: string;
+  risk?: string;
+  source?: string;     // upstream GitHub url
+  installedAt: number;
 }
 
 /** A note anchored to a specific element of a live design (by CSS selector). */
@@ -349,6 +364,7 @@ export class Store {
       if (this.data.routing && !this.data.routing.browser) { this.data.routing.browser = 'on'; dirty = true; }
       if (!this.data.browserMemory) { this.data.browserMemory = {}; dirty = true; }
       if (!this.data.designComments) { this.data.designComments = {}; dirty = true; }
+      if (!this.data.installedSkills) { this.data.installedSkills = {}; dirty = true; }
       // SP1: seed model-level roles on older stores from the engine-level fields.
       if (this.data.routing && !this.data.routing.roles) {
         const r = this.data.routing;
@@ -499,6 +515,25 @@ export class Store {
   deleteDesignComment(projectId: string, commentId: string): void {
     const list = this.data.designComments?.[projectId]; if (!list) return;
     this.data.designComments![projectId] = list.filter(x => x.id !== commentId);
+    this.save();
+  }
+
+  // ── Installed skills (registry skills copied into a project) ─────────────
+  listInstalledSkills(projectId: string): InstalledSkill[] {
+    return this.data.installedSkills?.[projectId] ?? [];
+  }
+  recordSkillInstall(projectId: string, s: Omit<InstalledSkill, 'installedAt'>): InstalledSkill {
+    if (!this.data.installedSkills) this.data.installedSkills = {};
+    const list = this.data.installedSkills[projectId] ?? (this.data.installedSkills[projectId] = []);
+    const rec: InstalledSkill = { ...s, installedAt: Date.now() };
+    const i = list.findIndex(x => x.id === s.id || x.slug === s.slug);
+    if (i >= 0) list[i] = rec; else list.push(rec);
+    this.save();
+    return rec;
+  }
+  removeInstalledSkill(projectId: string, idOrSlug: string): void {
+    const list = this.data.installedSkills?.[projectId]; if (!list) return;
+    this.data.installedSkills![projectId] = list.filter(x => x.id !== idOrSlug && x.slug !== idOrSlug);
     this.save();
   }
 

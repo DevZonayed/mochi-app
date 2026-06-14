@@ -14,6 +14,7 @@ import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
+import { registryBase, searchRegistry, registryMeta, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
 import { existsSync, mkdirSync, cpSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
@@ -391,6 +392,42 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return s ?? bad('skill not found', 404);
       }
       case 'listTemplates': return store.listTemplates();
+
+      // ── Skill registry (search + install secure skills into a project) ──
+      case 'searchSkills': {
+        return searchRegistry(registryBase(relayUrl), String(p.q ?? ''), Number(p.limit) || 30);
+      }
+      case 'skillRegistryMeta': {
+        return registryMeta(registryBase(relayUrl)).catch(() => ({ count: 0, generatedAt: '', source: '', note: 'registry unreachable' }));
+      }
+      case 'listProjectSkills': {
+        return { skills: store.listInstalledSkills(String(p.id ?? '')) };
+      }
+      case 'addSkillToProject': {
+        const proj = store.getProject(String(p.projectId ?? p.id ?? ''));
+        if (!proj) return bad('project not found', 404);
+        const skillId = String(p.skillId ?? '');
+        if (!skillId) return bad('skillId required');
+        const content = await fetchSkillContent(registryBase(relayUrl), skillId);
+        const root = projectRootOf(proj);
+        mkdirSync(root, { recursive: true });
+        const slug = installSkillFiles(root, skillId, content.skillMd);
+        const rec = store.recordSkillInstall(proj.id, {
+          id: skillId, slug, name: typeof p.name === 'string' && p.name ? p.name : content.name,
+          description: typeof p.description === 'string' ? p.description : undefined,
+          risk: typeof p.risk === 'string' ? p.risk : undefined,
+          source: typeof p.source === 'string' ? p.source : undefined,
+        });
+        return { skill: rec };
+      }
+      case 'removeSkillFromProject': {
+        const proj = store.getProject(String(p.projectId ?? p.id ?? ''));
+        if (!proj) return bad('project not found', 404);
+        const idOrSlug = String(p.skillId ?? p.slug ?? '');
+        removeSkillFiles(projectRootOf(proj), idOrSlug); // skills-registry slugs the last path segment
+        store.removeInstalledSkill(proj.id, idOrSlug);
+        return { ok: true };
+      }
 
       // ── Providers (all local: CLI logins + Keychain-encrypted keys) ─
       case 'listProviders': return providers.list();

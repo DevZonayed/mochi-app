@@ -131,6 +131,15 @@ export interface Skill {
   enabled: boolean;
   createdAt: number;
 }
+/** A skill from the remote registry (curated/secure index scraped from skills.sh). */
+export interface RegistrySkillSummary {
+  id: string; name: string; description: string; tags: string[]; license: string;
+  risk: string; source: string; directory: string; installCmd: string; rank: number;
+}
+/** A registry skill installed into a project (files in <project>/.claude/skills/). */
+export interface InstalledSkill {
+  id: string; slug: string; name: string; description?: string; risk?: string; source?: string; installedAt: number;
+}
 export interface Template {
   id: string;
   name: string;
@@ -644,6 +653,17 @@ export const api = {
 
   // Skills
   listSkills: () => call<Skill[]>('listSkills', {}, () => req<Skill[]>('/api/skills')),
+  // Skill registry: search the curated/secure index + install into a project.
+  searchSkills: (q: string, limit = 30) =>
+    call<{ count: number; results: RegistrySkillSummary[] }>('searchSkills', { q, limit }, () => Promise.reject(new Error('desktop only'))),
+  skillRegistryMeta: () =>
+    call<{ count: number; generatedAt: string; source: string; note: string }>('skillRegistryMeta', {}, () => Promise.reject(new Error('desktop only'))),
+  listProjectSkills: (projectId: string) =>
+    call<{ skills: InstalledSkill[] }>('listProjectSkills', { id: projectId }, () => Promise.reject(new Error('desktop only'))),
+  addSkillToProject: (projectId: string, skill: { skillId: string; name?: string; description?: string; risk?: string; source?: string }) =>
+    call<{ skill: InstalledSkill }>('addSkillToProject', { projectId, ...skill }, () => Promise.reject(new Error('desktop only'))),
+  removeSkillFromProject: (projectId: string, skillId: string) =>
+    call<{ ok: boolean }>('removeSkillFromProject', { projectId, skillId }, () => Promise.reject(new Error('desktop only'))),
   toggleSkill: (id: string) =>
     call<Skill>('toggleSkill', { id }, () => req<Skill>(`/api/skills/${encodeURIComponent(id)}/toggle`, { method: 'POST' })),
 

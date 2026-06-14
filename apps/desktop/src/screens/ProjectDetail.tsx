@@ -24,7 +24,7 @@ import {
 } from '../lib/ui';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -792,9 +792,95 @@ function McpRow({ m, last }: { m: McpDef; last?: boolean }) {
   );
 }
 
-function SkillsTab() {
+function SkillsTab({ projectId }: { projectId: string | null }) {
+  const [installed, setInstalled] = React.useState<InstalledSkill[]>([]);
+  const [q, setQ] = React.useState('');
+  const [results, setResults] = React.useState<RegistrySkillSummary[]>([]);
+  const [searching, setSearching] = React.useState(false);
+  const [busy, setBusy] = React.useState<string | null>(null);
+  const [meta, setMeta] = React.useState<{ count: number } | null>(null);
+  const reload = React.useCallback(() => {
+    if (!projectId) return;
+    api.listProjectSkills(projectId).then(r => setInstalled(r.skills)).catch(() => {});
+  }, [projectId]);
+  React.useEffect(() => { reload(); api.skillRegistryMeta().then(m => setMeta({ count: m.count })).catch(() => {}); }, [reload]);
+  const installedIds = new Set(installed.map(s => s.id));
+  const runSearch = async (term: string) => {
+    setSearching(true);
+    try { const r = await api.searchSkills(term, 24); setResults(r.results); } catch { setResults([]); }
+    setSearching(false);
+  };
+  const add = async (s: RegistrySkillSummary) => {
+    if (!projectId) return;
+    setBusy(s.id);
+    try { await api.addSkillToProject(projectId, { skillId: s.id, name: s.name, description: s.description, risk: s.risk, source: s.source }); reload(); }
+    catch { /* surfaced by absence */ }
+    setBusy(null);
+  };
+  const remove = async (s: InstalledSkill) => {
+    if (!projectId) return;
+    setInstalled(list => list.filter(x => x.id !== s.id));
+    try { await api.removeSkillFromProject(projectId, s.id); } catch { reload(); }
+  };
+  const riskTint = (r?: string) => r === 'MEDIUM' ? 'var(--orange)' : r === 'LOW' || r === 'SAFE' || r === 'NONE' ? 'var(--green)' : 'var(--ink-tertiary)';
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 22, maxWidth: 720 }}>
+      {/* Registry search → add to this project */}
+      <div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 10 }}>
+          <div style={{ font: '700 var(--fs-headline)/1 var(--font-display)', color: 'var(--ink)' }}>Add a skill</div>
+          {meta && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{meta.count} secure skills in the registry</span>}
+        </div>
+        <div style={{ position: 'relative', marginBottom: 10 }}>
+          <Icon name="search" size={15} style={{ position: 'absolute', left: 12, top: 11, color: 'var(--ink-tertiary)' }} />
+          <input value={q} onChange={e => { setQ(e.target.value); }} onKeyDown={e => { if (e.key === 'Enter') void runSearch(q); }}
+            placeholder="Search skills — e.g. pdf, google sheets, stripe, next.js…"
+            style={{ width: '100%', height: 38, padding: '0 12px 0 34px', borderRadius: 10, border: '0.5px solid var(--separator)', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-subhead)/1 var(--font-text)', outline: 'none', boxSizing: 'border-box' }} />
+        </div>
+        {searching && <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', padding: '4px 2px' }}>Searching…</div>}
+        {!searching && results.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {results.map(s => {
+              const has = installedIds.has(s.id);
+              return (
+                <div key={s.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '10px 12px', borderRadius: 11, background: 'var(--surface)', border: '0.5px solid var(--separator)' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
+                      <span style={{ width: 6, height: 6, borderRadius: 3, background: riskTint(s.risk), flexShrink: 0 }} title={`audit risk: ${s.risk}`} />
+                      <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.id.split('/').slice(0, 2).join('/')}</span>
+                    </div>
+                    <div style={{ font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 3 }}>{s.description}</div>
+                  </div>
+                  <button onClick={() => has ? undefined : void add(s)} disabled={has || busy === s.id}
+                    style={{ flexShrink: 0, height: 30, padding: '0 13px', borderRadius: 8, border: 'none', background: has ? 'var(--fill-tertiary)' : 'var(--blue)', color: has ? 'var(--ink-tertiary)' : '#fff', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: has ? 'default' : 'pointer' }}>
+                    {has ? 'Added' : busy === s.id ? 'Adding…' : 'Add'}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {!searching && q && results.length === 0 && <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', padding: '6px 2px' }}>No skills match “{q}”. The agent can also add skills itself during a run.</div>}
+      </div>
+
+      {/* Installed in this project */}
+      {installed.length > 0 && (
+        <GroupedList header="Installed in this project">
+          {installed.map((s, i) => (
+            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px', borderBottom: i === installed.length - 1 ? 'none' : '0.5px solid var(--separator)' }}>
+              <Icon name="spark" size={16} style={{ color: 'var(--indigo)', flexShrink: 0 }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</div>
+                {s.description && <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.description}</div>}
+              </div>
+              <code style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>.claude/skills/{s.slug}</code>
+              <button onClick={() => void remove(s)} className="link-btn" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Remove</button>
+            </div>
+          ))}
+        </GroupedList>
+      )}
+
       <GroupedList header="Starter skills">
         {SKILLS.map((s, i) => <SkillRow key={s.name} s={s} last={i === SKILLS.length - 1} />)}
       </GroupedList>
@@ -2738,7 +2824,7 @@ export default function ProjectDetail() {
         {tab === 'chat' && <ChatPane projectId={projectId} project={project} />}
         {tab === 'jobs' && <JobsTab jobs={projectJobs} />}
         {tab === 'instructions' && <InstructionsTab projectId={projectId} project={project} onSaved={(ins) => setProject(p => p ? { ...p, instructions: ins } : p)} />}
-        {tab === 'skills' && <SkillsTab />}
+        {tab === 'skills' && <SkillsTab projectId={projectId} />}
         {tab === 'budget' && <BudgetTab />}
         {tab === 'settings' && <SettingsTab />}
       </div>

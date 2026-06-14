@@ -319,7 +319,8 @@ app.whenReady().then(() => {
       // remote controls, not local-execution surfaces).
       if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject'
         || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment'
-        || method === 'copyDesignToCode') {
+        || method === 'copyDesignToCode'
+        || method === 'addSkillToProject' || method === 'removeSkillFromProject') {
         throw Object.assign(new Error('not available remotely'), { statusCode: 403 });
       }
       const r = await dispatch(method, params);
