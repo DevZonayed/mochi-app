@@ -226,6 +226,10 @@ export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
   const pending = usePendingApprovals();
   const workspaceName = useWorkspaceName();
   const { width, dragging, toggle } = useSidebar();
+  const purpose = usePurpose();
+  // Coding genre has no left sidebar — screens that hand-roll their chrome (and
+  // render <Sidebar/> directly) get the slim top nav via <Toolbar/> instead.
+  if (purpose === 'coding') return null;
   return (
     <aside className="win-drag" style={{
       width, flexShrink: 0, height: '100%', display: 'flex', flexDirection: 'column', position: 'relative', zIndex: 2,
@@ -336,7 +340,16 @@ export interface ToolbarProps {
 
 export function Toolbar({ onSearch, theme, setTheme, right, sidebarHidden }: ToolbarProps) {
   const navigate = useNavigate();
+  const location = useLocation();
   const pending = usePendingApprovals();
+  const purpose = usePurpose();
+  // Coding genre: the hand-rolled-chrome screens render <Toolbar/> as their top
+  // bar — give them the same slim icon-nav the CodingShell uses, so the genre
+  // chrome is truly global (no screen falls back to the classic sidebar+toolbar).
+  if (purpose === 'coding') {
+    const routeKey = ALL_NAV.find(r => location.pathname === r.path || location.pathname.startsWith(r.path + '/'))?.key;
+    return <CodingTopNav active={routeKey} onNav={(k) => navigate(pathForNav(k))} onSearch={onSearch} theme={theme} setTheme={setTheme} right={right} />;
+  }
   return (
     <header className="win-drag" style={{
       height: 56, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 14,
