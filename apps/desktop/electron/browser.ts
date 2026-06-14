@@ -23,8 +23,8 @@ import { chromeUserDataDir, importChromeCookies } from './chrome-profiles.js';
 
 /* ── Public result shapes (what the tools return to the model) ─────────── */
 export interface BrowserState { open: boolean; url: string; title: string; tabs: number; activeTab: number }
-export interface BrowserNav { url: string; title: string }
-export interface BrowserSnapshot { url: string; title: string; aria: string; truncated: boolean }
+export interface BrowserNav { url: string; title: string; memory?: string }
+export interface BrowserSnapshot { url: string; title: string; aria: string; truncated: boolean; memory?: string }
 export interface BrowserShot { path: string; assetId: string; width?: number; height?: number; url: string; title: string }
 export interface ClickTarget { selector?: string; text?: string; nth?: number }
 
@@ -275,7 +275,8 @@ export class BrowserController {
     const target = /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`;
     return this.exclusive(projectId, async (_s, p) => {
       await p.goto(target, { waitUntil: 'domcontentloaded', timeout: ACTION_TIMEOUT });
-      return { url: p.url(), title: await p.title() };
+      const url = p.url();
+      return { url, title: await p.title(), memory: this.recall(url) };
     });
   }
   async back(projectId: string | null | undefined): Promise<BrowserNav> {
@@ -297,7 +298,21 @@ export class BrowserController {
       try { aria = await p.locator('body').ariaSnapshot({ timeout: ACTION_TIMEOUT }); }
       catch { try { aria = (await p.locator('body').innerText()).slice(0, ARIA_CAP); } catch { aria = ''; } }
       const truncated = aria.length > ARIA_CAP;
-      return { url: p.url(), title: await p.title(), aria: truncated ? aria.slice(0, ARIA_CAP) + '\n… (truncated)' : aria, truncated };
+      const url = p.url();
+      return { url, title: await p.title(), aria: truncated ? aria.slice(0, ARIA_CAP) + '\n… (truncated)' : aria, truncated, memory: this.recall(url) };
+    });
+  }
+
+  /* ── Memory: per-domain operating notes the agent saves + auto-recalls ── */
+  private domainOf(url: string): string { try { return new URL(url).hostname.replace(/^www\./, '').toLowerCase(); } catch { return ''; } }
+  /** The saved note for a URL's domain, or '' if none. */
+  recall(url: string): string { const d = this.domainOf(url); return d ? this.store.getBrowserMemory(d) : ''; }
+  /** Save (replace) the operating note for the CURRENT page's domain. */
+  async remember(projectId: string | null | undefined, note: string): Promise<{ ok: true; domain: string }> {
+    return this.exclusive(projectId, async (_s, p) => {
+      const domain = this.domainOf(p.url());
+      if (domain) this.store.setBrowserMemory(domain, note);
+      return { ok: true as const, domain };
     });
   }
 

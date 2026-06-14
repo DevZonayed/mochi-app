@@ -40,7 +40,7 @@ const TOOL_NAMES = [
   'browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click',
   'browser_type', 'browser_press', 'browser_scroll', 'browser_upload',
   'browser_select', 'browser_hover', 'browser_wait',
-  'browser_evaluate', 'browser_console', 'browser_back', 'browser_forward',
+  'browser_evaluate', 'browser_console', 'browser_remember', 'browser_back', 'browser_forward',
   'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab',
 ] as const;
 
@@ -130,8 +130,9 @@ export class BrowserBridge {
     const s = (v: unknown) => (typeof v === 'string' ? v : undefined);
     const n = (v: unknown) => (typeof v === 'number' ? v : undefined);
     switch (tool) {
-      case 'browser_navigate': { const r = await b.navigate(pid, String(a.url ?? '')); return txt(`Opened ${r.url} — "${r.title}"`); }
-      case 'browser_snapshot': { const r = await b.snapshot(pid); return txt(`${r.url} — ${r.title}\n\n${r.aria}`); }
+      case 'browser_navigate': { const r = await b.navigate(pid, String(a.url ?? '')); return txt(`Opened ${r.url} — "${r.title}"` + (r.memory ? `\n\n📝 Your saved notes for this site:\n${r.memory}` : '')); }
+      case 'browser_snapshot': { const r = await b.snapshot(pid); return txt(`${r.url} — ${r.title}\n\n${r.aria}` + (r.memory ? `\n\n📝 Your saved notes for this site:\n${r.memory}` : '')); }
+      case 'browser_remember': { const r = await b.remember(pid, String(a.note ?? '')); return txt(r.domain ? `Saved notes for ${r.domain}.` : 'No page open to attach notes to.'); }
       case 'browser_screenshot': { const r = await b.screenshot(pid, { fullPage: !!a.fullPage }); reg.shots.push(r.assetId); return txt(`Captured a screenshot of ${r.url} (shown in the chat).`); }
       case 'browser_click': { const r = await b.click(pid, { selector: s(a.selector), text: s(a.text), nth: n(a.nth) }); return txt(`Clicked. Now at ${r.url} — "${r.title}"`); }
       case 'browser_type': { const r = await b.type(pid, { selector: s(a.selector), text: String(a.text ?? ''), submit: !!a.submit, clear: !!a.clear }); return txt(`Typed${a.submit ? ' and submitted' : ''}. Now at ${r.url}`); }
@@ -185,6 +186,7 @@ const SHIM_TOOLS = JSON.stringify([
   { name: 'browser_wait', description: 'Wait for an element (selector or text) to appear, or a fixed ms delay.', inputSchema: { type: 'object', properties: { selector: { type: 'string' }, text: { type: 'string' }, ms: { type: 'number' } } } },
   { name: 'browser_evaluate', description: 'Run a JS expression in the page and return its value (JSON, truncated).', inputSchema: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] } },
   { name: 'browser_console', description: 'Read recent console messages and page errors (most recent last).', inputSchema: { type: 'object', properties: {} } },
+  { name: 'browser_remember', description: 'Save operating notes about the CURRENT site for next time (selectors, button locations, login quirks). Auto-shown whenever this domain is next opened, so you never re-figure-out a site. Replaces the prior note; empty string forgets it.', inputSchema: { type: 'object', properties: { note: { type: 'string' } }, required: ['note'] } },
   { name: 'browser_back', description: 'Go back in history.', inputSchema: { type: 'object', properties: {} } },
   { name: 'browser_forward', description: 'Go forward in history.', inputSchema: { type: 'object', properties: {} } },
   { name: 'browser_reload', description: 'Reload the current page.', inputSchema: { type: 'object', properties: {} } },

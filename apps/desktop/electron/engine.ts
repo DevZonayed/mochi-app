@@ -326,13 +326,17 @@ async function runClaude(
           )] : []),
           ...(browser ? [
             tool('browser_navigate',
-              'Open a URL in this project\'s real Chrome browser (a persistent session — logins and cookies carry across the project\'s chats). Use this to browse the web, test a running web app, check docs, or reproduce something. Returns the final URL + page title.',
+              'Open a URL in this project\'s real Chrome browser (a persistent session — logins and cookies carry across the project\'s chats). Use this to browse the web, test a running web app, check docs, or reproduce something. Returns the final URL + page title, plus any notes you saved before for this site.',
               { url: z.string().describe('The URL to open (https:// assumed if no scheme).') },
-              wrap(async (a: { url: string }) => { const r = await browser!.navigate(pid, a.url); return txt(`Opened ${r.url} — "${r.title}"`); })),
+              wrap(async (a: { url: string }) => { const r = await browser!.navigate(pid, a.url); return txt(`Opened ${r.url} — "${r.title}"` + (r.memory ? `\n\n📝 Your saved notes for this site:\n${r.memory}` : '')); })),
             tool('browser_snapshot',
               'Read the current page as a structured accessibility snapshot (roles, names, headings, links, form fields). This is your PRIMARY way to SEE the page and decide what to click or type. Call it after navigating or after an action changes the page.',
               {},
-              wrap(async () => { const r = await browser!.snapshot(pid); return txt(`${r.url} — ${r.title}\n\n${r.aria}`); })),
+              wrap(async () => { const r = await browser!.snapshot(pid); return txt(`${r.url} — ${r.title}\n\n${r.aria}` + (r.memory ? `\n\n📝 Your saved notes for this site:\n${r.memory}` : '')); })),
+            tool('browser_remember',
+              'Save operating notes about the CURRENT site for next time — selectors that worked, where buttons live, login quirks, gotchas. They are auto-shown whenever you (or another chat) next open this domain, so you never re-figure-out a site. Replaces the previous note for this domain; include everything still useful.',
+              { note: z.string().describe('What to remember about this site (markdown ok). Empty string forgets it.') },
+              wrap(async (a: { note: string }) => { const r = await browser!.remember(pid, a.note); return txt(r.domain ? `Saved notes for ${r.domain}.` : 'No page open to attach notes to.'); })),
             tool('browser_screenshot',
               'Capture a PNG screenshot of the current page. It is shown inline in the chat automatically (use when the user wants to SEE the page, or to verify a visual result). Prefer browser_snapshot for reading content/deciding actions — it is cheaper.',
               { fullPage: z.boolean().optional().describe('Capture the full scrollable page rather than just the viewport.') },
@@ -391,7 +395,7 @@ async function runClaude(
     : null;
   const maestroAllowed = [
     ...(imageGen ? ['generate_image'] : []),
-    ...(browser ? ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_press', 'browser_scroll', 'browser_upload', 'browser_select', 'browser_hover', 'browser_wait', 'browser_evaluate', 'browser_console', 'browser_back', 'browser_forward', 'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab'] : []),
+    ...(browser ? ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_press', 'browser_scroll', 'browser_upload', 'browser_select', 'browser_hover', 'browser_wait', 'browser_evaluate', 'browser_console', 'browser_remember', 'browser_back', 'browser_forward', 'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab'] : []),
   ].map(n => `mcp__maestro__${n}`);
   /* Vision input: when the user attached images, the prompt becomes a streamed
      user message carrying text + base64 image blocks (a plain string can't hold

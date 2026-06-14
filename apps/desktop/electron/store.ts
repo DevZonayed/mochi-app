@@ -297,6 +297,10 @@ interface StoreData {
   telegram: TelegramState;
   /** Locally (safeStorage-)encrypted provider API keys, base64. Never leaves this Mac. */
   providerKeys: Record<string, { cipherB64: string; last4: string; createdAt: number }>;
+  /** Browser memory: per-domain operating notes the agent saves and auto-recalls
+      (selectors, login quirks, where buttons are) so it doesn't re-learn a site
+      every visit. Mac-local; never in relay snapshots. */
+  browserMemory?: Record<string, { note: string; updatedAt: number }>;
 }
 
 const CATALOG_VERSION = 2;
@@ -326,6 +330,7 @@ export class Store {
       if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
       // Native browser automation — default-on for stores written before it existed.
       if (this.data.routing && !this.data.routing.browser) { this.data.routing.browser = 'on'; dirty = true; }
+      if (!this.data.browserMemory) { this.data.browserMemory = {}; dirty = true; }
       // SP1: seed model-level roles on older stores from the engine-level fields.
       if (this.data.routing && !this.data.routing.roles) {
         const r = this.data.routing;
@@ -427,6 +432,26 @@ export class Store {
     this.data.settings = { ...this.data.settings, ...patch };
     this.save();
     return this.getSettings();
+  }
+
+  // ── Browser memory (per-domain operating notes the agent recalls) ───────
+  getBrowserMemory(domain: string): string {
+    return this.data.browserMemory?.[(domain || '').toLowerCase()]?.note ?? '';
+  }
+  setBrowserMemory(domain: string, note: string): void {
+    const key = (domain || '').toLowerCase().trim();
+    if (!key) return;
+    if (!this.data.browserMemory) this.data.browserMemory = {};
+    const trimmed = (note ?? '').slice(0, 4000);
+    if (!trimmed) { delete this.data.browserMemory[key]; }
+    else { this.data.browserMemory[key] = { note: trimmed, updatedAt: Date.now() }; }
+    // Cap total domains — evict the least-recently-updated past 300.
+    const entries = Object.entries(this.data.browserMemory);
+    if (entries.length > 300) {
+      entries.sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+      for (const [k] of entries.slice(0, entries.length - 300)) delete this.data.browserMemory[k];
+    }
+    this.save();
   }
 
   // ── Workspace ───────────────────────────────────────────────────────
