@@ -31,6 +31,8 @@ const require = createRequire(__filename);
 const EFFORT_TURNS: Record<string, number> = { fast: 8, balanced: 24, deep: 48, max: 96 };
 // Goal mode: pursue the goal autonomously over a long horizon — far more turns.
 const GOAL_MAX_TURNS = 240;
+// How many times to silently retry a transient engine crash before failing the run.
+const ENGINE_MAX_RETRIES = 2;
 const GOAL_DIRECTIVE =
   `\n\n---\n\n[Goal mode] Pursue the request above as a goal: work autonomously to ` +
   `completion. Don't stop to ask for confirmation on routine steps; plan, implement, ` +
@@ -203,6 +205,17 @@ function safeJson(v: unknown): string {
 
 class CancelledError extends Error {
   constructor() { super('cancelled'); this.name = 'CancelledError'; }
+}
+
+/* A run failure worth auto-retrying: the bundled `claude`/`codex` process exiting
+   on a transient blip (network drop, API overload/rate-limit, a 5xx), rather than
+   a deterministic problem (not signed in, bad input) that would just fail again. */
+const TRANSIENT_FAIL_RE = /exited with code|exited unexpectedly|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|fetch failed|network error|premature close|stream (?:closed|ended|error)|overloaded|rate.?limit|too many requests|\b429\b|internal server error|bad gateway|service unavailable|gateway timeout|temporarily/i;
+function isTransientFailure(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  // Never retry deterministic/auth problems — they won't get better.
+  if (/not signed in|cli not found|not found on this Mac|invalid api key|unauthorized|forbidden|\b40[13]\b|quota|insufficient|payment/i.test(msg)) return false;
+  return TRANSIENT_FAIL_RE.test(msg);
 }
 
 function workDirFor(project?: { name?: string; path?: string }): string {
@@ -1006,9 +1019,25 @@ export class LocalEngine {
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
       const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input), browserBridge: this.browserBridgeFor() };
-      const main = master === 'claude'
-        ? await runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, this.browserFor())
-        : await runCodex(prompt, cwd, hooks, false, masterModel, imageCtx, codexImageFiles);
+      const runPrimary = (): Promise<EngineRun> => master === 'claude'
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, this.browserFor())
+        : runCodex(prompt, cwd, hooks, false, masterModel, imageCtx, codexImageFiles);
+      // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
+      // network/service blip) so a one-off hiccup never surfaces as a dead run the
+      // operator has to retry by hand. The retry starts the turn fresh; resumeId is
+      // reused so chat continuity is kept.
+      let main: EngineRun;
+      for (let attempt = 0; ; attempt++) {
+        try { main = await runPrimary(); break; }
+        catch (e) {
+          if (e instanceof CancelledError || ac.signal.aborted) throw e;
+          if (attempt >= ENGINE_MAX_RETRIES || !isTransientFailure(e)) throw e;
+          cur = this.store.updateJob(jobId, { stage: `hit a transient error — retrying (${attempt + 1}/${ENGINE_MAX_RETRIES})…` });
+          this.emit('job', cur);
+          await new Promise<void>(res => setTimeout(res, 1500 * (attempt + 1)));
+          if (ac.signal.aborted) throw new CancelledError();
+        }
+      }
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {
         try { this.store.updateSession(session.id, { sdkSessionId: main.sdkSessionId }); } catch { /* session deleted mid-run */ }
       }
@@ -1123,9 +1152,15 @@ export class LocalEngine {
         }
         return existing as Job;
       }
+      // A transient crash that even retries couldn't clear → say so plainly, so
+      // "exited with code 1" doesn't read as a mysterious dead end.
+      const raw = e instanceof Error ? e.message : String(e);
+      const errMsg = isTransientFailure(e)
+        ? `The engine kept hitting a transient error and stopped after ${ENGINE_MAX_RETRIES} retries — usually a brief network or service blip. Tap Retry.\n\n${raw}`.trim()
+        : raw;
       const failed = this.store.updateJob(jobId, {
         status: 'failed', phase: 'Failed', stage: '',
-        error: e instanceof Error ? e.message : String(e),
+        error: errMsg,
       });
       this.emit('job', failed);
       this.store.pushEvent({ kind: 'job-failed', title: `Failed: ${failed.title}`, subtitle: failed.error ?? undefined, projectId: failed.projectId, jobId });
