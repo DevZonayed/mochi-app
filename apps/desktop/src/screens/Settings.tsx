@@ -219,8 +219,8 @@ function GeneralPane({ theme, setTheme, workspace }: {
 
 /* ── Engines pane — which engine plays which role ───────────────────── */
 const STUDIO_ROLE_ROWS: { key: 'image' | 'video'; label: string; sub: string }[] = [
-  { key: 'image', label: 'Image generation', sub: 'Used by Media Studio (preview).' },
-  { key: 'video', label: 'Video generation', sub: 'Used by Media Studio (preview).' },
+  { key: 'image', label: 'Image generation', sub: 'In chat: Codex = free, built-in · Claude = fal.ai (uses your fal credits).' },
+  { key: 'video', label: 'Video generation', sub: 'Used by Media Studio (fal.ai).' },
 ];
 const ENGINE_OPTIONS = ['Claude Code', 'Codex'] as const;
 const labelToEngine = (l: string): 'claude' | 'codex' => (l === 'Codex' ? 'codex' : 'claude');

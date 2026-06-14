@@ -18,6 +18,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice } from './store.js';
 import type { PublishingEngine } from './publishing.js';
+import { assetsDirFor } from './media.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { ensureBranch, branchSlug } from './git.js';
 import type { Providers } from './providers.js';
@@ -662,6 +663,28 @@ export class LocalEngine {
   setImageGen(fn: ImageGenFn) { this.imageGen = fn; }
   private publishing?: PublishingEngine;
   setPublishing(p: PublishingEngine) { this.publishing = p; }
+
+  /** Generate an image via Codex's FREE native image_gen skill (no fal credits).
+      Backs the generate_image tool when Settings → Image generation = Codex. Runs
+      a one-shot `codex exec` in the project's assets dir and harvests the PNG. */
+  async imageViaCodex(prompt: string, opts: { aspect?: string; projectId?: string | null }): Promise<ImageGenResult> {
+    const st = this.status('codex');
+    if (!st.available) throw Object.assign(new Error(`Codex isn’t ready for image generation — ${st.reason || 'sign into Codex'}. Or set Image generation to Claude (fal) in Settings.`), { statusCode: 503 });
+    if (!this.publishing) throw Object.assign(new Error('image pipeline not initialised'), { statusCode: 500 });
+    const project = opts.projectId ? this.store.getProject(opts.projectId) : undefined;
+    const dir = assetsDirFor(project?.name); // stable ~/Maestro/<project>/assets — not the repo
+    const orient = opts.aspect === '9:16' ? ' Portrait orientation.' : opts.aspect === '16:9' ? ' Landscape orientation.' : '';
+    const imgPrompt =
+      `Use your built-in image_gen skill to generate this image (NOT an SVG, NOT a placeholder, NOT a stock-photo download):\n${prompt}${orient}\n\n` +
+      `After generating, COPY the final selected image into the current working directory named generated-${Date.now().toString(36)}.png and state the saved path. Do not create any other files.`;
+    // Default model (no -m): the configured codex model has image_gen; a codex-
+    // specialized model may not. imageIntent:true turns on the harvest.
+    const run = await runCodex(imgPrompt, dir, {}, false, undefined,
+      { store: this.store, projectId: opts.projectId ?? null, publishing: this.publishing, imageIntent: true });
+    const img = run.images?.[0];
+    if (!img) throw Object.assign(new Error('Codex did not return an image — try again, or switch Image generation to Claude (fal) in Settings.'), { statusCode: 502 });
+    return { path: img.imagePath, assetId: img.assetId, alt: prompt.slice(0, 200), width: img.width, height: img.height };
+  }
 
   /** Is this engine actually runnable right now, and if not, exactly why. */
   status(engine: EngineId): EngineStatus {

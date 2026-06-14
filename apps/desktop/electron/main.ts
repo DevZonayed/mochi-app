@@ -93,10 +93,14 @@ app.whenReady().then(() => {
   // Give the coding agent a real image capability (it had none → it improvised SVG).
   // This is the ONLY place MediaEngine/publishing meet the coding engine; the relay
   // dispatch (createDispatch below) never receives them, so no key/bytes hit the server.
-  // Claude's generate_image tool runs on fal flux-schnell (~$0.003, fast); the Codex
-  // engine uses its own free native image_gen skill directly (harvested via publishing).
+  // The generate_image tool honours Settings → Image generation: 'codex' uses the
+  // FREE native image_gen skill (no fal credits); otherwise fal flux-schnell (fast,
+  // ~$0.003, uses your fal balance). The Codex *engine* always uses its own skill.
   engine.setPublishing(publishing);
   engine.setImageGen(async (prompt, opts) => {
+    if (store.routing().image === 'codex' && engine.status('codex').available) {
+      return engine.imageViaCodex(prompt, opts); // free, native — no fal credits needed
+    }
     const asset = await media.generateAndWait({ modelKey: 'flux-schnell', prompt, projectId: opts.projectId ?? null, aspect: opts.aspect });
     if (!asset.localPath) throw new Error('image was generated but saving it locally failed — please try again');
     return { path: asset.localPath, assetId: asset.id, alt: prompt.slice(0, 200), width: asset.width, height: asset.height };
