@@ -377,7 +377,7 @@ function EnginesPane() {
                 <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
                   {(appSettings?.chromeProfileMode ?? 'copy') === 'live'
                     ? 'Live: drives your real Chrome profile (always in sync) — quit Chrome before running.'
-                    : 'Copy: Maestro’s own browser, warm-started from a one-time copy of this profile. Your Chrome stays untouched.'}
+                    : 'Copy: signs in Maestro’s own browser using this profile’s cookies (one-time Keychain “Allow”). Your Chrome is never opened.'}
                 </span>
               </span>
               <Seg options={['Copy', 'Live']} value={(appSettings?.chromeProfileMode ?? 'copy') === 'live' ? 'Live' : 'Copy'} onChange={v => setChromeProfileMode(v === 'Live' ? 'live' : 'copy')} />

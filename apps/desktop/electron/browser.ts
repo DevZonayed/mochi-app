@@ -14,31 +14,12 @@
    step in for a CAPTCHA / login (the whole point of a real, trusted browser). */
 
 import { app } from 'electron';
-import { existsSync, mkdirSync, rmSync, cpSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import type { BrowserContext, Page, ConsoleMessage } from 'playwright-core';
 import type { Store } from './store.js';
 import type { PublishingEngine } from './publishing.js';
-import { chromeUserDataDir } from './chrome-profiles.js';
-
-/** Warm-start Maestro's OWN browser profile from a real Chrome profile: a ONE-TIME
-    copy of the session/login files so the app's browser starts signed in — without
-    ever opening, locking, or modifying the user's real Chrome. Cookies/passwords
-    decrypt because we drive the same Chrome binary as the same macOS user (the
-    "Chrome Safe Storage" keychain key is shared, not bound to the profile path).
-    Best-effort: any locked/unreadable file is skipped. */
-function seedFromChromeProfile(destUserDataDir: string, profileDir: string): void {
-  const srcProfile = path.join(chromeUserDataDir(), profileDir);
-  if (!existsSync(srcProfile)) return;
-  const destDefault = path.join(destUserDataDir, 'Default');
-  mkdirSync(destDefault, { recursive: true });
-  // Session/login/history-bearing files (skip the heavy caches + GB-scale extras).
-  for (const item of ['Cookies', 'Network', 'Login Data', 'Login Data For Account', 'Web Data', 'Local Storage', 'Session Storage', 'IndexedDB', 'Preferences', 'History', 'Bookmarks']) {
-    const s = path.join(srcProfile, item);
-    if (!existsSync(s)) continue;
-    try { cpSync(s, path.join(destDefault, item), { recursive: true, force: true, errorOnExist: false }); } catch { /* locked / unreadable — skip */ }
-  }
-}
+import { chromeUserDataDir, importChromeCookies } from './chrome-profiles.js';
 
 /* ── Public result shapes (what the tools return to the model) ─────────── */
 export interface BrowserState { open: boolean; url: string; title: string; tabs: number; activeTab: number }
@@ -164,12 +145,6 @@ export class BrowserController {
     if (!this.chromePath) throw Object.assign(new Error('Google Chrome not found — install it from google.com/chrome'), { statusCode: 503 });
 
     mkdirSync(userDataDir, { recursive: true });
-    // First run with a chosen profile in 'copy' mode → warm-start from a one-time
-    // copy of that profile's logins (only if our dir hasn't been seeded already).
-    if (plan.seedFrom) {
-      const alreadySeeded = existsSync(path.join(userDataDir, 'Default', 'Cookies')) || existsSync(path.join(userDataDir, 'Default', 'Network', 'Cookies'));
-      if (!alreadySeeded) seedFromChromeProfile(userDataDir, plan.seedFrom);
-    }
 
     const { chromium } = await import('playwright-core');
     const opts = {
@@ -211,6 +186,22 @@ export class BrowserController {
       } else {
         throw Object.assign(new Error(`Couldn't start the browser: ${msg}`), { statusCode: 500 });
       }
+    }
+
+    // Copy mode: warm-start this (isolated, app-owned) browser by decrypting the
+    // chosen Chrome profile's cookies and injecting them — so it's signed in
+    // without ever opening the user's real Chrome. Done on every launch so logins
+    // stay roughly in sync. Read-only + best-effort; failure → just no cookies.
+    if (plan.seedFrom) {
+      try {
+        const cookies = importChromeCookies(plan.seedFrom);
+        if (cookies.length) {
+          // One malformed cookie would reject the whole batch — fall back to
+          // adding them individually so the rest still land.
+          try { await ctx.addCookies(cookies); }
+          catch { for (const c of cookies) { try { await ctx.addCookies([c]); } catch { /* skip this one */ } } }
+        }
+      } catch { /* keychain denied / parse issue — proceed signed-out */ }
     }
 
     const session: Session = {
