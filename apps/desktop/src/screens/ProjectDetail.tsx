@@ -1131,6 +1131,9 @@ function renderChatBody(text: string, keyBase = 'b'): React.ReactNode[] {
 /* Tool/skill metadata — which glyph + accent tint a tool family reads as. */
 const TOOL_META = (name: string): { icon: IconName; tint: string } => {
   const n = name.toLowerCase();
+  // Image tools (e.g. mcp__maestro__generate_image) — tint them like media instead
+  // of the flat neutral default, which reads as a murky black chip in dark mode.
+  if (/image|photo|picture/.test(n)) return { icon: 'image', tint: 'var(--purple)' };
   if (/bash|shell|command|exec|terminal/.test(n)) return { icon: 'terminal', tint: 'var(--blue)' };
   if (/read|write|edit|glob|grep|notebook|file|patch|ls/.test(n)) return { icon: 'folder', tint: 'var(--teal)' };
   if (/web|search|fetch|browser/.test(n)) return { icon: 'telescope', tint: 'var(--indigo)' };
@@ -1138,6 +1141,9 @@ const TOOL_META = (name: string): { icon: IconName; tint: string } => {
   return { icon: 'command', tint: 'var(--ink-secondary)' };
 };
 const fmtToolDur = (ms?: number): string => (ms == null ? '' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`);
+/** Clean a tool name for display — drop the mcp__<server>__ prefix and underscores
+    so e.g. "mcp__maestro__generate_image" shows as "generate image". */
+const prettyToolName = (name: string): string => name.replace(/^mcp__[^_]+__/, '').replace(/_/g, ' ').trim() || name;
 
 /** A human verb for the tool the agent is running right now. */
 const TOOL_VERB = (name: string): string => {
@@ -1191,7 +1197,7 @@ function ToolNode({ item, connect }: { item: TranscriptItem; connect: boolean })
           background: `color-mix(in srgb, ${accent} 18%, transparent)`, color: accent }}>
           <Icon name={icon} size={13} />
         </span>
-        <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{item.name}</span>
+        <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{prettyToolName(item.name ?? '')}</span>
         {isWrite
           ? <FileChip path={item.text} preview={item.preview} />
           : item.text && <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text}</span>}
