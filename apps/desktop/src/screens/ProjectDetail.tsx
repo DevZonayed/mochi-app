@@ -1379,17 +1379,26 @@ const fmtDurationLive = (ms: number): string => {
   return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${(s % 60).toFixed(1)}s`;
 };
 
+/** Lets a generated/attached image open in an in-app viewer tab (provided by the
+    Workspace). Null when the chat is used standalone — then we reveal in Finder. */
+const ImageOpenContext = React.createContext<((assetId: string, name: string, imagePath?: string) => void) | null>(null);
+
 /** A small thumbnail of an image the user attached — loaded on-device by assetId. */
 function UserImageThumb({ img }: { img: ChatImage }) {
   const [src, setSrc] = React.useState<string | null>(null);
+  const onOpenImage = React.useContext(ImageOpenContext);
   React.useEffect(() => {
     let alive = true;
     if (IS_LOCAL && img.assetId) api.assetImage(img.assetId).then(d => { if (alive) setSrc(d); }).catch(() => {});
     return () => { alive = false; };
   }, [img.assetId]);
-  const clickable = IS_LOCAL && !!img.imagePath;
+  const clickable = IS_LOCAL && !!img.assetId;
+  const open = () => {
+    if (onOpenImage && img.assetId) onOpenImage(img.assetId, img.name || 'Image', img.imagePath);
+    else if (img.imagePath) void api.revealPath(img.imagePath);
+  };
   return (
-    <div onClick={() => { if (img.imagePath) void api.revealPath(img.imagePath); }} title={clickable ? (img.name || 'Reveal in Finder') : (img.name || 'image')}
+    <div onClick={open} title={clickable ? (img.name || 'Open image') : (img.name || 'image')}
       style={{ width: 158, maxWidth: '100%', borderRadius: 12, overflow: 'hidden', border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', cursor: clickable ? 'pointer' : 'default' }}>
       {src
         ? <img src={src} alt={img.name || 'attached image'} style={{ display: 'block', width: '100%', maxHeight: 200, objectFit: 'cover' }} />
@@ -1455,12 +1464,15 @@ function ReviewCard({ item }: { item: TranscriptItem }) {
   );
 }
 
-/* A generated image, shown inline in the chat. The bytes live on this Mac; the
-   renderer resolves the trusted Asset id to a data URL via a desktop-only IPC
-   (never the relay), so the phone/web shows an honest placeholder instead. */
+/* A generated image, shown inline as a COMPACT, collapsed chip (thumbnail +
+   caption) so it sits with the tool flow instead of dumping a huge picture into
+   the chat. Click → opens the full image in its own in-app viewer tab (Workspace);
+   standalone, it falls back to reveal-in-Finder. Bytes load on-device by Asset id
+   via a desktop-only IPC (never the relay) — phone/web shows a placeholder. */
 function InlineImage({ item }: { item: TranscriptItem }) {
   const [src, setSrc] = React.useState<string | null>(null);
   const [failed, setFailed] = React.useState(false);
+  const onOpenImage = React.useContext(ImageOpenContext);
   React.useEffect(() => {
     let alive = true;
     if (IS_LOCAL && item.assetId) {
@@ -1470,26 +1482,30 @@ function InlineImage({ item }: { item: TranscriptItem }) {
     }
     return () => { alive = false; };
   }, [item.assetId]);
-  const caption = item.alt || item.text || 'Generated image';
-  const reveal = () => { if (item.imagePath) void api.revealPath(item.imagePath); };
-  const clickable = IS_LOCAL && !!item.imagePath;
+  const caption = item.alt || item.text || '';
+  const openable = IS_LOCAL && !!item.assetId;
+  const open = () => {
+    if (!openable) return;
+    if (onOpenImage && item.assetId) onOpenImage(item.assetId, caption || 'Generated image', item.imagePath);
+    else if (item.imagePath) void api.revealPath(item.imagePath);
+  };
   return (
-    <div style={{ margin: '8px 0 2px', border: '0.5px solid var(--separator)', borderRadius: 12, background: 'var(--bg-elevated)', overflow: 'hidden', maxWidth: 480 }}>
-      {src
-        ? <img src={src} alt={caption} onClick={reveal} title={clickable ? 'Reveal in Finder' : caption}
-            style={{ display: 'block', width: '100%', maxHeight: 380, objectFit: 'contain', background: 'var(--bg-grouped)', cursor: clickable ? 'pointer' : 'default' }} />
-        : <div style={{ minHeight: 150, display: 'grid', placeItems: 'center', gap: 9, padding: 16, background: 'var(--bg-grouped)', color: 'var(--ink-tertiary)' }}>
-            {failed || !IS_LOCAL
-              ? <><Icon name="image" size={22} /><span style={{ font: '400 var(--fs-caption)/1.35 var(--font-text)', textAlign: 'center', maxWidth: 280 }}>{IS_LOCAL ? 'Image saved on this Mac' : 'Image generated on the Mac — open Maestro to view it'}</span></>
-              : <Spinner size={16} color="var(--purple)" />}
-          </div>}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 8px 7px 12px', borderTop: '0.5px solid var(--separator)' }}>
-        <Icon name="image" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} />
-        <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{caption}</span>
-        {clickable && <button onClick={reveal} title="Reveal in Finder" style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'transparent', border: 'none', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}><Icon name="folder" size={13} /></button>}
-        {item.imagePath && <CopyButton text={item.imagePath} label="Path" />}
-      </div>
-    </div>
+    <button onClick={open} disabled={!openable} title={openable ? 'Open image' : caption}
+      style={{ display: 'flex', alignItems: 'center', gap: 11, width: '100%', maxWidth: 440, margin: '7px 0 2px', padding: '7px 11px 7px 7px', borderRadius: 12,
+        textAlign: 'left', cursor: openable ? 'pointer' : 'default',
+        background: 'color-mix(in srgb, var(--purple) 8%, var(--bg-elevated))',
+        border: '0.5px solid color-mix(in srgb, var(--purple) 26%, var(--separator))' }}>
+      <span style={{ width: 46, height: 46, borderRadius: 9, overflow: 'hidden', flexShrink: 0, background: 'var(--bg-grouped)', display: 'grid', placeItems: 'center' }}>
+        {src ? <img src={src} alt={caption} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          : (failed || !IS_LOCAL) ? <Icon name="image" size={18} style={{ color: 'var(--purple)' }} />
+          : <Spinner size={14} color="var(--purple)" />}
+      </span>
+      <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1, gap: 2 }}>
+        <span style={{ font: '600 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)' }}>Generated image</span>
+        {caption && <span style={{ font: '400 var(--fs-caption)/1.25 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{caption}</span>}
+      </span>
+      {openable && <Icon name="arrowRight" size={14} stroke={2.2} style={{ color: 'var(--purple)', flexShrink: 0, transform: 'rotate(-45deg)' }} />}
+    </button>
   );
 }
 
@@ -1871,7 +1887,7 @@ function ChatMinimap({ turns, scrollRef }: { turns: Job[]; scrollRef: React.RefO
   );
 }
 
-export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, flush, autoFocus }: {
+export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, onOpenImage, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
   sessionId: string | null;
@@ -1879,11 +1895,18 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   /** Lifts this chat's turns (jobs) to the parent — used by the Workspace's
       "Changed files" panel to read the write-tool activity. */
   onTurns?: (jobs: Job[]) => void;
+  /** Open a generated/attached image in an in-app viewer tab (Workspace only). */
+  onOpenImage?: (assetId: string, name: string, imagePath?: string) => void;
   flush?: boolean;
   autoFocus?: boolean;
 }) {
   const [turns, setTurns] = React.useState<Job[]>([]);
   React.useEffect(() => { onTurns?.(turns); }, [turns]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Stable wrapper so the image-open context value never changes identity (would
+  // otherwise re-render every image chip on each streaming frame).
+  const onOpenImageRef = React.useRef(onOpenImage);
+  onOpenImageRef.current = onOpenImage;
+  const openImageStable = React.useMemo(() => (a: string, n: string, p?: string) => onOpenImageRef.current?.(a, n, p), []);
   const [activeId, setActiveId] = React.useState<string | null>(sessionId);
   const [text, setText] = React.useState('');
   // Primary (coding) + reviewer model. Remembered across the app via localStorage;
@@ -2176,12 +2199,14 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               </div>
             </div>
           )}
-          {turns.map((t, i) => (
-            <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
-              <UserBubble text={t.input} images={t.inputImages} />
-              <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
-            </div>
-          ))}
+          <ImageOpenContext.Provider value={openImageStable}>
+            {turns.map((t, i) => (
+              <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
+                <UserBubble text={t.input} images={t.inputImages} />
+                <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
+              </div>
+            ))}
+          </ImageOpenContext.Provider>
         </div>
       </div>
 

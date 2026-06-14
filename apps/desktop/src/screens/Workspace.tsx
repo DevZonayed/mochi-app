@@ -9,7 +9,7 @@ import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type ChatSession, type ProjectKind, type Job } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
-import { FileViewer } from '../lib/CodeView';
+import { FileViewer, ImageViewer } from '../lib/CodeView';
 import { RightSidebar, type CheckItem } from '../lib/RightSidebar';
 import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
@@ -40,7 +40,7 @@ const PAGE_CSS = `
   .ws-ovf-item:hover { background: var(--fill-tertiary); }
 `;
 
-interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file'; filePath?: string }
+interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image'; filePath?: string; imageAssetId?: string; imagePath?: string }
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
@@ -155,6 +155,14 @@ export default function Workspace() {
     if (existing) { setActiveKey(existing.key); return; }
     const key = 'file:' + filePath;
     setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: filePath.split('/').pop() ?? filePath, kind: 'file', filePath }]));
+    setActiveKey(key);
+  };
+  // Open a generated/attached image in its own VS Code-style tab (not Finder).
+  const openImage = (projectId: string, assetId: string, name: string, imagePath?: string) => {
+    const key = 'image:' + assetId;
+    const existing = tabs.find(t => t.key === key);
+    if (existing) { setActiveKey(existing.key); return; }
+    setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: name || 'Image', kind: 'image', imageAssetId: assetId, imagePath }]));
     setActiveKey(key);
   };
   // Files the active chat wrote (from its turns' write-tool steps), newest first.
@@ -516,8 +524,11 @@ export default function Workspace() {
                 <div key={t.key} style={{ position: 'absolute', inset: 0, display: t.key === activeKey ? 'flex' : 'none' }}>
                   {t.kind === 'file' && t.filePath
                     ? <FileViewer projectId={t.projectId} filePath={t.filePath} />
+                    : t.kind === 'image'
+                    ? <ImageViewer assetId={t.imageAssetId} name={t.title} imagePath={t.imagePath} />
                     : <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
-                        sessionId={t.sessionId} onSessionCreated={onSessionCreated(t.key)} onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))} />}
+                        sessionId={t.sessionId} onSessionCreated={onSessionCreated(t.key)} onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
+                        onOpenImage={(assetId, name, imagePath) => openImage(t.projectId, assetId, name, imagePath)} />}
                 </div>
               ))}
             </div>
