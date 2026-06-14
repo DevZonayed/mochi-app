@@ -292,7 +292,7 @@ export default function Workspace() {
       <div className={`ws-row${isActive ? ' ws-active' : ''}`} onClick={() => openSession(s)} style={{
         display: 'flex', alignItems: 'center', gap: 7, padding: `5px 8px 5px ${indent}px`, borderRadius: 8, cursor: 'pointer',
         background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
-        <span style={{ width: 6, height: 6, borderRadius: 3, flexShrink: 0, background: open ? projColor(p) : 'var(--separator-strong)' }} />
+        <Icon name="chat" size={13} style={{ flexShrink: 0, color: open ? projColor(p) : 'var(--ink-tertiary)' }} />
         {renamingId === s.id ? (
           <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
             onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
@@ -354,7 +354,7 @@ export default function Workspace() {
                         <div style={{ padding: '2px 9px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Recents</div>
                         {recents.map(p => (
                           <button key={p.id} onClick={() => { setAddOpen(false); setExpanded(e => new Set(e).add(p.id)); }} className="ws-ovf-item" title={p.path} style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '6px 9px', borderRadius: 8, cursor: 'pointer' }}>
-                            <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                            <Icon name="folder" size={13} style={{ flexShrink: 0, color: projColor(p) }} />
                             <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
                           </button>
                         ))}
@@ -427,7 +427,7 @@ export default function Workspace() {
                   <div className="ws-row ws-proj-head" onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
                     style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer' }}>
                     <Icon name="chevronRight" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
-                    <span style={{ width: 8, height: 8, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                    <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p) }} />
                     <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
                     {chats.length > 0 && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{chats.length}</span>}
                     <button className="ws-newchat" title="New chat here" onClick={e => { e.stopPropagation(); newChat(p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)', flexShrink: 0 }}>
@@ -471,7 +471,7 @@ export default function Workspace() {
                       ? <Icon name="globe" size={12} style={{ color: 'var(--blue)', flexShrink: 0 }} />
                       : t.kind === 'image'
                       ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
-                      : <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />}
+                      : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />}
                     <span style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
                     <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
                       <Icon name="x" size={11} stroke={2.6} />
@@ -496,7 +496,7 @@ export default function Workspace() {
                         return (
                           <div key={t.key} className="ws-ovf-item" onClick={() => { setActiveKey(t.key); setOvfOpen(false); }}
                             style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 9px', borderRadius: 8, cursor: 'pointer', background: on ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
-                            <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                            <Icon name={t.kind === 'file' ? 'file' : t.kind === 'browser' ? 'globe' : t.kind === 'image' ? 'image' : 'chat'} size={13} style={{ flexShrink: 0, color: t.kind && t.kind !== 'chat' ? 'var(--ink-secondary)' : projColor(p) }} />
                             <span style={{ flex: 1, minWidth: 0, font: `${on ? 600 : 500} var(--fs-footnote)/1.25 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
                             {p && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', flexShrink: 0, maxWidth: 70, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>}
                             <button title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>

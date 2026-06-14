@@ -6,7 +6,7 @@
 import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, MaestroMark } from './icons';
-import { NAV_ROUTES, ALL_NAV, pathForNav } from './routes';
+import { NAV_ROUTES, ALL_NAV, CODING_NAV, pathForNav } from './routes';
 import { api } from './api';
 import { CountUp } from './ui';
 
@@ -65,6 +65,31 @@ export function useTheme(_initial: Theme = 'light'): [Theme, React.Dispatch<Reac
     setThemePref(value);
   };
   return [resolvedTheme(), setTheme];
+}
+
+/* Genre-wise UI. The operator picks their main purpose (Settings → Workspace
+   mode); the whole app chrome reshapes to match. Coding = no sidebar, a slim
+   top icon-nav, the workspace gets the full canvas. Design/Video reshape later.
+   Module-level + localStorage (same live pattern as the theme) so the switch is
+   instant and app-wide and survives relaunch. */
+export type Purpose = 'general' | 'coding' | 'design' | 'video';
+const PURPOSE_KEY = 'maestro.purpose';
+const purposeListeners = new Set<() => void>();
+function readPurpose(): Purpose {
+  try { const v = localStorage.getItem(PURPOSE_KEY); if (v === 'general' || v === 'coding' || v === 'design' || v === 'video') return v; } catch { /* storage unavailable */ }
+  return 'general';
+}
+let purposePref: Purpose = readPurpose();
+export function getPurpose(): Purpose { return purposePref; }
+export function setPurpose(p: Purpose): void {
+  purposePref = p;
+  try { localStorage.setItem(PURPOSE_KEY, p); } catch { /* storage unavailable */ }
+  for (const l of purposeListeners) l();
+}
+export function usePurpose(): Purpose {
+  const [, force] = React.useReducer((x: number) => x + 1, 0);
+  React.useEffect(() => { purposeListeners.add(force); return () => { purposeListeners.delete(force); }; }, []);
+  return purposePref;
 }
 
 /* Persisted, app-wide sidebar geometry (width + hidden). One module-level source
@@ -377,11 +402,20 @@ export interface AppShellProps {
   onWorkspace?: () => void;
 }
 
+/* The app chrome — reshapes by purpose (genre-wise UI). 'coding' drops the
+   sidebar for a full-bleed workspace with a slim top icon-nav; everything else
+   keeps the classic frosted sidebar + toolbar. Delegates to a dedicated shell so
+   switching purpose cleanly unmounts/mounts (no hook-order hazard). */
+export function AppShell(props: AppShellProps) {
+  const purpose = usePurpose();
+  return purpose === 'coding' ? <CodingShell {...props} /> : <GeneralShell {...props} />;
+}
+
 /* Full desktop chrome: scaled macOS window + frosted sidebar + toolbar wrapper.
    Sidebar navigation is driven by the shared route registry (routes.ts) so the
    nav keys always resolve to real routes, and the active item is derived from
    the current location — this is the fix for the original dead-nav bug. */
-export function AppShell({ active, children, onSearch, right, initialTheme = 'light', onWorkspace }: AppShellProps) {
+function GeneralShell({ active, children, onSearch, right, initialTheme = 'light', onWorkspace }: AppShellProps) {
   const scale = useAppScale();
   const [theme, setTheme] = useTheme(initialTheme);
   const navigate = useNavigate();
@@ -440,6 +474,78 @@ function SidebarRevealZone() {
         width: 4, height: 46, borderRadius: 3, background: 'var(--ink-quaternary, var(--ink-tertiary))',
         opacity: hot ? 0.9 : 0, transition: 'opacity 160ms ease',
       }} />
+    </div>
+  );
+}
+
+/* ── Coding genre — workspace-focused chrome ──────────────────────────────
+   No left sidebar: the Workspace's own project/chat tree is enough. Navigation
+   lives in a slim frosted top bar as icon buttons (the active one expands to show
+   its label); the workspace gets the full canvas below. */
+function CodingNavButton({ route, on, pending, onNav }: { route: typeof CODING_NAV[number]; on: boolean; pending: number; onNav: (k: string) => void }) {
+  const badge = route.key === 'approvals' && pending > 0 ? pending : 0;
+  return (
+    <button onClick={() => onNav(route.key)} title={route.label} aria-label={route.label}
+      className={`win-no-drag${on ? '' : ' nav-item'}`} style={{
+        display: 'flex', alignItems: 'center', gap: on ? 7 : 0, height: 32, width: on ? 'auto' : 34,
+        padding: on ? '0 12px 0 10px' : 0, justifyContent: 'center', borderRadius: on ? 'var(--r-pill)' : 9,
+        position: 'relative', background: on ? 'var(--blue)' : 'transparent', color: on ? '#fff' : 'var(--ink-secondary)',
+        transition: 'background 160ms ease, color 160ms ease, width 200ms cubic-bezier(.32,.72,0,1)',
+      }}>
+      <Icon name={route.icon} size={18} stroke={on ? 2 : 1.85} />
+      {on && <span style={{ font: '600 var(--fs-subhead)/1 var(--font-text)', whiteSpace: 'nowrap' }}>{route.label}</span>}
+      {badge > 0 && <span style={{ position: 'absolute', top: 5, right: 5, minWidth: 7, height: 7, borderRadius: 4, background: on ? '#fff' : 'var(--red)', border: '1.5px solid var(--bg-grouped)' }} />}
+    </button>
+  );
+}
+
+function CodingTopNav({ active, onNav, onSearch, theme, setTheme, right }: { active?: string; onNav: (k: string) => void; onSearch?: () => void; theme: Theme; setTheme: React.Dispatch<React.SetStateAction<Theme>>; right?: React.ReactNode }) {
+  const pending = usePendingApprovals();
+  const iconBtn = { width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' } as const;
+  return (
+    <header className="win-drag" style={{
+      height: 46, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8,
+      padding: '0 14px 0 80px', // left pad clears the macOS traffic lights
+      background: 'var(--bg-grouped)', backdropFilter: 'blur(40px) saturate(180%)', WebkitBackdropFilter: 'blur(40px) saturate(180%)',
+      borderBottom: '0.5px solid var(--separator)', position: 'relative', zIndex: 20,
+    }}>
+      <MaestroMark size={22} />
+      <nav style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+        {CODING_NAV.map(r => <CodingNavButton key={r.key} route={r} on={active === r.key} pending={pending} onNav={onNav} />)}
+      </nav>
+      <div style={{ flex: 1 }} />
+      {right}
+      <button onClick={onSearch} title="Search (⌘K)" aria-label="Search" className="tb-icon win-no-drag" style={iconBtn}>
+        <Icon name="search" size={18} />
+      </button>
+      <BudgetChip />
+      <button onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')} title="Toggle appearance" aria-label="Toggle appearance" className="tb-icon win-no-drag" style={iconBtn}>
+        <Icon name={theme === 'light' ? 'moon' : 'sun'} size={18} />
+      </button>
+      <button onClick={() => onNav('settings')} title="Settings" aria-label="Settings" className={`tb-icon win-no-drag${active === 'settings' ? ' on' : ''}`} style={{ ...iconBtn, color: active === 'settings' ? 'var(--ink)' : 'var(--ink-secondary)' }}>
+        <Icon name="settings" size={18} />
+      </button>
+    </header>
+  );
+}
+
+function CodingShell({ active, children, onSearch, right, initialTheme = 'light' }: AppShellProps) {
+  useAppScale();
+  const [theme, setTheme] = useTheme(initialTheme);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const routeKey = ALL_NAV.find(r => location.pathname === r.path || location.pathname.startsWith(r.path + '/'))?.key;
+  const onNav = (key: string) => navigate(pathForNav(key));
+  return (
+    <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
+      <div style={{ width: '100%', height: '100%', overflow: 'hidden', position: 'relative', background: 'var(--bg)', display: 'flex', flexDirection: 'column' }}>
+        <div className="app-wallpaper" aria-hidden="true" />
+        <TrafficLights />
+        <CodingTopNav active={active ?? routeKey} onNav={onNav} onSearch={onSearch} theme={theme} setTheme={setTheme} right={right} />
+        <main style={{ flex: 1, minHeight: 0, overflow: 'auto', position: 'relative', zIndex: 1 }}>
+          {children}
+        </main>
+      </div>
     </div>
   );
 }

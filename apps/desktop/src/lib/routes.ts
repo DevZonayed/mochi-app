@@ -36,6 +36,13 @@ export const SETTINGS_ROUTE: NavRoute = { key: 'settings', path: '/settings', la
 /** Every navigable destination (sidebar items + pinned Settings), for active-key lookup. */
 export const ALL_NAV: NavRoute[] = [...NAV_ROUTES, SETTINGS_ROUTE];
 
+/** Coding-genre navigation — only the destinations a coder needs, in priority
+    order. The media/content surfaces (Studio, Publishing, Trends, Comms) belong
+    to the Design/Video genres and are hidden here. Drives the CodingShell top-nav. */
+export const CODING_NAV: NavRoute[] = (['workspace', 'home', 'projects', 'jobs', 'approvals', 'scheduler', 'skills', 'templates', 'budget'] as const)
+  .map(k => NAV_ROUTES.find(r => r.key === k))
+  .filter((r): r is NavRoute => !!r);
+
 /** Nav key → real route path. Keys and paths differ ('jobs' → '/job-monitor');
     guessing '/' + key sends mismatched keys into the router's catch-all (Home).
     Every onNav handler must resolve through this. */

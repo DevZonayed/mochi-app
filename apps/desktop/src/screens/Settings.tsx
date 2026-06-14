@@ -13,8 +13,8 @@ import {
   type EffortStop,
 } from '../lib/ui';
 import {
-  APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, TrafficLights, Sidebar, Toolbar,
-  type Theme,
+  APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, usePurpose, setPurpose, TrafficLights, Sidebar, Toolbar,
+  type Theme, type Purpose,
 } from '../lib/appShell';
 import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ChromeProfile, IS_LOCAL } from '../lib/api';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
@@ -193,6 +193,15 @@ function GeneralPane({ theme, setTheme, workspace }: {
 
   const eff: EffortStop = settings ? EFFORT_TO_STOP[settings.defaultEffort] ?? 'BALANCED' : 'BALANCED';
   const model = settings?.defaultEngine ?? 'auto';
+  const purpose = usePurpose();
+  const PURPOSE_LABEL: Record<Purpose, string> = { coding: 'Coding', design: 'Design', video: 'Video', general: 'General' };
+  const labelToPurpose = (l: string): Purpose => (l === 'Coding' ? 'coding' : l === 'Design' ? 'design' : l === 'Video' ? 'video' : 'general');
+  const PURPOSE_SUB: Record<Purpose, string> = {
+    coding: 'Workspace-focused: no sidebar, a slim top nav, the coding workspace front and centre.',
+    design: 'A design-focused layout is coming — for now this looks like General.',
+    video: 'A video-focused layout is coming — for now this looks like General.',
+    general: 'The classic layout: full sidebar with every surface.',
+  };
 
   const patch = (p: Partial<AppSettings>) => { setSettings(s => (s ? { ...s, ...p } : s)); void api.setSettings(p).catch(() => {}); };
   const saveName = (name: string) => { const n = name.trim(); if (n && n !== workspace?.name) void api.createWorkspace(n).catch(() => {}); };
@@ -204,6 +213,15 @@ function GeneralPane({ theme, setTheme, workspace }: {
         <GroupedList header="Workspace">
           <Row><span style={{ width: 110, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Name</span><input key={workspace?.id ?? 'ws'} defaultValue={workspace?.name ?? 'Maestro'} onBlur={e => saveName(e.target.value)} style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)', padding: '13px 0' }} /></Row>
           <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Appearance</span><Seg options={['Light', 'Dark', 'Auto']} value={getThemePref() === 'auto' ? 'Auto' : getThemePref() === 'dark' ? 'Dark' : 'Light'} onChange={v => setThemePref(v === 'Auto' ? 'auto' : v === 'Dark' ? 'dark' : 'light')} /></Row>
+        </GroupedList>
+        <GroupedList header="Workspace mode" footer={PURPOSE_SUB[purpose]}>
+          <Row last>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Main purpose</span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>The whole layout reshapes to fit what you do most.</span>
+            </span>
+            <Seg options={['Coding', 'Design', 'Video', 'General']} value={PURPOSE_LABEL[purpose]} onChange={v => setPurpose(labelToPurpose(v))} />
+          </Row>
         </GroupedList>
         <GroupedList header="Defaults" footer="Applies to new jobs; a project or the composer can override per run.">
           <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default effort</span><EffortDial value={eff} onChange={v => patch({ defaultEffort: STOP_TO_EFFORT[v] })} compact /></Row>
