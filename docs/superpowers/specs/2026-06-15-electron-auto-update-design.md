@@ -60,14 +60,16 @@ GitHub Releases ──latest*.yml + installers──► electron-updater
 
 ## How to cut a release
 
-1. Bump `version` in `apps/desktop/package.json` (e.g. `0.1.1`).
-2. Merge it to `master` (or push there).
+Releases are **manual** — nothing publishes automatically on push. When ready:
 
-That's it. The Release workflow notices a version that isn't published yet and
-builds + publishes installers for macOS, Windows and Linux. Ordinary commits to
-master (no version bump) are skipped, so nothing rebuilds needlessly. Installed
+- **GitHub:** Actions tab → "Release desktop app" → **Run workflow** → pick `master`.
+- **CLI:** `gh workflow run release.yml --ref master`
+
+The version **auto-increments** (patch bumps from the latest published release;
+bump major/minor in `apps/desktop/package.json` to start a new series), so no
+manual version edit is needed. The run builds + publishes installers for macOS,
+Windows and Linux, then syncs the new version back into package.json. Installed
 apps pick the update up within 4 h, on next launch, or via Settings → Check now.
-(Pushing a `v*` tag manually still works too.)
 
 The first release establishes the baseline everyone updates *from*.
 
