@@ -231,6 +231,25 @@ export interface AppSettings {
   chromeProfile?: string;
   /** 'copy' = warm-start the app's own browser from the profile; 'live' = drive the real Chrome profile. */
   chromeProfileMode?: 'copy' | 'live';
+  /** Target repo ("owner/repo") feedback is escalated to as GitHub issues. */
+  feedbackRepo?: string;
+}
+
+export type FeedbackCategory = 'bug' | 'idea' | 'other';
+export type FeedbackStatus = 'new' | 'triaged' | 'done';
+export type FeedbackSource = 'desktop' | 'web' | 'phone';
+export interface FeedbackContext { screen?: string; appVersion?: string; platform?: string; projectId?: string | null }
+export interface Feedback {
+  id: string;
+  category: FeedbackCategory;
+  message: string;
+  status: FeedbackStatus;
+  source: FeedbackSource;
+  context?: FeedbackContext;
+  issueUrl?: string;
+  issueNumber?: number;
+  createdAt: number;
+  updatedAt: number;
 }
 export interface ChromeProfile { dir: string; name: string }
 /** Per-project .continuum memory: the durable STATE + checkpoint chain (newest first). */
@@ -616,6 +635,20 @@ export const api = {
   exportDraft: (id: string) => call<PublishDraft>('exportDraft', { id }, () => req<PublishDraft>(`/api/publish/drafts/${encodeURIComponent(id)}/export`, { method: 'POST' })),
   markPublished: (id: string) => call<PublishDraft>('markPublished', { id }, () => req<PublishDraft>(`/api/publish/drafts/${encodeURIComponent(id)}/published`, { method: 'POST' })),
   deleteDraft: (id: string) => call<{ ok: boolean }>('deleteDraft', { id }, () => req<{ ok: boolean }>(`/api/publish/drafts/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
+  // Feedback (collected from any surface; stored + triaged on the Mac)
+  listFeedback: () => call<Feedback[]>('listFeedback', {}, () => req<Feedback[]>('/api/feedback')),
+  submitFeedback: (input: { category: FeedbackCategory; message: string; source?: FeedbackSource; context?: FeedbackContext }) =>
+    call<Feedback>('submitFeedback', { ...input }, () =>
+      req<Feedback>('/api/feedback', { method: 'POST', body: JSON.stringify({ ...input, source: input.source ?? 'web' }) })),
+  updateFeedback: (id: string, status: FeedbackStatus) =>
+    call<Feedback>('updateFeedback', { id, status }, () =>
+      req<Feedback>(`/api/feedback/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify({ status }) })),
+  deleteFeedback: (id: string) =>
+    call<{ ok: boolean }>('deleteFeedback', { id }, () => req<{ ok: boolean }>(`/api/feedback/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
+  /** Escalate feedback to a GitHub issue — desktop-only (spends the Mac's GitHub token). */
+  feedbackCreateIssue: (id: string, repo?: string) =>
+    call<{ feedback: Feedback; issueUrl?: string; issueNumber?: number }>('feedbackCreateIssue', { id, repo }, () => Promise.reject(new ApiError(403, 'Filing GitHub issues is only available in the desktop app'))),
+
   // Comms (Telegram bot)
   commsStatus: () => call<CommsStatus>('commsStatus', {}, () => req<CommsStatus>('/api/comms/status')),
   listChatBindings: () => call<ChatBinding[]>('listChatBindings', {}, () => req<ChatBinding[]>('/api/comms/bindings')),
@@ -808,7 +841,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
@@ -820,6 +853,7 @@ export const api = {
         if (name === 'publishDraft' && handlers.onPublishDraft) handlers.onPublishDraft(data as PublishDraft);
         if (name === 'comms' && handlers.onComms) handlers.onComms(data as CommsStatus);
         if (name === 'session' && handlers.onSession) handlers.onSession(data as ChatSession & { deleted?: boolean });
+        if (name === 'feedback' && handlers.onFeedback) handlers.onFeedback(data as Feedback & { deleted?: boolean });
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
@@ -833,6 +867,7 @@ export const api = {
     if (handlers.onPublishDraft) es.addEventListener('publishDraft', (e: MessageEvent) => { try { handlers.onPublishDraft!(JSON.parse(e.data) as PublishDraft); } catch { /* ignore */ } });
     if (handlers.onComms) es.addEventListener('comms', (e: MessageEvent) => { try { handlers.onComms!(JSON.parse(e.data) as CommsStatus); } catch { /* ignore */ } });
     if (handlers.onSession) es.addEventListener('session', (e: MessageEvent) => { try { handlers.onSession!(JSON.parse(e.data) as ChatSession & { deleted?: boolean }); } catch { /* ignore */ } });
+    if (handlers.onFeedback) es.addEventListener('feedback', (e: MessageEvent) => { try { handlers.onFeedback!(JSON.parse(e.data) as Feedback & { deleted?: boolean }); } catch { /* ignore */ } });
     return () => es.close();
   },
   /** Convenience: subscribe to job updates only. */

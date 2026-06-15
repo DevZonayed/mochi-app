@@ -27,6 +27,7 @@ const TrendIntelligence = React.lazy(() => import('./screens/TrendIntelligence')
 const CommsGateway = React.lazy(() => import('./screens/CommsGateway'));
 const BudgetDashboard = React.lazy(() => import('./screens/BudgetDashboard'));
 const Settings = React.lazy(() => import('./screens/Settings'));
+const Feedback = React.lazy(() => import('./screens/Feedback'));
 const DevicePairing = React.lazy(() => import('./screens/DevicePairing'));
 const AuditHistory = React.lazy(() => import('./screens/AuditHistory'));
 
@@ -69,6 +70,7 @@ export function App() {
           <Route path="/comms" element={<CommsGateway />} />
           <Route path="/budget" element={<BudgetDashboard />} />
           <Route path="/settings" element={<Settings />} />
+          <Route path="/feedback" element={<Feedback />} />
           <Route path="/device-pairing" element={<DevicePairing />} />
           <Route path="/audit" element={<AuditHistory />} />
           <Route path="*" element={<Navigate to={entryPath()} replace />} />

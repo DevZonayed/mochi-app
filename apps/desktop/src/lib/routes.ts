@@ -34,8 +34,12 @@ export const NAV_ROUTES: NavRoute[] = [
 
 export const SETTINGS_ROUTE: NavRoute = { key: 'settings', path: '/settings', label: 'Settings', icon: 'settings' };
 
-/** Every navigable destination (sidebar items + pinned Settings), for active-key lookup. */
-export const ALL_NAV: NavRoute[] = [...NAV_ROUTES, SETTINGS_ROUTE];
+/** Feedback inbox — reached from the chrome's feedback button (not a standing
+    sidebar item), but registered so pathForNav('feedback') + active highlighting resolve. */
+export const FEEDBACK_ROUTE: NavRoute = { key: 'feedback', path: '/feedback', label: 'Feedback', icon: 'feedback' };
+
+/** Every navigable destination (sidebar items + pinned Settings + Feedback), for active-key lookup. */
+export const ALL_NAV: NavRoute[] = [...NAV_ROUTES, SETTINGS_ROUTE, FEEDBACK_ROUTE];
 
 /** Coding-genre navigation. Both genres now LEAD with the Workspace (CodeSpace)
     and Design pair so the operator can cross between code and design from either
