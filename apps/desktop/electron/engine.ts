@@ -468,7 +468,7 @@ async function runClaude(
           ] : []),
           ...(skillsCtx ? [
             tool('search_skills',
-              'Search the live Maestro skill registry for specialized SKILL.md instructions. Use this before improvising when a task would benefit from a dedicated skill. Public search excludes disabled skills.',
+              'Search the live Maestro skill registry for a specialized SKILL.md. Call this FIRST — at the very start of a substantive task (build/scaffold, edit code, generate a design/content, or any domain-specific work), before you do the work — then add_skill_to_project and follow the best match. Installing and following a dedicated skill beats improvising. Public search excludes disabled skills.',
               { query: z.string().describe('What you need, e.g. "edit pdf", "google sheets", "stripe", "next.js best practices".'), limit: z.number().optional().describe('Max results (default 8).') },
               wrap(async (a: { query: string; limit?: number }) => {
                 const r = await skillsCtx.search(a.query, a.limit ?? 8);
@@ -1140,24 +1140,39 @@ export class LocalEngine {
         }
       }
 
-      // Installed skills (.claude/skills): surface what's installed so BOTH engines
-      // know the skill exists. Claude also auto-discovers SKILL.md via settingSources,
-      // but Codex does not — this index tells it to read the file. Reference data.
+      // Skills: surface what's installed AND — critically — a standing instruction to
+      // DISCOVER + INSTALL a registry skill before improvising. Previously this block
+      // was only added when a skill was already installed, so a project with no skills
+      // got zero skill guidance and the agent just started working — defeating the
+      // whole dynamic-skills feature. Now it's always injected on a real (non-plan) run
+      // so the agent searches first even from an empty project. Claude also auto-loads
+      // installed SKILL.md via settingSources; Codex relies on this index + the tools.
       if (job.projectId) {
         // Only enabled skills go into the agent's context — a disabled skill keeps
         // its files (renamed SKILL.md.disabled) but is hidden from the run.
         const installed = this.store.listInstalledSkills(job.projectId).filter(s => s.enabled !== false);
-        if (installed.length) {
-          const list = installed.map(s => {
-            const meta = [
-              s.version ? `version=${s.version}` : '',
-              s.risk ? `risk=${s.risk}` : '',
-              s.sha256 ? `sha256=${s.sha256.slice(0, 12)}` : '',
-              s.auditStatus ? `audit=${s.auditStatus}` : '',
-            ].filter(Boolean).join(', ');
-            return `- ${s.name}: ${(s.description || '').slice(0, 160)} (path=.claude/skills/${s.slug}/SKILL.md${meta ? `, ${meta}` : ''})`;
-          }).join('\n');
-          prompt = `<project_skills note="Compact installed skill index only. When a task matches one, READ its SKILL.md before acting. Use list_project_skills/search_skills/get_skill/download_skill/add_skill_to_project/remove_project_skill for live skill management.">\n${list}\n</project_skills>\n\n${prompt}`;
+        const list = installed.map(s => {
+          const meta = [
+            s.version ? `version=${s.version}` : '',
+            s.risk ? `risk=${s.risk}` : '',
+            s.sha256 ? `sha256=${s.sha256.slice(0, 12)}` : '',
+            s.auditStatus ? `audit=${s.auditStatus}` : '',
+          ].filter(Boolean).join(', ');
+          return `- ${s.name}: ${(s.description || '').slice(0, 160)} (path=.claude/skills/${s.slug}/SKILL.md${meta ? `, ${meta}` : ''})`;
+        }).join('\n');
+        const brokerLive = !opts.plan; // the Skill-Broker MCP (search_skills/add_skill_to_project/…) is only mounted on non-plan runs
+        if (brokerLive) {
+          const installedBlock = installed.length
+            ? `Already installed & enabled here (READ the matching SKILL.md before acting on a task it covers):\n${list}`
+            : `Already installed here: (none yet — so a registry search before you start is especially important).`;
+          prompt = `<project_skills note="How to work with skills on this project. This is an INSTRUCTION, follow it.">\n` +
+            `You have a Skill-Broker (MCP tools): search_skills, get_skill, download_skill, add_skill_to_project, list_project_skills, remove_project_skill.\n\n` +
+            `BEFORE you start any substantive task — scaffolding or building a project, editing code, generating a design/content, or any specialized or domain-specific work — FIRST call search_skills with keywords from the request. If a relevant skill comes back, add_skill_to_project, then READ the installed .claude/skills/<slug>/SKILL.md and follow it. Prefer an existing/registry skill over improvising; only proceed on your own when the search genuinely returns nothing useful (say so briefly if you do). Run this search-first step even when no skills are installed yet. Skip it only for trivial turns — a greeting, a quick question, a one-line tweak.\n\n` +
+            `${installedBlock}\n` +
+            `</project_skills>\n\n${prompt}`;
+        } else if (installed.length) {
+          // Plan mode has no MCP tools — still surface installed skills as reference.
+          prompt = `<project_skills note="Installed skills — read the matching SKILL.md before acting.">\n${list}\n</project_skills>\n\n${prompt}`;
         }
       }
 
