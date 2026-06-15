@@ -15,6 +15,11 @@ electronVersion: 33.4.11
 # pnpm workspace install is already complete in CI — skip the rebuild step.
 npmRebuild: false
 
+# Ad-hoc sign the macOS app (no Apple cert needed) so Apple Silicon treats it as
+# a valid signed app — softens the hard "is damaged" block into "unverified
+# developer → Open Anyway". A clean double-click still needs Developer ID + notarize.
+afterPack: build/after-pack.cjs
+
 directories:
   output: release/${version}
   buildResources: build # build/icon.png → electron-builder generates .icns/.ico
