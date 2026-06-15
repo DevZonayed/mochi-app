@@ -1,0 +1,70 @@
+name: Release desktop app
+
+# A release is cut whenever the version in apps/desktop/package.json is one that
+# hasn't been published yet. The simple path: bump that version and merge to
+# master — done. (A manual `v*` tag or a manual run work too.) The `check` job
+# skips the build when the version is already released, so ordinary commits to
+# master never rebuild anything.
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.decide.outputs.version }}
+      needed: ${{ steps.decide.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./apps/desktop/package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::v$VERSION is already released — nothing to build."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::v$VERSION not released yet — building installers."
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.needed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build renderer + main process
+        run: pnpm --filter @maestro/desktop build
+
+      - name: Build installers & publish to GitHub Releases
+        working-directory: apps/desktop
+        env:
+          # electron-builder uses this to create the release + upload assets.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm exec electron-builder --publish always

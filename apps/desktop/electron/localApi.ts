@@ -18,6 +18,7 @@ import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkil
 import { existsSync, mkdirSync, cpSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
+import { app } from 'electron';
 
 type Params = Record<string, unknown>;
 
@@ -46,7 +47,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
     const p = params ?? {};
     switch (method) {
       case 'health':
-        return { ok: true, name: 'maestro-desktop', version: '0.3.0', engine: 'claude-code', time: Date.now() };
+        return { ok: true, name: 'maestro-desktop', version: app.getVersion(), engine: 'claude-code', time: Date.now() };
 
       // ── Aggregates ─────────────────────────────────────────────
       case 'dashboard': return store.dashboard();

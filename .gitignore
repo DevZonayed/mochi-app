@@ -7,8 +7,14 @@ dist/
 dist-electron/
 build/
 web-build/
+release/
 .turbo/
 *.tsbuildinfo
+
+# …but DO keep the desktop app's committed build resources (app icon +
+# generator) that electron-builder consumes when packaging.
+!apps/desktop/build/
+!apps/desktop/build/**
 
 # expo / metro
 .expo/
