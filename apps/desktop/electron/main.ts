@@ -303,11 +303,31 @@ app.whenReady().then(() => {
   browserBridge.start();
   engine.setBrowserBridge(browserBridge);
   engine.setImageGen(async (prompt, opts) => {
-    if (store.routing().image === 'codex' && engine.status('codex').available) {
-      return engine.imageViaCodex(prompt, opts); // free, native — no fal credits needed
+    // Edit mode: a source image is supplied → keep that image and apply `prompt`
+    // as the change ("add a balloon in the sky"). Otherwise generate fresh.
+    const editing = !!(opts.sourceImagePath || opts.sourceImageUrl);
+    // Codex edits by attaching a LOCAL file (`-i`) — it can't fetch a url. If an
+    // edit was requested but there's no usable local source (url-only asset, or a
+    // stale/missing localPath), DON'T let Codex run: it would silently ignore the
+    // source and re-roll the instruction as a fresh text→image. Route those to fal
+    // Kontext (which accepts the url / a data-URI) instead.
+    const codexCanEdit = !editing || !!(opts.sourceImagePath && existsSync(opts.sourceImagePath));
+    const codexReady = store.routing().image === 'codex' && engine.status('codex').available;
+    if (codexReady && codexCanEdit) {
+      try {
+        // Codex (free, native image_gen) is prioritised. It edits by attaching the
+        // source image via `-i`; falls back to fal Kontext only if codex can't.
+        return await engine.imageViaCodex(prompt, { aspect: opts.aspect, projectId: opts.projectId, sourceImagePath: opts.sourceImagePath });
+      } catch (e) {
+        const falReady = providers.list().some(c => c.provider === 'fal');
+        if (!falReady) throw e; // no fal to fall back to — surface codex's error
+        // else fall through to fal below
+      }
     }
-    const asset = await media.generateAndWait({ modelKey: 'flux-schnell', prompt, projectId: opts.projectId ?? null, aspect: opts.aspect });
-    if (!asset.localPath) throw new Error('image was generated but saving it locally failed — please try again');
+    const asset = editing
+      ? await media.generateAndWait({ modelKey: 'flux-kontext', prompt, projectId: opts.projectId ?? null, imageUrl: opts.sourceImageUrl, imagePath: opts.sourceImagePath, aspect: opts.aspect })
+      : await media.generateAndWait({ modelKey: 'flux-schnell', prompt, projectId: opts.projectId ?? null, aspect: opts.aspect });
+    if (!asset.localPath) throw new Error(`image was ${editing ? 'edited' : 'generated'} but saving it locally failed — please try again`);
     return { path: asset.localPath, assetId: asset.id, alt: prompt.slice(0, 200), width: asset.width, height: asset.height };
   });
   telegram = new TelegramBot(store, engine, providers, emit);
