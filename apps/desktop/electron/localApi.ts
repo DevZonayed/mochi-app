@@ -2,7 +2,7 @@
    (over IPC) and remote controls (phone/web via the relay). Every command
    executes locally on this Mac against the local store + local engine. */
 
-import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, FeedbackCategory, FeedbackContext, FeedbackSource } from './store.js';
+import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem, FeedbackCategory, FeedbackContext, FeedbackSource } from './store.js';
 import { resolveModelKey, buildModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
@@ -15,6 +15,7 @@ import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } fro
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
+import { scanConversations, parseConversation, type ConvSource } from './conversation-sync.js';
 import { existsSync, mkdirSync, cpSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
@@ -261,6 +262,61 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const s = store.setSessionPinned(String(p.id ?? ''), p.pinned === true);
         emit('session', s);
         return s;
+      }
+
+      // ── Conversation sync (import Claude/Codex/Conductor history) ──────────
+      // DESKTOP-ONLY (reads local agent stores + the Conductor SQLite db). Guarded
+      // from the relay in main.ts. Scans the project's folder for past conversations.
+      case 'scanConversations': {
+        const proj = store.getProject(String(p.projectId ?? ''));
+        if (!proj) bad('project not found', 404);
+        const root = projectRootOf(proj!);
+        const { available, conversations } = scanConversations(root);
+        const seen = store.importedExternalIds(proj!.id);
+        return {
+          available,
+          path: root,
+          conversations: conversations.map(c => ({ ...c, imported: seen.has(c.externalId) })),
+        };
+      }
+      case 'importConversations': {
+        const proj = store.getProject(String(p.projectId ?? ''));
+        if (!proj) bad('project not found', 404);
+        const items = Array.isArray(p.items) ? p.items as Array<{ source?: string; externalId?: string; filePath?: string; title?: string; createdAt?: number; updatedAt?: number }> : [];
+        if (!items.length) bad('items required');
+        const seen = store.importedExternalIds(proj!.id);
+        const VALID = new Set<ConvSource>(['claude', 'codex', 'conductor']);
+        let imported = 0;
+        const sessions = [];
+        for (const it of items) {
+          const source = it.source as ConvSource;
+          const externalId = String(it.externalId ?? '');
+          if (!VALID.has(source) || !externalId || seen.has(externalId)) continue;
+          const turns = parseConversation(source, { filePath: it.filePath, externalId });
+          if (!turns.length) continue;
+          const mapped = turns.map(t => ({
+            input: t.input,
+            output: t.output,
+            createdAt: t.createdAt,
+            transcript: t.transcript.map((b): TranscriptItem => ({
+              kind: b.kind,
+              text: b.text,
+              ...(b.name ? { name: b.name } : {}),
+              ...(b.kind === 'tool' ? { toolStatus: 'done' as const } : {}),
+              ts: b.ts || t.createdAt,
+            })),
+          }));
+          const createdAt = turns[0]?.createdAt || Number(it.createdAt) || Date.now();
+          const updatedAt = Number(it.updatedAt) || turns[turns.length - 1]?.createdAt || createdAt;
+          const { session } = store.commitImportedConversation({
+            projectId: proj!.id, title: String(it.title ?? '') || `${source} chat`, source, externalId, createdAt, updatedAt, turns: mapped,
+          });
+          emit('session', session);
+          sessions.push(session);
+          seen.add(externalId);
+          imported++;
+        }
+        return { imported, sessions };
       }
       case 'sendChat': {
         const projectId = String(p.projectId ?? '');
