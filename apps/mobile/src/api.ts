@@ -154,6 +154,10 @@ export const api = {
 
   listTemplates: () => req<Template[]>('/api/templates'),
 
+  /** Send feedback from this phone — stored on the Mac (source: 'phone'). */
+  submitFeedback: (input: { category: 'bug' | 'idea' | 'other'; message: string }) =>
+    req<{ id: string }>('/api/feedback', { method: 'POST', body: JSON.stringify({ ...input, source: 'phone' }) }),
+
   /** Poll a fetcher every ms; returns a cleanup that stops polling. (RN has no SSE.) */
   poll(fetchOnce: () => void, ms = 4000): () => void {
     fetchOnce();

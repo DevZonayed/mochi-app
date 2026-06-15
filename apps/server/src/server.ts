@@ -38,6 +38,7 @@ interface Snapshot {
   chatBindings?: unknown[];
   pendingChats?: unknown[];
   commEvents?: unknown[];
+  feedback?: { id?: string; status?: string }[];
   commsStatus?: unknown;
   budget?: unknown;
   costs?: unknown;
@@ -256,6 +257,8 @@ export function buildServer(): FastifyInstance {
   app.get('/api/comms/bindings', async () => st()?.chatBindings ?? []);
   app.get('/api/comms/pending', async () => st()?.pendingChats ?? []);
   app.get('/api/comms/events', async () => st()?.commEvents ?? []);
+  // ── Feedback (mirror the Mac's list; submit/triage forward to the Mac) ──
+  app.get('/api/feedback', async () => st()?.feedback ?? []);
   app.post('/api/comms/telegram/connect', async (req, reply) => forward(reply, 'connectTelegram', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/comms/telegram/disconnect', async (_req, reply) => forward(reply, 'disconnectTelegram', {}));
   app.post('/api/comms/bind', async (req, reply) => forward(reply, 'bindChat', (req.body ?? {}) as Record<string, unknown>));
@@ -340,6 +343,10 @@ export function buildServer(): FastifyInstance {
     forward(reply, 'disconnectProvider', { ...(req.body ?? {}) as Record<string, unknown>, provider: (req.params as { provider: string }).provider }));
   app.post('/api/routing', async (req, reply) => forward(reply, 'setRouting', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/roles', async (req, reply) => forward(reply, 'setRoles', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/feedback', async (req, reply) => forward(reply, 'submitFeedback', (req.body ?? {}) as Record<string, unknown>));
+  app.post('/api/feedback/:id/update', async (req, reply) =>
+    forward(reply, 'updateFeedback', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
+  app.post('/api/feedback/:id/delete', async (req, reply) => forward(reply, 'deleteFeedback', { id: (req.params as { id: string }).id }));
 
   // ── SSE stream (host events relayed to web clients) ────────────────
   app.get('/api/stream', (req, reply) => {

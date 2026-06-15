@@ -9,6 +9,7 @@ import { Icon, MaestroMark } from './icons';
 import { NAV_ROUTES, ALL_NAV, CODING_NAV, DESIGN_NAV, pathForNav } from './routes';
 import { api } from './api';
 import { CountUp } from './ui';
+import { FeedbackButton } from './Feedback';
 
 export const APP_W = 1320, APP_H = 860;
 
@@ -385,6 +386,8 @@ export function Toolbar({ onSearch, theme, setTheme, right, sidebarHidden }: Too
 
       <BudgetChip />
 
+      <FeedbackButton size={19} />
+
       <button className="tb-icon" onClick={() => navigate('/approvals')} aria-label="Approvals" title={pending > 0 ? `${pending} waiting` : 'Approvals'} style={{
         width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', position: 'relative',
         color: 'var(--ink-secondary)',
@@ -546,6 +549,7 @@ function CodingTopNav({ active, onNav, onSearch, theme, setTheme, right }: { act
       <button onClick={onSearch} title="Search (⌘K)" aria-label="Search" className="tb-icon win-no-drag" style={iconBtn}>
         <Icon name="search" size={18} />
       </button>
+      <FeedbackButton size={18} />
       <button onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')} title="Toggle appearance" aria-label="Toggle appearance" className="tb-icon win-no-drag" style={iconBtn}>
         <Icon name={theme === 'light' ? 'moon' : 'sun'} size={18} />
       </button>

@@ -336,8 +336,16 @@ app.whenReady().then(() => {
       if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject'
         || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment'
         || method === 'copyDesignToCode'
-        || method === 'addSkillToProject' || method === 'removeSkillFromProject') {
+        || method === 'addSkillToProject' || method === 'removeSkillFromProject'
+        // feedbackCreateIssue spends THIS Mac's GitHub token — keep it local-only
+        // (a remote can still submit/list/triage feedback; just not file issues).
+        || method === 'feedbackCreateIssue') {
         throw Object.assign(new Error('not available remotely'), { statusCode: 403 });
+      }
+      // Feedback provenance is set by the TRANSPORT, not the caller: a remote is
+      // a phone or web client and can never assert it came from the desktop.
+      if (method === 'submitFeedback') {
+        params = { ...params, source: (params as { source?: unknown }).source === 'phone' ? 'phone' : 'web' };
       }
       const r = await dispatch(method, params);
       const isJob = (x: unknown): x is Job => !!x && typeof x === 'object' && 'input' in x && 'status' in x && 'phase' in x && 'projectId' in x;
@@ -367,9 +375,11 @@ app.whenReady().then(() => {
     try {
       // update.* controls this Mac's binary → handled locally, never via the
       // shared dispatch (which the relay also calls).
+      // Local IPC = the desktop app: stamp feedback provenance authoritatively.
+      const localParams = method === 'submitFeedback' ? { ...(params ?? {}), source: 'desktop' } : (params ?? {});
       const data = method.startsWith('update.')
         ? await handleUpdate(updater, method, params ?? {})
-        : await dispatch(method, params ?? {});
+        : await dispatch(method, localParams);
       return { ok: true, data };
     } catch (e) {
       const err = e as { message?: string; statusCode?: number };
