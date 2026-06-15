@@ -47,7 +47,6 @@ const styles = `
 interface PaletteItem { group: string; icon: IconName; label: string; hint: string; }
 
 const PALETTE_ITEMS: PaletteItem[] = [
-  { group: 'Jump to', icon: 'home', label: 'Command Center', hint: '⌘1' },
   { group: 'Jump to', icon: 'layers', label: 'Projects', hint: '⌘2' },
   { group: 'Jump to', icon: 'jobs', label: 'Jobs', hint: '⌘3' },
   { group: 'Jump to', icon: 'shield', label: 'Approvals', hint: '⌘4' },
@@ -725,13 +724,11 @@ function ResetSheet({ onClose }: { onClose: () => void }) {
 /* ───────────────────────── page root ───────────────────────── */
 // cross-page nav routing → react-router (mirrors the prototype's navTo map)
 const NAV_ROUTES: Record<string, string> = {
-  home: '/command-center',
   projects: '/projects',
   jobs: '/job-monitor',
   approvals: '/approvals',
   scheduler: '/scheduler',
   skills: '/skills-registry',
-  templates: '/templates',
   trends: '/trends',
   studio: '/media-studio',
   publishing: '/publishing',
