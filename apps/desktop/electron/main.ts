@@ -17,6 +17,7 @@ import { buildModelGroups } from './models.js';
 import { RelayClient } from './relay.js';
 import { CronRunner } from './cron.js';
 import { runSmoke } from './smoke.js';
+import { Updater } from './updater.js';
 
 const RENDERER_DIST = path.join(__dirname, '../dist');
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
@@ -135,6 +136,20 @@ const DESIGN_COMMENT_HARNESS = `(function(){
   });
 })();`;
 
+/** Route update.* IPC straight to the Updater — kept OUT of the shared dispatch
+    so it can never answer over the relay (it controls this Mac's own binary). */
+async function handleUpdate(updater: Updater, method: string, params: Record<string, unknown>): Promise<unknown> {
+  switch (method) {
+    case 'update.status': return updater.status();
+    case 'update.check': return updater.check();
+    case 'update.install': return updater.install();
+    case 'update.openReleases': return updater.openReleases();
+    case 'update.setChannel': return updater.setChannel(params.channel === 'beta' ? 'beta' : 'stable');
+    case 'update.notes': return updater.notes(typeof params.version === 'string' ? params.version : undefined);
+    default: throw Object.assign(new Error(`unknown update method: ${method}`), { statusCode: 404 });
+  }
+}
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1320,
@@ -241,13 +256,14 @@ app.whenReady().then(() => {
 
   let relay: RelayClient | null = null;
   let telegram: TelegramBot | null = null;
-  const emit = (name: string, data: unknown, opts?: { live?: boolean }) => {
+  const emit = (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => {
     for (const w of BrowserWindow.getAllWindows()) {
       try { w.webContents.send('maestro:event', { name, data }); } catch { /* window closing */ }
     }
     // Streaming frames (50ms cadence) are local-only: the relay/phone gets the
-    // ~1s checkpoint updates instead of a snapshot push per frame.
-    if (opts?.live) return;
+    // ~1s checkpoint updates instead of a snapshot push per frame. `desktopOnly`
+    // events (e.g. auto-update — about THIS Mac's binary) likewise stay local.
+    if (opts?.live || opts?.desktopOnly) return;
     if (name === 'settings' && data && typeof data === 'object') applyLoginItem(!!(data as { openAtLogin?: boolean }).openAtLogin);
     // A new pending approval (e.g. reviewer NEEDS WORK) → push to Telegram gates.
     if (name === 'approval' && telegram && (data as Approval)?.status === 'pending') telegram.notifyApproval(data as Approval);
@@ -342,11 +358,18 @@ app.whenReady().then(() => {
 
   const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs));
   cron.start();
-  app.on('before-quit', () => { cron.stop(); relay?.stop(); telegram?.stop(); browserBridge.stop(); void browser.dispose(); });
+  // Auto-update (electron-updater → GitHub Releases). Desktop-only: its events
+  // never cross the relay. Polling starts after the window exists (see below).
+  const updater = new Updater(emit);
+  app.on('before-quit', () => { cron.stop(); relay?.stop(); telegram?.stop(); browserBridge.stop(); updater.stop(); void browser.dispose(); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {
-      const data = await dispatch(method, params ?? {});
+      // update.* controls this Mac's binary → handled locally, never via the
+      // shared dispatch (which the relay also calls).
+      const data = method.startsWith('update.')
+        ? await handleUpdate(updater, method, params ?? {})
+        : await dispatch(method, params ?? {});
       return { ok: true, data };
     } catch (e) {
       const err = e as { message?: string; statusCode?: number };
@@ -498,6 +521,7 @@ app.whenReady().then(() => {
   }
 
   createWindow();
+  updater.start(); // check 8s after launch, then every 4h
 });
 
 app.on('activate', () => {

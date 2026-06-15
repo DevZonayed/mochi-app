@@ -456,6 +456,22 @@ const qp = (params: Record<string, string | undefined>): string => {
   return q ? `?${q}` : '';
 };
 
+export interface UpdateStatus {
+  phase: 'idle' | 'checking' | 'available' | 'none' | 'downloading' | 'ready' | 'error';
+  version?: string;
+  notes?: string;
+  percent?: number;
+  message?: string;
+  currentVersion: string;
+  channel: 'stable' | 'beta';
+  canInstall: boolean;      // win/linux + signed mac: can restart-to-install
+  manualDownload: boolean;  // mac-unsigned: open the download page instead
+  releasesUrl: string;
+  platform: string;
+}
+export interface UpdateNotes { version: string; notes: string; url: string }
+const updateUnavailable = (): Promise<never> => Promise.reject(new ApiError(501, 'Updates run in the desktop app'));
+
 export const api = {
   base: API_BASE,
   health: () =>
@@ -777,6 +793,19 @@ export const api = {
   // Pairing (desktop-only — the code remotes must enter)
   getPairing: () =>
     call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
+
+  /** Auto-update — desktop only; `undefined` in web/phone remotes (updates are
+      about this Mac's own binary, so they're never exposed over the relay). */
+  update: IS_LOCAL ? {
+    status: () => call<UpdateStatus>('update.status', {}, updateUnavailable),
+    check: () => call<UpdateStatus>('update.check', {}, updateUnavailable),
+    install: () => call<{ ok: boolean }>('update.install', {}, updateUnavailable),
+    openReleases: () => call<{ ok: boolean }>('update.openReleases', {}, updateUnavailable),
+    setChannel: (channel: 'stable' | 'beta') => call<UpdateStatus>('update.setChannel', { channel }, updateUnavailable),
+    notes: (version?: string) => call<UpdateNotes>('update.notes', { version }, updateUnavailable),
+    onUpdate: (cb: (s: UpdateStatus) => void): (() => void) =>
+      bridge?.onEvent ? bridge.onEvent(({ name, data }) => { if (name === 'update') cb(data as UpdateStatus); }) : () => {},
+  } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
   subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void }): () => void {

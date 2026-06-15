@@ -16,8 +16,9 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, usePurpose, setPurpose, TrafficLights, Sidebar, Toolbar,
   type Theme, type Purpose,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ChromeProfile, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ChromeProfile, type UpdateStatus, IS_LOCAL } from '../lib/api';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
+import { WhatsNew } from '../lib/WhatsNew';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -613,15 +614,73 @@ function PowerPane() {
   );
 }
 
+const upGhostBtn: React.CSSProperties = { height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' };
+const upPrimaryBtn: React.CSSProperties = { height: 32, padding: '0 15px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)' };
+
 function UpdatesPane() {
+  const upd = api.update;
+  const [st, setSt] = React.useState<UpdateStatus | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [whatsNew, setWhatsNew] = React.useState<{ version: string; notes: string } | null>(null);
+
+  React.useEffect(() => {
+    if (!upd) return;
+    upd.status().then(setSt).catch(() => {});
+    const unsub = upd.onUpdate(setSt);
+    return () => unsub();
+  }, [upd]);
+
+  if (!upd) {
+    return (
+      <div>
+        <PaneHead>Updates</PaneHead>
+        <GroupedList footer="Updates are managed in the desktop app.">
+          <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Open Maestro on your Mac to check for updates.</span></Row>
+        </GroupedList>
+      </div>
+    );
+  }
+
+  const phase = st?.phase ?? 'idle';
+  const check = () => { setBusy(true); upd.check().then(setSt).catch(() => {}).finally(() => setBusy(false)); };
+  const openNotes = () => upd.notes(st?.currentVersion).then(n => setWhatsNew({ version: n.version, notes: n.notes })).catch(() => {});
+
+  const status = (() => {
+    if (busy || phase === 'checking') return { color: 'var(--ink-secondary)', icon: null as IconName | null, text: 'Checking…' };
+    if (phase === 'downloading') return { color: 'var(--blue)', icon: null as IconName | null, text: `Downloading… ${st?.percent ?? 0}%` };
+    if (phase === 'ready') return { color: 'var(--green)', icon: 'check' as IconName | null, text: `Version ${st?.version} ready` };
+    if (phase === 'available') return { color: 'var(--orange)', icon: null as IconName | null, text: `Version ${st?.version} available` };
+    if (phase === 'error') return { color: 'var(--red)', icon: 'alert' as IconName | null, text: 'Couldn’t check for updates' };
+    return { color: 'var(--green)', icon: 'check' as IconName | null, text: 'Up to date' };
+  })();
+
+  const action = phase === 'ready'
+    ? <button onClick={() => void upd.install()} style={upPrimaryBtn}>Restart to update</button>
+    : phase === 'available'
+      ? <button onClick={() => void upd.install()} style={upPrimaryBtn}>Download</button>
+      : (phase === 'downloading' || phase === 'checking' || busy)
+        ? null
+        : <button onClick={check} className="ghost-btn" style={upGhostBtn}>Check now</button>;
+
   return (
     <div>
       <PaneHead>Updates</PaneHead>
-      <GroupedList footer="Updates are signed and verified before install.">
-        <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Current version</span><span style={{ font: '500 var(--fs-callout)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>3.4.1 (build 8821)</span></Row>
-        <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Channel</span><Seg options={['Stable', 'Beta']} value={'Stable'} onChange={() => {}} /></Row>
-        <Row last><span style={{ flex: 1, display: 'inline-flex', alignItems: 'center', gap: 7, font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--green)' }}><Icon name="check" size={14} stroke={2.6} /> Up to date</span><button className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Check now</button></Row>
+      <GroupedList footer={st?.manualDownload
+        ? 'On macOS the app isn’t code-signed yet, so updates open the download page. Windows & Linux update in place on restart.'
+        : 'Updates download in the background and install when you restart.'}>
+        <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Current version</span><span style={{ font: '500 var(--fs-callout)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{st?.currentVersion ?? '—'}</span></Row>
+        <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Channel</span><Seg options={['Stable', 'Beta']} value={st?.channel === 'beta' ? 'Beta' : 'Stable'} onChange={v => { setBusy(true); upd.setChannel(v === 'Beta' ? 'beta' : 'stable').then(setSt).catch(() => {}).finally(() => setBusy(false)); }} /></Row>
+        <Row last>
+          <span style={{ flex: 1, display: 'inline-flex', alignItems: 'center', gap: 7, font: '500 var(--fs-footnote)/1 var(--font-text)', color: status.color }}>
+            {status.icon && <Icon name={status.icon} size={14} stroke={2.6} />} {status.text}
+          </span>
+          <div style={{ display: 'inline-flex', gap: 8 }}>
+            <button onClick={openNotes} className="ghost-btn" style={upGhostBtn}>What's New</button>
+            {action}
+          </div>
+        </Row>
       </GroupedList>
+      {whatsNew && <WhatsNew version={whatsNew.version} notes={whatsNew.notes} onClose={() => setWhatsNew(null)} onOpenReleases={() => void upd.openReleases()} />}
     </div>
   );
 }

@@ -11,7 +11,7 @@ export default defineConfig({
         // The Claude Agent SDK is ESM + spawns the `claude` binary, and
         // playwright-core drives the system Chrome — keep them external so they
         // load from node_modules at runtime (both are dynamically imported).
-        vite: { build: { rollupOptions: { external: ['@anthropic-ai/claude-agent-sdk', 'ws', 'playwright-core'] } } },
+        vite: { build: { rollupOptions: { external: ['@anthropic-ai/claude-agent-sdk', 'ws', 'playwright-core', 'electron-updater'] } } },
       },
       preload: { input: 'electron/preload.ts' },
       renderer: {},

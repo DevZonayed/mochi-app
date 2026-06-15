@@ -1,5 +1,6 @@
 import React from 'react';
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { UpdateBanner } from './lib/UpdateBanner';
 
 /* Real application entry. First run → Onboarding (creates the workspace, sets
    the budget); afterwards the app opens on the Command Center. The old "Launcher"
@@ -73,6 +74,7 @@ export function App() {
           <Route path="*" element={<Navigate to={entryPath()} replace />} />
         </Routes>
       </React.Suspense>
+      <UpdateBanner />
     </HashRouter>
   );
 }

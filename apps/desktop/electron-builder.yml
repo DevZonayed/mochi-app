@@ -1,0 +1,64 @@
+# Packaging + auto-update feed for the Maestro desktop app.
+# Installers and the update manifests (latest.yml / latest-mac.yml /
+# latest-linux.yml) are published to GitHub Releases; electron-updater reads
+# them from there. See electron/updater.ts.
+appId: com.maestro.desktop
+productName: Maestro
+copyright: © Maestro
+
+# Stated explicitly: electron-builder can't auto-detect the version through
+# pnpm's symlinked node_modules. Keep this in sync with `electron` in
+# package.json (devDependencies) when you bump it.
+electronVersion: 33.4.11
+
+# We have no native modules to rebuild (ws's native addons are optional), and a
+# pnpm workspace install is already complete in CI — skip the rebuild step.
+npmRebuild: false
+
+directories:
+  output: release/${version}
+  buildResources: build # build/icon.png → electron-builder generates .icns/.ico
+
+# Vite emits the renderer to dist/ and the main+preload to dist-electron/.
+files:
+  - dist/**
+  - dist-electron/**
+  - package.json
+  - '!**/*.map'
+
+publish:
+  provider: github
+  owner: DevZonayed
+  repo: mochi-app
+  releaseType: release # publish immediately so everyone can download + auto-update
+
+mac:
+  category: public.app-category.developer-tools
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip # REQUIRED for electron-updater on macOS (Squirrel.Mac feed)
+      arch: [arm64, x64]
+  # Unsigned for now (no Apple Developer ID needed). To enable silent macOS
+  # auto-update later: set `identity` to your "Developer ID Application: …"
+  # cert, add notarization, and flip MAC_SILENT_UPDATE in electron/updater.ts.
+  identity: null
+
+win:
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  target:
+    - target: nsis
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+
+linux:
+  category: Development
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  target:
+    - target: AppImage # the only Linux target electron-updater can auto-update
+      arch: [x64]
