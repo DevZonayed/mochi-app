@@ -438,7 +438,7 @@ function PairStep({ secondsLeft, onRefresh }: PairStepProps) {
   );
 }
 
-// ── A glimpse of the Command Center dashboard that resolves behind the
+// ── A glimpse of the Workspace that resolves behind the
 //    dissolving setup card on the final step.
 interface DashboardPeekProps {
   workspace: string;
@@ -447,7 +447,7 @@ interface DashboardPeekProps {
 
 function DashboardPeek({ workspace, budget }: DashboardPeekProps) {
   const nav: { icon: IconName; label: string; active?: boolean }[] = [
-    { icon: 'bolt', label: 'Command Center', active: true },
+    { icon: 'terminal', label: 'CodeSpace', active: true },
     { icon: 'folder', label: 'Projects' },
     { icon: 'cpu', label: 'Job monitor' },
     { icon: 'shield', label: 'Approvals' },
@@ -610,7 +610,7 @@ export default function Onboarding() {
     }
     // Persist the workspace on the live backend — best-effort, never blocks setup.
     if (workspace.trim()) void api.createWorkspace(workspace.trim()).catch(() => {});
-    window.setTimeout(() => navigate('/command-center'), 1500);
+    window.setTimeout(() => navigate('/workspace'), 1500);
   };
   const restart = () => {
     setPhase('card'); setStep(0); setMaxVisited(0); setWorkspace('');
