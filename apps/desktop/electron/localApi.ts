@@ -422,14 +422,15 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!proj) return { skills: records };
         const disk = listInstalledSlugsDetailed(projectRootOf(proj));
         const diskBySlug = new Map(disk.map(d => [d.slug, d]));
-        const skills = records
-          .map(r => {
-            const d = diskBySlug.get(r.slug);
-            diskBySlug.delete(r.slug);
-            // Record with no folder on disk anymore → no longer installed; drop it.
-            return d ? { ...r, enabled: d.enabled } : null;
-          })
-          .filter((x): x is NonNullable<typeof x> => x !== null);
+        // Always show a recorded skill — never silently drop one just because the disk
+        // scan missed it (path quirks shouldn't make installed skills vanish from the
+        // UI). When the folder IS found, trust its real enabled state (SKILL.md vs
+        // .disabled); otherwise fall back to the record's flag.
+        const skills = records.map(r => {
+          const d = diskBySlug.get(r.slug);
+          diskBySlug.delete(r.slug);
+          return d ? { ...r, enabled: d.enabled } : r;
+        });
         // Folders on disk with no record (e.g. dropped in manually / by another tool).
         for (const d of diskBySlug.values()) {
           skills.push({ id: d.slug, slug: d.slug, name: d.slug, enabled: d.enabled, addedBy: 'agent', installedAt: 0 });
