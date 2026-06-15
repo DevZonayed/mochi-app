@@ -2,7 +2,7 @@
    (over IPC) and remote controls (phone/web via the relay). Every command
    executes locally on this Mac against the local store + local engine. */
 
-import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile } from './store.js';
+import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem } from './store.js';
 import { resolveModelKey, buildModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
@@ -516,6 +516,70 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           imageUrl: typeof p.imageUrl === 'string' ? p.imageUrl : undefined,
           aspect: typeof p.aspect === 'string' ? p.aspect : undefined,
         });
+      }
+      // Regenerate or modify an existing image. Routes through engine.generateImage
+      // → the SAME Codex/fal backend the generate_image tool uses (Codex-first).
+      // No `instruction` → re-roll the original prompt. With an `instruction`
+      // ("add a balloon in the sky") → EDIT the source image, keeping the rest.
+      // Always produces a NEW asset (non-destructive). When a jobId is given the
+      // result is appended to that chat turn's transcript so it shows inline and
+      // survives reload. Runs on this Mac; safe over the relay (bytes never cross).
+      case 'regenerateImage': {
+        const src = store.getAsset(String(p.assetId ?? p.id ?? ''));
+        if (!src) return bad('asset not found', 404);
+        if (src.kind !== 'image') return bad('only images can be regenerated', 400);
+        const instruction = typeof p.instruction === 'string' ? p.instruction.trim() : '';
+        const basePrompt = typeof p.prompt === 'string' && p.prompt.trim() ? p.prompt.trim() : (src.prompt ?? '');
+        const editing = instruction.length > 0;
+        if (!editing && !basePrompt) return bad('no original prompt to regenerate from — describe a change instead', 400);
+        // An edit needs a usable source image (a local file or a fetchable url). If
+        // neither exists, fail loudly here rather than letting it silently degrade
+        // to a fresh text→image of the instruction.
+        if (editing) {
+          const hasLocal = !!(src.localPath && existsSync(src.localPath));
+          const hasUrl = !!(src.url && /^https?:\/\//i.test(src.url));
+          if (!hasLocal && !hasUrl) return bad('this image has no source to edit on this Mac — re-roll it instead', 400);
+        }
+        const aspect = src.width && src.height
+          ? (src.height > src.width ? '9:16' : src.width > src.height ? '16:9' : '1:1')
+          : undefined;
+        const text = editing ? instruction : basePrompt;
+        const res = await engine.generateImage(text, {
+          aspect, projectId: src.projectId,
+          ...(editing ? { sourceImagePath: src.localPath, sourceImageUrl: src.url } : {}),
+        });
+        // Backstop: a backend that returns the SOURCE asset id means nothing new was
+        // produced (content-dedup of an unchanged result). Don't pass it off as new.
+        if (res.assetId && res.assetId === src.id) return bad('the image came back unchanged — try again, or describe the change differently', 502);
+        // An edited image's stored prompt should re-roll to a variation of the WHOLE
+        // picture, not just the change fragment — compose original + instruction.
+        if (editing && res.assetId) {
+          const composed = (basePrompt ? `${basePrompt} — ${instruction}` : instruction).slice(0, 2000);
+          try { store.updateAsset(res.assetId, { prompt: composed }); } catch { /* best effort */ }
+        }
+        const newAsset = res.assetId ? store.getAsset(res.assetId) : undefined;
+        if (newAsset) emit('asset', newAsset);
+        // Append the result to the originating chat turn so it shows inline + persists.
+        // Guard ownership (a relay caller could pass any jobId) and skip while the job
+        // is still streaming — the engine wholesale-rewrites transcript on each flush,
+        // which would clobber an out-of-band append (the 'asset' event still delivers
+        // the image to Media Studio either way).
+        if (p.jobId) {
+          const job = store.getJob(String(p.jobId));
+          if (job && job.projectId === src.projectId && !engine.isRunning(job.id)) {
+            const item: TranscriptItem = {
+              kind: 'image', text: text.slice(0, 200), imagePath: res.path, assetId: res.assetId,
+              alt: res.alt ?? text.slice(0, 200), width: res.width, height: res.height, ts: Date.now(),
+            };
+            const updated = store.updateJob(job.id, { transcript: [...(job.transcript ?? []), item] });
+            emit('job', updated);
+          }
+        }
+        // Return a minimal, relay-safe ack only — the new image reaches every
+        // surface via the slimmed 'asset' / 'job' events above. Never return the
+        // full Asset here: onCommand doesn't slim it, so its localPath/url would
+        // ride the relay response in the clear.
+        return { ok: true, assetId: res.assetId };
       }
       case 'cancelAsset': return media.cancel(String(p.id ?? ''));
       case 'deleteAsset': { const removed = store.deleteAsset(String(p.id ?? '')); emit('asset', { ...removed, status: 'deleted' }); return { ok: true }; }

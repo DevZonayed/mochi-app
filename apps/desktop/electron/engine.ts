@@ -166,8 +166,12 @@ interface EngineRun {
 export interface ImageGenResult { path: string; assetId?: string; alt?: string; width?: number; height?: number }
 /** The pluggable image-generation backend the Claude `generate_image` tool calls.
     Satisfied by fal (MediaEngine) or a codex-delegation impl — wired in main.ts,
-    never via the relay dispatch, so no key/bytes touch the server. */
-export type ImageGenFn = (prompt: string, opts: { aspect?: string; projectId?: string | null }) => Promise<ImageGenResult>;
+    never via the relay dispatch, so no key/bytes touch the server.
+    When a source image is supplied (sourceImagePath / sourceImageUrl), `prompt` is
+    read as an EDIT instruction ("add a balloon in the sky") and the backend edits
+    that image instead of generating a fresh one. */
+export interface ImageGenOpts { aspect?: string; projectId?: string | null; sourceImagePath?: string; sourceImageUrl?: string }
+export type ImageGenFn = (prompt: string, opts: ImageGenOpts) => Promise<ImageGenResult>;
 
 /** Running totals streamed during a run so the UI counts cost/tokens live. */
 export interface LiveUsage { tokens: number; cost: number }
@@ -880,6 +884,14 @@ export class LocalEngine {
      generate_image tool; publishing registers codex-produced PNGs as Assets. */
   private imageGen?: ImageGenFn;
   setImageGen(fn: ImageGenFn) { this.imageGen = fn; }
+  /** Public entry the UI/dispatch use to (re)generate or edit an image outside a
+      coding turn — routes through the SAME backend (Codex/fal) the generate_image
+      tool uses, so a one-click "Regenerate" or a "modify this image" instruction
+      honours Settings → Image generation. */
+  async generateImage(prompt: string, opts: ImageGenOpts): Promise<ImageGenResult> {
+    if (!this.imageGen) throw Object.assign(new Error('image generation is not available on this Mac'), { statusCode: 503 });
+    return this.imageGen(prompt, opts);
+  }
   private publishing?: PublishingEngine;
   setPublishing(p: PublishingEngine) { this.publishing = p; }
   /* Native browser automation — one real Chrome per project, driven by Playwright.
@@ -907,22 +919,51 @@ export class LocalEngine {
   /** Generate an image via Codex's FREE native image_gen skill (no fal credits).
       Backs the generate_image tool when Settings → Image generation = Codex. Runs
       a one-shot `codex exec` in the project's assets dir and harvests the PNG. */
-  async imageViaCodex(prompt: string, opts: { aspect?: string; projectId?: string | null }): Promise<ImageGenResult> {
+  async imageViaCodex(prompt: string, opts: { aspect?: string; projectId?: string | null; sourceImagePath?: string }): Promise<ImageGenResult> {
     const st = this.status('codex');
     if (!st.available) throw Object.assign(new Error(`Codex isn’t ready for image generation — ${st.reason || 'sign into Codex'}. Or set Image generation to Claude (fal) in Settings.`), { statusCode: 503 });
     if (!this.publishing) throw Object.assign(new Error('image pipeline not initialised'), { statusCode: 500 });
     const project = opts.projectId ? this.store.getProject(opts.projectId) : undefined;
-    const dir = assetsDirFor(project?.name); // stable ~/Maestro/<project>/assets — not the repo
+    const assetsDir = assetsDirFor(project?.name); // stable ~/Maestro/<project>/assets — not the repo
     const orient = opts.aspect === '9:16' ? ' Portrait orientation.' : opts.aspect === '16:9' ? ' Landscape orientation.' : '';
-    const imgPrompt =
-      `Use your built-in image_gen skill to generate this image (NOT an SVG, NOT a placeholder, NOT a stock-photo download):\n${prompt}${orient}\n\n` +
-      `After generating, COPY the final selected image into the current working directory named generated-${Date.now().toString(36)}.png and state the saved path. Do not create any other files.`;
+    // Edit mode: a source image is attached via `-i` so codex SEES the original;
+    // we instruct image_gen to apply only the change and keep the rest identical.
+    const editing = !!opts.sourceImagePath && existsSync(opts.sourceImagePath);
+    // Edits run in an isolated, hidden work dir UNDER the assets dir. The source
+    // image lives in the PARENT dir, so it can never be in cwd → the harvest can't
+    // mistake the unchanged original for the new output, and the dir holds only
+    // this run's file (no stale-image / dir-budget confusion). The `.`-prefix makes
+    // recentImagesUnder skip it on normal runs; importAsset references files in
+    // place, so a sub-dir of the assets tree keeps them persistent.
+    const dir = editing ? path.join(assetsDir, `.edit-${Date.now().toString(36)}`) : assetsDir;
+    if (editing) { try { mkdirSync(dir, { recursive: true }); } catch { /* exists */ } }
+    const outName = `generated-${Date.now().toString(36)}.png`;
+    const imgPrompt = editing
+      ? `Use your built-in image_gen skill to EDIT the attached image. Apply ONLY this change and keep the rest of the image as close to the original as possible (same subject, composition, and style):\n${prompt}${orient}\n\n` +
+        `Do NOT return an SVG, a placeholder, or a stock-photo download. After editing, COPY the final image into the current working directory named ${outName} and state the saved path. Do not create any other files.`
+      : `Use your built-in image_gen skill to generate this image (NOT an SVG, NOT a placeholder, NOT a stock-photo download):\n${prompt}${orient}\n\n` +
+        `After generating, COPY the final selected image into the current working directory named ${outName} and state the saved path. Do not create any other files.`;
     // Default model (no -m): the configured codex model has image_gen; a codex-
     // specialized model may not. imageIntent:true turns on the harvest.
+    const t0 = Date.now();
     const run = await runCodex(imgPrompt, dir, {}, false, undefined,
-      { store: this.store, projectId: opts.projectId ?? null, publishing: this.publishing, imageIntent: true });
+      { store: this.store, projectId: opts.projectId ?? null, publishing: this.publishing, imageIntent: true },
+      editing ? [opts.sourceImagePath!] : undefined);
     const img = run.images?.[0];
-    if (!img) throw Object.assign(new Error('Codex did not return an image — try again, or switch Image generation to Claude (fal) in Settings.'), { statusCode: 502 });
+    if (!img) throw Object.assign(new Error(`Codex did not ${editing ? 'edit the' : 'return an'} image — try again, or switch Image generation to Claude (fal) in Settings.`), { statusCode: 502 });
+    // No-op guard: if image_gen returned bytes identical to an existing image,
+    // importAsset's content-dedup hands back that PRE-EXISTING asset (e.g. the
+    // unchanged source) instead of a fresh one. Detect via createdAt < t0 and
+    // reject — never return or re-stamp a pre-existing asset.
+    const harvested = this.store.getAsset(img.assetId);
+    if (editing && harvested && harvested.createdAt < t0) {
+      throw Object.assign(new Error('Codex returned the image unchanged — try again, or describe the change differently.'), { statusCode: 502 });
+    }
+    // Codex PNGs import as plain assets (source 'import', no prompt). Stamp the
+    // prompt + model so Media Studio can regenerate them too — but keep source
+    // 'import': it was a free Codex image, not a fal spend, so it must stay out of
+    // the fal cost ledger.
+    try { this.store.updateAsset(img.assetId, { model: 'codex', prompt: prompt.slice(0, 2000) }); } catch { /* best effort */ }
     return { path: img.imagePath, assetId: img.assetId, alt: prompt.slice(0, 200), width: img.width, height: img.height };
   }
 

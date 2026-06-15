@@ -1573,9 +1573,13 @@ function ReviewCard({ item }: { item: TranscriptItem }) {
    the chat. Click → opens the full image in its own in-app viewer tab (Workspace);
    standalone, it falls back to reveal-in-Finder. Bytes load on-device by Asset id
    via a desktop-only IPC (never the relay) — phone/web shows a placeholder. */
-function InlineImage({ item }: { item: TranscriptItem }) {
+function InlineImage({ item, jobId }: { item: TranscriptItem; jobId?: string }) {
   const [src, setSrc] = React.useState<string | null>(null);
   const [failed, setFailed] = React.useState(false);
+  const [editing, setEditing] = React.useState(false);
+  const [instruction, setInstruction] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState('');
   const onOpenImage = React.useContext(ImageOpenContext);
   React.useEffect(() => {
     let alive = true;
@@ -1593,23 +1597,68 @@ function InlineImage({ item }: { item: TranscriptItem }) {
     if (onOpenImage && item.assetId) onOpenImage(item.assetId, caption || 'Generated image', item.imagePath);
     else if (item.imagePath) void api.revealPath(item.imagePath);
   };
+  // Regenerate: no instruction → re-roll the same prompt; with one → edit this
+  // image, keeping the rest. The result arrives as a NEW chip in this turn (the
+  // job's transcript is appended, so it streams in via the job subscription).
+  const regen = async (withInstruction: boolean) => {
+    if (!item.assetId || busy) return;
+    const instr = instruction.trim();
+    if (withInstruction && !instr) return;
+    setBusy(true); setErr('');
+    try {
+      await api.regenerateImage({ assetId: item.assetId, jobId, instruction: withInstruction ? instr : undefined });
+      setInstruction(''); setEditing(false);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not regenerate the image');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const accent = 'var(--purple)';
   return (
-    <button onClick={open} disabled={!openable} title={openable ? 'Open image' : caption}
-      style={{ display: 'flex', alignItems: 'center', gap: 11, width: '100%', maxWidth: 440, margin: '7px 0 2px', padding: '7px 11px 7px 7px', borderRadius: 12,
-        textAlign: 'left', cursor: openable ? 'pointer' : 'default',
+    <div style={{ width: '100%', maxWidth: 440, margin: '7px 0 2px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '7px 9px 7px 7px', borderRadius: 12,
         background: 'color-mix(in srgb, var(--purple) 8%, var(--bg-elevated))',
         border: '0.5px solid color-mix(in srgb, var(--purple) 26%, var(--separator))' }}>
-      <span style={{ width: 46, height: 46, borderRadius: 9, overflow: 'hidden', flexShrink: 0, background: 'var(--bg-grouped)', display: 'grid', placeItems: 'center' }}>
-        {src ? <img src={src} alt={caption} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-          : (failed || !IS_LOCAL) ? <Icon name="image" size={18} style={{ color: 'var(--purple)' }} />
-          : <Spinner size={14} color="var(--purple)" />}
-      </span>
-      <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1, gap: 2 }}>
-        <span style={{ font: '600 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)' }}>Generated image</span>
-        {caption && <span style={{ font: '400 var(--fs-caption)/1.25 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{caption}</span>}
-      </span>
-      {openable && <Icon name="arrowRight" size={14} stroke={2.2} style={{ color: 'var(--purple)', flexShrink: 0, transform: 'rotate(-45deg)' }} />}
-    </button>
+        <button onClick={open} disabled={!openable} title={openable ? 'Open image' : caption}
+          style={{ display: 'flex', alignItems: 'center', gap: 11, flex: 1, minWidth: 0, padding: 0, background: 'none', border: 0,
+            textAlign: 'left', cursor: openable ? 'pointer' : 'default' }}>
+          <span style={{ width: 46, height: 46, borderRadius: 9, overflow: 'hidden', flexShrink: 0, background: 'var(--bg-grouped)', display: 'grid', placeItems: 'center' }}>
+            {src ? <img src={src} alt={caption} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+              : (failed || !IS_LOCAL) ? <Icon name="image" size={18} style={{ color: accent }} />
+              : <Spinner size={14} color={accent} />}
+          </span>
+          <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1, gap: 2 }}>
+            <span style={{ font: '600 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)' }}>Generated image</span>
+            {caption && <span style={{ font: '400 var(--fs-caption)/1.25 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{caption}</span>}
+          </span>
+        </button>
+        {IS_LOCAL && !!item.assetId && (
+          <button onClick={() => setEditing(e => !e)} disabled={busy} title="Regenerate or modify this image"
+            style={{ width: 30, height: 30, borderRadius: 8, flexShrink: 0, display: 'grid', placeItems: 'center', border: 0, color: accent,
+              cursor: busy ? 'default' : 'pointer', background: editing ? 'color-mix(in srgb, var(--purple) 16%, transparent)' : 'transparent' }}>
+            {busy ? <Spinner size={13} color={accent} /> : <Icon name="refresh" size={15} stroke={2.2} />}
+          </button>
+        )}
+        {openable && <Icon name="arrowRight" size={14} stroke={2.2} style={{ color: accent, flexShrink: 0, transform: 'rotate(-45deg)', marginRight: 2 }} />}
+      </div>
+      {editing && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '6px 0 0', padding: '0 2px' }}>
+          <input value={instruction} autoFocus disabled={busy} onChange={e => setInstruction(e.target.value)}
+            placeholder="Describe a change — or leave empty to re-roll"
+            onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void regen(instruction.trim().length > 0); } }}
+            style={{ flex: 1, minWidth: 0, height: 32, padding: '0 11px', borderRadius: 9, font: '400 var(--fs-footnote)/1 var(--font-text)',
+              color: 'var(--ink)', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)' }} />
+          <button onClick={() => void regen(false)} disabled={busy} title="Generate a fresh version of the same prompt"
+            style={{ height: 32, padding: '0 12px', borderRadius: 9, flexShrink: 0, border: 0, font: '600 var(--fs-caption)/1 var(--font-text)',
+              color: 'var(--ink-secondary)', background: 'var(--fill-secondary)', cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.5 : 1 }}>Re-roll</button>
+          <button onClick={() => void regen(true)} disabled={busy || !instruction.trim()} className="send-btn"
+            style={{ height: 32, padding: '0 13px', borderRadius: 9, flexShrink: 0, border: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: '#fff',
+              background: 'var(--purple)', opacity: (busy || !instruction.trim()) ? 0.5 : 1, cursor: (busy || !instruction.trim()) ? 'default' : 'pointer' }}>Modify</button>
+        </div>
+      )}
+      {err && <div style={{ margin: '5px 0 0', padding: '0 2px', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--red)' }}>{err}</div>}
+    </div>
   );
 }
 
@@ -1655,7 +1704,7 @@ function StreamingBody({ text, keyBase }: { text: string; keyBase: string }): Re
   return <>{renderChatBody(text.slice(0, shownLen), keyBase)}</>;
 }
 
-function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { caretAt?: number; onAnswer?: (t: string) => void; answered?: boolean }): React.ReactNode[] {
+function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { caretAt?: number; onAnswer?: (t: string) => void; answered?: boolean; jobId?: string }): React.ReactNode[] {
   const blocks: React.ReactNode[] = [];
   let i = 0;
   while (i < items.length) {
@@ -1671,7 +1720,7 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
       blocks.push(<ReviewCard key={`${keyPrefix}rv${i}`} item={it} />);
       i++;
     } else if (it.kind === 'image') {
-      blocks.push(<InlineImage key={`${keyPrefix}im${i}`} item={it} />);
+      blocks.push(<InlineImage key={`${keyPrefix}im${i}`} item={it} jobId={opts.jobId} />);
       i++;
     } else {
       const idx = i;
@@ -1732,7 +1781,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
       body = (
         <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
           <WorkBar toolCount={workTools} elapsed={elapsed} expanded={expanded} onToggle={() => setExpanded(e => !e)}>
-            <div style={{ font: '400 13px/1.55 var(--font-text)' }}>{renderTranscript(work, 'w', { answered: true })}</div>
+            <div style={{ font: '400 13px/1.55 var(--font-text)' }}>{renderTranscript(work, 'w', { answered: true, jobId: job.id })}</div>
           </WorkBar>
           <div style={{ marginTop: 6 }}>{renderChatBody(transcript[finalIdx].text, 'fa')}</div>
         </div>
@@ -1740,7 +1789,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
     } else {
       body = (
         <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
-          {renderTranscript(transcript, 'a', { caretAt: live ? lastIdx : undefined, onAnswer, answered: !isLast })}
+          {renderTranscript(transcript, 'a', { caretAt: live ? lastIdx : undefined, onAnswer, answered: !isLast, jobId: job.id })}
         </div>
       );
     }

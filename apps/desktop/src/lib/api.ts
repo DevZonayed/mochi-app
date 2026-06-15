@@ -594,6 +594,11 @@ export const api = {
   getAsset: (id: string) => call<Asset>('getAsset', { id }, () => req<Asset>(`/api/assets/${encodeURIComponent(id)}`)),
   generateAsset: (input: { projectId?: string | null; modelKey: string; prompt: string; durationS?: number; voice?: string; imageUrl?: string; aspect?: string }) =>
     call<Asset>('generateAsset', { ...input }, () => req<Asset>('/api/assets/generate', { method: 'POST', body: JSON.stringify(input) })),
+  /** Regenerate an image. No instruction → re-roll the original prompt; with an
+      instruction ("add a balloon in the sky") → edit the source image, keeping the
+      rest. jobId appends the result to that chat turn so it shows inline. */
+  regenerateImage: (input: { assetId: string; jobId?: string; instruction?: string; prompt?: string }) =>
+    call<{ ok: boolean; assetId?: string }>('regenerateImage', { ...input }, () => req<{ ok: boolean; assetId?: string }>('/api/assets/regenerate', { method: 'POST', body: JSON.stringify(input) })),
   cancelAsset: (id: string) => call<Asset>('cancelAsset', { id }, () => req<Asset>(`/api/assets/${encodeURIComponent(id)}/cancel`, { method: 'POST' })),
   approveAsset: (id: string) => call<Asset>('approveAsset', { id }, () => req<Asset>(`/api/assets/${encodeURIComponent(id)}/approve`, { method: 'POST' })),
   deleteAsset: (id: string) => call<{ ok: boolean }>('deleteAsset', { id }, () => req<{ ok: boolean }>(`/api/assets/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
