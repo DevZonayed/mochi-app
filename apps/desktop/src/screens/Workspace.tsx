@@ -459,7 +459,10 @@ export default function Workspace() {
               const chats = sessionsByProject(p.id);
               const isOpen = expanded.has(p.id) || (!!q && chats.length > 0);
               return (
-                <div key={p.id} className="ws-proj">
+                // Lift the whole project above sibling rows while its "⋯" menu is open, so the
+                // dropdown isn't painted over by the next project's row (each row otherwise
+                // scopes the menu's z-index to its own stacking context).
+                <div key={p.id} className="ws-proj" style={menuProj === p.id ? { position: 'relative', zIndex: 60 } : undefined}>
                   <div className="ws-row ws-proj-head" onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
                     style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer', position: 'relative' }}>
                     <Icon name="chevronRight" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />

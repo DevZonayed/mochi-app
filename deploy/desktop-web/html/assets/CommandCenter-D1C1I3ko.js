@@ -1,4 +1,4 @@
-import{R as d,j as e}from"./index-CEMSq9gz.js";import{A as C}from"./appShell-DTLUj0gy.js";import{a as y,I as h,c as A,C as j}from"./ui-TXbOWJdC.js";const M=`
+import{R as d,j as e}from"./index-MIrWyksH.js";import{A as C}from"./appShell-CnyAmoqw.js";import{a as y,I as h,c as A,C as j}from"./ui-DC7b7hJy.js";const M=`
   /* job rows */
   .job-row { transition: border-color 140ms ease, transform 140ms ease, box-shadow 140ms ease; }
   .job-row:hover { border-color: var(--separator-strong); transform: translateY(-1px); }
