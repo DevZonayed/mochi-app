@@ -24,7 +24,7 @@ import {
 } from '../lib/ui';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -2553,6 +2553,200 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   );
 }
 
+/* ───────────────── Conversation sync ─────────────────
+   "Let's sync" — scan the project's folder on this Mac for past conversations
+   from the tools the operator already uses (Claude Code, Codex) and Conductor,
+   then import the chosen ones as read-only chats. The Mac is the brain: this all
+   reads local agent stores; nothing leaves the machine. */
+const SOURCE_META: Record<ConvSource, { label: string; tint: string; icon: IconName }> = {
+  claude: { label: 'Claude', tint: 'var(--orange)', icon: 'spark' },
+  codex: { label: 'Codex', tint: 'var(--green)', icon: 'command' },
+  conductor: { label: 'Conductor', tint: 'var(--purple)', icon: 'layers' },
+};
+const convKey = (c: { source: ConvSource; externalId: string }) => `${c.source}:${c.externalId}`;
+
+/** Small source chip shown on imported chats in the rail (the "prefix"). */
+function SourceChip({ source }: { source: ConvSource }) {
+  const m = SOURCE_META[source];
+  return (
+    <span title={`Imported from ${m.label}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 3, height: 15, padding: '0 5px', borderRadius: 5, flexShrink: 0,
+      background: `color-mix(in srgb, ${m.tint} 16%, transparent)`, color: m.tint, font: '700 9px/1 var(--font-text)', letterSpacing: '0.02em', textTransform: 'uppercase' }}>
+      <Icon name={m.icon} size={9} />{m.label}
+    </span>
+  );
+}
+
+function SyncModal({ projectId, onClose, onImported }: { projectId: string; onClose: () => void; onImported: (sessions: ChatSession[]) => void }) {
+  const [phase, setPhase] = React.useState<'scanning' | 'ready' | 'importing' | 'error'>('scanning');
+  const [scan, setScan] = React.useState<ConversationScan | null>(null);
+  const [sel, setSel] = React.useState<Set<string>>(new Set());
+  const [err, setErr] = React.useState('');
+  const [done, setDone] = React.useState(0);
+
+  const runScan = React.useCallback(() => {
+    setPhase('scanning'); setErr('');
+    api.scanConversations(projectId)
+      .then(r => {
+        setScan(r);
+        setSel(new Set(r.conversations.filter(c => !c.imported).map(convKey)));
+        setPhase('ready');
+      })
+      .catch(e => { setErr(e?.message || 'Scan failed'); setPhase('error'); });
+  }, [projectId]);
+  React.useEffect(() => { runScan(); }, [runScan]);
+
+  const groups = React.useMemo(() => {
+    const g: Record<ConvSource, ScannedConversation[]> = { claude: [], codex: [], conductor: [] };
+    for (const c of scan?.conversations ?? []) g[c.source].push(c);
+    return g;
+  }, [scan]);
+
+  const selectable = (scan?.conversations ?? []).filter(c => !c.imported);
+  const selectedCount = sel.size;
+  const toggle = (c: ScannedConversation) => setSel(prev => { const n = new Set(prev); const k = convKey(c); n.has(k) ? n.delete(k) : n.add(k); return n; });
+  const toggleGroup = (src: ConvSource) => setSel(prev => {
+    const n = new Set(prev);
+    const rows = groups[src].filter(c => !c.imported);
+    const allOn = rows.length > 0 && rows.every(c => n.has(convKey(c)));
+    for (const c of rows) { if (allOn) n.delete(convKey(c)); else n.add(convKey(c)); }
+    return n;
+  });
+
+  const doImport = async () => {
+    if (!scan || !selectedCount) return;
+    const items = scan.conversations.filter(c => sel.has(convKey(c))).map(c => ({
+      source: c.source, externalId: c.externalId, filePath: c.filePath, title: c.title, createdAt: c.createdAt, updatedAt: c.updatedAt,
+    }));
+    setPhase('importing');
+    try {
+      const r = await api.importConversations(projectId, items);
+      setDone(r.imported);
+      onImported(r.sessions);
+      onClose();
+    } catch (e) {
+      setErr((e as { message?: string })?.message || 'Import failed');
+      setPhase('error');
+    }
+  };
+
+  return (
+    <div onMouseDown={onClose} style={{ position: 'absolute', inset: 0, zIndex: 90, display: 'flex', justifyContent: 'center', alignItems: 'flex-start', paddingTop: 84,
+      background: 'rgba(10,12,24,0.32)', backdropFilter: 'blur(3px)', WebkitBackdropFilter: 'blur(3px)' }}>
+      <div onMouseDown={e => e.stopPropagation()} style={{ width: 600, maxHeight: 'calc(100vh - 168px)', display: 'flex', flexDirection: 'column',
+        background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--glass-border)',
+        boxShadow: '0 30px 80px rgba(10,15,40,0.45), var(--glass-inner)', overflow: 'hidden', animation: 'palettePop 200ms var(--spring)' }}>
+        {/* header */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '16px 18px', borderBottom: '0.5px solid var(--separator)' }}>
+          <span style={{ width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 14%, transparent)', color: 'var(--blue)', flexShrink: 0 }}>
+            <Icon name="refresh" size={17} />
+          </span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Sync past conversations</div>
+            <div style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {scan?.path ? shortHomePath(scan.path) : 'Scanning this project’s folder on your Mac…'}
+            </div>
+          </div>
+          <button onClick={onClose} className="tb-icon" style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+            <Icon name="x" size={15} stroke={2.4} />
+          </button>
+        </div>
+
+        {/* body */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: 12 }}>
+          {(phase === 'scanning') && (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '48px 0', color: 'var(--ink-tertiary)' }}>
+              <Spinner size={22} /><span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)' }}>Scanning Claude, Codex &amp; Conductor…</span>
+            </div>
+          )}
+          {phase === 'error' && (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '40px 18px', textAlign: 'center' }}>
+              <Icon name="alert" size={22} style={{ color: 'var(--red)' }} />
+              <span style={{ font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>{err}</span>
+              <button onClick={runScan} className="filter-chip" style={{ height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-subhead)/1 var(--font-text)', cursor: 'pointer' }}>Try again</button>
+            </div>
+          )}
+          {(phase === 'ready' || phase === 'importing') && scan && (
+            scan.conversations.length === 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10, padding: '40px 24px', textAlign: 'center' }}>
+                <Icon name="search" size={22} style={{ color: 'var(--ink-tertiary)' }} />
+                <span style={{ font: '500 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                  No past conversations found for this folder.<br />
+                  Claude, Codex, and Conductor chats that ran here will appear automatically.
+                </span>
+                <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                  {(['claude', 'codex', 'conductor'] as ConvSource[]).map(s => (
+                    <span key={s} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, font: '500 var(--fs-caption)/1 var(--font-text)', color: scan.available[s] ? 'var(--green)' : 'var(--ink-tertiary)' }}>
+                      <Icon name={scan.available[s] ? 'check' : 'x'} size={11} stroke={2.4} />{SOURCE_META[s].label}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              (['claude', 'codex', 'conductor'] as ConvSource[]).filter(s => groups[s].length).map(src => {
+                const m = SOURCE_META[src];
+                const rows = groups[src];
+                const free = rows.filter(c => !c.imported);
+                const allOn = free.length > 0 && free.every(c => sel.has(convKey(c)));
+                return (
+                  <div key={src} style={{ marginBottom: 14 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px 8px' }}>
+                      <Icon name={m.icon} size={14} style={{ color: m.tint }} />
+                      <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-secondary)' }}>{m.label}</span>
+                      <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{rows.length}</span>
+                      <span style={{ flex: 1 }} />
+                      {free.length > 0 && (
+                        <button onClick={() => toggleGroup(src)} className="link-btn" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--blue)', cursor: 'pointer' }}>
+                          {allOn ? 'Deselect all' : 'Select all'}
+                        </button>
+                      )}
+                    </div>
+                    <div style={{ background: 'var(--bg-grouped)', borderRadius: 12, border: '0.5px solid var(--separator)', overflow: 'hidden' }}>
+                      {rows.map((c, i) => {
+                        const on = sel.has(convKey(c));
+                        return (
+                          <div key={convKey(c)} onClick={() => !c.imported && toggle(c)} className="mm-row" style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '10px 12px',
+                            borderBottom: i < rows.length - 1 ? '0.5px solid var(--separator)' : 'none', cursor: c.imported ? 'default' : 'pointer', opacity: c.imported ? 0.55 : 1 }}>
+                            <span style={{ width: 18, height: 18, borderRadius: 5, flexShrink: 0, display: 'grid', placeItems: 'center',
+                              border: `1.5px solid ${c.imported ? 'var(--separator-strong)' : on ? m.tint : 'var(--separator-strong)'}`,
+                              background: c.imported ? 'var(--fill-secondary)' : on ? m.tint : 'transparent' }}>
+                              {(on || c.imported) && <Icon name="check" size={12} stroke={3} style={{ color: c.imported ? 'var(--ink-tertiary)' : '#fff' }} />}
+                            </span>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{c.title}</div>
+                              <div style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>
+                                {c.messageCount} message{c.messageCount === 1 ? '' : 's'} · {relativeTime(c.updatedAt)}
+                              </div>
+                            </div>
+                            {c.imported && <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', flexShrink: 0 }}>Imported</span>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })
+            )
+          )}
+        </div>
+
+        {/* footer */}
+        {(phase === 'ready' || phase === 'importing') && scan && scan.conversations.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderTop: '0.5px solid var(--separator)' }}>
+            <span style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', flex: 1 }}>
+              {selectable.length === 0 ? 'All conversations already imported.' : `${selectedCount} of ${selectable.length} selected`}
+            </span>
+            <button onClick={onClose} className="filter-chip" style={{ height: 34, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-subhead)/1 var(--font-text)', cursor: 'pointer' }}>Cancel</button>
+            <button onClick={doImport} disabled={!selectedCount || phase === 'importing'} className="primary-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 34, padding: '0 16px', borderRadius: 'var(--r-pill)',
+              background: selectedCount ? 'var(--blue)' : 'var(--fill-secondary)', color: selectedCount ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-subhead)/1 var(--font-text)', cursor: selectedCount ? 'pointer' : 'default', border: 'none' }}>
+              {phase === 'importing' ? <><Spinner size={13} color="#fff" /> Importing…</> : <>Import{selectedCount ? ` ${selectedCount}` : ''}</>}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* Per-project chat: a sessions rail + the shared ChatThread. (The multi-project
    Workspace screen wires ChatThread into tabs instead.) */
 function ChatPane({ projectId, project }: { projectId: string | null; project: Project | null }) {
@@ -2561,6 +2755,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   const [activeId, setActiveId] = React.useState<string | null>(null);
   const [renamingId, setRenamingId] = React.useState<string | null>(null);
   const [renameVal, setRenameVal] = React.useState('');
+  const [syncOpen, setSyncOpen] = React.useState(false);
   const activeRef = React.useRef<string | null>(null);
   activeRef.current = activeId;
 
@@ -2610,10 +2805,14 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
       {/* sessions rail */}
       <div style={{ width: 236, flexShrink: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-grouped)',
         borderRadius: 18, border: '0.5px solid var(--separator)', overflow: 'hidden', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-        <div style={{ padding: '11px 10px 9px' }}>
-          <button onClick={() => setActiveId(null)} className="newchat-btn" title="New chat" style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, height: 36, padding: '0 11px', borderRadius: 11,
+        <div style={{ padding: '11px 10px 9px', display: 'flex', gap: 6 }}>
+          <button onClick={() => setActiveId(null)} className="newchat-btn" title="New chat" style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, height: 36, padding: '0 11px', borderRadius: 11,
             background: 'var(--fill-secondary)', color: 'var(--ink)', cursor: 'pointer', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
             <Icon name="plus" size={15} stroke={2.4} style={{ color: 'var(--blue)' }} /> New chat
+          </button>
+          <button onClick={() => setSyncOpen(true)} disabled={!projectId} className="newchat-btn" title="Sync past conversations from Claude, Codex & Conductor" style={{ width: 36, flexShrink: 0, display: 'grid', placeItems: 'center', height: 36, borderRadius: 11,
+            background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', cursor: projectId ? 'pointer' : 'default' }}>
+            <Icon name="refresh" size={15} stroke={2.2} />
           </button>
         </div>
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px 10px', display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -2637,8 +2836,9 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
                       style={{ width: '100%', border: '1px solid var(--blue)', borderRadius: 6, padding: '2px 6px', background: 'var(--bg)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1.3 var(--font-text)' }} />
                   ) : (
                     <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
-                      style={{ display: 'block', font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: active ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {s.title}
+                      style={{ display: 'flex', alignItems: 'center', gap: 5, font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: active ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden' }}>
+                      {s.importedFrom && <SourceChip source={s.importedFrom} />}
+                      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.title}</span>
                     </span>
                   )}
                   <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>{relativeTime(s.updatedAt)}</span>
@@ -2656,6 +2856,19 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
       {/* thread + composer (shared) */}
       <ChatThread projectId={projectId} project={project} sessionId={activeId}
         onSessionCreated={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }} />
+
+      {syncOpen && projectId && (
+        <SyncModal projectId={projectId} onClose={() => setSyncOpen(false)}
+          onImported={(imported) => {
+            if (!imported.length) return;
+            setSessions(ss => {
+              const byId = new Map(ss.map(s => [s.id, s] as const));
+              for (const s of imported) byId.set(s.id, s);
+              return [...byId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+            });
+            setActiveId(imported[0].id);
+          }} />
+      )}
     </div>
   );
 }

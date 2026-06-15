@@ -337,6 +337,7 @@ app.whenReady().then(() => {
         || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment'
         || method === 'copyDesignToCode'
         || method === 'addSkillToProject' || method === 'removeSkillFromProject'
+        || method === 'scanConversations' || method === 'importConversations'
         // feedbackCreateIssue spends THIS Mac's GitHub token — keep it local-only
         // (a remote can still submit/list/triage feedback; just not file issues).
         || method === 'feedbackCreateIssue') {

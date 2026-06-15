@@ -119,6 +119,10 @@ export interface ChatSession {
   reviewer?: RoleChoice | 'off';
   /** Isolated git branch for this chat (Conductor-style), once checked out. */
   branch?: string;
+  /** Imported from an external store (Claude/Codex/Conductor) — read-only history. */
+  importedFrom?: 'claude' | 'codex' | 'conductor';
+  /** Source-side conversation id; dedupes re-imports of the same conversation. */
+  externalId?: string;
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
@@ -693,6 +697,40 @@ export class Store {
     // Turns stay in the jobs ledger (costs/audit) but leave the chat.
     for (const j of this.data.jobs) if (j.sessionId === sessionId) j.sessionId = undefined;
     this.save();
+  }
+  /** External-conversation ids already imported into a project (re-scan dedupe). */
+  importedExternalIds(projectId: string): Set<string> {
+    return new Set(this.data.sessions.filter(s => s.projectId === projectId && s.externalId).map(s => s.externalId as string));
+  }
+  /** Atomically add an imported conversation: one read-only session + its turns,
+      with original timestamps preserved, persisting once. */
+  commitImportedConversation(args: {
+    projectId: string;
+    title: string;
+    source: 'claude' | 'codex' | 'conductor';
+    externalId: string;
+    createdAt: number;
+    updatedAt: number;
+    turns: { input: string; output: string; transcript: TranscriptItem[]; createdAt: number }[];
+  }): { session: ChatSession; jobs: Job[] } {
+    const sId = id();
+    const session: ChatSession = {
+      id: sId, projectId: args.projectId, title: (args.title.trim() || 'Imported chat').slice(0, 80),
+      importedFrom: args.source, externalId: args.externalId,
+      createdAt: args.createdAt || now(), updatedAt: args.updatedAt || now(),
+    };
+    const jobs: Job[] = args.turns.map(t => ({
+      id: id(), projectId: args.projectId, title: (t.input || t.output || 'Message').slice(0, 60),
+      status: 'done' as JobStatus, phase: 'Imported', progress: 100,
+      input: t.input, output: t.output || null, error: null,
+      effort: this.data.settings.defaultEffort, cost: 0, tokens: 0, stage: '',
+      sessionId: sId, transcript: t.transcript,
+      createdAt: t.createdAt || session.createdAt, updatedAt: t.createdAt || session.createdAt,
+    }));
+    this.data.sessions.push(session);
+    this.data.jobs.push(...jobs);
+    this.save();
+    return { session, jobs };
   }
 
   // ── Jobs ────────────────────────────────────────────────────────────
