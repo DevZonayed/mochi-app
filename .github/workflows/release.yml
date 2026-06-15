@@ -1,13 +1,12 @@
 name: Release desktop app
 
-# Every push to master (or a manual run) publishes a new desktop release with an
-# AUTO-INCREMENTED version — no manual version bump needed. The patch bumps from
-# the latest published release; bump major/minor in apps/desktop/package.json to
-# start a new series. After publishing, the new version is synced back to
-# package.json (a [skip ci] bot commit, so it doesn't re-trigger).
+# Manual release only — this NEVER runs automatically on push. Trigger it by hand:
+#   - GitHub -> Actions tab -> "Release desktop app" -> "Run workflow" (pick master)
+#   - or:  gh workflow run release.yml --ref master
+# It publishes a new desktop release with an AUTO-INCREMENTED version (patch bumps
+# from the latest published release; bump major/minor in apps/desktop/package.json
+# to start a new series), then syncs that version back into package.json.
 on:
-  push:
-    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -49,6 +48,14 @@ jobs:
         # (no distutils) and Windows (VS detection) runners.
         run: pnpm install --frozen-lockfile --ignore-scripts
 
+      - name: Set release version
+        # Write the computed version into package.json so electron-builder picks it
+        # up normally. (The -c.extraMetadata.version CLI flag is mis-parsed by
+        # PowerShell on the Windows runner, so we avoid it — this is cross-platform.)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: node .github/scripts/set-version.mjs
+
       - name: Build renderer + main process
         run: pnpm --filter @maestro/desktop build
 
@@ -56,8 +63,7 @@ jobs:
         working-directory: apps/desktop
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # Inject the computed version (overrides package.json for this build).
-        run: pnpm exec electron-builder --publish always -c.extraMetadata.version=${{ needs.version.outputs.version }}
+        run: pnpm exec electron-builder --publish always
 
   # Keep package.json in sync with the version we just shipped. Cosmetic + sets
   # the floor for the next run; never fails the release (the version logic reads
