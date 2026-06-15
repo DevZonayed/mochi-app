@@ -247,7 +247,6 @@ function ResearchRail({ runs, onOpen }: { runs: ResearchRun[]; onOpen: (jobId: s
 interface PaletteItem { group: string; icon: IconName; label: string; hint: string; }
 
 const PALETTE_ITEMS: PaletteItem[] = [
-  { group: 'Jump to', icon: 'home', label: 'Command Center', hint: '⌘1' },
   { group: 'Jump to', icon: 'layers', label: 'Projects', hint: '⌘2' },
   { group: 'Jump to', icon: 'jobs', label: 'Jobs', hint: '⌘3' },
   { group: 'Jump to', icon: 'shield', label: 'Approvals', hint: '⌘4' },

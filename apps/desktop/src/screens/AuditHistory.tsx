@@ -62,7 +62,6 @@ function ShapeChip({ shape }: { shape: string }) {
 interface PaletteItem { group: string; icon: IconName; label: string; hint: string; }
 
 const PALETTE_ITEMS: PaletteItem[] = [
-  { group: 'Jump to', icon: 'home', label: 'Command Center', hint: '⌘1' },
   { group: 'Jump to', icon: 'layers', label: 'Projects', hint: '⌘2' },
   { group: 'Jump to', icon: 'jobs', label: 'Jobs', hint: '⌘3' },
   { group: 'Jump to', icon: 'shield', label: 'Approvals', hint: '⌘4' },
@@ -415,9 +414,7 @@ export default function AuditHistory() {
   // shared cross-page nav routing
   const navTo = (k: string) => {
     const map: Record<string, string> = {
-      home: '/command-center',
       projects: '/projects',
-      templates: '/templates',
       trends: '/trends',
       studio: '/media-studio',
       publishing: '/publishing',
