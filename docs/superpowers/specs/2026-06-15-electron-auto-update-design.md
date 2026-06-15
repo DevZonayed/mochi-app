@@ -60,14 +60,13 @@ GitHub Releases ──latest*.yml + installers──► electron-updater
 
 ## How to cut a release
 
-1. Bump `version` in `apps/desktop/package.json` (e.g. `0.1.1`).
-2. Merge it to `master` (or push there).
-
-That's it. The Release workflow notices a version that isn't published yet and
-builds + publishes installers for macOS, Windows and Linux. Ordinary commits to
-master (no version bump) are skipped, so nothing rebuilds needlessly. Installed
-apps pick the update up within 4 h, on next launch, or via Settings → Check now.
-(Pushing a `v*` tag manually still works too.)
+Just **merge to `master`** (or run the workflow). The version **auto-increments**
+— the patch bumps from the latest published release (`next-version.mjs`), so no
+manual edit is needed. The workflow builds + publishes installers for macOS,
+Windows and Linux with that version injected, then syncs it back into
+`apps/desktop/package.json` (a `[skip ci]` bot commit). Bump the major/minor in
+package.json only to start a new series (e.g. `0.2.0`). Installed apps pick the
+update up within 4 h, on next launch, or via Settings → Check now.
 
 The first release establishes the baseline everyone updates *from*.
 
