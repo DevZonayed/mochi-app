@@ -8,9 +8,10 @@ export default defineConfig({
     electron({
       main: {
         entry: 'electron/main.ts',
-        // The Claude Agent SDK is ESM + spawns the `claude` binary — keep it
-        // external so it loads from node_modules at runtime (dynamic import).
-        vite: { build: { rollupOptions: { external: ['@anthropic-ai/claude-agent-sdk', 'ws'] } } },
+        // The Claude Agent SDK is ESM + spawns the `claude` binary, and
+        // playwright-core drives the system Chrome — keep them external so they
+        // load from node_modules at runtime (both are dynamically imported).
+        vite: { build: { rollupOptions: { external: ['@anthropic-ai/claude-agent-sdk', 'ws', 'playwright-core'] } } },
       },
       preload: { input: 'electron/preload.ts' },
       renderer: {},

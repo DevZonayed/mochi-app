@@ -34,8 +34,8 @@ const styles = `
   @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
   input[type="range"].ios-slider { -webkit-appearance: none; appearance: none; outline: none; }
   input[type="range"].ios-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.28); cursor: pointer; }
-  *::-webkit-scrollbar { width: 9px; height: 9px; }
-  *::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  *::-webkit-scrollbar { width: 11px; height: 11px; }
+  *::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
   ::selection { background: rgba(0,122,255,0.22); }
 `;
 

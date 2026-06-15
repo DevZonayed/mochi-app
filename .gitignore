@@ -28,6 +28,7 @@ web-build/
 # tooling / local state
 .context/
 .continuum/
+.playwright-cli/
 .DS_Store
 *.log
 coverage/

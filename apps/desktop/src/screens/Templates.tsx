@@ -76,8 +76,8 @@ const PAGE_CSS = `
   .breathe { animation: breathe 1.8s ease-in-out infinite; }
   @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-  main::-webkit-scrollbar { width: 9px; }
-  main::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  main::-webkit-scrollbar { width: 11px; }
+  main::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
   textarea::placeholder, input::placeholder { color: var(--ink-tertiary); }
   ::selection { background: rgba(0,122,255,0.22); }
 `;

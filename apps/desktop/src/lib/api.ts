@@ -10,7 +10,7 @@ export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
-export type ProjectKind = 'coding' | 'content' | 'research' | 'general';
+export type ProjectKind = 'coding' | 'design' | 'content' | 'research' | 'general';
 
 export interface Workspace {
   id: string;
@@ -42,17 +42,36 @@ export interface ChatSession {
   updatedAt: number;
 }
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result' | 'ask' | 'review';
+  kind: 'text' | 'tool' | 'result' | 'ask' | 'review' | 'image';
   text: string;
   name?: string;
   toolStatus?: 'running' | 'done' | 'error';
   verdict?: 'approved' | 'needs-work';
+  /** review only: the primary fixed the flagged findings → show as resolved. */
+  resolved?: boolean;
   durMs?: number;
   /** file-writing tools only: capped snapshot of the written content (hover preview). */
   preview?: string;
   ask?: string;
+  /** image only: the Asset id (resolved to bytes on the Mac via api.assetImage; never sent to the relay). */
+  assetId?: string;
+  /** image only: absolute Mac-local path (reveal-in-Finder/copy; stripped from the relay snapshot). */
+  imagePath?: string;
+  /** image only: alt text / the generation prompt. */
+  alt?: string;
+  width?: number;
+  height?: number;
   ts: number;
 }
+/** An image attached to a user message (pasted/dropped/picked) — vision input.
+    imagePath is Mac-local (stripped from the relay snapshot); the bytes are
+    resolved on the desktop via api.assetImage(assetId). */
+export interface ChatImage { assetId: string; imagePath?: string; mime: string; name?: string; width?: number; height?: number }
+
+/** A non-image file attached to a message — text inlined for the agent, other
+    files saved on the Mac. content/path are stripped from the relay snapshot. */
+export interface ChatFile { name: string; kind: 'text' | 'file'; mime?: string; bytes?: number; content?: string; path?: string; preview?: string }
+
 export interface Job {
   id: string;
   projectId: string;
@@ -62,6 +81,8 @@ export interface Job {
   progress: number;
   sessionId?: string;
   transcript?: TranscriptItem[];
+  inputImages?: ChatImage[];
+  inputFiles?: ChatFile[];
   input: string;
   output: string | null;
   error: string | null;
@@ -110,6 +131,20 @@ export interface Skill {
   enabled: boolean;
   createdAt: number;
 }
+/** A skill from the remote registry (curated/secure index scraped from skills.sh). */
+export interface RegistrySkillSummary {
+  id: string; name: string; description: string; tags: string[]; license: string;
+  risk: string; source: string; directory: string; installCmd: string; rank: number;
+  enabled?: boolean; disabledReason?: string | null; version?: string; sha256?: string | null;
+  sourceRepo?: string | null; sourceStatus?: string | null;
+  mirrorRepo?: string | null; forkStatus?: string | null; lastSyncAt?: string | null; auditStatus?: string | null;
+}
+/** A registry skill installed into a project (files in <project>/.claude/skills/). */
+export interface InstalledSkill {
+  id: string; slug: string; name: string; description?: string; risk?: string; source?: string;
+  version?: string; sha256?: string; enabled?: boolean; disabledReason?: string | null;
+  mirrorRepo?: string | null; auditStatus?: string | null; installedAt: number;
+}
 export interface Template {
   id: string;
   name: string;
@@ -145,7 +180,11 @@ export interface Routing {
   image: EngineId;
   video: EngineId;
   roles?: Roles;
+  /** Native browser automation available to whichever engine runs the job. */
+  browser?: 'on' | 'off';
 }
+export interface BrowserState { open: boolean; url: string; title: string; tabs: number; activeTab: number }
+export interface BrowserShotRef { assetId: string; width?: number; height?: number; url: string; title: string }
 export type ModelProviderId = 'claude' | 'codex' | 'cursor';
 export interface ModelDescriptor {
   key: string;
@@ -188,6 +227,23 @@ export interface AppSettings {
   openAtLogin: boolean;
   rescanCadence: 'daily' | 'weekly' | 'onchange';
   favoriteModels?: string[];
+  /** Chrome profile dir the browser inherits cookies/logins from ('' = isolated). */
+  chromeProfile?: string;
+  /** 'copy' = warm-start the app's own browser from the profile; 'live' = drive the real Chrome profile. */
+  chromeProfileMode?: 'copy' | 'live';
+}
+export interface ChromeProfile { dir: string; name: string }
+/** Per-project .continuum memory: the durable STATE + checkpoint chain (newest first). */
+export interface ProjectMemory { state: string; checkpoints: { id: number; summary: string }[] }
+/** A note anchored to a specific element of a live design (by CSS selector). */
+export interface DesignComment {
+  id: string;
+  projectId: string;
+  selector: string;
+  label: string;
+  note: string;
+  status: 'open' | 'resolved';
+  createdAt: number;
 }
 export interface CostsData {
   today: number;
@@ -291,6 +347,8 @@ interface Bridge {
   pickFolder?: () => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   revealPath?: (p: string) => Promise<{ ok: boolean; error?: string }>;
   importAsset?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  assetImage?: (assetId: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  browserView?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   readFile?: (projectId: string, p: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   listDir?: (projectId: string, p?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   runCommand?: (projectId: string, command: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
@@ -332,6 +390,15 @@ export function setRemoteToken(token: string): void {
   try { localStorage.setItem(TOKEN_KEY, remoteToken); } catch { /* storage unavailable */ }
 }
 
+const REGISTRY_ADMIN_TOKEN_KEY = 'maestro.registry.admin.token';
+export function getRegistryAdminToken(): string {
+  if (typeof window === 'undefined') return '';
+  try { return localStorage.getItem(REGISTRY_ADMIN_TOKEN_KEY) ?? ''; } catch { return ''; }
+}
+export function setRegistryAdminToken(token: string): void {
+  try { localStorage.setItem(REGISTRY_ADMIN_TOKEN_KEY, token.trim()); } catch { /* storage unavailable */ }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   // Only send a JSON content-type when there's actually a body — otherwise
   // Fastify rejects the empty body (FST_ERR_CTP_EMPTY_JSON_BODY) on bodyless POSTs.
@@ -356,6 +423,19 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
+}
+
+async function reqRegistryAdmin<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getRegistryAdminToken();
+  const hasBody = init?.body != null;
+  return req<T>(path, {
+    ...init,
+    headers: {
+      ...(hasBody ? { 'content-type': 'application/json' } : {}),
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers ?? {}),
+    },
+  });
 }
 
 /** Route to the local core when in Electron, otherwise run the REST fallback. */
@@ -416,6 +496,26 @@ export const api = {
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   getProject: (id: string) =>
     call<Project>('getProject', { id }, () => req<Project>(`/api/projects/${encodeURIComponent(id)}`)),
+  // Per-project .continuum memory (STATE.md + checkpoint chain).
+  getProjectMemory: (id: string) =>
+    call<ProjectMemory>('getProjectMemory', { id }, () => req<ProjectMemory>(`/api/projects/${encodeURIComponent(id)}/memory`)),
+  setProjectMemory: (id: string, state: string) =>
+    call<{ ok: true }>('setProjectMemory', { id, state }, () => req<{ ok: true }>(`/api/projects/${encodeURIComponent(id)}/memory`, { method: 'POST', body: JSON.stringify({ state }) })),
+  /** Commit a referable snapshot of the project (design + attachments). */
+  snapshotProject: (id: string, message?: string) =>
+    call<{ ok: boolean; hash?: string; reason?: string }>('snapshotProject', { id, message }, () => req<{ ok: boolean; hash?: string; reason?: string }>(`/api/projects/${encodeURIComponent(id)}/snapshot`, { method: 'POST', body: JSON.stringify({ message }) })),
+  // Per-element design comments (Mochi-style commenting over the live preview). Desktop-only.
+  listDesignComments: (id: string) =>
+    call<{ comments: DesignComment[] }>('listDesignComments', { id }, () => Promise.reject(new Error('desktop only'))),
+  addDesignComment: (id: string, input: { selector: string; label: string; note: string }) =>
+    call<{ comment: DesignComment }>('addDesignComment', { id, ...input }, () => Promise.reject(new Error('desktop only'))),
+  setDesignCommentStatus: (id: string, commentId: string, status: 'open' | 'resolved') =>
+    call<{ ok: true }>('setDesignCommentStatus', { id, commentId, status }, () => Promise.reject(new Error('desktop only'))),
+  deleteDesignComment: (id: string, commentId: string) =>
+    call<{ ok: true }>('deleteDesignComment', { id, commentId }, () => Promise.reject(new Error('desktop only'))),
+  /** Hand off a design to code: copy its folder into a NEW coding project (lives in both tabs). Desktop-only. */
+  copyDesignToCode: (id: string, name?: string) =>
+    call<Project>('copyDesignToCode', { id, name }, () => Promise.reject(new Error('desktop only'))),
 
   // Coding agent: clone a repo / open a folder / inspect git (desktop owns git)
   gitAvailable: () => call<{ available: boolean }>('gitAvailable', {}, () => Promise.resolve({ available: false })),
@@ -433,6 +533,20 @@ export const api = {
   },
   /** Reveal a local path in Finder — desktop only; no-op in the browser. */
   revealPath: async (p: string): Promise<void> => { if (bridge?.revealPath) await bridge.revealPath(p); },
+  /** Resolve a generated-image Asset to a data URL for inline display — desktop only; null on web/phone. */
+  assetImage: async (assetId: string): Promise<string | null> => {
+    if (!bridge?.assetImage) return null;
+    const r = await bridge.assetImage(assetId);
+    if (!r.ok) return null;
+    return (r.data as { dataUrl?: string })?.dataUrl ?? null;
+  },
+  /** Live browser preview frame (PNG data URL) for the in-app Browser tab — desktop only; null on web/phone. */
+  browserView: async (projectId: string | null): Promise<{ open: boolean; dataUrl?: string; url: string; title: string } | null> => {
+    if (!bridge?.browserView) return null;
+    const r = await bridge.browserView(projectId);
+    if (!r.ok) return null;
+    return r.data as { open: boolean; dataUrl?: string; url: string; title: string };
+  },
   /** Read a file's text — desktop only, confined to the project folder; null in the browser. */
   readFile: async (projectId: string, p: string): Promise<{ path: string; text: string; bytes: number; truncated: boolean } | null> => {
     if (!bridge?.readFile) return null;
@@ -510,7 +624,7 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; images?: { name?: string; mime: string; dataB64: string }[]; files?: { name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   renameSession: (id: string, title: string) =>
@@ -566,6 +680,56 @@ export const api = {
 
   // Skills
   listSkills: () => call<Skill[]>('listSkills', {}, () => req<Skill[]>('/api/skills')),
+  // Skill registry: search the curated/secure index + install into a project.
+  searchSkills: (q: string, limit = 30) =>
+    call<{ count: number; mode?: string; results: RegistrySkillSummary[] }>(
+      'searchSkills',
+      { q, limit },
+      () => req<{ count: number; mode?: string; results: RegistrySkillSummary[] }>('/registry/skills' + qp({ q, limit: String(limit) })),
+    ),
+  skillRegistryMeta: () =>
+    call<{ count: number; total?: number; uniqueRepos?: number; generatedAt: string; source: string; note: string; semantic?: boolean }>(
+      'skillRegistryMeta',
+      {},
+      () => req<{ count: number; total?: number; uniqueRepos?: number; generatedAt: string; source: string; note: string; semantic?: boolean }>('/registry/meta'),
+    ),
+  registryGetSkill: (id: string) =>
+    call<RegistrySkillSummary & { rawBase?: string; skillPath?: string; branch?: string; excerpt?: string }>(
+      'registryGetSkill',
+      { id },
+      () => req<RegistrySkillSummary & { rawBase?: string; skillPath?: string; branch?: string; excerpt?: string }>('/registry/skill' + qp({ id })),
+    ),
+  registrySkillContent: (id: string) =>
+    call<{ id: string; name: string; skillMd: string; sha256?: string; enabled?: boolean }>(
+      'registrySkillContent',
+      { id },
+      () => req<{ id: string; name: string; skillMd: string; sha256?: string; enabled?: boolean }>('/registry/skill/content' + qp({ id })),
+    ),
+  registryAdminListSkills: (input: { q?: string; includeDisabled?: boolean; limit?: number } = {}) =>
+    reqRegistryAdmin<{ count: number; mode: string; results: RegistrySkillSummary[] }>(
+      '/registry/admin/skills' + qp({
+        q: input.q,
+        includeDisabled: input.includeDisabled === undefined ? undefined : String(input.includeDisabled),
+        limit: input.limit === undefined ? undefined : String(input.limit),
+      }),
+    ),
+  registryAdminAddSkill: (input: { url?: string; owner?: string; repo?: string; skill?: string; skillMd?: string; name?: string; description?: string }) =>
+    reqRegistryAdmin<RegistrySkillSummary>('/registry/admin/skills', { method: 'POST', body: JSON.stringify(input) }),
+  registryAdminPatchSkill: (id: string, patch: { enabled?: boolean; disabledReason?: string; name?: string; description?: string; tags?: string[] }) =>
+    reqRegistryAdmin<RegistrySkillSummary>('/registry/admin/skill' + qp({ id }), { method: 'PATCH', body: JSON.stringify(patch) }),
+  registryAdminRescanSkill: (id: string) =>
+    reqRegistryAdmin<RegistrySkillSummary>('/registry/admin/skill/rescan' + qp({ id }), { method: 'POST' }),
+  registryAdminSyncSources: (input: { dryRun?: boolean; includeFresh?: boolean; limit?: number } = {}) =>
+    reqRegistryAdmin<{ dryRun: boolean; mode: 'upstream-source'; includeFresh: boolean; repos: number; attempted: number; results: { skillId: string; repo: string; status: string; sourceRepo: string; sha256?: string; commitSha?: string | null; error?: string }[] }>(
+      '/registry/admin/sync/sources',
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+  listProjectSkills: (projectId: string) =>
+    call<{ skills: InstalledSkill[] }>('listProjectSkills', { id: projectId }, () => Promise.reject(new Error('desktop only'))),
+  addSkillToProject: (projectId: string, skill: { skillId: string; name?: string; description?: string; risk?: string; source?: string; version?: string; disabledReason?: string | null; mirrorRepo?: string | null; auditStatus?: string | null }) =>
+    call<{ skill: InstalledSkill }>('addSkillToProject', { projectId, ...skill }, () => Promise.reject(new Error('desktop only'))),
+  removeSkillFromProject: (projectId: string, skillId: string) =>
+    call<{ ok: boolean }>('removeSkillFromProject', { projectId, skillId }, () => Promise.reject(new Error('desktop only'))),
   toggleSkill: (id: string) =>
     call<Skill>('toggleSkill', { id }, () => req<Skill>(`/api/skills/${encodeURIComponent(id)}/toggle`, { method: 'POST' })),
 
@@ -587,6 +751,15 @@ export const api = {
   setRouting: (patch: Partial<Routing>) =>
     call<Routing>('setRouting', { ...patch }, () =>
       req<Routing>('/api/routing', { method: 'POST', body: JSON.stringify(patch) })),
+
+  // Native browser automation (one real Chrome per project; engine-agnostic).
+  browserAvailable: () => call<{ ok: boolean; reason?: string }>('browserAvailable', {}, () => req<{ ok: boolean; reason?: string }>('/api/browser/available')),
+  listChromeProfiles: () => call<ChromeProfile[]>('listChromeProfiles', {}, () => req<ChromeProfile[]>('/api/browser/profiles')),
+  browserState: (projectId: string | null) => call<BrowserState>('browserState', { projectId }, () => req<BrowserState>(`/api/browser/state?projectId=${projectId ?? ''}`)),
+  browserNavigate: (projectId: string | null, url: string) => call<{ url: string; title: string }>('browserNavigate', { projectId, url }, () => req<{ url: string; title: string }>('/api/browser/navigate', { method: 'POST', body: JSON.stringify({ projectId, url }) })),
+  browserScreenshot: (projectId: string | null, fullPage = false) => call<BrowserShotRef>('browserScreenshot', { projectId, fullPage }, () => req<BrowserShotRef>('/api/browser/screenshot', { method: 'POST', body: JSON.stringify({ projectId, fullPage }) })),
+  browserFocus: (projectId: string | null) => call<{ ok: boolean }>('browserFocus', { projectId }, () => req<{ ok: boolean }>('/api/browser/focus', { method: 'POST', body: JSON.stringify({ projectId }) })),
+  browserClose: (projectId: string | null) => call<{ ok: boolean }>('browserClose', { projectId }, () => req<{ ok: boolean }>('/api/browser/close', { method: 'POST', body: JSON.stringify({ projectId }) })),
 
   // Model registry (provider-owned catalog) + per-role (primary/reviewer) model defaults
   listModels: () => call<ModelGroup[]>('listModels', {}, () => req<ModelGroup[]>('/api/models')),
