@@ -2,7 +2,7 @@
    (over IPC) and remote controls (phone/web via the relay). Every command
    executes locally on this Mac against the local store + local engine. */
 
-import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem } from './store.js';
+import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem, FeedbackCategory, FeedbackContext, FeedbackSource } from './store.js';
 import { resolveModelKey, buildModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
@@ -26,6 +26,10 @@ type Params = Record<string, unknown>;
 const bad = (msg: string, statusCode = 400): never => {
   throw Object.assign(new Error(msg), { statusCode });
 };
+
+/** A GitHub "owner/repo" slug: each side must start AND end alphanumeric, so
+    junk like `owner/..`, `../repo`, or `a/.` is rejected (no traversal-ish names). */
+const REPO_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 
 const ENGINE_VALUES = new Set(['claude', 'codex']);
 /** A project's working root on disk — its own folder, or ~/Maestro/<name>. */
@@ -70,6 +74,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           if (v === '' || listChromeProfiles().some(c => c.dir === v)) patch.chromeProfile = v;
         }
         if (p.chromeProfileMode === 'copy' || p.chromeProfileMode === 'live') patch.chromeProfileMode = p.chromeProfileMode;
+        if (typeof p.feedbackRepo === 'string') { // '' clears it; otherwise must look like owner/repo
+          const v = p.feedbackRepo.trim().slice(0, 140);
+          if (v === '' || REPO_RE.test(v)) patch.feedbackRepo = v;
+        }
         if (Object.keys(patch).length === 0) bad('no valid settings fields');
         const next = store.setSettings(patch);
         emit('settings', next);
@@ -647,6 +655,75 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const b = store.setChatPermissions(String(p.chatId), p.permissions as Record<string, boolean>);
         emit('comms', store.commsStatus());
         return b;
+      }
+
+      // ── Feedback (collected from desktop / web / phone) ────────
+      case 'listFeedback': return store.listFeedback();
+      case 'submitFeedback': {
+        const message = String(p.message ?? '').trim();
+        if (!message) bad('a feedback message is required');
+        const category: FeedbackCategory = (p.category === 'bug' || p.category === 'idea' || p.category === 'other') ? p.category : 'other';
+        const source: FeedbackSource = (p.source === 'web' || p.source === 'phone') ? p.source : 'desktop';
+        const ctxIn = (p.context && typeof p.context === 'object') ? p.context as Record<string, unknown> : {};
+        const context: FeedbackContext = {
+          appVersion: app.getVersion(), // authoritative — this Mac's build
+          ...(typeof ctxIn.screen === 'string' ? { screen: ctxIn.screen.slice(0, 80) } : {}),
+          ...(typeof ctxIn.platform === 'string' ? { platform: ctxIn.platform.slice(0, 40) } : {}),
+          ...(typeof ctxIn.projectId === 'string' ? { projectId: ctxIn.projectId } : {}),
+        };
+        const rec = store.addFeedback({ category, message, source, context });
+        emit('feedback', rec);
+        return rec;
+      }
+      case 'updateFeedback': {
+        const patch: { status?: 'new' | 'triaged' | 'done' } = {};
+        if (p.status === 'new' || p.status === 'triaged' || p.status === 'done') patch.status = p.status;
+        if (Object.keys(patch).length === 0) bad('no valid feedback fields');
+        const rec = store.updateFeedback(String(p.id ?? ''), patch);
+        emit('feedback', rec);
+        return rec;
+      }
+      case 'deleteFeedback': {
+        store.deleteFeedback(String(p.id ?? ''));
+        emit('feedback', { id: String(p.id ?? ''), deleted: true });
+        return { ok: true };
+      }
+      // Escalate a piece of feedback to a GitHub issue using the local GitHub
+      // token. Desktop-only (blocked on the relay) — it spends the Mac's token.
+      case 'feedbackCreateIssue': {
+        const rec = store.getFeedback(String(p.id ?? ''));
+        if (!rec) return bad('feedback not found', 404);
+        const repo = (typeof p.repo === 'string' && p.repo.trim() ? p.repo.trim() : store.getSettings().feedbackRepo ?? '').trim();
+        if (!REPO_RE.test(repo)) bad('set a target repo (owner/repo) for feedback issues');
+        const token = providers.getLocalKey('github');
+        if (!token) bad('connect GitHub in Settings → Accounts & keys first', 400);
+        const TITLE_MAX = 80;
+        const firstLine = rec.message.split('\n')[0].slice(0, TITLE_MAX);
+        const title = `[${rec.category}] ${firstLine}${rec.message.length > firstLine.length ? '…' : ''}`;
+        const ctx = rec.context ?? {};
+        const body = [
+          rec.message,
+          '',
+          '---',
+          `*Filed from Maestro feedback (${rec.source}).*`,
+          ctx.screen ? `- Screen: \`${ctx.screen}\`` : '',
+          ctx.appVersion ? `- App version: \`${ctx.appVersion}\`` : '',
+          ctx.platform ? `- Platform: \`${ctx.platform}\`` : '',
+        ].filter(Boolean).join('\n');
+        const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'content-type': 'application/json', 'user-agent': 'maestro' },
+          body: JSON.stringify({ title, body, labels: ['feedback', rec.category] }),
+        });
+        if (!res.ok) {
+          let detail = `GitHub returned ${res.status}`;
+          try { const j = await res.json() as { message?: string }; if (j?.message) detail = j.message; } catch { /* non-JSON */ }
+          bad(detail, res.status === 401 || res.status === 403 ? 400 : 502);
+        }
+        const issue = await res.json() as { number?: number; html_url?: string };
+        const updated = store.updateFeedback(rec.id, { status: 'triaged', issueUrl: issue.html_url, issueNumber: issue.number });
+        emit('feedback', updated);
+        return { feedback: updated, issueUrl: issue.html_url, issueNumber: issue.number };
       }
 
       // ── Engine status (THE single source of truth) ────────────

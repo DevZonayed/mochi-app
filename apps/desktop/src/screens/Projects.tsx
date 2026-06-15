@@ -670,7 +670,6 @@ interface PaletteItem {
 }
 
 const PALETTE_ITEMS: PaletteItem[] = [
-  { group: 'Jump to', icon: 'home', label: 'Command Center', hint: '⌘1' },
   { group: 'Jump to', icon: 'layers', label: 'Projects', hint: '⌘2' },
   { group: 'Jump to', icon: 'jobs', label: 'Jobs', hint: '⌘3' },
   { group: 'Jump to', icon: 'shield', label: 'Approvals', hint: '⌘4' },
@@ -769,7 +768,7 @@ export default function Projects() {
   const [suggestedName, setSuggestedName] = React.useState<string | undefined>(undefined);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
 
-  // Opened from Templates "Use" (router state) → open the New-project sheet.
+  // Opened with router state { openNew: true } → open the New-project sheet.
   React.useEffect(() => {
     const st = location.state as { openNew?: boolean; suggestedName?: string } | null;
     if (st?.openNew) {
