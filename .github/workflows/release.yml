@@ -54,8 +54,11 @@ jobs:
           node-version: 20
           cache: pnpm
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Install dependencies (desktop subtree only)
+        # Scope to the desktop app + its workspace deps. This skips the server's
+        # native modules (e.g. better-sqlite3), which otherwise fail node-gyp on
+        # the macOS/Windows runners and aren't needed to build the desktop app.
+        run: pnpm install --frozen-lockfile --filter "@maestro/desktop..."
 
       - name: Build renderer + main process
         run: pnpm --filter @maestro/desktop build
