@@ -83,6 +83,30 @@ function AssetCard({ a, onCancel, onApprove, onDelete, onReveal, onUseAsSource }
   a: Asset; onCancel: () => void; onApprove: () => void; onDelete: () => void; onReveal: () => void; onUseAsSource?: () => void;
 }) {
   const busy = a.status === 'queued' || a.status === 'generating';
+  // Regenerate / modify — only for finished images. No instruction → re-roll the
+  // original prompt; with one → edit this image, keeping the rest. Produces a NEW
+  // asset (a fresh card appears via the asset subscription); never destructive.
+  const [editing, setEditing] = React.useState(false);
+  const [instruction, setInstruction] = React.useState('');
+  const [regenBusy, setRegenBusy] = React.useState(false);
+  const [regenErr, setRegenErr] = React.useState('');
+  // Regenerate runs Codex/fal on THIS Mac — only offer it on the desktop (the
+  // result isn't viewable, and the relay has no regenerate route, on phone/web).
+  const canRegen = IS_LOCAL && a.kind === 'image' && (a.status === 'done' || a.status === 'approved');
+  const hasPrompt = !!(a.prompt && a.prompt.trim());
+  const regen = async (withInstruction: boolean) => {
+    if (regenBusy) return;
+    const instr = instruction.trim();
+    if (withInstruction && !instr) return;
+    if (!withInstruction && !hasPrompt) { setRegenErr('No original prompt — describe a change to modify it.'); return; }
+    setRegenBusy(true); setRegenErr('');
+    try {
+      await api.regenerateImage({ assetId: a.id, instruction: withInstruction ? instr : undefined });
+      setInstruction(''); setEditing(false);
+    } catch (e) {
+      setRegenErr(e instanceof ApiError ? e.message : 'Could not regenerate');
+    } finally { setRegenBusy(false); }
+  };
   return (
     <div className="asset-card" style={{ background: 'var(--bg-elevated)', borderRadius: 14, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
       <div style={{ aspectRatio: a.kind === 'video' ? '16/9' : a.kind === 'image' ? '1/1' : '16/6', position: 'relative', background: 'var(--fill-secondary)' }}>
@@ -101,6 +125,10 @@ function AssetCard({ a, onCancel, onApprove, onDelete, onReveal, onUseAsSource }
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
           {busy && <button onClick={onCancel} style={{ flex: 1, height: 30, borderRadius: 8, background: 'rgba(255,59,48,0.1)', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Cancel</button>}
+          {canRegen && <button onClick={() => setEditing(e => !e)} disabled={regenBusy} title="Regenerate or modify this image"
+            style={{ width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', border: 0, cursor: regenBusy ? 'default' : 'pointer',
+              background: editing ? 'color-mix(in srgb, var(--purple) 16%, transparent)' : 'var(--fill-secondary)', color: editing ? 'var(--purple)' : 'var(--ink-secondary)' }}>
+            {regenBusy ? <Spinner size={13} /> : <Icon name="refresh" size={14} />}</button>}
           {(a.status === 'done') && <>
             <button onClick={onApprove} className="send-btn" style={{ flex: 1, height: 30, borderRadius: 8, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Send to Publishing</button>
             {onUseAsSource && a.kind === 'image' && <button onClick={onUseAsSource} title="Use as avatar source" style={{ width: 30, height: 30, borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', display: 'grid', placeItems: 'center' }}><Icon name="smartphone" size={14} /></button>}
@@ -108,6 +136,19 @@ function AssetCard({ a, onCancel, onApprove, onDelete, onReveal, onUseAsSource }
           </>}
           {(a.status === 'failed' || a.status === 'cancelled' || a.status === 'approved') && <button onClick={onDelete} style={{ flex: 1, height: 30, borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Remove</button>}
         </div>
+        {canRegen && editing && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input value={instruction} autoFocus disabled={regenBusy} onChange={e => setInstruction(e.target.value)}
+              placeholder={hasPrompt ? 'Change to apply — or leave empty to re-roll' : 'Describe a change to apply'}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void regen(instruction.trim().length > 0); } }}
+              style={{ flex: 1, minWidth: 0, height: 30, padding: '0 10px', borderRadius: 8, font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', background: 'var(--bg-grouped)', border: '0.5px solid var(--separator)' }} />
+            {hasPrompt && <button onClick={() => void regen(false)} disabled={regenBusy} title="Generate a fresh version of the same prompt"
+              style={{ height: 30, padding: '0 10px', borderRadius: 8, border: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', background: 'var(--fill-secondary)', cursor: regenBusy ? 'default' : 'pointer', opacity: regenBusy ? 0.5 : 1 }}>Re-roll</button>}
+            <button onClick={() => void regen(true)} disabled={regenBusy || !instruction.trim()} className="send-btn"
+              style={{ height: 30, padding: '0 11px', borderRadius: 8, border: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: '#fff', background: 'var(--purple)', opacity: (regenBusy || !instruction.trim()) ? 0.5 : 1, cursor: (regenBusy || !instruction.trim()) ? 'default' : 'pointer' }}>Modify</button>
+          </div>
+        )}
+        {regenErr && <span style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--red)' }}>{regenErr}</span>}
       </div>
     </div>
   );
@@ -158,10 +199,12 @@ export default function MediaStudio() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Models available for the active stage.
+  // Models available for the active stage. flux-kontext is an EDIT-only model
+  // (needs a source image) reached via the Regenerate/Modify affordance, not the
+  // blank-composer flow — so keep it out of the manual picker.
   const stageModels = React.useMemo(() => {
     if (stage.key === 'avatar') return rates.filter(r => r.key === AVATAR_MODEL);
-    return rates.filter(r => stage.kinds.includes(r.kind));
+    return rates.filter(r => stage.kinds.includes(r.kind) && r.key !== 'flux-kontext');
   }, [rates, stage]);
   React.useEffect(() => { if (stageModels[0] && !stageModels.some(m => m.key === modelKey)) setModelKey(stageModels[0].key); }, [stageModels, modelKey]);
 

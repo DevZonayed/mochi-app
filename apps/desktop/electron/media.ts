@@ -9,7 +9,7 @@
    streamed down to ~/Maestro/<project>/assets/ for the record + publishing. */
 
 import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { Store, Asset, AssetKind, AssetStage } from './store.js';
@@ -38,6 +38,9 @@ export interface GenArgs {
   durationS?: number;
   voice?: string;
   imageUrl?: string;
+  /** A local source image for edit/i2v models. Read + base64'd into a data URI
+      when no imageUrl is given (e.g. a Codex-generated image has no fal CDN url). */
+  imagePath?: string;
   aspect?: string;
 }
 
@@ -65,6 +68,12 @@ const MODEL_LIST: MediaModel[] = [
   {
     key: 'flux-pro', id: 'fal-ai/flux-pro/v1.1', label: 'FLUX 1.1 Pro', kind: 'image', stage: 'broll', rate: 0.05,
     blurb: 'Hero image', buildInput: (a) => ({ prompt: a.prompt, image_size: a.aspect === '9:16' ? 'portrait_16_9' : 'landscape_16_9', num_images: 1 }), extractUrl: firstUrl,
+  },
+  {
+    // Instruction edit — keeps the source image and applies the change ("add a
+    // balloon in the sky"). image_url accepts a CDN url or a data URI.
+    key: 'flux-kontext', id: 'fal-ai/flux-pro/kontext', label: 'FLUX.1 Kontext · edit', kind: 'image', stage: 'broll', rate: 0.04,
+    blurb: 'Edit an image with an instruction', buildInput: (a) => ({ prompt: a.prompt, image_url: a.imageUrl, num_images: 1 }), extractUrl: firstUrl,
   },
   {
     key: 'kling-t2v', id: 'fal-ai/kling-video/v1.6/standard/text-to-video', label: 'Kling 1.6 · text→video', kind: 'video', stage: 'broll', rate: 0.045, perSecond: true,
@@ -106,6 +115,16 @@ function extFor(kind: AssetKind, url: string): string {
   if (m) return m[1].toLowerCase();
   return kind === 'image' ? 'png' : kind === 'video' ? 'mp4' : 'mp3';
 }
+/** Read a local image into a fal-acceptable data URI (used for edit/i2v models
+    when there's no CDN url — e.g. a Codex-generated source image). */
+function fileToDataUri(filePath: string): string {
+  const buf = readFileSync(filePath);
+  const MAX_BYTES = 12 * 1024 * 1024; // fal rejects very large inline payloads — fail clearly first
+  if (buf.byteLength > MAX_BYTES) throw Object.assign(new Error('source image is too large to edit (max 12 MB) — try a smaller image'), { statusCode: 413 });
+  const ext = (filePath.split('?')[0].match(/\.([a-zA-Z0-9]{2,4})$/)?.[1] ?? 'png').toLowerCase();
+  const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : 'image/png';
+  return `data:${mime};base64,${buf.toString('base64')}`;
+}
 
 export class MediaEngine {
   private ticking = false;
@@ -125,7 +144,15 @@ export class MediaEngine {
     const model = MODELS[args.modelKey];
     if (!model) throw Object.assign(new Error('unknown media model'), { statusCode: 400 });
     if (!args.prompt || !args.prompt.trim()) throw Object.assign(new Error('a prompt is required'), { statusCode: 400 });
+    // Resolve a local source path into a data URI when no CDN url was supplied
+    // (Codex images have a localPath but no fal url). Edit / image→video models
+    // then have a usable image_url either way. Lets fileToDataUri's clear "too
+    // large" error surface rather than collapsing into a generic "need a source".
+    if (!args.imageUrl && args.imagePath && existsSync(args.imagePath)) {
+      args = { ...args, imageUrl: fileToDataUri(args.imagePath) };
+    }
     if (model.key === 'kling-i2v' && !args.imageUrl) throw Object.assign(new Error('image→video needs a source image'), { statusCode: 400 });
+    if (model.key === 'flux-kontext' && !args.imageUrl) throw Object.assign(new Error('editing needs a source image'), { statusCode: 400 });
 
     const asset = this.store.createAsset({
       source: 'generated', kind: model.kind, stage: model.stage, prompt: args.prompt.slice(0, 2000), model: model.key,
