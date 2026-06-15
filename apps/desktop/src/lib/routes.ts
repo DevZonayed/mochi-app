@@ -16,7 +16,6 @@ export interface NavRoute {
 }
 
 export const NAV_ROUTES: NavRoute[] = [
-  { key: 'home', path: '/command-center', label: 'Home', icon: 'home' },
   { key: 'workspace', path: '/workspace', label: 'CodeSpace', icon: 'terminal' },
   { key: 'design', path: '/design-workspace', label: 'Design', icon: 'brush' },
   { key: 'projects', path: '/projects', label: 'Projects', icon: 'layers' },
@@ -24,7 +23,6 @@ export const NAV_ROUTES: NavRoute[] = [
   { key: 'approvals', path: '/approvals', label: 'Approvals', icon: 'shield' },
   { key: 'scheduler', path: '/scheduler', label: 'Scheduler', icon: 'calendar' },
   { key: 'skills', path: '/skills-registry', label: 'Skills', icon: 'spark' },
-  { key: 'templates', path: '/templates', label: 'Templates', icon: 'sliders' },
   { key: 'trends', path: '/trends', label: 'Trends', icon: 'telescope' },
   { key: 'studio', path: '/media-studio', label: 'Studio', icon: 'clapper' },
   { key: 'publishing', path: '/publishing', label: 'Publishing', icon: 'send' },
@@ -40,11 +38,11 @@ export const ALL_NAV: NavRoute[] = [...NAV_ROUTES, SETTINGS_ROUTE];
 /** Coding-genre navigation. Both genres now LEAD with the Workspace (CodeSpace)
     and Design pair so the operator can cross between code and design from either
     header. Costs and Skills are intentionally NOT here — they live in the Settings
-    page and in each project's settings tabs, not as standing top-nav menus. Home,
+    page and in each project's settings tabs, not as standing top-nav menus.
     Projects, Trends and Approvals are hidden too (Approvals surfaces as a bell only
     when a gate is actually pending). Every route stays registered in App.tsx, so
     dropping a key here hides the menu without breaking the route. */
-export const CODING_NAV: NavRoute[] = (['workspace', 'design', 'jobs', 'scheduler', 'templates'] as const)
+export const CODING_NAV: NavRoute[] = (['workspace', 'design', 'jobs', 'scheduler'] as const)
   .map(k => NAV_ROUTES.find(r => r.key === k))
   .filter((r): r is NavRoute => !!r);
 
