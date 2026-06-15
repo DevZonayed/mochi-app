@@ -14,7 +14,7 @@ import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
-import { registryBase, searchRegistry, registryMeta, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
+import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
 import { existsSync, mkdirSync, cpSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
@@ -400,6 +400,16 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'skillRegistryMeta': {
         return registryMeta(registryBase(relayUrl)).catch(() => ({ count: 0, generatedAt: '', source: '', note: 'registry unreachable' }));
       }
+      case 'registryGetSkill': {
+        const id = String(p.id ?? p.skillId ?? '');
+        if (!id) return bad('skill id required');
+        return getRegistrySkill(registryBase(relayUrl), id);
+      }
+      case 'registrySkillContent': {
+        const id = String(p.id ?? p.skillId ?? '');
+        if (!id) return bad('skill id required');
+        return fetchSkillContent(registryBase(relayUrl), id);
+      }
       case 'listProjectSkills': {
         return { skills: store.listInstalledSkills(String(p.id ?? '')) };
       }
@@ -417,6 +427,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           description: typeof p.description === 'string' ? p.description : undefined,
           risk: typeof p.risk === 'string' ? p.risk : undefined,
           source: typeof p.source === 'string' ? p.source : undefined,
+          version: typeof p.version === 'string' ? p.version : 'latest',
+          sha256: content.sha256,
+          enabled: content.enabled !== false,
+          disabledReason: typeof p.disabledReason === 'string' ? p.disabledReason : undefined,
+          mirrorRepo: typeof p.mirrorRepo === 'string' ? p.mirrorRepo : undefined,
+          auditStatus: typeof p.auditStatus === 'string' ? p.auditStatus : undefined,
         });
         return { skill: rec };
       }

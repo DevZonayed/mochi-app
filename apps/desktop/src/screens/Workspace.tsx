@@ -42,7 +42,7 @@ const PAGE_CSS = `
   .ws-ovf-item:hover { background: var(--fill-tertiary); }
 `;
 
-type ProjectSection = 'settings' | 'instructions' | 'jobs';
+type ProjectSection = 'settings' | 'instructions' | 'jobs' | 'skills';
 interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image' | 'browser' | 'project'; filePath?: string; imageAssetId?: string; imagePath?: string; projectSection?: ProjectSection }
 
 const TABS_KEY = 'maestro.workspace.tabs';
@@ -479,6 +479,7 @@ export default function Workspace() {
                           {[
                             { key: 'settings', icon: 'settings' as const, label: 'Project settings' },
                             { key: 'instructions', icon: 'bookmark' as const, label: 'Instructions & memory' },
+                            { key: 'skills', icon: 'spark' as const, label: 'Project skills' },
                             { key: 'jobs', icon: 'jobs' as const, label: 'Jobs' },
                           ].map(it => (
                             <button key={it.key} className="ws-ovf-item" onClick={() => { setMenuProj(null); openProject(p.id, it.key as ProjectSection); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>

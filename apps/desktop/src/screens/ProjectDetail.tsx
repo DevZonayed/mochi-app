@@ -822,7 +822,13 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
   const add = async (s: RegistrySkillSummary) => {
     if (!projectId) return;
     setBusy(s.id);
-    try { await api.addSkillToProject(projectId, { skillId: s.id, name: s.name, description: s.description, risk: s.risk, source: s.source }); reload(); }
+    try {
+      await api.addSkillToProject(projectId, {
+        skillId: s.id, name: s.name, description: s.description, risk: s.risk, source: s.source,
+        version: s.version, disabledReason: s.disabledReason, mirrorRepo: s.sourceRepo || s.mirrorRepo, auditStatus: s.auditStatus,
+      });
+      reload();
+    }
     catch { /* surfaced by absence */ }
     setBusy(null);
   };
@@ -857,7 +863,7 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <span style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
                       <span style={{ width: 6, height: 6, borderRadius: 3, background: riskTint(s.risk), flexShrink: 0 }} title={`audit risk: ${s.risk}`} />
-                      <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.id.split('/').slice(0, 2).join('/')}</span>
+                      <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.sourceRepo || s.mirrorRepo || s.id.split('/').slice(0, 2).join('/')}</span>
                     </div>
                     <div style={{ font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 3 }}>{s.description}</div>
                   </div>
@@ -883,6 +889,7 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
                 <div style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</div>
                 {s.description && <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.description}</div>}
               </div>
+              {s.sha256 && <span title={s.sha256} style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{s.sha256.slice(0, 8)}</span>}
               <code style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>.claude/skills/{s.slug}</code>
               <button onClick={() => void remove(s)} className="link-btn" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Remove</button>
             </div>

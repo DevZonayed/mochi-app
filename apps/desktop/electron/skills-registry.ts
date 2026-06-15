@@ -15,6 +15,9 @@ import localIndex from './skills-index.json';
 export interface RegistrySkillSummary {
   id: string; name: string; description: string; tags: string[]; license: string;
   risk: string; source: string; directory: string; installCmd: string; rank: number;
+  enabled?: boolean; disabledReason?: string | null; version?: string; sha256?: string | null;
+  sourceRepo?: string | null; sourceStatus?: string | null;
+  mirrorRepo?: string | null; forkStatus?: string | null; lastSyncAt?: string | null; auditStatus?: string | null;
 }
 
 /* Mac-local fallback. The Mac is the brain: a snapshot of the registry index is
@@ -31,6 +34,7 @@ const LOCAL = localIndex as unknown as { count: number; skills: IndexSkill[] };
 const toSummary = (s: IndexSkill): RegistrySkillSummary => ({
   id: s.id, name: s.name, description: s.description, tags: s.tags || [], license: s.license || '',
   risk: s.security?.risk || 'UNKNOWN', source: s.source, directory: s.directory, installCmd: s.installCmd, rank: s.rank,
+  enabled: true, version: 'latest', sourceRepo: s.id.split('/').slice(0, 2).join('/'), sourceStatus: 'bundled',
 });
 function localSearch(q: string, limit: number): { count: number; results: RegistrySkillSummary[] } {
   const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
@@ -63,7 +67,14 @@ async function getJSON<T>(url: string, timeout = 15000): Promise<T> {
   const t = setTimeout(() => ctrl.abort(), timeout);
   try {
     const r = await fetch(url, { signal: ctrl.signal, headers: { accept: 'application/json' } });
-    if (!r.ok) throw Object.assign(new Error(`registry ${r.status}`), { statusCode: r.status === 404 ? 404 : 502 });
+    if (!r.ok) {
+      let message = `registry ${r.status}`;
+      try {
+        const j = await r.json() as { error?: string };
+        if (j?.error) message = j.error;
+      } catch { /* non-json */ }
+      throw Object.assign(new Error(message), { statusCode: r.status });
+    }
     return (await r.json()) as T;
   } finally { clearTimeout(t); }
 }
@@ -78,9 +89,22 @@ export async function registryMeta(base: string): Promise<{ count: number; gener
   catch { return { count: LOCAL.count, generatedAt: '', source: 'bundled', note: 'using the app\'s bundled index (relay registry not reachable)' }; }
 }
 
-export async function fetchSkillContent(base: string, id: string): Promise<{ id: string; name: string; skillMd: string }> {
-  try { return await getJSON(`${base}/registry/skill/content?id=${encodeURIComponent(id)}`); }
+export async function getRegistrySkill(base: string, id: string): Promise<RegistrySkillSummary & { rawBase?: string; skillPath?: string; branch?: string; excerpt?: string }> {
+  try { return await getJSON(`${base}/registry/skill?id=${encodeURIComponent(id)}`); }
   catch {
+    const s = LOCAL.skills.find(x => x.id === id);
+    if (!s) throw Object.assign(new Error('skill not found'), { statusCode: 404 });
+    return { ...toSummary(s), rawBase: s.rawBase };
+  }
+}
+
+export async function fetchSkillContent(base: string, id: string): Promise<{ id: string; name: string; skillMd: string; sha256?: string; enabled?: boolean }> {
+  try { return await getJSON(`${base}/registry/skill/content?id=${encodeURIComponent(id)}`); }
+  catch (e) {
+    const status = (e as { statusCode?: number }).statusCode;
+    // A reachable registry explicitly blocking a disabled/quarantined skill is
+    // authoritative. Do not bypass it with the bundled fallback.
+    if (status === 401 || status === 403) throw e;
     // Fall back to pulling the SKILL.md straight from the author's GitHub.
     const s = LOCAL.skills.find(x => x.id === id);
     if (!s) throw Object.assign(new Error('skill not found'), { statusCode: 404 });

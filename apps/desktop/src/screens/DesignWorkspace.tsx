@@ -12,7 +12,7 @@ import { useNavigate } from 'react-router-dom';
 import { AppShell } from '../lib/appShell';
 import { Icon } from '../lib/icons';
 import { ImageViewer } from '../lib/CodeView';
-import { api, IS_LOCAL, type Project, type ChatSession, type DesignComment } from '../lib/api';
+import { api, IS_LOCAL, type Project, type ChatSession, type DesignComment, type InstalledSkill, type RegistrySkillSummary } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
 
 const DEVICES = [
@@ -119,6 +119,7 @@ export default function DesignWorkspace() {
   const [handoff, setHandoff] = React.useState(false);
   const [handingOff, setHandingOff] = React.useState(false);
   const [stack, setStack] = React.useState({ framework: 'next', lang: 'ts', styling: 'tailwind', pkg: 'pnpm', notes: '' });
+  const [skillsOpen, setSkillsOpen] = React.useState(false);
 
   const designProjects = projects.filter(p => p.kind === 'design');
   const active = designProjects.find(p => p.id === activeId) ?? null;
@@ -454,6 +455,7 @@ export default function DesignWorkspace() {
                   {comments.length > 0 && <span style={{ position: 'absolute', top: -2, right: -2, minWidth: 15, height: 15, padding: '0 3px', borderRadius: 8, background: openComments.length ? 'var(--orange, #fb8500)' : 'var(--green)', color: '#fff', font: '700 9px/15px var(--font-text)', textAlign: 'center' }}>{comments.length}</span>}
                 </button>
                 <button onClick={() => setNonce(n => n + 1)} title="Reload preview" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="refresh" size={16} /></button>
+                <button onClick={() => setSkillsOpen(true)} title="Design project skills" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="spark" size={16} /></button>
                 <button onClick={toggleFullscreen} title={fsActive ? 'Exit full screen' : 'Full screen'} className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: fsActive ? 'var(--blue)' : 'var(--ink-secondary)' }}><Icon name={fsActive ? 'minimize' : 'maximize'} size={16} /></button>
                 <button onClick={() => void doSnapshot()} title="Save a referable snapshot (commit the design + attachments)" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="bookmark" size={16} /></button>
                 {IS_LOCAL && active.path && <button onClick={() => void api.revealPath(active.path!)} title="Reveal design folder" className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="folder" size={16} /></button>}
@@ -586,6 +588,107 @@ export default function DesignWorkspace() {
           </div>
         </div>
       )}
+      <DesignSkillsSheet open={skillsOpen} project={active} onClose={() => setSkillsOpen(false)} />
     </AppShell>
+  );
+}
+
+function DesignSkillsSheet({ open, project, onClose }: { open: boolean; project: Project | null; onClose: () => void }) {
+  const [installed, setInstalled] = React.useState<InstalledSkill[]>([]);
+  const [q, setQ] = React.useState('');
+  const [results, setResults] = React.useState<RegistrySkillSummary[]>([]);
+  const [busy, setBusy] = React.useState<string | null>(null);
+  const projectId = project?.id ?? null;
+  const load = React.useCallback(() => {
+    if (!projectId) return;
+    api.listProjectSkills(projectId).then(r => setInstalled(r.skills)).catch(() => setInstalled([]));
+    api.searchSkills(q || 'design', 16).then(r => setResults(r.results)).catch(() => setResults([]));
+  }, [projectId, q]);
+  React.useEffect(() => { if (open) load(); }, [open, load]);
+  if (!open || !project) return null;
+  const installedIds = new Set(installed.map(s => s.id));
+  const search = async () => {
+    setBusy('__search');
+    try { const r = await api.searchSkills(q, 16); setResults(r.results); } catch { setResults([]); }
+    setBusy(null);
+  };
+  const add = async (s: RegistrySkillSummary) => {
+    if (s.enabled === false) return;
+    setBusy(s.id);
+    try {
+      await api.addSkillToProject(project.id, {
+        skillId: s.id,
+        name: s.name,
+        description: s.description,
+        risk: s.risk,
+        source: s.source,
+        version: s.version,
+        disabledReason: s.disabledReason,
+        mirrorRepo: s.sourceRepo || s.mirrorRepo,
+        auditStatus: s.auditStatus,
+      });
+      const r = await api.listProjectSkills(project.id);
+      setInstalled(r.skills);
+    } catch { /* fail soft */ }
+    setBusy(null);
+  };
+  const remove = async (s: InstalledSkill) => {
+    setInstalled(xs => xs.filter(x => x.id !== s.id));
+    try { await api.removeSkillFromProject(project.id, s.id); } catch { load(); }
+  };
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 90, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.22)' }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ width: 520, maxHeight: 'min(680px, calc(100vh - 64px))', display: 'flex', flexDirection: 'column', borderRadius: 16, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 24px 70px rgba(0,0,0,.28)', overflow: 'hidden' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '14px 16px', borderBottom: '0.5px solid var(--separator)' }}>
+          <Icon name="spark" size={18} style={{ color: 'var(--purple)' }} />
+          <span style={{ flex: 1, font: '700 var(--fs-headline)/1 var(--font-display)', color: 'var(--ink)' }}>{project.name} skills</span>
+          <button onClick={onClose} className="tb-icon" style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}><Icon name="x" size={14} /></button>
+        </div>
+        <div style={{ padding: 14, display: 'flex', gap: 8, borderBottom: '0.5px solid var(--separator)' }}>
+          <input value={q} onChange={e => setQ(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') void search(); }} placeholder="Search design, motion, accessibility, Figma…"
+            style={{ flex: 1, height: 34, padding: '0 11px', borderRadius: 9, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none' }} />
+          <button onClick={() => void search()} style={{ height: 34, padding: '0 12px', borderRadius: 9, border: 'none', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>{busy === '__search' ? 'Searching' : 'Search'}</button>
+        </div>
+        <div className="ds-scroll" style={{ overflow: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {installed.length > 0 && (
+            <div>
+              <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 8 }}>Installed</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {installed.map(s => (
+                  <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '9px 10px', borderRadius: 10, background: 'var(--surface)', border: '0.5px solid var(--separator)' }}>
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <span style={{ display: 'block', font: '600 var(--fs-footnote)/1.25 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
+                      <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>.claude/skills/{s.slug}/SKILL.md</span>
+                    </span>
+                    <button onClick={() => void remove(s)} style={{ height: 26, padding: '0 9px', borderRadius: 7, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Remove</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div>
+            <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 8 }}>Available</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {results.map(s => {
+                const disabled = s.enabled === false;
+                const has = installedIds.has(s.id);
+                return (
+                  <div key={s.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 9, padding: '9px 10px', borderRadius: 10, background: 'var(--surface)', border: '0.5px solid var(--separator)', opacity: disabled ? .7 : 1 }}>
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <span style={{ display: 'block', font: '600 var(--fs-footnote)/1.25 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
+                      <span style={{ display: 'block', marginTop: 2, font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-secondary)' }}>{disabled ? (s.disabledReason || 'Disabled in registry') : s.description}</span>
+                    </span>
+                    <button onClick={() => void add(s)} disabled={disabled || has || busy === s.id}
+                      style={{ flexShrink: 0, height: 26, padding: '0 9px', borderRadius: 7, border: 'none', background: disabled || has ? 'var(--fill-tertiary)' : 'var(--blue)', color: disabled || has ? 'var(--ink-tertiary)' : '#fff', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: disabled || has ? 'default' : 'pointer' }}>
+                      {disabled ? 'Blocked' : has ? 'Added' : busy === s.id ? 'Adding' : 'Add'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }

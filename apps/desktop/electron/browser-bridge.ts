@@ -17,14 +17,17 @@
 import { app } from 'electron';
 import net from 'node:net';
 import { randomBytes } from 'node:crypto';
-import { writeFileSync, chmodSync, unlinkSync, mkdirSync } from 'node:fs';
+import { writeFileSync, chmodSync, unlinkSync, mkdirSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import type { BrowserController } from './browser.js';
 import type { Store } from './store.js';
+import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
 
 /** A registered codex run: the project its browser tools target + the screenshot
     Asset ids produced during the run (folded into the transcript afterward). */
-interface RunReg { projectId: string | null; shots: string[] }
+interface RunReg { projectId: string | null; shots: string[]; browser: boolean; skills: boolean }
+interface RunOptions { browser?: boolean; skills?: boolean }
 
 /** Handle returned to runCodex: the codex `-c` config to add + the shot list. */
 export interface BrowserRunRegistration {
@@ -42,6 +45,8 @@ const TOOL_NAMES = [
   'browser_select', 'browser_hover', 'browser_wait',
   'browser_evaluate', 'browser_console', 'browser_remember', 'browser_back', 'browser_forward',
   'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab',
+  'search_skills', 'get_skill', 'download_skill', 'add_skill_to_project',
+  'list_project_skills', 'remove_project_skill',
 ] as const;
 
 const txt = (s: string) => ({ content: [{ type: 'text', text: s }] });
@@ -80,9 +85,9 @@ export class BrowserBridge {
   }
 
   /** Register a codex run: returns the `-c mcp_servers` config + a live shot list. */
-  register(projectId: string | null): BrowserRunRegistration {
+  register(projectId: string | null, opts: RunOptions = { browser: true, skills: false }): BrowserRunRegistration {
     const token = randomBytes(18).toString('hex');
-    const reg: RunReg = { projectId, shots: [] };
+    const reg: RunReg = { projectId, shots: [], browser: opts.browser !== false, skills: !!opts.skills };
     this.runs.set(token, reg);
     // Run the shim via Electron's own node (always present; no PATH dependency).
     // The per-run token goes in the MCP server's ENV (not the shim's argv) so it
@@ -129,7 +134,75 @@ export class BrowserBridge {
     const b = this.browser;
     const s = (v: unknown) => (typeof v === 'string' ? v : undefined);
     const n = (v: unknown) => (typeof v === 'number' ? v : undefined);
+    const projectRoot = () => {
+      if (!pid) throw new Error('project skill tools require a project');
+      const p = this.store.getProject(pid);
+      if (!p) throw new Error('project not found');
+      if (p.path && existsSync(p.path)) return p.path;
+      const safe = (p.name || 'default').replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
+      return path.join(homedir(), 'Maestro', safe);
+    };
+    if (tool.startsWith('browser_') && !reg.browser) return errRes('browser tools are not enabled for this run');
     switch (tool) {
+      case 'search_skills': {
+        if (!reg.skills) return errRes('skill tools are not enabled for this run');
+        const r = await searchRegistry(registryBase(), String(a.query ?? ''), n(a.limit) ?? 8);
+        if (!r.results.length) return txt(`No skills found for "${a.query ?? ''}".`);
+        return txt(r.results.map(x => `- ${x.id} — ${x.name}: ${x.description || '(no description)'} [risk=${x.risk}${x.version ? `, version=${x.version}` : ''}${x.sha256 ? `, sha256=${x.sha256.slice(0, 12)}` : ''}${x.sourceRepo ? `, source=${x.sourceRepo}` : ''}${x.sourceStatus ? `, sourceStatus=${x.sourceStatus}` : ''}]`).join('\n'));
+      }
+      case 'get_skill': {
+        if (!reg.skills) return errRes('skill tools are not enabled for this run');
+        const x = await getRegistrySkill(registryBase(), String(a.skillId ?? ''));
+        return txt(`${x.id} — ${x.name}\n${x.description || ''}\nrisk=${x.risk}\nenabled=${x.enabled !== false}\nversion=${x.version ?? 'latest'}\nsha256=${x.sha256 ?? ''}\nsourceRepo=${x.sourceRepo ?? x.id.split('/').slice(0, 2).join('/')}\nsourceStatus=${x.sourceStatus ?? ''}\nsource=${x.source}\ndirectory=${x.directory}\naudit=${x.auditStatus ?? ''}\n\n${x.excerpt ? `Excerpt:\n${x.excerpt}` : ''}`);
+      }
+      case 'download_skill': {
+        if (!reg.skills) return errRes('skill tools are not enabled for this run');
+        const c = await fetchSkillContent(registryBase(), String(a.skillId ?? ''));
+        const body = c.skillMd.length > 32000 ? c.skillMd.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]' : c.skillMd;
+        return txt(`# ${c.name}\n\nid=${c.id}\nsha256=${c.sha256 ?? 'unknown'}\n\n${body}`);
+      }
+      case 'add_skill_to_project': {
+        if (!reg.skills) return errRes('skill tools are not enabled for this run');
+        if (!pid) return errRes('project skill tools require a project');
+        const skillId = String(a.skillId ?? '');
+        const base = registryBase();
+        const [content, meta] = await Promise.all([
+          fetchSkillContent(base, skillId),
+          getRegistrySkill(base, skillId).catch(() => null),
+        ]);
+        const root = projectRoot();
+        mkdirSync(root, { recursive: true });
+        const slug = installSkillFiles(root, skillId, content.skillMd);
+        const rec = this.store.recordSkillInstall(pid, {
+          id: skillId,
+          slug,
+          name: meta?.name || content.name,
+          description: meta?.description,
+          risk: meta?.risk,
+          source: meta?.source,
+          version: meta?.version || 'latest',
+          sha256: content.sha256,
+          enabled: content.enabled !== false && meta?.enabled !== false,
+          disabledReason: meta?.disabledReason,
+          mirrorRepo: meta?.sourceRepo ?? meta?.mirrorRepo,
+          auditStatus: meta?.auditStatus,
+        });
+        return txt(`Installed "${rec.name}" -> .claude/skills/${rec.slug}/SKILL.md${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}. Read that file before using the skill.`);
+      }
+      case 'list_project_skills': {
+        if (!reg.skills) return errRes('skill tools are not enabled for this run');
+        if (!pid) return errRes('project skill tools require a project');
+        const rows = this.store.listInstalledSkills(pid);
+        return txt(rows.length ? rows.map(x => `- ${x.id} — ${x.name} (.claude/skills/${x.slug}/SKILL.md${x.version ? `, version=${x.version}` : ''}${x.sha256 ? `, sha256=${x.sha256.slice(0, 12)}` : ''}${x.risk ? `, risk=${x.risk}` : ''})`).join('\n') : 'No skills are installed in this project yet.');
+      }
+      case 'remove_project_skill': {
+        if (!reg.skills) return errRes('skill tools are not enabled for this run');
+        if (!pid) return errRes('project skill tools require a project');
+        const skillId = String(a.skillId ?? '');
+        removeSkillFiles(projectRoot(), skillId);
+        this.store.removeInstalledSkill(pid, skillId);
+        return txt(`Removed project skill ${skillId}.`);
+      }
       case 'browser_navigate': { const r = await b.navigate(pid, String(a.url ?? '')); return txt(`Opened ${r.url} — "${r.title}"` + (r.memory ? `\n\n📝 Your saved notes for this site:\n${r.memory}` : '')); }
       case 'browser_snapshot': { const r = await b.snapshot(pid); return txt(`${r.url} — ${r.title}\n\n${r.aria}` + (r.memory ? `\n\n📝 Your saved notes for this site:\n${r.memory}` : '')); }
       case 'browser_remember': { const r = await b.remember(pid, String(a.note ?? '')); return txt(r.domain ? `Saved notes for ${r.domain}.` : 'No page open to attach notes to.'); }
@@ -193,6 +266,12 @@ const SHIM_TOOLS = JSON.stringify([
   { name: 'browser_tabs', description: 'List open tabs (index, title, url; * = active).', inputSchema: { type: 'object', properties: {} } },
   { name: 'browser_new_tab', description: 'Open a new tab (optionally at a URL) and switch to it.', inputSchema: { type: 'object', properties: { url: { type: 'string' } } } },
   { name: 'browser_select_tab', description: 'Switch to a tab by index (from browser_tabs).', inputSchema: { type: 'object', properties: { index: { type: 'number' } }, required: ['index'] } },
+  { name: 'search_skills', description: 'Search the live Maestro skill registry for specialized SKILL.md instructions. Public search excludes disabled skills.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number' } }, required: ['query'] } },
+  { name: 'get_skill', description: 'Fetch metadata for one registry skill by id, including audit, version, and original source state.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },
+  { name: 'download_skill', description: 'Download a registry skill SKILL.md without installing it into the project.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },
+  { name: 'add_skill_to_project', description: 'Install a registry skill into this project at .claude/skills/<slug>/SKILL.md. Read that file before using the skill.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },
+  { name: 'list_project_skills', description: 'List skills already installed in this project.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'remove_project_skill', description: 'Remove an installed project skill by registry id or slug.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },
 ]);
 
 const SHIM_SRC = `'use strict';

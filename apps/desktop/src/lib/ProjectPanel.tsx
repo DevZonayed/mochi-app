@@ -5,10 +5,10 @@
 
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type Project, type Job, type ProjectMemory } from './api';
+import { api, type Project, type Job, type ProjectMemory, type InstalledSkill, type RegistrySkillSummary } from './api';
 import { Icon, type IconName } from './icons';
 
-type Section = 'settings' | 'instructions' | 'jobs' | 'memory';
+type Section = 'settings' | 'instructions' | 'jobs' | 'memory' | 'skills';
 
 function relTime(ms: number): string {
   const s = Math.max(0, (Date.now() - ms) / 1000);
@@ -35,6 +35,7 @@ export function ProjectPanel({ projectId, section = 'settings' }: { projectId: s
     { key: 'settings', label: 'Settings', icon: 'settings' },
     { key: 'instructions', label: 'Instructions', icon: 'bookmark' },
     { key: 'memory', label: 'Memory', icon: 'spark' },
+    { key: 'skills', label: 'Skills', icon: 'spark' },
     { key: 'jobs', label: 'Jobs', icon: 'jobs' },
   ];
 
@@ -63,7 +64,120 @@ export function ProjectPanel({ projectId, section = 'settings' }: { projectId: s
         {tab === 'settings' && project && <SettingsBody project={project} patch={patch} onFull={() => navigate(`/project-detail/${projectId}`)} />}
         {tab === 'instructions' && project && <InstructionsBody project={project} patch={patch} />}
         {tab === 'memory' && <MemoryBody projectId={projectId} />}
+        {tab === 'skills' && <SkillsBody projectId={projectId} />}
         {tab === 'jobs' && <JobsBody projectId={projectId} />}
+      </div>
+    </div>
+  );
+}
+
+function SkillsBody({ projectId }: { projectId: string }) {
+  const [installed, setInstalled] = React.useState<InstalledSkill[]>([]);
+  const [q, setQ] = React.useState('');
+  const [results, setResults] = React.useState<RegistrySkillSummary[]>([]);
+  const [busy, setBusy] = React.useState<string | null>(null);
+  const [meta, setMeta] = React.useState<{ count: number; total?: number; uniqueRepos?: number } | null>(null);
+  const reloadInstalled = React.useCallback(() => {
+    api.listProjectSkills(projectId).then(r => setInstalled(r.skills)).catch(() => setInstalled([]));
+  }, [projectId]);
+  React.useEffect(() => {
+    reloadInstalled();
+    api.skillRegistryMeta().then(m => setMeta(m as typeof meta)).catch(() => {});
+    api.searchSkills('', 12).then(r => setResults(r.results)).catch(() => setResults([]));
+  }, [reloadInstalled]); // eslint-disable-line react-hooks/exhaustive-deps
+  const search = async (term = q) => {
+    setBusy('__search');
+    try { const r = await api.searchSkills(term, 18); setResults(r.results); } catch { setResults([]); }
+    setBusy(null);
+  };
+  const add = async (s: RegistrySkillSummary) => {
+    if (s.enabled === false) return;
+    setBusy(s.id);
+    try {
+      await api.addSkillToProject(projectId, {
+        skillId: s.id,
+        name: s.name,
+        description: s.description,
+        risk: s.risk,
+        source: s.source,
+        version: s.version,
+        disabledReason: s.disabledReason,
+        mirrorRepo: s.sourceRepo || s.mirrorRepo,
+        auditStatus: s.auditStatus,
+      });
+      reloadInstalled();
+    } catch { /* fail soft */ }
+    setBusy(null);
+  };
+  const remove = async (s: InstalledSkill) => {
+    setInstalled(xs => xs.filter(x => x.id !== s.id));
+    try { await api.removeSkillFromProject(projectId, s.id); } catch { reloadInstalled(); }
+  };
+  const installedIds = new Set(installed.map(s => s.id));
+  const riskTint = (r?: string) => {
+    const v = (r || '').toUpperCase();
+    if (v === 'MEDIUM') return 'var(--orange)';
+    if (v === 'LOW' || v === 'SAFE' || v === 'NONE') return 'var(--green)';
+    if (v === 'HIGH' || v === 'CRITICAL') return 'var(--red, #e5484d)';
+    return 'var(--ink-tertiary)';
+  };
+  return (
+    <div style={{ maxWidth: 760, display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 9 }}>
+          <div style={{ font: '700 var(--fs-headline)/1 var(--font-display)', color: 'var(--ink)' }}>Project skills</div>
+          {meta && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{meta.count} enabled · {meta.uniqueRepos ?? '444'} repos</span>}
+        </div>
+        <div style={{ font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+          Installed skills live in this project at <code>.claude/skills/&lt;slug&gt;/SKILL.md</code>. Registry disable blocks future installs but leaves existing project files untouched.
+        </div>
+      </div>
+
+      {installed.length > 0 && (
+        <div style={{ border: '0.5px solid var(--separator)', borderRadius: 12, background: 'var(--surface)', overflow: 'hidden' }}>
+          {installed.map((s, i) => (
+            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderBottom: i === installed.length - 1 ? 'none' : '0.5px solid var(--separator)' }}>
+              <Icon name="spark" size={15} style={{ color: 'var(--indigo)', flexShrink: 0 }} />
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', font: '600 var(--fs-footnote)/1.25 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
+                <span style={{ display: 'block', font: '400 var(--fs-caption)/1.35 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>.claude/skills/{s.slug}/SKILL.md{s.sha256 ? ` · ${s.sha256.slice(0, 12)}` : ''}</span>
+              </span>
+              <button onClick={() => void remove(s)} style={{ height: 28, padding: '0 10px', borderRadius: 7, border: '1px solid var(--hairline)', background: 'var(--surface)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Remove</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div style={{ position: 'relative', flex: 1 }}>
+          <Icon name="search" size={14} style={{ position: 'absolute', left: 11, top: 10, color: 'var(--ink-tertiary)' }} />
+          <input value={q} onChange={e => setQ(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') void search(); }} placeholder="Search available skills"
+            style={{ width: '100%', height: 34, padding: '0 11px 0 31px', borderRadius: 9, border: '1px solid var(--hairline)', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none' }} />
+        </div>
+        <button onClick={() => void search()} disabled={busy === '__search'} style={{ height: 34, padding: '0 12px', borderRadius: 9, border: 'none', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>{busy === '__search' ? 'Searching' : 'Search'}</button>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+        {results.map(s => {
+          const installedAlready = installedIds.has(s.id);
+          const disabled = s.enabled === false;
+          return (
+            <div key={s.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 12px', borderRadius: 11, border: '0.5px solid var(--separator)', background: 'var(--surface)', opacity: disabled ? 0.72 : 1 }}>
+              <span style={{ width: 7, height: 7, borderRadius: 4, background: disabled ? 'var(--red, #e5484d)' : riskTint(s.risk), marginTop: 7, flexShrink: 0 }} />
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                  <span style={{ font: '600 var(--fs-footnote)/1.25 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
+                  <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{s.sourceRepo || s.mirrorRepo || s.id.split('/').slice(0, 2).join('/')}</span>
+                </span>
+                <span style={{ display: 'block', marginTop: 3, font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>{disabled ? `Disabled${s.disabledReason ? `: ${s.disabledReason}` : ''}` : s.description}</span>
+              </span>
+              <button onClick={() => void add(s)} disabled={disabled || installedAlready || busy === s.id}
+                style={{ flexShrink: 0, height: 28, padding: '0 10px', borderRadius: 7, border: 'none', background: installedAlready || disabled ? 'var(--fill-tertiary)' : 'var(--blue)', color: installedAlready || disabled ? 'var(--ink-tertiary)' : '#fff', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: installedAlready || disabled ? 'default' : 'pointer' }}>
+                {disabled ? 'Blocked' : installedAlready ? 'Added' : busy === s.id ? 'Adding' : 'Add'}
+              </button>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

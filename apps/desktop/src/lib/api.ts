@@ -135,10 +135,15 @@ export interface Skill {
 export interface RegistrySkillSummary {
   id: string; name: string; description: string; tags: string[]; license: string;
   risk: string; source: string; directory: string; installCmd: string; rank: number;
+  enabled?: boolean; disabledReason?: string | null; version?: string; sha256?: string | null;
+  sourceRepo?: string | null; sourceStatus?: string | null;
+  mirrorRepo?: string | null; forkStatus?: string | null; lastSyncAt?: string | null; auditStatus?: string | null;
 }
 /** A registry skill installed into a project (files in <project>/.claude/skills/). */
 export interface InstalledSkill {
-  id: string; slug: string; name: string; description?: string; risk?: string; source?: string; installedAt: number;
+  id: string; slug: string; name: string; description?: string; risk?: string; source?: string;
+  version?: string; sha256?: string; enabled?: boolean; disabledReason?: string | null;
+  mirrorRepo?: string | null; auditStatus?: string | null; installedAt: number;
 }
 export interface Template {
   id: string;
@@ -385,6 +390,15 @@ export function setRemoteToken(token: string): void {
   try { localStorage.setItem(TOKEN_KEY, remoteToken); } catch { /* storage unavailable */ }
 }
 
+const REGISTRY_ADMIN_TOKEN_KEY = 'maestro.registry.admin.token';
+export function getRegistryAdminToken(): string {
+  if (typeof window === 'undefined') return '';
+  try { return localStorage.getItem(REGISTRY_ADMIN_TOKEN_KEY) ?? ''; } catch { return ''; }
+}
+export function setRegistryAdminToken(token: string): void {
+  try { localStorage.setItem(REGISTRY_ADMIN_TOKEN_KEY, token.trim()); } catch { /* storage unavailable */ }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   // Only send a JSON content-type when there's actually a body — otherwise
   // Fastify rejects the empty body (FST_ERR_CTP_EMPTY_JSON_BODY) on bodyless POSTs.
@@ -409,6 +423,19 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
+}
+
+async function reqRegistryAdmin<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getRegistryAdminToken();
+  const hasBody = init?.body != null;
+  return req<T>(path, {
+    ...init,
+    headers: {
+      ...(hasBody ? { 'content-type': 'application/json' } : {}),
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers ?? {}),
+    },
+  });
 }
 
 /** Route to the local core when in Electron, otherwise run the REST fallback. */
@@ -655,12 +682,51 @@ export const api = {
   listSkills: () => call<Skill[]>('listSkills', {}, () => req<Skill[]>('/api/skills')),
   // Skill registry: search the curated/secure index + install into a project.
   searchSkills: (q: string, limit = 30) =>
-    call<{ count: number; results: RegistrySkillSummary[] }>('searchSkills', { q, limit }, () => Promise.reject(new Error('desktop only'))),
+    call<{ count: number; mode?: string; results: RegistrySkillSummary[] }>(
+      'searchSkills',
+      { q, limit },
+      () => req<{ count: number; mode?: string; results: RegistrySkillSummary[] }>('/registry/skills' + qp({ q, limit: String(limit) })),
+    ),
   skillRegistryMeta: () =>
-    call<{ count: number; generatedAt: string; source: string; note: string }>('skillRegistryMeta', {}, () => Promise.reject(new Error('desktop only'))),
+    call<{ count: number; total?: number; uniqueRepos?: number; generatedAt: string; source: string; note: string; semantic?: boolean }>(
+      'skillRegistryMeta',
+      {},
+      () => req<{ count: number; total?: number; uniqueRepos?: number; generatedAt: string; source: string; note: string; semantic?: boolean }>('/registry/meta'),
+    ),
+  registryGetSkill: (id: string) =>
+    call<RegistrySkillSummary & { rawBase?: string; skillPath?: string; branch?: string; excerpt?: string }>(
+      'registryGetSkill',
+      { id },
+      () => req<RegistrySkillSummary & { rawBase?: string; skillPath?: string; branch?: string; excerpt?: string }>('/registry/skill' + qp({ id })),
+    ),
+  registrySkillContent: (id: string) =>
+    call<{ id: string; name: string; skillMd: string; sha256?: string; enabled?: boolean }>(
+      'registrySkillContent',
+      { id },
+      () => req<{ id: string; name: string; skillMd: string; sha256?: string; enabled?: boolean }>('/registry/skill/content' + qp({ id })),
+    ),
+  registryAdminListSkills: (input: { q?: string; includeDisabled?: boolean; limit?: number } = {}) =>
+    reqRegistryAdmin<{ count: number; mode: string; results: RegistrySkillSummary[] }>(
+      '/registry/admin/skills' + qp({
+        q: input.q,
+        includeDisabled: input.includeDisabled === undefined ? undefined : String(input.includeDisabled),
+        limit: input.limit === undefined ? undefined : String(input.limit),
+      }),
+    ),
+  registryAdminAddSkill: (input: { url?: string; owner?: string; repo?: string; skill?: string; skillMd?: string; name?: string; description?: string }) =>
+    reqRegistryAdmin<RegistrySkillSummary>('/registry/admin/skills', { method: 'POST', body: JSON.stringify(input) }),
+  registryAdminPatchSkill: (id: string, patch: { enabled?: boolean; disabledReason?: string; name?: string; description?: string; tags?: string[] }) =>
+    reqRegistryAdmin<RegistrySkillSummary>('/registry/admin/skill' + qp({ id }), { method: 'PATCH', body: JSON.stringify(patch) }),
+  registryAdminRescanSkill: (id: string) =>
+    reqRegistryAdmin<RegistrySkillSummary>('/registry/admin/skill/rescan' + qp({ id }), { method: 'POST' }),
+  registryAdminSyncSources: (input: { dryRun?: boolean; includeFresh?: boolean; limit?: number } = {}) =>
+    reqRegistryAdmin<{ dryRun: boolean; mode: 'upstream-source'; includeFresh: boolean; repos: number; attempted: number; results: { skillId: string; repo: string; status: string; sourceRepo: string; sha256?: string; commitSha?: string | null; error?: string }[] }>(
+      '/registry/admin/sync/sources',
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
   listProjectSkills: (projectId: string) =>
     call<{ skills: InstalledSkill[] }>('listProjectSkills', { id: projectId }, () => Promise.reject(new Error('desktop only'))),
-  addSkillToProject: (projectId: string, skill: { skillId: string; name?: string; description?: string; risk?: string; source?: string }) =>
+  addSkillToProject: (projectId: string, skill: { skillId: string; name?: string; description?: string; risk?: string; source?: string; version?: string; disabledReason?: string | null; mirrorRepo?: string | null; auditStatus?: string | null }) =>
     call<{ skill: InstalledSkill }>('addSkillToProject', { projectId, ...skill }, () => Promise.reject(new Error('desktop only'))),
   removeSkillFromProject: (projectId: string, skillId: string) =>
     call<{ ok: boolean }>('removeSkillFromProject', { projectId, skillId }, () => Promise.reject(new Error('desktop only'))),

@@ -321,6 +321,12 @@ export interface InstalledSkill {
   description?: string;
   risk?: string;
   source?: string;     // upstream GitHub url
+  version?: string;
+  sha256?: string;
+  enabled?: boolean;
+  disabledReason?: string | null;
+  mirrorRepo?: string | null;
+  auditStatus?: string | null;
   installedAt: number;
 }
 
