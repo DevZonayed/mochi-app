@@ -119,3 +119,39 @@ export function FileViewer({ projectId, filePath }: { projectId: string; filePat
     </div>
   );
 }
+
+/** Read-only image viewer tab — loads the bytes on-device by Asset id and shows
+    the picture fit-to-window (click to toggle actual size). Mirrors FileViewer so
+    a generated/attached image opens like any other VS Code-style tab. */
+export function ImageViewer({ assetId, name, imagePath }: { assetId?: string; name: string; imagePath?: string }) {
+  const [src, setSrc] = React.useState<string | null>(null);
+  const [err, setErr] = React.useState(false);
+  const [actual, setActual] = React.useState(false);
+  React.useEffect(() => {
+    let alive = true; setSrc(null); setErr(false);
+    if (assetId) api.assetImage(assetId).then(d => { if (alive) (d ? setSrc(d) : setErr(true)); }).catch(() => { if (alive) setErr(true); });
+    return () => { alive = false; };
+  }, [assetId]);
+  return (
+    <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', borderBottom: '0.5px solid var(--separator)', flexShrink: 0 }}>
+        <Icon name="image" size={14} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+        <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+        <span style={{ flex: 1 }} />
+        {src && <button onClick={() => setActual(a => !a)} title={actual ? 'Fit to window' : 'Actual size'}
+          style={{ height: 26, padding: '0 11px', borderRadius: 7, border: '0.5px solid var(--separator)', background: 'transparent', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer', flexShrink: 0 }}>{actual ? 'Fit' : '1:1'}</button>}
+        {imagePath && <button onClick={() => void api.revealPath(imagePath)} title="Reveal in Finder"
+          style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'transparent', border: 'none', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}><Icon name="folder" size={14} /></button>}
+      </div>
+      <div style={{ flex: 1, minHeight: 0, overflow: 'auto', display: 'grid', placeItems: 'center', background: 'var(--bg-grouped)', padding: 24 }}>
+        {src
+          ? <img src={src} alt={name} onClick={() => setActual(a => !a)}
+              style={actual
+                ? { maxWidth: 'none', cursor: 'zoom-out' }
+                : { maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', cursor: 'zoom-in', borderRadius: 8, boxShadow: '0 10px 34px rgba(0,0,0,0.28)' }} />
+          : err ? <div style={{ font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)', textAlign: 'center' }}>Couldn’t load this image.</div>
+          : <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Loading…</div>}
+      </div>
+    </div>
+  );
+}

@@ -4,12 +4,14 @@
    real desktop coding app. The chat itself is the shared <ChatThread>. */
 
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type ChatSession, type ProjectKind, type Job } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
-import { FileViewer } from '../lib/CodeView';
+import { FileViewer, ImageViewer } from '../lib/CodeView';
+import { BrowserPane } from '../lib/BrowserPane';
+import { ProjectPanel } from '../lib/ProjectPanel';
 import { RightSidebar, type CheckItem } from '../lib/RightSidebar';
 import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
@@ -26,9 +28,9 @@ const PAGE_CSS = `
   .ws-newbtn:hover { background: var(--fill-secondary) !important; }
   .ws-tabs::-webkit-scrollbar { height: 0; }
   .ws-kinds::-webkit-scrollbar { height: 0; }
-  .ws-tree::-webkit-scrollbar { width: 9px; }
-  .ws-tree::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
-  .ws-tree:hover::-webkit-scrollbar-thumb { background: var(--separator-strong); background-clip: padding-box; }
+  .ws-tree::-webkit-scrollbar { width: 11px; }
+  .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+  .ws-tree:hover::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 40%, transparent); background-clip: padding-box; }
   .ws-proj:hover .ws-newchat { opacity: 1; }
   .ws-newchat { opacity: 0; transition: opacity 120ms ease; }
   /* project header sticks to the top of the scroll area while you read its
@@ -40,7 +42,8 @@ const PAGE_CSS = `
   .ws-ovf-item:hover { background: var(--fill-tertiary); }
 `;
 
-interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file'; filePath?: string }
+type ProjectSection = 'settings' | 'instructions' | 'jobs' | 'skills';
+interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image' | 'browser' | 'project'; filePath?: string; imageAssetId?: string; imagePath?: string; projectSection?: ProjectSection }
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
@@ -54,6 +57,7 @@ function relTime(ts: number): string {
 }
 const projColor = (p?: Project): string => (p?.color ? `var(--${p.color})` : 'var(--blue)');
 const projKind = (p?: Project): ProjectKind => (p?.kind ?? 'general');
+const CHAT_PREVIEW = 7; // chats shown per project before "Show all"
 
 const KIND_FILTER_KEY = 'maestro.workspace.kind';
 type KindFilter = ProjectKind | 'all';
@@ -68,6 +72,8 @@ const kindOf = (k: KindFilter) => KIND_META.find(m => m.key === k) ?? KIND_META[
 
 export default function Workspace() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const seedConsumed = React.useRef(false);
   const [projects, setProjects] = React.useState<Project[]>([]);
   const [sessions, setSessions] = React.useState<ChatSession[]>([]);
   const [tabs, setTabs] = React.useState<Tab[]>([]);
@@ -77,6 +83,11 @@ export default function Workspace() {
   });
   const [renamingId, setRenamingId] = React.useState<string | null>(null);
   const [renameVal, setRenameVal] = React.useState('');
+  // Cap chats shown per project so a busy one doesn't bury the others; "Show all"
+  // per project reveals the rest. Searching always shows every match.
+  const [chatsAllOpen, setChatsAllOpen] = React.useState<Set<string>>(new Set());
+  // Per-project "⋯" menu (settings / jobs / instructions / reveal …).
+  const [menuProj, setMenuProj] = React.useState<string | null>(null);
   const [kindFilter, setKindFilterState] = React.useState<KindFilter>(() => {
     try { const v = localStorage.getItem(KIND_FILTER_KEY); return (v && KIND_META.some(m => m.key === v)) ? v as KindFilter : 'all'; } catch { return 'all'; }
   });
@@ -146,6 +157,22 @@ export default function Workspace() {
     return unsub;
   }, []);
 
+  // Hand-off-from-design: open the freshly-copied coding project + its seeded chat
+  // (the design tab navigated here with these ids). One-shot — cleared after use.
+  React.useEffect(() => {
+    const st = location.state as { seedProjectId?: string; seedSessionId?: string; expand?: boolean } | null;
+    if (!st?.seedProjectId || seedConsumed.current) return;
+    seedConsumed.current = true;
+    const { seedProjectId, seedSessionId } = st;
+    api.listProjects().then(setProjects).catch(() => {}); // pick up the new project immediately
+    if (st.expand) setExpanded(e => new Set(e).add(seedProjectId));
+    if (seedSessionId) {
+      setTabs(ts => ts.some(t => t.sessionId === seedSessionId) ? ts : [...ts, { key: seedSessionId, projectId: seedProjectId, sessionId: seedSessionId, title: 'Building from design…' }]);
+      setActiveKey(seedSessionId);
+    }
+    navigate('.', { replace: true, state: {} }); // clear so back/refresh doesn't re-seed
+  }, [location.state]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const activeTab = tabs.find(t => t.key === activeKey) ?? null;
   const activeProject = activeTab ? projById[activeTab.projectId] : undefined;
 
@@ -155,6 +182,30 @@ export default function Workspace() {
     if (existing) { setActiveKey(existing.key); return; }
     const key = 'file:' + filePath;
     setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: filePath.split('/').pop() ?? filePath, kind: 'file', filePath }]));
+    setActiveKey(key);
+  };
+  // Open a generated/attached image in its own VS Code-style tab (not Finder).
+  const openImage = (projectId: string, assetId: string, name: string, imagePath?: string) => {
+    const key = 'image:' + assetId;
+    const existing = tabs.find(t => t.key === key);
+    if (existing) { setActiveKey(existing.key); return; }
+    setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: name || 'Image', kind: 'image', imageAssetId: assetId, imagePath }]));
+    setActiveKey(key);
+  };
+  // Open the live Browser tab for a project (one per project; deduped).
+  const openBrowser = (projectId: string) => {
+    const key = 'browser:' + projectId;
+    const existing = tabs.find(t => t.key === key);
+    if (existing) { setActiveKey(existing.key); return; }
+    setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: 'Browser', kind: 'browser' }]));
+    setActiveKey(key);
+  };
+  // Open a project hub tab (settings / instructions+memory / jobs) — deduped.
+  const openProject = (projectId: string, section: ProjectSection = 'settings') => {
+    const key = 'project:' + projectId;
+    setTabs(ts => ts.some(t => t.key === key)
+      ? ts.map(t => (t.key === key ? { ...t, projectSection: section } : t))
+      : [...ts, { key, projectId, sessionId: null, title: projById[projectId]?.name ?? 'Project', kind: 'project', projectSection: section }]);
     setActiveKey(key);
   };
   // Files the active chat wrote (from its turns' write-tool steps), newest first.
@@ -193,7 +244,7 @@ export default function Workspace() {
       setExpanded(e => new Set(e).add(proj.id));
     } catch { /* cancelled or failed */ }
   };
-  const recents = projects.filter(p => p.path).slice(0, 5);
+  const recents = projects.filter(p => p.path && projKind(p) !== 'design').slice(0, 5);
 
   // keep the active tab in view + recompute whether the strip overflows
   React.useLayoutEffect(() => {
@@ -258,13 +309,15 @@ export default function Workspace() {
   const chatHit = (s: ChatSession) => !q || s.title.toLowerCase().includes(q);
   const projHit = (p: Project) => !q || p.name.toLowerCase().includes(q) || sessions.some(s => s.projectId === p.id && s.title.toLowerCase().includes(q));
 
-  const kindCount = (k: KindFilter) => (k === 'all' ? projects.length : projects.filter(p => projKind(p) === k).length);
-  const visibleProjects = projects.filter(p => kindMatch(p) && projHit(p));
+  // CodeSpace shows coding work only — design projects live in the Design tab.
+  const codeProjects = projects.filter(p => projKind(p) !== 'design');
+  const kindCount = (k: KindFilter) => (k === 'all' ? codeProjects.length : codeProjects.filter(p => projKind(p) === k).length);
+  const visibleProjects = codeProjects.filter(p => kindMatch(p) && projHit(p));
   const sessionsByProject = (pid: string) => {
     const p = projById[pid];
     return sessions.filter(s => s.projectId === pid && (!q || chatHit(s) || (p && p.name.toLowerCase().includes(q)))).sort((a, b) => b.updatedAt - a.updatedAt);
   };
-  const pinned = sessions.filter(s => s.pinned && kindMatch(projById[s.projectId]) && (chatHit(s) || (projById[s.projectId]?.name.toLowerCase().includes(q) ?? false))).sort((a, b) => b.updatedAt - a.updatedAt);
+  const pinned = sessions.filter(s => s.pinned && projKind(projById[s.projectId]) !== 'design' && kindMatch(projById[s.projectId]) && (chatHit(s) || (projById[s.projectId]?.name.toLowerCase().includes(q) ?? false))).sort((a, b) => b.updatedAt - a.updatedAt);
 
   // a session row in the tree
   const SessionRow = ({ s, indent }: { s: ChatSession; indent: number }) => {
@@ -275,7 +328,7 @@ export default function Workspace() {
       <div className={`ws-row${isActive ? ' ws-active' : ''}`} onClick={() => openSession(s)} style={{
         display: 'flex', alignItems: 'center', gap: 7, padding: `5px 8px 5px ${indent}px`, borderRadius: 8, cursor: 'pointer',
         background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
-        <span style={{ width: 6, height: 6, borderRadius: 3, flexShrink: 0, background: open ? projColor(p) : 'var(--separator-strong)' }} />
+        <Icon name="chat" size={13} style={{ flexShrink: 0, color: open ? projColor(p) : 'var(--ink-tertiary)' }} />
         {renamingId === s.id ? (
           <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
             onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
@@ -310,7 +363,7 @@ export default function Workspace() {
         <div style={{ width: 260, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 14px 10px' }}>
             <Icon name="terminal" size={16} style={{ color: 'var(--blue)' }} />
-            <span style={{ flex: 1, font: '700 var(--fs-callout)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Workspace</span>
+            <span style={{ flex: 1, font: '700 var(--fs-callout)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>CodeSpace</span>
             <div style={{ position: 'relative' }}>
               <button onClick={() => setAddOpen(o => !o)} title="Add a project" className="ws-newbtn" style={{ width: 28, height: 28, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'transparent', color: addOpen ? 'var(--ink)' : 'var(--ink-tertiary)' }}>
                 <Icon name="plus" size={16} stroke={2.4} />
@@ -337,7 +390,7 @@ export default function Workspace() {
                         <div style={{ padding: '2px 9px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Recents</div>
                         {recents.map(p => (
                           <button key={p.id} onClick={() => { setAddOpen(false); setExpanded(e => new Set(e).add(p.id)); }} className="ws-ovf-item" title={p.path} style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '6px 9px', borderRadius: 8, cursor: 'pointer' }}>
-                            <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                            <Icon name="folder" size={13} style={{ flexShrink: 0, color: projColor(p) }} />
                             <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
                           </button>
                         ))}
@@ -408,14 +461,37 @@ export default function Workspace() {
               return (
                 <div key={p.id} className="ws-proj">
                   <div className="ws-row ws-proj-head" onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
-                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer' }}>
+                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer', position: 'relative' }}>
                     <Icon name="chevronRight" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
-                    <span style={{ width: 8, height: 8, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                    <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p) }} />
                     <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
                     {chats.length > 0 && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{chats.length}</span>}
+                    <button className="ws-newchat" title="Project · settings, jobs, memory" onClick={e => { e.stopPropagation(); setMenuProj(m => m === p.id ? null : p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0, position: 'relative' }}>
+                      <Icon name="more" size={15} />
+                    </button>
                     <button className="ws-newchat" title="New chat here" onClick={e => { e.stopPropagation(); newChat(p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)', flexShrink: 0 }}>
                       <Icon name="plus" size={14} stroke={2.4} />
                     </button>
+                    {menuProj === p.id && (
+                      <>
+                        <div onClick={e => { e.stopPropagation(); setMenuProj(null); }} style={{ position: 'fixed', inset: 0, zIndex: 50 }} />
+                        <div onClick={e => e.stopPropagation()} style={{ position: 'absolute', top: '100%', right: 6, zIndex: 51, marginTop: 2, minWidth: 184, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--card-shadow)', padding: 5 }}>
+                          {[
+                            { key: 'settings', icon: 'settings' as const, label: 'Project settings' },
+                            { key: 'instructions', icon: 'bookmark' as const, label: 'Instructions & memory' },
+                            { key: 'skills', icon: 'spark' as const, label: 'Project skills' },
+                            { key: 'jobs', icon: 'jobs' as const, label: 'Jobs' },
+                          ].map(it => (
+                            <button key={it.key} className="ws-ovf-item" onClick={() => { setMenuProj(null); openProject(p.id, it.key as ProjectSection); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
+                              <Icon name={it.icon} size={15} style={{ color: 'var(--ink-secondary)' }} /> {it.label}
+                            </button>
+                          ))}
+                          <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
+                          {p.path && <button className="ws-ovf-item" onClick={() => { setMenuProj(null); void api.revealPath(p.path!); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="folder" size={15} style={{ color: 'var(--ink-secondary)' }} /> Reveal in Finder</button>}
+                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); navigate('/skills-registry'); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="spark" size={15} style={{ color: 'var(--ink-secondary)' }} /> Skills</button>
+                        </div>
+                      </>
+                    )}
                   </div>
                   {isOpen && (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
@@ -424,7 +500,13 @@ export default function Workspace() {
                           <Icon name="plus" size={12} /> New chat
                         </button>
                       )}
-                      {chats.map(s => <SessionRow key={s.id} s={s} indent={26} />)}
+                      {(q || chatsAllOpen.has(p.id) ? chats : chats.slice(0, CHAT_PREVIEW)).map(s => <SessionRow key={s.id} s={s} indent={26} />)}
+                      {!q && chats.length > CHAT_PREVIEW && (
+                        <button onClick={() => setChatsAllOpen(prev => { const n = new Set(prev); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
+                          style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px 4px 26px', borderRadius: 8, color: 'var(--blue)', font: '600 var(--fs-caption)/1.3 var(--font-text)', cursor: 'pointer' }}>
+                          {chatsAllOpen.has(p.id) ? 'Show less' : `Show all ${chats.length} chats`}
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -450,7 +532,13 @@ export default function Workspace() {
                     {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: projColor(p) }} />}
                     {t.kind === 'file'
                       ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
-                      : <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />}
+                      : t.kind === 'browser'
+                      ? <Icon name="globe" size={12} style={{ color: 'var(--blue)', flexShrink: 0 }} />
+                      : t.kind === 'image'
+                      ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
+                      : t.kind === 'project'
+                      ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
+                      : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />}
                     <span style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
                     <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
                       <Icon name="x" size={11} stroke={2.6} />
@@ -475,7 +563,7 @@ export default function Workspace() {
                         return (
                           <div key={t.key} className="ws-ovf-item" onClick={() => { setActiveKey(t.key); setOvfOpen(false); }}
                             style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 9px', borderRadius: 8, cursor: 'pointer', background: on ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
-                            <span style={{ width: 7, height: 7, borderRadius: 3, flexShrink: 0, background: projColor(p) }} />
+                            <Icon name={t.kind === 'file' ? 'file' : t.kind === 'browser' ? 'globe' : t.kind === 'image' ? 'image' : 'chat'} size={13} style={{ flexShrink: 0, color: t.kind && t.kind !== 'chat' ? 'var(--ink-secondary)' : projColor(p) }} />
                             <span style={{ flex: 1, minWidth: 0, font: `${on ? 600 : 500} var(--fs-footnote)/1.25 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
                             {p && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', flexShrink: 0, maxWidth: 70, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>}
                             <button title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
@@ -489,8 +577,14 @@ export default function Workspace() {
                 )}
               </div>
             )}
+            {IS_LOCAL && (
+              <button onClick={() => openBrowser(activeTab?.projectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
+                title="Open the live browser for this project" className="ws-newbtn" style={{ width: 38, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
+                <Icon name="globe" size={15} />
+              </button>
+            )}
             <button onClick={() => newChat(activeTab?.projectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
-              title="New chat" className="ws-newbtn" style={{ width: 40, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: tabs.length ? '0.5px solid var(--separator)' : 'none', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
+              title="New chat" className="ws-newbtn" style={{ width: 40, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
               <Icon name="plus" size={16} stroke={2.4} />
             </button>
           </div>
@@ -516,8 +610,15 @@ export default function Workspace() {
                 <div key={t.key} style={{ position: 'absolute', inset: 0, display: t.key === activeKey ? 'flex' : 'none' }}>
                   {t.kind === 'file' && t.filePath
                     ? <FileViewer projectId={t.projectId} filePath={t.filePath} />
+                    : t.kind === 'image'
+                    ? <ImageViewer assetId={t.imageAssetId} name={t.title} imagePath={t.imagePath} />
+                    : t.kind === 'browser'
+                    ? <BrowserPane projectId={t.projectId} />
+                    : t.kind === 'project'
+                    ? <ProjectPanel projectId={t.projectId} section={t.projectSection} />
                     : <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
-                        sessionId={t.sessionId} onSessionCreated={onSessionCreated(t.key)} onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))} />}
+                        sessionId={t.sessionId} onSessionCreated={onSessionCreated(t.key)} onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
+                        onOpenImage={(assetId, name, imagePath) => openImage(t.projectId, assetId, name, imagePath)} />}
                 </div>
               ))}
             </div>

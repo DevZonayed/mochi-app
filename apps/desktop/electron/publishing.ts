@@ -30,6 +30,12 @@ export class PublishingEngine {
   importAsset(filePath: string, projectId: string | null): Asset {
     if (!filePath || !existsSync(filePath)) throw Object.assign(new Error('file not found'), { statusCode: 404 });
     const buf = readFileSync(filePath);
+    const sha = createHash('sha256').update(buf).digest('hex');
+    // Idempotent by content: re-importing identical bytes for the same project
+    // returns the existing Asset (keeps the codex harvest dedup'd across a turn's
+    // main + review-fix rounds, and a manual re-import a no-op).
+    const dup = this.store.listAssets().find(a => a.sha256 === sha && a.projectId === projectId);
+    if (dup) return dup;
     const kind = kindFromExt(filePath);
     let thumbDataUrl: string | undefined; let width: number | undefined; let height: number | undefined;
     if (kind === 'image') {
@@ -43,11 +49,45 @@ export class PublishingEngine {
     const asset = this.store.createAsset({
       source: 'import', kind, status: 'done', projectId,
       name: path.basename(filePath), localPath: filePath, bytes: buf.byteLength,
-      sha256: createHash('sha256').update(buf).digest('hex'), thumbDataUrl, width, height, cost: 0,
+      sha256: sha, thumbDataUrl, width, height, cost: 0,
     });
     this.emit('asset', asset);
     this.store.pushEvent({ kind: 'asset', title: `Imported ${asset.name}`, projectId });
     return asset;
+  }
+
+  /** Register raw bytes (a pasted/dropped image) as an Asset — writes them under
+      ~/Maestro/<project>/attachments/ then reuses importAsset (thumbnail + sha +
+      content dedup). Used for vision input attached to a chat message. */
+  importAssetBytes(buf: Buffer, name: string, projectId: string | null): Asset {
+    const sha = createHash('sha256').update(buf).digest('hex');
+    const dup = this.store.listAssets().find(a => a.sha256 === sha && a.projectId === projectId);
+    if (dup) return dup;
+    const projName = (projectId ? this.store.getProject(projectId)?.name : '') || 'default';
+    const safeProj = projName.replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
+    const dir = path.join(homedir(), 'Maestro', safeProj, 'attachments');
+    mkdirSync(dir, { recursive: true });
+    const ext = (path.extname(name).slice(1) || 'png').toLowerCase().replace('jpeg', 'jpg');
+    const base = safeName(path.basename(name, path.extname(name))) || 'pasted';
+    const file = path.join(dir, `${base}-${sha.slice(0, 8)}.${ext}`);
+    writeFileSync(file, buf);
+    return this.importAsset(file, projectId);
+  }
+
+  /** Save a non-media attachment (any file) under ~/Maestro/<project>/attachments
+      and return its absolute path. Not registered as an Asset — the agent just
+      reads it. Content-addressed name so re-attaching the same bytes is a no-op. */
+  saveAttachmentFile(buf: Buffer, name: string, projectId: string | null): string {
+    const sha = createHash('sha256').update(buf).digest('hex');
+    const projName = (projectId ? this.store.getProject(projectId)?.name : '') || 'default';
+    const safeProj = projName.replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
+    const dir = path.join(homedir(), 'Maestro', safeProj, 'attachments');
+    mkdirSync(dir, { recursive: true });
+    const ext = path.extname(name).slice(1).toLowerCase();
+    const base = safeName(path.basename(name, path.extname(name))) || 'file';
+    const file = path.join(dir, `${base}-${sha.slice(0, 8)}${ext ? '.' + ext : ''}`);
+    writeFileSync(file, buf);
+    return file;
   }
 
   /** Create a draft from an approved/done asset. */

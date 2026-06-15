@@ -17,7 +17,8 @@ export interface NavRoute {
 
 export const NAV_ROUTES: NavRoute[] = [
   { key: 'home', path: '/command-center', label: 'Home', icon: 'home' },
-  { key: 'workspace', path: '/workspace', label: 'Workspace', icon: 'terminal' },
+  { key: 'workspace', path: '/workspace', label: 'CodeSpace', icon: 'terminal' },
+  { key: 'design', path: '/design-workspace', label: 'Design', icon: 'brush' },
   { key: 'projects', path: '/projects', label: 'Projects', icon: 'layers' },
   { key: 'jobs', path: '/job-monitor', label: 'Jobs', icon: 'jobs' },
   { key: 'approvals', path: '/approvals', label: 'Approvals', icon: 'shield' },
@@ -35,6 +36,24 @@ export const SETTINGS_ROUTE: NavRoute = { key: 'settings', path: '/settings', la
 
 /** Every navigable destination (sidebar items + pinned Settings), for active-key lookup. */
 export const ALL_NAV: NavRoute[] = [...NAV_ROUTES, SETTINGS_ROUTE];
+
+/** Coding-genre navigation. Both genres now LEAD with the Workspace (CodeSpace)
+    and Design pair so the operator can cross between code and design from either
+    header. Costs and Skills are intentionally NOT here — they live in the Settings
+    page and in each project's settings tabs, not as standing top-nav menus. Home,
+    Projects, Trends and Approvals are hidden too (Approvals surfaces as a bell only
+    when a gate is actually pending). Every route stays registered in App.tsx, so
+    dropping a key here hides the menu without breaking the route. */
+export const CODING_NAV: NavRoute[] = (['workspace', 'design', 'jobs', 'scheduler', 'templates'] as const)
+  .map(k => NAV_ROUTES.find(r => r.key === k))
+  .filter((r): r is NavRoute => !!r);
+
+/** Design-genre navigation — same Workspace + Design lead, plus the media Studio
+    a designer reaches for. Projects, Trends and Costs are dropped (Costs lives in
+    Settings; Projects/Trends are hidden for now). */
+export const DESIGN_NAV: NavRoute[] = (['workspace', 'design', 'studio'] as const)
+  .map(k => NAV_ROUTES.find(r => r.key === k))
+  .filter((r): r is NavRoute => !!r);
 
 /** Nav key → real route path. Keys and paths differ ('jobs' → '/job-monitor');
     guessing '/' + key sends mismatched keys into the router's catch-all (Home).

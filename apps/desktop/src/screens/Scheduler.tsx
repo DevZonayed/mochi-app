@@ -37,7 +37,7 @@ const SCHEDULER_CSS = `
   @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
   @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
 
-  .cal-scroll::-webkit-scrollbar { width: 9px; height: 9px; }
+  .cal-scroll::-webkit-scrollbar { width: 11px; height: 11px; }
 `;
 
 // ──────────────────────────────────────────────────────────────────────────

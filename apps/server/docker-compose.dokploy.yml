@@ -1,0 +1,19 @@
+services:
+  maestro-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      MAESTRO_REGISTRY_DB: /data/maestro-registry.sqlite
+    volumes:
+      - maestro_registry_data:/data
+    ports:
+      - "8080:8080"
+
+volumes:
+  maestro_registry_data:

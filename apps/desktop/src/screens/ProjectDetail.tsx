@@ -24,7 +24,7 @@ import {
 } from '../lib/ui';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -55,6 +55,15 @@ export const COMPOSER_CSS = `
   .send-fab { transition: transform 160ms cubic-bezier(.32,.72,0,1), background 160ms ease, box-shadow 160ms ease; }
   .send-fab:not(:disabled):hover { transform: scale(1.06); }
   .send-fab:not(:disabled):active { transform: scale(.94); }
+  .att-chip { transition: border-color 120ms ease, background 120ms ease; }
+  .att-chip:hover { border-color: color-mix(in srgb, var(--blue) 45%, var(--separator-strong)) !important; background: var(--surface) !important; }
+  .att-card { animation: attIn 130ms cubic-bezier(.32,.72,0,1); }
+  @keyframes attIn { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+  .att-scroll { scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: var(--fill-secondary) transparent; overscroll-behavior: contain; }
+  .att-scroll::-webkit-scrollbar { width: 11px; height: 11px; }
+  .att-scroll::-webkit-scrollbar-track { background: transparent; }
+  .att-scroll::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 9px; border: 3px solid transparent; background-clip: padding-box; }
+  .att-scroll::-webkit-scrollbar-thumb:hover { background: var(--ink-quaternary, var(--ink-tertiary)); background-clip: padding-box; }
 `;
 
 /* ───────────────── page-specific CSS (from Project Detail.html <style>) ───────────────── */
@@ -186,8 +195,8 @@ const PAGE_CSS = `
   @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
   @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
 
-  main::-webkit-scrollbar { width: 9px; }
-  main::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  main::-webkit-scrollbar { width: 11px; }
+  main::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
   textarea::placeholder { color: var(--ink-tertiary); }
   ::selection { background: rgba(0,122,255,0.22); }
 `;
@@ -792,9 +801,102 @@ function McpRow({ m, last }: { m: McpDef; last?: boolean }) {
   );
 }
 
-function SkillsTab() {
+function SkillsTab({ projectId }: { projectId: string | null }) {
+  const [installed, setInstalled] = React.useState<InstalledSkill[]>([]);
+  const [q, setQ] = React.useState('');
+  const [results, setResults] = React.useState<RegistrySkillSummary[]>([]);
+  const [searching, setSearching] = React.useState(false);
+  const [busy, setBusy] = React.useState<string | null>(null);
+  const [meta, setMeta] = React.useState<{ count: number } | null>(null);
+  const reload = React.useCallback(() => {
+    if (!projectId) return;
+    api.listProjectSkills(projectId).then(r => setInstalled(r.skills)).catch(() => {});
+  }, [projectId]);
+  React.useEffect(() => { reload(); api.skillRegistryMeta().then(m => setMeta({ count: m.count })).catch(() => {}); }, [reload]);
+  const installedIds = new Set(installed.map(s => s.id));
+  const runSearch = async (term: string) => {
+    setSearching(true);
+    try { const r = await api.searchSkills(term, 24); setResults(r.results); } catch { setResults([]); }
+    setSearching(false);
+  };
+  const add = async (s: RegistrySkillSummary) => {
+    if (!projectId) return;
+    setBusy(s.id);
+    try {
+      await api.addSkillToProject(projectId, {
+        skillId: s.id, name: s.name, description: s.description, risk: s.risk, source: s.source,
+        version: s.version, disabledReason: s.disabledReason, mirrorRepo: s.sourceRepo || s.mirrorRepo, auditStatus: s.auditStatus,
+      });
+      reload();
+    }
+    catch { /* surfaced by absence */ }
+    setBusy(null);
+  };
+  const remove = async (s: InstalledSkill) => {
+    if (!projectId) return;
+    setInstalled(list => list.filter(x => x.id !== s.id));
+    try { await api.removeSkillFromProject(projectId, s.id); } catch { reload(); }
+  };
+  const riskTint = (r?: string) => r === 'MEDIUM' ? 'var(--orange)' : r === 'LOW' || r === 'SAFE' || r === 'NONE' ? 'var(--green)' : 'var(--ink-tertiary)';
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 22, maxWidth: 720 }}>
+      {/* Registry search → add to this project */}
+      <div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 10 }}>
+          <div style={{ font: '700 var(--fs-headline)/1 var(--font-display)', color: 'var(--ink)' }}>Add a skill</div>
+          {meta && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{meta.count} secure skills in the registry</span>}
+        </div>
+        <div style={{ position: 'relative', marginBottom: 10 }}>
+          <Icon name="search" size={15} style={{ position: 'absolute', left: 12, top: 11, color: 'var(--ink-tertiary)' }} />
+          <input value={q} onChange={e => { setQ(e.target.value); }} onKeyDown={e => { if (e.key === 'Enter') void runSearch(q); }}
+            placeholder="Search skills — e.g. pdf, google sheets, stripe, next.js…"
+            style={{ width: '100%', height: 38, padding: '0 12px 0 34px', borderRadius: 10, border: '0.5px solid var(--separator)', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-subhead)/1 var(--font-text)', outline: 'none', boxSizing: 'border-box' }} />
+        </div>
+        {searching && <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', padding: '4px 2px' }}>Searching…</div>}
+        {!searching && results.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {results.map(s => {
+              const has = installedIds.has(s.id);
+              return (
+                <div key={s.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '10px 12px', borderRadius: 11, background: 'var(--surface)', border: '0.5px solid var(--separator)' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
+                      <span style={{ width: 6, height: 6, borderRadius: 3, background: riskTint(s.risk), flexShrink: 0 }} title={`audit risk: ${s.risk}`} />
+                      <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.sourceRepo || s.mirrorRepo || s.id.split('/').slice(0, 2).join('/')}</span>
+                    </div>
+                    <div style={{ font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 3 }}>{s.description}</div>
+                  </div>
+                  <button onClick={() => has ? undefined : void add(s)} disabled={has || busy === s.id}
+                    style={{ flexShrink: 0, height: 30, padding: '0 13px', borderRadius: 8, border: 'none', background: has ? 'var(--fill-tertiary)' : 'var(--blue)', color: has ? 'var(--ink-tertiary)' : '#fff', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: has ? 'default' : 'pointer' }}>
+                    {has ? 'Added' : busy === s.id ? 'Adding…' : 'Add'}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {!searching && q && results.length === 0 && <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', padding: '6px 2px' }}>No skills match “{q}”. The agent can also add skills itself during a run.</div>}
+      </div>
+
+      {/* Installed in this project */}
+      {installed.length > 0 && (
+        <GroupedList header="Installed in this project">
+          {installed.map((s, i) => (
+            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px', borderBottom: i === installed.length - 1 ? 'none' : '0.5px solid var(--separator)' }}>
+              <Icon name="spark" size={16} style={{ color: 'var(--indigo)', flexShrink: 0 }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</div>
+                {s.description && <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.description}</div>}
+              </div>
+              {s.sha256 && <span title={s.sha256} style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{s.sha256.slice(0, 8)}</span>}
+              <code style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>.claude/skills/{s.slug}</code>
+              <button onClick={() => void remove(s)} className="link-btn" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Remove</button>
+            </div>
+          ))}
+        </GroupedList>
+      )}
+
       <GroupedList header="Starter skills">
         {SKILLS.map((s, i) => <SkillRow key={s.name} s={s} last={i === SKILLS.length - 1} />)}
       </GroupedList>
@@ -1131,6 +1233,9 @@ function renderChatBody(text: string, keyBase = 'b'): React.ReactNode[] {
 /* Tool/skill metadata — which glyph + accent tint a tool family reads as. */
 const TOOL_META = (name: string): { icon: IconName; tint: string } => {
   const n = name.toLowerCase();
+  // Image tools (e.g. mcp__maestro__generate_image) — tint them like media instead
+  // of the flat neutral default, which reads as a murky black chip in dark mode.
+  if (/image|photo|picture/.test(n)) return { icon: 'image', tint: 'var(--purple)' };
   if (/bash|shell|command|exec|terminal/.test(n)) return { icon: 'terminal', tint: 'var(--blue)' };
   if (/read|write|edit|glob|grep|notebook|file|patch|ls/.test(n)) return { icon: 'folder', tint: 'var(--teal)' };
   if (/web|search|fetch|browser/.test(n)) return { icon: 'telescope', tint: 'var(--indigo)' };
@@ -1138,6 +1243,44 @@ const TOOL_META = (name: string): { icon: IconName; tint: string } => {
   return { icon: 'command', tint: 'var(--ink-secondary)' };
 };
 const fmtToolDur = (ms?: number): string => (ms == null ? '' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`);
+/** Clean a tool name for display — drop the mcp__<server>__ prefix and underscores
+    so e.g. "mcp__maestro__generate_image" shows as "generate image". */
+const prettyToolName = (name: string): string => name.replace(/^mcp__[^_]+__/, '').replace(/_/g, ' ').trim() || name;
+
+/** A human verb for the tool the agent is running right now. */
+const TOOL_VERB = (name: string): string => {
+  const n = name.toLowerCase();
+  if (/generate_image|imagegen/.test(n)) return 'Generating image';
+  if (/bash|shell|command|exec|terminal|run/.test(n)) return 'Running';
+  if (/write|edit|create|patch|notebook|apply|multiedit/.test(n)) return 'Editing';
+  if (/read|view|cat|glob|ls|open/.test(n)) return 'Reading';
+  if (/grep|search/.test(n)) return 'Searching';
+  if (/web|fetch|browser/.test(n)) return 'Browsing';
+  if (/skill|task|agent|subagent/.test(n)) return 'Working';
+  return 'Running';
+};
+/** What the agent is doing RIGHT NOW — derived live from the streamed transcript
+    and the engine's phase, so a run never feels frozen or "blank" between steps. */
+function liveActivity(job: Job, transcript: TranscriptItem[]): string {
+  const stage = (job.stage || '').trim();
+  // The engine's review-loop phases are the most informative — surface them verbatim.
+  if (/review|fixing|reviewer/i.test(stage)) return stage.replace(/…+$/, '') + '…';
+  const last = transcript.length ? transcript[transcript.length - 1] : null;
+  if (last) {
+    if (last.kind === 'tool') {
+      if (last.toolStatus === 'running') {
+        const what = (last.text || '').replace(/\s+/g, ' ').trim();
+        const verb = TOOL_VERB(last.name ?? '');
+        return what ? `${verb} ${what.length > 54 ? what.slice(0, 54) + '…' : what}` : `${verb}…`;
+      }
+      return 'Thinking…'; // tool finished — the model is deciding the next step
+    }
+    if (last.kind === 'image') return 'Saving image…';
+    if (last.kind === 'ask') return 'Waiting for your answer…';
+    if ((last.kind === 'text' || last.kind === 'result') && last.text.trim()) return 'Responding…';
+  }
+  return 'Thinking…';
+}
 
 /** One step in the agent's tool sequence — a crisp, tinted, monospace card. */
 function ToolNode({ item, connect }: { item: TranscriptItem; connect: boolean }) {
@@ -1156,7 +1299,7 @@ function ToolNode({ item, connect }: { item: TranscriptItem; connect: boolean })
           background: `color-mix(in srgb, ${accent} 18%, transparent)`, color: accent }}>
           <Icon name={icon} size={13} />
         </span>
-        <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{item.name}</span>
+        <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{prettyToolName(item.name ?? '')}</span>
         {isWrite
           ? <FileChip path={item.text} preview={item.preview} />
           : item.text && <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text}</span>}
@@ -1338,15 +1481,63 @@ const fmtDurationLive = (ms: number): string => {
   return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${(s % 60).toFixed(1)}s`;
 };
 
-function UserBubble({ text }: { text: string }) {
+/** Lets a generated/attached image open in an in-app viewer tab (provided by the
+    Workspace). Null when the chat is used standalone — then we reveal in Finder. */
+const ImageOpenContext = React.createContext<((assetId: string, name: string, imagePath?: string) => void) | null>(null);
+
+/** A small thumbnail of an image the user attached — loaded on-device by assetId. */
+function UserImageThumb({ img }: { img: ChatImage }) {
+  const [src, setSrc] = React.useState<string | null>(null);
+  const onOpenImage = React.useContext(ImageOpenContext);
+  React.useEffect(() => {
+    let alive = true;
+    if (IS_LOCAL && img.assetId) api.assetImage(img.assetId).then(d => { if (alive) setSrc(d); }).catch(() => {});
+    return () => { alive = false; };
+  }, [img.assetId]);
+  const clickable = IS_LOCAL && !!img.assetId;
+  const open = () => {
+    if (onOpenImage && img.assetId) onOpenImage(img.assetId, img.name || 'Image', img.imagePath);
+    else if (img.imagePath) void api.revealPath(img.imagePath);
+  };
   return (
-    <div className="chat-msg" style={{ display: 'flex', justifyContent: 'flex-end' }}>
-      <div style={{ maxWidth: '78%', padding: '10px 14px', borderRadius: '18px 18px 5px 18px',
-        background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
-        color: '#fff', font: '400 14px/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-        boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
-        {text}
-      </div>
+    <div onClick={open} title={clickable ? (img.name || 'Open image') : (img.name || 'image')}
+      style={{ width: 158, maxWidth: '100%', borderRadius: 12, overflow: 'hidden', border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', cursor: clickable ? 'pointer' : 'default' }}>
+      {src
+        ? <img src={src} alt={img.name || 'attached image'} style={{ display: 'block', width: '100%', maxHeight: 200, objectFit: 'cover' }} />
+        : <div style={{ height: 92, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}><Icon name="image" size={18} /></div>}
+    </div>
+  );
+}
+
+function UserBubble({ text, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
+  return (
+    <div className="chat-msg" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+      {images && images.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: '78%' }}>
+          {images.map((im, i) => <UserImageThumb key={`${im.assetId}-${i}`} img={im} />)}
+        </div>
+      )}
+      {files && files.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: '78%' }}>
+          {files.map((f, i) => (
+            <div key={i} title={f.name} style={{ display: 'flex', alignItems: 'center', gap: 8, maxWidth: 240, height: 42, padding: '0 12px 0 9px', borderRadius: 11, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-elevated)' }}>
+              <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={14} /></span>
+              <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+                <span style={{ font: '600 var(--fs-caption)/1.15 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{f.name === 'Pasted text.txt' ? 'Pasted text' : f.name}</span>
+                <span style={{ font: '400 9px/1.1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{f.kind === 'text' ? 'text' : (f.mime || 'file')} · {fmtBytes(f.bytes)}</span>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {text && (
+        <div style={{ maxWidth: '78%', padding: '10px 14px', borderRadius: '18px 18px 5px 18px',
+          background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
+          color: '#fff', font: '400 14px/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
+          {text}
+        </div>
+      )}
     </div>
   );
 }
@@ -1373,19 +1564,111 @@ function TurnMeta({ job, elapsed, toolCount, live }: { job: Job; elapsed: string
 /* A reviewer's verdict block (SP3): the second engine's findings + APPROVED /
    NEEDS WORK, tinted green/orange. Fix rounds stream in as normal turns after. */
 function ReviewCard({ item }: { item: TranscriptItem }) {
-  const needsWork = item.verdict === 'needs-work';
+  // The primary addressed a needs-work review → show it as RESOLVED (green), not a
+  // lingering "needs work", so the finished thread reads as solved.
+  const resolved = !!item.resolved;
+  const needsWork = item.verdict === 'needs-work' && !resolved;
   const tint = needsWork ? 'var(--orange)' : 'var(--green)';
+  const label = resolved ? 'Resolved' : needsWork ? 'Needs work' : 'Approved';
   return (
     <div style={{ margin: '8px 0 2px', border: `0.5px solid color-mix(in srgb, ${tint} 38%, var(--separator))`, borderRadius: 12, background: `color-mix(in srgb, ${tint} 6%, var(--bg-elevated))`, overflow: 'hidden' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: '0.5px solid var(--separator)' }}>
-        <Icon name="shield" size={14} style={{ color: tint, flexShrink: 0 }} />
+        <Icon name={resolved ? 'checkCircle' : 'shield'} size={14} style={{ color: tint, flexShrink: 0 }} />
         <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Reviewer · {item.name ?? 'review'}</span>
+        {resolved && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>· addressed by the agent</span>}
         <span style={{ flex: 1 }} />
-        <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: tint, textTransform: 'uppercase' }}>{needsWork ? 'Needs work' : 'Approved'}</span>
+        <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: tint, textTransform: 'uppercase' }}>{label}</span>
       </div>
       <div style={{ padding: '6px 12px 8px' }}>{renderChatBody(item.text, 'rvb')}</div>
     </div>
   );
+}
+
+/* A generated image, shown inline as a COMPACT, collapsed chip (thumbnail +
+   caption) so it sits with the tool flow instead of dumping a huge picture into
+   the chat. Click → opens the full image in its own in-app viewer tab (Workspace);
+   standalone, it falls back to reveal-in-Finder. Bytes load on-device by Asset id
+   via a desktop-only IPC (never the relay) — phone/web shows a placeholder. */
+function InlineImage({ item }: { item: TranscriptItem }) {
+  const [src, setSrc] = React.useState<string | null>(null);
+  const [failed, setFailed] = React.useState(false);
+  const onOpenImage = React.useContext(ImageOpenContext);
+  React.useEffect(() => {
+    let alive = true;
+    if (IS_LOCAL && item.assetId) {
+      api.assetImage(item.assetId)
+        .then(d => { if (alive) { d ? setSrc(d) : setFailed(true); } })
+        .catch(() => { if (alive) setFailed(true); });
+    }
+    return () => { alive = false; };
+  }, [item.assetId]);
+  const caption = item.alt || item.text || '';
+  const openable = IS_LOCAL && !!item.assetId;
+  const open = () => {
+    if (!openable) return;
+    if (onOpenImage && item.assetId) onOpenImage(item.assetId, caption || 'Generated image', item.imagePath);
+    else if (item.imagePath) void api.revealPath(item.imagePath);
+  };
+  return (
+    <button onClick={open} disabled={!openable} title={openable ? 'Open image' : caption}
+      style={{ display: 'flex', alignItems: 'center', gap: 11, width: '100%', maxWidth: 440, margin: '7px 0 2px', padding: '7px 11px 7px 7px', borderRadius: 12,
+        textAlign: 'left', cursor: openable ? 'pointer' : 'default',
+        background: 'color-mix(in srgb, var(--purple) 8%, var(--bg-elevated))',
+        border: '0.5px solid color-mix(in srgb, var(--purple) 26%, var(--separator))' }}>
+      <span style={{ width: 46, height: 46, borderRadius: 9, overflow: 'hidden', flexShrink: 0, background: 'var(--bg-grouped)', display: 'grid', placeItems: 'center' }}>
+        {src ? <img src={src} alt={caption} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          : (failed || !IS_LOCAL) ? <Icon name="image" size={18} style={{ color: 'var(--purple)' }} />
+          : <Spinner size={14} color="var(--purple)" />}
+      </span>
+      <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1, gap: 2 }}>
+        <span style={{ font: '600 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)' }}>Generated image</span>
+        {caption && <span style={{ font: '400 var(--fs-caption)/1.25 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{caption}</span>}
+      </span>
+      {openable && <Icon name="arrowRight" size={14} stroke={2.2} style={{ color: 'var(--purple)', flexShrink: 0, transform: 'rotate(-45deg)' }} />}
+    </button>
+  );
+}
+
+/* Smooth streaming. The Claude Agent SDK (and Codex even more so) hands us text
+   in coarse ~70-char bursts every ~0.4–0.7s, not token-by-token — so a faithful
+   render steps in half-second jumps that read as "updates every second", not a
+   stream. This types the buffered text out at a steady, adaptive cadence: each
+   frame we reveal a few more chars, draining the backlog over ~0.45s, with a
+   lively floor and a bound on how far behind we ever fall (so a big Codex block
+   shows quickly instead of crawling). Settled turns render full text directly —
+   this component is only mounted for the one live, growing block. */
+const STREAM_MIN_CPS = 80;     // chars/sec floor — keep it alive on a trickle
+const STREAM_MAX_CPS = 1400;   // ceiling so big blocks don't machine-gun
+const STREAM_DRAIN_S = 0.45;   // aim to empty the current backlog this fast
+const STREAM_MAX_LAG = 1800;   // never trail the buffer by more than this (chars)
+function StreamingBody({ text, keyBase }: { text: string; keyBase: string }): React.ReactElement {
+  const [shownLen, setShownLen] = React.useState(text.length);
+  const shownRef = React.useRef(text.length);
+  const targetRef = React.useRef(text.length);
+  targetRef.current = text.length; // picked up by the rAF loop without re-subscribing
+  React.useEffect(() => {
+    let raf = 0;
+    let last = performance.now();
+    const tick = (now: number) => {
+      const dt = Math.min(64, now - last); last = now;
+      const target = targetRef.current;
+      let cur = shownRef.current;
+      if (cur > target) cur = target; // text replaced with something shorter — resync
+      if (cur < target) {
+        let backlog = target - cur;
+        if (backlog > STREAM_MAX_LAG) { cur = target - STREAM_MAX_LAG; backlog = STREAM_MAX_LAG; }
+        const cps = Math.min(STREAM_MAX_CPS, Math.max(STREAM_MIN_CPS, backlog / STREAM_DRAIN_S));
+        const add = Math.max(1, Math.ceil((cps * dt) / 1000));
+        cur = Math.min(target, cur + add);
+        shownRef.current = cur;
+        setShownLen(cur);
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+  return <>{renderChatBody(text.slice(0, shownLen), keyBase)}</>;
 }
 
 function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { caretAt?: number; onAnswer?: (t: string) => void; answered?: boolean }): React.ReactNode[] {
@@ -1403,11 +1686,16 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
     } else if (it.kind === 'review') {
       blocks.push(<ReviewCard key={`${keyPrefix}rv${i}`} item={it} />);
       i++;
+    } else if (it.kind === 'image') {
+      blocks.push(<InlineImage key={`${keyPrefix}im${i}`} item={it} />);
+      i++;
     } else {
       const idx = i;
       blocks.push(
         <div key={`${keyPrefix}b${idx}`} style={{ margin: idx > 0 ? '4px 0 0' : 0 }}>
-          {renderChatBody(it.text, `${keyPrefix}${it.kind === 'result' ? 'r' : 't'}${idx}`)}
+          {opts.caretAt === idx
+            ? <StreamingBody text={it.text} keyBase={`${keyPrefix}t${idx}`} />
+            : renderChatBody(it.text, `${keyPrefix}${it.kind === 'result' ? 'r' : 't'}${idx}`)}
           {opts.caretAt === idx && <span className="chat-caret" />}
         </div>
       );
@@ -1440,9 +1728,12 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   // (narration + tools) that collapses once the turn is done. A turn that ends
   // in a question stays fully expanded — questions are never hidden.
   const hasAsk = transcript.some(t => t.kind === 'ask');
+  // A generated image is never "work" to be collapsed away — keep image turns fully
+  // expanded so the picture (and anything after it) always renders.
+  const hasImage = transcript.some(t => t.kind === 'image');
   let finalIdx = -1;
   for (let k = transcript.length - 1; k >= 0; k--) { if (transcript[k].kind === 'text' || transcript[k].kind === 'result') { finalIdx = k; break; } }
-  const collapsible = !live && !hasAsk && finalIdx > 0 && transcript.slice(0, finalIdx).some(t => t.kind === 'tool' || t.kind === 'text');
+  const collapsible = !live && !hasAsk && !hasImage && finalIdx > 0 && transcript.slice(0, finalIdx).some(t => t.kind === 'tool' || t.kind === 'text');
   const [expanded, setExpanded] = React.useState(false);
 
   const toolCount = transcript.filter(t => t.kind === 'tool').length;
@@ -1472,7 +1763,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   } else if (hasBody) {
     body = (
       <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
-        {renderChatBody(job.output ?? '')}
+        {live ? <StreamingBody text={job.output ?? ''} keyBase="b" /> : renderChatBody(job.output ?? '')}
         {live && <span className="chat-caret" />}
       </div>
     );
@@ -1502,13 +1793,16 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
             </span>
           )}
           <span style={{ flex: 1 }} />
-          {(live || job.tokens > 0 || job.cost > 0) && <TurnMeta job={job} elapsed={elapsed} toolCount={toolCount} live={live} />}
           {job.status === 'done' && replyText && <CopyButton text={replyText} className="turn-copy" />}
         </div>
         {body}
-        {!hasBody && live && (
-          <div style={{ font: '500 14px/1.5 var(--font-text)' }}>
-            <span className="think-shimmer">{job.stage || 'Thinking…'}</span>
+        {/* Always-on "what it's doing right now" heartbeat while the turn runs —
+           a spinner + the live activity (current tool / thinking / responding /
+           reviewing), so the run never feels blank between steps. */}
+        {live && (
+          <div style={{ marginTop: hasBody ? 9 : 1, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Spinner size={12} color="var(--purple)" />
+            <span className="think-shimmer" style={{ font: '500 13.5px/1.4 var(--font-text)' }}>{liveActivity(job, transcript)}</span>
           </div>
         )}
         {job.status === 'failed' && (
@@ -1527,6 +1821,13 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
         {job.status === 'cancelled' && (
           <div style={{ marginTop: 5, display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
             <Icon name="x" size={11} stroke={2.4} /> Stopped
+          </div>
+        )}
+        {/* Timing / tokens / cost at the BOTTOM of the message so it stays visible
+            no matter how long the reply scrolls. */}
+        {(live || job.tokens > 0 || job.cost > 0) && (
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: hasBody ? 8 : 4 }}>
+            <TurnMeta job={job} elapsed={elapsed} toolCount={toolCount} live={live} />
           </div>
         )}
       </div>
@@ -1712,7 +2013,19 @@ function ChatMinimap({ turns, scrollRef }: { turns: Job[]; scrollRef: React.RefO
   );
 }
 
-export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, flush, autoFocus }: {
+/* A composer attachment before send: an image (vision), a text blob (pasted text
+   or a code/text file — inlined for the agent), or any other file (saved + read). */
+type Attach =
+  | { id: string; kind: 'image'; name: string; mime: string; dataUrl: string }
+  | { id: string; kind: 'text'; name: string; content: string }
+  | { id: string; kind: 'file'; name: string; mime: string; dataB64: string; size: number };
+const SUPPORTED_IMG = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+const TEXT_EXT = /\.(txt|md|markdown|mdx|rst|json|jsonc|ya?ml|toml|ini|cfg|conf|csv|tsv|log|xml|html?|svg|css|scss|sass|less|js|jsx|ts|tsx|mjs|cjs|py|rb|go|rs|java|kt|kts|c|h|cc|cpp|hpp|cs|php|swift|m|mm|sh|bash|zsh|fish|sql|graphql|gql|env|gitignore|dockerfile|makefile|gradle|properties|vue|svelte|astro|r|lua|pl|pm|dart|ex|exs|erl|clj|scala|tf|proto)$/i;
+const isTextFile = (f: File): boolean =>
+  f.type.startsWith('text/') || /json|xml|javascript|typescript|ecmascript|csv|yaml|x-sh|x-python|x-ruby|toml|markdown/.test(f.type) || TEXT_EXT.test(f.name) || (!f.type && f.size <= 512 * 1024);
+const fmtBytes = (n?: number): string => (n == null ? '' : n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
+
+export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, onOpenImage, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
   sessionId: string | null;
@@ -1720,11 +2033,18 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   /** Lifts this chat's turns (jobs) to the parent — used by the Workspace's
       "Changed files" panel to read the write-tool activity. */
   onTurns?: (jobs: Job[]) => void;
+  /** Open a generated/attached image in an in-app viewer tab (Workspace only). */
+  onOpenImage?: (assetId: string, name: string, imagePath?: string) => void;
   flush?: boolean;
   autoFocus?: boolean;
 }) {
   const [turns, setTurns] = React.useState<Job[]>([]);
   React.useEffect(() => { onTurns?.(turns); }, [turns]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Stable wrapper so the image-open context value never changes identity (would
+  // otherwise re-render every image chip on each streaming frame).
+  const onOpenImageRef = React.useRef(onOpenImage);
+  onOpenImageRef.current = onOpenImage;
+  const openImageStable = React.useMemo(() => (a: string, n: string, p?: string) => onOpenImageRef.current?.(a, n, p), []);
   const [activeId, setActiveId] = React.useState<string | null>(sessionId);
   const [text, setText] = React.useState('');
   // Primary (coding) + reviewer model. Remembered across the app via localStorage;
@@ -1766,6 +2086,18 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [optsOpen, setOptsOpen] = React.useState(false); // reviewer + schedule popover
   const [schedNote, setSchedNote] = React.useState('');
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
+  const [attachments, setAttachments] = React.useState<Attach[]>([]); // images / text / files
+  // Hover preview for a text attachment — a smooth, scrollable peek of the content.
+  const [hoverAtt, setHoverAtt] = React.useState<{ id: string; rect: DOMRect } | null>(null);
+  const hoverTimer = React.useRef<number | undefined>(undefined);
+  const openPreview = (id: string, el: HTMLElement) => { window.clearTimeout(hoverTimer.current); setHoverAtt({ id, rect: el.getBoundingClientRect() }); };
+  const keepPreview = () => window.clearTimeout(hoverTimer.current);
+  const closePreviewSoon = () => { window.clearTimeout(hoverTimer.current); hoverTimer.current = window.setTimeout(() => setHoverAtt(null), 180); };
+  React.useEffect(() => () => window.clearTimeout(hoverTimer.current), []);
+  const [dragOver, setDragOver] = React.useState(false);
+  const fileRef = React.useRef<HTMLInputElement>(null);
+  const attachmentsRef = React.useRef(attachments);
+  attachmentsRef.current = attachments; // fresh count for addFiles' over-cap notice
   const activeRef = React.useRef<string | null>(activeId);
   activeRef.current = activeId;
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -1825,9 +2157,15 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending');
 
   // The actual send — no guards. Used directly, by the queue drainer, and by steer.
-  const sendRaw = React.useCallback(async (raw: string): Promise<boolean> => {
+  const sendRaw = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
     const t = raw.trim();
-    if (!t || !projectId) return false;
+    const list = atts ?? [];
+    const imgs = list.filter((a): a is Extract<Attach, { kind: 'image' }> => a.kind === 'image')
+      .map(a => ({ name: a.name, mime: a.mime, dataB64: a.dataUrl.includes(',') ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : a.dataUrl }));
+    const files = list.filter(a => a.kind !== 'image').map(a => a.kind === 'text'
+      ? { name: a.name, kind: 'text' as const, content: a.content }
+      : { name: a.name, kind: 'file' as const, mime: (a as Extract<Attach, { kind: 'file' }>).mime, dataB64: (a as Extract<Attach, { kind: 'file' }>).dataB64 });
+    if ((!t && !imgs.length && !files.length) || !projectId) return false;
     setSendError('');
     stickBottom.current = true;
     try {
@@ -1836,6 +2174,8 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
         effort: EFFORT_TO_API[effort], plan: planMode, goal: goalMode,
         ...(primaryKey ? { modelKey: primaryKey } : {}),
         ...(reviewerKey ? { reviewerKey } : {}),
+        ...(imgs.length ? { images: imgs } : {}),
+        ...(files.length ? { files } : {}),
       });
       if (activeRef.current !== resp.session.id) {
         activeRef.current = resp.session.id; // match the streamed job immediately
@@ -1863,17 +2203,76 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   }, [projectId, streaming, sendRaw]);
 
   // STEER: interrupt the running turn and send right now (session resumes with context).
-  const sendNow = React.useCallback(async (raw: string) => {
+  const sendNow = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
     const t = raw.trim();
-    if (!t) return;
+    if (!t && !(atts?.length)) return false;
     setText('');
     if (taRef.current) taRef.current.style.height = 'auto';
     if (lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending')) {
       try { await api.cancelJob(lastTurn.id); } catch { /* already gone */ }
     }
-    const ok = await sendRaw(t);
+    const ok = await sendRaw(t, atts);
     if (!ok) setText(raw);
+    return ok;
   }, [lastTurn, sendRaw]);
+
+  // ── Attachments: paste, drop, or pick — images (vision), text/code (inlined),
+  //    or any other file (saved + read by the agent). ─────────────────────────
+  const MAX_ATTACH = 8;
+  const newId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const pushAttach = React.useCallback((a: Attach) => { setSendError(''); setAttachments(arr => arr.length >= MAX_ATTACH ? arr : [...arr, a]); }, []);
+  const addFiles = React.useCallback((files: FileList | File[] | null) => {
+    if (!files) return;
+    const all = Array.from(files);
+    const remaining = Math.max(0, MAX_ATTACH - attachmentsRef.current.length);
+    if (all.length > remaining) setSendError(`Up to ${MAX_ATTACH} attachments per message — ${all.length - remaining} skipped.`);
+    for (const f of all.slice(0, remaining)) {
+      if (f.size > 30 * 1024 * 1024) { setSendError(`"${f.name || 'file'}" is too large (max 30 MB).`); continue; }
+      const reader = new FileReader();
+      if (f.type.startsWith('image/') && SUPPORTED_IMG.includes(f.type)) {
+        reader.onload = () => { const dataUrl = String(reader.result || ''); if (dataUrl.startsWith('data:image/')) pushAttach({ id: newId(), kind: 'image', name: f.name || 'pasted.png', mime: f.type || 'image/png', dataUrl }); };
+        reader.readAsDataURL(f);
+      } else if (isTextFile(f)) {
+        reader.onload = () => { const content = String(reader.result || ''); if (content) pushAttach({ id: newId(), kind: 'text', name: f.name || 'pasted.txt', content }); };
+        reader.readAsText(f);
+      } else {
+        reader.onload = () => { const du = String(reader.result || ''); const b64 = du.includes(',') ? du.slice(du.indexOf(',') + 1) : ''; if (b64) pushAttach({ id: newId(), kind: 'file', name: f.name || 'file', mime: f.type || '', dataB64: b64, size: f.size }); };
+        reader.readAsDataURL(f);
+      }
+    }
+  }, [pushAttach]);
+  const onPaste = React.useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    const imgs: File[] = [];
+    if (items) for (const it of Array.from(items)) if (it.kind === 'file' && it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) imgs.push(f); }
+    if (imgs.length) { e.preventDefault(); addFiles(imgs); return; }
+    // A long paste becomes a "Pasted text" attachment instead of flooding the box.
+    const txt = e.clipboardData?.getData('text/plain') ?? '';
+    if (txt.length > 1500 || txt.split('\n').length > 28) {
+      e.preventDefault();
+      pushAttach({ id: newId(), kind: 'text', name: 'Pasted text.txt', content: txt });
+    }
+  }, [addFiles, pushAttach]);
+  const removeAttachment = (id: string) => { setSendError(''); setAttachments(a => a.filter(x => x.id !== id)); };
+  const canSend = !!text.trim() || attachments.length > 0;
+
+  // Compose-and-send: text-only follows the normal queue/idle path; a message with
+  // images sends now (interrupting a running turn so turns never overlap mid-stream).
+  // On failure the text + images are restored so nothing is lost.
+  const sendComposed = React.useCallback(() => {
+    const t = text.trim(); const imgs = attachments;
+    if ((!t && !imgs.length) || !projectId) return;
+    if (!imgs.length) { sendText(text); return; }
+    setText(''); setAttachments([]); if (taRef.current) taRef.current.style.height = 'auto';
+    if (streaming) void sendNow(t, imgs).then(ok => { if (!ok) setAttachments(imgs); });
+    else void sendRaw(t, imgs).then(ok => { if (!ok) { setText(t); setAttachments(imgs); } });
+  }, [text, attachments, projectId, streaming, sendText, sendNow, sendRaw]);
+  const sendComposedNow = React.useCallback(() => {
+    const t = text.trim(); const imgs = attachments;
+    if ((!t && !imgs.length) || !projectId) return;
+    setAttachments([]);
+    void sendNow(t, imgs.length ? imgs : undefined).then(ok => { if (!ok) setAttachments(imgs); });
+  }, [text, attachments, projectId, sendNow]);
 
   const removeFromQueue = (i: number) => setQueue(q => q.filter((_, j) => j !== i));
   // Reorder = reprioritize: the drainer always fires queue[0] next.
@@ -1959,12 +2358,14 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               </div>
             </div>
           )}
-          {turns.map((t, i) => (
-            <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
-              <UserBubble text={t.input} />
-              <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
-            </div>
-          ))}
+          <ImageOpenContext.Provider value={openImageStable}>
+            {turns.map((t, i) => (
+              <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
+                <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />
+                <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
+              </div>
+            ))}
+          </ImageOpenContext.Provider>
         </div>
       </div>
 
@@ -2005,10 +2406,61 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
             </div>
           )}
           <div className={`composer-card composer-eff${effort === 'MAX' ? ' composer-ultra' : ''}`}
-            style={{ borderRadius: 18, border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)',
-            boxShadow: 'var(--card-shadow)', padding: '10px 10px 8px 14px', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
+            onDragOver={e => { if (Array.from(e.dataTransfer?.types ?? []).includes('Files')) { e.preventDefault(); setDragOver(true); } }}
+            onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false); }}
+            onDrop={e => { e.preventDefault(); setDragOver(false); addFiles(e.dataTransfer?.files ?? null); }}
+            style={{ borderRadius: 18, border: `1px solid ${dragOver ? 'var(--blue)' : 'var(--separator-strong)'}`, background: 'var(--bg-elevated)',
+            boxShadow: dragOver ? '0 0 0 3px color-mix(in srgb, var(--blue) 22%, transparent)' : 'var(--card-shadow)', padding: '10px 10px 8px 14px',
+            transition: 'border-color 120ms ease, box-shadow 120ms ease', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
+            {attachments.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 9 }}>
+                {attachments.map(a => a.kind === 'image' ? (
+                  <div key={a.id} style={{ position: 'relative', width: 58, height: 58, borderRadius: 10, overflow: 'hidden', border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0 }}>
+                    <img src={a.dataUrl} alt={a.name} title={a.name} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+                    <button onClick={() => removeAttachment(a.id)} title="Remove" style={{ position: 'absolute', top: 2, right: 2, width: 18, height: 18, borderRadius: '50%', border: 'none', display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.6)', color: '#fff', cursor: 'pointer', padding: 0 }}>
+                      <Icon name="x" size={11} stroke={2.8} />
+                    </button>
+                  </div>
+                ) : (
+                  <div key={a.id} title={a.kind === 'text' ? 'Hover to preview' : a.name} className={a.kind === 'text' ? 'att-chip' : undefined}
+                    onMouseEnter={a.kind === 'text' ? (e => openPreview(a.id, e.currentTarget)) : undefined}
+                    onMouseLeave={a.kind === 'text' ? closePreviewSoon : undefined}
+                    style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: 8, maxWidth: 220, height: 40, padding: '0 30px 0 9px', borderRadius: 10, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0, cursor: a.kind === 'text' ? 'zoom-in' : 'default' }}>
+                    <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={14} /></span>
+                    <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+                      <span style={{ font: '600 var(--fs-caption)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.kind === 'text' ? (a.name === 'Pasted text.txt' ? 'Pasted text' : a.name) : a.name}</span>
+                      <span style={{ font: '400 9px/1.1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{a.kind === 'text' ? `${a.content.split('\n').length} lines · ${fmtBytes(a.content.length)}` : fmtBytes(a.size)}</span>
+                    </span>
+                    <button onClick={() => removeAttachment(a.id)} title="Remove" style={{ position: 'absolute', top: 11, right: 8, width: 18, height: 18, borderRadius: '50%', border: 'none', display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', cursor: 'pointer', padding: 0 }}>
+                      <Icon name="x" size={10} stroke={2.8} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {hoverAtt && (() => {
+              const a = attachments.find(x => x.id === hoverAtt.id);
+              if (!a || a.kind !== 'text') return null;
+              const r = hoverAtt.rect;
+              const W = Math.min(560, window.innerWidth - 32);
+              const left = Math.max(16, Math.min(r.left, window.innerWidth - W - 16));
+              const maxH = Math.max(140, Math.min(440, r.top - 24));
+              const body = a.content.length > 20000 ? a.content.slice(0, 20000) + '\n\n…(preview truncated — full text is sent)' : a.content;
+              return (
+                <div className="att-card" onMouseEnter={keepPreview} onMouseLeave={closePreviewSoon}
+                  style={{ position: 'fixed', left, bottom: Math.max(8, window.innerHeight - r.top + 6), width: W, maxHeight: maxH, zIndex: 1200, display: 'flex', flexDirection: 'column', borderRadius: 12, overflow: 'hidden', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 16px 48px rgba(0,0,0,0.34)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', borderBottom: '0.5px solid var(--separator)', flexShrink: 0 }}>
+                    <span style={{ width: 22, height: 22, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={12} /></span>
+                    <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.name === 'Pasted text.txt' ? 'Pasted text' : a.name}</span>
+                    <span style={{ flexShrink: 0, font: '500 9px/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{a.content.split('\n').length} lines · {fmtBytes(a.content.length)}</span>
+                  </div>
+                  <pre className="att-scroll" style={{ margin: 0, flex: 1, minHeight: 0, overflow: 'auto', padding: '10px 13px', font: '400 11.5px/1.55 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: 'var(--bg-grouped)' }}>{body}</pre>
+                </div>
+              );
+            })()}
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
               <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
+                onPaste={onPaste}
                 onKeyDown={e => {
                   if (slashOpen) {
                     if (e.key === 'ArrowDown') { e.preventDefault(); setSlashSel((slashIdx + 1) % slashList.length); return; }
@@ -2016,9 +2468,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                     if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); applySlash(slashList[slashIdx]); return; }
                     if (e.key === 'Escape') { e.preventDefault(); setText(''); return; }
                   }
-                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) void sendNow(text); else sendText(text); }
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) sendComposedNow(); else sendComposed(); }
                 }}
-                placeholder={!projectId ? 'Pick a project first' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent…'}
+                placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent…'}
                 title="Enter to send · Shift+Enter for a new line · while running: Enter queues, ⌘Enter sends now"
                 disabled={!projectId}
                 style={{ flex: 1, resize: 'none', border: 'none', outline: 'none', background: 'transparent',
@@ -2026,11 +2478,11 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   minHeight: 24, maxHeight: 150, boxSizing: 'content-box' }} />
               {streaming ? (
                 <>
-                  {text.trim() && (
-                    <button onClick={() => sendText(text)} className="send-fab" title="Queue (Enter) — runs when the agent finishes · ⌘Enter to send now" style={{
+                  {canSend && (
+                    <button onClick={sendComposed} className="send-fab" title={attachments.length ? 'Send now — interrupts the current run' : 'Queue (Enter) — runs when the agent finishes · ⌘Enter to send now'} style={{
                       width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
                       background: 'var(--blue)', color: '#fff', boxShadow: '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)', cursor: 'pointer' }}>
-                      <Icon name="plus" size={18} stroke={2.6} />
+                      <Icon name={attachments.length ? 'arrowRight' : 'plus'} size={18} stroke={2.6} style={attachments.length ? { transform: 'rotate(-90deg)' } : undefined} />
                     </button>
                   )}
                   <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
@@ -2039,15 +2491,23 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   </button>
                 </>
               ) : (
-                <button onClick={() => { void sendText(text); }} disabled={!text.trim() || !projectId} className="send-fab" title="Send (Enter)" style={{
+                <button onClick={sendComposed} disabled={!canSend || !projectId} className="send-fab" title="Send (Enter)" style={{
                   width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
-                  background: text.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: text.trim() ? '#fff' : 'var(--ink-secondary)',
-                  boxShadow: text.trim() ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: text.trim() ? 'pointer' : 'default' }}>
+                  background: canSend ? 'var(--blue)' : 'var(--fill-secondary)', color: canSend ? '#fff' : 'var(--ink-secondary)',
+                  boxShadow: canSend ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: canSend ? 'pointer' : 'default' }}>
                   <Icon name="arrowRight" size={18} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
                 </button>
               )}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, rowGap: 6, marginTop: 6 }}>
+              {/* attach a file — image, text/code, or any file (also: paste or drag-drop) */}
+              <input ref={fileRef} type="file" multiple style={{ display: 'none' }}
+                onChange={e => { addFiles(e.target.files); if (e.target) e.target.value = ''; }} />
+              <button onClick={() => fileRef.current?.click()} disabled={!projectId} title="Attach a file — image, text, or any file (or paste / drag-drop)" className="tb-icon" style={{
+                width: 30, height: 30, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+                background: 'transparent', color: 'var(--ink-secondary)', opacity: projectId ? 1 : 0.4, cursor: projectId ? 'pointer' : 'default' }}>
+                <Icon name="paperclip" size={16} />
+              </button>
               {/* core: which model · how hard · the two run modes */}
               <ModelPicker compact direction="up" value={primaryKey} onChange={setPrimaryKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
               <EffortDial compact value={effort} onChange={setEffort} />
@@ -2099,7 +2559,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               <span style={{ flex: 1, minWidth: 6 }} />
               {streaming
                 ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>
-                    <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn?.stage || 'working…'}
+                    <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn ? liveActivity(lastTurn, lastTurn.transcript ?? []) : 'Working…'}
                   </span>
                 : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{planMode ? 'Plan · ⏎' : goalMode ? 'Goal · ⏎' : queue.length ? `${queue.length} queued` : '⏎ to send'}</span>}
             </div>
@@ -2410,7 +2870,7 @@ export default function ProjectDetail() {
         {tab === 'chat' && <ChatPane projectId={projectId} project={project} />}
         {tab === 'jobs' && <JobsTab jobs={projectJobs} />}
         {tab === 'instructions' && <InstructionsTab projectId={projectId} project={project} onSaved={(ins) => setProject(p => p ? { ...p, instructions: ins } : p)} />}
-        {tab === 'skills' && <SkillsTab />}
+        {tab === 'skills' && <SkillsTab projectId={projectId} />}
         {tab === 'budget' && <BudgetTab />}
         {tab === 'settings' && <SettingsTab />}
       </div>

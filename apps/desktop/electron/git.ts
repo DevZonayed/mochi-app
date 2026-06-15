@@ -26,6 +26,23 @@ export function resolveGit(): string | null {
 
 export function gitAvailable(): boolean { return resolveGit() !== null; }
 
+/** Commit a snapshot of a project folder so its design + attachments are
+    referable by a short hash (the "commit shortcut"). Inits a git repo on first
+    use; commits with a local Maestro identity so it works without global config. */
+export function snapshotProject(dir: string, message: string): { ok: boolean; hash?: string; reason?: string } {
+  const git = resolveGit();
+  if (!git) return { ok: false, reason: 'git is not installed' };
+  if (!dir || !existsSync(dir)) return { ok: false, reason: 'this project has no folder yet' };
+  try {
+    if (!isGitRepo(dir)) execFileSync(git, ['-C', dir, 'init', '-q'], { timeout: 10_000 });
+    execFileSync(git, ['-C', dir, 'add', '-A'], { timeout: 30_000 });
+    execFileSync(git, ['-C', dir, '-c', 'user.name=Maestro', '-c', 'user.email=maestro@local',
+      'commit', '-q', '--allow-empty', '-m', (message || 'snapshot').slice(0, 200)], { timeout: 30_000 });
+    const hash = execFileSync(git, ['-C', dir, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', timeout: 5_000 }).trim();
+    return { ok: true, hash };
+  } catch (e) { return { ok: false, reason: e instanceof Error ? e.message.slice(0, 200) : 'snapshot failed' }; }
+}
+
 export function isGitRepo(dir: string): boolean {
   try { return existsSync(path.join(dir, '.git')); } catch { return false; }
 }
