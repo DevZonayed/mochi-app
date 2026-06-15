@@ -217,6 +217,77 @@ const NOTIFS: [string, boolean][] = [
   ['Publishing', false],
 ];
 
+/* Send-feedback bottom sheet — submits to the Mac (source: 'phone'). */
+function FeedbackSheet({ visible, onClose }: { visible: boolean; onClose: () => void }) {
+  const { theme } = useTheme();
+  const [category, setCategory] = useState<'bug' | 'idea' | 'other'>('idea');
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [error, setError] = useState('');
+  const cats: { id: 'bug' | 'idea' | 'other'; label: string }[] = [
+    { id: 'bug', label: 'Bug' }, { id: 'idea', label: 'Idea' }, { id: 'other', label: 'Other' },
+  ];
+  const close = () => { setMessage(''); setCategory('idea'); setBusy(false); setDone(false); setError(''); onClose(); };
+  const submit = () => {
+    const text = message.trim();
+    if (!text || busy) return;
+    setBusy(true); setError('');
+    api.submitFeedback({ category, message: text })
+      .then(() => { setDone(true); setTimeout(close, 1100); })
+      .catch((e: unknown) => { setError(e instanceof Error ? e.message : 'Could not send.'); setBusy(false); });
+  };
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={close}>
+      <Pressable style={{ flex: 1, backgroundColor: 'rgba(10,12,24,0.4)', justifyContent: 'flex-end' }} onPress={close}>
+        <Pressable onPress={() => {}} style={{ backgroundColor: theme.color.bg, borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: 20, paddingBottom: 36 }}>
+          {done ? (
+            <View style={{ alignItems: 'center', paddingVertical: 22 }}>
+              <View style={{ width: 52, height: 52, borderRadius: 26, backgroundColor: theme.color.green + '28', alignItems: 'center', justifyContent: 'center', marginBottom: 12 }}>
+                <Icon name="check" size={26} color={theme.color.green} stroke={2.6} />
+              </View>
+              <Text style={{ fontSize: 18, fontWeight: '700', color: theme.color.ink }}>Thanks for the feedback</Text>
+              <Text style={{ fontSize: 14, color: theme.color.inkSecondary, marginTop: 4 }}>Saved on your Mac.</Text>
+            </View>
+          ) : (
+            <>
+              <Text style={{ fontSize: 20, fontWeight: '700', color: theme.color.ink, marginBottom: 4 }}>Send feedback</Text>
+              <Text style={{ fontSize: 14, color: theme.color.inkSecondary, marginBottom: 16 }}>Found a bug or have an idea? We read every note.</Text>
+              <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+                {cats.map((c) => {
+                  const on = category === c.id;
+                  return (
+                    <Pressable key={c.id} onPress={() => setCategory(c.id)} style={{ flex: 1, height: 40, borderRadius: 11, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: on ? theme.color.blue : theme.color.separator, backgroundColor: on ? theme.color.blue + '18' : theme.color.fillTertiary }}>
+                      <Text style={{ fontSize: 14, fontWeight: on ? '700' : '500', color: on ? theme.color.blue : theme.color.inkSecondary }}>{c.label}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <TextInput
+                value={message}
+                onChangeText={setMessage}
+                multiline
+                placeholder={category === 'bug' ? 'What went wrong?' : category === 'idea' ? 'What would make Maestro better?' : 'Tell us what’s on your mind…'}
+                placeholderTextColor={theme.color.inkTertiary}
+                style={{ minHeight: 110, borderRadius: 12, borderWidth: 1, borderColor: theme.color.separator, backgroundColor: theme.color.fillTertiary, padding: 12, fontSize: 16, color: theme.color.ink, textAlignVertical: 'top' }}
+              />
+              {error ? <Text style={{ fontSize: 13, color: theme.color.red, marginTop: 10 }}>{error}</Text> : null}
+              <View style={{ flexDirection: 'row', gap: 10, marginTop: 16 }}>
+                <Pressable onPress={close} style={{ flex: 1, height: 48, borderRadius: theme.radius.pill, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}>
+                  <Text style={{ fontSize: 16, fontWeight: '600', color: theme.color.ink }}>Cancel</Text>
+                </Pressable>
+                <Pressable onPress={submit} disabled={!message.trim() || busy} style={{ flex: 1, height: 48, borderRadius: theme.radius.pill, backgroundColor: !message.trim() || busy ? theme.color.fillSecondary : theme.color.blue, alignItems: 'center', justifyContent: 'center' }}>
+                  <Text style={{ fontSize: 16, fontWeight: '600', color: !message.trim() || busy ? theme.color.inkTertiary : '#fff' }}>{busy ? 'Sending…' : 'Send'}</Text>
+                </Pressable>
+              </View>
+            </>
+          )}
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+}
+
 export function SettingsScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
@@ -229,6 +300,7 @@ export function SettingsScreen() {
   const [lockApprove, setLockApprove] = useState(true);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [conn, setConn] = useState<'idle' | 'testing' | 'ok' | 'fail'>('idle');
+  const [fbOpen, setFbOpen] = useState(false);
 
   const testConnection = () => {
     setConn('testing');
@@ -432,6 +504,21 @@ export function SettingsScreen() {
           </Group>
         </View>
 
+        {/* Feedback */}
+        <View style={{ marginBottom: 22 }}>
+          <Group header="Feedback" footer="Bugs and ideas land on your Mac, where you can review and triage them.">
+            <Row last onPress={() => setFbOpen(true)}>
+              <View style={{ width: 30, height: 30, borderRadius: 8, backgroundColor: theme.color.blue + '24', alignItems: 'center', justifyContent: 'center' }}>
+                <Icon name="send" size={16} color={theme.color.blue} />
+              </View>
+              <View style={rowLabel}>
+                <Text style={labelText}>Send feedback</Text>
+              </View>
+              <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
+            </Row>
+          </Group>
+        </View>
+
         {/* About */}
         <View style={{ marginBottom: 28 }}>
           <Group header="About">
@@ -450,6 +537,7 @@ export function SettingsScreen() {
           </Group>
         </View>
       </ScrollView>
+      <FeedbackSheet visible={fbOpen} onClose={() => setFbOpen(false)} />
     </View>
   );
 }

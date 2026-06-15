@@ -220,6 +220,34 @@ export interface AppEvent {
   projectId?: string | null; jobId?: string | null;
 }
 
+/* ── Feedback (operator/tester feedback collected from any surface) ──────
+   Lives on the Mac like every other entity; the relay only mirrors it so a
+   remote can submit + the operator can review. No secrets — safe to relay. */
+export type FeedbackCategory = 'bug' | 'idea' | 'other';
+export type FeedbackStatus = 'new' | 'triaged' | 'done';
+export type FeedbackSource = 'desktop' | 'web' | 'phone';
+/** Lightweight, auto-captured context so a piece of feedback is actionable
+    without the sender having to describe their environment. */
+export interface FeedbackContext {
+  screen?: string;      // current route/screen key, e.g. 'workspace'
+  appVersion?: string;
+  platform?: string;    // 'darwin' | 'web' | 'ios' | …
+  projectId?: string | null;
+}
+export interface Feedback {
+  id: string;
+  category: FeedbackCategory;
+  message: string;
+  status: FeedbackStatus;
+  source: FeedbackSource;
+  context?: FeedbackContext;
+  /** Set once escalated to a GitHub issue. */
+  issueUrl?: string;
+  issueNumber?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; approveGates: boolean }
 export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; projectId: string | null; permissions: ChatPermissions; boundAt: number }
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
@@ -245,6 +273,9 @@ export interface AppSettings {
       own browser from a one-time copy of the profile's logins; 'live' drives the
       real Chrome profile (requires the user's Chrome to be quit). */
   chromeProfileMode?: 'copy' | 'live';
+  /** Target repo ("owner/repo") that feedback is escalated to as GitHub issues.
+      Empty/undefined = issue creation is disabled until the operator sets one. */
+  feedbackRepo?: string;
 }
 export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [] };
 
@@ -296,6 +327,7 @@ interface StoreData {
   chatBindings: ChatBinding[];
   pendingChats: PendingChat[];
   commEvents: CommEvent[];
+  feedback: Feedback[];
   telegram: TelegramState;
   /** Locally (safeStorage-)encrypted provider API keys, base64. Never leaves this Mac. */
   providerKeys: Record<string, { cipherB64: string; last4: string; createdAt: number }>;
@@ -394,6 +426,7 @@ export class Store {
       if (!this.data.chatBindings) { this.data.chatBindings = []; dirty = true; }
       if (!this.data.pendingChats) { this.data.pendingChats = []; dirty = true; }
       if (!this.data.commEvents) { this.data.commEvents = []; dirty = true; }
+      if (!this.data.feedback) { this.data.feedback = []; dirty = true; }
       if (!this.data.telegram) { this.data.telegram = { offset: 0, botUsername: null, connectedAt: null }; dirty = true; }
 
       // One-time demo-data purge: only fires on the full seed fingerprint so a
@@ -426,7 +459,7 @@ export class Store {
         workspace: null,
         projects: [], jobs: [], sessions: [], approvals: [], schedules: [], skills: [], templates: [],
         assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
-        chatBindings: [], pendingChats: [], commEvents: [],
+        chatBindings: [], pendingChats: [], commEvents: [], feedback: [],
         telegram: { offset: 0, botUsername: null, connectedAt: null },
         providerKeys: {},
       };
@@ -1007,6 +1040,39 @@ export class Store {
     };
   }
 
+  // ── Feedback (collected from desktop / web / phone) ─────────────────
+  listFeedback(): Feedback[] { return [...this.data.feedback].sort((a, b) => b.createdAt - a.createdAt); }
+  getFeedback(feedbackId: string): Feedback | undefined { return this.data.feedback.find(f => f.id === feedbackId); }
+  addFeedback(input: { category: FeedbackCategory; message: string; source?: FeedbackSource; context?: FeedbackContext }): Feedback {
+    const t = now();
+    const rec: Feedback = {
+      id: id(),
+      category: input.category,
+      message: input.message.slice(0, 4000),
+      status: 'new',
+      source: input.source ?? 'desktop',
+      ...(input.context ? { context: input.context } : {}),
+      createdAt: t, updatedAt: t,
+    };
+    this.data.feedback.unshift(rec);
+    if (this.data.feedback.length > 500) this.data.feedback.length = 500; // cap
+    this.save();
+    return rec;
+  }
+  updateFeedback(feedbackId: string, patch: Partial<Pick<Feedback, 'status' | 'issueUrl' | 'issueNumber'>>): Feedback {
+    const f = this.getFeedback(feedbackId);
+    if (!f) throw Object.assign(new Error('feedback not found'), { statusCode: 404 });
+    Object.assign(f, patch, { updatedAt: now() });
+    this.save();
+    return f;
+  }
+  deleteFeedback(feedbackId: string): void {
+    const i = this.data.feedback.findIndex(f => f.id === feedbackId);
+    if (i === -1) throw Object.assign(new Error('feedback not found'), { statusCode: 404 });
+    this.data.feedback.splice(i, 1);
+    this.save();
+  }
+
   // ── Provider keys (local, encrypted) ───────────────────────────────
   providerKeyMeta(provider: string): { last4: string; createdAt: number } | undefined {
     const k = this.data.providerKeys[provider];
@@ -1119,6 +1185,7 @@ export class Store {
       chatBindings: this.listChatBindings(),
       pendingChats: this.listPendingChats(),
       commEvents: this.listCommEvents(),
+      feedback: this.listFeedback(),
       commsStatus: this.commsStatus(),
       budget: this.budget(),
       costs: this.costs(),
