@@ -38,8 +38,29 @@ export interface ChatSession {
   pinned?: boolean;
   primary?: RoleChoice;
   reviewer?: RoleChoice | 'off';
+  /** Set when this chat was imported from an external store (read-only history). */
+  importedFrom?: ConvSource;
+  externalId?: string;
   createdAt: number;
   updatedAt: number;
+}
+export type ConvSource = 'claude' | 'codex' | 'conductor';
+/** A past conversation found on disk (Claude/Codex/Conductor) for a project. */
+export interface ScannedConversation {
+  source: ConvSource;
+  externalId: string;
+  title: string;
+  messageCount: number;
+  createdAt: number;
+  updatedAt: number;
+  filePath?: string;
+  /** Already imported into this project (re-scan dedupe). */
+  imported?: boolean;
+}
+export interface ConversationScan {
+  available: Record<ConvSource, boolean>;
+  path: string;
+  conversations: ScannedConversation[];
 }
 export interface TranscriptItem {
   kind: 'text' | 'tool' | 'result' | 'ask' | 'review' | 'image';
@@ -652,6 +673,14 @@ export const api = {
     call<ChatSession>('pinSession', { id, pinned }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/pin`, { method: 'POST', body: JSON.stringify({ pinned }) })),
   deleteProject: (id: string) =>
     call<{ ok: boolean }>('deleteProject', { id }, () => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
+
+  // Conversation sync — scan the project's folder for past Claude/Codex/Conductor
+  // conversations and import the selected ones as read-only chats. Desktop-only
+  // (reads local agent stores), so the relay/web build rejects.
+  scanConversations: (projectId: string) =>
+    call<ConversationScan>('scanConversations', { projectId }, () => Promise.reject(new ApiError(501, 'Conversation sync runs in the desktop app'))),
+  importConversations: (projectId: string, items: { source: ConvSource; externalId: string; filePath?: string; title?: string; createdAt?: number; updatedAt?: number }[]) =>
+    call<{ imported: number; sessions: ChatSession[] }>('importConversations', { projectId, items }, () => Promise.reject(new ApiError(501, 'Conversation sync runs in the desktop app'))),
 
   // Jobs — in the desktop app these EXECUTE on this Mac (Claude Code login)
   listJobs: (projectId?: string, sessionId?: string) =>

@@ -336,7 +336,8 @@ app.whenReady().then(() => {
       if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject'
         || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment'
         || method === 'copyDesignToCode'
-        || method === 'addSkillToProject' || method === 'removeSkillFromProject') {
+        || method === 'addSkillToProject' || method === 'removeSkillFromProject'
+        || method === 'scanConversations' || method === 'importConversations') {
         throw Object.assign(new Error('not available remotely'), { statusCode: 403 });
       }
       const r = await dispatch(method, params);
