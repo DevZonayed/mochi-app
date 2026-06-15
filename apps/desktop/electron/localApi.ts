@@ -14,7 +14,7 @@ import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
-import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
+import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
 import { existsSync, mkdirSync, cpSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
@@ -411,7 +411,30 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return fetchSkillContent(registryBase(relayUrl), id);
       }
       case 'listProjectSkills': {
-        return { skills: store.listInstalledSkills(String(p.id ?? '')) };
+        // The on-disk .claude/skills folder is the source of truth for what's
+        // actually active. Reconcile the store records (operator- AND agent-added)
+        // with disk so: (a) every active skill shows incl. ones the model installed
+        // mid-run, (b) enabled state reflects the real SKILL.md vs .disabled file,
+        // (c) a folder dropped in outside the app still appears.
+        const projId = String(p.id ?? '');
+        const proj = store.getProject(projId);
+        const records = store.listInstalledSkills(projId);
+        if (!proj) return { skills: records };
+        const disk = listInstalledSlugsDetailed(projectRootOf(proj));
+        const diskBySlug = new Map(disk.map(d => [d.slug, d]));
+        const skills = records
+          .map(r => {
+            const d = diskBySlug.get(r.slug);
+            diskBySlug.delete(r.slug);
+            // Record with no folder on disk anymore → no longer installed; drop it.
+            return d ? { ...r, enabled: d.enabled } : null;
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null);
+        // Folders on disk with no record (e.g. dropped in manually / by another tool).
+        for (const d of diskBySlug.values()) {
+          skills.push({ id: d.slug, slug: d.slug, name: d.slug, enabled: d.enabled, addedBy: 'agent', installedAt: 0 });
+        }
+        return { skills };
       }
       case 'addSkillToProject': {
         const proj = store.getProject(String(p.projectId ?? p.id ?? ''));
@@ -433,8 +456,26 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           disabledReason: typeof p.disabledReason === 'string' ? p.disabledReason : undefined,
           mirrorRepo: typeof p.mirrorRepo === 'string' ? p.mirrorRepo : undefined,
           auditStatus: typeof p.auditStatus === 'string' ? p.auditStatus : undefined,
+          addedBy: p.via === 'agent' ? 'agent' : 'operator',
         });
         return { skill: rec };
+      }
+      case 'setProjectSkillEnabled': {
+        const proj = store.getProject(String(p.projectId ?? p.id ?? ''));
+        if (!proj) return bad('project not found', 404);
+        const idOrSlug = String(p.skillId ?? p.slug ?? '');
+        if (!idOrSlug) return bad('skillId required');
+        const enabled = Boolean(p.enabled);
+        // Move the SKILL.md on disk so Claude's settingSources actually stops/starts
+        // loading it, then mirror the flag in the store record.
+        const ok = setSkillFilesEnabled(projectRootOf(proj), idOrSlug, enabled);
+        let rec = store.setInstalledSkillEnabled(proj.id, idOrSlug, enabled);
+        if (!rec) { // disk-only skill with no record yet — create one so the flag sticks
+          const slug = skillSlug(idOrSlug);
+          rec = store.ensureInstalledSkill(proj.id, { id: idOrSlug, slug, name: slug, enabled, addedBy: 'agent' });
+          store.setInstalledSkillEnabled(proj.id, idOrSlug, enabled);
+        }
+        return { ok, skill: rec };
       }
       case 'removeSkillFromProject': {
         const proj = store.getProject(String(p.projectId ?? p.id ?? ''));

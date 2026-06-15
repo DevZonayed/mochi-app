@@ -24,7 +24,7 @@ import {
 } from '../lib/ui';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -746,73 +746,53 @@ function InstructionsTab({ projectId, project, onSaved }: { projectId: string | 
   );
 }
 
-/* ───────────────── Skills & tools tab (from pd-tabs.jsx) ───────────────── */
-interface SkillDef { name: string; ver: string; on: boolean }
-const SKILLS: SkillDef[] = [
-  { name: 'TypeScript engineer', ver: '2.4.0', on: true },
-  { name: 'PR author', ver: '1.8.1', on: true },
-  { name: 'Test writer', ver: '3.0.2', on: true },
-  { name: 'Postgres migrator', ver: '1.2.0', on: false },
-];
-interface McpDef { name: string; scope: string; tint: string; on: boolean }
-const MCP: McpDef[] = [
-  { name: 'GitHub', scope: 'read-write · 12 tools', tint: 'var(--ink)', on: true },
-  { name: 'Postgres (prod)', scope: 'read-only · 3 tools', tint: 'var(--teal)', on: true },
-  { name: 'Linear', scope: 'read-only · 5 tools', tint: 'var(--indigo)', on: true },
-  { name: 'Sentry', scope: 'read-only · 4 tools', tint: 'var(--orange)', on: false },
-];
-
-function SkillRow({ s, last }: { s: SkillDef; last?: boolean }) {
-  const [on, setOn] = React.useState(s.on);
+/* ───────────────── Skills & tools tab (live) ─────────────────
+   Built-in capabilities + connected MCP servers come from the real host skill
+   catalog (api.listSkills) and toggle through api.toggleSkill — no mock data. */
+function CapabilityRow({ s, icon, last, onToggle }: { s: ApiSkill; icon: IconName; last?: boolean; onToggle: (s: ApiSkill) => void }) {
   return (
     <Row last={last}>
       <span style={{ width: 34, height: 34, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center',
         background: 'var(--fill-tertiary)', color: 'var(--blue)', border: '0.5px solid var(--separator)' }}>
-        <Icon name="spark" size={18} />
+        <Icon name={icon} size={18} />
       </span>
       <span style={{ flex: 1, minWidth: 0 }}>
         <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
           <span style={{ height: 18, padding: '0 7px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)',
-            font: '600 var(--fs-caption)/18px var(--font-mono)', color: 'var(--ink-secondary)' }}>v{s.ver}</span>
-          <span title="Signature verified" style={{ display: 'inline-flex', alignItems: 'center', gap: 3, color: 'var(--green)',
-            font: '600 var(--fs-caption)/1 var(--font-text)' }}><Icon name="shield" size={13} /></span>
+            font: '600 var(--fs-caption)/18px var(--font-mono)', color: 'var(--ink-secondary)' }}>v{s.version}</span>
+          {s.category && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{s.category}</span>}
         </span>
+        {s.description && <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.description}</span>}
       </span>
-      <Switch on={on} onChange={setOn} />
-    </Row>
-  );
-}
-
-function McpRow({ m, last }: { m: McpDef; last?: boolean }) {
-  const [on, setOn] = React.useState(m.on);
-  return (
-    <Row last={last}>
-      <span style={{ width: 34, height: 34, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center',
-        background: `color-mix(in srgb, ${m.tint} 13%, transparent)`, color: m.tint, border: '0.5px solid var(--separator)' }}>
-        <Icon name="cpu" size={18} />
-      </span>
-      <span style={{ flex: 1, minWidth: 0 }}>
-        <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{m.name}</span>
-        <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.2 var(--font-mono)', color: 'var(--ink-secondary)', marginTop: 2 }}>{m.scope}</span>
-      </span>
-      <Switch on={on} onChange={setOn} />
+      <Switch on={s.enabled} onChange={() => onToggle(s)} />
     </Row>
   );
 }
 
 function SkillsTab({ projectId }: { projectId: string | null }) {
+  const navigate = useNavigate();
   const [installed, setInstalled] = React.useState<InstalledSkill[]>([]);
   const [q, setQ] = React.useState('');
   const [results, setResults] = React.useState<RegistrySkillSummary[]>([]);
   const [searching, setSearching] = React.useState(false);
   const [busy, setBusy] = React.useState<string | null>(null);
   const [meta, setMeta] = React.useState<{ count: number } | null>(null);
+  const [caps, setCaps] = React.useState<ApiSkill[]>([]);
   const reload = React.useCallback(() => {
     if (!projectId) return;
     api.listProjectSkills(projectId).then(r => setInstalled(r.skills)).catch(() => {});
   }, [projectId]);
-  React.useEffect(() => { reload(); api.skillRegistryMeta().then(m => setMeta({ count: m.count })).catch(() => {}); }, [reload]);
+  const loadCaps = React.useCallback(() => { api.listSkills().then(setCaps).catch(() => {}); }, []);
+  React.useEffect(() => { reload(); loadCaps(); api.skillRegistryMeta().then(m => setMeta({ count: m.count })).catch(() => {}); }, [reload, loadCaps]);
+  // Enable/disable a host capability (optimistic; reconcile with the returned record).
+  const toggleCap = async (s: ApiSkill) => {
+    setCaps(list => list.map(x => (x.id === s.id ? { ...x, enabled: !x.enabled } : x)));
+    try { const u = await api.toggleSkill(s.id); setCaps(list => list.map(x => (x.id === u.id ? u : x))); }
+    catch { loadCaps(); }
+  };
+  const builtins = caps.filter(c => c.kind !== 'mcp');
+  const mcps = caps.filter(c => c.kind === 'mcp');
   const installedIds = new Set(installed.map(s => s.id));
   const runSearch = async (term: string) => {
     setSearching(true);
@@ -897,9 +877,11 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
         </GroupedList>
       )}
 
-      <GroupedList header="Starter skills">
-        {SKILLS.map((s, i) => <SkillRow key={s.name} s={s} last={i === SKILLS.length - 1} />)}
-      </GroupedList>
+      {builtins.length > 0 && (
+        <GroupedList header="Built-in capabilities">
+          {builtins.map((s, i) => <CapabilityRow key={s.id} s={s} icon="spark" last={i === builtins.length - 1} onToggle={toggleCap} />)}
+        </GroupedList>
+      )}
 
       <div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', borderRadius: 12, marginBottom: 12,
@@ -910,10 +892,12 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
           </span>
         </div>
         <GroupedList header="Allowed MCP servers" footer={
-          <button className="link-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--blue)' }}>
-            <Icon name="plus" size={14} stroke={2.4} /> Add from registry
+          <button onClick={() => navigate('/mcp-gateway')} className="link-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--blue)' }}>
+            <Icon name="cpu" size={14} stroke={2.4} /> Manage in Tools &amp; Gateway
           </button>}>
-          {MCP.map((m, i) => <McpRow key={m.name} m={m} last={i === MCP.length - 1} />)}
+          {mcps.length > 0
+            ? mcps.map((m, i) => <CapabilityRow key={m.id} s={m} icon="cpu" last={i === mcps.length - 1} onToggle={toggleCap} />)
+            : <div style={{ padding: '14px 16px', font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>No MCP servers connected yet. Connect and scope servers in Tools &amp; Gateway — agents reach only what you allow.</div>}
         </GroupedList>
       </div>
     </div>

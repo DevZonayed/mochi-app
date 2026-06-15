@@ -1144,7 +1144,9 @@ export class LocalEngine {
       // know the skill exists. Claude also auto-discovers SKILL.md via settingSources,
       // but Codex does not — this index tells it to read the file. Reference data.
       if (job.projectId) {
-        const installed = this.store.listInstalledSkills(job.projectId);
+        // Only enabled skills go into the agent's context — a disabled skill keeps
+        // its files (renamed SKILL.md.disabled) but is hidden from the run.
+        const installed = this.store.listInstalledSkills(job.projectId).filter(s => s.enabled !== false);
         if (installed.length) {
           const list = installed.map(s => {
             const meta = [
@@ -1193,6 +1195,7 @@ export class LocalEngine {
             disabledReason: meta?.disabledReason,
             mirrorRepo: meta?.sourceRepo ?? meta?.mirrorRepo,
             auditStatus: meta?.auditStatus,
+            addedBy: 'agent',
           });
           return { name: rec.name, slug: rec.slug, sha256: rec.sha256 };
         },

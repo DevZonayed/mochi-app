@@ -1,4 +1,4 @@
-import{u as M,b as J,R as d,j as e}from"./index-DQnA0BTl.js";import{a as y,I as f,E as O,C}from"./ui-BtSv6MYo.js";import{I as _,F as H}from"./fileChip-DRpAkgzi.js";import{A as Y}from"./appShell-CLYEicFB.js";const G=`
+import{u as M,b as J,R as d,j as e}from"./index-CEMSq9gz.js";import{a as y,I as f,E as O,C}from"./ui-TXbOWJdC.js";import{I as _,F as H}from"./fileChip-DjHEWJmI.js";import{A as Y}from"./appShell-DTLUj0gy.js";const G=`
   @keyframes spin { to { transform: rotate(360deg); } }
 
   .nav-item:hover { background: var(--fill-tertiary); color: var(--ink); }

@@ -4,9 +4,9 @@
    workspace instead of buried in a separate screen. */
 
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
 import { api, type Project, type Job, type ProjectMemory, type InstalledSkill, type RegistrySkillSummary } from './api';
 import { Icon, type IconName } from './icons';
+import { Switch } from './ui';
 
 type Section = 'settings' | 'instructions' | 'jobs' | 'memory' | 'skills';
 
@@ -23,7 +23,6 @@ const STATUS_TINT: Record<string, string> = {
 };
 
 export function ProjectPanel({ projectId, section = 'settings' }: { projectId: string; section?: Section }) {
-  const navigate = useNavigate();
   const [project, setProject] = React.useState<Project | null>(null);
   const [tab, setTab] = React.useState<Section>(section);
   React.useEffect(() => { setTab(section); }, [section]);
@@ -61,7 +60,7 @@ export function ProjectPanel({ projectId, section = 'settings' }: { projectId: s
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '18px 16px 28px' }}>
-        {tab === 'settings' && project && <SettingsBody project={project} patch={patch} onFull={() => navigate(`/project-detail/${projectId}`)} />}
+        {tab === 'settings' && project && <SettingsBody project={project} patch={patch} />}
         {tab === 'instructions' && project && <InstructionsBody project={project} patch={patch} />}
         {tab === 'memory' && <MemoryBody projectId={projectId} />}
         {tab === 'skills' && <SkillsBody projectId={projectId} />}
@@ -113,7 +112,13 @@ function SkillsBody({ projectId }: { projectId: string }) {
     setInstalled(xs => xs.filter(x => x.id !== s.id));
     try { await api.removeSkillFromProject(projectId, s.id); } catch { reloadInstalled(); }
   };
+  const toggle = async (s: InstalledSkill) => {
+    const next = s.enabled === false; // currently disabled → enabling
+    setInstalled(xs => xs.map(x => (x.id === s.id ? { ...x, enabled: next } : x)));
+    try { await api.setProjectSkillEnabled(projectId, s.id, next); } catch { reloadInstalled(); }
+  };
   const installedIds = new Set(installed.map(s => s.id));
+  const activeCount = installed.filter(s => s.enabled !== false).length;
   const riskTint = (r?: string) => {
     const v = (r || '').toUpperCase();
     if (v === 'MEDIUM') return 'var(--orange)';
@@ -126,25 +131,39 @@ function SkillsBody({ projectId }: { projectId: string }) {
       <div>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 9 }}>
           <div style={{ font: '700 var(--fs-headline)/1 var(--font-display)', color: 'var(--ink)' }}>Project skills</div>
-          {meta && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{meta.count} enabled · {meta.uniqueRepos ?? '444'} repos</span>}
+          <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+            {activeCount} active{installed.length !== activeCount ? ` · ${installed.length - activeCount} disabled` : ''}{meta ? ` · ${meta.count} in registry` : ''}
+          </span>
         </div>
         <div style={{ font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
-          Installed skills live in this project at <code>.claude/skills/&lt;slug&gt;/SKILL.md</code>. Registry disable blocks future installs but leaves existing project files untouched.
+          Everything active on this project — including skills the agent installed itself mid-run. Toggle to disable a skill without losing it (its <code>SKILL.md</code> is set aside); Remove deletes it from <code>.claude/skills/</code>.
         </div>
       </div>
 
-      {installed.length > 0 && (
+      {installed.length > 0 ? (
         <div style={{ border: '0.5px solid var(--separator)', borderRadius: 12, background: 'var(--surface)', overflow: 'hidden' }}>
-          {installed.map((s, i) => (
-            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderBottom: i === installed.length - 1 ? 'none' : '0.5px solid var(--separator)' }}>
-              <Icon name="spark" size={15} style={{ color: 'var(--indigo)', flexShrink: 0 }} />
-              <span style={{ flex: 1, minWidth: 0 }}>
-                <span style={{ display: 'block', font: '600 var(--fs-footnote)/1.25 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
-                <span style={{ display: 'block', font: '400 var(--fs-caption)/1.35 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>.claude/skills/{s.slug}/SKILL.md{s.sha256 ? ` · ${s.sha256.slice(0, 12)}` : ''}</span>
-              </span>
-              <button onClick={() => void remove(s)} style={{ height: 28, padding: '0 10px', borderRadius: 7, border: '1px solid var(--hairline)', background: 'var(--surface)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Remove</button>
-            </div>
-          ))}
+          {installed.slice().sort((a, b) => Number(b.enabled !== false) - Number(a.enabled !== false)).map((s, i, arr) => {
+            const on = s.enabled !== false;
+            return (
+              <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderBottom: i === arr.length - 1 ? 'none' : '0.5px solid var(--separator)', opacity: on ? 1 : 0.6 }}>
+                <Icon name="spark" size={15} style={{ color: on ? 'var(--indigo)' : 'var(--ink-tertiary)', flexShrink: 0 }} />
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                    <span style={{ font: '600 var(--fs-footnote)/1.25 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
+                    {s.addedBy === 'agent' && <span title="The agent installed this itself during a run" style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexShrink: 0, height: 16, padding: '0 6px', borderRadius: 'var(--r-pill)', background: 'color-mix(in srgb, var(--indigo) 14%, transparent)', color: 'var(--indigo)', font: '600 var(--fs-caption)/16px var(--font-text)' }}><Icon name="bolt" size={10} /> by agent</span>}
+                    {!on && <span style={{ flexShrink: 0, height: 16, padding: '0 6px', borderRadius: 'var(--r-pill)', background: 'var(--fill-tertiary)', color: 'var(--ink-tertiary)', font: '600 var(--fs-caption)/16px var(--font-text)' }}>Disabled</span>}
+                  </span>
+                  <span style={{ display: 'block', font: '400 var(--fs-caption)/1.35 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>.claude/skills/{s.slug}/SKILL.md{s.sha256 ? ` · ${s.sha256.slice(0, 12)}` : ''}</span>
+                </span>
+                <Switch on={on} onChange={() => void toggle(s)} />
+                <button onClick={() => void remove(s)} style={{ height: 28, padding: '0 10px', borderRadius: 7, border: '1px solid var(--hairline)', background: 'var(--surface)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Remove</button>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div style={{ padding: '18px 14px', border: '0.5px dashed var(--separator)', borderRadius: 12, color: 'var(--ink-tertiary)', font: '400 var(--fs-footnote)/1.5 var(--font-text)', textAlign: 'center' }}>
+          No skills on this project yet. Search below to add one — or the agent will add what it needs during a run, and it’ll show up here.
         </div>
       )}
 
@@ -192,7 +211,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-function SettingsBody({ project, patch, onFull }: { project: Project; patch: (p: Partial<Project>) => void; onFull: () => void }) {
+function SettingsBody({ project, patch }: { project: Project; patch: (p: Partial<Project>) => void }) {
   return (
     <div style={{ maxWidth: 560, display: 'flex', flexDirection: 'column', gap: 12 }}>
       <Field label="Name"><input defaultValue={project.name} key={project.id} onBlur={e => { const v = e.target.value.trim(); if (v && v !== project.name) patch({ name: v }); }} style={{ width: '100%', border: '1px solid var(--hairline)', borderRadius: 8, padding: '6px 10px', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none' }} /></Field>
@@ -204,9 +223,6 @@ function SettingsBody({ project, patch, onFull }: { project: Project; patch: (p:
         </span>
       </Field>}
       {project.repoUrl && <Field label="Repository"><code style={{ font: '400 var(--fs-caption)/1.4 var(--font-mono)', color: 'var(--ink-secondary)' }}>{project.repoUrl}</code></Field>}
-      <button onClick={onFull} style={{ alignSelf: 'flex-start', marginTop: 6, display: 'flex', alignItems: 'center', gap: 7, height: 32, padding: '0 13px', borderRadius: 8, border: '1px solid var(--hairline)', background: 'var(--surface)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
-        <Icon name="arrowRight" size={14} /> Open full project page
-      </button>
     </div>
   );
 }

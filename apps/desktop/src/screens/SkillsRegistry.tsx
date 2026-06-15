@@ -86,7 +86,6 @@ interface Skill {
   desc: string;
   signed: boolean;
   scan: ScanState;
-  uses: string;
   installed: boolean;
   mine: boolean;
   tags: string[];
@@ -130,24 +129,17 @@ function SkillGlyph({ name, size = 40, radius = 11 }: SkillGlyphProps) {
 
 // scan: ok | pending | quarantined ; signed: bool
 //
-// Live data: the registry list is populated from the registry service when
-// available, with the old local capability list only as a compatibility fallback.
-function skHash(s: string): number {
-  let h = 0;
-  for (const ch of s) h = (h * 31 + ch.charCodeAt(0)) & 0xffff;
-  return h;
-}
-function fmtUses(n: number): string {
-  return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : String(n);
-}
+// All status is derived from real registry signals (enabled state + audit risk).
+// Nothing is fabricated from a hash — a skill only shows pending/quarantined when
+// the registry actually says so.
 /** Map a live API/registry skill into the existing row shape. */
 function toSkill(a: ApiSkill | RegistrySkillSummary): Skill {
-  const h = skHash(a.id + a.name);
   const reg = a as RegistrySkillSummary;
   const local = a as ApiSkill;
+  const isRegistry = 'risk' in a || 'tags' in a; // a public/registry skill vs. a local host capability
   const enabled = 'enabled' in a ? a.enabled !== false : local.enabled;
   const risk = (reg.risk || '').toUpperCase();
-  const scan: ScanState = !enabled ? 'quarantined' : risk === 'MEDIUM' ? 'pending' : risk === 'HIGH' || risk === 'CRITICAL' ? 'quarantined' : h % 11 === 0 ? 'quarantined' : h % 5 === 0 ? 'pending' : 'ok';
+  const scan: ScanState = !enabled ? 'quarantined' : risk === 'HIGH' || risk === 'CRITICAL' ? 'quarantined' : risk === 'MEDIUM' ? 'pending' : 'ok';
   const tags = 'tags' in a && Array.isArray(a.tags)
     ? a.tags
     : local.category
@@ -160,9 +152,8 @@ function toSkill(a: ApiSkill | RegistrySkillSummary): Skill {
     desc: a.description,
     signed: enabled && scan !== 'quarantined',
     scan,
-    uses: fmtUses(80 + (h % 1500)),
     installed: enabled,
-    mine: !!reg.sourceRepo || !!reg.mirrorRepo || h % 2 === 0,
+    mine: !isRegistry, // "yours" = a local host capability, not a public-registry entry
     tags,
     risk: reg.risk,
     sha256: reg.sha256,
@@ -214,7 +205,6 @@ function SkillRow({ s, last, onOpen }: { s: Skill; last: boolean; onOpen: (s: Sk
         <div style={{ font: '400 var(--fs-subhead)/1.35 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.desc}</div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-        <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{s.uses} uses</span>
         <SigShield signed={s.signed} />
         <ScanChip scan={s.scan} />
         <Icon name="chevronRight" size={16} style={{ color: 'var(--ink-tertiary)' }} />
@@ -479,18 +469,19 @@ function PublishSheet({ open, onClose, onPublished }: { open: boolean; onClose: 
   if (!open) return null;
 
   const drop = () => { if (source.trim()) setStage(1); };
+  // Real publish: the relay fetches + hashes + scans + lists the skill in one
+  // call. We show "working" (stage 2) while that request is in flight and jump to
+  // done (stage 5) only when it actually succeeds — no timed fake progress.
   const publish = async () => {
     const url = source.trim();
     if (!url) { setErr('Source URL required'); return; }
     setErr('');
     setStage(2);
-    let s = 2;
-    const t = setInterval(() => { s += 1; setStage(s); if (s >= 5) clearInterval(t); }, 850);
     try {
       const rec = await api.registryAdminAddSkill({ url });
+      setStage(5);
       onPublished(toSkill(rec));
     } catch (e) {
-      clearInterval(t);
       setStage(1);
       setErr(e instanceof Error ? e.message : 'Could not add skill');
     }
@@ -822,7 +813,7 @@ export default function SkillsRegistry() {
     setSyncing(true);
     try {
       const r = await api.registryAdminSyncSources({ dryRun, limit: dryRun ? 20 : undefined });
-      setAdded({ id: 'sync', name: `${dryRun ? 'Dry-run' : 'Synced'} ${r.attempted}/${r.repos} original sources`, ver: 'latest', desc: '', signed: true, scan: 'ok', uses: '', installed: true, mine: true, tags: [] });
+      setAdded({ id: 'sync', name: `${dryRun ? 'Dry-run' : 'Synced'} ${r.attempted}/${r.repos} original sources`, ver: 'latest', desc: '', signed: true, scan: 'ok', installed: true, mine: true, tags: [] });
       await refreshRegistry();
     } catch { /* admin token missing or source unavailable */ }
     setSyncing(false);
