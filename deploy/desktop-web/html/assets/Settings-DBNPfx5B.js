@@ -1,4 +1,4 @@
-import{R as l,u as V,j as e}from"./index-DQnA0BTl.js";import{a as x,I as w,G as b,R as p,d as $,E as Y,j as H,g as q,A as Q}from"./ui-BtSv6MYo.js";import{a as X,b as Z,T as ee,S as te,c as re,d as ne,s as oe,g as O,e as se}from"./appShell-CLYEicFB.js";import{u as ae,k as M,M as L}from"./ModelPicker-DKikESPz.js";const ie=`
+import{R as l,u as V,j as e}from"./index-MIrWyksH.js";import{a as x,I as w,G as b,R as p,d as $,E as Y,j as H,e as q,A as Q}from"./ui-DC7b7hJy.js";import{a as X,b as Z,T as ee,S as te,c as re,d as ne,s as oe,g as O,e as se}from"./appShell-CnyAmoqw.js";import{u as ae,k as M,M as L}from"./ModelPicker-6rsZjzRl.js";const ie=`
   @keyframes spin { to { transform: rotate(360deg); } }
   .app-wallpaper { position: absolute; inset: 0; z-index: 0; pointer-events: none;
     background: radial-gradient(60% 50% at 16% 0%, color-mix(in srgb, var(--blob-a) 26%, transparent), transparent 70%), radial-gradient(55% 50% at 100% 100%, color-mix(in srgb, var(--blob-b) 22%, transparent), transparent 70%), var(--bg); }

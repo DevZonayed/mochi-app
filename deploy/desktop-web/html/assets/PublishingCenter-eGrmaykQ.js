@@ -1,4 +1,4 @@
-import{R as i,j as e}from"./index-DQnA0BTl.js";import{a as n,d as j,I as p}from"./ui-BtSv6MYo.js";import{A as I}from"./appShell-CLYEicFB.js";const A=`
+import{R as i,j as e}from"./index-MIrWyksH.js";import{a as n,d as j,I as p}from"./ui-DC7b7hJy.js";import{A as I}from"./appShell-CnyAmoqw.js";const A=`
   .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease, background 140ms ease; }
   .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.4); }
   .primary-cta:active { transform: translateY(1px); }
