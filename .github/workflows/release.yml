@@ -54,11 +54,14 @@ jobs:
           node-version: 20
           cache: pnpm
 
-      - name: Install dependencies (desktop subtree only)
-        # Scope to the desktop app + its workspace deps. This skips the server's
-        # native modules (e.g. better-sqlite3), which otherwise fail node-gyp on
-        # the macOS/Windows runners and aren't needed to build the desktop app.
-        run: pnpm install --frozen-lockfile --filter "@maestro/desktop..."
+      - name: Install dependencies
+        # --ignore-scripts: the desktop app needs no native builds — electron-builder
+        # downloads Electron itself (electronVersion in electron-builder.yml) and
+        # esbuild resolves its binary from its platform optional-dep. This skips the
+        # server's better-sqlite3 node-gyp compile, which fails on the macOS (no
+        # distutils in Python 3.12) and Windows (VS detection) runners and is not
+        # needed to build the desktop app.
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Build renderer + main process
         run: pnpm --filter @maestro/desktop build
