@@ -8,7 +8,7 @@
  * this Mac; only the catalog lives on the server.
  */
 
-import { mkdirSync, writeFileSync, rmSync, existsSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, readdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import localIndex from './skills-index.json';
 
@@ -138,7 +138,7 @@ export function removeSkillFiles(projectRoot: string, id: string): void {
   if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 }
 
-/** Slugs of skills physically present in the project (source of truth on disk). */
+/** Slugs of skills physically present + ENABLED in the project (SKILL.md exists). */
 export function listInstalledSlugs(projectRoot: string): string[] {
   const dir = join(projectRoot, '.claude', 'skills');
   if (!existsSync(dir)) return [];
@@ -146,5 +146,37 @@ export function listInstalledSlugs(projectRoot: string): string[] {
     return readdirSync(dir, { withFileTypes: true })
       .filter(e => e.isDirectory() && existsSync(join(dir, e.name, 'SKILL.md')))
       .map(e => e.name);
+  } catch { return []; }
+}
+
+/* Soft enable/disable: a disabled skill keeps its folder but its SKILL.md is
+   renamed to SKILL.md.disabled so the Claude Agent SDK's settingSources no longer
+   auto-discovers it (and our prompt index drops it) — re-enabling renames it back,
+   so nothing is lost. Returns true if the on-disk state matches `enabled` after. */
+export function setSkillFilesEnabled(projectRoot: string, id: string, enabled: boolean): boolean {
+  const slug = skillSlug(id);
+  const dir = join(projectRoot, '.claude', 'skills', slug);
+  const active = join(dir, 'SKILL.md');
+  const off = join(dir, 'SKILL.md.disabled');
+  try {
+    if (enabled) { if (existsSync(off) && !existsSync(active)) renameSync(off, active); return existsSync(active); }
+    if (existsSync(active)) renameSync(active, off);
+    return existsSync(off);
+  } catch { return false; }
+}
+
+/** Every skill folder on disk with its enabled state (SKILL.md → on, .disabled → off). */
+export function listInstalledSlugsDetailed(projectRoot: string): { slug: string; enabled: boolean }[] {
+  const dir = join(projectRoot, '.claude', 'skills');
+  if (!existsSync(dir)) return [];
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter(e => e.isDirectory())
+      .map(e => {
+        const hasActive = existsSync(join(dir, e.name, 'SKILL.md'));
+        const hasOff = existsSync(join(dir, e.name, 'SKILL.md.disabled'));
+        return (hasActive || hasOff) ? { slug: e.name, enabled: hasActive } : null;
+      })
+      .filter((x): x is { slug: string; enabled: boolean } => x !== null);
   } catch { return []; }
 }

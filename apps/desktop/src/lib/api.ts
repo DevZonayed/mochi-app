@@ -143,7 +143,7 @@ export interface RegistrySkillSummary {
 export interface InstalledSkill {
   id: string; slug: string; name: string; description?: string; risk?: string; source?: string;
   version?: string; sha256?: string; enabled?: boolean; disabledReason?: string | null;
-  mirrorRepo?: string | null; auditStatus?: string | null; installedAt: number;
+  mirrorRepo?: string | null; auditStatus?: string | null; addedBy?: 'operator' | 'agent'; installedAt: number;
 }
 export interface Template {
   id: string;
@@ -730,6 +730,9 @@ export const api = {
     call<{ skill: InstalledSkill }>('addSkillToProject', { projectId, ...skill }, () => Promise.reject(new Error('desktop only'))),
   removeSkillFromProject: (projectId: string, skillId: string) =>
     call<{ ok: boolean }>('removeSkillFromProject', { projectId, skillId }, () => Promise.reject(new Error('desktop only'))),
+  /** Enable/disable a project skill without uninstalling it (renames SKILL.md on disk). */
+  setProjectSkillEnabled: (projectId: string, skillId: string, enabled: boolean) =>
+    call<{ ok: boolean; skill: InstalledSkill | null }>('setProjectSkillEnabled', { projectId, skillId, enabled }, () => Promise.reject(new Error('desktop only'))),
   toggleSkill: (id: string) =>
     call<Skill>('toggleSkill', { id }, () => req<Skill>(`/api/skills/${encodeURIComponent(id)}/toggle`, { method: 'POST' })),
 

@@ -1,4 +1,4 @@
-import{R as i,j as e}from"./index-DQnA0BTl.js";import{a as f,d as k,I as w,A as S}from"./ui-BtSv6MYo.js";import{A as R}from"./appShell-CLYEicFB.js";const C=`
+import{R as i,j as e}from"./index-MIrWyksH.js";import{a as f,d as k,I as w,A as S}from"./ui-DC7b7hJy.js";import{A as R}from"./appShell-CnyAmoqw.js";const C=`
   .tab-fade { animation: tfade 240ms var(--spring); }
   @keyframes tfade { from { transform: translateY(6px); } to { transform: none; } }
   .row-hover:hover { background: var(--fill-tertiary); }

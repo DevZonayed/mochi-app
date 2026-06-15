@@ -11,6 +11,7 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AppShell } from '../lib/appShell';
 import { Icon } from '../lib/icons';
+import { Switch } from '../lib/ui';
 import { ImageViewer } from '../lib/CodeView';
 import { api, IS_LOCAL, type Project, type ChatSession, type DesignComment, type InstalledSkill, type RegistrySkillSummary } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
@@ -636,6 +637,12 @@ function DesignSkillsSheet({ open, project, onClose }: { open: boolean; project:
     setInstalled(xs => xs.filter(x => x.id !== s.id));
     try { await api.removeSkillFromProject(project.id, s.id); } catch { load(); }
   };
+  const toggle = async (s: InstalledSkill) => {
+    const next = s.enabled === false;
+    setInstalled(xs => xs.map(x => (x.id === s.id ? { ...x, enabled: next } : x)));
+    try { await api.setProjectSkillEnabled(project.id, s.id, next); } catch { load(); }
+  };
+  const activeCount = installed.filter(s => s.enabled !== false).length;
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 90, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.22)' }} onClick={onClose}>
       <div onClick={e => e.stopPropagation()} style={{ width: 520, maxHeight: 'min(680px, calc(100vh - 64px))', display: 'flex', flexDirection: 'column', borderRadius: 16, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 24px 70px rgba(0,0,0,.28)', overflow: 'hidden' }}>
@@ -652,17 +659,25 @@ function DesignSkillsSheet({ open, project, onClose }: { open: boolean; project:
         <div className="ds-scroll" style={{ overflow: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
           {installed.length > 0 && (
             <div>
-              <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 8 }}>Installed</div>
+              <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 8 }}>Active on this project · {activeCount}</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {installed.map(s => (
-                  <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '9px 10px', borderRadius: 10, background: 'var(--surface)', border: '0.5px solid var(--separator)' }}>
-                    <span style={{ flex: 1, minWidth: 0 }}>
-                      <span style={{ display: 'block', font: '600 var(--fs-footnote)/1.25 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
-                      <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>.claude/skills/{s.slug}/SKILL.md</span>
-                    </span>
-                    <button onClick={() => void remove(s)} style={{ height: 26, padding: '0 9px', borderRadius: 7, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Remove</button>
-                  </div>
-                ))}
+                {installed.slice().sort((a, b) => Number(b.enabled !== false) - Number(a.enabled !== false)).map(s => {
+                  const on = s.enabled !== false;
+                  return (
+                    <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '9px 10px', borderRadius: 10, background: 'var(--surface)', border: '0.5px solid var(--separator)', opacity: on ? 1 : 0.6 }}>
+                      <span style={{ flex: 1, minWidth: 0 }}>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                          <span style={{ font: '600 var(--fs-footnote)/1.25 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
+                          {s.addedBy === 'agent' && <span title="Installed by the agent during a run" style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexShrink: 0, height: 15, padding: '0 5px', borderRadius: 'var(--r-pill)', background: 'color-mix(in srgb, var(--purple) 16%, transparent)', color: 'var(--purple)', font: '600 var(--fs-caption)/15px var(--font-text)' }}><Icon name="bolt" size={9} /> agent</span>}
+                          {!on && <span style={{ flexShrink: 0, height: 15, padding: '0 5px', borderRadius: 'var(--r-pill)', background: 'var(--fill-tertiary)', color: 'var(--ink-tertiary)', font: '600 var(--fs-caption)/15px var(--font-text)' }}>off</span>}
+                        </span>
+                        <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>.claude/skills/{s.slug}/SKILL.md</span>
+                      </span>
+                      <Switch on={on} onChange={() => void toggle(s)} />
+                      <button onClick={() => void remove(s)} style={{ height: 26, padding: '0 9px', borderRadius: 7, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Remove</button>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

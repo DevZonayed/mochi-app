@@ -186,6 +186,7 @@ export class BrowserBridge {
           disabledReason: meta?.disabledReason,
           mirrorRepo: meta?.sourceRepo ?? meta?.mirrorRepo,
           auditStatus: meta?.auditStatus,
+          addedBy: 'agent',
         });
         return txt(`Installed "${rec.name}" -> .claude/skills/${rec.slug}/SKILL.md${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}. Read that file before using the skill.`);
       }

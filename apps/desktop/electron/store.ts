@@ -327,6 +327,8 @@ export interface InstalledSkill {
   disabledReason?: string | null;
   mirrorRepo?: string | null;
   auditStatus?: string | null;
+  /** Who installed it: 'operator' from the UI, 'agent' when the model self-installed mid-run. */
+  addedBy?: 'operator' | 'agent';
   installedAt: number;
 }
 
@@ -541,6 +543,26 @@ export class Store {
     const list = this.data.installedSkills?.[projectId]; if (!list) return;
     this.data.installedSkills![projectId] = list.filter(x => x.id !== idOrSlug && x.slug !== idOrSlug);
     this.save();
+  }
+  /** Flip a project skill's enabled flag (the on-disk SKILL.md move is done by the caller). */
+  setInstalledSkillEnabled(projectId: string, idOrSlug: string, enabled: boolean): InstalledSkill | null {
+    const list = this.data.installedSkills?.[projectId]; if (!list) return null;
+    const rec = list.find(x => x.id === idOrSlug || x.slug === idOrSlug); if (!rec) return null;
+    rec.enabled = enabled;
+    if (enabled) rec.disabledReason = null;
+    this.save();
+    return rec;
+  }
+  /** Upsert a bare record for a skill found on disk but not yet tracked (e.g. dropped in manually). */
+  ensureInstalledSkill(projectId: string, rec: Omit<InstalledSkill, 'installedAt'>): InstalledSkill {
+    if (!this.data.installedSkills) this.data.installedSkills = {};
+    const list = this.data.installedSkills[projectId] ?? (this.data.installedSkills[projectId] = []);
+    const existing = list.find(x => x.id === rec.id || x.slug === rec.slug);
+    if (existing) return existing;
+    const full: InstalledSkill = { ...rec, installedAt: Date.now() };
+    list.push(full);
+    this.save();
+    return full;
   }
 
   // ── Workspace ───────────────────────────────────────────────────────
