@@ -472,8 +472,8 @@ async function runClaude(
               { query: z.string().describe('What you need, e.g. "edit pdf", "google sheets", "stripe", "next.js best practices".'), limit: z.number().optional().describe('Max results (default 8).') },
               wrap(async (a: { query: string; limit?: number }) => {
                 const r = await skillsCtx.search(a.query, a.limit ?? 8);
-                if (!r.results.length) return txt(`No skills found for "${a.query}".`);
-                return txt(`Found ${r.results.length} skill(s):\n` + r.results.map(skillLine).join('\n') + `\n\nUse get_skill for metadata, download_skill to read SKILL.md, or add_skill_to_project to install it into this project.`);
+                if (!r.results.length) return txt(`No skills found for "${a.query}". Try broader keywords; if still nothing, proceed without a skill.`);
+                return txt(`Found ${r.results.length} skill(s):\n` + r.results.map(skillLine).join('\n') + `\n\nNow INSTALL the best match: call add_skill_to_project with its id, then read its SKILL.md and follow it. (Use get_skill/download_skill first only if you need to disambiguate.)`);
               })),
             tool('get_skill',
               'Fetch one registry skill metadata record by id. Use this to inspect original source, audit, and version state before installing.',
@@ -1167,7 +1167,11 @@ export class LocalEngine {
             : `Already installed here: (none yet — so a registry search before you start is especially important).`;
           prompt = `<project_skills note="How to work with skills on this project. This is an INSTRUCTION, follow it.">\n` +
             `You have a Skill-Broker (MCP tools): search_skills, get_skill, download_skill, add_skill_to_project, list_project_skills, remove_project_skill.\n\n` +
-            `BEFORE you start any substantive task — scaffolding or building a project, editing code, generating a design/content, or any specialized or domain-specific work — FIRST call search_skills with keywords from the request. If a relevant skill comes back, add_skill_to_project, then READ the installed .claude/skills/<slug>/SKILL.md and follow it. Prefer an existing/registry skill over improvising; only proceed on your own when the search genuinely returns nothing useful (say so briefly if you do). Run this search-first step even when no skills are installed yet. Skip it only for trivial turns — a greeting, a quick question, a one-line tweak.\n\n` +
+            `For any substantive task — scaffolding or building a project, editing code, generating a design/content, or any specialized or domain-specific work — do this FIRST, before the work:\n` +
+            `1) Call search_skills with keywords from the request.\n` +
+            `2) INSTALL the best-matching result with add_skill_to_project (use its exact id). Installing + following a relevant skill is the DEFAULT, not optional — the registry is curated, so a reasonable match is worth installing. If several fit, install the closest (you may install more than one).\n` +
+            `3) READ the installed .claude/skills/<slug>/SKILL.md and follow it as you work.\n` +
+            `Only skip installing when EVERY result is clearly unrelated to the request — and if you skip, say in one line which top result you saw and why it didn't fit, then proceed. Do all of this even when nothing is installed yet. Skip the whole step only for trivial turns — a greeting, a quick question, a one-line tweak.\n\n` +
             `${installedBlock}\n` +
             `</project_skills>\n\n${prompt}`;
         } else if (installed.length) {
