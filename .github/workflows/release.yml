@@ -12,6 +12,12 @@ on:
 permissions:
   contents: write # create the GitHub Release + push the version sync commit
 
+concurrency:
+  # Serialize releases: if one is running, the next waits instead of racing on
+  # the auto-incremented version (which is what scrambled versions during setup).
+  group: desktop-release
+  cancel-in-progress: false
+
 jobs:
   version:
     runs-on: ubuntu-latest
