@@ -340,25 +340,53 @@ export function resolveClaude(): string | null {
   return claudePath;
 }
 
-/* ── Codex binary resolution ─────────────────────────────────────────── */
+/* ── Codex binary resolution (bundled binary first) ──────────────────────
+   Mirror Claude: ship our own Codex CLI so it runs whether or not the user has
+   a global install. `@openai/codex` vends the native binary via a per-platform
+   optional dep (`@openai/codex-<platform>-<arch>`); the executable lives at
+   <pkg>/vendor/<target-triple>/bin/codex. We resolve that directly (it's the
+   same rust binary a global `codex` install would run), then fall back to a
+   `codex` on PATH and the common install locations. */
+const CODEX_PLATFORM: Record<string, { pkg: string; triple: string }> = {
+  'darwin-arm64': { pkg: '@openai/codex-darwin-arm64', triple: 'aarch64-apple-darwin' },
+  'darwin-x64':   { pkg: '@openai/codex-darwin-x64',   triple: 'x86_64-apple-darwin' },
+  'linux-x64':    { pkg: '@openai/codex-linux-x64',    triple: 'x86_64-unknown-linux-musl' },
+  'linux-arm64':  { pkg: '@openai/codex-linux-arm64',  triple: 'aarch64-unknown-linux-musl' },
+  'win32-x64':    { pkg: '@openai/codex-win32-x64',    triple: 'x86_64-pc-windows-msvc' },
+  'win32-arm64':  { pkg: '@openai/codex-win32-arm64',  triple: 'aarch64-pc-windows-msvc' },
+};
+function bundledCodex(): string | null {
+  const entry = CODEX_PLATFORM[`${process.platform}-${process.arch}`];
+  if (!entry) return null;
+  try {
+    const pkgJson = require.resolve(`${entry.pkg}/package.json`);
+    const exe = process.platform === 'win32' ? 'codex.exe' : 'codex';
+    const cand = path.join(path.dirname(pkgJson), 'vendor', entry.triple, 'bin', exe);
+    if (existsSync(cand)) return cand;
+  } catch { /* optional dep not installed for this platform — fall through */ }
+  return null;
+}
 let codexPath: string | null | undefined;
 export function resolveCodex(): string | null {
   if (codexPath !== undefined) return codexPath;
+  // 1) The binary we bundle for this platform/arch (always present in node_modules).
+  const bundled = bundledCodex();
+  if (bundled) { codexPath = bundled; return codexPath; }
+  // 2) A `codex` on the login shell PATH.
   try {
-    codexPath = execFileSync('/bin/zsh', ['-lc', 'command -v codex'], { encoding: 'utf8' }).trim() || null;
-  } catch {
-    codexPath = null;
+    const found = execFileSync('/bin/zsh', ['-lc', 'command -v codex'], { encoding: 'utf8' }).trim();
+    if (found && existsSync(found)) { codexPath = found; return codexPath; }
+  } catch { /* none */ }
+  // 3) Common install locations.
+  for (const cand of [
+    path.join(homedir(), '.local', 'bin', 'codex'),
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+  ]) {
+    if (existsSync(cand)) { codexPath = cand; return codexPath; }
   }
-  if (!codexPath) {
-    for (const cand of [
-      path.join(homedir(), '.local', 'bin', 'codex'),
-      '/opt/homebrew/bin/codex',
-      '/usr/local/bin/codex',
-    ]) {
-      if (existsSync(cand)) { codexPath = cand; break; }
-    }
-  }
-  return codexPath ?? null;
+  codexPath = null;
+  return codexPath;
 }
 
 function abortControllerFromSignal(signal: AbortSignal): AbortController {
@@ -815,10 +843,16 @@ async function runClaude(
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
 function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
-  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; browserBridge?: BrowserBridge; browserEnabled?: boolean },
+  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; browserBridge?: BrowserBridge; browserEnabled?: boolean; openaiKey?: string },
   imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex CLI not found on this Mac'), { statusCode: 503 }));
+  // API-key auth: when there is no ChatGPT subscription login, pass the stored
+  // OpenAI key to `codex exec` via OPENAI_API_KEY (the provider's env_key). When a
+  // subscription login exists, leave the env alone so Codex uses that.
+  const env = (!codexLoggedIn() && ctx?.openaiKey)
+    ? { ...process.env, OPENAI_API_KEY: ctx.openaiKey }
+    : process.env;
   const outFile = path.join(tmpdir(), `maestro-codex-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
   // Native MCP for codex: one stdio bridge forwards browser tools and the
   // Skill-Broker tools back into Maestro. Codex's sandbox auto-cancels MCP tool
@@ -837,7 +871,7 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
     prompt,
   ];
   return new Promise<EngineRun>((resolve, reject) => {
-    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env });
     hooks.onChild?.(child);
     let stdout = '';
     let stderr = '';
@@ -1002,6 +1036,8 @@ const ENGINE_LABEL: Record<EngineId, string> = { claude: 'Claude Code', codex: '
 export class LocalEngine {
   /** jobId → live cancel handle (abort for claude, child for codex). */
   private running = new Map<string, { ac: AbortController; child?: ChildProcess }>();
+  /** In-flight `codex login` child (browser OAuth), if any. */
+  private codexLoginChild?: ChildProcess;
 
   constructor(private store: Store, private emit: (name: string, data: unknown, opts?: { live?: boolean }) => void, private providers?: Providers) {}
 
@@ -1191,12 +1227,14 @@ export class LocalEngine {
       if (key) return { engine, available: true, method: 'apiKey', detail: 'Anthropic API key', reason: '' };
       return { engine, available: false, method: 'none', detail: 'Not signed in', reason: 'Run `claude login` once on this Mac, or add an Anthropic API key in Settings → Accounts.' };
     }
-    // codex
-    const loggedIn = codexLoggedIn();
+    // codex — runnable on EITHER a ChatGPT subscription login OR an OpenAI API
+    // key (passed to `codex exec` via OPENAI_API_KEY). The CLI is bundled, so a
+    // missing binary is only ever a packaging edge case, not the common path.
     const bin = resolveCodex();
-    if (loggedIn && bin) return { engine, available: true, method: 'subscription', detail: 'Codex (ChatGPT) login', reason: '' };
-    if (!bin) return { engine, available: false, method: 'none', detail: 'CLI not found', reason: 'Install the Codex CLI (`npm i -g @openai/codex`) so it is on your PATH.' };
-    return { engine, available: false, method: 'none', detail: 'Not signed in', reason: 'Sign into Codex (`codex login`) on this Mac.' };
+    if (!bin) return { engine, available: false, method: 'none', detail: 'CLI not found', reason: 'The bundled Codex CLI could not be located — reinstall the app, or install `@openai/codex`.' };
+    if (codexLoggedIn()) return { engine, available: true, method: 'subscription', detail: 'Codex (ChatGPT) login', reason: '' };
+    if (this.providers?.getLocalKey('openai')) return { engine, available: true, method: 'apiKey', detail: 'OpenAI API key', reason: '' };
+    return { engine, available: false, method: 'none', detail: 'Not signed in', reason: 'Sign in with ChatGPT or add an OpenAI API key in Settings → Accounts.' };
   }
 
   statuses(): Record<EngineId, EngineStatus> {
@@ -1204,6 +1242,50 @@ export class LocalEngine {
   }
 
   available(engine: EngineId): boolean { return this.status(engine).available; }
+
+  /** Drive the bundled Codex CLI's ChatGPT OAuth login. Opens the system browser
+      and resolves once `codex login` completes (writes ~/.codex/auth.json).
+      Works whether or not already signed in — re-auth / switch account. */
+  codexLogin(): Promise<{ ok: true; method: 'subscription' }> {
+    const bin = resolveCodex();
+    if (!bin) return Promise.reject(Object.assign(new Error('Bundled Codex CLI not found on this Mac.'), { statusCode: 503 }));
+    // A previous, still-pending login is superseded by this one.
+    try { this.codexLoginChild?.kill('SIGTERM'); } catch { /* gone */ }
+    return new Promise((resolve, reject) => {
+      let out = '';
+      const child = spawn(bin, ['login'], { stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
+      this.codexLoginChild = child;
+      const timer = setTimeout(() => {
+        try { child.kill('SIGTERM'); } catch { /* gone */ }
+        reject(Object.assign(new Error('Codex sign-in timed out — no response after 5 minutes.'), { statusCode: 408 }));
+      }, 5 * 60 * 1000);
+      child.stdout?.on('data', (d: Buffer) => { out += String(d); });
+      child.stderr?.on('data', (d: Buffer) => { out += String(d); });
+      child.on('error', (e) => { clearTimeout(timer); this.codexLoginChild = undefined; reject(Object.assign(new Error(`Codex sign-in failed to start: ${e.message}`), { statusCode: 500 })); });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        this.codexLoginChild = undefined;
+        if (codexLoggedIn()) { resolve({ ok: true, method: 'subscription' }); return; }
+        reject(Object.assign(new Error(out.trim().slice(-300) || `Codex sign-in exited ${code ?? 'unknown'}.`), { statusCode: 500 }));
+      });
+    });
+  }
+
+  /** Abort an in-flight `codex login` (e.g. the user closed the dialog). */
+  codexLoginCancel(): { ok: true } {
+    try { this.codexLoginChild?.kill('SIGTERM'); } catch { /* gone */ }
+    this.codexLoginChild = undefined;
+    return { ok: true };
+  }
+
+  /** Remove stored Codex ChatGPT credentials. */
+  codexLogout(): { ok: true } {
+    const bin = resolveCodex();
+    if (bin) { try { execFileSync(bin, ['logout'], { stdio: 'ignore' }); } catch { /* fall through to file removal */ } }
+    // Belt-and-suspenders: ensure auth.json is gone even if the CLI balks.
+    try { rmSync(path.join(homedir(), '.codex', 'auth.json'), { force: true }); } catch { /* ignore */ }
+    return { ok: true };
+  }
 
   /** Cancel a running job. Returns the updated (cancelled) job, or null if not running. */
   cancel(jobId: string): Job | null {
@@ -1465,7 +1547,7 @@ export class LocalEngine {
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
       const browserForRun = this.browserFor();
-      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input), browserBridge: this.browserBridgeFor(), browserEnabled: !!browserForRun };
+      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input), browserBridge: this.browserBridgeFor(), browserEnabled: !!browserForRun, openaiKey: this.providers?.getLocalKey('openai') };
       // Let the agent discover + self-install registry skills mid-run (Claude MCP).
       const projForSkills = job.projectId;
       const skillsCtx: SkillsCtx | undefined = (projForSkills && !opts.plan) ? {

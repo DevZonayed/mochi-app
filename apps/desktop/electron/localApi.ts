@@ -642,6 +642,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         providers.disconnect(prov as ProviderId);
         return { ok: true };
       }
+      // Codex ChatGPT OAuth, driven by the bundled CLI. Opens the system browser;
+      // resolves once signed in. Available even when already signed in (re-auth).
+      case 'codexLogin': return engine.codexLogin();
+      case 'codexLoginCancel': return engine.codexLoginCancel();
+      case 'codexLogout': return engine.codexLogout();
+
       // Live GitHub connection status (login + scopes + repo-scope capability).
       case 'githubStatus': return githubConnectionStatus(providers.getLocalKey('github'));
       // One-click connect by importing a token from an authenticated `gh` CLI.
