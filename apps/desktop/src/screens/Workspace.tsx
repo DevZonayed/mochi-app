@@ -10,7 +10,6 @@ import { AppShell } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type ChatSession, type ProjectKind, type Job } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
 import { FileViewer, ImageViewer } from '../lib/CodeView';
-import { BrowserPane } from '../lib/BrowserPane';
 import { ProjectPanel } from '../lib/ProjectPanel';
 import { RightSidebar, type CheckItem } from '../lib/RightSidebar';
 import { IS_WRITE_TOOL } from '../lib/fileChip';
@@ -43,7 +42,7 @@ const PAGE_CSS = `
 `;
 
 type ProjectSection = 'settings' | 'instructions' | 'jobs' | 'skills';
-interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image' | 'browser' | 'project'; filePath?: string; imageAssetId?: string; imagePath?: string; projectSection?: ProjectSection }
+interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image' | 'project'; filePath?: string; imageAssetId?: string; imagePath?: string; projectSection?: ProjectSection }
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
@@ -194,14 +193,6 @@ export default function Workspace() {
     const existing = tabs.find(t => t.key === key);
     if (existing) { setActiveKey(existing.key); return; }
     setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: name || 'Image', kind: 'image', imageAssetId: assetId, imagePath }]));
-    setActiveKey(key);
-  };
-  // Open the live Browser tab for a project (one per project; deduped).
-  const openBrowser = (projectId: string) => {
-    const key = 'browser:' + projectId;
-    const existing = tabs.find(t => t.key === key);
-    if (existing) { setActiveKey(existing.key); return; }
-    setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: 'Browser', kind: 'browser' }]));
     setActiveKey(key);
   };
   // Open a project hub tab (settings / instructions+memory / jobs) — deduped.
@@ -585,8 +576,6 @@ export default function Workspace() {
                     {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: projColor(p) }} />}
                     {t.kind === 'file'
                       ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
-                      : t.kind === 'browser'
-                      ? <Icon name="globe" size={12} style={{ color: 'var(--blue)', flexShrink: 0 }} />
                       : t.kind === 'image'
                       ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
                       : t.kind === 'project'
@@ -616,7 +605,7 @@ export default function Workspace() {
                         return (
                           <div key={t.key} className="ws-ovf-item" onClick={() => { setActiveKey(t.key); setOvfOpen(false); }}
                             style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 9px', borderRadius: 8, cursor: 'pointer', background: on ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
-                            <Icon name={t.kind === 'file' ? 'file' : t.kind === 'browser' ? 'globe' : t.kind === 'image' ? 'image' : 'chat'} size={13} style={{ flexShrink: 0, color: t.kind && t.kind !== 'chat' ? 'var(--ink-secondary)' : projColor(p) }} />
+                            <Icon name={t.kind === 'file' ? 'file' : t.kind === 'image' ? 'image' : 'chat'} size={13} style={{ flexShrink: 0, color: t.kind && t.kind !== 'chat' ? 'var(--ink-secondary)' : projColor(p) }} />
                             <span style={{ flex: 1, minWidth: 0, font: `${on ? 600 : 500} var(--fs-footnote)/1.25 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
                             {p && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', flexShrink: 0, maxWidth: 70, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>}
                             <button title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
@@ -629,12 +618,6 @@ export default function Workspace() {
                   </>
                 )}
               </div>
-            )}
-            {IS_LOCAL && (
-              <button onClick={() => openBrowser(activeTab?.projectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
-                title="Open the live browser for this project" className="ws-newbtn" style={{ width: 38, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
-                <Icon name="globe" size={15} />
-              </button>
             )}
             <button onClick={() => newChat(activeTab?.projectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
               title="New chat" className="ws-newbtn" style={{ width: 40, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
@@ -665,8 +648,6 @@ export default function Workspace() {
                     ? <FileViewer projectId={t.projectId} filePath={t.filePath} />
                     : t.kind === 'image'
                     ? <ImageViewer assetId={t.imageAssetId} name={t.title} imagePath={t.imagePath} />
-                    : t.kind === 'browser'
-                    ? <BrowserPane projectId={t.projectId} />
                     : t.kind === 'project'
                     ? <ProjectPanel projectId={t.projectId} section={t.projectSection} />
                     : <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
