@@ -176,9 +176,9 @@ function ProjectCard({ p, onMenu, onOpen }: CardProps) {
             <span style={{ display: 'block', font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{t.label}</span>
           </span>
           {!p.paused && (
-            <button className="proj-menu" onClick={e => { e.stopPropagation(); onMenu(p.id); }} style={{
+            <button className="proj-menu" title="Delete project" onClick={e => { e.stopPropagation(); onMenu(p.id); }} style={{
               width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0,
-            }}><Icon name="more" size={18} /></button>
+            }}><Icon name="trash" size={16} /></button>
           )}
         </div>
 
@@ -246,9 +246,9 @@ function ProjectRow({ p, onMenu, onOpen, last }: RowProps) {
       </div>
       <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{p.path ? (p.repoUrl ? 'repo' : 'folder') : '—'}</span>
       <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{p.next === '—' ? p.activity : `Next ${p.next}`}</span>
-      <button className="proj-menu" onClick={e => { e.stopPropagation(); onMenu(p.id); }} style={{
+      <button className="proj-menu" title="Delete project" onClick={e => { e.stopPropagation(); onMenu(p.id); }} style={{
         width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}>
-        <Icon name="more" size={18} />
+        <Icon name="trash" size={16} />
       </button>
     </div>
   );
@@ -767,6 +767,7 @@ export default function Projects() {
   const [galleryOpen, setGalleryOpen] = React.useState(false);
   const [suggestedName, setSuggestedName] = React.useState<string | undefined>(undefined);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [confirmDel, setConfirmDel] = React.useState<string | null>(null);
 
   // Opened with router state { openNew: true } → open the New-project sheet.
   React.useEffect(() => {
@@ -809,7 +810,14 @@ export default function Projects() {
     navigate(`/project-detail/${projectId}`);
   };
 
-  const archive = (id: string) => setProjects(ps => ps.filter(p => p.id !== id));
+  // Delete a project — confirm first, then persist (the old "archive" only hid it
+  // from local state, so it reappeared on reload).
+  const requestDelete = (id: string) => setConfirmDel(id);
+  const deleteProject = (id: string) => {
+    setConfirmDel(null);
+    setProjects(ps => ps.filter(p => p.id !== id));
+    void api.deleteProject(id).catch(() => { void load(); });
+  };
   const open = (id: string) => { navigate(`/project-detail/${id}`); };
 
   const newBtn = (
@@ -845,14 +853,40 @@ export default function Projects() {
             : projects.length === 0 ? <EmptyProjects onPick={() => setGalleryOpen(true)} />
             : view === 'grid'
               ? <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(316px, 1fr))', gap: 18 }}>
-                  {projects.map(p => <ProjectCard key={p.id} p={p} onMenu={archive} onOpen={open} />)}
+                  {projects.map(p => <ProjectCard key={p.id} p={p} onMenu={requestDelete} onOpen={open} />)}
                 </div>
-              : <ListTable projects={projects} onMenu={archive} onOpen={open} />}
+              : <ListTable projects={projects} onMenu={requestDelete} onOpen={open} />}
         </div>
       </AppShell>
 
       <NewProjectSheet open={galleryOpen} onClose={() => { setGalleryOpen(false); setSuggestedName(undefined); }} onCreated={onCreated} suggestedName={suggestedName} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
+
+      {confirmDel && (() => {
+        const p = projects.find(x => x.id === confirmDel);
+        return (
+          <div onClick={() => setConfirmDel(null)} style={{ position: 'fixed', inset: 0, zIndex: 200, background: 'rgba(8,10,30,0.34)', backdropFilter: 'blur(2px)', display: 'grid', placeItems: 'center', padding: 20 }}>
+            <div onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" style={{ width: 'min(420px, 100%)', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 16, boxShadow: 'var(--shadow-lg, 0 24px 70px rgba(15,20,60,0.32))', padding: 22 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+                <span style={{ width: 40, height: 40, borderRadius: 11, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--red, #ff3b30) 14%, transparent)', color: 'var(--red, #ff3b30)' }}>
+                  <Icon name="trash" size={20} />
+                </span>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ font: '700 var(--fs-headline)/1.2 var(--font-display)', color: 'var(--ink)' }}>Delete project?</div>
+                  <div style={{ font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p?.name ?? 'This project'}</div>
+                </div>
+              </div>
+              <p style={{ margin: '0 0 18px', font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                This removes the project and its chats from Maestro. {p?.path ? 'The folder on disk is left untouched.' : ''} This can’t be undone.
+              </p>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+                <button onClick={() => setConfirmDel(null)} style={{ height: 36, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Cancel</button>
+                <button onClick={() => deleteProject(confirmDel)} style={{ height: 36, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--red, #ff3b30)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Delete project</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </>
   );
 }

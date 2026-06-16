@@ -2805,6 +2805,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
   const [renamingId, setRenamingId] = React.useState<string | null>(null);
   const [renameVal, setRenameVal] = React.useState('');
   const [syncOpen, setSyncOpen] = React.useState(false);
+  const [showArchived, setShowArchived] = React.useState(false);
   const activeRef = React.useRef<string | null>(null);
   activeRef.current = activeId;
 
@@ -2815,7 +2816,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
     let alive = true;
     const want = new URLSearchParams(location.search).get('s');
     api.listSessions(projectId)
-      .then(ss => { if (alive) { setSessions(ss); setActiveId((want && ss.some(x => x.id === want)) ? want : (ss[0]?.id ?? null)); } })
+      .then(ss => { if (alive) { setSessions(ss); setActiveId((want && ss.some(x => x.id === want)) ? want : (ss.find(x => !x.archived)?.id ?? null)); } })
       .catch(() => {});
     return () => { alive = false; };
   }, [projectId, location.search]);
@@ -2841,6 +2842,11 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
     setSessions(ss => ss.filter(s => s.id !== id));
     if (activeRef.current === id) setActiveId(null);
   };
+  const archiveSession = (s: ChatSession, archived: boolean) => {
+    setSessions(ss => ss.map(x => (x.id === s.id ? { ...x, archived: archived ? Date.now() : undefined } : x)));
+    if (archived && activeRef.current === s.id) setActiveId(null);
+    void api.archiveSession(s.id, archived).catch(() => {});
+  };
   const commitRename = (id: string) => {
     const title = renameVal.trim();
     setRenamingId(null);
@@ -2865,40 +2871,63 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
           </button>
         </div>
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px 10px', display: 'flex', flexDirection: 'column', gap: 2 }}>
-          {sessions.length > 0 && <div style={{ padding: '6px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Recent</div>}
-          {sessions.length === 0 && (
-            <div style={{ padding: '22px 12px', font: '400 var(--fs-footnote)/1.55 var(--font-text)', color: 'var(--ink-tertiary)', textAlign: 'center' }}>
-              No chats yet.<br />Start one on the right.
-            </div>
-          )}
-          {sessions.map(s => {
-            const active = s.id === activeId;
+          {(() => {
+            const activeSessions = sessions.filter(s => !s.archived);
+            const archivedSessions = sessions.filter(s => s.archived).sort((a, b) => (b.archived ?? 0) - (a.archived ?? 0));
+            const renderRow = (s: ChatSession) => {
+              const active = s.id === activeId;
+              return (
+                <div key={s.id} className="sess-row" onClick={() => setActiveId(s.id)} style={{
+                  position: 'relative', display: 'flex', alignItems: 'center', gap: 6, padding: '8px 10px', borderRadius: 10, cursor: 'pointer',
+                  background: active ? 'var(--fill-secondary)' : 'transparent' }}>
+                  {active && <span style={{ position: 'absolute', left: 0, top: 9, bottom: 9, width: 2.5, borderRadius: 2, background: 'var(--blue)' }} />}
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    {renamingId === s.id ? (
+                      <input autoFocus value={renameVal} onChange={e => setRenameVal(e.target.value)} onClick={e => e.stopPropagation()}
+                        onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
+                        style={{ width: '100%', border: '1px solid var(--blue)', borderRadius: 6, padding: '2px 6px', background: 'var(--bg)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1.3 var(--font-text)' }} />
+                    ) : (
+                      <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
+                        style={{ display: 'flex', alignItems: 'center', gap: 5, font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (active ? 'var(--ink)' : 'var(--ink-secondary)'), whiteSpace: 'nowrap', overflow: 'hidden' }}>
+                        {s.importedFrom && <SourceChip source={s.importedFrom} />}
+                        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.title}</span>
+                      </span>
+                    )}
+                    <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>{relativeTime(s.updatedAt)}</span>
+                  </span>
+                  <button className="sess-x" title={s.archived ? 'Unarchive' : 'Archive chat'} onClick={e => { e.stopPropagation(); archiveSession(s, !s.archived); }}
+                    style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: s.archived ? 'var(--blue)' : 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+                    <Icon name="archive" size={12} />
+                  </button>
+                  <button className="sess-x" title="Delete chat" onClick={e => { e.stopPropagation(); removeSession(s.id); }}
+                    style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+                    <Icon name="trash" size={12} />
+                  </button>
+                </div>
+              );
+            };
             return (
-              <div key={s.id} className="sess-row" onClick={() => setActiveId(s.id)} style={{
-                position: 'relative', display: 'flex', alignItems: 'center', gap: 6, padding: '8px 10px', borderRadius: 10, cursor: 'pointer',
-                background: active ? 'var(--fill-secondary)' : 'transparent' }}>
-                {active && <span style={{ position: 'absolute', left: 0, top: 9, bottom: 9, width: 2.5, borderRadius: 2, background: 'var(--blue)' }} />}
-                <span style={{ flex: 1, minWidth: 0 }}>
-                  {renamingId === s.id ? (
-                    <input autoFocus value={renameVal} onChange={e => setRenameVal(e.target.value)} onClick={e => e.stopPropagation()}
-                      onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
-                      style={{ width: '100%', border: '1px solid var(--blue)', borderRadius: 6, padding: '2px 6px', background: 'var(--bg)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1.3 var(--font-text)' }} />
-                  ) : (
-                    <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
-                      style={{ display: 'flex', alignItems: 'center', gap: 5, font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: active ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden' }}>
-                      {s.importedFrom && <SourceChip source={s.importedFrom} />}
-                      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.title}</span>
-                    </span>
-                  )}
-                  <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>{relativeTime(s.updatedAt)}</span>
-                </span>
-                <button className="sess-x" title="Delete chat" onClick={e => { e.stopPropagation(); removeSession(s.id); }}
-                  style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
-                  <Icon name="x" size={12} stroke={2.4} />
-                </button>
-              </div>
+              <>
+                {activeSessions.length > 0 && <div style={{ padding: '6px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Recent</div>}
+                {sessions.length === 0 && (
+                  <div style={{ padding: '22px 12px', font: '400 var(--fs-footnote)/1.55 var(--font-text)', color: 'var(--ink-tertiary)', textAlign: 'center' }}>
+                    No chats yet.<br />Start one on the right.
+                  </div>
+                )}
+                {activeSessions.map(renderRow)}
+                {archivedSessions.length > 0 && (
+                  <>
+                    <button onClick={() => setShowArchived(v => !v)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', cursor: 'pointer', background: 'transparent' }}>
+                      <Icon name="chevronRight" size={11} style={{ transform: showArchived ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
+                      Archived ({archivedSessions.length})
+                    </button>
+                    {showArchived && archivedSessions.map(renderRow)}
+                  </>
+                )}
+              </>
             );
-          })}
+          })()}
         </div>
       </div>
 
