@@ -9,10 +9,9 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import type { Store } from './store.js';
 import type { LocalEngine } from './engine.js';
-import type { BrowserController } from './browser.js';
 
 type Dispatch = (method: string, params: Record<string, unknown>) => Promise<unknown>;
-interface Ctx { dispatch: Dispatch; engine: LocalEngine; browser?: BrowserController; store: Store }
+interface Ctx { dispatch: Dispatch; engine: LocalEngine; store: Store }
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
@@ -37,7 +36,7 @@ async function runChat(dispatch: Dispatch, projectId: string, text: string, time
 }
 
 export async function runSmoke(ctx: Ctx): Promise<number> {
-  const { dispatch, engine, browser, store } = ctx;
+  const { dispatch, engine, store } = ctx;
   const results: { name: string; ok: boolean; detail: string; ms: number }[] = [];
   const T = async (name: string, fn: () => Promise<string>) => {
     const t0 = Date.now();
@@ -67,12 +66,6 @@ export async function runSmoke(ctx: Ctx): Promise<number> {
     return `${groups.length} providers, ${groups.filter(g => g.runnable).length} runnable`;
   });
 
-  await T('browser available (system Chrome)', async () => {
-    const r = browser?.available();
-    if (!r?.ok) throw new Error(r?.reason || 'browser controller missing');
-    return 'Chrome found';
-  });
-
   let codeProj: any;
   await T('create coding project', async () => { codeProj = await dispatch('createProject', { name: `Smoke Code ${Date.now().toString(36)}`, kind: 'coding' }); return codeProj.id; });
 
@@ -81,15 +74,6 @@ export async function runSmoke(ctx: Ctx): Promise<number> {
     const m = await dispatch('getProjectMemory', { id: codeProj.id }) as any;
     if (!String(m.state).includes('smoke-test marker')) throw new Error('STATE.md did not round-trip');
     return 'STATE.md persists + reads back';
-  });
-
-  if (browser) await T('browser navigate + screenshot', async () => {
-    const nav = await browser.navigate(codeProj.id, 'https://example.com');
-    if (!/example/i.test(nav.title || '')) throw new Error(`unexpected title: ${nav.title}`);
-    const shot = await browser.screenshot(codeProj.id, {});
-    await browser.close(codeProj.id).catch(() => {});
-    if (!shot.assetId) throw new Error('no screenshot asset');
-    return `"${nav.title}" + screenshot saved`;
   });
 
   await T('image generation (skill fires + asset saved)', async () => {

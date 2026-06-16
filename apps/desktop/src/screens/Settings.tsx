@@ -16,7 +16,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, usePurpose, setPurpose, TrafficLights, Sidebar, Toolbar,
   type Theme, type Purpose,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ChromeProfile, type UpdateStatus, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, IS_LOCAL } from '../lib/api';
 import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
 import { WhatsNew } from '../lib/WhatsNew';
 import { EngineSetup } from '../EngineSetup';
@@ -144,6 +144,7 @@ const SET_NAV: SetNavItem[] = [
   { key: 'accounts', icon: 'key', label: 'Accounts & keys', tint: 'var(--blue)' },
   { key: 'security', icon: 'shield', label: 'Security', tint: 'var(--green)' },
   { key: 'devices', icon: 'smartphone', label: 'Devices', tint: 'var(--teal)' },
+  { key: 'extension', icon: 'globe', label: 'Browser extension', tint: 'var(--blue)' },
   { key: 'power', icon: 'bolt', label: 'Power & reliability', tint: 'var(--orange)' },
   { key: 'updates', icon: 'refresh', label: 'Updates', tint: 'var(--indigo)' },
   { key: 'danger', icon: 'alert', label: 'Danger zone', tint: 'var(--red)' },
@@ -254,23 +255,6 @@ function EnginesPane() {
   const [roles, setRolesState] = React.useState<Roles | null>(null);
   const groups = useModelGroups();
   const [favorites, setFavorites] = React.useState<string[]>([]);
-  const [browserAvail, setBrowserAvail] = React.useState<{ ok: boolean; reason?: string } | null>(null);
-  const [appSettings, setAppSettings] = React.useState<AppSettings | null>(null);
-  const [chromeProfiles, setChromeProfiles] = React.useState<ChromeProfile[]>([]);
-  React.useEffect(() => {
-    void api.browserAvailable().then(setBrowserAvail).catch(() => setBrowserAvail({ ok: false }));
-    void api.getSettings().then(setAppSettings).catch(() => {});
-    void api.listChromeProfiles().then(setChromeProfiles).catch(() => {});
-  }, []);
-  const setChromeProfile = (dir: string) => {
-    setAppSettings(s => (s ? { ...s, chromeProfile: dir } : s));
-    void api.setSettings({ chromeProfile: dir }).then(setAppSettings).catch(() => {});
-  };
-  const setChromeProfileMode = (mode: 'copy' | 'live') => {
-    setAppSettings(s => (s ? { ...s, chromeProfileMode: mode } : s));
-    void api.setSettings({ chromeProfileMode: mode }).then(setAppSettings).catch(() => {});
-  };
-
   const refetch = React.useCallback(() => {
     Promise.all([api.getRouting(), api.engineStatus(), api.getRoles()])
       .then(([r, e, ro]) => { setRouting(r); setEngines(e); setRolesState(ro); })
@@ -299,10 +283,6 @@ function EnginesPane() {
     const value = labelToEngine(label);
     setRouting(r => (r ? { ...r, [key]: value } as Routing : r));
     void api.setRouting({ [key]: value } as Partial<Routing>).then(setRouting).catch(() => {});
-  };
-  const setBrowserMode = (mode: 'on' | 'off') => {
-    setRouting(r => (r ? { ...r, browser: mode } : r));
-    void api.setRouting({ browser: mode }).then(setRouting).catch(() => {});
   };
 
   // ONE source of truth: the same status the run path uses, so the pane can
@@ -347,48 +327,6 @@ function EnginesPane() {
             </Row>
           ))}
         </GroupedList>
-        <GroupedList header="Browser" footer="One browser per project — shared across the project's chats (logins & cookies carry over), driven by whichever engine runs the job. When on, Codex runs with full access (matching how Claude already runs) so it can use the browser too.">
-          <Row last={chromeProfiles.length === 0}>
-            <span style={{ flex: 1, minWidth: 0 }}>
-              <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Browser automation</span>
-              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: browserAvail && !browserAvail.ok ? 'var(--orange, #d9821b)' : 'var(--ink-secondary)', marginTop: 2 }}>
-                {browserAvail ? (browserAvail.ok ? 'A real Chrome is ready for your agents to drive.' : (browserAvail.reason ?? 'Google Chrome not found.')) : 'Checking for Chrome…'}
-              </span>
-            </span>
-            {routing
-              ? <Seg options={['On', 'Off']} value={routing.browser === 'off' ? 'Off' : 'On'} onChange={v => setBrowserMode(v === 'On' ? 'on' : 'off')} />
-              : <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</span>}
-          </Row>
-          {chromeProfiles.length > 0 && (
-            <Row last={!appSettings?.chromeProfile}>
-              <span style={{ flex: 1, minWidth: 0 }}>
-                <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Chrome profile</span>
-                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
-                  {appSettings?.chromeProfile ? 'Maestro inherits this profile’s logins & history — never touching your real Chrome.' : 'Isolated: a fresh browser per project (no sign-ins carried over).'}
-                </span>
-              </span>
-              <select value={appSettings?.chromeProfile || ''} onChange={e => setChromeProfile(e.target.value)}
-                style={{ height: 30, maxWidth: 200, padding: '0 8px', borderRadius: 8, border: '1px solid var(--hairline)', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
-                <option value="">Isolated (per project)</option>
-                {chromeProfiles.map(p => <option key={p.dir} value={p.dir}>{p.name}</option>)}
-              </select>
-            </Row>
-          )}
-          {chromeProfiles.length > 0 && appSettings?.chromeProfile && (
-            <Row last>
-              <span style={{ flex: 1, minWidth: 0 }}>
-                <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>How to use it</span>
-                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
-                  {(appSettings?.chromeProfileMode ?? 'copy') === 'live'
-                    ? 'Live: drives your real Chrome profile (always in sync) — quit Chrome before running.'
-                    : 'Copy: signs in Maestro’s own browser using this profile’s cookies (one-time Keychain “Allow”). Your Chrome is never opened.'}
-                </span>
-              </span>
-              <Seg options={['Copy', 'Live']} value={(appSettings?.chromeProfileMode ?? 'copy') === 'live' ? 'Live' : 'Copy'} onChange={v => setChromeProfileMode(v === 'Live' ? 'live' : 'copy')} />
-            </Row>
-          )}
-        </GroupedList>
-
         <GroupedList header="Engine status" footer="Engines use your own sign-ins on this Mac — Claude Code (`claude login`) and Codex (ChatGPT). Cursor needs its agent CLI installed.">
           {ENGINE_STATUS_ROWS.map((row) => {
             const s = engines?.[row.id];
@@ -584,6 +522,61 @@ function SecurityPane({ onExportAudit }: { onExportAudit: () => void }) {
         <GroupedList header="Audit log">
           <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Retention</span><Seg options={['90 days', '1 year', 'Forever']} value={'Forever'} onChange={() => {}} /></Row>
           <Row last onClick={onExportAudit}><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--blue)' }}>Export audit (JSONL)</span><Icon name="enter" size={16} style={{ color: 'var(--ink-tertiary)', transform: 'rotate(-90deg)' }} /></Row>
+        </GroupedList>
+      </div>
+    </div>
+  );
+}
+
+function ExtensionPane() {
+  const [status, setStatus] = React.useState<ExtensionStatus | null>(null);
+  const [copied, setCopied] = React.useState(false);
+  const refetch = React.useCallback(() => { if (IS_LOCAL) void api.extensionStatus().then(setStatus).catch(() => {}); }, []);
+  React.useEffect(() => {
+    refetch();
+    const t = setInterval(refetch, 2000); // live profile/active updates while the pane is open
+    return () => clearInterval(t);
+  }, [refetch]);
+  const copy = () => {
+    if (!status?.token) return;
+    void navigator.clipboard?.writeText(status.token).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1600); });
+  };
+  const makeActive = (clientId: string) => { void api.extensionSetActive(clientId).then(setStatus).catch(() => {}); };
+  const peers = status?.peers ?? [];
+  return (
+    <div>
+      <PaneHead sub="The native Chrome extension talks to this Mac over one local port. Pair it once with the token below — then send or steer messages and drop comments on any chat, from any tab.">Browser extension</PaneHead>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+        <GroupedList header="Connection" footer={status?.running ? `Listening on 127.0.0.1:${status.port} — localhost only.` : 'The control port isn’t listening. Restart the app, or set MAESTRO_EXT_PORT if 9234 is in use.'}>
+          <Row last>
+            <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: status?.running ? 'color-mix(in srgb, var(--green) 14%, transparent)' : 'var(--fill-tertiary)', color: status?.running ? 'var(--green)' : 'var(--ink-tertiary)' }}><Icon name="globe" size={18} /></span>
+            <span style={{ flex: 1 }}>
+              <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{status?.running ? 'Control channel ready' : 'Offline'}</span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{peers.length ? `${peers.length} Chrome profile${peers.length === 1 ? '' : 's'} connected` : 'No Chrome profile connected yet'}</span>
+            </span>
+          </Row>
+        </GroupedList>
+
+        <GroupedList header="Pairing token" footer="Open the Mochi extension popup in Chrome and paste this token once. Each Chrome profile pairs separately. Keep it private — it lets the browser drive this Mac.">
+          <Row last>
+            <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 13%, transparent)', color: 'var(--blue)' }}><Icon name="key" size={17} /></span>
+            <span style={{ flex: 1, font: '600 var(--fs-headline)/1 var(--font-mono)', letterSpacing: '0.08em', color: 'var(--ink)' }}>{status?.token ?? '…'}</span>
+            <button onClick={copy} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: copied ? 'rgba(52,199,89,0.14)' : 'var(--fill-secondary)', color: copied ? 'var(--green)' : 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{copied ? 'Copied ✓' : 'Copy'}</button>
+          </Row>
+        </GroupedList>
+
+        <GroupedList header="Chrome profiles" footer="One profile is active at a time (it owns the browser context). Take over from any profile’s popup, or make one active here.">
+          {peers.length === 0
+            ? <Row last><span style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>No profiles connected. Load the extension in Chrome, open its popup, and pair with the token above.</span></Row>
+            : peers.map((pe, i) => (
+              <Row key={pe.clientId} last={i === peers.length - 1}>
+                <span style={{ width: 8, height: 8, borderRadius: 4, flexShrink: 0, background: pe.active ? 'var(--green)' : 'var(--ink-tertiary)' }} />
+                <span style={{ flex: 1, font: '500 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{pe.profile}</span>
+                {pe.active
+                  ? <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)' }}>Active</span>
+                  : <button onClick={() => makeActive(pe.clientId)} className="ghost-btn" style={{ height: 30, padding: '0 12px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Make active</button>}
+              </Row>
+            ))}
         </GroupedList>
       </div>
     </div>
@@ -808,6 +801,7 @@ export default function Settings() {
     accounts: <AccountsPane />,
     security: <SecurityPane onExportAudit={() => navigate('/audit')} />,
     devices: <DevicesPane onPair={() => navigate('/device-pairing')} />,
+    extension: <ExtensionPane />,
     power: <PowerPane />,
     updates: <UpdatesPane />,
     danger: <DangerPane onReset={() => setReset(true)} />,
