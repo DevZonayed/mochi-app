@@ -30,6 +30,8 @@ export interface Project {
   kind?: ProjectKind;
   path?: string;
   repoUrl?: string;
+  /** Manual display order from drag-and-drop. Lower = earlier. */
+  order?: number;
   createdAt: number;
 }
 export interface ChatSession {
@@ -569,6 +571,9 @@ export const api = {
   updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template'>>) =>
     call<Project>('updateProject', { id, ...patch }, () =>
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
+  reorderProjects: (ids: string[]) =>
+    call<Project[]>('reorderProjects', { ids }, () =>
+      req<Project[]>('/api/projects/reorder', { method: 'POST', body: JSON.stringify({ ids }) })),
   getProject: (id: string) =>
     call<Project>('getProject', { id }, () => req<Project>(`/api/projects/${encodeURIComponent(id)}`)),
   // Per-project .continuum memory (STATE.md + checkpoint chain).

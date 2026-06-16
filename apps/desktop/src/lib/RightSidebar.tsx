@@ -191,21 +191,25 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
       {/* drag handle to resize the panel */}
       <div onMouseDown={startResize} title="Drag to resize" style={{ position: 'absolute', left: -3, top: 0, bottom: 0, width: 7, cursor: 'col-resize', zIndex: 6 }} />
       {/* top: tabs + actions */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 2, height: 42, flexShrink: 0, padding: '0 6px', borderBottom: '0.5px solid var(--separator)' }}>
-        {([['files', 'All files', 0], ['changes', 'Changes', changed.length], ['checks', 'Checks', checks.length]] as [TopTab, string, number][]).map(([k, label, n]) => (
-          <button key={k} onClick={() => setTab(k)} style={{ height: 28, padding: '0 9px', borderRadius: 7, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 5,
-            font: `${tab === k ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: tab === k ? 'var(--ink)' : 'var(--ink-tertiary)', background: tab === k ? 'var(--fill-secondary)' : 'transparent' }}>
-            {label}{n > 0 && <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: k === 'checks' && failing ? 'var(--orange)' : 'var(--ink-tertiary)' }}>{n}</span>}
-          </button>
-        ))}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 2, height: 42, flexShrink: 0, padding: '0 6px', borderBottom: '0.5px solid var(--separator)', overflow: 'hidden' }}>
+        {/* Tabs scroll sideways when the panel is too narrow, rather than wrapping
+            the labels to a second line (which broke the fixed-height header). */}
+        <div className="ws-tabs" style={{ display: 'flex', alignItems: 'center', gap: 2, minWidth: 0, flexShrink: 1, overflowX: 'auto' }}>
+          {([['files', 'All files', 0], ['changes', 'Changes', changed.length], ['checks', 'Checks', checks.length]] as [TopTab, string, number][]).map(([k, label, n]) => (
+            <button key={k} onClick={() => setTab(k)} style={{ height: 28, padding: '0 9px', borderRadius: 7, cursor: 'pointer', flexShrink: 0, whiteSpace: 'nowrap', display: 'inline-flex', alignItems: 'center', gap: 5,
+              font: `${tab === k ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: tab === k ? 'var(--ink)' : 'var(--ink-tertiary)', background: tab === k ? 'var(--fill-secondary)' : 'transparent' }}>
+              {label}{n > 0 && <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: k === 'checks' && failing ? 'var(--orange)' : 'var(--ink-tertiary)' }}>{n}</span>}
+            </button>
+          ))}
+        </div>
         <span style={{ flex: 1 }} />
         {tab === 'files' && (
           <>
-            <button onClick={() => setSearching(s => !s)} title="Search files" className="ws-newbtn" style={{ width: 26, height: 26, borderRadius: 6, display: 'grid', placeItems: 'center', background: 'transparent', color: searching ? 'var(--ink)' : 'var(--ink-tertiary)' }}><Icon name="search" size={14} /></button>
-            <button onClick={loadRoot} title="Refresh" className="ws-newbtn" style={{ width: 26, height: 26, borderRadius: 6, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)' }}><Icon name="refresh" size={13} /></button>
+            <button onClick={() => setSearching(s => !s)} title="Search files" className="ws-newbtn" style={{ width: 26, height: 26, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'transparent', color: searching ? 'var(--ink)' : 'var(--ink-tertiary)' }}><Icon name="search" size={14} /></button>
+            <button onClick={loadRoot} title="Refresh" className="ws-newbtn" style={{ width: 26, height: 26, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)' }}><Icon name="refresh" size={13} /></button>
           </>
         )}
-        <button onClick={onToggleCollapse} title="Hide panel" className="ws-newbtn" style={{ width: 26, height: 26, borderRadius: 6, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)' }}><Icon name="sidebar" size={15} /></button>
+        <button onClick={onToggleCollapse} title="Hide panel" className="ws-newbtn" style={{ width: 26, height: 26, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)' }}><Icon name="sidebar" size={15} /></button>
       </div>
 
       {/* body */}

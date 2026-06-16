@@ -197,6 +197,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('project', proj);
         return proj;
       }
+      case 'reorderProjects': {
+        const ids = Array.isArray(p.ids) ? (p.ids as unknown[]).map(String) : [];
+        if (!ids.length) bad('ids required');
+        return store.reorderProjects(ids);
+      }
 
       // ── Coding agent: folders + GitHub clone (git lives on this Mac) ──
       case 'gitAvailable': return { available: gitAvailable() };
