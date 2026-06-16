@@ -19,6 +19,7 @@ import {
 import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ChromeProfile, type UpdateStatus, IS_LOCAL } from '../lib/api';
 import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
 import { WhatsNew } from '../lib/WhatsNew';
+import { EngineSetup } from '../EngineSetup';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -540,6 +541,9 @@ function AccountsPane() {
         })}
       </GroupedList>
       <div style={{ height: 18 }} />
+      {/* Engine runtimes — native binaries downloaded on demand (not bundled). */}
+      {IS_LOCAL && <EngineSetup />}
+      {IS_LOCAL && <div style={{ height: 18 }} />}
       <GroupedList header="More providers" footer="Additional providers are on the roadmap.">
         {OTHER_PROVIDERS.map((p, i) => (
           <Row key={p.name} last={i === OTHER_PROVIDERS.length - 1}>

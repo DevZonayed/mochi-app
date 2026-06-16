@@ -11,7 +11,6 @@
    UI can never claim "signed in" in one place and "not signed in" in another. */
 
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, readFileSync, rmSync, readdirSync, statSync, lstatSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
@@ -27,8 +26,11 @@ import { ensureSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
 import type { Providers } from './providers.js';
+import {
+  enginesRoot, managedBinary, systemBinary, bundledBinary, downloadEngine, engineState,
+  type EngineState, type DownloadProgress,
+} from './engines.js';
 
-const require = createRequire(__filename);
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
 // coding agent needs real headroom — 4 turns dies mid-`ls`.
 const EFFORT_TURNS: Record<string, number> = { fast: 8, balanced: 24, deep: 48, max: 96 };
@@ -313,80 +315,33 @@ function workDirFor(project?: { name?: string; path?: string }): string {
   return dir;
 }
 
-/* ── Claude binary resolution (bundled SDK binary first) ─────────────── */
+/* ── Engine binary resolution ────────────────────────────────────────────
+   The heavy native binaries are no longer bundled (see engines.ts). We resolve
+   the binary for this platform, downloading it on demand if needed:
+
+   - Claude: the Agent SDK is version-coupled to its `claude` binary, so prefer
+     our version-matched MANAGED copy, then an existing system install.
+   - Codex is a standalone CLI, so prefer an existing SYSTEM install (no
+     download), then our managed copy.
+
+   In both, a node_modules binary is a dev-only last resort (absent in
+   production builds). resolve* is memoized; invalidateEngineCache() clears it
+   so a freshly-downloaded binary is picked up without an app restart. */
 let claudePath: string | null | undefined;
 export function resolveClaude(): string | null {
   if (claudePath !== undefined) return claudePath;
-  // 1) The binary the SDK bundles for this platform/arch (always present in node_modules).
-  try {
-    const pkg = require.resolve(`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/package.json`);
-    const cand = path.join(path.dirname(pkg), 'claude');
-    if (existsSync(cand)) { claudePath = cand; return claudePath; }
-  } catch { /* not bundled for this platform — fall through */ }
-  // 2) A `claude` on the login shell PATH.
-  try {
-    const found = execFileSync('/bin/zsh', ['-lc', 'command -v claude'], { encoding: 'utf8' }).trim();
-    if (found && existsSync(found)) { claudePath = found; return claudePath; }
-  } catch { /* none */ }
-  // 3) Common install locations.
-  for (const cand of [
-    path.join(homedir(), '.local', 'bin', 'claude'),
-    '/opt/homebrew/bin/claude',
-    '/usr/local/bin/claude',
-  ]) {
-    if (existsSync(cand)) { claudePath = cand; return claudePath; }
-  }
-  claudePath = null;
-  return claudePath;
-}
-
-/* ── Codex binary resolution (bundled binary first) ──────────────────────
-   Mirror Claude: ship our own Codex CLI so it runs whether or not the user has
-   a global install. `@openai/codex` vends the native binary via a per-platform
-   optional dep (`@openai/codex-<platform>-<arch>`); the executable lives at
-   <pkg>/vendor/<target-triple>/bin/codex. We resolve that directly (it's the
-   same rust binary a global `codex` install would run), then fall back to a
-   `codex` on PATH and the common install locations. */
-const CODEX_PLATFORM: Record<string, { pkg: string; triple: string }> = {
-  'darwin-arm64': { pkg: '@openai/codex-darwin-arm64', triple: 'aarch64-apple-darwin' },
-  'darwin-x64':   { pkg: '@openai/codex-darwin-x64',   triple: 'x86_64-apple-darwin' },
-  'linux-x64':    { pkg: '@openai/codex-linux-x64',    triple: 'x86_64-unknown-linux-musl' },
-  'linux-arm64':  { pkg: '@openai/codex-linux-arm64',  triple: 'aarch64-unknown-linux-musl' },
-  'win32-x64':    { pkg: '@openai/codex-win32-x64',    triple: 'x86_64-pc-windows-msvc' },
-  'win32-arm64':  { pkg: '@openai/codex-win32-arm64',  triple: 'aarch64-pc-windows-msvc' },
-};
-function bundledCodex(): string | null {
-  const entry = CODEX_PLATFORM[`${process.platform}-${process.arch}`];
-  if (!entry) return null;
-  try {
-    const pkgJson = require.resolve(`${entry.pkg}/package.json`);
-    const exe = process.platform === 'win32' ? 'codex.exe' : 'codex';
-    const cand = path.join(path.dirname(pkgJson), 'vendor', entry.triple, 'bin', exe);
-    if (existsSync(cand)) return cand;
-  } catch { /* optional dep not installed for this platform — fall through */ }
-  return null;
+  return (claudePath = managedBinary(enginesRoot(), 'claude') ?? systemBinary('claude') ?? bundledBinary('claude'));
 }
 let codexPath: string | null | undefined;
 export function resolveCodex(): string | null {
   if (codexPath !== undefined) return codexPath;
-  // 1) The binary we bundle for this platform/arch (always present in node_modules).
-  const bundled = bundledCodex();
-  if (bundled) { codexPath = bundled; return codexPath; }
-  // 2) A `codex` on the login shell PATH.
-  try {
-    const found = execFileSync('/bin/zsh', ['-lc', 'command -v codex'], { encoding: 'utf8' }).trim();
-    if (found && existsSync(found)) { codexPath = found; return codexPath; }
-  } catch { /* none */ }
-  // 3) Common install locations.
-  for (const cand of [
-    path.join(homedir(), '.local', 'bin', 'codex'),
-    '/opt/homebrew/bin/codex',
-    '/usr/local/bin/codex',
-  ]) {
-    if (existsSync(cand)) { codexPath = cand; return codexPath; }
-  }
-  codexPath = null;
-  return codexPath;
+  return (codexPath = systemBinary('codex') ?? managedBinary(enginesRoot(), 'codex') ?? bundledBinary('codex'));
+}
+
+/** Clear the resolve memo (call after a managed download completes). */
+export function invalidateEngineCache(id?: EngineId): void {
+  if (!id || id === 'claude') claudePath = undefined;
+  if (!id || id === 'codex') codexPath = undefined;
 }
 
 function abortControllerFromSignal(signal: AbortSignal): AbortController {
@@ -444,6 +399,10 @@ async function runClaude(
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
+  // The native binary is downloaded on demand and no longer bundled — without it
+  // the SDK can't run. Fail clearly (the UI prompts a download) rather than let
+  // the SDK fall back to a path that doesn't exist.
+  if (!binary) throw Object.assign(new Error('Claude engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'claude' });
   let stderrTail = '';
   /* Give Claude a real image capability. Claude Code ships no text→image tool,
      so without this it improvises (hand-written SVG). The in-process MCP tool's
@@ -846,7 +805,7 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; browserBridge?: BrowserBridge; browserEnabled?: boolean; openaiKey?: string },
   imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
-  if (!bin) return Promise.reject(Object.assign(new Error('Codex CLI not found on this Mac'), { statusCode: 503 }));
+  if (!bin) return Promise.reject(Object.assign(new Error('Codex engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'codex' }));
   // API-key auth: when there is no ChatGPT subscription login, pass the stored
   // OpenAI key to `codex exec` via OPENAI_API_KEY (the provider's env_key). When a
   // subscription login exists, leave the env alone so Codex uses that.
@@ -1038,6 +997,8 @@ export class LocalEngine {
   private running = new Map<string, { ac: AbortController; child?: ChildProcess }>();
   /** In-flight `codex login` child (browser OAuth), if any. */
   private codexLoginChild?: ChildProcess;
+  /** In-flight engine binary downloads → their abort handle (one per engine). */
+  private engineInstalls = new Map<EngineId, AbortController>();
 
   constructor(private store: Store, private emit: (name: string, data: unknown, opts?: { live?: boolean }) => void, private providers?: Providers) {}
 
@@ -1222,16 +1183,19 @@ export class LocalEngine {
   /** Is this engine actually runnable right now, and if not, exactly why. */
   status(engine: EngineId): EngineStatus {
     if (engine === 'claude') {
+      // The native binary is downloaded on demand (engines.ts), so an absent
+      // binary is a real, recoverable state — surface it distinctly from auth.
+      if (!resolveClaude()) return { engine, available: false, method: 'none', detail: 'Engine not installed', reason: 'Download the Claude engine to run jobs (Settings → Engines), or install Claude Code on this Mac.' };
       if (claudeLoggedIn()) return { engine, available: true, method: 'subscription', detail: 'Claude Code login', reason: '' };
       const key = this.providers?.getLocalKey('anthropic');
       if (key) return { engine, available: true, method: 'apiKey', detail: 'Anthropic API key', reason: '' };
       return { engine, available: false, method: 'none', detail: 'Not signed in', reason: 'Run `claude login` once on this Mac, or add an Anthropic API key in Settings → Accounts.' };
     }
     // codex — runnable on EITHER a ChatGPT subscription login OR an OpenAI API
-    // key (passed to `codex exec` via OPENAI_API_KEY). The CLI is bundled, so a
-    // missing binary is only ever a packaging edge case, not the common path.
+    // key (passed to `codex exec` via OPENAI_API_KEY). The CLI is downloaded on
+    // demand (engines.ts) or reused from a system install.
     const bin = resolveCodex();
-    if (!bin) return { engine, available: false, method: 'none', detail: 'CLI not found', reason: 'The bundled Codex CLI could not be located — reinstall the app, or install `@openai/codex`.' };
+    if (!bin) return { engine, available: false, method: 'none', detail: 'Engine not installed', reason: 'Download the Codex engine to run jobs (Settings → Engines), or install Codex on this Mac.' };
     if (codexLoggedIn()) return { engine, available: true, method: 'subscription', detail: 'Codex (ChatGPT) login', reason: '' };
     if (this.providers?.getLocalKey('openai')) return { engine, available: true, method: 'apiKey', detail: 'OpenAI API key', reason: '' };
     return { engine, available: false, method: 'none', detail: 'Not signed in', reason: 'Sign in with ChatGPT or add an OpenAI API key in Settings → Accounts.' };
@@ -1248,7 +1212,7 @@ export class LocalEngine {
       Works whether or not already signed in — re-auth / switch account. */
   codexLogin(): Promise<{ ok: true; method: 'subscription' }> {
     const bin = resolveCodex();
-    if (!bin) return Promise.reject(Object.assign(new Error('Bundled Codex CLI not found on this Mac.'), { statusCode: 503 }));
+    if (!bin) return Promise.reject(Object.assign(new Error('Codex engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'codex' }));
     // A previous, still-pending login is superseded by this one.
     try { this.codexLoginChild?.kill('SIGTERM'); } catch { /* gone */ }
     return new Promise((resolve, reject) => {
@@ -1284,6 +1248,48 @@ export class LocalEngine {
     if (bin) { try { execFileSync(bin, ['logout'], { stdio: 'ignore' }); } catch { /* fall through to file removal */ } }
     // Belt-and-suspenders: ensure auth.json is gone even if the CLI balks.
     try { rmSync(path.join(homedir(), '.codex', 'auth.json'), { force: true }); } catch { /* ignore */ }
+    return { ok: true };
+  }
+
+  /* ── Engine binary install (download-on-demand) ─────────────────────────
+     The heavy native binaries are no longer bundled; fetch them on first run
+     or from the lazy "engine not installed" prompt. Progress streams to the
+     renderer over the same emit channel as jobs (name: 'engine-download'). */
+
+  /** Where each engine currently resolves from (managed copy / system install /
+      none) + the version we'd download. Source of truth for the setup UI. */
+  enginesStatus(): Record<EngineId, EngineState> {
+    const root = enginesRoot();
+    return {
+      claude: engineState(root, 'claude', resolveClaude()),
+      codex: engineState(root, 'codex', resolveCodex()),
+    };
+  }
+
+  /** Download + install one engine binary. Idempotent guard: one in-flight
+      install per engine. Invalidates the resolve memo on success so the new
+      binary is usable immediately (no app restart). */
+  async installEngine(id: EngineId): Promise<{ ok: true; path: string; version: string; source: 'managed' }> {
+    if (this.engineInstalls.has(id)) throw Object.assign(new Error(`${ENGINE_LABEL[id]} is already downloading.`), { statusCode: 409 });
+    const ac = new AbortController();
+    this.engineInstalls.set(id, ac);
+    const emit = (p: DownloadProgress) => { try { this.emit('engine-download', { engine: id, ...p }); } catch { /* window gone */ } };
+    try {
+      const res = await downloadEngine(enginesRoot(), id, emit, ac.signal);
+      invalidateEngineCache(id);
+      return { ok: true, path: res.path, version: res.version, source: 'managed' };
+    } catch (e) {
+      emit({ phase: 'error' });
+      throw e;
+    } finally {
+      this.engineInstalls.delete(id);
+    }
+  }
+
+  /** Abort an in-flight engine download. */
+  cancelEngineInstall(id: EngineId): { ok: true } {
+    this.engineInstalls.get(id)?.abort();
+    this.engineInstalls.delete(id);
     return { ok: true };
   }
 
@@ -1820,7 +1826,7 @@ export class LocalEngine {
 
 /* Back-compat free functions (used by cron) — prefer LocalEngine.status(). */
 export function engineAvailable(engine: EngineId): boolean {
-  if (engine === 'claude') return claudeLoggedIn();
+  if (engine === 'claude') return claudeLoggedIn() && resolveClaude() !== null;
   return codexLoggedIn() && resolveCodex() !== null;
 }
 export function codexAvailable(): boolean { return codexLoggedIn() && resolveCodex() !== null; }

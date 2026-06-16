@@ -25,19 +25,23 @@ directories:
   buildResources: build # build/icon.png → electron-builder generates .icns/.ico
 
 # Vite emits the renderer to dist/ and the main+preload to dist-electron/.
+#
+# Engine binaries are NO LONGER bundled. The Codex (Rust) binary and the Claude
+# Agent SDK's `claude` binary are ~50–80 MB each (doubled on the universal mac
+# build) and dominated the installer. We keep only the small JS (the Codex JS
+# wrapper + the Agent SDK) and download the matching native binary on first run
+# into userData/engines (see electron/engines.ts) — or reuse a system install.
+# So exclude the per-platform binary subpackages (NOT the meta JS packages) from
+# packaging; cover both the symlink path and pnpm's real `.pnpm` store path.
 files:
   - dist/**
   - dist-electron/**
   - package.json
   - '!**/*.map'
-
-# We bundle our own Codex CLI (`@openai/codex` + its per-platform native binary
-# in `@openai/codex-<platform>-<arch>`). The binary must live on the real
-# filesystem — a file inside app.asar can't be exec()'d — so unpack it. Electron
-# transparently rewrites the require.resolve/spawn path to app.asar.unpacked.
-asarUnpack:
-  - node_modules/@openai/codex/**
-  - node_modules/@openai/codex-*/**
+  - '!node_modules/@openai/codex-*/**'
+  - '!node_modules/.pnpm/@openai+codex-*/**'
+  - '!node_modules/@anthropic-ai/claude-agent-sdk-*/**'
+  - '!node_modules/.pnpm/@anthropic-ai+claude-agent-sdk-*/**'
 
 publish:
   provider: github
