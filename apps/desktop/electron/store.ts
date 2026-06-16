@@ -120,6 +120,9 @@ export interface ChatSession {
   sdkSessionId?: string;
   /** Pinned to the top of the workspace, across projects. */
   pinned?: boolean;
+  /** Archived (hidden from the project's active chat list, restorable). Set to the
+      timestamp it was archived; absent = active. */
+  archived?: number;
   /** Per-chat model overrides; absent = the workspace role defaults apply. */
   primary?: RoleChoice;
   reviewer?: RoleChoice | 'off';
@@ -699,6 +702,16 @@ export class Store {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     s.pinned = pinned || undefined;
+    this.save();
+    return s;
+  }
+  /** Archive/unarchive without bumping updatedAt (archiving must not reorder the list). */
+  setSessionArchived(sessionId: string, archived: boolean): ChatSession {
+    const s = this.getSession(sessionId);
+    if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
+    s.archived = archived ? now() : undefined;
+    // An archived chat shouldn't also sit pinned at the top.
+    if (archived) s.pinned = undefined;
     this.save();
     return s;
   }

@@ -355,7 +355,7 @@ app.whenReady().then(() => {
       // *ProjectMemory + snapshotProject methods read/write project files and run
       // git on the Mac — none may answer over the relay (phone/web are read-mostly
       // remote controls, not local-execution surfaces).
-      if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject' || method === 'archiveSession' || method === 'importGithubFromCli' || method === 'getSessionGitStatus' || method === 'refreshSessionGitStatus' || method === 'pushSession' || method === 'createSessionPR' || method === 'mergeSessionPR' || method === 'resolveSession'
+      if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject' || method === 'archiveSessionWorktree' || method === 'importGithubFromCli' || method === 'getSessionGitStatus' || method === 'refreshSessionGitStatus' || method === 'pushSession' || method === 'createSessionPR' || method === 'mergeSessionPR' || method === 'resolveSession'
         || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment'
         || method === 'copyDesignToCode'
         || method === 'addSkillToProject' || method === 'removeSkillFromProject'

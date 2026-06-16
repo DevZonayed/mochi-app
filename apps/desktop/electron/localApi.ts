@@ -274,6 +274,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return s;
       }
       case 'archiveSession': {
+        const s = store.setSessionArchived(String(p.id ?? ''), p.archived === true);
+        emit('session', s);
+        return s;
+      }
+      // Worktree archive (Conductor PR lifecycle): prune this session's git worktree.
+      case 'archiveSessionWorktree': {
         const s = store.getSession(String(p.sessionId ?? p.id ?? ''));
         if (!s) return bad('session not found', 404);
         const proj = store.getProject(s.projectId);

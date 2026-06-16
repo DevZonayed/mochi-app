@@ -59,7 +59,7 @@ export function GitStatusBar({ sessionId }: { sessionId: string | null }) {
       case 'ready-for-pr': return { label: 'Create PR', go: () => run(() => api.createSessionPR(sessionId), 'Push the branch and open a pull request on GitHub?') };
       case 'pr-mergeable': return { label: 'Merge', go: () => run(() => api.mergeSessionPR(sessionId), 'Merge this pull request on GitHub?') };
       case 'pr-conflicts': return { label: 'Resolve', go: () => run(() => api.resolveSession(sessionId).then(r => ({ ok: r.ok, reason: r.conflicts?.length ? `Conflicts: ${r.conflicts.join(', ')}` : r.reason }))) };
-      case 'pr-merged': return { label: 'Archive', go: () => run(() => api.archiveSession(sessionId), 'Remove this session’s worktree?') };
+      case 'pr-merged': return { label: 'Archive', go: () => run(() => api.archiveSessionWorktree(sessionId), 'Remove this session’s worktree?') };
       default: return null;
     }
   })();
