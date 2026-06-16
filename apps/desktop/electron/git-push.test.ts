@@ -4,7 +4,7 @@ import { rmSync, writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { makeTempRepo } from './test-helpers.js';
-import { aheadBehind, isDirty, remoteHasBranch, pushBranch, buildAskpassScript } from './git.js';
+import { aheadBehind, isDirty, remoteHasBranch, pushBranch, buildAskpassScript, mergeBaseIntoBranch } from './git.js';
 
 const cleanup: string[] = [];
 afterEach(() => { for (const d of cleanup.splice(0)) { try { rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } } });
@@ -52,5 +52,29 @@ describe('buildAskpassScript', () => {
     const s = buildAskpassScript();
     expect(s).toContain('x-access-token');
     expect(s).toContain('$GIT_TOKEN');
+  });
+});
+
+describe('mergeBaseIntoBranch', () => {
+  test('clean merge of base into the branch (different files)', () => {
+    const r = repo();
+    git(r, 'checkout', '-q', '-b', 'feat');
+    writeFileSync(path.join(r, 'feat.txt'), 'f'); git(r, 'add', '-A'); git(r, 'commit', '-q', '-m', 'feat');
+    git(r, 'checkout', '-q', 'main');
+    writeFileSync(path.join(r, 'main.txt'), 'm'); git(r, 'add', '-A'); git(r, 'commit', '-q', '-m', 'main');
+    git(r, 'checkout', '-q', 'feat');
+    expect(mergeBaseIntoBranch(r, 'main')).toEqual({ ok: true, conflicts: [] });
+  });
+
+  test('reports conflicted files when the same file diverges', () => {
+    const r = repo();
+    git(r, 'checkout', '-q', '-b', 'feat');
+    writeFileSync(path.join(r, 'shared.txt'), 'feat-version'); git(r, 'add', '-A'); git(r, 'commit', '-q', '-m', 'feat');
+    git(r, 'checkout', '-q', 'main');
+    writeFileSync(path.join(r, 'shared.txt'), 'main-version'); git(r, 'add', '-A'); git(r, 'commit', '-q', '-m', 'main');
+    git(r, 'checkout', '-q', 'feat');
+    const res = mergeBaseIntoBranch(r, 'main');
+    expect(res.ok).toBe(false);
+    expect(res.conflicts).toContain('shared.txt');
   });
 });

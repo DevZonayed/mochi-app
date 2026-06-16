@@ -318,6 +318,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const method = p.method === 'merge' || p.method === 'squash' || p.method === 'rebase' ? p.method : undefined;
         return gitService.mergePr(s, { method });
       }
+      case 'resolveSession': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.resolveSession(s);
+      }
 
       // ── Conversation sync (import Claude/Codex/Conductor history) ──────────
       // DESKTOP-ONLY (reads local agent stores + the Conductor SQLite db). Guarded

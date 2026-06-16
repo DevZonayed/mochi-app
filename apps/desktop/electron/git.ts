@@ -373,3 +373,15 @@ export function pushBranch(dir: string, branch: string, opts: { token?: string; 
 export function localRefExists(dir: string, ref: string): boolean {
   return execGit(['-C', dir, 'rev-parse', '--verify', '--quiet', ref]).code === 0;
 }
+
+/** Merge `base` (preferring origin/<base>) into the current branch in `dir`. A
+    clean merge auto-commits; on conflict, returns the conflicted file paths and
+    leaves the merge in progress so an agent/operator can resolve them. */
+export function mergeBaseIntoBranch(dir: string, base: string): { ok: boolean; conflicts: string[]; reason?: string } {
+  const ref = localRefExists(dir, `origin/${base}`) ? `origin/${base}` : base;
+  const m = execGit(['-C', dir, 'merge', '--no-edit', ref], { timeout: 60_000 });
+  if (m.ok) return { ok: true, conflicts: [] };
+  const conf = execGit(['-C', dir, 'diff', '--name-only', '--diff-filter=U']);
+  const conflicts = conf.ok ? conf.out.split('\n').filter(Boolean) : [];
+  return conflicts.length ? { ok: false, conflicts } : { ok: false, conflicts: [], reason: m.out.slice(0, 200) };
+}

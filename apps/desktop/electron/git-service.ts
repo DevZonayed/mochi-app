@@ -5,7 +5,7 @@
 import { existsSync } from 'node:fs';
 import type { Store, ChatSession, Project } from './store.js';
 import type { Providers } from './providers.js';
-import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch } from './git.js';
+import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch, fetchOrigin, mergeBaseIntoBranch } from './git.js';
 import { parseGitHubRemote, findOpenPr, getPullStatus, createPull, mergePull, getRepo, pickMergeMethod } from './github.js';
 import { deriveState, type LocalState, type PrStatus, type SessionGitStatus } from './pr-state.js';
 
@@ -125,6 +125,21 @@ export class GitService {
     } catch (e) {
       return { ok: false, reason: e instanceof Error ? e.message : 'merge failed' };
     }
+  }
+
+  /** Merge the latest base into the session's worktree branch. Clean → push (the
+      PR recomputes to mergeable); conflicts → leave them in the worktree for the
+      operator/agent to resolve, returning the conflicted files. */
+  async resolveSession(session: ChatSession): Promise<{ ok: boolean; conflicts: string[]; reason?: string }> {
+    const project = this.store.getProject(session.projectId);
+    const dir = project ? this.dirFor(session, project) : null;
+    if (!dir || !session.branch) return { ok: false, conflicts: [], reason: 'no worktree or branch' };
+    const base = session.baseBranch ?? resolveBaseBranch(dir);
+    fetchOrigin(dir);
+    const res = mergeBaseIntoBranch(dir, base);
+    if (res.ok) pushBranch(dir, session.branch, { token: this.token() });
+    await this.fullStatus(session, { withPr: true });
+    return res;
   }
 
   /** Sessions worth polling for PR state (have a branch + live worktree, not archived). */
