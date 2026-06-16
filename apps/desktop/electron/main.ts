@@ -19,6 +19,7 @@ import { RelayClient } from './relay.js';
 import { CronRunner } from './cron.js';
 import { runSmoke } from './smoke.js';
 import { Updater } from './updater.js';
+import { setEnginesRoot } from './engines.js';
 
 const RENDERER_DIST = path.join(__dirname, '../dist');
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
@@ -280,6 +281,10 @@ app.whenReady().then(() => {
     relay?.event(name, relayData);
     relay?.pushSnapshot();
   };
+
+  // Engine binaries (Codex / Claude) are downloaded on demand into userData
+  // rather than bundled — point the store at this Mac's per-user data dir.
+  setEnginesRoot(path.join(app.getPath('userData'), 'engines'));
 
   const engine = new LocalEngine(store, emit, providers);
   const media = new MediaEngine(store, emit, () => providers.getLocalKey('fal'));

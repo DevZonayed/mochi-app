@@ -653,6 +653,19 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'codexLoginCancel': return engine.codexLoginCancel();
       case 'codexLogout': return engine.codexLogout();
 
+      // ── Engine binaries (Codex / Claude) — downloaded on demand, not bundled.
+      case 'enginesStatus': return engine.enginesStatus();
+      case 'installEngine': {
+        const id = String(p.engine ?? '');
+        if (!ENGINE_VALUES.has(id)) bad('unsupported engine');
+        return engine.installEngine(id as EngineId);
+      }
+      case 'cancelEngineInstall': {
+        const id = String(p.engine ?? '');
+        if (!ENGINE_VALUES.has(id)) bad('unsupported engine');
+        return engine.cancelEngineInstall(id as EngineId);
+      }
+
       // Live GitHub connection status (login + scopes + repo-scope capability).
       case 'githubStatus': return githubConnectionStatus(providers.getLocalKey('github'));
       // One-click connect by importing a token from an authenticated `gh` CLI.
