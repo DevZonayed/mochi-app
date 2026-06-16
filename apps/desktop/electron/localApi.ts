@@ -13,6 +13,7 @@ import type { TelegramBot } from './telegram.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
+import { githubConnectionStatus, ghCliToken } from './github-auth.js';
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
@@ -583,6 +584,14 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal' && prov !== 'github') bad('unsupported provider');
         providers.disconnect(prov as ProviderId);
         return { ok: true };
+      }
+      // Live GitHub connection status (login + scopes + repo-scope capability).
+      case 'githubStatus': return githubConnectionStatus(providers.getLocalKey('github'));
+      // One-click connect by importing a token from an authenticated `gh` CLI.
+      case 'importGithubFromCli': {
+        const token = ghCliToken();
+        if (!token) bad('gh CLI is not authenticated — run `gh auth login`, or paste a token', 400);
+        return providers.connect('github', token as string);
       }
 
       // ── Media Studio (real fal generation) ─────────────────────
