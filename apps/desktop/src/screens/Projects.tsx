@@ -27,6 +27,8 @@ const PAGE_CSS = `
   .proj-card:hover { transform: translateY(-2px); box-shadow: var(--card-shadow), 0 10px 30px rgba(15,20,60,0.12); border-color: var(--separator-strong); }
   .proj-row { transition: background 120ms ease; }
   .proj-row:hover { background: var(--fill-tertiary); }
+  /* the card/row being dragged dims while the rest reflow around it */
+  .proj-card.dragging, .proj-row.dragging { opacity: 0.4; }
   .proj-menu:hover { background: var(--fill-secondary); color: var(--ink); }
   .tpl-pick { transition: transform 140ms var(--spring), box-shadow 160ms ease; }
   .tpl-pick:hover { transform: translateY(-2px); box-shadow: var(--card-shadow), 0 8px 22px rgba(15,20,60,0.12); }
@@ -76,6 +78,31 @@ interface Project {
   kind?: ProjectKind;
   path?: string;
   repoUrl?: string;
+}
+
+/* Drag-and-drop reorder wiring, shared by the grid cards and the list rows.
+   Native HTML5 DnD — no library — with the parent owning the live reorder. */
+interface Dnd {
+  draggingId: string | null;
+  start: (id: string) => void;
+  over: (id: string) => void;
+  end: () => void;
+}
+
+/* Props spread onto a draggable card/row root. The whole card is the handle;
+   clicks still open the project (a click and a drag are distinct native events). */
+function dragProps(dnd: Dnd, id: string) {
+  return {
+    draggable: true,
+    onDragStart: (e: React.DragEvent) => {
+      e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('text/plain', id); } catch { /* some engines require data set */ }
+      dnd.start(id);
+    },
+    onDragOver: (e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; dnd.over(id); },
+    onDrop: (e: React.DragEvent) => { e.preventDefault(); dnd.end(); },
+    onDragEnd: () => dnd.end(),
+  };
 }
 
 /* The five project types this screen offers → the engine `kind` they map to. */
@@ -153,12 +180,13 @@ interface CardProps {
   p: Project;
   onMenu: (id: string) => void;
   onOpen?: (id: string) => void;
+  dnd?: Dnd;
 }
 
-function ProjectCard({ p, onMenu, onOpen }: CardProps) {
+function ProjectCard({ p, onMenu, onOpen, dnd }: CardProps) {
   const t = TEMPLATES[p.tpl];
   return (
-    <div className="proj-card" onClick={() => onOpen && onOpen(p.id)} style={{
+    <div className={`proj-card${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
       position: 'relative', background: 'var(--bg-elevated)', borderRadius: 20, overflow: 'hidden',
       border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', cursor: 'pointer',
       display: 'flex', flexDirection: 'column',
@@ -221,12 +249,13 @@ interface RowProps {
   onMenu: (id: string) => void;
   onOpen?: (id: string) => void;
   last: boolean;
+  dnd?: Dnd;
 }
 
-function ProjectRow({ p, onMenu, onOpen, last }: RowProps) {
+function ProjectRow({ p, onMenu, onOpen, last, dnd }: RowProps) {
   const t = TEMPLATES[p.tpl];
   return (
-    <div className="proj-row" onClick={() => onOpen && onOpen(p.id)} style={{
+    <div className={`proj-row${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
       display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.4fr 0.8fr 1fr 36px', alignItems: 'center', gap: 14,
       padding: '13px 16px', borderBottom: last ? 'none' : '0.5px solid var(--separator)', cursor: 'pointer',
     }}>
@@ -291,9 +320,10 @@ interface ListTableProps {
   projects: Project[];
   onMenu: (id: string) => void;
   onOpen?: (id: string) => void;
+  dnd?: Dnd;
 }
 
-function ListTable({ projects, onMenu, onOpen }: ListTableProps) {
+function ListTable({ projects, onMenu, onOpen, dnd }: ListTableProps) {
   const [sort, setSort] = React.useState<string>('activity');
   const sorted = [...projects].sort((a, b) => sort === 'spend' ? b.spent - a.spent : 0);
   const cols: [string, string | null][] = [['Project', null], ['Status', null], ['Spend', 'spend'], ['Source', null], ['Schedule', 'activity'], ['', null]];
@@ -312,7 +342,7 @@ function ListTable({ projects, onMenu, onOpen }: ListTableProps) {
           </button>
         ))}
       </div>
-      {sorted.map((p, i) => <ProjectRow key={p.id} p={p} onMenu={onMenu} onOpen={onOpen} last={i === sorted.length - 1} />)}
+      {sorted.map((p, i) => <ProjectRow key={p.id} p={p} onMenu={onMenu} onOpen={onOpen} last={i === sorted.length - 1} dnd={sort === 'spend' ? undefined : dnd} />)}
     </div>
   );
 }
@@ -820,6 +850,41 @@ export default function Projects() {
   };
   const open = (id: string) => { navigate(`/project-detail/${id}`); };
 
+  // ── Drag-and-drop reorder ─────────────────────────────────────────────────
+  // Cards/rows reflow live as you drag (a "last hovered" ref stops oscillation),
+  // and the new order is committed to the engine on drop. The store persists it
+  // and sorts projects by it, so the order survives reload and syncs to remotes.
+  const dragIdRef = React.useRef<string | null>(null);
+  const lastOverRef = React.useRef<string | null>(null);
+  const orderRef = React.useRef<string[]>([]);
+  const [draggingId, setDraggingId] = React.useState<string | null>(null);
+  React.useEffect(() => { orderRef.current = projects.map(p => p.id); }, [projects]);
+  const dnd: Dnd = React.useMemo(() => ({
+    draggingId,
+    start: (id: string) => { dragIdRef.current = id; lastOverRef.current = id; setDraggingId(id); },
+    over: (overId: string) => {
+      const from = dragIdRef.current;
+      if (!from || overId === from || lastOverRef.current === overId) return;
+      lastOverRef.current = overId;
+      setProjects(ps => {
+        const fromIdx = ps.findIndex(p => p.id === from);
+        const toIdx = ps.findIndex(p => p.id === overId);
+        if (fromIdx === -1 || toIdx === -1 || fromIdx === toIdx) return ps;
+        const next = [...ps];
+        const [moved] = next.splice(fromIdx, 1);
+        next.splice(toIdx, 0, moved);
+        return next;
+      });
+    },
+    end: () => {
+      const moved = dragIdRef.current;
+      dragIdRef.current = null;
+      lastOverRef.current = null;
+      setDraggingId(null);
+      if (moved) void api.reorderProjects(orderRef.current).catch(() => { void load(); });
+    },
+  }), [draggingId, load]);
+
   const newBtn = (
     <button onClick={() => setGalleryOpen(true)} className="primary-cta" style={{
       display: 'inline-flex', alignItems: 'center', gap: 7, height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)',
@@ -853,9 +918,9 @@ export default function Projects() {
             : projects.length === 0 ? <EmptyProjects onPick={() => setGalleryOpen(true)} />
             : view === 'grid'
               ? <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(316px, 1fr))', gap: 18 }}>
-                  {projects.map(p => <ProjectCard key={p.id} p={p} onMenu={requestDelete} onOpen={open} />)}
+                  {projects.map(p => <ProjectCard key={p.id} p={p} onMenu={requestDelete} onOpen={open} dnd={dnd} />)}
                 </div>
-              : <ListTable projects={projects} onMenu={requestDelete} onOpen={open} />}
+              : <ListTable projects={projects} onMenu={requestDelete} onOpen={open} dnd={dnd} />}
         </div>
       </AppShell>
 

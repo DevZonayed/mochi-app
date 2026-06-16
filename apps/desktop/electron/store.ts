@@ -41,6 +41,8 @@ export interface Project {
   setupScript?: string;
   /** Gitignored files copied into each new session worktree. Default ['.env*']. */
   copyGlobs?: string[];
+  /** Manual display order from drag-and-drop. Lower = earlier. Unset → sorts by createdAt. */
+  order?: number;
   createdAt: number;
 }
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
@@ -633,7 +635,10 @@ export class Store {
   }
 
   // ── Projects ────────────────────────────────────────────────────────
-  listProjects(): Project[] { return [...this.data.projects].sort((a, b) => a.createdAt - b.createdAt); }
+  // Manual `order` (small ints from drag-and-drop) sorts ahead of unordered
+  // projects, which fall back to createdAt — so newly-created projects land at
+  // the end of a hand-ordered list and legacy projects keep creation order.
+  listProjects(): Project[] { return [...this.data.projects].sort((a, b) => (a.order ?? a.createdAt) - (b.order ?? b.createdAt)); }
   getProject(projectId: string): Project | undefined { return this.data.projects.find(p => p.id === projectId); }
   /** A project name that doesn't collide: "Repo", then "Repo v1", "Repo v2"… */
   uniqueProjectName(base: string): string {
@@ -661,6 +666,16 @@ export class Store {
     Object.assign(cur, patch);
     this.save();
     return cur;
+  }
+  /** Persist a manual display order from drag-and-drop. Each id's position in
+      `orderedIds` becomes its `order`; ids not present keep their current order. */
+  reorderProjects(orderedIds: string[]): Project[] {
+    orderedIds.forEach((pid, i) => {
+      const p = this.data.projects.find(x => x.id === pid);
+      if (p) p.order = i;
+    });
+    this.save();
+    return this.listProjects();
   }
   /** Remove a project + its jobs/sessions/schedules. Files on disk are untouched. */
   deleteProject(projectId: string): void {
