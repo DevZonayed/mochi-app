@@ -10,6 +10,7 @@
 
 import React from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
+import { GitStatusBar } from './GitStatusBar';
 import { Icon, type IconName } from '../lib/icons';
 import { EffortDial, CountUp } from '../lib/ui';
 import { FileChip, IS_WRITE_TOOL } from '../lib/fileChip';
@@ -487,6 +488,7 @@ export default function SessionTranscript() {
                 <EffortDial value={job ? EFFORT_TO_PILL[job.effort] : 'DEEP'} compact />
               </div>
             </div>
+            <GitStatusBar sessionId={job?.sessionId ?? null} />
             {/* real engine · model badge — which engine ran this job, on this Mac */}
             {job?.engine && (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)',

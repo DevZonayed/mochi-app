@@ -19,5 +19,6 @@
       "@maestro/design-tokens/theme": ["../../packages/design-tokens/src/theme.ts"]
     }
   },
-  "include": ["src", "electron"]
+  "include": ["src", "electron"],
+  "exclude": ["**/*.test.ts"]
 }
