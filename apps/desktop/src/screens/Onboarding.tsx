@@ -25,6 +25,7 @@ import {
   StatusPill,
   EffortDial,
 } from '../lib/ui';
+import { EngineSetup } from '../EngineSetup';
 
 const WIN_W = 1240;
 const WIN_H = 800;
@@ -328,6 +329,11 @@ function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect }: Prov
           );
         })}
       </GroupedList>
+      {/* Engine runtimes — the native binaries are downloaded on demand (not
+          bundled). Auto-start Claude (the core engine); Codex is optional. */}
+      <div style={{ marginTop: 14 }}>
+        <EngineSetup autoInstall={['claude']} />
+      </div>
     </div>
   );
 }

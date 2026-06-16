@@ -531,6 +531,25 @@ export interface UpdateStatus {
   platform: string;
 }
 export interface UpdateNotes { version: string; notes: string; url: string }
+
+// Engine binaries (native CLIs) downloaded on demand rather than bundled.
+export type EngineKind = 'codex' | 'claude';
+export interface EngineState {
+  id: EngineKind;
+  installed: boolean;
+  source: 'managed' | 'system' | 'none';
+  version: string | null;
+  path: string | null;
+  supported: boolean;
+}
+export interface EngineDownloadProgress {
+  engine: EngineKind;
+  phase: 'resolve' | 'download' | 'verify' | 'extract' | 'install' | 'done' | 'error';
+  received?: number;
+  total?: number;
+  pct?: number;
+}
+
 const updateUnavailable = (): Promise<never> => Promise.reject(new ApiError(501, 'Updates run in the desktop app'));
 
 export const api = {
@@ -876,6 +895,18 @@ export const api = {
     throw new ApiError(501, 'Signing out of Codex is only available in the desktop app.');
   }),
 
+  // Engine binaries (Codex / Claude) — downloaded on demand into userData rather
+  // than bundled. Desktop-only (a remote can't install a binary on your Mac).
+  enginesStatus: () => call<Record<EngineKind, EngineState>>('enginesStatus', {}, () => {
+    throw new ApiError(501, 'Engine setup is only available in the desktop app.');
+  }),
+  installEngine: (engine: EngineKind) =>
+    call<{ ok: boolean; path: string; version: string; source: string }>('installEngine', { engine }, () => {
+      throw new ApiError(501, 'Engine downloads are only available in the desktop app.');
+    }),
+  cancelEngineInstall: (engine: EngineKind) =>
+    call<{ ok: boolean }>('cancelEngineInstall', { engine }, () => Promise.resolve({ ok: true })),
+
   // GitHub connection + per-session PR lifecycle (desktop-only on the relay).
   githubStatus: () => call<GithubConnection>('githubStatus', {}, () => req<GithubConnection>('/api/github/status')),
   importGithubFromCli: () => call<ProviderConn>('importGithubFromCli', {}, () => req<ProviderConn>('/api/github/import-cli', { method: 'POST' })),
@@ -941,9 +972,10 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
+        if (name === 'engine-download' && handlers.onEngineDownload) handlers.onEngineDownload(data as EngineDownloadProgress);
         if (name === 'bg' && handlers.onBg) handlers.onBg(data as BgTask);
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
         if (name === 'approval' && handlers.onApproval) handlers.onApproval(data as Approval);
