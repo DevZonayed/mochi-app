@@ -2,6 +2,8 @@
    tests), never on Electron. Callers read the token from the Keychain (providers)
    and pass it in — the token never lives in this module. */
 
+import type { PrStatus, PrCheck } from './pr-state.js';
+
 const DEFAULT_BASE = 'https://api.github.com';
 type FetchImpl = typeof fetch;
 
@@ -86,4 +88,76 @@ export function parseGitHubRemote(remote: string | null | undefined): { owner: s
   m = s.match(/^(?:https?|ssh):\/\/(?:[^@]+@)?github\.com\/([^/]+)\/(.+?)(?:\.git)?\/?$/i);
   if (m) return { owner: m[1], repo: m[2] };
   return null;
+}
+
+/* ── Repos + Pull Requests ────────────────────────────────────────────── */
+
+export interface Repo { defaultBranch: string; allowSquash: boolean; allowMerge: boolean; allowRebase: boolean; permissionsPush: boolean; }
+
+export async function getRepo(token: string, owner: string, repo: string, fetchImpl?: FetchImpl): Promise<Repo> {
+  const r = await ghRequest<{ default_branch: string; allow_squash_merge?: boolean; allow_merge_commit?: boolean; allow_rebase_merge?: boolean; permissions?: { push?: boolean } }>({ token, path: `/repos/${owner}/${repo}`, fetchImpl });
+  return {
+    defaultBranch: r.data.default_branch,
+    allowSquash: r.data.allow_squash_merge !== false,
+    allowMerge: r.data.allow_merge_commit !== false,
+    allowRebase: r.data.allow_rebase_merge !== false,
+    permissionsPush: !!r.data.permissions?.push,
+  };
+}
+
+export interface OpenPr { number: number; url: string; title: string; headSha: string; }
+
+/** The open PR whose head is `headBranch`, or null. */
+export async function findOpenPr(token: string, owner: string, repo: string, headBranch: string, fetchImpl?: FetchImpl): Promise<OpenPr | null> {
+  const r = await ghRequest<Array<{ number: number; html_url: string; title: string; head: { sha: string } }>>({ token, path: `/repos/${owner}/${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(headBranch)}`, fetchImpl });
+  const pr = r.data?.[0];
+  return pr ? { number: pr.number, url: pr.html_url, title: pr.title, headSha: pr.head.sha } : null;
+}
+
+function normalizeMergeableState(s: string): PrStatus['mergeableState'] {
+  const known = ['clean', 'dirty', 'blocked', 'behind', 'unstable', 'draft', 'unknown'];
+  return (known.includes(s) ? s : 'unknown') as PrStatus['mergeableState'];
+}
+
+async function getChecks(token: string, owner: string, repo: string, sha: string, fetchImpl?: FetchImpl): Promise<PrCheck[]> {
+  try {
+    const r = await ghRequest<{ check_runs: Array<{ name: string; status: string; conclusion: string | null }> }>({ token, path: `/repos/${owner}/${repo}/commits/${sha}/check-runs`, fetchImpl });
+    return (r.data?.check_runs ?? []).map(c => ({
+      name: c.name,
+      status: c.status !== 'completed' ? 'pending' : c.conclusion === 'success' ? 'success' : 'failure',
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/** Full status of PR #num: state, mergeability, and the check-run rollup. */
+export async function getPullStatus(token: string, owner: string, repo: string, num: number, fetchImpl?: FetchImpl): Promise<PrStatus> {
+  const r = await ghRequest<{ number: number; html_url: string; title: string; state: string; merged: boolean; mergeable: boolean | null; mergeable_state: string; head: { sha: string } }>({ token, path: `/repos/${owner}/${repo}/pulls/${num}`, fetchImpl });
+  const d = r.data;
+  const checks = await getChecks(token, owner, repo, d.head.sha, fetchImpl);
+  return {
+    number: d.number,
+    url: d.html_url,
+    title: d.title,
+    state: d.merged ? 'merged' : d.state === 'closed' ? 'closed' : 'open',
+    mergeable: d.mergeable,
+    mergeableState: normalizeMergeableState(d.mergeable_state),
+    checks,
+  };
+}
+
+export async function createPull(token: string, owner: string, repo: string, args: { head: string; base: string; title: string; body?: string }, fetchImpl?: FetchImpl): Promise<{ number: number; url: string }> {
+  const r = await ghRequest<{ number: number; html_url: string }>({ token, method: 'POST', path: `/repos/${owner}/${repo}/pulls`, body: { head: args.head, base: args.base, title: args.title, body: args.body ?? '' }, fetchImpl });
+  return { number: r.data.number, url: r.data.html_url };
+}
+
+export async function mergePull(token: string, owner: string, repo: string, num: number, method: 'merge' | 'squash' | 'rebase', fetchImpl?: FetchImpl): Promise<{ merged: boolean; sha?: string }> {
+  const r = await ghRequest<{ merged: boolean; sha?: string }>({ token, method: 'PUT', path: `/repos/${owner}/${repo}/pulls/${num}/merge`, body: { merge_method: method }, fetchImpl });
+  return { merged: !!r.data.merged, sha: r.data.sha };
+}
+
+export async function createRepo(token: string, name: string, opts: { private?: boolean } = {}, fetchImpl?: FetchImpl): Promise<{ cloneUrl: string; sshUrl: string; fullName: string }> {
+  const r = await ghRequest<{ clone_url: string; ssh_url: string; full_name: string }>({ token, method: 'POST', path: '/user/repos', body: { name, private: opts.private ?? true, auto_init: false }, fetchImpl });
+  return { cloneUrl: r.data.clone_url, sshUrl: r.data.ssh_url, fullName: r.data.full_name };
 }
