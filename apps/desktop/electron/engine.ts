@@ -34,6 +34,16 @@ const require = createRequire(__filename);
 const EFFORT_TURNS: Record<string, number> = { fast: 8, balanced: 24, deep: 48, max: 96 };
 // Goal mode: pursue the goal autonomously over a long horizon — far more turns.
 const GOAL_MAX_TURNS = 240;
+// When a normal (non-goal) run exhausts its per-run turn budget MID-TASK, we resume
+// the SAME session and keep going rather than failing the run. This caps the TOTAL
+// turns we'll auto-spend that way before pausing — high enough that a substantive
+// task finishes hands-free, bounded enough to keep worst-case cost in check. Past
+// it the run pauses gracefully (work saved, session resumable), never "failed".
+const AUTO_CONTINUE_MAX_TURNS = 120;
+// The nudge sent when resuming a run that stopped only because it hit its turn limit.
+const CONTINUE_PROMPT =
+  'Continue exactly where you left off and finish the task. Do not repeat work already done; ' +
+  'pick up from the last step and carry on to completion.';
 // How many times to silently retry a transient engine crash before failing the run.
 const ENGINE_MAX_RETRIES = 2;
 // Design mode (the Design genre): steer the agent to produce ONE self-contained,
@@ -66,6 +76,22 @@ const GOAL_DIRECTIVE =
   `completion. Don't stop to ask for confirmation on routine steps; plan, implement, ` +
   `test, and self-correct in a loop until the goal is fully met or you are genuinely ` +
   `blocked. If blocked, state precisely what's needed.`;
+// Background execution: a coding agent constantly starts dev servers and watchers. In
+// the FOREGROUND shell those block the whole turn until they time out (the chat sits
+// there "generating") AND get killed the instant the user steers or sends the next
+// message. So steer the agent to the run_in_background tool for anything long-lived.
+// Added on real (non-plan) Claude runs, where those MCP tools are mounted.
+const BG_DIRECTIVE =
+  `\n\n---\n\n[Running commands] For any command that does NOT return on its own within a ` +
+  `few seconds — a dev/preview server (\`npm run dev\`, \`vite\`, \`next dev\`, \`expo start\`), a ` +
+  `file watcher, \`build --watch\`, \`tail -f\`, a long-running worker — you MUST use the ` +
+  `run_in_background tool, NOT the normal shell. A foreground server blocks your turn until ` +
+  `it times out and is killed when the user sends the next message; a background task keeps ` +
+  `running after you reply, persists across messages, and the user sees it as a running ` +
+  `session they can stop. After starting one, poll background_output briefly to confirm it ` +
+  `came up, tell the user the URL and how to stop it, then finish your reply — do NOT sit and ` +
+  `wait on it. Use the normal shell only for commands that finish quickly (install, build, ` +
+  `test, git, file ops).`;
 // SP3 — primary↔reviewer loop: how many review→fix→re-review rounds at most.
 const REVIEW_MAX_ROUNDS = 2;
 // Codex already ships a native built-in `image_gen` skill (rides the ChatGPT
@@ -161,6 +187,11 @@ interface EngineRun {
   transcript: TranscriptItem[];
   /** Codex native image_gen: images harvested into the project + persisted as Assets. */
   images?: { assetId: string; imagePath: string; width?: number; height?: number }[];
+  /** The agent stopped only because it exhausted its per-run turn budget while still
+      mid-task (SDK `error_max_turns`). The transcript above is real, partial work and
+      `sdkSessionId` can be resumed to continue — so the caller keeps going rather than
+      surfacing a dead, failed run. */
+  hitMaxTurns?: boolean;
 }
 
 /** A finished image: a real raster file on this Mac + the Asset it was saved as. */
@@ -176,6 +207,29 @@ export type ImageGenFn = (prompt: string, opts: ImageGenOpts) => Promise<ImageGe
 
 /** Running totals streamed during a run so the UI counts cost/tokens live. */
 export interface LiveUsage { tokens: number; cost: number }
+
+/** A long-lived shell process the agent started that OUTLIVES the chat turn that
+    spawned it (a dev server, a watcher, `build --watch`, `tail -f`, …). Owned by
+    LocalEngine in the MAIN process — NOT a child of the per-turn claude/codex
+    subprocess — so steering or sending the next message (which aborts the turn)
+    can't kill it, and the turn finishes immediately instead of blocking on a command
+    that never returns. In-memory only: these die when the Mac app quits, by design
+    (this is in-session background execution, not app-exit survival). */
+export interface BgTaskRecord {
+  id: string;
+  projectId: string | null;
+  sessionId: string | null;
+  command: string;
+  cwd: string;
+  status: 'running' | 'exited' | 'stopped' | 'failed';
+  pid: number | null;
+  exitCode: number | null;
+  startedAt: number;
+  endedAt: number | null;
+  /** Total bytes of stdout+stderr seen so far (the kept buffer itself is tail-capped). */
+  bytes: number;
+}
+const BG_BUFFER_CAP = 256 * 1024; // keep only the last 256 KB of a bg task's output
 
 interface RunHooks {
   /** Live progress: prose-so-far + the structured transcript + running usage. Throttled by the caller. */
@@ -338,6 +392,18 @@ interface SkillsCtx {
   remove: (skillId: string) => Promise<{ ok: true }>;
 }
 
+/** Agent-facing background-process capability, injected into runClaude. Lets the agent
+    run long-lived commands (dev servers, watchers) that OUTLIVE the turn and are
+    tracked + stoppable — instead of blocking the turn on a command that never returns,
+    or having it killed when the next message aborts the turn. Bound to the engine's
+    bg manager + this run's project/session/cwd in LocalEngine.run. */
+interface BgCtx {
+  start: (command: string, cwd?: string) => { id: string; pid: number | null; status: string; cwd: string };
+  output: (id: string, tailKB?: number) => { status: string; exitCode: number | null; bytes: number; output: string } | null;
+  list: () => { id: string; command: string; status: string; pid: number | null }[];
+  stop: (id: string) => { id: string; status: string } | null;
+}
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -346,6 +412,7 @@ async function runClaude(
   images?: { mime: string; b64: string }[],
   browser?: BrowserController,
   skillsCtx?: SkillsCtx,
+  bgCtx?: BgCtx,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -383,7 +450,7 @@ async function runClaude(
     ].filter(Boolean).join(', ');
     return `- ${s.id} — ${s.name}: ${s.description || '(no description)'}${bits ? ` [${bits}]` : ''}`;
   };
-  const maestroServer = ((imageGen || browser || skillsCtx) && !plan)
+  const maestroServer = ((imageGen || browser || skillsCtx || bgCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
@@ -518,6 +585,41 @@ async function runClaude(
                 return txt(`Removed project skill ${a.skillId}.`);
               })),
           ] : []),
+          ...(bgCtx ? [
+            tool('run_in_background',
+              'Start a long-lived or never-returning command (a dev/preview server like `npm run dev`/`vite`/`next dev`, a file watcher, `build --watch`, `tail -f`, a queue worker, etc.) as a TRACKED BACKGROUND process. CRITICAL: use this — NOT the normal Bash tool — for anything that does not exit on its own within a few seconds. The process is owned by the app (not this turn): it KEEPS RUNNING after you reply, SURVIVES the user sending the next message or steering, and is shown to the user as a running session they can stop. This tool returns IMMEDIATELY with a task id (it does NOT wait for the command) so you can finish your reply instead of hanging. After starting, briefly poll background_output to confirm it came up (e.g. the dev URL) and tell the user the URL + task id. Never run a server in the foreground Bash tool — that blocks the whole turn until it times out.',
+              { command: z.string().describe('The shell command to run, e.g. `npm run dev`.'),
+                cwd: z.string().optional().describe('Working directory (absolute, or relative to the project). Defaults to the project root.') },
+              wrap(async (a: { command: string; cwd?: string }) => {
+                const r = bgCtx.start(a.command, a.cwd);
+                return txt(`Started background task ${r.id} (pid ${r.pid ?? '?'}) in ${r.cwd}: \`${a.command}\`. It keeps running after this turn. Use background_output("${r.id}") in a moment to read its logs / confirm it started, and stop_background("${r.id}") to stop it.`);
+              })),
+            tool('background_output',
+              'Read the recent stdout+stderr and current status of a background task started with run_in_background. Use it to confirm a server came up (and find its URL), or to check on a long task later — including in a LATER message, since background tasks persist across turns.',
+              { id: z.string().describe('The background task id.'),
+                tailKB: z.number().optional().describe('Only return the last N kilobytes of output (default: all kept, up to 256 KB).') },
+              wrap(async (a: { id: string; tailKB?: number }) => {
+                const r = bgCtx.output(a.id, a.tailKB);
+                if (!r) return txt(`No background task ${a.id} (it may have been cleared).`);
+                const head = `status=${r.status}${r.exitCode != null ? ` exit=${r.exitCode}` : ''} bytes=${r.bytes}`;
+                return txt(`${head}\n\n${r.output || '(no output yet)'}`);
+              })),
+            tool('list_background',
+              'List the background tasks for this project (running ones first), with their id, status and command. Use it to see what is already running before starting another, or to find a task id to read or stop.',
+              {},
+              wrap(async () => {
+                const rows = bgCtx.list();
+                if (!rows.length) return txt('No background tasks for this project.');
+                return txt(rows.map(r => `- ${r.id} [${r.status}${r.pid != null ? ` pid ${r.pid}` : ''}]: \`${r.command}\``).join('\n'));
+              })),
+            tool('stop_background',
+              'Stop a background task (kills its whole process tree). Use this when a server/watcher is no longer needed, before restarting it, or when the user asks to stop it.',
+              { id: z.string().describe('The background task id to stop.') },
+              wrap(async (a: { id: string }) => {
+                const r = bgCtx.stop(a.id);
+                return txt(r ? `Stopped background task ${a.id} (status ${r.status}).` : `No background task ${a.id}.`);
+              })),
+          ] : []),
         ],
       })
     : null;
@@ -525,6 +627,7 @@ async function runClaude(
     ...(imageGen ? ['generate_image'] : []),
     ...(browser ? ['browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_click', 'browser_type', 'browser_press', 'browser_scroll', 'browser_upload', 'browser_select', 'browser_hover', 'browser_wait', 'browser_evaluate', 'browser_console', 'browser_remember', 'browser_back', 'browser_forward', 'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab'] : []),
     ...(skillsCtx ? ['search_skills', 'get_skill', 'download_skill', 'add_skill_to_project', 'list_project_skills', 'remove_project_skill'] : []),
+    ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
   ].map(n => `mcp__maestro__${n}`);
   /* Vision input: when the user attached images, the prompt becomes a streamed
      user message carrying text + base64 image blocks (a plain string can't hold
@@ -584,6 +687,8 @@ async function runClaude(
   let cost = 0;
   let model = 'claude';
   let sdkSessionId: string | undefined;
+  // Set when the run stops solely because it ran out of turns (vs. finished or crashed).
+  let hitMaxTurns = false;
   // Live usage: count GENERATED (output) tokens — monotonic, unlike input which
   // collapses once context is cached. Track per-message boundaries from the
   // stream (message_start/delta/stop) so the counter never dips between steps.
@@ -603,6 +708,8 @@ async function runClaude(
       if (hooks.signal?.aborted) throw new CancelledError();
       const m = raw as {
         type?: string;
+        subtype?: string;
+        errors?: string[];
         session_id?: string;
         parent_tool_use_id?: string | null;
         message?: { content?: { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; is_error?: boolean }[]; model?: string };
@@ -658,6 +765,12 @@ async function runClaude(
         usage = m.usage ?? usage;
         cost = m.total_cost_usd ?? 0;
         if (typeof m.result === 'string') resultText = m.result;
+        // An error-subtype result means the agent stopped WITHOUT finishing — most
+        // often because it ran out of its turn budget. Flag it so the caller resumes
+        // and continues rather than treating the partial run as complete. (The SDK
+        // usually THROWS this instead of yielding it — the catch below is the main
+        // path — but handle a clean stream too.)
+        if (m.subtype === 'error_max_turns' || m.subtype === 'error_max_budget_usd') hitMaxTurns = true;
         // Snap the live counters to the SDK's authoritative totals.
         if (usage?.output_tokens != null) { committedOut = usage.output_tokens; curOut = 0; }
         if (m.total_cost_usd != null) finalCost = m.total_cost_usd;
@@ -665,8 +778,20 @@ async function runClaude(
     }
   } catch (e) {
     if (e instanceof CancelledError || hooks.signal?.aborted) throw new CancelledError();
-    const detail = stderrTail.trim();
-    throw new Error(`${e instanceof Error ? e.message : String(e)}${detail ? `\n${detail}` : ''}`);
+    const msg = e instanceof Error ? e.message : String(e);
+    // The SDK does NOT yield a usable result when the agent exhausts its turn budget —
+    // it THROWS, converting the `error_max_turns` result into an Error whose message is
+    // "…returned an error result: Reached maximum number of turns (N)". That's not a real
+    // failure: the partial transcript + session id we streamed above are intact. So swallow
+    // it and FALL THROUGH to the normal return below, flagged `hitMaxTurns`, letting the
+    // caller resume the SAME session and continue — instead of re-throwing and marking the
+    // whole job 'failed' (which discarded the work and the resume handle).
+    if (/maximum number of turns/i.test(msg)) {
+      hitMaxTurns = true;
+    } else {
+      const detail = stderrTail.trim();
+      throw new Error(`${msg}${detail ? `\n${detail}` : ''}`);
+    }
   }
   // Any tool left 'running' (no matching tool_result before the stream ended)
   // would otherwise spin forever in the UI — settle it.
@@ -684,6 +809,7 @@ async function runClaude(
     model,
     sdkSessionId,
     transcript: items,
+    hitMaxTurns,
   };
 }
 
@@ -699,7 +825,7 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   // calls unless danger-full-access + approval_policy=never (probe-proven), so a
   // run with any Maestro MCP tools uses that sandbox. Never on reviewer passes.
   const bridge = (!readOnly && ctx?.browserBridge && (ctx.browserEnabled || ctx.projectId)) ? ctx.browserBridge : undefined;
-  const browserReg = bridge ? bridge.register(ctx!.projectId ?? null, { browser: !!ctx?.browserEnabled, skills: !!ctx?.projectId }) : undefined;
+  const browserReg = bridge ? bridge.register(ctx!.projectId ?? null, { browser: !!ctx?.browserEnabled, skills: !!ctx?.projectId, bg: !!ctx?.projectId }) : undefined;
   const sandbox = browserReg ? 'danger-full-access' : (readOnly ? 'read-only' : 'workspace-write');
   const args = [
     'exec', '--json', '--ephemeral', '--skip-git-repo-check',
@@ -915,6 +1041,95 @@ export class LocalEngine {
       need the bridge process plus a project id, so keep it available. */
   private browserBridgeFor(): BrowserBridge | undefined {
     return this.browserBridge;
+  }
+
+  /* ── Background tasks ────────────────────────────────────────────────
+     Long-lived processes the agent starts (dev servers, watchers) that must
+     OUTLIVE the turn. Spawned HERE in the main process, detached into their own
+     process group, and deliberately NOT wired to any run's AbortController — so a
+     steer / cancel / next message (which aborts the turn) leaves them running, and
+     the turn returns the instant the agent stops reasoning instead of blocking on a
+     command that never exits. The agent reaches them via the MCP tools above
+     (run_in_background …); the UI tracks them over 'bg' events. Killed on app quit
+     (bgStopAll) so nothing outlives the Mac app — this is in-session background, not
+     app-exit survival. */
+  private bg = new Map<string, { rec: BgTaskRecord; child: ChildProcess | null; buf: string }>();
+
+  private emitBg(rec: BgTaskRecord) { try { this.emit('bg', rec); } catch { /* window gone */ } }
+
+  /** Start a command as a tracked background process. Returns its record immediately. */
+  bgStart(opts: { projectId: string | null; sessionId?: string | null; command: string; cwd: string }): BgTaskRecord {
+    const id = `bg_${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`;
+    const rec: BgTaskRecord = {
+      id, projectId: opts.projectId, sessionId: opts.sessionId ?? null,
+      command: opts.command, cwd: opts.cwd, status: 'running',
+      pid: null, exitCode: null, startedAt: Date.now(), endedAt: null, bytes: 0,
+    };
+    let child: ChildProcess;
+    try {
+      // Run through the LOGIN shell (`/bin/zsh -lc`, the app's standard for shell ops in
+      // git.ts/models.ts/main.ts) so node/npm/etc. resolve via the user's real PATH — a
+      // GUI-launched Mac app otherwise has a minimal PATH and `npm run dev` would not be
+      // found. detached:true → own process group so stop_background kills the WHOLE tree
+      // (the dev server's children too), not just the shell.
+      child = spawn('/bin/zsh', ['-lc', opts.command], { cwd: opts.cwd, detached: true, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      rec.status = 'failed'; rec.endedAt = Date.now();
+      this.bg.set(id, { rec, child: null, buf: e instanceof Error ? e.message : String(e) });
+      this.emitBg(rec);
+      return rec;
+    }
+    rec.pid = child.pid ?? null;
+    const handle = { rec, child, buf: '' };
+    this.bg.set(id, handle);
+    const append = (d: Buffer) => { handle.buf = (handle.buf + d.toString()).slice(-BG_BUFFER_CAP); rec.bytes += d.length; };
+    child.stdout?.on('data', append);
+    child.stderr?.on('data', append);
+    child.on('error', (err) => {
+      handle.buf = (handle.buf + `\n[spawn error] ${err.message}\n`).slice(-BG_BUFFER_CAP);
+      if (rec.status === 'running') { rec.status = 'failed'; rec.endedAt = Date.now(); this.emitBg(rec); }
+    });
+    child.on('exit', (code, signal) => {
+      if (rec.status === 'running') rec.status = signal ? 'stopped' : (code && code !== 0 ? 'failed' : 'exited');
+      rec.exitCode = code ?? null; rec.endedAt = Date.now();
+      this.emitBg(rec);
+    });
+    this.emitBg(rec);
+    return rec;
+  }
+
+  /** Recent output + status of a background task (tail-capped). */
+  bgOutput(id: string, tailKB?: number): { record: BgTaskRecord; output: string } | null {
+    const h = this.bg.get(id);
+    if (!h) return null;
+    return { record: h.rec, output: tailKB ? h.buf.slice(-tailKB * 1024) : h.buf };
+  }
+
+  /** Background tasks (running first, then most-recent), optionally scoped to a project. */
+  bgList(projectId?: string | null): BgTaskRecord[] {
+    const all = [...this.bg.values()].map(h => h.rec);
+    const inProj = projectId == null ? all : all.filter(r => r.projectId === projectId);
+    return inProj.sort((a, b) => (a.status === 'running' ? 0 : 1) - (b.status === 'running' ? 0 : 1) || b.startedAt - a.startedAt);
+  }
+
+  /** Stop a background task — kills its whole process group. */
+  bgStop(id: string): BgTaskRecord | null {
+    const h = this.bg.get(id);
+    if (!h) return null;
+    this.killTree(h.child);
+    if (h.rec.status === 'running') { h.rec.status = 'stopped'; h.rec.endedAt = Date.now(); this.emitBg(h.rec); }
+    return h.rec;
+  }
+
+  /** Kill every background task — called on app quit so none outlive the Mac app. */
+  bgStopAll() { for (const h of this.bg.values()) this.killTree(h.child); }
+
+  private killTree(child: ChildProcess | null) {
+    const pid = child?.pid;
+    if (!pid) return;
+    const send = (sig: NodeJS.Signals) => { try { process.kill(-pid, sig); } catch { try { child?.kill(sig); } catch { /* already gone */ } } };
+    send('SIGTERM');
+    setTimeout(() => send('SIGKILL'), 4000); // escalate if it ignores SIGTERM
   }
 
   /** Generate an image via Codex's FREE native image_gen skill (no fal credits).
@@ -1152,6 +1367,10 @@ export class LocalEngine {
         prompt = `${base}${cur.input}`;
       }
       if (goalMode) prompt += GOAL_DIRECTIVE;
+      // Long-lived commands (dev servers/watchers) → run_in_background, not the blocking
+      // foreground shell. Mounted on real Claude runs, and on Codex runs with a project
+      // (the stdio bridge forwards the same tools there).
+      if (!opts.plan && (master === 'claude' || (master === 'codex' && job.projectId))) prompt += BG_DIRECTIVE;
       // Design genre: steer the turn toward the live, self-contained design artifact.
       if (project?.kind === 'design') prompt += DESIGN_DIRECTIVE;
       // Codex ships a native image_gen skill — nudge it to use that (not SVG) and
@@ -1292,8 +1511,24 @@ export class LocalEngine {
           return { ok: true };
         },
       } : undefined;
+      // Background-task capability for the agent: long-lived processes (dev servers,
+      // watchers) that outlive THIS turn. Bound to the engine's bg manager + this run's
+      // project/session, defaulting cwd to the run's working dir. Off in plan mode.
+      const bgCtx: BgCtx | undefined = !opts.plan ? {
+        start: (command: string, dir?: string) => {
+          const runCwd = dir ? (path.isAbsolute(dir) ? dir : path.join(cwd, dir)) : cwd;
+          const r = this.bgStart({ projectId: job.projectId, sessionId: cur.sessionId ?? null, command, cwd: runCwd });
+          return { id: r.id, pid: r.pid, status: r.status, cwd: r.cwd };
+        },
+        output: (id: string, tailKB?: number) => {
+          const r = this.bgOutput(id, tailKB);
+          return r ? { status: r.record.status, exitCode: r.record.exitCode, bytes: r.record.bytes, output: r.output } : null;
+        },
+        list: () => this.bgList(job.projectId).map(r => ({ id: r.id, command: r.command, status: r.status, pid: r.pid })),
+        stop: (id: string) => { const r = this.bgStop(id); return r ? { id: r.id, status: r.status } : null; },
+      } : undefined;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, browserForRun, skillsCtx)
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, browserForRun, skillsCtx, bgCtx)
         : runCodex(prompt, cwd, hooks, false, masterModel, imageCtx, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
@@ -1309,6 +1544,52 @@ export class LocalEngine {
           this.emit('job', cur);
           await new Promise<void>(res => setTimeout(res, 1500 * (attempt + 1)));
           if (ac.signal.aborted) throw new CancelledError();
+        }
+      }
+      // The agent hit its per-run turn ceiling while still mid-task. Don't fail (and
+      // throw the work away) — RESUME the same session and keep going, up to a bounded
+      // total, so a substantive task finishes hands-free. The first run preserved its
+      // partial transcript + sdkSessionId (see runClaude's `hitMaxTurns`); each segment
+      // streams live and respects cancellation. If it's STILL going at the hard cap, the
+      // run ends gracefully below (work + session preserved) rather than as 'failed'.
+      if (master === 'claude' && main.hitMaxTurns && !opts.plan && !ac.signal.aborted) {
+        const segment = EFFORT_TURNS[effort] ?? EFFORT_TURNS.balanced;
+        const ceiling = goalMode ? GOAL_MAX_TURNS : AUTO_CONTINUE_MAX_TURNS;
+        let turnsSoFar = goalMode ? GOAL_MAX_TURNS : segment; // the first run already spent ~a segment (goal mode already ran to its cap)
+        while (main.hitMaxTurns && main.sdkSessionId && turnsSoFar < ceiling && !ac.signal.aborted) {
+          turnsSoFar += segment;
+          cur = this.store.updateJob(jobId, { stage: `kept working past the turn limit — continuing (${Math.min(turnsSoFar, ceiling)}/${ceiling})…` });
+          this.emit('job', cur);
+          const soFar = main.transcript; // re-read each round; it grows as segments fold in
+          const contHooks: RunHooks = {
+            signal: ac.signal,
+            onProgress: (_p, items, usage) => { const merged = [...soFar, ...items]; flush(proseOf(merged), merged, usage); },
+            onChild: (c) => { handle.child = c; },
+          };
+          let cont: EngineRun;
+          try {
+            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, browserForRun, skillsCtx, bgCtx);
+          } catch (ce) { if (ce instanceof CancelledError || ac.signal.aborted) throw ce; break; }
+          main = {
+            text: cont.text || main.text,
+            tokens: main.tokens + cont.tokens,
+            cost: Math.round((main.cost + cont.cost) * 1000) / 1000,
+            model: cont.model || main.model,
+            sdkSessionId: cont.sdkSessionId ?? main.sdkSessionId,
+            transcript: [...main.transcript, ...cont.transcript],
+            images: [...(main.images ?? []), ...(cont.images ?? [])],
+            hitMaxTurns: cont.hitMaxTurns,
+          };
+        }
+        // Auto-continue exhausted and STILL not finished → pause gracefully. The work is
+        // saved and the chat resumes by simply sending another message ("continue").
+        if (main.hitMaxTurns && !ac.signal.aborted) {
+          const note = '⏸ Paused at the turn limit — the work so far is saved. Send “continue” and I’ll pick up exactly where this left off.';
+          main = {
+            ...main,
+            text: main.text ? `${main.text}\n\n${note}` : note,
+            transcript: [...main.transcript, { kind: 'text', text: note, ts: Date.now() }],
+          };
         }
       }
       if (isChat && main.sdkSessionId && main.sdkSessionId !== session.sdkSessionId) {

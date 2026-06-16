@@ -121,6 +121,21 @@ export interface Job {
   createdAt: number;
   updatedAt: number;
 }
+/** A long-lived process the agent started (a dev server, watcher, …) that outlives the
+    chat turn. Tracked + stoppable; streamed live over the 'bg' event. */
+export interface BgTask {
+  id: string;
+  projectId: string | null;
+  sessionId: string | null;
+  command: string;
+  cwd: string;
+  status: 'running' | 'exited' | 'stopped' | 'failed';
+  pid: number | null;
+  exitCode: number | null;
+  startedAt: number;
+  endedAt: number | null;
+  bytes: number;
+}
 export interface Approval {
   id: string;
   projectId: string | null;
@@ -744,6 +759,14 @@ export const api = {
   deleteJob: (id: string) =>
     call<{ ok: boolean }>('deleteJob', { id }, () => req<{ ok: boolean }>(`/api/jobs/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 
+  // Background tasks (long-lived processes the agent started — dev servers, watchers)
+  listBgTasks: (projectId?: string) =>
+    call<BgTask[]>('listBgTasks', { projectId }, () => req<BgTask[]>('/api/bg' + qp({ projectId }))),
+  bgOutput: (id: string, tailKB?: number) =>
+    call<{ record: BgTask; output: string }>('bgOutput', { id, tailKB }, () => req<{ record: BgTask; output: string }>(`/api/bg/${encodeURIComponent(id)}/output` + qp({ tailKB: tailKB != null ? String(tailKB) : undefined }))),
+  stopBgTask: (id: string) =>
+    call<BgTask>('stopBgTask', { id }, () => req<BgTask>(`/api/bg/${encodeURIComponent(id)}/stop`, { method: 'POST' })),
+
   // Approvals
   listApprovals: (status?: ApprovalStatus) =>
     call<Approval[]>('listApprovals', { status }, () => req<Approval[]>('/api/approvals' + qp({ status }))),
@@ -903,9 +926,10 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onGitStatus?: (s: SessionGitStatus) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
+        if (name === 'bg' && handlers.onBg) handlers.onBg(data as BgTask);
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
         if (name === 'approval' && handlers.onApproval) handlers.onApproval(data as Approval);
         if (name === 'project' && handlers.onProject) handlers.onProject(data as Project);
@@ -921,6 +945,7 @@ export const api = {
     }
     if (typeof EventSource === 'undefined') return () => {};
     const es = new EventSource(API_BASE + '/api/stream' + (remoteToken ? `?token=${encodeURIComponent(remoteToken)}` : ''));
+    if (handlers.onBg) es.addEventListener('bg', (e: MessageEvent) => { try { handlers.onBg!(JSON.parse(e.data) as BgTask); } catch { /* ignore */ } });
     if (handlers.onJob) es.addEventListener('job', (e: MessageEvent) => { try { handlers.onJob!(JSON.parse(e.data) as Job); } catch { /* ignore */ } });
     if (handlers.onApproval) es.addEventListener('approval', (e: MessageEvent) => { try { handlers.onApproval!(JSON.parse(e.data) as Approval); } catch { /* ignore */ } });
     if (handlers.onProject) es.addEventListener('project', (e: MessageEvent) => { try { handlers.onProject!(JSON.parse(e.data) as Project); } catch { /* ignore */ } });
