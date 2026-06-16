@@ -22,12 +22,23 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import type { BrowserController } from './browser.js';
 import type { Store } from './store.js';
+import type { BgTaskRecord } from './engine.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
+
+/** Background-task hooks injected from main.ts — the engine OWNS the processes; the
+    bridge just forwards Codex's tool calls to it (Claude reaches the same manager via
+    its in-process MCP server). Signatures mirror LocalEngine's bg* methods. */
+export interface BridgeBg {
+  start(opts: { projectId: string | null; sessionId: string | null; command: string; cwd: string }): BgTaskRecord;
+  output(id: string, tailKB?: number): { record: BgTaskRecord; output: string } | null;
+  list(projectId: string | null): BgTaskRecord[];
+  stop(id: string): BgTaskRecord | null;
+}
 
 /** A registered codex run: the project its browser tools target + the screenshot
     Asset ids produced during the run (folded into the transcript afterward). */
-interface RunReg { projectId: string | null; shots: string[]; browser: boolean; skills: boolean }
-interface RunOptions { browser?: boolean; skills?: boolean }
+interface RunReg { projectId: string | null; shots: string[]; browser: boolean; skills: boolean; bg: boolean }
+interface RunOptions { browser?: boolean; skills?: boolean; bg?: boolean }
 
 /** Handle returned to runCodex: the codex `-c` config to add + the shot list. */
 export interface BrowserRunRegistration {
@@ -47,6 +58,7 @@ const TOOL_NAMES = [
   'browser_reload', 'browser_tabs', 'browser_new_tab', 'browser_select_tab',
   'search_skills', 'get_skill', 'download_skill', 'add_skill_to_project',
   'list_project_skills', 'remove_project_skill',
+  'run_in_background', 'background_output', 'list_background', 'stop_background',
 ] as const;
 
 const txt = (s: string) => ({ content: [{ type: 'text', text: s }] });
@@ -59,6 +71,9 @@ export class BrowserBridge {
   private sockPath: string;
   private shimPath: string;
   private runs = new Map<string, RunReg>();
+  private bgHooks?: BridgeBg;
+  /** Wire the engine's background-task manager (from main.ts, after both exist). */
+  setBg(bg: BridgeBg) { this.bgHooks = bg; }
 
   constructor(private browser: BrowserController, private store: Store) {
     // Socket lives in a 0700 dir we own (not world-traversable /tmp), so it's never
@@ -87,7 +102,7 @@ export class BrowserBridge {
   /** Register a codex run: returns the `-c mcp_servers` config + a live shot list. */
   register(projectId: string | null, opts: RunOptions = { browser: true, skills: false }): BrowserRunRegistration {
     const token = randomBytes(18).toString('hex');
-    const reg: RunReg = { projectId, shots: [], browser: opts.browser !== false, skills: !!opts.skills };
+    const reg: RunReg = { projectId, shots: [], browser: opts.browser !== false, skills: !!opts.skills, bg: !!opts.bg };
     this.runs.set(token, reg);
     // Run the shim via Electron's own node (always present; no PATH dependency).
     // The per-run token goes in the MCP server's ENV (not the shim's argv) so it
@@ -204,6 +219,29 @@ export class BrowserBridge {
         this.store.removeInstalledSkill(pid, skillId);
         return txt(`Removed project skill ${skillId}.`);
       }
+      case 'run_in_background': {
+        if (!reg.bg || !this.bgHooks) return errRes('background tools are not enabled for this run');
+        const dir = s(a.cwd);
+        const cwd = dir ? (path.isAbsolute(dir) ? dir : path.join(projectRoot(), dir)) : projectRoot();
+        const r = this.bgHooks.start({ projectId: pid, sessionId: null, command: String(a.command ?? ''), cwd });
+        return txt(`Started background task ${r.id} (pid ${r.pid ?? '?'}) in ${cwd}: \`${a.command ?? ''}\`. It keeps running after this turn. Use background_output("${r.id}") to read its logs / confirm it started, and stop_background("${r.id}") to stop it.`);
+      }
+      case 'background_output': {
+        if (!reg.bg || !this.bgHooks) return errRes('background tools are not enabled for this run');
+        const r = this.bgHooks.output(String(a.id ?? ''), n(a.tailKB));
+        if (!r) return txt(`No background task ${a.id ?? ''} (it may have been cleared).`);
+        return txt(`status=${r.record.status}${r.record.exitCode != null ? ` exit=${r.record.exitCode}` : ''} bytes=${r.record.bytes}\n\n${r.output || '(no output yet)'}`);
+      }
+      case 'list_background': {
+        if (!reg.bg || !this.bgHooks) return errRes('background tools are not enabled for this run');
+        const rows = this.bgHooks.list(pid);
+        return txt(rows.length ? rows.map(r => `- ${r.id} [${r.status}${r.pid != null ? ` pid ${r.pid}` : ''}]: \`${r.command}\``).join('\n') : 'No background tasks for this project.');
+      }
+      case 'stop_background': {
+        if (!reg.bg || !this.bgHooks) return errRes('background tools are not enabled for this run');
+        const r = this.bgHooks.stop(String(a.id ?? ''));
+        return txt(r ? `Stopped background task ${a.id ?? ''} (status ${r.status}).` : `No background task ${a.id ?? ''}.`);
+      }
       case 'browser_navigate': { const r = await b.navigate(pid, String(a.url ?? '')); return txt(`Opened ${r.url} — "${r.title}"` + (r.memory ? `\n\n📝 Your saved notes for this site:\n${r.memory}` : '')); }
       case 'browser_snapshot': { const r = await b.snapshot(pid); return txt(`${r.url} — ${r.title}\n\n${r.aria}` + (r.memory ? `\n\n📝 Your saved notes for this site:\n${r.memory}` : '')); }
       case 'browser_remember': { const r = await b.remember(pid, String(a.note ?? '')); return txt(r.domain ? `Saved notes for ${r.domain}.` : 'No page open to attach notes to.'); }
@@ -273,6 +311,10 @@ const SHIM_TOOLS = JSON.stringify([
   { name: 'add_skill_to_project', description: 'Install a registry skill into this project at .claude/skills/<slug>/SKILL.md. Read that file before using the skill.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },
   { name: 'list_project_skills', description: 'List skills already installed in this project.', inputSchema: { type: 'object', properties: {} } },
   { name: 'remove_project_skill', description: 'Remove an installed project skill by registry id or slug.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },
+  { name: 'run_in_background', description: 'Start a long-lived or never-returning command (a dev/preview server like `npm run dev`/`vite`/`next dev`, a file watcher, `build --watch`, `tail -f`, a worker) as a TRACKED BACKGROUND process. Use this — NOT a normal shell command — for anything that does not exit on its own within a few seconds. It keeps running after you reply, survives the user sending the next message, and the user sees it as a running session they can stop. Returns IMMEDIATELY with a task id (does not wait). After starting, poll background_output to confirm it came up (the URL), then finish your reply — never run a server in the foreground.', inputSchema: { type: 'object', properties: { command: { type: 'string' }, cwd: { type: 'string' } }, required: ['command'] } },
+  { name: 'background_output', description: 'Read recent stdout+stderr and status of a background task started with run_in_background (e.g. to confirm a server came up and find its URL). Works across turns — background tasks persist.', inputSchema: { type: 'object', properties: { id: { type: 'string' }, tailKB: { type: 'number' } }, required: ['id'] } },
+  { name: 'list_background', description: 'List this project\'s background tasks (running first) with id, status and command.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'stop_background', description: 'Stop a background task (kills its whole process tree).', inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
 ]);
 
 const SHIM_SRC = `'use strict';

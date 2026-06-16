@@ -420,6 +420,17 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return c ?? bad('job is not running', 409);
       }
       case 'deleteJob': { store.deleteJob(String(p.id ?? '')); return { ok: true }; }
+
+      // ── Background tasks (long-lived processes the agent started) ──
+      case 'listBgTasks': return engine.bgList(p.projectId ? String(p.projectId) : undefined);
+      case 'bgOutput': {
+        const r = engine.bgOutput(String(p.id ?? ''), typeof p.tailKB === 'number' ? p.tailKB : undefined);
+        return r ?? bad('background task not found', 404);
+      }
+      case 'stopBgTask': {
+        const r = engine.bgStop(String(p.id ?? ''));
+        return r ?? bad('background task not found', 404);
+      }
       case 'createAndRunJob': {
         if (!p.projectId || !p.input) bad('projectId and input required');
         if (!store.getProject(String(p.projectId))) bad('project not found', 404);

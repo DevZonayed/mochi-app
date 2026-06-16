@@ -24,7 +24,7 @@ import {
 } from '../lib/ui';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -1867,6 +1867,63 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   );
 });
 
+/* Running background tasks (dev servers, watchers the agent started). They persist
+   across turns and SURVIVE steering / cancel / the next message — this panel lets the
+   operator SEE them, peek at their logs (e.g. to grab the dev URL), and stop them. */
+function BgTasksPanel({ tasks, onStop }: { tasks: BgTask[]; onStop: (id: string) => void }) {
+  const [collapsed, setCollapsed] = React.useState(false);
+  const [open, setOpen] = React.useState<string | null>(null); // task id whose logs are expanded
+  const [logs, setLogs] = React.useState<Record<string, string>>({});
+  const shown = tasks.filter(t => t.status === 'running' || (t.endedAt != null && Date.now() - t.endedAt < 60_000)); // running + just-ended
+  const running = shown.filter(t => t.status === 'running').length;
+
+  // While a task's logs are expanded, poll its recent output (tail) live.
+  React.useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    const pull = () => { void api.bgOutput(open, 64).then(r => { if (alive) setLogs(m => ({ ...m, [open]: r.output })); }).catch(() => {}); };
+    pull();
+    const id = window.setInterval(pull, 1500);
+    return () => { alive = false; window.clearInterval(id); };
+  }, [open]);
+
+  if (!shown.length) return null;
+  const dot = (s: BgTask['status']) => s === 'running' ? 'var(--green, #34c759)' : s === 'failed' ? 'var(--red)' : 'var(--ink-tertiary)';
+
+  return (
+    <div className="q-panel" style={{ marginBottom: 8, borderRadius: 14, overflow: 'hidden', border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', boxShadow: 'var(--card-shadow)' }}>
+      <button onClick={() => setCollapsed(c => !c)} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: 'transparent', cursor: 'pointer', borderBottom: collapsed ? 'none' : '0.5px solid var(--separator)' }}>
+        <span className={running ? 'breathe' : undefined} style={{ width: 8, height: 8, borderRadius: 4, background: dot(running ? 'running' : 'exited'), flexShrink: 0 }} />
+        <span style={{ flex: 1, textAlign: 'left', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>
+          {running ? `${running} background task${running === 1 ? '' : 's'} running` : 'Background tasks'}
+        </span>
+        <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)', transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+      </button>
+      {!collapsed && (
+        <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 300, overflowY: 'auto' }}>
+          {shown.map(t => (
+            <div key={t.id} style={{ borderBottom: '0.5px solid var(--separator)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 12px' }}>
+                <span className={t.status === 'running' ? 'breathe' : undefined} style={{ width: 7, height: 7, borderRadius: 4, background: dot(t.status), flexShrink: 0 }} />
+                <button onClick={() => setOpen(o => o === t.id ? null : t.id)} title="Show logs" style={{ flex: 1, minWidth: 0, textAlign: 'left', background: 'transparent', cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ font: '600 var(--fs-caption)/1.2 var(--font-mono, ui-monospace)', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.command}</span>
+                  <span style={{ font: '500 11px/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{t.status}{t.pid != null ? ` · pid ${t.pid}` : ''}{t.exitCode != null ? ` · exit ${t.exitCode}` : ''}</span>
+                </button>
+                {t.status === 'running' && (
+                  <button onClick={() => onStop(t.id)} title="Stop this task" style={{ height: 26, padding: '0 11px', borderRadius: 7, border: '0.5px solid var(--separator)', background: 'var(--fill-secondary)', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer', flexShrink: 0 }}>Stop</button>
+                )}
+              </div>
+              {open === t.id && (
+                <pre style={{ margin: 0, padding: '8px 12px 12px', maxHeight: 200, overflow: 'auto', font: '500 11px/1.5 var(--font-mono, ui-monospace)', color: 'var(--ink-secondary)', background: 'var(--bg-elevated)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{logs[t.id] ?? '…'}</pre>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* Collapsible "N queued messages" panel — keyboard-navigable, with row actions.
    Rows are drag-and-droppable (and ⌥↑/⌥↓ move the selected one) so the operator
    can prioritize which task runs next: the drainer always fires queue[0]. */
@@ -2118,6 +2175,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [optsOpen, setOptsOpen] = React.useState(false); // reviewer + schedule popover
   const [schedNote, setSchedNote] = React.useState('');
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
+  const [bgTasks, setBgTasks] = React.useState<BgTask[]>([]); // long-lived processes the agent started (dev servers, watchers)
   const [attachments, setAttachments] = React.useState<Attach[]>([]); // images / text / files
   // Hover preview for a text attachment — a smooth, scrollable peek of the content.
   const [hoverAtt, setHoverAtt] = React.useState<{ id: string; rect: DOMRect } | null>(null);
@@ -2161,8 +2219,26 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
           const next = ts.slice(); next[i] = j; return next;
         });
       },
+      // Background tasks (dev servers/watchers) the agent started for THIS project —
+      // tracked live so the user can see + stop them. They persist across turns.
+      onBg: (t) => {
+        if (t.projectId && projectId && t.projectId !== projectId) return;
+        setBgTasks(list => { const i = list.findIndex(x => x.id === t.id); if (i === -1) return [t, ...list]; const next = list.slice(); next[i] = t; return next; });
+      },
     });
     return unsub;
+  }, [projectId]);
+
+  // Seed the background-task list for this project (records persist across turns).
+  React.useEffect(() => {
+    if (!projectId) { setBgTasks([]); return; }
+    let alive = true;
+    void api.listBgTasks(projectId).then(rows => { if (alive) setBgTasks(rows); }).catch(() => {});
+    return () => { alive = false; };
+  }, [projectId]);
+  const stopBg = React.useCallback((id: string) => {
+    setBgTasks(list => list.map(t => t.id === id ? { ...t, status: 'stopped' as const } : t)); // optimistic
+    void api.stopBgTask(id).then(rec => setBgTasks(list => list.map(t => t.id === rec.id ? rec : t))).catch(() => {});
   }, []);
 
   // Stick to the bottom while streaming unless the user scrolled up.
@@ -2420,6 +2496,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
           {sendError && (
             <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 7, padding: '8px 11px', borderRadius: 10, background: 'color-mix(in srgb, var(--red) 9%, var(--bg-elevated))',
               font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)' }}><Icon name="alert" size={13} /> {sendError}</div>
+          )}
+          {bgTasks.some(t => t.status === 'running') && (
+            <BgTasksPanel tasks={bgTasks} onStop={stopBg} />
           )}
           {queue.length > 0 && (
             <QueuePanel queue={queue} onSendNow={sendQueuedNow} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
