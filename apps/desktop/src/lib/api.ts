@@ -6,6 +6,8 @@
    falls back to REST against the relay server, which mirrors the Mac's pushed
    state and forwards commands to it — the web app is a remote control. */
 
+import type { SessionGitStatus, GithubConnection } from './git-types';
+
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
@@ -832,6 +834,28 @@ export const api = {
     call<{ ok: boolean }>('disconnectProvider', { provider, workspaceId }, () =>
       req<{ ok: boolean }>(`/api/providers/${provider}/disconnect`, { method: 'POST', body: JSON.stringify({ workspaceId }) })),
 
+  // GitHub connection + per-session PR lifecycle (desktop-only on the relay).
+  githubStatus: () => call<GithubConnection>('githubStatus', {}, () => req<GithubConnection>('/api/github/status')),
+  importGithubFromCli: () => call<ProviderConn>('importGithubFromCli', {}, () => req<ProviderConn>('/api/github/import-cli', { method: 'POST' })),
+  getSessionGitStatus: (sessionId: string, withPr = true) =>
+    call<SessionGitStatus>('getSessionGitStatus', { sessionId, withPr }, () => req<SessionGitStatus>(`/api/sessions/${sessionId}/git-status`)),
+  refreshSessionGitStatus: (sessionId: string) =>
+    call<SessionGitStatus>('refreshSessionGitStatus', { sessionId }, () => req<SessionGitStatus>(`/api/sessions/${sessionId}/git-status/refresh`, { method: 'POST' })),
+  pushSession: (sessionId: string) =>
+    call<{ ok: boolean; reason?: string }>('pushSession', { sessionId }, () => req<{ ok: boolean; reason?: string }>(`/api/sessions/${sessionId}/push`, { method: 'POST' })),
+  createSessionPR: (sessionId: string, title?: string, body?: string, base?: string) =>
+    call<{ ok: boolean; url?: string; number?: number; reason?: string }>('createSessionPR', { sessionId, title, body, base }, () =>
+      req<{ ok: boolean; url?: string; number?: number; reason?: string }>(`/api/sessions/${sessionId}/pr`, { method: 'POST', body: JSON.stringify({ title, body, base }) })),
+  mergeSessionPR: (sessionId: string, method?: 'merge' | 'squash' | 'rebase') =>
+    call<{ ok: boolean; reason?: string }>('mergeSessionPR', { sessionId, method }, () =>
+      req<{ ok: boolean; reason?: string }>(`/api/sessions/${sessionId}/merge`, { method: 'POST', body: JSON.stringify({ method }) })),
+  resolveSession: (sessionId: string) =>
+    call<{ ok: boolean; conflicts: string[]; reason?: string }>('resolveSession', { sessionId }, () =>
+      req<{ ok: boolean; conflicts: string[]; reason?: string }>(`/api/sessions/${sessionId}/resolve`, { method: 'POST' })),
+  archiveSession: (sessionId: string, deleteBranch?: boolean) =>
+    call<{ ok: boolean }>('archiveSession', { sessionId, deleteBranch }, () =>
+      req<{ ok: boolean }>(`/api/sessions/${sessionId}/archive`, { method: 'POST', body: JSON.stringify({ deleteBranch }) })),
+
   // Engine routing (which engine plays which role)
   getRouting: () => call<Routing>('getRouting', {}, () => req<Routing>('/api/routing')),
   setRouting: (patch: Partial<Routing>) =>
@@ -875,7 +899,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onGitStatus?: (s: SessionGitStatus) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
@@ -888,6 +912,7 @@ export const api = {
         if (name === 'comms' && handlers.onComms) handlers.onComms(data as CommsStatus);
         if (name === 'session' && handlers.onSession) handlers.onSession(data as ChatSession & { deleted?: boolean });
         if (name === 'feedback' && handlers.onFeedback) handlers.onFeedback(data as Feedback & { deleted?: boolean });
+        if (name === 'git-status' && handlers.onGitStatus) handlers.onGitStatus(data as SessionGitStatus);
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
@@ -902,6 +927,7 @@ export const api = {
     if (handlers.onComms) es.addEventListener('comms', (e: MessageEvent) => { try { handlers.onComms!(JSON.parse(e.data) as CommsStatus); } catch { /* ignore */ } });
     if (handlers.onSession) es.addEventListener('session', (e: MessageEvent) => { try { handlers.onSession!(JSON.parse(e.data) as ChatSession & { deleted?: boolean }); } catch { /* ignore */ } });
     if (handlers.onFeedback) es.addEventListener('feedback', (e: MessageEvent) => { try { handlers.onFeedback!(JSON.parse(e.data) as Feedback & { deleted?: boolean }); } catch { /* ignore */ } });
+    if (handlers.onGitStatus) es.addEventListener('git-status', (e: MessageEvent) => { try { handlers.onGitStatus!(JSON.parse(e.data) as SessionGitStatus); } catch { /* ignore */ } });
     return () => es.close();
   },
   /** Convenience: subscribe to job updates only. */
