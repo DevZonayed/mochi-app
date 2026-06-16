@@ -172,11 +172,8 @@ export interface Routing {
   video: EngineId;
   /** Model-level primary/reviewer roles (SP1). */
   roles?: Roles;
-  /** Native browser automation — 'on' makes a real Chrome available to whichever
-      engine runs the job (Claude + Codex alike); 'off' withholds the tools. */
-  browser?: 'on' | 'off';
 }
-export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex', roles: { ...DEFAULT_ROLES }, browser: 'on' };
+export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex', roles: { ...DEFAULT_ROLES } };
 
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
@@ -284,14 +281,6 @@ export interface AppSettings {
   rescanCadence: 'daily' | 'weekly' | 'onchange';
   /** Picker keys the user starred — surfaced first in the model picker. */
   favoriteModels?: string[];
-  /** Chrome profile directory (e.g. 'Default', 'Profile 1') the browser should
-      inherit cookies/logins/passwords from. Empty/undefined = isolated per-project
-      profiles (Maestro-managed). */
-  chromeProfile?: string;
-  /** How a chosen Chrome profile is used: 'copy' (default) warm-starts Maestro's
-      own browser from a one-time copy of the profile's logins; 'live' drives the
-      real Chrome profile (requires the user's Chrome to be quit). */
-  chromeProfileMode?: 'copy' | 'live';
   /** Target repo ("owner/repo") that feedback is escalated to as GitHub issues.
       Empty/undefined = issue creation is disabled until the operator sets one. */
   feedbackRepo?: string;
@@ -326,6 +315,8 @@ interface StoreData {
   deckSecret: string;
   /** Pairing token remotes must present to the relay. Shown in the app; never in snapshots. */
   accessToken: string;
+  /** Pairing token the local browser extension must present on the control port. Shown in the app; never in snapshots. */
+  extensionToken: string;
   routing: Routing;
   settings: AppSettings;
   catalogVersion?: number;
@@ -350,10 +341,6 @@ interface StoreData {
   telegram: TelegramState;
   /** Locally (safeStorage-)encrypted provider API keys, base64. Never leaves this Mac. */
   providerKeys: Record<string, { cipherB64: string; last4: string; createdAt: number }>;
-  /** Browser memory: per-domain operating notes the agent saves and auto-recalls
-      (selectors, login quirks, where buttons are) so it doesn't re-learn a site
-      every visit. Mac-local; never in relay snapshots. */
-  browserMemory?: Record<string, { note: string; updatedAt: number }>;
   /** Per-design element comments (Mochi-style): a CSS selector into the live
       design artifact + the operator's note. The design agent reads these to
       revise specific elements. Keyed by projectId. Mac-local; never relayed. */
@@ -418,10 +405,8 @@ export class Store {
       let dirty = false;
       // migrations for stores written by older builds (dirty-flag pattern)
       if (!this.data.accessToken) { this.data.accessToken = newPairingToken(); dirty = true; }
+      if (!this.data.extensionToken) { this.data.extensionToken = newPairingToken(); dirty = true; }
       if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
-      // Native browser automation — default-on for stores written before it existed.
-      if (this.data.routing && !this.data.routing.browser) { this.data.routing.browser = 'on'; dirty = true; }
-      if (!this.data.browserMemory) { this.data.browserMemory = {}; dirty = true; }
       if (!this.data.designComments) { this.data.designComments = {}; dirty = true; }
       if (!this.data.installedSkills) { this.data.installedSkills = {}; dirty = true; }
       // SP1: seed model-level roles on older stores from the engine-level fields.
@@ -473,7 +458,7 @@ export class Store {
       if (dirty) this.save();
     } catch {
       this.data = {
-        deckId: id(), deckSecret: id(), accessToken: newPairingToken(),
+        deckId: id(), deckSecret: id(), accessToken: newPairingToken(), extensionToken: newPairingToken(),
         routing: { ...DEFAULT_ROUTING }, settings: { ...DEFAULT_SETTINGS }, catalogVersion: CATALOG_VERSION,
         workspace: null,
         projects: [], jobs: [], sessions: [], approvals: [], schedules: [], skills: [], templates: [],
@@ -501,6 +486,7 @@ export class Store {
     return { deckId: this.data.deckId, deckSecret: this.data.deckSecret };
   }
   get accessToken(): string { return this.data.accessToken; }
+  get extensionToken(): string { return this.data.extensionToken; }
 
   routing(): Routing { return { ...this.data.routing }; }
   setRouting(patch: Partial<Routing>): Routing {
@@ -526,26 +512,6 @@ export class Store {
     this.data.settings = { ...this.data.settings, ...patch };
     this.save();
     return this.getSettings();
-  }
-
-  // ── Browser memory (per-domain operating notes the agent recalls) ───────
-  getBrowserMemory(domain: string): string {
-    return this.data.browserMemory?.[(domain || '').toLowerCase()]?.note ?? '';
-  }
-  setBrowserMemory(domain: string, note: string): void {
-    const key = (domain || '').toLowerCase().trim();
-    if (!key) return;
-    if (!this.data.browserMemory) this.data.browserMemory = {};
-    const trimmed = (note ?? '').slice(0, 4000);
-    if (!trimmed) { delete this.data.browserMemory[key]; }
-    else { this.data.browserMemory[key] = { note: trimmed, updatedAt: Date.now() }; }
-    // Cap total domains — evict the least-recently-updated past 300.
-    const entries = Object.entries(this.data.browserMemory);
-    if (entries.length > 300) {
-      entries.sort((a, b) => a[1].updatedAt - b[1].updatedAt);
-      for (const [k] of entries.slice(0, entries.length - 300)) delete this.data.browserMemory[k];
-    }
-    this.save();
   }
 
   // ── Design comments (per-element notes the design agent revises against) ──

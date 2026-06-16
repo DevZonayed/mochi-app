@@ -8,14 +8,13 @@ import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
 import type { ResearchEngine } from './research.js';
 import type { PublishingEngine } from './publishing.js';
-import type { BrowserController } from './browser.js';
 import type { TelegramBot } from './telegram.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
 import type { GitService } from './git-service.js';
-import { listChromeProfiles } from './chrome-profiles.js';
+import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
 import { scanConversations, parseConversation, type ConvSource } from './conversation-sync.js';
@@ -50,7 +49,7 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', browser?: BrowserController, gitService?: GitService) {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null) {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -72,11 +71,6 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (typeof p.openAtLogin === 'boolean') patch.openAtLogin = p.openAtLogin;
         if (p.rescanCadence === 'daily' || p.rescanCadence === 'weekly' || p.rescanCadence === 'onchange') patch.rescanCadence = p.rescanCadence;
         if (Array.isArray(p.favoriteModels)) patch.favoriteModels = (p.favoriteModels as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 40);
-        if (typeof p.chromeProfile === 'string') { // '' = isolated; otherwise must be a real installed profile dir
-          const v = p.chromeProfile.slice(0, 64);
-          if (v === '' || listChromeProfiles().some(c => c.dir === v)) patch.chromeProfile = v;
-        }
-        if (p.chromeProfileMode === 'copy' || p.chromeProfileMode === 'live') patch.chromeProfileMode = p.chromeProfileMode;
         if (typeof p.feedbackRepo === 'string') { // '' clears it; otherwise must look like owner/repo
           const v = p.feedbackRepo.trim().slice(0, 140);
           if (v === '' || REPO_RE.test(v)) patch.feedbackRepo = v;
@@ -144,6 +138,16 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'deleteDesignComment': {
         store.deleteDesignComment(String(p.id ?? ''), String(p.commentId ?? ''));
         return { ok: true };
+      }
+      // ── Browser-extension control channel (local-only; blocked from relay) ──
+      case 'extensionStatus': {
+        const b = getExtensionBridge?.();
+        return b ? b.status() : { running: false, port: 0, token: store.extensionToken, peers: [] };
+      }
+      case 'extensionSetActive': {
+        const b = getExtensionBridge?.();
+        if (!b) bad('extension channel unavailable', 503);
+        return b!.setActiveFromApp(String(p.clientId ?? ''));
       }
       // Hand off a design to code: COPY the design's folder (design/index.html +
       // assets + .continuum memory) into a NEW coding project so the design lives
@@ -926,35 +930,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (image) patch.image = image;
         const video = asEngine(p.video);
         if (video) patch.video = video;
-        if (p.browser === 'on' || p.browser === 'off') patch.browser = p.browser;
         if (Object.keys(patch).length === 0) bad('no valid routing fields');
         const next = store.setRouting(patch);
         emit('routing', next);
         return next;
-      }
-
-      // ── Native browser automation (one real Chrome per project) ──
-      // Results never carry a local filesystem path — screenshots come back as an
-      // Asset id, fetched as bytes only over the desktop-only maestro:assetImage IPC.
-      case 'browserAvailable': return browser ? browser.available() : { ok: false, reason: 'browser unavailable' };
-      case 'listChromeProfiles': return listChromeProfiles();
-      case 'browserState': return browser ? browser.state(p.projectId ? String(p.projectId) : null) : { open: false, url: '', title: '', tabs: 0, activeTab: 0 };
-      case 'browserNavigate': {
-        if (!browser) bad('browser unavailable', 503);
-        return browser!.navigate(p.projectId ? String(p.projectId) : null, String(p.url ?? ''));
-      }
-      case 'browserScreenshot': {
-        if (!browser) bad('browser unavailable', 503);
-        const r = await browser!.screenshot(p.projectId ? String(p.projectId) : null, { fullPage: !!p.fullPage });
-        return { assetId: r.assetId, width: r.width, height: r.height, url: r.url, title: r.title }; // no local path crosses dispatch
-      }
-      case 'browserClose': {
-        if (!browser) bad('browser unavailable', 503);
-        return browser!.close(p.projectId ? String(p.projectId) : null);
-      }
-      case 'browserFocus': {
-        if (!browser) bad('browser unavailable', 503);
-        return browser!.focus(p.projectId ? String(p.projectId) : null);
       }
 
       // ── Pairing (desktop-only; never enters relay snapshots) ──
