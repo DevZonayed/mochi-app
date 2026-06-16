@@ -35,6 +35,12 @@ export interface Workspace { id: string; name: string; budgetCap: number; create
 export interface Project {
   id: string; workspaceId: string; name: string; template: string; instructions: string; color: string;
   kind?: ProjectKind; path?: string; repoUrl?: string;
+  /** Worktree base branch override (else auto-detected from origin/HEAD). */
+  defaultBaseBranch?: string;
+  /** Shell script run once in each new session worktree (e.g. install deps). */
+  setupScript?: string;
+  /** Gitignored files copied into each new session worktree. Default ['.env*']. */
+  copyGlobs?: string[];
   createdAt: number;
 }
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
@@ -119,6 +125,12 @@ export interface ChatSession {
   reviewer?: RoleChoice | 'off';
   /** Isolated git branch for this chat (Conductor-style), once checked out. */
   branch?: string;
+  /** Absolute path of this session's git worktree (Conductor-style isolation). */
+  worktreePath?: string;
+  /** The base branch this session's worktree was forked from. */
+  baseBranch?: string;
+  /** Set when the session's worktree has been pruned/archived. */
+  archivedAt?: number;
   /** Imported from an external store (Claude/Codex/Conductor) — read-only history. */
   importedFrom?: 'claude' | 'codex' | 'conductor';
   /** Source-side conversation id; dedupes re-imports of the same conversation. */
@@ -671,7 +683,7 @@ export class Store {
     this.data.sessions.push(s); this.save();
     return s;
   }
-  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch'>>): ChatSession {
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt'>>): ChatSession {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     Object.assign(s, patch, { updatedAt: now() });

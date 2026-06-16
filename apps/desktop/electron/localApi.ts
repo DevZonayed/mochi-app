@@ -12,6 +12,7 @@ import type { BrowserController } from './browser.js';
 import type { TelegramBot } from './telegram.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
+import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
@@ -254,6 +255,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return s;
       }
       case 'deleteSession': {
+        const s = store.getSession(String(p.id ?? ''));
+        if (s?.worktreePath) {
+          const proj = store.getProject(s.projectId);
+          if (proj?.path) {
+            try { pruneSessionWorktree({ repoDir: proj.path, worktreeRoot: worktreeRootDir(), projectId: proj.id, sessionId: s.id, branch: s.branch, deleteBranch: false }); } catch { /* best effort */ }
+          }
+        }
         store.deleteSession(String(p.id ?? ''));
         emit('session', { id: String(p.id ?? ''), deleted: true });
         return { ok: true };
@@ -262,6 +270,17 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const s = store.setSessionPinned(String(p.id ?? ''), p.pinned === true);
         emit('session', s);
         return s;
+      }
+      case 'archiveSession': {
+        const s = store.getSession(String(p.sessionId ?? p.id ?? ''));
+        if (!s) return bad('session not found', 404);
+        const proj = store.getProject(s.projectId);
+        if (proj?.path && s.worktreePath) {
+          try { pruneSessionWorktree({ repoDir: proj.path, worktreeRoot: worktreeRootDir(), projectId: proj.id, sessionId: s.id, branch: s.branch, deleteBranch: p.deleteBranch === true }); } catch { /* best effort */ }
+        }
+        const updated = store.updateSession(s.id, { archivedAt: Date.now(), worktreePath: undefined });
+        emit('session', updated);
+        return updated;
       }
 
       // ── Conversation sync (import Claude/Codex/Conductor history) ──────────
