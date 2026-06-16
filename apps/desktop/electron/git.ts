@@ -368,3 +368,8 @@ export function pushBranch(dir: string, branch: string, opts: { token?: string; 
     if (askpass) { try { rmSync(askpass, { force: true }); } catch { /* ignore */ } }
   }
 }
+
+/** Whether a ref (e.g. `origin/feat`) exists locally. Cheap, no network. */
+export function localRefExists(dir: string, ref: string): boolean {
+  return execGit(['-C', dir, 'rev-parse', '--verify', '--quiet', ref]).code === 0;
+}

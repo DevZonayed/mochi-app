@@ -14,6 +14,7 @@ import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
+import type { GitService } from './git-service.js';
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
@@ -49,7 +50,7 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', browser?: BrowserController) {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', browser?: BrowserController, gitService?: GitService) {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -282,6 +283,19 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const updated = store.updateSession(s.id, { archivedAt: Date.now(), worktreePath: undefined });
         emit('session', updated);
         return updated;
+      }
+      // Per-session git/PR status (local facts + live PR). Emits a git-status event too.
+      case 'getSessionGitStatus': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? ''));
+        if (!s) return bad('session not found', 404);
+        return gitService.fullStatus(s, { withPr: p.withPr !== false });
+      }
+      case 'refreshSessionGitStatus': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? ''));
+        if (!s) return bad('session not found', 404);
+        return gitService.fullStatus(s, { withPr: true });
       }
 
       // ── Conversation sync (import Claude/Codex/Conductor history) ──────────

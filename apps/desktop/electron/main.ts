@@ -13,6 +13,7 @@ import { TelegramBot } from './telegram.js';
 import { Providers } from './providers.js';
 import type { Approval, Job } from './store.js';
 import { createDispatch } from './localApi.js';
+import { GitService } from './git-service.js';
 import { buildModelGroups } from './models.js';
 import { RelayClient } from './relay.js';
 import { CronRunner } from './cron.js';
@@ -332,7 +333,8 @@ app.whenReady().then(() => {
   });
   telegram = new TelegramBot(store, engine, providers, emit);
   telegram.resumeOnBoot();
-  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, providers, emit, RELAY_URL, browser);
+  const gitService = new GitService(store, emit, providers);
+  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, providers, emit, RELAY_URL, browser, gitService);
 
   relay = new RelayClient({
     url: RELAY_URL,
@@ -353,7 +355,7 @@ app.whenReady().then(() => {
       // *ProjectMemory + snapshotProject methods read/write project files and run
       // git on the Mac — none may answer over the relay (phone/web are read-mostly
       // remote controls, not local-execution surfaces).
-      if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject' || method === 'archiveSession' || method === 'importGithubFromCli'
+      if (method === 'getPairing' || method === 'listChromeProfiles' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject' || method === 'archiveSession' || method === 'importGithubFromCli' || method === 'getSessionGitStatus' || method === 'refreshSessionGitStatus'
         || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment'
         || method === 'copyDesignToCode'
         || method === 'addSkillToProject' || method === 'removeSkillFromProject'
@@ -387,10 +389,12 @@ app.whenReady().then(() => {
 
   const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs));
   cron.start();
+  // Poll PR/git status for active sessions; the renderer + phone update via git-status events.
+  const gitPoll = setInterval(() => { for (const s of gitService.pollable()) void gitService.fullStatus(s, { withPr: true }).catch(() => { /* transient */ }); }, 30_000);
   // Auto-update (electron-updater → GitHub Releases). Desktop-only: its events
   // never cross the relay. Polling starts after the window exists (see below).
   const updater = new Updater(emit);
-  app.on('before-quit', () => { cron.stop(); relay?.stop(); telegram?.stop(); browserBridge.stop(); updater.stop(); void browser.dispose(); });
+  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); relay?.stop(); telegram?.stop(); browserBridge.stop(); updater.stop(); void browser.dispose(); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {
