@@ -297,6 +297,27 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!s) return bad('session not found', 404);
         return gitService.fullStatus(s, { withPr: true });
       }
+      // ── PR actions (DESKTOP-ONLY, outward — UI confirms before calling) ─
+      case 'pushSession': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.pushSession(s);
+      }
+      case 'createSessionPR': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.createPr(s, {
+          title: typeof p.title === 'string' ? p.title : undefined,
+          body: typeof p.body === 'string' ? p.body : undefined,
+          base: typeof p.base === 'string' ? p.base : undefined,
+        });
+      }
+      case 'mergeSessionPR': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        const method = p.method === 'merge' || p.method === 'squash' || p.method === 'rebase' ? p.method : undefined;
+        return gitService.mergePr(s, { method });
+      }
 
       // ── Conversation sync (import Claude/Codex/Conductor history) ──────────
       // DESKTOP-ONLY (reads local agent stores + the Conductor SQLite db). Guarded

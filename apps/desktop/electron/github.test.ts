@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { ghRequest, getViewer, parseGitHubRemote, getRepo, findOpenPr, getPullStatus, createPull, mergePull } from './github.js';
+import { ghRequest, getViewer, parseGitHubRemote, getRepo, findOpenPr, getPullStatus, createPull, mergePull, pickMergeMethod } from './github.js';
 
 /** A fake fetch that routes by URL substring (for multi-call functions). */
 function routeFetch(routes: Array<{ match: string; status: number; body?: unknown; headers?: Record<string, string> }>): typeof fetch {
@@ -103,4 +103,10 @@ describe('createPull / mergePull', () => {
     const f = routeFetch([{ match: '/merge', status: 200, body: { merged: true, sha: 'deadbeef' } }]);
     expect(await mergePull('t', 'o', 'r', 9, 'squash', f)).toEqual({ merged: true, sha: 'deadbeef' });
   });
+});
+
+describe('pickMergeMethod', () => {
+  test('prefers squash', () => { expect(pickMergeMethod({ allowSquash: true, allowMerge: true, allowRebase: true })).toBe('squash'); });
+  test('falls to merge when squash disabled', () => { expect(pickMergeMethod({ allowSquash: false, allowMerge: true, allowRebase: true })).toBe('merge'); });
+  test('falls to rebase when only rebase', () => { expect(pickMergeMethod({ allowSquash: false, allowMerge: false, allowRebase: true })).toBe('rebase'); });
 });

@@ -161,3 +161,11 @@ export async function createRepo(token: string, name: string, opts: { private?: 
   const r = await ghRequest<{ clone_url: string; ssh_url: string; full_name: string }>({ token, method: 'POST', path: '/user/repos', body: { name, private: opts.private ?? true, auto_init: false }, fetchImpl });
   return { cloneUrl: r.data.clone_url, sshUrl: r.data.ssh_url, fullName: r.data.full_name };
 }
+
+/** Pick a merge method the repo actually allows (prefer squash → merge → rebase). */
+export function pickMergeMethod(repo: { allowSquash: boolean; allowMerge: boolean; allowRebase: boolean }): 'squash' | 'merge' | 'rebase' {
+  if (repo.allowSquash) return 'squash';
+  if (repo.allowMerge) return 'merge';
+  if (repo.allowRebase) return 'rebase';
+  return 'merge';
+}
