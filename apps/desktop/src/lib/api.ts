@@ -36,6 +36,8 @@ export interface ChatSession {
   title: string;
   sdkSessionId?: string;
   pinned?: boolean;
+  /** Archived (hidden from the active chat list, restorable). Timestamp it was archived; absent = active. */
+  archived?: number;
   primary?: RoleChoice;
   reviewer?: RoleChoice | 'off';
   /** Set when this chat was imported from an external store (read-only history). */
@@ -709,6 +711,8 @@ export const api = {
     call<{ ok: boolean }>('deleteSession', { id }, () => req<{ ok: boolean }>(`/api/sessions/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
   pinSession: (id: string, pinned: boolean) =>
     call<ChatSession>('pinSession', { id, pinned }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/pin`, { method: 'POST', body: JSON.stringify({ pinned }) })),
+  archiveSession: (id: string, archived: boolean) =>
+    call<ChatSession>('archiveSession', { id, archived }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify({ archived }) })),
   deleteProject: (id: string) =>
     call<{ ok: boolean }>('deleteProject', { id }, () => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 

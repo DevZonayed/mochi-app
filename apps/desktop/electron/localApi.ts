@@ -263,6 +263,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('session', s);
         return s;
       }
+      case 'archiveSession': {
+        const s = store.setSessionArchived(String(p.id ?? ''), p.archived === true);
+        emit('session', s);
+        return s;
+      }
 
       // ── Conversation sync (import Claude/Codex/Conductor history) ──────────
       // DESKTOP-ONLY (reads local agent stores + the Conductor SQLite db). Guarded

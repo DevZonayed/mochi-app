@@ -88,6 +88,10 @@ export default function Workspace() {
   const [chatsAllOpen, setChatsAllOpen] = React.useState<Set<string>>(new Set());
   // Per-project "⋯" menu (settings / jobs / instructions / reveal …).
   const [menuProj, setMenuProj] = React.useState<string | null>(null);
+  // Project pending a delete confirmation (the destructive modal).
+  const [confirmDelProj, setConfirmDelProj] = React.useState<string | null>(null);
+  // Per-project "Archived" sub-list expanded state.
+  const [archivedOpen, setArchivedOpen] = React.useState<Set<string>>(new Set());
   const [kindFilter, setKindFilterState] = React.useState<KindFilter>(() => {
     try { const v = localStorage.getItem(KIND_FILTER_KEY); return (v && KIND_META.some(m => m.key === v)) ? v as KindFilter : 'all'; } catch { return 'all'; }
   });
@@ -295,6 +299,19 @@ export default function Workspace() {
     setSessions(ss => ss.filter(s => s.id !== id));
     setTabs(ts => ts.filter(t => t.sessionId !== id));
   };
+  const archiveSession = (s: ChatSession, archived: boolean) => {
+    setSessions(ss => ss.map(x => (x.id === s.id ? { ...x, archived: archived ? Date.now() : undefined, pinned: archived ? undefined : x.pinned } : x)));
+    // Archiving an open chat closes its tab (it's no longer in the active list).
+    if (archived) setTabs(ts => ts.filter(t => t.sessionId !== s.id));
+    void api.archiveSession(s.id, archived).catch(() => {});
+  };
+  const deleteProject = (id: string) => {
+    setConfirmDelProj(null);
+    setProjects(ps => ps.filter(p => p.id !== id));
+    setTabs(ts => ts.filter(t => t.projectId !== id));
+    setExpanded(e => { const n = new Set(e); n.delete(id); return n; });
+    void api.deleteProject(id).catch(() => {});
+  };
   const commitRename = (id: string) => {
     const title = renameVal.trim(); setRenamingId(null);
     if (!title) return;
@@ -315,9 +332,14 @@ export default function Workspace() {
   const visibleProjects = codeProjects.filter(p => kindMatch(p) && projHit(p));
   const sessionsByProject = (pid: string) => {
     const p = projById[pid];
-    return sessions.filter(s => s.projectId === pid && (!q || chatHit(s) || (p && p.name.toLowerCase().includes(q)))).sort((a, b) => b.updatedAt - a.updatedAt);
+    return sessions.filter(s => s.projectId === pid && !s.archived && (!q || chatHit(s) || (p && p.name.toLowerCase().includes(q)))).sort((a, b) => b.updatedAt - a.updatedAt);
   };
-  const pinned = sessions.filter(s => s.pinned && projKind(projById[s.projectId]) !== 'design' && kindMatch(projById[s.projectId]) && (chatHit(s) || (projById[s.projectId]?.name.toLowerCase().includes(q) ?? false))).sort((a, b) => b.updatedAt - a.updatedAt);
+  // Archived chats for a project (most-recently-archived first), restorable.
+  const archivedByProject = (pid: string) => {
+    const p = projById[pid];
+    return sessions.filter(s => s.projectId === pid && s.archived && (!q || chatHit(s) || (p && p.name.toLowerCase().includes(q)))).sort((a, b) => (b.archived ?? 0) - (a.archived ?? 0));
+  };
+  const pinned = sessions.filter(s => s.pinned && !s.archived && projKind(projById[s.projectId]) !== 'design' && kindMatch(projById[s.projectId]) && (chatHit(s) || (projById[s.projectId]?.name.toLowerCase().includes(q) ?? false))).sort((a, b) => b.updatedAt - a.updatedAt);
 
   // a session row in the tree
   const SessionRow = ({ s, indent }: { s: ChatSession; indent: number }) => {
@@ -335,16 +357,27 @@ export default function Workspace() {
             style={{ flex: 1, minWidth: 0, border: '1px solid var(--blue)', borderRadius: 6, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1.3 var(--font-text)' }} />
         ) : (
           <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
-            style={{ flex: 1, minWidth: 0, font: `${isActive ? 600 : 500} var(--fs-footnote)/1.35 var(--font-text)`, color: isActive ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            style={{ flex: 1, minWidth: 0, font: `${isActive ? 600 : 500} var(--fs-footnote)/1.35 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (isActive ? 'var(--ink)' : 'var(--ink-secondary)'), whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
             {s.title}
           </span>
         )}
         <span className="ws-act" style={{ display: 'inline-flex', gap: 1, flexShrink: 0 }}>
-          <button title={s.pinned ? 'Unpin' : 'Pin to top'} onClick={e => { e.stopPropagation(); togglePin(s); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: s.pinned ? 'var(--blue)' : 'var(--ink-tertiary)' }}>
-            <Icon name="bookmark" size={12} />
-          </button>
+          {s.archived ? (
+            <button title="Unarchive" onClick={e => { e.stopPropagation(); archiveSession(s, false); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)' }}>
+              <Icon name="archive" size={12} />
+            </button>
+          ) : (
+            <>
+              <button title={s.pinned ? 'Unpin' : 'Pin to top'} onClick={e => { e.stopPropagation(); togglePin(s); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: s.pinned ? 'var(--blue)' : 'var(--ink-tertiary)' }}>
+                <Icon name="bookmark" size={12} />
+              </button>
+              <button title="Archive chat" onClick={e => { e.stopPropagation(); archiveSession(s, true); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}>
+                <Icon name="archive" size={12} />
+              </button>
+            </>
+          )}
           <button title="Delete chat" onClick={e => { e.stopPropagation(); deleteSession(s.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}>
-            <Icon name="x" size={12} stroke={2.4} />
+            <Icon name="trash" size={12} />
           </button>
         </span>
       </div>
@@ -492,6 +525,8 @@ export default function Workspace() {
                           <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
                           {p.path && <button className="ws-ovf-item" onClick={() => { setMenuProj(null); void api.revealPath(p.path!); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="folder" size={15} style={{ color: 'var(--ink-secondary)' }} /> Reveal in Finder</button>}
                           <button className="ws-ovf-item" onClick={() => { setMenuProj(null); navigate('/skills-registry'); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="spark" size={15} style={{ color: 'var(--ink-secondary)' }} /> Skills</button>
+                          <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
+                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); setConfirmDelProj(p.id); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--red, #ff3b30)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="trash" size={15} /> Delete project</button>
                         </div>
                       </>
                     )}
@@ -510,6 +545,21 @@ export default function Workspace() {
                           {chatsAllOpen.has(p.id) ? 'Show less' : `Show all ${chats.length} chats`}
                         </button>
                       )}
+                      {(() => {
+                        const arch = archivedByProject(p.id);
+                        if (arch.length === 0) return null;
+                        const aOpen = archivedOpen.has(p.id) || !!q;
+                        return (
+                          <>
+                            <button onClick={() => setArchivedOpen(prev => { const n = new Set(prev); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
+                              style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px 4px 22px', borderRadius: 8, color: 'var(--ink-tertiary)', font: '600 var(--fs-caption)/1.3 var(--font-text)', cursor: 'pointer' }}>
+                              <Icon name="chevronRight" size={11} style={{ transform: aOpen ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
+                              <Icon name="archive" size={11} /> Archived <span style={{ opacity: 0.7, fontFamily: 'var(--font-mono)' }}>{arch.length}</span>
+                            </button>
+                            {aOpen && arch.map(s => <SessionRow key={s.id} s={s} indent={26} />)}
+                          </>
+                        );
+                      })()}
                     </div>
                   )}
                 </div>
@@ -633,6 +683,33 @@ export default function Workspace() {
           </div>
         </div>
       </div>
+
+      {confirmDelProj && (() => {
+        const p = projById[confirmDelProj];
+        const chatCount = sessions.filter(s => s.projectId === confirmDelProj).length;
+        return (
+          <div onClick={() => setConfirmDelProj(null)} style={{ position: 'fixed', inset: 0, zIndex: 200, background: 'rgba(8,10,30,0.34)', backdropFilter: 'blur(2px)', display: 'grid', placeItems: 'center', padding: 20 }}>
+            <div onClick={e => e.stopPropagation()} role="dialog" aria-modal="true" style={{ width: 'min(420px, 100%)', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 16, boxShadow: 'var(--shadow-lg, 0 24px 70px rgba(15,20,60,0.32))', padding: 22 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+                <span style={{ width: 40, height: 40, borderRadius: 11, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--red, #ff3b30) 14%, transparent)', color: 'var(--red, #ff3b30)' }}>
+                  <Icon name="trash" size={20} />
+                </span>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ font: '700 var(--fs-headline)/1.2 var(--font-display)', color: 'var(--ink)' }}>Delete project?</div>
+                  <div style={{ font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p?.name ?? 'This project'}</div>
+                </div>
+              </div>
+              <p style={{ margin: '0 0 18px', font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                This removes the project{chatCount > 0 ? ` and its ${chatCount} chat${chatCount !== 1 ? 's' : ''}` : ''} from Maestro. {p?.path ? 'The folder on disk is left untouched.' : ''} This can’t be undone.
+              </p>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+                <button onClick={() => setConfirmDelProj(null)} style={{ height: 36, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Cancel</button>
+                <button onClick={() => deleteProject(confirmDelProj)} style={{ height: 36, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--red, #ff3b30)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Delete project</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </AppShell>
   );
 }
