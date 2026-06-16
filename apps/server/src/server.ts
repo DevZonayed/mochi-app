@@ -314,6 +314,7 @@ export function buildServer(): FastifyInstance {
   app.post('/api/projects', async (req, reply) => forward(reply, 'createProject', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/projects/:id/update', async (req, reply) =>
     forward(reply, 'updateProject', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
+  app.post('/api/projects/reorder', async (req, reply) => forward(reply, 'reorderProjects', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/projects/clone', async (req, reply) => forward(reply, 'cloneRepo', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/projects/:id/delete', async (req, reply) => forward(reply, 'deleteProject', { id: (req.params as { id: string }).id }));
   app.post('/api/chat', async (req, reply) => forward(reply, 'sendChat', (req.body ?? {}) as Record<string, unknown>));
