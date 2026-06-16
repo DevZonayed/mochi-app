@@ -861,6 +861,16 @@ export const api = {
     call<{ ok: boolean }>('disconnectProvider', { provider, workspaceId }, () =>
       req<{ ok: boolean }>(`/api/providers/${provider}/disconnect`, { method: 'POST', body: JSON.stringify({ workspaceId }) })),
 
+  // Codex ChatGPT OAuth via the bundled CLI — desktop-only (drives a local binary
+  // + system browser, so there is no relay fallback).
+  codexLogin: () => call<{ ok: boolean; method: string }>('codexLogin', {}, () => {
+    throw new ApiError(501, 'Signing into Codex is only available in the desktop app.');
+  }),
+  codexLoginCancel: () => call<{ ok: boolean }>('codexLoginCancel', {}, () => Promise.resolve({ ok: true })),
+  codexLogout: () => call<{ ok: boolean }>('codexLogout', {}, () => {
+    throw new ApiError(501, 'Signing out of Codex is only available in the desktop app.');
+  }),
+
   // GitHub connection + per-session PR lifecycle (desktop-only on the relay).
   githubStatus: () => call<GithubConnection>('githubStatus', {}, () => req<GithubConnection>('/api/github/status')),
   importGithubFromCli: () => call<ProviderConn>('importGithubFromCli', {}, () => req<ProviderConn>('/api/github/import-cli', { method: 'POST' })),
