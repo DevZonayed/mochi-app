@@ -12,6 +12,9 @@ import type { BrowserController } from './browser.js';
 import type { TelegramBot } from './telegram.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
+import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
+import { githubConnectionStatus, ghCliToken } from './github-auth.js';
+import type { GitService } from './git-service.js';
 import { listChromeProfiles } from './chrome-profiles.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
@@ -47,7 +50,7 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', browser?: BrowserController) {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', browser?: BrowserController, gitService?: GitService) {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -254,6 +257,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return s;
       }
       case 'deleteSession': {
+        const s = store.getSession(String(p.id ?? ''));
+        if (s?.worktreePath) {
+          const proj = store.getProject(s.projectId);
+          if (proj?.path) {
+            try { pruneSessionWorktree({ repoDir: proj.path, worktreeRoot: worktreeRootDir(), projectId: proj.id, sessionId: s.id, branch: s.branch, deleteBranch: false }); } catch { /* best effort */ }
+          }
+        }
         store.deleteSession(String(p.id ?? ''));
         emit('session', { id: String(p.id ?? ''), deleted: true });
         return { ok: true };
@@ -267,6 +277,57 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const s = store.setSessionArchived(String(p.id ?? ''), p.archived === true);
         emit('session', s);
         return s;
+      }
+      // Worktree archive (Conductor PR lifecycle): prune this session's git worktree.
+      case 'archiveSessionWorktree': {
+        const s = store.getSession(String(p.sessionId ?? p.id ?? ''));
+        if (!s) return bad('session not found', 404);
+        const proj = store.getProject(s.projectId);
+        if (proj?.path && s.worktreePath) {
+          try { pruneSessionWorktree({ repoDir: proj.path, worktreeRoot: worktreeRootDir(), projectId: proj.id, sessionId: s.id, branch: s.branch, deleteBranch: p.deleteBranch === true }); } catch { /* best effort */ }
+        }
+        const updated = store.updateSession(s.id, { archivedAt: Date.now(), worktreePath: undefined });
+        emit('session', updated);
+        return updated;
+      }
+      // Per-session git/PR status (local facts + live PR). Emits a git-status event too.
+      case 'getSessionGitStatus': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? ''));
+        if (!s) return bad('session not found', 404);
+        return gitService.fullStatus(s, { withPr: p.withPr !== false });
+      }
+      case 'refreshSessionGitStatus': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? ''));
+        if (!s) return bad('session not found', 404);
+        return gitService.fullStatus(s, { withPr: true });
+      }
+      // ── PR actions (DESKTOP-ONLY, outward — UI confirms before calling) ─
+      case 'pushSession': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.pushSession(s);
+      }
+      case 'createSessionPR': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.createPr(s, {
+          title: typeof p.title === 'string' ? p.title : undefined,
+          body: typeof p.body === 'string' ? p.body : undefined,
+          base: typeof p.base === 'string' ? p.base : undefined,
+        });
+      }
+      case 'mergeSessionPR': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        const method = p.method === 'merge' || p.method === 'squash' || p.method === 'rebase' ? p.method : undefined;
+        return gitService.mergePr(s, { method });
+      }
+      case 'resolveSession': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.resolveSession(s);
       }
 
       // ── Conversation sync (import Claude/Codex/Conductor history) ──────────
@@ -580,6 +641,14 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal' && prov !== 'github') bad('unsupported provider');
         providers.disconnect(prov as ProviderId);
         return { ok: true };
+      }
+      // Live GitHub connection status (login + scopes + repo-scope capability).
+      case 'githubStatus': return githubConnectionStatus(providers.getLocalKey('github'));
+      // One-click connect by importing a token from an authenticated `gh` CLI.
+      case 'importGithubFromCli': {
+        const token = ghCliToken();
+        if (!token) bad('gh CLI is not authenticated — run `gh auth login`, or paste a token', 400);
+        return providers.connect('github', token as string);
       }
 
       // ── Media Studio (real fal generation) ─────────────────────

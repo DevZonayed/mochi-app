@@ -4,8 +4,8 @@
    progress streams back so the UI can show it live. */
 
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdirSync, rmSync, readdirSync, statSync, copyFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 
 let gitPath: string | null | undefined;
@@ -185,4 +185,203 @@ export function repoInfoAsync(dir: string): Promise<RepoInfo> {
       });
     });
   });
+}
+
+/* ── Worktree primitives (Conductor-style per-session isolation) ─────── */
+
+/** Run git, returning stdout (or stderr on failure) + the exit code. Never throws. */
+function execGit(args: string[], opts: { timeout?: number } = {}): { ok: boolean; out: string; code: number } {
+  const git = resolveGit();
+  if (!git) return { ok: false, out: '', code: 127 };
+  try {
+    const out = execFileSync(git, args, { encoding: 'utf8', timeout: opts.timeout ?? 15_000 }).toString().trim();
+    return { ok: true, out, code: 0 };
+  } catch (e) {
+    const err = e as { status?: number; stderr?: Buffer | string };
+    const stderr = err.stderr == null ? '' : typeof err.stderr === 'string' ? err.stderr : err.stderr.toString();
+    return { ok: false, out: stderr.trim(), code: err.status ?? 1 };
+  }
+}
+
+/** The branch new worktrees fork from: origin/HEAD → current branch → 'main'. */
+export function resolveBaseBranch(repoDir: string): string {
+  const head = execGit(['-C', repoDir, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+  if (head.ok && head.out) return head.out.replace(/^origin\//, '');
+  const cur = execGit(['-C', repoDir, 'rev-parse', '--abbrev-ref', 'HEAD']);
+  if (cur.ok && cur.out && cur.out !== 'HEAD') return cur.out;
+  return 'main';
+}
+
+export interface WorktreeEntry { path: string; branch: string | null; head: string }
+
+/** All registered worktrees of a repo (parsed from `worktree list --porcelain`). */
+export function listWorktrees(repoDir: string): WorktreeEntry[] {
+  const r = execGit(['-C', repoDir, 'worktree', 'list', '--porcelain']);
+  if (!r.ok) return [];
+  const out: WorktreeEntry[] = [];
+  let cur: Partial<WorktreeEntry> = {};
+  const flush = () => { if (cur.path) out.push({ path: cur.path, branch: cur.branch ?? null, head: cur.head ?? '' }); };
+  for (const line of r.out.split('\n')) {
+    if (line.startsWith('worktree ')) { flush(); cur = { path: line.slice('worktree '.length) }; }
+    else if (line.startsWith('HEAD ')) cur.head = line.slice('HEAD '.length);
+    else if (line.startsWith('branch ')) cur.branch = line.slice('branch '.length).replace(/^refs\/heads\//, '');
+    else if (line === 'detached') cur.branch = null;
+  }
+  flush();
+  return out;
+}
+
+/** Add a worktree for `branch` (created from `base` if it doesn't exist yet). */
+export function addWorktree(repoDir: string, wtPath: string, branch: string, base: string): { ok: boolean; path: string; reason?: string } {
+  const branchExists = execGit(['-C', repoDir, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]).code === 0;
+  const args = branchExists
+    ? ['-C', repoDir, 'worktree', 'add', wtPath, branch]
+    : ['-C', repoDir, 'worktree', 'add', '-b', branch, wtPath, base];
+  const r = execGit(args, { timeout: 60_000 });
+  return r.ok ? { ok: true, path: wtPath } : { ok: false, path: wtPath, reason: r.out.slice(0, 300) };
+}
+
+/** Remove a worktree (force) + prune stale admin dirs; optionally delete its branch. */
+export function removeWorktree(repoDir: string, wtPath: string, opts: { deleteBranch?: string } = {}): { ok: boolean; reason?: string } {
+  const rm = execGit(['-C', repoDir, 'worktree', 'remove', '--force', wtPath]);
+  execGit(['-C', repoDir, 'worktree', 'prune']);
+  if (opts.deleteBranch) execGit(['-C', repoDir, 'branch', '-D', opts.deleteBranch]);
+  if (!rm.ok && existsSync(wtPath)) return { ok: false, reason: rm.out.slice(0, 300) };
+  return { ok: true };
+}
+
+/** Copy gitignored files (e.g. `.env*`, `config/*.local.json`) from a repo into a
+    worktree. The last path segment may contain `*`. Best-effort; never throws. */
+export function copyGlobsInto(srcRepo: string, wtPath: string, globs: string[]): void {
+  for (const glob of globs) {
+    const norm = glob.replace(/^\.\//, '');
+    const slash = norm.lastIndexOf('/');
+    const dir = slash >= 0 ? norm.slice(0, slash) : '.';
+    const pat = slash >= 0 ? norm.slice(slash + 1) : norm;
+    const srcDir = path.join(srcRepo, dir);
+    if (!existsSync(srcDir)) continue;
+    const re = new RegExp('^' + pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
+    let entries: string[] = [];
+    try { entries = readdirSync(srcDir); } catch { continue; }
+    for (const name of entries) {
+      if (!re.test(name)) continue;
+      const from = path.join(srcDir, name);
+      const to = path.join(wtPath, dir, name);
+      try {
+        if (!statSync(from).isFile()) continue;
+        mkdirSync(path.dirname(to), { recursive: true });
+        copyFileSync(from, to);
+      } catch { /* best effort */ }
+    }
+  }
+}
+
+/** Resolve symlinks (e.g. macOS /var → /private/var) so paths compare equal to
+    what `git worktree list` reports. Falls back to a plain resolve if the path
+    no longer exists. */
+function canonicalPath(p: string): string {
+  try { return realpathSync(p); } catch { return path.resolve(p); }
+}
+
+/** Whether `wtPath` is already a registered worktree of `repoDir` (symlink-safe). */
+export function worktreeExists(repoDir: string, wtPath: string): boolean {
+  const target = canonicalPath(wtPath);
+  return listWorktrees(repoDir).some(w => canonicalPath(w.path) === target);
+}
+
+/** Best-effort `git fetch origin`. No-op (ok:false) when there's no origin remote. */
+export function fetchOrigin(repoDir: string): { ok: boolean; reason?: string } {
+  const remotes = execGit(['-C', repoDir, 'remote']);
+  if (!remotes.ok || !remotes.out.split(/\s+/).includes('origin')) return { ok: false, reason: 'no origin remote' };
+  const r = execGit(['-C', repoDir, 'fetch', '--prune', 'origin'], { timeout: 60_000 });
+  return r.ok ? { ok: true } : { ok: false, reason: r.out.slice(0, 200) };
+}
+
+/* ── PR-availability + push (Phase 2) ─────────────────────────────────── */
+
+/** Commits the branch is ahead/behind `base` (`rev-list --left-right --count base...HEAD`). */
+export function aheadBehind(dir: string, base: string): { ahead: number; behind: number } {
+  const r = execGit(['-C', dir, 'rev-list', '--left-right', '--count', `${base}...HEAD`]);
+  if (!r.ok) return { ahead: 0, behind: 0 };
+  const [left, right] = r.out.split(/\s+/);
+  const behind = Number(left); // commits in base not HEAD
+  const ahead = Number(right); // commits in HEAD not base
+  return { ahead: Number.isFinite(ahead) ? ahead : 0, behind: Number.isFinite(behind) ? behind : 0 };
+}
+
+/** Whether the working tree has uncommitted changes. */
+export function isDirty(dir: string): boolean {
+  const r = execGit(['-C', dir, 'status', '--porcelain']);
+  return r.ok && r.out.length > 0;
+}
+
+/** Whether `remote` has `branch` (via ls-remote; works for file:// remotes in tests). */
+export function remoteHasBranch(repoDir: string, remote: string, branch: string): boolean {
+  const r = execGit(['-C', repoDir, 'ls-remote', '--heads', remote, branch], { timeout: 30_000 });
+  return r.ok && r.out.split('\n').some(l => l.trim().endsWith(`refs/heads/${branch}`));
+}
+
+/** Best-effort: set origin/HEAD so resolveBaseBranch can find the default branch. */
+export function setRemoteHead(repoDir: string): void {
+  execGit(['-C', repoDir, 'remote', 'set-head', 'origin', '-a']);
+}
+
+/** Askpass script body: feeds git the username + token over HTTPS without putting
+    the token in argv or repo config. Reads the secret from $GIT_TOKEN at runtime. */
+export function buildAskpassScript(): string {
+  return [
+    '#!/bin/sh',
+    'case "$1" in',
+    '  *Username*) echo "x-access-token" ;;',
+    '  *Password*) echo "$GIT_TOKEN" ;;',
+    'esac',
+    '',
+  ].join('\n');
+}
+
+/** Push `branch` to `remote` and set upstream. With a token, authenticates over
+    HTTPS via a temporary GIT_ASKPASS (token in env, never in argv/config). */
+export function pushBranch(dir: string, branch: string, opts: { token?: string; remote?: string } = {}): { ok: boolean; reason?: string } {
+  const git = resolveGit();
+  if (!git) return { ok: false, reason: 'git is not installed' };
+  const remote = opts.remote ?? 'origin';
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  let askpass: string | undefined;
+  try {
+    if (opts.token) {
+      askpass = path.join(tmpdir(), `mst-askpass-${process.pid}-${Date.now()}.sh`);
+      writeFileSync(askpass, buildAskpassScript(), { mode: 0o700 });
+      env.GIT_ASKPASS = askpass;
+      env.GIT_TOKEN = opts.token;
+    }
+    execFileSync(git, ['-C', dir, 'push', '--set-upstream', remote, branch], { encoding: 'utf8', env, timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
+    return { ok: true };
+  } catch (e) {
+    const err = e as { stderr?: Buffer | string; message?: string };
+    const stderr = err.stderr == null ? (err.message ?? '') : typeof err.stderr === 'string' ? err.stderr : err.stderr.toString();
+    const low = stderr.toLowerCase();
+    let reason = stderr.trim().split('\n').pop() || 'push failed';
+    if (low.includes('non-fast-forward') || low.includes('rejected')) reason = 'remote branch has diverged (non-fast-forward) — update or force-with-lease';
+    else if (low.includes('authentication') || low.includes('could not read') || low.includes('403') || low.includes('permission')) reason = 'push authentication failed — reconnect GitHub';
+    return { ok: false, reason: reason.slice(0, 300) };
+  } finally {
+    if (askpass) { try { rmSync(askpass, { force: true }); } catch { /* ignore */ } }
+  }
+}
+
+/** Whether a ref (e.g. `origin/feat`) exists locally. Cheap, no network. */
+export function localRefExists(dir: string, ref: string): boolean {
+  return execGit(['-C', dir, 'rev-parse', '--verify', '--quiet', ref]).code === 0;
+}
+
+/** Merge `base` (preferring origin/<base>) into the current branch in `dir`. A
+    clean merge auto-commits; on conflict, returns the conflicted file paths and
+    leaves the merge in progress so an agent/operator can resolve them. */
+export function mergeBaseIntoBranch(dir: string, base: string): { ok: boolean; conflicts: string[]; reason?: string } {
+  const ref = localRefExists(dir, `origin/${base}`) ? `origin/${base}` : base;
+  const m = execGit(['-C', dir, 'merge', '--no-edit', ref], { timeout: 60_000 });
+  if (m.ok) return { ok: true, conflicts: [] };
+  const conf = execGit(['-C', dir, 'diff', '--name-only', '--diff-filter=U']);
+  const conflicts = conf.ok ? conf.out.split('\n').filter(Boolean) : [];
+  return conflicts.length ? { ok: false, conflicts } : { ok: false, conflicts: [], reason: m.out.slice(0, 200) };
 }

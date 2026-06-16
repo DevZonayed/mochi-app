@@ -16,13 +16,14 @@ import { existsSync, mkdirSync, readFileSync, rmSync, readdirSync, statSync, lst
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
-import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice } from './store.js';
+import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice, ChatSession } from './store.js';
 import type { PublishingEngine } from './publishing.js';
 import type { BrowserController } from './browser.js';
 import type { BrowserBridge } from './browser-bridge.js';
 import { assetsDirFor } from './media.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
-import { ensureBranch, branchSlug } from './git.js';
+import { branchSlug, isGitRepo } from './git.js';
+import { ensureSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
 import type { Providers } from './providers.js';
@@ -1320,20 +1321,37 @@ export class LocalEngine {
       let effort = opts.effort ?? cur.effort;
       if (goalMode && (effort === 'fast' || effort === 'balanced')) effort = 'deep'; // goal mode wants depth
       if (goalMode) { cur = this.store.updateJob(jobId, { goal: true }); this.emit('job', cur); } // record + surface goal mode on the turn
-      const cwd = workDirFor(project);
+      let cwd = workDirFor(project);
       const anthropicKey = this.status(master).method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined;
 
       // Chat turns: keep the conversation. Claude resumes its own SDK session
       // (full context incl. tool use); codex gets recent turns stitched in.
       const session = cur.sessionId ? this.store.getSession(cur.sessionId) : undefined;
       const isChat = !!session;
-      // SP4 — branch-per-chat: isolate each chat on its own git branch
-      // (Conductor-style). Best-effort; if the repo is dirty or not a git repo,
-      // the chat just runs on the current branch.
-      if (session && project?.path) {
-        const want = session.branch ?? `mochi/${branchSlug(session.title)}-${session.id.slice(0, 4)}`;
-        const res = ensureBranch(cwd, want);
-        if (res.ok && session.branch !== want) { try { this.store.updateSession(session.id, { branch: want }); } catch { /* gone */ } }
+      // Per-session worktree isolation (Conductor-style): each chat runs in its
+      // OWN git worktree dir, so sessions are isolated and can run in parallel.
+      // Best-effort — non-repo / failure falls back to the project folder.
+      if (session && project?.path && isGitRepo(project.path)) {
+        const branch = session.branch ?? `mochi/${branchSlug(session.title)}-${session.id.slice(0, 4)}`;
+        const res = ensureSessionWorktree({
+          repoDir: project.path,
+          worktreeRoot: worktreeRootDir(),
+          projectId: project.id,
+          sessionId: session.id,
+          branch,
+          base: session.baseBranch,
+          copyGlobs: project.copyGlobs,
+          setupScript: project.setupScript,
+          fetch: true,
+        });
+        if (res.ok) {
+          cwd = res.cwd;
+          const patch: Partial<Pick<ChatSession, 'branch' | 'worktreePath' | 'baseBranch'>> = {};
+          if (session.branch !== branch) patch.branch = branch;
+          if (session.worktreePath !== res.cwd) patch.worktreePath = res.cwd;
+          if (res.base && session.baseBranch !== res.base) patch.baseBranch = res.base;
+          if (Object.keys(patch).length) { try { this.store.updateSession(session.id, patch); } catch { /* gone */ } }
+        }
       }
       const resumeId = isChat && master === 'claude' ? session.sdkSessionId : undefined;
       const base = project?.instructions ? `${project.instructions}\n\n---\n\n` : '';

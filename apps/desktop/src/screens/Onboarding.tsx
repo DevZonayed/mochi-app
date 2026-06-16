@@ -260,7 +260,7 @@ function WorkspaceStep({ value, onChange }: WorkspaceStepProps) {
 }
 
 // ── Step 3: Connect providers
-type ProviderKey = 'anthropic' | 'openai';
+type ProviderKey = 'anthropic' | 'openai' | 'github';
 type ProviderState = 'idle' | 'waiting' | 'connected' | 'error';
 
 interface ProvidersStepProps {
@@ -275,6 +275,7 @@ function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect }: Prov
   const rows: { key: ProviderKey; name: string; meta: string; glyph: React.ReactNode; brand: string; hint: string }[] = [
     { key: 'anthropic', name: 'Anthropic', meta: 'Claude · coding & reasoning', glyph: <AnthropicGlyph size={24} />, brand: '#D97757', hint: 'sk-ant-…' },
     { key: 'openai', name: 'OpenAI', meta: 'GPT · media & vision', glyph: <OpenAIGlyph size={22} />, brand: 'var(--ink)', hint: 'sk-…' },
+    { key: 'github', name: 'GitHub', meta: 'Repos · PRs & push (required)', glyph: <span style={{ font: '700 18px/1 var(--font-text)', color: 'var(--ink)' }}>G</span>, brand: 'var(--ink)', hint: 'ghp_… (repo scope)' },
   ];
   return (
     <div>
@@ -542,9 +543,9 @@ export default function Onboarding() {
   const [phase, setPhase] = React.useState<Phase>('card');
 
   const [workspace, setWorkspace] = React.useState('');
-  const [providers, setProviders] = React.useState<Record<ProviderKey, ProviderState>>({ anthropic: 'idle', openai: 'idle' });
-  const [keys, setKeys] = React.useState<Record<ProviderKey, string>>({ anthropic: '', openai: '' });
-  const [providerErrors, setProviderErrors] = React.useState<Record<ProviderKey, string>>({ anthropic: '', openai: '' });
+  const [providers, setProviders] = React.useState<Record<ProviderKey, ProviderState>>({ anthropic: 'idle', openai: 'idle', github: 'idle' });
+  const [keys, setKeys] = React.useState<Record<ProviderKey, string>>({ anthropic: '', openai: '', github: '' });
+  const [providerErrors, setProviderErrors] = React.useState<Record<ProviderKey, string>>({ anthropic: '', openai: '', github: '' });
   const [budget, setBudget] = React.useState(200);
   const [secondsLeft, setSecondsLeft] = React.useState(120);
   const openaiTries = React.useRef(0);
@@ -561,7 +562,7 @@ export default function Onboarding() {
         setProviders(prev => {
           const next = { ...prev };
           for (const c of conns) {
-            if (c.provider === 'anthropic' || c.provider === 'openai') next[c.provider] = 'connected';
+            if (c.provider === 'anthropic' || c.provider === 'openai' || c.provider === 'github') next[c.provider] = 'connected';
           }
           return next;
         });
@@ -614,11 +615,11 @@ export default function Onboarding() {
   };
   const restart = () => {
     setPhase('card'); setStep(0); setMaxVisited(0); setWorkspace('');
-    setProviders({ anthropic: 'idle', openai: 'idle' }); setBudget(200);
+    setProviders({ anthropic: 'idle', openai: 'idle', github: 'idle' }); setBudget(200);
     openaiTries.current = 0;
   };
 
-  const canContinue = [true, workspace.trim().length > 0, true, true, true][step];
+  const canContinue = [true, workspace.trim().length > 0, providers.github === 'connected', true, true][step];
 
   const steps: React.ReactNode[] = [
     <WelcomeStep />,
