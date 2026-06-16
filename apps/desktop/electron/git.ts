@@ -4,7 +4,7 @@
    progress streams back so the UI can show it live. */
 
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, readdirSync, statSync, copyFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -185,4 +185,29 @@ export function repoInfoAsync(dir: string): Promise<RepoInfo> {
       });
     });
   });
+}
+
+/* ── Worktree primitives (Conductor-style per-session isolation) ─────── */
+
+/** Run git, returning stdout (or stderr on failure) + the exit code. Never throws. */
+function execGit(args: string[], opts: { timeout?: number } = {}): { ok: boolean; out: string; code: number } {
+  const git = resolveGit();
+  if (!git) return { ok: false, out: '', code: 127 };
+  try {
+    const out = execFileSync(git, args, { encoding: 'utf8', timeout: opts.timeout ?? 15_000 }).toString().trim();
+    return { ok: true, out, code: 0 };
+  } catch (e) {
+    const err = e as { status?: number; stderr?: Buffer | string };
+    const stderr = err.stderr == null ? '' : typeof err.stderr === 'string' ? err.stderr : err.stderr.toString();
+    return { ok: false, out: stderr.trim(), code: err.status ?? 1 };
+  }
+}
+
+/** The branch new worktrees fork from: origin/HEAD → current branch → 'main'. */
+export function resolveBaseBranch(repoDir: string): string {
+  const head = execGit(['-C', repoDir, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+  if (head.ok && head.out) return head.out.replace(/^origin\//, '');
+  const cur = execGit(['-C', repoDir, 'rev-parse', '--abbrev-ref', 'HEAD']);
+  if (cur.ok && cur.out && cur.out !== 'HEAD') return cur.out;
+  return 'main';
 }
