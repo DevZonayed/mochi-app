@@ -302,6 +302,13 @@ app.whenReady().then(() => {
   const browserBridge = new BrowserBridge(browser, store);
   browserBridge.start();
   engine.setBrowserBridge(browserBridge);
+  // Give codex the SAME background-task manager Claude uses (engine owns the processes).
+  browserBridge.setBg({
+    start: (o) => engine.bgStart(o),
+    output: (id, tailKB) => engine.bgOutput(id, tailKB),
+    list: (pid) => engine.bgList(pid),
+    stop: (id) => engine.bgStop(id),
+  });
   engine.setImageGen(async (prompt, opts) => {
     // Edit mode: a source image is supplied → keep that image and apply `prompt`
     // as the change ("add a balloon in the sky"). Otherwise generate fresh.
@@ -390,7 +397,7 @@ app.whenReady().then(() => {
   // Auto-update (electron-updater → GitHub Releases). Desktop-only: its events
   // never cross the relay. Polling starts after the window exists (see below).
   const updater = new Updater(emit);
-  app.on('before-quit', () => { cron.stop(); relay?.stop(); telegram?.stop(); browserBridge.stop(); updater.stop(); void browser.dispose(); });
+  app.on('before-quit', () => { cron.stop(); relay?.stop(); telegram?.stop(); browserBridge.stop(); updater.stop(); engine.bgStopAll(); void browser.dispose(); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {
