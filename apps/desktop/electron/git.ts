@@ -288,3 +288,11 @@ export function worktreeExists(repoDir: string, wtPath: string): boolean {
   const target = canonicalPath(wtPath);
   return listWorktrees(repoDir).some(w => canonicalPath(w.path) === target);
 }
+
+/** Best-effort `git fetch origin`. No-op (ok:false) when there's no origin remote. */
+export function fetchOrigin(repoDir: string): { ok: boolean; reason?: string } {
+  const remotes = execGit(['-C', repoDir, 'remote']);
+  if (!remotes.ok || !remotes.out.split(/\s+/).includes('origin')) return { ok: false, reason: 'no origin remote' };
+  const r = execGit(['-C', repoDir, 'fetch', '--prune', 'origin'], { timeout: 60_000 });
+  return r.ok ? { ok: true } : { ok: false, reason: r.out.slice(0, 200) };
+}
