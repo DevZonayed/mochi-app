@@ -31,6 +31,14 @@ files:
   - package.json
   - '!**/*.map'
 
+# We bundle our own Codex CLI (`@openai/codex` + its per-platform native binary
+# in `@openai/codex-<platform>-<arch>`). The binary must live on the real
+# filesystem — a file inside app.asar can't be exec()'d — so unpack it. Electron
+# transparently rewrites the require.resolve/spawn path to app.asar.unpacked.
+asarUnpack:
+  - node_modules/@openai/codex/**
+  - node_modules/@openai/codex-*/**
+
 publish:
   provider: github
   owner: DevZonayed

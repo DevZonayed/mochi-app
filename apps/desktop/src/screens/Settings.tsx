@@ -17,7 +17,7 @@ import {
   type Theme, type Purpose,
 } from '../lib/appShell';
 import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ChromeProfile, type UpdateStatus, IS_LOCAL } from '../lib/api';
-import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
+import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
 import { WhatsNew } from '../lib/WhatsNew';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
@@ -442,10 +442,29 @@ function AccountsPane() {
   const [errors, setErrors] = React.useState<Record<string, string>>({ anthropic: '', openai: '', fal: '' });
   const [busy, setBusy] = React.useState<Record<string, boolean>>({ anthropic: false, openai: false, fal: false });
 
+  // Codex ChatGPT OAuth (desktop-only): drives the bundled CLI + system browser.
+  const [codexBusy, setCodexBusy] = React.useState(false);
+
   const refetch = React.useCallback(() => { api.listProviders().then(setConns).catch(() => {}); }, []);
   React.useEffect(() => { refetch(); }, [refetch]);
 
   const connOf = (id: ProviderId) => conns.find(c => c.provider === id);
+
+  const codexLogin = async () => {
+    setCodexBusy(true); setErrors(e => ({ ...e, openai: '' }));
+    try {
+      await api.codexLogin();          // resolves once the browser OAuth completes
+      refetch(); refreshModelGroups();  // both Settings + the model picker update
+    } catch (err) {
+      setErrors(e => ({ ...e, openai: err instanceof ApiError ? err.message : 'Sign-in failed' }));
+    } finally {
+      setCodexBusy(false);
+    }
+  };
+  const codexLogout = async () => {
+    setCodexBusy(true);
+    try { await api.codexLogout(); refetch(); refreshModelGroups(); } catch { /* ignore */ } finally { setCodexBusy(false); }
+  };
 
   const connect = async (id: ProviderId) => {
     const key = (keys[id] || '').trim();
@@ -473,6 +492,15 @@ function AccountsPane() {
         {REAL_PROVIDERS.map((p, i) => {
           const c = connOf(p.id);
           const connected = !!c;
+          const isOpenai = p.id === 'openai';
+          // Codex ChatGPT OAuth button — available whether or not already signed
+          // in (first sign-in, re-auth, or switch from an API key to a login).
+          const chatgptBtn = isOpenai ? (
+            <button key="chatgpt" onClick={codexLogin} disabled={codexBusy} className="ghost-btn"
+              style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: c?.method === 'subscription' ? 'var(--fill-secondary)' : 'var(--blue)', color: c?.method === 'subscription' ? 'var(--ink)' : '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', whiteSpace: 'nowrap', opacity: codexBusy ? 0.6 : 1 }}>
+              {codexBusy ? 'Signing in…' : c?.method === 'subscription' ? 'Re-authenticate' : 'Sign in with ChatGPT'}
+            </button>
+          ) : null;
           return (
             <Row key={p.id} last={i === REAL_PROVIDERS.length - 1}>
               <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${p.tint} 15%, transparent)`, color: p.tint, font: '800 var(--fs-callout)/1 var(--font-display)' }}>{p.glyph}</span>
@@ -483,13 +511,23 @@ function AccountsPane() {
                 </span>
               </span>
               {connected ? (
-                <span style={{ flex: 1, display: 'flex', justifyContent: 'flex-end' }}>
-                  {c?.method === 'subscription'
-                    ? <span style={{ height: 32, display: 'inline-flex', alignItems: 'center', padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'rgba(52,199,89,0.12)', color: 'var(--green)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Signed in</span>
-                    : <button onClick={() => disconnect(p.id)} disabled={busy[p.id]} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{busy[p.id] ? '…' : 'Disconnect'}</button>}
+                <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                  {c?.method === 'subscription' ? (
+                    <>
+                      <span style={{ height: 32, display: 'inline-flex', alignItems: 'center', padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'rgba(52,199,89,0.12)', color: 'var(--green)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Signed in</span>
+                      {isOpenai && chatgptBtn}
+                      {isOpenai && <button onClick={codexLogout} disabled={codexBusy} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: codexBusy ? 0.6 : 1 }}>Sign out</button>}
+                    </>
+                  ) : (
+                    <>
+                      {isOpenai && chatgptBtn}
+                      <button onClick={() => disconnect(p.id)} disabled={busy[p.id]} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{busy[p.id] ? '…' : 'Disconnect'}</button>
+                    </>
+                  )}
                 </span>
               ) : (
-                <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' }}>
+                <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                  {isOpenai && chatgptBtn}
                   <input type="password" value={keys[p.id] || ''} placeholder={p.hint}
                     onChange={(e: React.ChangeEvent<HTMLInputElement>) => setKeys(k => ({ ...k, [p.id]: e.target.value }))}
                     onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') connect(p.id); }}
