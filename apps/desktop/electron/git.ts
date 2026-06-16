@@ -4,7 +4,7 @@
    progress streams back so the UI can show it live. */
 
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, readdirSync, statSync, copyFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, readdirSync, statSync, copyFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -210,4 +210,81 @@ export function resolveBaseBranch(repoDir: string): string {
   const cur = execGit(['-C', repoDir, 'rev-parse', '--abbrev-ref', 'HEAD']);
   if (cur.ok && cur.out && cur.out !== 'HEAD') return cur.out;
   return 'main';
+}
+
+export interface WorktreeEntry { path: string; branch: string | null; head: string }
+
+/** All registered worktrees of a repo (parsed from `worktree list --porcelain`). */
+export function listWorktrees(repoDir: string): WorktreeEntry[] {
+  const r = execGit(['-C', repoDir, 'worktree', 'list', '--porcelain']);
+  if (!r.ok) return [];
+  const out: WorktreeEntry[] = [];
+  let cur: Partial<WorktreeEntry> = {};
+  const flush = () => { if (cur.path) out.push({ path: cur.path, branch: cur.branch ?? null, head: cur.head ?? '' }); };
+  for (const line of r.out.split('\n')) {
+    if (line.startsWith('worktree ')) { flush(); cur = { path: line.slice('worktree '.length) }; }
+    else if (line.startsWith('HEAD ')) cur.head = line.slice('HEAD '.length);
+    else if (line.startsWith('branch ')) cur.branch = line.slice('branch '.length).replace(/^refs\/heads\//, '');
+    else if (line === 'detached') cur.branch = null;
+  }
+  flush();
+  return out;
+}
+
+/** Add a worktree for `branch` (created from `base` if it doesn't exist yet). */
+export function addWorktree(repoDir: string, wtPath: string, branch: string, base: string): { ok: boolean; path: string; reason?: string } {
+  const branchExists = execGit(['-C', repoDir, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]).code === 0;
+  const args = branchExists
+    ? ['-C', repoDir, 'worktree', 'add', wtPath, branch]
+    : ['-C', repoDir, 'worktree', 'add', '-b', branch, wtPath, base];
+  const r = execGit(args, { timeout: 60_000 });
+  return r.ok ? { ok: true, path: wtPath } : { ok: false, path: wtPath, reason: r.out.slice(0, 300) };
+}
+
+/** Remove a worktree (force) + prune stale admin dirs; optionally delete its branch. */
+export function removeWorktree(repoDir: string, wtPath: string, opts: { deleteBranch?: string } = {}): { ok: boolean; reason?: string } {
+  const rm = execGit(['-C', repoDir, 'worktree', 'remove', '--force', wtPath]);
+  execGit(['-C', repoDir, 'worktree', 'prune']);
+  if (opts.deleteBranch) execGit(['-C', repoDir, 'branch', '-D', opts.deleteBranch]);
+  if (!rm.ok && existsSync(wtPath)) return { ok: false, reason: rm.out.slice(0, 300) };
+  return { ok: true };
+}
+
+/** Copy gitignored files (e.g. `.env*`, `config/*.local.json`) from a repo into a
+    worktree. The last path segment may contain `*`. Best-effort; never throws. */
+export function copyGlobsInto(srcRepo: string, wtPath: string, globs: string[]): void {
+  for (const glob of globs) {
+    const norm = glob.replace(/^\.\//, '');
+    const slash = norm.lastIndexOf('/');
+    const dir = slash >= 0 ? norm.slice(0, slash) : '.';
+    const pat = slash >= 0 ? norm.slice(slash + 1) : norm;
+    const srcDir = path.join(srcRepo, dir);
+    if (!existsSync(srcDir)) continue;
+    const re = new RegExp('^' + pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
+    let entries: string[] = [];
+    try { entries = readdirSync(srcDir); } catch { continue; }
+    for (const name of entries) {
+      if (!re.test(name)) continue;
+      const from = path.join(srcDir, name);
+      const to = path.join(wtPath, dir, name);
+      try {
+        if (!statSync(from).isFile()) continue;
+        mkdirSync(path.dirname(to), { recursive: true });
+        copyFileSync(from, to);
+      } catch { /* best effort */ }
+    }
+  }
+}
+
+/** Resolve symlinks (e.g. macOS /var → /private/var) so paths compare equal to
+    what `git worktree list` reports. Falls back to a plain resolve if the path
+    no longer exists. */
+function canonicalPath(p: string): string {
+  try { return realpathSync(p); } catch { return path.resolve(p); }
+}
+
+/** Whether `wtPath` is already a registered worktree of `repoDir` (symlink-safe). */
+export function worktreeExists(repoDir: string, wtPath: string): boolean {
+  const target = canonicalPath(wtPath);
+  return listWorktrees(repoDir).some(w => canonicalPath(w.path) === target);
 }
