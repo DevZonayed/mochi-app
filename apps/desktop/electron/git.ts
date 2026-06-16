@@ -4,8 +4,8 @@
    progress streams back so the UI can show it live. */
 
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, readdirSync, statSync, copyFileSync, realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdirSync, rmSync, readdirSync, statSync, copyFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 
 let gitPath: string | null | undefined;
@@ -295,4 +295,76 @@ export function fetchOrigin(repoDir: string): { ok: boolean; reason?: string } {
   if (!remotes.ok || !remotes.out.split(/\s+/).includes('origin')) return { ok: false, reason: 'no origin remote' };
   const r = execGit(['-C', repoDir, 'fetch', '--prune', 'origin'], { timeout: 60_000 });
   return r.ok ? { ok: true } : { ok: false, reason: r.out.slice(0, 200) };
+}
+
+/* ── PR-availability + push (Phase 2) ─────────────────────────────────── */
+
+/** Commits the branch is ahead/behind `base` (`rev-list --left-right --count base...HEAD`). */
+export function aheadBehind(dir: string, base: string): { ahead: number; behind: number } {
+  const r = execGit(['-C', dir, 'rev-list', '--left-right', '--count', `${base}...HEAD`]);
+  if (!r.ok) return { ahead: 0, behind: 0 };
+  const [left, right] = r.out.split(/\s+/);
+  const behind = Number(left); // commits in base not HEAD
+  const ahead = Number(right); // commits in HEAD not base
+  return { ahead: Number.isFinite(ahead) ? ahead : 0, behind: Number.isFinite(behind) ? behind : 0 };
+}
+
+/** Whether the working tree has uncommitted changes. */
+export function isDirty(dir: string): boolean {
+  const r = execGit(['-C', dir, 'status', '--porcelain']);
+  return r.ok && r.out.length > 0;
+}
+
+/** Whether `remote` has `branch` (via ls-remote; works for file:// remotes in tests). */
+export function remoteHasBranch(repoDir: string, remote: string, branch: string): boolean {
+  const r = execGit(['-C', repoDir, 'ls-remote', '--heads', remote, branch], { timeout: 30_000 });
+  return r.ok && r.out.split('\n').some(l => l.trim().endsWith(`refs/heads/${branch}`));
+}
+
+/** Best-effort: set origin/HEAD so resolveBaseBranch can find the default branch. */
+export function setRemoteHead(repoDir: string): void {
+  execGit(['-C', repoDir, 'remote', 'set-head', 'origin', '-a']);
+}
+
+/** Askpass script body: feeds git the username + token over HTTPS without putting
+    the token in argv or repo config. Reads the secret from $GIT_TOKEN at runtime. */
+export function buildAskpassScript(): string {
+  return [
+    '#!/bin/sh',
+    'case "$1" in',
+    '  *Username*) echo "x-access-token" ;;',
+    '  *Password*) echo "$GIT_TOKEN" ;;',
+    'esac',
+    '',
+  ].join('\n');
+}
+
+/** Push `branch` to `remote` and set upstream. With a token, authenticates over
+    HTTPS via a temporary GIT_ASKPASS (token in env, never in argv/config). */
+export function pushBranch(dir: string, branch: string, opts: { token?: string; remote?: string } = {}): { ok: boolean; reason?: string } {
+  const git = resolveGit();
+  if (!git) return { ok: false, reason: 'git is not installed' };
+  const remote = opts.remote ?? 'origin';
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  let askpass: string | undefined;
+  try {
+    if (opts.token) {
+      askpass = path.join(tmpdir(), `mst-askpass-${process.pid}-${Date.now()}.sh`);
+      writeFileSync(askpass, buildAskpassScript(), { mode: 0o700 });
+      env.GIT_ASKPASS = askpass;
+      env.GIT_TOKEN = opts.token;
+    }
+    execFileSync(git, ['-C', dir, 'push', '--set-upstream', remote, branch], { encoding: 'utf8', env, timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
+    return { ok: true };
+  } catch (e) {
+    const err = e as { stderr?: Buffer | string; message?: string };
+    const stderr = err.stderr == null ? (err.message ?? '') : typeof err.stderr === 'string' ? err.stderr : err.stderr.toString();
+    const low = stderr.toLowerCase();
+    let reason = stderr.trim().split('\n').pop() || 'push failed';
+    if (low.includes('non-fast-forward') || low.includes('rejected')) reason = 'remote branch has diverged (non-fast-forward) — update or force-with-lease';
+    else if (low.includes('authentication') || low.includes('could not read') || low.includes('403') || low.includes('permission')) reason = 'push authentication failed — reconnect GitHub';
+    return { ok: false, reason: reason.slice(0, 300) };
+  } finally {
+    if (askpass) { try { rmSync(askpass, { force: true }); } catch { /* ignore */ } }
+  }
 }
