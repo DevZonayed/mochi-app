@@ -376,6 +376,9 @@ app.whenReady().then(() => {
       if (r && typeof r === 'object' && isJob((r as { job?: unknown }).job)) return { ...r, job: store.slimJobForRelay((r as { job: Job }).job) };
       return r;
     },
+    // The relay reports remote-device presence → mirror it into the store and tell
+    // the desktop UI (Devices pane + pairing window). Desktop-only; never relayed.
+    onRemote: (info) => { emit('devices', store.setRemotePresence(info), { desktopOnly: true }); },
   });
   relay.start();
 

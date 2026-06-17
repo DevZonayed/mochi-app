@@ -1,8 +1,8 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { View, Text, Pressable, TextInput, Animated, Easing, type ViewStyle } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { View, Text, Pressable, TextInput, Animated, Easing, ActivityIndicator, Platform, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
-import Svg, { Rect, G } from 'react-native-svg';
+import { CameraView, useCameraPermissions } from 'expo-camera';
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { MaestroMark } from '../Icon';
@@ -13,47 +13,17 @@ const BLUE = '#007AFF';
 const GREEN = '#34C759';
 const ONBOARD_BG = '#0a0b10';
 
-/** Deterministic QR-style glyph — RN port of the design's <MQR>. */
-function MQR({ size = 146 }: { size?: number }) {
-  const N = 21;
-  const cell = size / N;
-  const cells = useMemo(() => {
-    let s = 99;
-    const rnd = () => {
-      s = (s * 1103515245 + 12345) & 0x7fffffff;
-      return s / 0x7fffffff;
-    };
-    const inFinder = (r: number, c: number) => {
-      const b = (br: number, bc: number) => r >= br && r < br + 7 && c >= bc && c < bc + 7;
-      return b(0, 0) || b(0, N - 7) || b(N - 7, 0);
-    };
-    const out: { x: number; y: number }[] = [];
-    for (let r = 0; r < N; r++) {
-      for (let c = 0; c < N; c++) {
-        if (inFinder(r, c)) continue;
-        if (rnd() > 0.5) out.push({ x: c * cell, y: r * cell });
-      }
-    }
-    return out;
-  }, [cell]);
-
-  const finder = (x: number, y: number) => (
-    <G key={`f-${x}-${y}`}>
-      <Rect x={x} y={y} width={cell * 7} height={cell * 7} rx={cell} fill="none" stroke="#000" strokeWidth={cell} />
-      <Rect x={x + cell * 2} y={y + cell * 2} width={cell * 3} height={cell * 3} fill="#000" />
-    </G>
-  );
-
-  return (
-    <Svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
-      {cells.map((p, i) => (
-        <Rect key={i} x={p.x} y={p.y} width={cell} height={cell} fill="#000" />
-      ))}
-      {finder(0, 0)}
-      {finder(size - cell * 7, 0)}
-      {finder(0, size - cell * 7)}
-    </Svg>
-  );
+/** Pull the pairing token out of a scanned QR or a typed code.
+   The Mac's QR encodes `maestro://pair?token=XXXX-XXXX-XXXX&relay=…`;
+   a typed code is the bare `XXXX-XXXX-XXXX`. */
+function extractToken(raw: string): string | null {
+  const s = (raw ?? '').trim();
+  if (!s) return null;
+  const m = s.match(/[?&]token=([^&]+)/i);
+  if (m) return decodeURIComponent(m[1]).toUpperCase();
+  // Bare code: groups of A–Z/2–9 separated by dashes (the desktop format).
+  if (/^[A-Z0-9][A-Z0-9-]{4,}$/i.test(s)) return s.toUpperCase();
+  return null;
 }
 
 /** Vertically sweeping scan line. */
@@ -137,46 +107,107 @@ function Welcome({ insets, onNext }: { insets: { top: number; bottom: number }; 
 }
 
 function Scanner({ insets, onScan }: { insets: { top: number; bottom: number }; onScan: () => void }) {
+  const [permission, requestPermission] = useCameraPermissions();
   const [entering, setEntering] = useState(false);
   const [code, setCode] = useState(getPairToken());
-  const save = () => {
-    if (!code.trim()) return;
-    setPairToken(code);
-    onScan();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const lockRef = useRef(false); // prevents the camera from firing onScan repeatedly
+
+  // Ask for the camera once when we land on this step (native only).
+  useEffect(() => {
+    if (Platform.OS !== 'web' && permission && !permission.granted && permission.canAskAgain) {
+      void requestPermission();
+    }
+  }, [permission, requestPermission]);
+
+  const tryPair = async (raw: string) => {
+    const token = extractToken(raw);
+    if (!token) { setError('That doesn’t look like a Maestro pairing code.'); lockRef.current = false; return; }
+    setBusy(true); setError(null);
+    setPairToken(token);
+    const res = await api.verifyPairing();
+    setBusy(false);
+    if (res === 'invalid') { setError('That code didn’t match — check Settings ▸ Devices on your Mac.'); lockRef.current = false; return; }
+    if (res === 'unreachable') { setError('Couldn’t reach the relay — check your connection and try again.'); lockRef.current = false; return; }
+    onScan(); // 'ok' (verified) or 'mac-offline' (saved; will connect when the Mac is online)
   };
+
+  const onBarcode = ({ data }: { data: string }) => {
+    if (lockRef.current || busy || entering) return;
+    lockRef.current = true;
+    void tryPair(data);
+  };
+
+  const save = () => { if (code.trim() && !busy) void tryPair(code); };
+
+  const cameraReady = Platform.OS !== 'web' && !!permission?.granted;
+
   return (
     <View style={{ flex: 1, alignItems: 'center', paddingTop: insets.top + 8 }}>
       <View style={{ paddingHorizontal: 32, alignItems: 'center' }}>
         <Text style={{ color: '#fff', fontSize: 17, fontWeight: '600', lineHeight: 24, textAlign: 'center' }}>Scan the code on your Mac</Text>
         <Text style={{ color: 'rgba(255,255,255,0.55)', fontSize: 14, lineHeight: 18, marginTop: 4, textAlign: 'center' }}>Settings &#9656; Devices</Text>
       </View>
+
       <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
         <View style={{ width: 230, height: 230, alignItems: 'center', justifyContent: 'center' }}>
           <ScanBracket corner="tl" />
           <ScanBracket corner="tr" />
           <ScanBracket corner="bl" />
           <ScanBracket corner="br" />
-          <Pressable onPress={() => setEntering(true)} style={{ position: 'absolute', top: 28, left: 28, right: 28, bottom: 28, borderRadius: 18, backgroundColor: '#fff', padding: 14, overflow: 'hidden' }}>
-            <MQR size={146} />
-            <ScanShimmer />
-          </Pressable>
+          <View style={{ position: 'absolute', top: 28, left: 28, right: 28, bottom: 28, borderRadius: 18, backgroundColor: '#000', overflow: 'hidden' }}>
+            {cameraReady ? (
+              <>
+                <CameraView
+                  style={{ flex: 1 }}
+                  facing="back"
+                  barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+                  onBarcodeScanned={busy || entering ? undefined : onBarcode}
+                />
+                <ScanShimmer />
+                {busy ? (
+                  <View style={{ position: 'absolute', inset: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.45)' }}>
+                    <ActivityIndicator color="#fff" />
+                  </View>
+                ) : null}
+              </>
+            ) : (
+              <Pressable onPress={() => (permission?.canAskAgain ? requestPermission() : setEntering(true))} style={{ flex: 1, alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+                <Icon name="camera" size={30} color="rgba(255,255,255,0.6)" />
+                <Text style={{ color: 'rgba(255,255,255,0.7)', fontSize: 13, lineHeight: 18, textAlign: 'center', marginTop: 10 }}>
+                  {permission && !permission.granted && !permission.canAskAgain
+                    ? 'Camera access is off — enter the code instead.'
+                    : 'Tap to enable the camera, or enter the code instead.'}
+                </Text>
+              </Pressable>
+            )}
+          </View>
         </View>
+        {error ? (
+          <Text style={{ color: '#FF6961', fontSize: 14, fontWeight: '500', textAlign: 'center', paddingHorizontal: 32, marginTop: 18 }}>{error}</Text>
+        ) : null}
       </View>
+
       {entering ? (
         <View style={{ width: '100%', paddingHorizontal: 32, marginBottom: insets.bottom + 24 }}>
           <TextInput
             value={code}
-            onChangeText={setCode}
+            onChangeText={(t) => { setCode(t); if (error) setError(null); }}
             onSubmitEditing={save}
             autoFocus
             autoCapitalize="characters"
             autoCorrect={false}
+            editable={!busy}
             placeholder="XXXX-XXXX-XXXX"
             placeholderTextColor="rgba(255,255,255,0.35)"
             style={{ height: 52, borderRadius: 14, backgroundColor: 'rgba(255,255,255,0.1)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.25)', color: '#fff', fontSize: 18, fontWeight: '600', letterSpacing: 2, textAlign: 'center', marginBottom: 12 }}
           />
-          <Pressable onPress={save} style={({ pressed }) => ({ height: 52, borderRadius: 980, backgroundColor: code.trim() ? BLUE : 'rgba(255,255,255,0.15)', alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.9 : 1 })}>
-            <Text style={{ color: '#fff', fontSize: 17, fontWeight: '600' }}>Pair with this code</Text>
+          <Pressable onPress={save} disabled={busy || !code.trim()} style={({ pressed }) => ({ height: 52, borderRadius: 980, backgroundColor: code.trim() && !busy ? BLUE : 'rgba(255,255,255,0.15)', alignItems: 'center', justifyContent: 'center', opacity: pressed ? 0.9 : 1 })}>
+            {busy ? <ActivityIndicator color="#fff" /> : <Text style={{ color: '#fff', fontSize: 17, fontWeight: '600' }}>Pair with this code</Text>}
+          </Pressable>
+          <Pressable hitSlop={8} onPress={() => setEntering(false)} style={{ alignSelf: 'center', marginTop: 14 }}>
+            <Text style={{ color: 'rgba(255,255,255,0.6)', fontSize: 15, fontWeight: '500' }}>Use the camera instead</Text>
           </Pressable>
         </View>
       ) : (
@@ -339,33 +370,16 @@ export function OnboardingScreen() {
         />
       ) : null}
 
-      {/* tiny step nav for review */}
-      <View
-        style={{
-          position: 'absolute',
-          top: insets.top + 6,
-          right: 16,
-          zIndex: 40,
-          flexDirection: 'row',
-          gap: 4,
-          padding: 3,
-          borderRadius: 20,
-          backgroundColor: 'rgba(255,255,255,0.12)',
-        }}
-      >
-        {['1', '2', '3', '✓'].map((l, i) => {
-          const on = step === i;
-          return (
-            <Pressable
-              key={i}
-              onPress={() => setStep(i)}
-              style={{ width: 22, height: 22, borderRadius: 11, alignItems: 'center', justifyContent: 'center', backgroundColor: on ? '#fff' : 'transparent' }}
-            >
-              <Text style={{ fontSize: 11, fontWeight: '600', color: on ? '#000' : 'rgba(255,255,255,0.7)' }}>{l}</Text>
-            </Pressable>
-          );
-        })}
-      </View>
+      {/* Back affordance on the scanner step (returns to Welcome). */}
+      {step === 1 ? (
+        <Pressable
+          onPress={() => setStep(0)}
+          hitSlop={10}
+          style={{ position: 'absolute', top: insets.top + 6, left: 16, zIndex: 40, width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.12)' }}
+        >
+          <Icon name="arrowLeft" size={20} color="#fff" />
+        </Pressable>
+      ) : null}
     </View>
   );
 }

@@ -6,6 +6,7 @@ import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { Card, Mono } from '../ui';
 import { api, type Job, type Project } from '../api';
+import { useLive } from '../useLive';
 
 /** Live project descriptor used to render the filter avatars + row subtitles. */
 type LiveProj = { id: string; name: string; color: string };
@@ -97,28 +98,20 @@ export function JobsScreen() {
     [theme],
   );
 
-  // load live jobs + projects (refetch on focus + light polling for a live feel).
-  useFocusEffect(
-    useCallback(() => {
-      let alive = true;
-      const load = () => {
-        Promise.all([api.listJobs(), api.listProjects()])
-          .then(([js, ps]) => {
-            if (!alive) return;
-            setJobs(js);
-            setProjects(ps.map((p: Project): LiveProj => ({ id: p.id, name: p.name, color: resolveColor(p.color) })));
-          })
-          .catch(() => {
-            /* fail soft — keep last good data */
-          });
-      };
-      const stop = api.poll(load, 5000);
-      return () => {
-        alive = false;
-        stop();
-      };
-    }, [resolveColor]),
-  );
+  const refresh = useCallback(() => {
+    Promise.all([api.listJobs(), api.listProjects()])
+      .then(([js, ps]) => {
+        setJobs(js);
+        setProjects(ps.map((p: Project): LiveProj => ({ id: p.id, name: p.name, color: resolveColor(p.color) })));
+      })
+      .catch(() => {
+        /* fail soft — keep last good data */
+      });
+  }, [resolveColor]);
+
+  // SSE drives instant updates; a slow poll is just a backstop if the stream drops.
+  useFocusEffect(useCallback(() => api.poll(refresh, 10000), [refresh]));
+  useLive(['job', 'session'], refresh);
 
   const projById = useCallback(
     (projectId: string | null): ProjResolved => {

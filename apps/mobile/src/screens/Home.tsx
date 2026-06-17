@@ -6,12 +6,15 @@ import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Card, SectionLabel, ProgressBar, Mono } from '../ui';
 import { api, type DashboardData, type Approval, type Job } from '../api';
+import { getStr } from '../storage';
+import { eventAllowed } from '../notifPrefs';
+import { useLive } from '../useLive';
 
 /** Resolved project label + accent for a live row. */
 type ProjVM = { name: string; color: string };
 
 type GateVM = { id: string; proj: ProjVM; icon: IconName; tint: string; type: string; summary: string; age: string };
-type LiveVM = { proj: ProjVM; name: string; verb: string; tint: string; pct: number; cost: string };
+type LiveVM = { id: string; proj: ProjVM; name: string; verb: string; tint: string; pct: number; cost: string };
 type DoneVM = { ok: boolean; name: string; cost: string; when: string };
 
 /** Color names carried by live projects -> theme accent. */
@@ -141,6 +144,7 @@ export function HomeScreen() {
   const [live, setLive] = useState<LiveVM[]>([]);
   const [done, setDone] = useState<DoneVM[]>([]);
   const [strip, setStrip] = useState({ spend: 0, scheduled: 0, done: 0 });
+  const [unread, setUnread] = useState(false);
 
   // Resolve a live project's accent name -> theme color, falling back softly.
   const colorFor = useCallback(
@@ -166,7 +170,7 @@ export function HomeScreen() {
       setLive(
         d.activeJobs.map((j: Job): LiveVM => {
           const proj = resolve(j.projectId);
-          return { proj, name: j.title, verb: j.phase, tint: proj.color, pct: j.progress, cost: j.cost.toFixed(2) };
+          return { id: j.id, proj, name: j.title, verb: j.phase, tint: proj.color, pct: j.progress, cost: j.cost.toFixed(2) };
         }),
       );
 
@@ -191,6 +195,14 @@ export function HomeScreen() {
     } catch {
       /* fail soft — keep last good state */
     }
+    // Unread badge: any allowed event newer than the last "mark all read".
+    try {
+      const events = await api.listEvents();
+      const readTs = Number(getStr('maestro.mobile.notifReadTs')) || 0;
+      setUnread(events.some((e) => eventAllowed(e.kind) && e.ts > readTs));
+    } catch {
+      /* leave the badge as-is */
+    }
   }, [apply]);
 
   // Refetch whenever the screen regains focus (and on first mount).
@@ -199,6 +211,8 @@ export function HomeScreen() {
       void refetch();
     }, [refetch]),
   );
+  // Real-time: refresh instantly when the Mac reports job/approval/session activity.
+  useLive(['job', 'approval', 'session'], () => { void refetch(); });
 
   const onApprove = useCallback(
     (id: string) => {
@@ -225,10 +239,17 @@ export function HomeScreen() {
         {/* large title header */}
         <View style={{ paddingHorizontal: 20, paddingBottom: 10, flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' }}>
           <Text style={{ fontSize: 34, fontWeight: '700', letterSpacing: -0.7, color: theme.color.ink }}>Maestro</Text>
-          <Pressable onPress={() => nav.navigate('Notifications')}>
-            <Icon name="bell" size={24} color={theme.color.ink} />
-            <View style={{ position: 'absolute', top: -2, right: -2, width: 9, height: 9, borderRadius: 5, backgroundColor: theme.color.red, borderWidth: 2, borderColor: theme.color.bg }} />
-          </Pressable>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 18 }}>
+            <Pressable onPress={() => nav.navigate('Queue')} hitSlop={8}>
+              <Icon name="clock" size={23} color={theme.color.ink} />
+            </Pressable>
+            <Pressable onPress={() => nav.navigate('Notifications')} hitSlop={8}>
+              <Icon name="bell" size={24} color={theme.color.ink} />
+              {unread ? (
+                <View style={{ position: 'absolute', top: -2, right: -2, width: 9, height: 9, borderRadius: 5, backgroundColor: theme.color.red, borderWidth: 2, borderColor: theme.color.bg }} />
+              ) : null}
+            </Pressable>
+          </View>
         </View>
 
         <NeedsYou gates={gates} onApprove={onApprove} />
@@ -241,7 +262,7 @@ export function HomeScreen() {
               const p = j.proj;
               const tint = j.tint;
               return (
-                <Pressable key={i} onPress={() => nav.navigate('JobTimeline')}>
+                <Pressable key={i} onPress={() => nav.navigate('JobTimeline', { jobId: j.id })}>
                   <Card style={{ padding: 14 } as any}>
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
                       <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: p.color }} />
