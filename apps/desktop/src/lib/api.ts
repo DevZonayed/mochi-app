@@ -162,6 +162,13 @@ export interface Schedule {
   fireAt?: number;
   sessionId?: string;
   prompt?: string;
+  /** A user-scheduled chat message, or an auto-continue queued when a Claude run
+      is blocked by the usage limit (fires "continue" into the chat at reset). */
+  kind?: 'message' | 'auto-continue';
+  effort?: Effort;
+  browser?: boolean;
+  plan?: boolean;
+  goal?: boolean;
 }
 export interface Skill {
   id: string;
@@ -824,6 +831,11 @@ export const api = {
   scheduleCheck: (input: { projectId?: string | null; sessionId?: string; prompt?: string; delayMs: number }) =>
     call<Schedule>('scheduleCheck', { ...input }, () =>
       req<Schedule>('/api/schedules/check', { method: 'POST', body: JSON.stringify(input) })),
+  // Scheduled message: send a real chat message into a session at an absolute time
+  // (fireAt = ms timestamp), carrying composer effort/browser/plan/goal.
+  scheduleMessage: (input: { projectId: string; sessionId?: string; prompt: string; fireAt: number; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean }) =>
+    call<Schedule>('scheduleMessage', { ...input }, () =>
+      req<Schedule>('/api/schedules/message', { method: 'POST', body: JSON.stringify(input) })),
   toggleSchedule: (id: string, enabled: boolean) =>
     call<{ ok: boolean }>('toggleSchedule', { id, enabled }, () =>
       req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) })),
@@ -979,7 +991,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onDevices?: (d: DevicePresence) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: DevicePresence) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as DevicePresence);
@@ -996,6 +1008,7 @@ export const api = {
         if (name === 'session' && handlers.onSession) handlers.onSession(data as ChatSession & { deleted?: boolean });
         if (name === 'feedback' && handlers.onFeedback) handlers.onFeedback(data as Feedback & { deleted?: boolean });
         if (name === 'git-status' && handlers.onGitStatus) handlers.onGitStatus(data as SessionGitStatus);
+        if (name === 'schedule' && handlers.onSchedule) handlers.onSchedule(data as Schedule);
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
@@ -1012,6 +1025,7 @@ export const api = {
     if (handlers.onSession) es.addEventListener('session', (e: MessageEvent) => { try { handlers.onSession!(JSON.parse(e.data) as ChatSession & { deleted?: boolean }); } catch { /* ignore */ } });
     if (handlers.onFeedback) es.addEventListener('feedback', (e: MessageEvent) => { try { handlers.onFeedback!(JSON.parse(e.data) as Feedback & { deleted?: boolean }); } catch { /* ignore */ } });
     if (handlers.onGitStatus) es.addEventListener('git-status', (e: MessageEvent) => { try { handlers.onGitStatus!(JSON.parse(e.data) as SessionGitStatus); } catch { /* ignore */ } });
+    if (handlers.onSchedule) es.addEventListener('schedule', (e: MessageEvent) => { try { handlers.onSchedule!(JSON.parse(e.data) as Schedule); } catch { /* ignore */ } });
     return () => es.close();
   },
   /** Convenience: subscribe to job updates only. */
