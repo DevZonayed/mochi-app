@@ -5,7 +5,7 @@ import { useNavigation, useRoute } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Mono } from '../ui';
-import { api, type Job, type TranscriptItem } from '../api';
+import { api, type Job, type TranscriptItem, type Effort, type ModelGroup } from '../api';
 import { useLive } from '../useLive';
 import { cacheGet, cacheSet } from '../storage';
 
@@ -15,6 +15,107 @@ function toolIcon(name: string): IconName {
   if (n.includes('search') || n.includes('grep') || n.includes('glob') || n.includes('web') || n.includes('fetch')) return 'search';
   if (n.includes('read') || n.includes('write') || n.includes('edit') || n.includes('file')) return 'file';
   return 'terminal';
+}
+
+/* ── Per-session effort dial (FAST → BALANCED → DEEP → MAX) ──────────────── */
+const EFFORT_ORDER: Effort[] = ['fast', 'balanced', 'deep', 'max'];
+function effortMeta(theme: ReturnType<typeof useTheme>['theme']): Record<Effort, { label: string; tint: string; bars: number }> {
+  return {
+    fast: { label: 'Fast', tint: theme.color.green, bars: 1 },
+    balanced: { label: 'Balanced', tint: theme.color.blue, bars: 2 },
+    deep: { label: 'Deep', tint: theme.color.orange, bars: 3 },
+    max: { label: 'Max', tint: theme.color.red, bars: 4 },
+  };
+}
+
+function EffortDial({ value, onChange }: { value: Effort; onChange: (e: Effort) => void }) {
+  const { theme } = useTheme();
+  const m = effortMeta(theme)[value];
+  const cycle = () => onChange(EFFORT_ORDER[(EFFORT_ORDER.indexOf(value) + 1) % EFFORT_ORDER.length]);
+  return (
+    <Pressable
+      onPress={cycle}
+      style={{ flexDirection: 'row', alignItems: 'center', gap: 7, height: 28, paddingHorizontal: 11, borderRadius: 14, backgroundColor: m.tint + '1c', borderWidth: 1, borderColor: m.tint + '55' }}
+    >
+      <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 1.5, height: 12 }}>
+        {[0, 1, 2, 3].map((i) => (
+          <View key={i} style={{ width: 2.5, height: 4 + i * 2.6, borderRadius: 1, backgroundColor: i < m.bars ? m.tint : theme.color.inkTertiary, opacity: i < m.bars ? 1 : 0.35 }} />
+        ))}
+      </View>
+      <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 0.5, textTransform: 'uppercase', color: m.tint }}>{m.label}</Text>
+    </Pressable>
+  );
+}
+
+/* ── Per-session model picker (Auto + the Mac's real model catalog) ──────── */
+function ModelPicker({ groups, value, onChange }: { groups: ModelGroup[]; value: string; onChange: (key: string) => void }) {
+  const { theme } = useTheme();
+  const [open, setOpen] = useState(false);
+  const all = groups.flatMap((g) => g.models);
+  const label = value === 'auto' ? 'Auto' : (all.find((m) => m.key === value)?.label ?? 'Auto');
+  return (
+    <>
+      <Pressable
+        onPress={() => setOpen(true)}
+        style={{ flexDirection: 'row', alignItems: 'center', gap: 6, height: 28, paddingHorizontal: 11, borderRadius: 14, backgroundColor: theme.color.fillSecondary, borderWidth: 1, borderColor: theme.color.separator }}
+      >
+        <Icon name="spark" size={14} color={value === 'auto' ? theme.color.inkSecondary : theme.color.ink} />
+        <Text style={{ fontSize: 12, fontWeight: '600', color: theme.color.ink }}>{label}</Text>
+        <Icon name="chevronDown" size={12} color={theme.color.inkTertiary} />
+      </Pressable>
+      <Modal visible={open} transparent animationType="slide" onRequestClose={() => setOpen(false)}>
+        <Pressable style={{ flex: 1, backgroundColor: 'rgba(10,12,24,0.45)', justifyContent: 'flex-end' }} onPress={() => setOpen(false)}>
+          <Pressable onPress={() => {}} style={{ maxHeight: '75%', backgroundColor: theme.color.bg, borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingTop: 10, paddingBottom: 28 }}>
+            <View style={{ alignItems: 'center', marginBottom: 8 }}>
+              <View style={{ width: 36, height: 5, borderRadius: 3, backgroundColor: theme.color.separatorStrong }} />
+            </View>
+            <Text style={{ fontSize: 20, fontWeight: '700', color: theme.color.ink, paddingHorizontal: 20, marginBottom: 10 }}>Model for this chat</Text>
+            <ScrollView contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 10 }} showsVerticalScrollIndicator={false}>
+              {/* Auto */}
+              <Pressable onPress={() => { onChange('auto'); setOpen(false); }} style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 13, borderRadius: 12, marginBottom: 8, backgroundColor: value === 'auto' ? theme.color.blue + '1a' : theme.color.bgElevated, borderWidth: 1, borderColor: value === 'auto' ? theme.color.blue : theme.color.separator }}>
+                <Icon name="spark" size={18} color={theme.color.inkSecondary} />
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontSize: 15, fontWeight: '600', color: theme.color.ink }}>Auto</Text>
+                  <Text style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 1 }}>Routed per task (workspace default)</Text>
+                </View>
+                {value === 'auto' ? <Icon name="check" size={16} color={theme.color.blue} stroke={2.6} /> : null}
+              </Pressable>
+              {groups.map((g) => (
+                <View key={g.provider} style={{ marginBottom: 8 }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 6, paddingTop: 8, paddingBottom: 6 }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary }}>{g.label}</Text>
+                    {!g.runnable ? <Text style={{ flex: 1, fontSize: 11, color: theme.color.inkTertiary }} numberOfLines={1}>· {g.reason || 'not available'}</Text> : null}
+                  </View>
+                  {g.models.map((m) => {
+                    const on = m.key === value;
+                    const disabled = !g.runnable || m.external;
+                    return (
+                      <Pressable
+                        key={m.key}
+                        disabled={disabled}
+                        onPress={() => { onChange(m.key); setOpen(false); }}
+                        style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 12, borderRadius: 11, marginBottom: 6, opacity: disabled ? 0.45 : 1, backgroundColor: on ? theme.color.blue + '1a' : theme.color.bgElevated, borderWidth: 1, borderColor: on ? theme.color.blue : theme.color.separator }}
+                      >
+                        <View style={{ flex: 1, minWidth: 0 }}>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
+                            <Text style={{ fontSize: 15, fontWeight: '600', color: theme.color.ink }}>{m.label}</Text>
+                            {m.badge === 'NEW' ? <View style={{ paddingHorizontal: 6, height: 16, borderRadius: 8, backgroundColor: theme.color.purple + '28', justifyContent: 'center' }}><Text style={{ fontSize: 9, fontWeight: '700', color: theme.color.purple }}>NEW</Text></View> : null}
+                            {m.external ? <Text style={{ fontSize: 11, color: theme.color.inkTertiary }}>↗</Text> : null}
+                          </View>
+                          {m.tierNote ? <Text style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 1 }}>{m.tierNote}</Text> : null}
+                        </View>
+                        {on ? <Icon name="check" size={16} color={theme.color.blue} stroke={2.6} /> : null}
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              ))}
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    </>
+  );
 }
 
 function ToolRow({ item }: { item: TranscriptItem }) {
@@ -36,7 +137,125 @@ function ToolRow({ item }: { item: TranscriptItem }) {
   );
 }
 
-function AgentBlocks({ job }: { job: Job }) {
+/* ── Agent question → a real, tappable card (not raw JSON) ───────────────── */
+interface AskOption { label: string; description?: string }
+interface AskQuestion { question: string; header?: string; multiSelect: boolean; options: AskOption[] }
+
+function parseAsk(json?: string): AskQuestion[] {
+  if (!json) return [];
+  try {
+    const raw = JSON.parse(json) as Record<string, unknown>;
+    const list = Array.isArray(raw.questions) ? raw.questions : raw.question ? [raw] : [];
+    return (list as Record<string, unknown>[])
+      .map((q) => ({
+        question: String(q.question ?? q.header ?? 'Pick an option'),
+        header: typeof q.header === 'string' ? q.header : undefined,
+        multiSelect: q.multiSelect === true || q.allowMultiple === true,
+        options: (Array.isArray(q.options) ? q.options : []).map((o): AskOption =>
+          typeof o === 'string' ? { label: o } : { label: String((o as AskOption).label ?? ''), description: (o as AskOption).description }),
+      }))
+      .filter((q) => q.options.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (text: string) => void; answered: boolean }) {
+  const { theme } = useTheme();
+  const questions = parseAsk(ask);
+  const [picked, setPicked] = useState<Record<number, string[]>>({});
+  if (questions.length === 0) {
+    // Couldn't parse structured options — show readable prompt text, never raw JSON.
+    const looksJson = !!ask && ask.trim().startsWith('{');
+    const prompt = ask && !looksJson ? ask : 'The agent asked a question — reply below to answer.';
+    return (
+      <View style={{ borderRadius: 14, padding: 13, borderWidth: 0.5, borderColor: theme.color.separator, backgroundColor: theme.color.bgGrouped, gap: 6 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <Icon name="command" size={13} color={theme.color.blue} />
+          <Text style={{ fontSize: 12, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.blue }}>Agent is asking</Text>
+        </View>
+        <Text style={{ fontSize: 15, lineHeight: 21, color: theme.color.ink }}>{prompt}</Text>
+      </View>
+    );
+  }
+  const needsSubmit = questions.some((q) => q.multiSelect) || questions.length > 1;
+  const accent = answered ? theme.color.green : theme.color.blue;
+
+  const toggle = (qi: number, label: string, multi: boolean) => {
+    setPicked((p) => {
+      const cur = new Set(p[qi] ?? []);
+      if (multi) { cur.has(label) ? cur.delete(label) : cur.add(label); } else { cur.clear(); cur.add(label); }
+      return { ...p, [qi]: [...cur] };
+    });
+  };
+  const onPick = (qi: number, q: AskQuestion, label: string) => {
+    if (answered) return;
+    if (q.multiSelect) toggle(qi, label, true);
+    else { toggle(qi, label, false); if (!needsSubmit) onAnswer(label); }
+  };
+  const submit = () => {
+    const parts = questions.map((q, qi) => { const sel = picked[qi] ?? []; return sel.length ? `${q.header ?? q.question}: ${sel.join(', ')}` : ''; }).filter(Boolean);
+    if (parts.length) onAnswer(parts.join('\n'));
+  };
+  const anyPicked = Object.values(picked).some((s) => s.length > 0);
+
+  return (
+    <View style={{ borderRadius: 14, padding: 13, borderWidth: 0.5, borderColor: theme.color.separator, backgroundColor: theme.color.bgGrouped, opacity: answered ? 0.65 : 1, gap: 14 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+        <Icon name={answered ? 'check' : 'command'} size={13} color={accent} stroke={answered ? 2.6 : 2} />
+        <Text style={{ fontSize: 12, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: accent }}>{answered ? 'Answered' : 'Agent is asking'}</Text>
+      </View>
+      {questions.map((q, qi) => {
+        const sel = new Set(picked[qi] ?? []);
+        const hasDesc = q.options.some((o) => o.description);
+        return (
+          <View key={qi} style={{ gap: 8 }}>
+            <Text style={{ fontSize: 15, lineHeight: 21, fontWeight: '600', color: theme.color.ink }}>{q.question}</Text>
+            {hasDesc ? (
+              <View style={{ gap: 7 }}>
+                {q.options.map((o, oi) => {
+                  const on = sel.has(o.label);
+                  return (
+                    <Pressable key={oi} disabled={answered} onPress={() => onPick(qi, q, o.label)} style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 10, padding: 11, borderRadius: 11, borderWidth: 1, borderColor: on ? theme.color.blue : theme.color.separator, backgroundColor: on ? theme.color.blue + '14' : theme.color.bgElevated }}>
+                      <View style={{ width: 18, height: 18, borderRadius: q.multiSelect ? 5 : 9, marginTop: 1, alignItems: 'center', justifyContent: 'center', borderWidth: 1.5, borderColor: on ? theme.color.blue : theme.color.separatorStrong, backgroundColor: on ? theme.color.blue : 'transparent' }}>
+                        {on ? <Icon name="check" size={11} color="#fff" stroke={3} /> : null}
+                      </View>
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Text style={{ fontSize: 14, fontWeight: '600', color: theme.color.ink }}>{o.label}</Text>
+                        {o.description ? <Text style={{ fontSize: 12, lineHeight: 17, color: theme.color.inkSecondary, marginTop: 2 }}>{o.description}</Text> : null}
+                      </View>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            ) : (
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 7 }}>
+                {q.options.map((o, oi) => {
+                  const on = sel.has(o.label);
+                  return (
+                    <Pressable key={oi} disabled={answered} onPress={() => onPick(qi, q, o.label)} style={{ flexDirection: 'row', alignItems: 'center', gap: 6, height: 34, paddingHorizontal: 14, borderRadius: 17, borderWidth: 1, borderColor: on ? theme.color.blue : theme.color.separatorStrong, backgroundColor: on ? theme.color.blue : theme.color.bgElevated }}>
+                      {q.multiSelect && on ? <Icon name="check" size={12} color="#fff" stroke={3} /> : null}
+                      <Text style={{ fontSize: 14, fontWeight: '600', color: on ? '#fff' : theme.color.ink }}>{o.label}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            )}
+          </View>
+        );
+      })}
+      {answered ? (
+        <Text style={{ fontSize: 12, color: theme.color.inkTertiary }}>Send another message to change your answer.</Text>
+      ) : needsSubmit ? (
+        <Pressable onPress={submit} disabled={!anyPicked} style={{ alignSelf: 'flex-start', height: 38, paddingHorizontal: 18, borderRadius: 19, alignItems: 'center', justifyContent: 'center', backgroundColor: anyPicked ? theme.color.blue : theme.color.fillSecondary }}>
+          <Text style={{ fontSize: 14, fontWeight: '600', color: anyPicked ? '#fff' : theme.color.inkTertiary }}>Send answer</Text>
+        </Pressable>
+      ) : null}
+    </View>
+  );
+}
+
+function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: string) => void; answered: boolean }) {
   const { theme } = useTheme();
   const items = job.transcript ?? [];
   const live = job.status === 'running' || job.status === 'pending';
@@ -47,12 +266,7 @@ function AgentBlocks({ job }: { job: Job }) {
       if (it.kind === 'tool') {
         blocks.push(<ToolRow key={i} item={it} />);
       } else if (it.kind === 'ask') {
-        blocks.push(
-          <View key={i} style={{ borderRadius: 12, padding: 12, backgroundColor: theme.color.blue + '14', borderWidth: 0.5, borderColor: theme.color.blue + '40' }}>
-            <Text style={{ fontSize: 12, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.blue, marginBottom: 5 }}>Question</Text>
-            <Text style={{ fontSize: 15, lineHeight: 21, color: theme.color.ink }}>{it.ask || it.text}</Text>
-          </View>,
-        );
+        blocks.push(<QuestionCard key={i} ask={it.ask || it.text} onAnswer={onAnswer} answered={answered} />);
       } else if (it.kind === 'review') {
         const ok = it.verdict === 'approved';
         blocks.push(
@@ -90,7 +304,7 @@ function AgentBlocks({ job }: { job: Job }) {
   return <View style={{ gap: 10 }}>{blocks}</View>;
 }
 
-function Turn({ job }: { job: Job }) {
+function Turn({ job, onAnswer, answered }: { job: Job; onAnswer: (text: string) => void; answered: boolean }) {
   const { theme } = useTheme();
   return (
     <View style={{ gap: 12, marginBottom: 20 }}>
@@ -102,7 +316,7 @@ function Turn({ job }: { job: Job }) {
       ) : null}
       {/* agent reply */}
       <View style={{ alignSelf: 'flex-start', maxWidth: '94%' }}>
-        <AgentBlocks job={job} />
+        <AgentBlocks job={job} onAnswer={onAnswer} answered={answered} />
         {job.status === 'done' || job.status === 'failed' ? (
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 }}>
             <Mono style={{ fontSize: 11, color: theme.color.inkTertiary }}>${job.cost.toFixed(2)}</Mono>
@@ -131,7 +345,17 @@ export function SessionChatScreen() {
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(() => !!initialSid && cacheGet<Job[]>(`turns.${initialSid}`, []).length === 0);
   const [schedOpen, setSchedOpen] = useState(false);
+  // Per-session effort + model — remembered for the chat, sent with every message.
+  const [effort, setEffort] = useState<Effort>(() => (initialSid ? cacheGet<Effort>(`effort.${initialSid}`, 'balanced') : 'balanced'));
+  const [modelKey, setModelKey] = useState<string>(() => (initialSid ? cacheGet<string>(`model.${initialSid}`, 'auto') : 'auto'));
+  const [models, setModels] = useState<ModelGroup[]>(() => cacheGet('models', []));
   const scrollRef = useRef<ScrollView>(null);
+
+  const changeEffort = (e: Effort) => { setEffort(e); if (sessionId) cacheSet(`effort.${sessionId}`, e); };
+  const changeModel = (key: string) => { setModelKey(key); if (sessionId) cacheSet(`model.${sessionId}`, key); };
+
+  // Load the Mac's model catalog (cache-then-network) for the picker.
+  useEffect(() => { api.listModels().then((g) => { setModels(g); cacheSet('models', g); }).catch(() => {}); }, []);
 
   const load = useCallback(() => {
     if (!sessionId) { setLoading(false); return; }
@@ -159,20 +383,30 @@ export function SessionChatScreen() {
   // Auto-scroll to the newest content.
   useEffect(() => { const t = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60); return () => clearTimeout(t); }, [turns]);
 
-  const send = () => {
-    const body = text.trim();
-    if (!body || sending) return;
+  // Core send — used by the composer AND by answering a question's option.
+  const dispatchChat = useCallback((body: string) => {
     setSending(true);
-    setText('');
-    api.sendChat({ projectId, text: body, sessionId })
+    return api.sendChat({ projectId, text: body, sessionId, effort, ...(modelKey !== 'auto' ? { modelKey } : {}) })
       .then((res) => {
-        if (!sessionId) { setSessionId(res.session.id); setTitle(res.session.title || body.slice(0, 40)); }
+        if (!sessionId) {
+          setSessionId(res.session.id); setTitle(res.session.title || body.slice(0, 40));
+          cacheSet(`effort.${res.session.id}`, effort); cacheSet(`model.${res.session.id}`, modelKey);
+        }
         // Optimistically show the new turn; live events fill in the reply.
         setTurns((prev) => [...prev, res.job]);
       })
-      .catch(() => { setText(body); /* restore on failure */ })
       .finally(() => setSending(false));
+  }, [projectId, sessionId, effort, modelKey]);
+
+  const send = () => {
+    const body = text.trim();
+    if (!body || sending) return;
+    setText('');
+    dispatchChat(body).catch(() => setText(body)); // restore on failure
   };
+
+  // Answer an agent question by sending the chosen option(s) as a turn.
+  const answer = (body: string) => { if (!sending && body.trim()) void dispatchChat(body).catch(() => {}); };
 
   // Queue the typed message to deliver into this chat at a future time.
   const scheduleAt = (ms: number, label: string) => {
@@ -235,33 +469,42 @@ export function SessionChatScreen() {
               </Text>
             </View>
           ) : (
-            turns.map((j) => <Turn key={j.id} job={j} />)
+            turns.map((j, i) => <Turn key={j.id} job={j} onAnswer={answer} answered={i < turns.length - 1} />)
           )}
         </ScrollView>
       )}
 
       {/* composer */}
-      <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 8, paddingHorizontal: 12, paddingTop: 10, paddingBottom: insets.bottom + 10, borderTopWidth: 0.5, borderTopColor: theme.color.separator, backgroundColor: theme.color.bgGrouped }}>
-        <Pressable onPress={openScheduler} style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.fillSecondary }}>
-          <Icon name="clock" size={19} color={theme.color.inkSecondary} />
-        </Pressable>
-        <View style={{ flex: 1, minHeight: 44, maxHeight: 130, borderRadius: 22, backgroundColor: theme.color.bgElevated, borderWidth: 0.5, borderColor: theme.color.separator, paddingHorizontal: 16, justifyContent: 'center' }}>
-          <TextInput
-            value={text}
-            onChangeText={setText}
-            placeholder="Message the agent…"
-            placeholderTextColor={theme.color.inkTertiary}
-            multiline
-            style={{ fontSize: 16, lineHeight: 21, color: theme.color.ink, paddingVertical: 11 }}
-          />
+      <View style={{ paddingBottom: insets.bottom + 10, borderTopWidth: 0.5, borderTopColor: theme.color.separator, backgroundColor: theme.color.bgGrouped }}>
+        {/* effort + model strip — applies to this chat's messages */}
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 14, paddingTop: 9 }}>
+          <EffortDial value={effort} onChange={changeEffort} />
+          <ModelPicker groups={models} value={modelKey} onChange={changeModel} />
+          <View style={{ flex: 1 }} />
         </View>
-        <Pressable
-          onPress={send}
-          disabled={!text.trim() || sending}
-          style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: text.trim() && !sending ? theme.color.blue : theme.color.fillSecondary }}
-        >
-          {sending ? <ActivityIndicator size="small" color="#fff" /> : <Icon name="send" size={19} color={text.trim() ? '#fff' : theme.color.inkTertiary} />}
-        </Pressable>
+        {/* input row */}
+        <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 8, paddingHorizontal: 12, paddingTop: 8 }}>
+          <Pressable onPress={openScheduler} style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.fillSecondary }}>
+            <Icon name="clock" size={19} color={theme.color.inkSecondary} />
+          </Pressable>
+          <View style={{ flex: 1, minHeight: 44, maxHeight: 130, borderRadius: 22, backgroundColor: theme.color.bgElevated, borderWidth: 0.5, borderColor: theme.color.separator, paddingHorizontal: 16, justifyContent: 'center' }}>
+            <TextInput
+              value={text}
+              onChangeText={setText}
+              placeholder="Message the agent…"
+              placeholderTextColor={theme.color.inkTertiary}
+              multiline
+              style={{ fontSize: 16, lineHeight: 21, color: theme.color.ink, paddingVertical: 11 }}
+            />
+          </View>
+          <Pressable
+            onPress={send}
+            disabled={!text.trim() || sending}
+            style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: text.trim() && !sending ? theme.color.blue : theme.color.fillSecondary }}
+          >
+            {sending ? <ActivityIndicator size="small" color="#fff" /> : <Icon name="send" size={19} color={text.trim() ? '#fff' : theme.color.inkTertiary} />}
+          </Pressable>
+        </View>
       </View>
 
       {/* schedule (queue a message) */}

@@ -337,6 +337,8 @@ export function buildServer(): FastifyInstance {
   app.post('/api/workspaces/:id/budget', async (req, reply) =>
     forward(reply, 'setBudgetCap', { ...(req.body ?? {}) as Record<string, unknown>, workspaceId: (req.params as { id: string }).id }));
   app.post('/api/projects', async (req, reply) => forward(reply, 'createProject', (req.body ?? {}) as Record<string, unknown>));
+  // Read-only folder browser on the Mac (for the phone's new-project location picker).
+  app.get('/api/browse', async (req, reply) => forward(reply, 'browseDir', { path: (req.query as { path?: string }).path }));
   app.post('/api/projects/:id/update', async (req, reply) =>
     forward(reply, 'updateProject', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/projects/reorder', async (req, reply) => forward(reply, 'reorderProjects', (req.body ?? {}) as Record<string, unknown>));

@@ -5,17 +5,35 @@ import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Card, SectionLabel, ProgressBar, Mono } from '../ui';
-import { api, type DashboardData, type Approval, type Job } from '../api';
-import { getStr } from '../storage';
+import { api, type DashboardData, type Approval, type Job, type ChatSession, type Project } from '../api';
+import { getStr, cacheGet, cacheSet } from '../storage';
 import { eventAllowed } from '../notifPrefs';
 import { useLive } from '../useLive';
+
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** Time-of-day greeting. */
+function greetingFor(h: number): string {
+  if (h < 5) return 'Good night';
+  if (h < 12) return 'Good morning';
+  if (h < 18) return 'Good afternoon';
+  return 'Good evening';
+}
+/** "Wednesday, Jun 18 · 1:37 AM" (manual format — no reliance on Intl). */
+function dateTimeLine(now: number): string {
+  const d = new Date(now);
+  const h = d.getHours();
+  const min = String(d.getMinutes()).padStart(2, '0');
+  const time = `${(h % 12) || 12}:${min} ${h < 12 ? 'AM' : 'PM'}`;
+  return `${WEEKDAYS[d.getDay()]}, ${MONTHS[d.getMonth()]} ${d.getDate()} · ${time}`;
+}
 
 /** Resolved project label + accent for a live row. */
 type ProjVM = { name: string; color: string };
 
 type GateVM = { id: string; proj: ProjVM; icon: IconName; tint: string; type: string; summary: string; age: string };
 type LiveVM = { id: string; proj: ProjVM; name: string; verb: string; tint: string; pct: number; cost: string };
-type DoneVM = { ok: boolean; name: string; cost: string; when: string };
 
 /** Color names carried by live projects -> theme accent. */
 type ColorName = 'blue' | 'purple' | 'indigo' | 'teal' | 'orange' | 'green' | 'red';
@@ -142,9 +160,15 @@ export function HomeScreen() {
 
   const [gates, setGates] = useState<GateVM[]>([]);
   const [live, setLive] = useState<LiveVM[]>([]);
-  const [done, setDone] = useState<DoneVM[]>([]);
   const [strip, setStrip] = useState({ spend: 0, scheduled: 0, done: 0 });
   const [unread, setUnread] = useState(false);
+  // Recent chats — seeded from cache (shared with Projects) for an instant render.
+  const [sessions, setSessions] = useState<ChatSession[]>(() => cacheGet('sessions', []));
+  const [projects, setProjects] = useState<Project[]>(() => cacheGet('projects', []));
+  const [allJobs, setAllJobs] = useState<Job[]>(() => cacheGet('jobs', []));
+  const [now, setNow] = useState(Date.now());
+  // Live clock for the greeting (minute granularity is enough).
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(t); }, []);
 
   // Resolve a live project's accent name -> theme color, falling back softly.
   const colorFor = useCallback(
@@ -174,15 +198,6 @@ export function HomeScreen() {
         }),
       );
 
-      setDone(
-        d.recentlyCompleted.map((j: Job): DoneVM => ({
-          ok: j.status === 'done',
-          name: j.title,
-          cost: j.cost.toFixed(2),
-          when: agoLong(j.updatedAt),
-        })),
-      );
-
       setStrip({ spend: d.budget.spent, scheduled: d.schedule.length, done: d.recentlyCompleted.length });
     },
     [colorFor, theme],
@@ -194,6 +209,14 @@ export function HomeScreen() {
       apply(d);
     } catch {
       /* fail soft — keep last good state */
+    }
+    // Recent chats: sessions + projects + jobs (cache-then-network, shared cache).
+    try {
+      const [ss, ps, js] = await Promise.all([api.listSessions(), api.listProjects(), api.listJobs()]);
+      setSessions(ss); setProjects(ps); setAllJobs(js);
+      cacheSet('sessions', ss); cacheSet('projects', ps); cacheSet('jobs', js);
+    } catch {
+      /* keep cached chats */
     }
     // Unread badge: any allowed event newer than the last "mark all read".
     try {
@@ -233,13 +256,28 @@ export function HomeScreen() {
     [`${strip.done} ✓`, 'done'],
   ];
 
+  // Latest chats across projects — sorted by last activity, for one-tap resume.
+  const projMap = new Map(projects.map((p) => [p.id, p]));
+  const recentSessions = sessions
+    .filter((s) => !s.archived)
+    .map((s) => {
+      let last = s.updatedAt;
+      for (const j of allJobs) if (j.sessionId === s.id && j.updatedAt > last) last = j.updatedAt;
+      return { s, last };
+    })
+    .sort((a, b) => b.last - a.last)
+    .slice(0, 5);
+
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
-      <ScrollView contentContainerStyle={{ paddingTop: insets.top + 6, paddingBottom: 24 }} showsVerticalScrollIndicator={false}>
-        {/* large title header */}
-        <View style={{ paddingHorizontal: 20, paddingBottom: 10, flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' }}>
-          <Text style={{ fontSize: 34, fontWeight: '700', letterSpacing: -0.7, color: theme.color.ink }}>Maestro</Text>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 18 }}>
+      <ScrollView contentContainerStyle={{ paddingTop: insets.top + 6, paddingBottom: 96 }} showsVerticalScrollIndicator={false}>
+        {/* greeting + live time */}
+        <View style={{ paddingHorizontal: 20, paddingBottom: 16, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' }}>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkTertiary }}>{dateTimeLine(now)}</Text>
+            <Text style={{ fontSize: 30, fontWeight: '700', letterSpacing: -0.6, color: theme.color.ink, marginTop: 3 }}>{greetingFor(new Date(now).getHours())}</Text>
+          </View>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 18, paddingTop: 6 }}>
             <Pressable onPress={() => nav.navigate('Queue')} hitSlop={8}>
               <Icon name="clock" size={23} color={theme.color.ink} />
             </Pressable>
@@ -254,7 +292,35 @@ export function HomeScreen() {
 
         <NeedsYou gates={gates} onApprove={onApprove} />
 
+        {/* jump back in — latest chats, one tap into the conversation */}
+        {recentSessions.length > 0 ? (
+          <View style={{ paddingHorizontal: 20, marginBottom: 22 }}>
+            <SectionLabel icon="chat" color={theme.color.blue}>Jump back in</SectionLabel>
+            <Card>
+              {recentSessions.map(({ s, last }, i) => {
+                const p = projMap.get(s.projectId);
+                const tint = p && isColorName(p.color) ? theme.color[p.color] : theme.color.inkTertiary;
+                return (
+                  <Pressable
+                    key={s.id}
+                    onPress={() => nav.navigate('SessionChat', { projectId: s.projectId, sessionId: s.id, title: s.title })}
+                    style={{ flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, paddingHorizontal: 15, borderBottomWidth: i < recentSessions.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}
+                  >
+                    <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: tint }} />
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text numberOfLines={1} style={{ fontSize: 15, fontWeight: '600', color: theme.color.ink }}>{s.title || 'Untitled chat'}</Text>
+                      <Text numberOfLines={1} style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 2 }}>{p?.name ?? 'Project'} · {agoLong(last)}</Text>
+                    </View>
+                    <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
+                  </Pressable>
+                );
+              })}
+            </Card>
+          </View>
+        ) : null}
+
         {/* live now */}
+        {live.length > 0 ? (
         <View style={{ paddingHorizontal: 20, marginBottom: 22 }}>
           <SectionLabel icon="bolt" color={theme.color.purple}>Live now</SectionLabel>
           <View style={{ gap: 9 }}>
@@ -282,6 +348,7 @@ export function HomeScreen() {
             })}
           </View>
         </View>
+        ) : null}
 
         {/* today strip */}
         <Pressable onPress={() => nav.navigate('Budget')} style={{ flexDirection: 'row', marginHorizontal: 20, marginBottom: 22, paddingVertical: 14, paddingHorizontal: 18, borderRadius: 14, backgroundColor: theme.color.bgGrouped, borderWidth: 0.5, borderColor: theme.color.separator }}>
@@ -295,22 +362,33 @@ export function HomeScreen() {
             </React.Fragment>
           ))}
         </Pressable>
-
-        {/* recently finished */}
-        <View style={{ paddingHorizontal: 20 }}>
-          <Text style={{ fontSize: 13, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary, marginBottom: 11 }}>Recently finished</Text>
-          <Card>
-            {done.map((d, i) => (
-              <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, paddingHorizontal: 15, borderBottomWidth: i < done.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}>
-                <Icon name={d.ok ? 'checkCircle' : 'xCircle'} size={18} color={d.ok ? theme.color.green : theme.color.red} />
-                <Text numberOfLines={1} style={{ flex: 1, fontSize: 15, fontWeight: '500', color: theme.color.ink }}>{d.name}</Text>
-                <Mono style={{ fontSize: 13, color: theme.color.inkSecondary }}>${d.cost}</Mono>
-                <Text style={{ fontSize: 12, color: theme.color.inkTertiary, width: 56, textAlign: 'right' }}>{d.when}</Text>
-              </View>
-            ))}
-          </Card>
-        </View>
       </ScrollView>
+
+      {/* New job — Home is the jobs hub now (no Jobs tab). */}
+      <Pressable
+        onPress={() => nav.navigate('NewJob')}
+        style={({ pressed }) => ({
+          position: 'absolute',
+          bottom: insets.bottom + 16,
+          right: 18,
+          flexDirection: 'row',
+          alignItems: 'center',
+          gap: 8,
+          height: 52,
+          paddingHorizontal: 20,
+          borderRadius: 26,
+          backgroundColor: theme.color.blue,
+          shadowColor: theme.color.blue,
+          shadowOpacity: 0.4,
+          shadowRadius: 12,
+          shadowOffset: { width: 0, height: 8 },
+          elevation: 6,
+          transform: [{ scale: pressed ? 0.95 : 1 }],
+        })}
+      >
+        <Icon name="plus" size={22} color="#fff" stroke={2.4} />
+        <Text style={{ fontSize: 16, fontWeight: '600', color: '#fff' }}>New job</Text>
+      </Pressable>
     </View>
   );
 }
