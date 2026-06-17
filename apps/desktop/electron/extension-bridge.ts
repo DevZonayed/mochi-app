@@ -18,9 +18,13 @@ import type { Store } from './store.js';
 type Dispatch = (method: string, params: Record<string, unknown>) => Promise<unknown>;
 
 const DEFAULT_PORT = 9234;
+/** Server→client keepalive cadence. A peer that misses a ping/pong round is a
+    zombie (half-open socket) and gets terminated so it can't hold the "active"
+    slot or a stale snapshot subscription. */
+const HEARTBEAT_MS = 15000;
 
 /** A connected Chrome profile (one WS per profile, keyed by its stable clientId). */
-interface Peer { ws: WebSocket; clientId: string; profile: string; active: boolean; lastActiveAt: number }
+interface Peer { ws: WebSocket; clientId: string; profile: string; active: boolean; lastActiveAt: number; alive: boolean }
 
 export interface ExtensionStatus {
   running: boolean;
@@ -35,6 +39,10 @@ export class ExtensionBridge {
   private peers = new Map<string, Peer>(); // keyed by clientId — one per Chrome profile
   private port: number;
   private snapTimer: ReturnType<typeof setTimeout> | null = null;
+  private hbTimer: ReturnType<typeof setInterval> | null = null;
+  // app→extension RPC (browser automation): outstanding requests keyed by id.
+  private reqSeq = 1;
+  private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
 
   constructor(
     private store: Store,
@@ -53,14 +61,34 @@ export class ExtensionBridge {
     this.wss.on('listening', () => { this.listening = true; this.publishStatus(); });
     this.wss.on('connection', (ws) => this.onConnection(ws));
     this.wss.on('error', () => { this.listening = false; this.publishStatus(); /* e.g. port in use */ });
+    this.startHeartbeat();
   }
 
   stop(): void {
+    if (this.hbTimer) { clearInterval(this.hbTimer); this.hbTimer = null; }
     if (this.snapTimer) { clearTimeout(this.snapTimer); this.snapTimer = null; }
+    this.rejectAllPending('extension bridge stopped');
     for (const p of this.peers.values()) { try { p.ws.close(); } catch { /* gone */ } }
     this.peers.clear();
     try { this.wss?.close(); } catch { /* already closed */ }
     this.listening = false;
+  }
+
+  /** Periodic WS ping to every peer. Browsers auto-answer ping frames with a
+      pong (invisible to page JS), so a peer that didn't pong since the last tick
+      is genuinely gone — terminate it, which fires `close` → detach → promotion
+      of the next profile. Unref'd so it never holds the app process open. */
+  private startHeartbeat(): void {
+    if (this.hbTimer) return;
+    const t = setInterval(() => {
+      for (const p of this.peers.values()) {
+        if (!p.alive) { try { p.ws.terminate(); } catch { /* already gone */ } continue; }
+        p.alive = false;
+        try { p.ws.ping(); } catch { /* surfaces as a close */ }
+      }
+    }, HEARTBEAT_MS);
+    t.unref();
+    this.hbTimer = t;
   }
 
   // ── status (for the Settings panel + app-side takeover) ──────────────────
@@ -103,7 +131,11 @@ export class ExtensionBridge {
     // A reconnecting profile keeps its prior active flag; a brand-new profile
     // becomes active only if nobody is active yet.
     const active = prev?.active ?? !someoneActive;
-    this.peers.set(clientId, { ws, clientId, profile, active, lastActiveAt: prev?.lastActiveAt ?? (active ? Date.now() : 0) });
+    this.peers.set(clientId, { ws, clientId, profile, active, lastActiveAt: prev?.lastActiveAt ?? (active ? Date.now() : 0), alive: true });
+    // A pong (auto-sent by the browser in reply to our heartbeat ping) proves
+    // this exact socket is still live. Guard on `p.ws === ws` so a late pong from
+    // a replaced socket can't revive a reconnected peer's new entry.
+    ws.on('pong', () => { const p = this.peers.get(clientId); if (p && p.ws === ws) p.alive = true; });
     if (active) this.setActive(clientId); else this.broadcastLifecycle();
     this.send(ws, { type: 'welcome', clientId, active });
     this.send(ws, this.snapshotMessage(active));
@@ -114,6 +146,9 @@ export class ExtensionBridge {
     const wasActive = this.peers.get(clientId)?.active;
     this.peers.delete(clientId);
     if (wasActive) {
+      // In-flight browser commands were routed to this (now gone) profile — fail
+      // them fast instead of waiting for the per-request timeout.
+      this.rejectAllPending('browser profile disconnected');
       // Promote the most-recently-active remaining profile, if any.
       const next = [...this.peers.values()].sort((a, b) => b.lastActiveAt - a.lastActiveAt)[0];
       if (next) this.setActive(next.clientId);
@@ -173,6 +208,16 @@ export class ExtensionBridge {
     if (msg.type === 'request_takeover') { this.setActive(clientId); return; }
     if (msg.type === 'ping') { this.send(ws, { type: 'pong' }); return; }
     const id = msg.id;
+    // A reply to one of OUR app→ext requests (browser automation): {id, ok, result|error}, no `type`.
+    if (id != null && msg.type === undefined && 'ok' in msg) {
+      const p = this.pending.get(String(id));
+      if (p) {
+        clearTimeout(p.timer); this.pending.delete(String(id));
+        if (msg.ok) p.resolve(msg.result);
+        else p.reject(new Error(typeof msg.error === 'string' ? msg.error : 'browser command failed'));
+      }
+      return;
+    }
     if (id == null) return; // not an RPC
     try {
       const result = await this.action(String(msg.type ?? ''), (msg.params as Record<string, unknown>) ?? {});
@@ -224,8 +269,11 @@ export class ExtensionBridge {
     const selector = str(params.selector);
     const added = await this.dispatch('addDesignComment', { id: projectId, selector, label, note }) as { comment: { id: string } };
     let deliveredSession: string | undefined;
-    const sessionId = params.sessionId ? str(params.sessionId) : '';
-    if (sessionId && params.deliverToChat !== false) {
+    // A null sessionId means "+ New chat" — deliver() opens a fresh chat with the
+    // comment body. Only skip delivery when the caller explicitly opts out, so
+    // picking an element + "New chat" actually starts a chat (not silently drop).
+    const sessionId = params.sessionId ? str(params.sessionId) : null;
+    if (params.deliverToChat !== false) {
       const body = [
         `💬 Browser comment on **${label}**${url ? ` — ${url}` : ''}:`,
         note,
@@ -234,6 +282,35 @@ export class ExtensionBridge {
       try { deliveredSession = (await this.deliver(projectId, sessionId, body)).sessionId; } catch { /* comment is still saved */ }
     }
     return { commentId: added.comment.id, sessionId: deliveredSession };
+  }
+
+  // ── app→extension RPC: drive the ACTIVE Chrome profile (browser automation) ──
+  private activePeer(): Peer | undefined { for (const p of this.peers.values()) if (p.active) return p; return undefined; }
+
+  /** Is there a live Chrome profile the agent can drive right now? */
+  hasActiveBrowser(): boolean { return !!this.activePeer(); }
+  /** The active profile's label (for agent/UI context), or null. */
+  activeProfile(): string | null { return this.activePeer()?.profile ?? null; }
+
+  /** Run a browser-automation command (navigate/click/snapshot/type/…) against the
+      ACTIVE profile and resolve with its result. The extension already dispatches
+      `{id,type,params,clientId}` through its automation switch and replies
+      `{id,ok,result|error}`; this is the app-side caller + correlation that was the
+      missing half of "Round 2". Throws (503) when no browser is connected. */
+  async request(type: string, params: Record<string, unknown> = {}, timeoutMs = 30000): Promise<unknown> {
+    const peer = this.activePeer();
+    if (!peer) throw Object.assign(new Error('No browser connected. Open the Mochi Chrome extension and activate a profile (the app shows it under Settings → Browser extension).'), { statusCode: 503 });
+    const id = `a${this.reqSeq++}`;
+    return new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => { if (this.pending.delete(id)) reject(new Error(`browser '${type}' timed out after ${Math.round(timeoutMs / 1000)}s`)); }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      this.send(peer.ws, { id, type, params, clientId: peer.clientId });
+    });
+  }
+
+  private rejectAllPending(reason: string): void {
+    for (const p of this.pending.values()) { clearTimeout(p.timer); try { p.reject(new Error(reason)); } catch { /* */ } }
+    this.pending.clear();
   }
 
   private send(ws: WebSocket, obj: unknown): void {

@@ -50,6 +50,15 @@ const ENGINE_MAX_RETRIES = 2;
 // Design mode (the Design genre): steer the agent to produce ONE self-contained,
 // live-previewable HTML artifact — the OpenDesign "agent-native design" model, but
 // on Maestro's own engines + image-gen. Prepended to every turn of a design project.
+const BROWSER_DIRECTIVE =
+  `\n\n---\n\n[Browser mode ON] The user turned on BROWSER for this message: drive their REAL connected Chrome ` +
+  `via the mcp__maestro__browser_navigate / browser_snapshot / browser_read / browser_links / browser_click / ` +
+  `browser_type tools — do NOT use WebSearch/WebFetch. First call mcp__maestro__browser_status to confirm a ` +
+  `profile is connected; if none, tell the user to open the Mochi extension and pair it (the app shows the token ` +
+  `under Settings → Browser extension). Then browser_navigate to the relevant site and read it with ` +
+  `browser_snapshot / browser_read before acting. Accomplish the task on the live page; only fall back to ` +
+  `WebSearch if no browser is connected.`;
+
 const DESIGN_DIRECTIVE =
   `\n\n---\n\n[Design mode] You are a senior product designer working in a live design ` +
   `canvas. Build and iteratively refine ONE self-contained artifact at \`design/index.html\` ` +
@@ -386,6 +395,24 @@ interface BgCtx {
   stop: (id: string) => { id: string; status: string } | null;
 }
 
+/** Structural view of ExtensionBridge — kept loose so engine.ts doesn't couple to it. */
+interface ExtensionBridgeLike {
+  hasActiveBrowser: () => boolean;
+  activeProfile: () => string | null;
+  request: (type: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
+}
+
+/** Agent-facing BROWSER capability: drive the user's REAL Chrome (the active Mochi
+    extension profile) over the local control channel, backed by ExtensionBridge.request
+    in LocalEngine.run. This is the agent half of "Round 2" — the user asks the in-app
+    agent to use "my browser" and it drives their actual logged-in Chrome (with the
+    extension's live cursor/HUD), not a sandbox. Off in plan mode / with no bridge. */
+interface BrowserCtx {
+  connected: () => boolean;
+  profile: () => string | null;
+  call: (type: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
+}
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -394,6 +421,7 @@ async function runClaude(
   images?: { mime: string; b64: string }[],
   skillsCtx?: SkillsCtx,
   bgCtx?: BgCtx,
+  browserCtx?: BrowserCtx,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -427,7 +455,7 @@ async function runClaude(
     ].filter(Boolean).join(', ');
     return `- ${s.id} — ${s.name}: ${s.description || '(no description)'}${bits ? ` [${bits}]` : ''}`;
   };
-  const maestroServer = ((imageGen || skillsCtx || bgCtx) && !plan)
+  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
@@ -531,6 +559,53 @@ async function runClaude(
                 return txt(r ? `Stopped background task ${a.id} (status ${r.status}).` : `No background task ${a.id}.`);
               })),
           ] : []),
+          ...(browserCtx ? [
+            tool('browser_status',
+              'Check whether the user\'s real Chrome browser is connected (via the Mochi extension) and which profile is active. Use before the other browser_* tools if unsure a browser is available.',
+              {},
+              wrap(async () => {
+                if (!browserCtx.connected()) return txt('No browser connected. Ask the user to open the Mochi Chrome extension and pair/activate a profile (the app shows the token under Settings → Browser extension).');
+                let where = '';
+                try { const t = await browserCtx.call('tab_url') as { url?: string }; if (t?.url) where = ` Current tab: ${t.url}`; } catch { /* no tab yet */ }
+                return txt(`Browser connected — active profile "${browserCtx.profile() ?? 'Chrome'}".${where}`);
+              })),
+            tool('browser_navigate',
+              'Open a URL in the USER\'S OWN real Chrome (their logged-in session) via the Mochi extension. Use this WHENEVER the user says "my browser", "go to my browser", "open …", "browse …", "check this site", or asks you to act on a real website (shop, search, log-in-walled page, fill a form). This is NOT WebFetch/WebSearch — it drives their actual visible browser with a live cursor. After navigating, call browser_snapshot or browser_read to see the page.',
+              { url: z.string().describe('The URL to open, including scheme, e.g. https://www.daraz.com.bd.') },
+              wrap(async (a: { url: string }) => {
+                try { const r = await browserCtx.call('navigate', { url: a.url }, 45000) as { url?: string }; return txt(`Opened ${r?.url ?? a.url} in the user's browser. Use browser_snapshot or browser_read to see the page.`); }
+                catch (e) {
+                  if (/no active session|session_start first/i.test(String((e as Error).message ?? e))) {
+                    await browserCtx.call('session_start', { url: a.url, title: 'Maestro Agent', color: 'blue' }, 45000);
+                    return txt(`Opened a new browser tab at ${a.url}. Use browser_snapshot or browser_read to see the page.`);
+                  }
+                  throw e;
+                }
+              })),
+            tool('browser_snapshot',
+              'Read the current page in the user\'s browser as an accessibility tree (roles, names, and CSS refs you can click). Use after browser_navigate to understand the page and find elements for browser_click.',
+              {},
+              wrap(async () => txt(JSON.stringify(await browserCtx.call('snapshot'), null, 2).slice(0, 24000)))),
+            tool('browser_read',
+              'Extract the visible TEXT of the current page in the user\'s browser (optionally focused by a query). Use this to actually read content — search results, product listings, article text — after navigating.',
+              { query: z.string().optional().describe('Optional keyword/substring to focus the extraction.'), limit: z.number().optional().describe('Max blocks (default 80).') },
+              wrap(async (a: { query?: string; limit?: number }) => {
+                const r = await browserCtx.call('text', { query: a.query, limit: a.limit ?? 80 }) as { text?: string };
+                return txt((typeof r?.text === 'string' ? r.text : JSON.stringify(r)).slice(0, 16000));
+              })),
+            tool('browser_links',
+              'List links on the current page in the user\'s browser (text + href), optionally filtered. Use to find where to navigate next (a product page, a category, a result).',
+              { query: z.string().optional().describe('Optional keyword to filter links.') },
+              wrap(async (a: { query?: string }) => txt(JSON.stringify(await browserCtx.call('links', { query: a.query, limit: 50 })).slice(0, 12000)))),
+            tool('browser_click',
+              'Click an element in the user\'s browser by CSS selector (get selectors from browser_snapshot). Use to press buttons, open a result, add to cart, etc. The page may navigate — follow up with browser_snapshot/browser_read.',
+              { ref: z.string().describe('A CSS selector for the element, e.g. "button.add-to-cart" or "a[href*=\'product\']".') },
+              wrap(async (a: { ref: string }) => { const r = await browserCtx.call('click', { ref: a.ref }, 45000) as { url?: string }; return txt(`Clicked ${a.ref}.${r?.url ? ` Now at ${r.url}.` : ''} Use browser_snapshot/browser_read to see the result.`); })),
+            tool('browser_type',
+              'Type text into an input/textarea in the user\'s browser (e.g. a search box). Optionally submit (press Enter) — handy for running a search.',
+              { ref: z.string().describe('CSS selector for the input.'), text: z.string().describe('The text to type.'), submit: z.boolean().optional().describe('Press Enter after typing (e.g. to run a search).') },
+              wrap(async (a: { ref: string; text: string; submit?: boolean }) => { await browserCtx.call('type', { ref: a.ref, text: a.text, submit: !!a.submit }); return txt(`Typed into ${a.ref}${a.submit ? ' and submitted' : ''}. Use browser_snapshot/browser_read to see the result.`); })),
+          ] : []),
         ],
       })
     : null;
@@ -538,6 +613,7 @@ async function runClaude(
     ...(imageGen ? ['generate_image'] : []),
     ...(skillsCtx ? ['search_skills', 'get_skill', 'download_skill', 'add_skill_to_project', 'list_project_skills', 'remove_project_skill'] : []),
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
+    ...(browserCtx ? ['browser_status', 'browser_navigate', 'browser_snapshot', 'browser_read', 'browser_links', 'browser_click', 'browser_type'] : []),
   ].map(n => `mcp__maestro__${n}`);
   /* Vision input: when the user attached images, the prompt becomes a streamed
      user message carrying text + base64 image blocks (a plain string can't hold
@@ -926,6 +1002,11 @@ export class LocalEngine {
      generate_image tool; publishing registers codex-produced PNGs as Assets. */
   private imageGen?: ImageGenFn;
   setImageGen(fn: ImageGenFn) { this.imageGen = fn; }
+  /** The browser-extension control channel (ExtensionBridge), injected from main.ts.
+      A getter (not the instance) so a late/missing bridge is harmless — browser tools
+      simply report "no browser connected" until a Chrome profile pairs + activates. */
+  private extBridge?: () => ExtensionBridgeLike | null;
+  setExtensionBridge(fn: () => ExtensionBridgeLike | null) { this.extBridge = fn; }
   /** Public entry the UI/dispatch use to (re)generate or edit an image outside a
       coding turn — routes through the SAME backend (Codex/fal) the generate_image
       tool uses, so a one-click "Regenerate" or a "modify this image" instruction
@@ -1234,7 +1315,7 @@ export class LocalEngine {
   }
 
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
-  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; plan?: boolean; goal?: boolean } = {}): Promise<Job> {
+  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; plan?: boolean; goal?: boolean; browser?: boolean } = {}): Promise<Job> {
     const job = this.store.getJob(jobId);
     if (!job) throw Object.assign(new Error('job not found'), { statusCode: 404 });
     const project = this.store.getProject(job.projectId);
@@ -1519,8 +1600,20 @@ export class LocalEngine {
         list: () => this.bgList(job.projectId).map(r => ({ id: r.id, command: r.command, status: r.status, pid: r.pid })),
         stop: (id: string) => { const r = this.bgStop(id); return r ? { id: r.id, status: r.status } : null; },
       } : undefined;
+      // Browser capability: drive the user's real Chrome (the active Mochi profile)
+      // when asked to use "my browser". Claude turns only (not plan mode); each
+      // browser_* tool reports clearly if no profile is connected.
+      const bridge = this.extBridge?.() ?? null;
+      const browserCtx: BrowserCtx | undefined = (bridge && !opts.plan) ? {
+        connected: () => bridge.hasActiveBrowser(),
+        profile: () => bridge.activeProfile(),
+        call: (type, params, timeoutMs) => bridge.request(type, params ?? {}, timeoutMs),
+      } : undefined;
+      // Browser mode (composer toggle): the maestro MCP tools are deferred, so an
+      // explicit directive ensures the agent loads + uses the real-Chrome tools.
+      if (opts.browser && browserCtx) prompt += BROWSER_DIRECTIVE;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx)
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx)
         : runCodex(prompt, cwd, hooks, false, masterModel, imageCtx, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
@@ -1560,7 +1653,7 @@ export class LocalEngine {
           };
           let cont: EngineRun;
           try {
-            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx);
+            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx);
           } catch (ce) { if (ce instanceof CancelledError || ac.signal.aborted) throw ce; break; }
           main = {
             text: cont.text || main.text,

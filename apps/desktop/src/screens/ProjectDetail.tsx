@@ -8,6 +8,8 @@
 import React from 'react';
 import { useNavigate, useParams, useLocation } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
+import { RichComposer, type RichComposerHandle, type ComposerChip } from './RichComposer';
+import { FileTypeIcon } from '../lib/fileIcons';
 import { FileChip, IS_WRITE_TOOL } from '../lib/fileChip';
 import {
   GroupedList,
@@ -84,7 +86,7 @@ const PAGE_CSS = `
 
   /* "thinking" shimmer text before the first token */
   @keyframes thinkSweep { to { background-position: -200% 0; } }
-  .think-shimmer { background: linear-gradient(100deg, var(--ink-tertiary) 30%, var(--ink) 50%, var(--ink-tertiary) 70%);
+  .think-shimmer { background: linear-gradient(100deg, var(--ink-secondary) 32%, var(--ink) 50%, var(--ink-secondary) 68%);
     background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
     animation: thinkSweep 1.5s linear infinite; }
 
@@ -2039,6 +2041,52 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: 
 /* Composer slash-commands — type `/` to scaffold a coding instruction. These are
    Maestro's own prompt commands (they work the same whichever engine runs the
    chat), shown in a menu like Claude Code's. */
+// Per-session composer queue, persisted to localStorage so the "N queued" box
+// survives the chat unmounting — e.g. navigating to Settings (a sibling route)
+// and back, which otherwise drops the in-memory queue. Keyed by sessionId.
+const QUEUE_KEY = (sid: string) => `maestro.chat.queue.${sid}`;
+const readQueue = (sid: string | null): string[] => {
+  if (!sid) return [];
+  try { const a = JSON.parse(localStorage.getItem(QUEUE_KEY(sid)) || '[]'); return Array.isArray(a) ? a.filter((x: unknown): x is string => typeof x === 'string') : []; }
+  catch { return []; }
+};
+const writeQueue = (sid: string | null, q: string[]): void => {
+  if (!sid) return;
+  try { if (q.length) localStorage.setItem(QUEUE_KEY(sid), JSON.stringify(q)); else localStorage.removeItem(QUEUE_KEY(sid)); }
+  catch { /* ignore quota / serialisation */ }
+};
+
+// Composer @-mentions — typing `@` suggests a capability; selecting it turns the
+// capability on (shown as its iconed capsule in the toolbar) and tidies the token.
+const MENTIONS: { id: string; label: string; icon: IconName; desc: string }[] = [
+  { id: 'browser', label: 'Browser', icon: 'globe', desc: 'Drive your real connected Chrome for this message' },
+];
+
+// Fast client-side fuzzy match over the project's flat file index (for @-file search).
+function isSubseq(hay: string, needle: string): boolean {
+  let i = 0;
+  for (let j = 0; j < hay.length && i < needle.length; j++) if (hay[j] === needle[i]) i++;
+  return i === needle.length;
+}
+function fuzzyFiles(files: string[], q: string, limit: number): string[] {
+  const ql = q.toLowerCase();
+  const out: { p: string; s: number }[] = [];
+  for (const p of files) {
+    const pl = p.toLowerCase();
+    const base = pl.slice(pl.lastIndexOf('/') + 1);
+    let s: number;
+    if (base === ql) s = 0;
+    else if (base.startsWith(ql)) s = 1;
+    else if (base.includes(ql)) s = 2;
+    else if (pl.includes(ql)) s = 3;
+    else if (isSubseq(pl, ql)) s = 4;
+    else continue;
+    out.push({ p, s });
+  }
+  out.sort((a, b) => a.s - b.s || a.p.length - b.p.length || a.p.localeCompare(b.p));
+  return out.slice(0, limit).map(x => x.p);
+}
+
 const SLASH_COMMANDS: { cmd: string; desc: string; template: string }[] = [
   { cmd: 'plan', desc: 'Plan the work before building', template: 'Make a step-by-step plan for: ' },
   { cmd: 'explain', desc: 'Explain how something works', template: 'Explain how this works: ' },
@@ -2107,7 +2155,8 @@ function ChatMinimap({ turns, scrollRef }: { turns: Job[]; scrollRef: React.RefO
 type Attach =
   | { id: string; kind: 'image'; name: string; mime: string; dataUrl: string }
   | { id: string; kind: 'text'; name: string; content: string }
-  | { id: string; kind: 'file'; name: string; mime: string; dataB64: string; size: number };
+  | { id: string; kind: 'file'; name: string; mime: string; dataB64: string; size: number }
+  | { id: string; kind: 'ref'; name: string; path: string; isDir: boolean };
 const SUPPORTED_IMG = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 const TEXT_EXT = /\.(txt|md|markdown|mdx|rst|json|jsonc|ya?ml|toml|ini|cfg|conf|csv|tsv|log|xml|html?|svg|css|scss|sass|less|js|jsx|ts|tsx|mjs|cjs|py|rb|go|rs|java|kt|kts|c|h|cc|cpp|hpp|cs|php|swift|m|mm|sh|bash|zsh|fish|sql|graphql|gql|env|gitignore|dockerfile|makefile|gradle|properties|vue|svelte|astro|r|lua|pl|pm|dart|ex|exs|erl|clj|scala|tf|proto)$/i;
 const isTextFile = (f: File): boolean =>
@@ -2166,12 +2215,17 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [goalMode, setGoalModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.goal') === '1'; } catch { return false; } });
   const setPlanMode = (on: boolean) => { setPlanModeState(on); try { localStorage.setItem('maestro.chat.plan', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setGoalModeState(false); try { localStorage.setItem('maestro.chat.goal', '0'); } catch { /* ignore */ } } };
   const setGoalMode = (on: boolean) => { setGoalModeState(on); try { localStorage.setItem('maestro.chat.goal', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setPlanModeState(false); try { localStorage.setItem('maestro.chat.plan', '0'); } catch { /* ignore */ } } };
+  // Browser mode: drive the user's REAL connected Chrome (the Mochi extension) for
+  // this turn via the agent's browser_* tools. Orthogonal to plan/goal; persisted.
+  const [browserMode, setBrowserModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.browser') === '1'; } catch { return false; } });
+  const setBrowserMode = (on: boolean) => { setBrowserModeState(on); try { localStorage.setItem('maestro.chat.browser', on ? '1' : '0'); } catch { /* ignore */ } };
   const primaryProvider = React.useMemo(() => {
     for (const g of modelGroups) { const d = g.models.find(m => m.key === primaryKey); if (d) return d.provider; }
     return 'claude';
   }, [modelGroups, primaryKey]);
   const [sendError, setSendError] = React.useState('');
   const [slashSel, setSlashSel] = React.useState(0);
+  const [mentionSel, setMentionSel] = React.useState(0);
   const [optsOpen, setOptsOpen] = React.useState(false); // reviewer + schedule popover
   const [schedNote, setSchedNote] = React.useState('');
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
@@ -2190,16 +2244,33 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   attachmentsRef.current = attachments; // fresh count for addFiles' over-cap notice
   const activeRef = React.useRef<string | null>(activeId);
   activeRef.current = activeId;
+  // Mutate the queue AND persist it for the current session in one step, so the
+  // queue box survives navigating away (which unmounts this chat) and back.
+  const mutateQueue = React.useCallback((fn: (prev: string[]) => string[]) => {
+    setQueue(prev => { const next = fn(prev); writeQueue(activeRef.current, next); return next; });
+  }, []);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const stickBottom = React.useRef(true);
-  const taRef = React.useRef<HTMLTextAreaElement>(null);
+  const composerRef = React.useRef<RichComposerHandle>(null);
+  const [mentionQuery, setMentionQuery] = React.useState<string | null>(null);
+  const [composerBrowser, setComposerBrowser] = React.useState(false);
+  // @-mention file search: a flat project file index, fetched once (cached ~15s) the
+  // first time the menu opens, then fuzzy-filtered client-side for instant results.
+  const [fileIndex, setFileIndex] = React.useState<{ projectId: string; files: string[]; at: number } | null>(null);
+  React.useEffect(() => {
+    if (mentionQuery === null || !projectId) return;
+    if (fileIndex && fileIndex.projectId === projectId && Date.now() - fileIndex.at < 15000) return;
+    let alive = true;
+    void api.listProjectFiles(projectId).then(files => { if (alive) setFileIndex({ projectId, files, at: Date.now() }); });
+    return () => { alive = false; };
+  }, [mentionQuery, projectId, fileIndex]);
 
   // Controlled active session: follow the parent (tab switch / rail pick / new chat).
   React.useEffect(() => { setActiveId(sessionId); }, [sessionId]);
 
   // Turns of the open session (ascending — a chat thread). Queue is per-session.
   React.useEffect(() => {
-    setQueue([]);
+    setQueue(readQueue(activeId)); // restore this session's persisted queue
     if (!activeId) { setTurns([]); return; }
     let alive = true;
     api.listJobs(undefined, activeId)
@@ -2259,7 +2330,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     if (el && stickBottom.current) el.scrollTop = el.scrollHeight;
   }, [turns]);
 
-  React.useEffect(() => { if (autoFocus) taRef.current?.focus(); }, [autoFocus]);
+  React.useEffect(() => { if (autoFocus) composerRef.current?.focus(); }, [autoFocus]);
 
   const lastTurn = turns.length ? turns[turns.length - 1] : null;
   const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending');
@@ -2270,16 +2341,22 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     const list = atts ?? [];
     const imgs = list.filter((a): a is Extract<Attach, { kind: 'image' }> => a.kind === 'image')
       .map(a => ({ name: a.name, mime: a.mime, dataB64: a.dataUrl.includes(',') ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : a.dataUrl }));
-    const files = list.filter(a => a.kind !== 'image').map(a => a.kind === 'text'
+    const files = list.filter(a => a.kind !== 'image' && a.kind !== 'ref').map(a => a.kind === 'text'
       ? { name: a.name, kind: 'text' as const, content: a.content }
       : { name: a.name, kind: 'file' as const, mime: (a as Extract<Attach, { kind: 'file' }>).mime, dataB64: (a as Extract<Attach, { kind: 'file' }>).dataB64 });
-    if ((!t && !imgs.length && !files.length) || !projectId) return false;
+    // File/folder reference capsules: passed to the local agent as on-disk paths
+    // (it reads them with its own tools — no bytes uploaded; folders work too).
+    const refs = list.filter((a): a is Extract<Attach, { kind: 'ref' }> => a.kind === 'ref');
+    if ((!t && !imgs.length && !files.length && !refs.length) || !projectId) return false;
+    const body = refs.length
+      ? `${t ? t + '\n\n' : ''}Attached ${refs.length === 1 ? 'path' : 'paths'} (on this Mac — read directly from disk):\n${refs.map(r => `- ${r.isDir ? 'folder' : 'file'}: \`${r.path}\``).join('\n')}`
+      : t;
     setSendError('');
     stickBottom.current = true;
     try {
       const resp = await api.sendChat({
-        projectId, text: t, sessionId: activeRef.current ?? undefined,
-        effort: EFFORT_TO_API[effort], plan: planMode, goal: goalMode,
+        projectId, text: body, sessionId: activeRef.current ?? undefined,
+        effort: EFFORT_TO_API[effort], plan: planMode, goal: goalMode, browser: browserMode || composerBrowser,
         ...(primaryKey ? { modelKey: primaryKey } : {}),
         ...(reviewerKey ? { reviewerKey } : {}),
         ...(imgs.length ? { images: imgs } : {}),
@@ -2298,29 +2375,27 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
       return false;
     }
-  }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, onSessionCreated]);
+  }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, browserMode, composerBrowser, onSessionCreated]);
 
   // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
   const sendText = React.useCallback((raw: string) => {
     const t = raw.trim();
     if (!t || !projectId) return;
-    setText('');
-    if (taRef.current) taRef.current.style.height = 'auto';
-    if (streaming) { setQueue(q => [...q, t]); return; }
-    void sendRaw(t).then(ok => { if (!ok) setText(raw); });
-  }, [projectId, streaming, sendRaw]);
+    composerRef.current?.clear();
+    if (streaming) { mutateQueue(q => [...q, t]); return; }
+    void sendRaw(t).then(ok => { if (!ok) composerRef.current?.setText(raw); });
+  }, [projectId, streaming, sendRaw, mutateQueue]);
 
   // STEER: interrupt the running turn and send right now (session resumes with context).
   const sendNow = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
     const t = raw.trim();
     if (!t && !(atts?.length)) return false;
-    setText('');
-    if (taRef.current) taRef.current.style.height = 'auto';
+    composerRef.current?.clear();
     if (lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending')) {
       try { await api.cancelJob(lastTurn.id); } catch { /* already gone */ }
     }
     const ok = await sendRaw(t, atts);
-    if (!ok) setText(raw);
+    if (!ok) composerRef.current?.setText(raw);
     return ok;
   }, [lastTurn, sendRaw]);
 
@@ -2349,7 +2424,44 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       }
     }
   }, [pushAttach]);
-  const onPaste = React.useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+  // Drag-drop of real files/folders → reference capsules carrying the absolute path
+  // (the local agent reads them straight from disk). Folders are supported — bytes
+  // can't represent a directory. Falls back to a byte-attachment when no path is
+  // available (e.g. a web/phone remote, or a file dragged from a browser).
+  const onDropItems = React.useCallback((e: React.DragEvent) => {
+    e.preventDefault(); setDragOver(false);
+    const dt = e.dataTransfer; if (!dt) return;
+    // In-app drag from the Files panel → reference chip(s) by project-relative path.
+    const inApp = dt.getData('application/x-maestro-path');
+    if (inApp) {
+      try {
+        const refs = JSON.parse(inApp) as { name?: string; path: string; isDir?: boolean }[];
+        const chips: ComposerChip[] = (Array.isArray(refs) ? refs : []).filter(r => r && r.path)
+          .map(r => ({ kind: 'file', name: r.name || r.path.split('/').filter(Boolean).pop() || r.path, path: r.path, isDir: !!r.isDir }));
+        if (chips.length) { setSendError(''); composerRef.current?.insertChips(chips); }
+      } catch { /* malformed payload — ignore */ }
+      return;
+    }
+    const getPath = (window as unknown as { maestro?: { getPathForFile?: (f: File) => string } }).maestro?.getPathForFile;
+    const items = Array.from(dt.items || []).filter(it => it.kind === 'file');
+    const chips: ComposerChip[] = [];
+    const bytes: File[] = [];
+    if (items.length && getPath) {
+      for (const it of items) {
+        const entry = it.webkitGetAsEntry?.();
+        const file = it.getAsFile?.();
+        if (!file) continue;
+        let path = ''; try { path = getPath(file) || ''; } catch { path = ''; }
+        if (path) chips.push({ kind: 'file', name: entry?.name || file.name || path.split('/').filter(Boolean).pop() || path, path, isDir: !!entry?.isDirectory });
+        else bytes.push(file);
+      }
+    } else {
+      for (const f of Array.from(dt.files || [])) bytes.push(f);
+    }
+    if (chips.length) { setSendError(''); composerRef.current?.insertChips(chips); }
+    if (bytes.length) addFiles(bytes);
+  }, [addFiles]);
+  const onPaste = React.useCallback((e: React.ClipboardEvent<HTMLDivElement>) => {
     const items = e.clipboardData?.items;
     const imgs: File[] = [];
     if (items) for (const it of Array.from(items)) if (it.kind === 'file' && it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) imgs.push(f); }
@@ -2371,9 +2483,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     const t = text.trim(); const imgs = attachments;
     if ((!t && !imgs.length) || !projectId) return;
     if (!imgs.length) { sendText(text); return; }
-    setText(''); setAttachments([]); if (taRef.current) taRef.current.style.height = 'auto';
+    composerRef.current?.clear(); setAttachments([]);
     if (streaming) void sendNow(t, imgs).then(ok => { if (!ok) setAttachments(imgs); });
-    else void sendRaw(t, imgs).then(ok => { if (!ok) { setText(t); setAttachments(imgs); } });
+    else void sendRaw(t, imgs).then(ok => { if (!ok) { composerRef.current?.setText(t); setAttachments(imgs); } });
   }, [text, attachments, projectId, streaming, sendText, sendNow, sendRaw]);
   const sendComposedNow = React.useCallback(() => {
     const t = text.trim(); const imgs = attachments;
@@ -2382,9 +2494,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     void sendNow(t, imgs.length ? imgs : undefined).then(ok => { if (!ok) setAttachments(imgs); });
   }, [text, attachments, projectId, sendNow]);
 
-  const removeFromQueue = (i: number) => setQueue(q => q.filter((_, j) => j !== i));
+  const removeFromQueue = (i: number) => mutateQueue(q => q.filter((_, j) => j !== i));
   // Reorder = reprioritize: the drainer always fires queue[0] next.
-  const moveInQueue = (from: number, to: number) => setQueue(q => {
+  const moveInQueue = (from: number, to: number) => mutateQueue(q => {
     if (from === to || from < 0 || to < 0 || from >= q.length || to >= q.length) return q;
     const next = q.slice();
     const [item] = next.splice(from, 1);
@@ -2392,7 +2504,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     return next;
   });
   const sendQueuedNow = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); void sendNow(t); };
-  const editQueued = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); setText(t); taRef.current?.focus(); requestAnimationFrame(() => autoGrow()); };
+  const editQueued = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); composerRef.current?.setText(t); composerRef.current?.focus(); };
 
   // Drain the queue: when the agent goes idle and items are waiting, fire the next.
   const drainingRef = React.useRef(false);
@@ -2400,18 +2512,13 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     if (streaming || queue.length === 0 || drainingRef.current) return;
     drainingRef.current = true;
     const next = queue[0];
-    setQueue(q => q.slice(1));
+    mutateQueue(q => q.slice(1));
     void sendRaw(next).finally(() => { drainingRef.current = false; });
-  }, [streaming, queue, sendRaw]);
+  }, [streaming, queue, sendRaw, mutateQueue]);
 
   const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
 
-  const autoGrow = () => {
-    const el = taRef.current; if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = Math.min(150, el.scrollHeight) + 'px';
-  };
-  const fillComposer = (v: string) => { setText(v); taRef.current?.focus(); requestAnimationFrame(autoGrow); };
+  const fillComposer = (v: string) => { composerRef.current?.setText(v); composerRef.current?.focus(); };
   // Wait-&-check: schedule a one-shot follow-up that pokes this chat after a delay.
   const scheduleCheck = (delayMs: number, label: string) => {
     setOptsOpen(false);
@@ -2430,7 +2537,27 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const slashList = slashQuery !== null ? SLASH_COMMANDS.filter(c => c.cmd.startsWith(slashQuery)) : [];
   const slashOpen = slashQuery !== null && slashList.length > 0;
   const slashIdx = Math.min(slashSel, Math.max(0, slashList.length - 1));
-  const applySlash = (c: { template: string }) => { setText(c.template); requestAnimationFrame(() => { taRef.current?.focus(); autoGrow(); }); };
+  const applySlash = (c: { template: string }) => { composerRef.current?.setText(c.template); composerRef.current?.focus(); };
+
+  // @-mention menu: capability mentions (Browser) + fast project-file search. The
+  // query is set by RichComposer (DOM caret detection), so it works anywhere mid-line.
+  const mentionFiles = (() => {
+    const q = (mentionQuery ?? '').trim();
+    if (!q || !fileIndex || fileIndex.projectId !== projectId) return [] as string[];
+    return fuzzyFiles(fileIndex.files, q, 7);
+  })();
+  type MentionItem = { t: 'cap'; m: typeof MENTIONS[number] } | { t: 'file'; path: string };
+  const mentionItems: MentionItem[] = [
+    ...(mentionQuery !== null ? MENTIONS.filter(m => m.id.startsWith(mentionQuery) || m.label.toLowerCase().startsWith(mentionQuery)).map((m): MentionItem => ({ t: 'cap', m })) : []),
+    ...mentionFiles.map((p): MentionItem => ({ t: 'file', path: p })),
+  ];
+  const mentionOpen = mentionQuery !== null && mentionItems.length > 0 && !slashOpen;
+  const mentionIdx = Math.min(mentionSel, Math.max(0, mentionItems.length - 1));
+  const applyMentionItem = (it: MentionItem) => {
+    if (it.t === 'cap') composerRef.current?.applyMention({ kind: 'mention', id: it.m.id, label: it.m.label, icon: it.m.icon });
+    else composerRef.current?.applyMention({ kind: 'file', name: it.path.split('/').pop() || it.path, path: it.path, isDir: false });
+    setMentionQuery(null); setMentionSel(0);
+  };
 
   return (
     <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)', overflow: 'hidden',
@@ -2516,10 +2643,37 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               ))}
             </div>
           )}
+          {mentionOpen && (
+            <div style={{ marginBottom: 8, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.22))', overflow: 'hidden', padding: 5 }}>
+              <div style={{ padding: '4px 9px 5px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: 'var(--ink-tertiary)', textTransform: 'uppercase' }}>Mention</div>
+              {mentionItems.map((it, i) => (
+                <button key={it.t === 'cap' ? 'c:' + it.m.id : 'f:' + it.path} onMouseEnter={() => setMentionSel(i)} onClick={() => applyMentionItem(it)}
+                  style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 10px', borderRadius: 8, cursor: 'pointer',
+                    background: i === mentionIdx ? 'var(--fill-tertiary)' : 'transparent' }}>
+                  {it.t === 'cap' ? (
+                    <>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 9px', borderRadius: 999, flexShrink: 0,
+                        background: 'color-mix(in srgb, var(--green) 14%, transparent)', border: '1px solid color-mix(in srgb, var(--green) 40%, transparent)',
+                        color: 'var(--green)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                        <Icon name={it.m.icon} size={13} /> @{it.m.label.toLowerCase()}
+                      </span>
+                      <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>{it.m.desc}</span>
+                    </>
+                  ) : (
+                    <>
+                      <FileTypeIcon name={it.path.split('/').pop() || it.path} size={15} />
+                      <span style={{ font: '600 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{it.path.split('/').pop()}</span>
+                      <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1.2 var(--font-mono)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'right' }}>{it.path.split('/').slice(0, -1).join('/')}</span>
+                    </>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
           <div className={`composer-card composer-eff${effort === 'MAX' ? ' composer-ultra' : ''}`}
-            onDragOver={e => { if (Array.from(e.dataTransfer?.types ?? []).includes('Files')) { e.preventDefault(); setDragOver(true); } }}
+            onDragOver={e => { const types = Array.from(e.dataTransfer?.types ?? []); if (types.includes('Files') || types.includes('application/x-maestro-path')) { e.preventDefault(); setDragOver(true); } }}
             onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false); }}
-            onDrop={e => { e.preventDefault(); setDragOver(false); addFiles(e.dataTransfer?.files ?? null); }}
+            onDrop={onDropItems}
             style={{ borderRadius: 18, border: `1px solid ${dragOver ? 'var(--blue)' : 'var(--separator-strong)'}`, background: 'var(--bg-elevated)',
             boxShadow: dragOver ? '0 0 0 3px color-mix(in srgb, var(--blue) 22%, transparent)' : 'var(--card-shadow)', padding: '10px 10px 8px 14px',
             transition: 'border-color 120ms ease, box-shadow 120ms ease', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
@@ -2530,6 +2684,18 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                     <img src={a.dataUrl} alt={a.name} title={a.name} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
                     <button onClick={() => removeAttachment(a.id)} title="Remove" style={{ position: 'absolute', top: 2, right: 2, width: 18, height: 18, borderRadius: '50%', border: 'none', display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.6)', color: '#fff', cursor: 'pointer', padding: 0 }}>
                       <Icon name="x" size={11} stroke={2.8} />
+                    </button>
+                  </div>
+                ) : a.kind === 'ref' ? (
+                  <div key={a.id} title={a.path}
+                    style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: 8, maxWidth: 240, height: 40, padding: '0 30px 0 9px', borderRadius: 10, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0 }}>
+                    <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: a.isDir ? 'color-mix(in srgb, var(--purple) 16%, transparent)' : 'color-mix(in srgb, var(--blue) 16%, transparent)', color: a.isDir ? 'var(--purple)' : 'var(--blue)' }}><Icon name={a.isDir ? 'folder' : 'file'} size={14} /></span>
+                    <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+                      <span style={{ font: '600 var(--fs-caption)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.name}</span>
+                      <span style={{ font: '400 9px/1.1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{a.isDir ? 'folder · read from disk' : 'file · read from disk'}</span>
+                    </span>
+                    <button onClick={() => removeAttachment(a.id)} title="Remove" style={{ position: 'absolute', top: 11, right: 8, width: 18, height: 18, borderRadius: '50%', border: 'none', display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', cursor: 'pointer', padding: 0 }}>
+                      <Icon name="x" size={10} stroke={2.8} />
                     </button>
                   </div>
                 ) : (
@@ -2570,23 +2736,33 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               );
             })()}
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
-              <textarea ref={taRef} value={text} rows={1} onChange={e => { setText(e.target.value); autoGrow(); }}
+              <RichComposer
+                ref={composerRef}
+                disabled={!projectId}
+                placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
+                onTextChange={setText}
+                onChips={info => setComposerBrowser(info.hasBrowser)}
+                onMention={q => { setMentionQuery(q); if (q === null) setMentionSel(0); }}
                 onPaste={onPaste}
                 onKeyDown={e => {
+                  if (e.nativeEvent.isComposing) return;
+                  if (mentionOpen) {
+                    if (e.key === 'ArrowDown') { e.preventDefault(); setMentionSel((mentionIdx + 1) % mentionItems.length); return; }
+                    if (e.key === 'ArrowUp') { e.preventDefault(); setMentionSel((mentionIdx - 1 + mentionItems.length) % mentionItems.length); return; }
+                    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); applyMentionItem(mentionItems[mentionIdx]); return; }
+                    // Space confirms the highlighted item (so "@browser " becomes the chip).
+                    if (e.key === ' ' && mentionQuery) { e.preventDefault(); applyMentionItem(mentionItems[mentionIdx]); return; }
+                    if (e.key === 'Escape') { e.preventDefault(); setMentionQuery(null); return; }
+                  }
                   if (slashOpen) {
                     if (e.key === 'ArrowDown') { e.preventDefault(); setSlashSel((slashIdx + 1) % slashList.length); return; }
                     if (e.key === 'ArrowUp') { e.preventDefault(); setSlashSel((slashIdx - 1 + slashList.length) % slashList.length); return; }
                     if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); applySlash(slashList[slashIdx]); return; }
-                    if (e.key === 'Escape') { e.preventDefault(); setText(''); return; }
+                    if (e.key === 'Escape') { e.preventDefault(); composerRef.current?.clear(); return; }
                   }
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) sendComposedNow(); else sendComposed(); }
                 }}
-                placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent…'}
-                title="Enter to send · Shift+Enter for a new line · while running: Enter queues, ⌘Enter sends now"
-                disabled={!projectId}
-                style={{ flex: 1, resize: 'none', border: 'none', outline: 'none', background: 'transparent',
-                  color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '6px 0',
-                  minHeight: 24, maxHeight: 150, boxSizing: 'content-box' }} />
+              />
               {streaming ? (
                 <>
                   {canSend && (
@@ -2637,6 +2813,13 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   color: goalMode ? 'var(--purple)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                 <Icon name="target" size={14} /> {primaryProvider === 'codex' ? 'Pursue goal' : 'Goal'}
               </button>
+              <button onClick={() => setBrowserMode(!browserMode)} title={browserMode ? 'Browser mode on — the agent drives your connected Chrome (Mochi extension)' : 'Use my browser — drive your real connected Chrome for this task'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9, cursor: 'pointer',
+                  background: browserMode ? 'color-mix(in srgb, var(--green) 14%, transparent)' : 'var(--fill-secondary)',
+                  border: browserMode ? '1px solid color-mix(in srgb, var(--green) 45%, transparent)' : '1px solid transparent',
+                  color: browserMode ? 'var(--green)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                <Icon name="globe" size={14} /> Browser
+              </button>
               {/* secondary options — reviewer model + schedule — tucked behind one button to keep the bar clean */}
               <div style={{ position: 'relative' }}>
                 <button onClick={() => setOptsOpen(o => !o)} title="Reviewer & schedule"
@@ -2669,7 +2852,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               {schedNote && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)', display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}><Icon name="check" size={12} /> {schedNote}</span>}
               <span style={{ flex: 1, minWidth: 6 }} />
               {streaming
-                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>
+                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>
                     <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn ? liveActivity(lastTurn, lastTurn.transcript ?? []) : 'Working…'}
                   </span>
                 : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{planMode ? 'Plan · ⏎' : goalMode ? 'Goal · ⏎' : queue.length ? `${queue.length} queued` : '⏎ to send'}</span>}

@@ -730,7 +730,7 @@ function segMatch(s: Skill, key: string): boolean {
     || (key === 'quarantined' && s.scan === 'quarantined');
 }
 
-export default function SkillsRegistry() {
+export default function SkillsRegistry({ embedded = false }: { embedded?: boolean } = {}) {
   const navigate = useNavigate();
   const scale = useAppScale();
   const [theme, setTheme] = useTheme('light');
@@ -779,9 +779,10 @@ export default function SkillsRegistry() {
   }, [refreshRegistry]);
 
   React.useEffect(() => {
+    if (embedded) return; // Settings hosts its own ⌘K when this renders as a pane
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
-  }, []);
+  }, [embedded]);
 
   const onNav = (key: string) => navigate(pathForNav(key));
 
@@ -821,20 +822,9 @@ export default function SkillsRegistry() {
   let rows = skills.filter(s => segMatch(s, seg));
   if (query) rows = rows.map(s => ({ s, r: rank(s, query) })).filter(x => x.r > 0).sort((a, b) => b.r - a.r).map(x => x.s);
 
-  return (
-    <>
-      <style>{PAGE_CSS}</style>
-      <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
-        <div style={{
-          width: '100%', height: '100%', overflow: 'hidden', position: 'relative', background: 'var(--bg)',
-          display: 'flex',
-        }}>
-          <div className="app-wallpaper" aria-hidden="true" />
-          <TrafficLights />
-          <Sidebar active="skills" onNav={onNav} onWorkspace={() => {}} />
-
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, position: 'relative', zIndex: 1 }}>
-            <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} />
+  const body = (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, position: 'relative', zIndex: 1 }}>
+      {!embedded && <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} />}
 
             {open ? (
               <SkillDetail s={open} onBack={() => setOpen(null)} onAdd={onToggleSkill} onRescan={onRescanSkill} />
@@ -912,10 +902,39 @@ export default function SkillsRegistry() {
                 </div>
               </main>
             )}
-          </div>
+    </div>
+  );
 
-          <PublishSheet open={publish} onClose={() => setPublish(false)} onPublished={(s) => setSkills(prev => [s, ...prev.filter(x => x.id !== s.id)])} />
-          {added && <AddedToast skill={added} onDone={() => setAdded(null)} />}
+  const overlays = (
+    <>
+      <PublishSheet open={publish} onClose={() => setPublish(false)} onPublished={(s) => setSkills(prev => [s, ...prev.filter(x => x.id !== s.id)])} />
+      {added && <AddedToast skill={added} onDone={() => setAdded(null)} />}
+    </>
+  );
+
+  if (embedded) {
+    return (
+      <>
+        <style>{PAGE_CSS}</style>
+        {body}
+        {overlays}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <style>{PAGE_CSS}</style>
+      <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
+        <div style={{
+          width: '100%', height: '100%', overflow: 'hidden', position: 'relative', background: 'var(--bg)',
+          display: 'flex',
+        }}>
+          <div className="app-wallpaper" aria-hidden="true" />
+          <TrafficLights />
+          <Sidebar active="skills" onNav={onNav} onWorkspace={() => {}} />
+          {body}
+          {overlays}
           <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
         </div>
       </div>

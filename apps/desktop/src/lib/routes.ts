@@ -46,7 +46,7 @@ export const ALL_NAV: NavRoute[] = [...NAV_ROUTES, SETTINGS_ROUTE, FEEDBACK_ROUT
     Projects, Trends and Approvals are hidden too (Approvals surfaces as a bell only
     when a gate is actually pending). Every route stays registered in App.tsx, so
     dropping a key here hides the menu without breaking the route. */
-export const CODING_NAV: NavRoute[] = (['workspace', 'design', 'jobs', 'scheduler'] as const)
+export const CODING_NAV: NavRoute[] = (['workspace', 'design', 'scheduler'] as const)
   .map(k => NAV_ROUTES.find(r => r.key === k))
   .filter((r): r is NavRoute => !!r);
 

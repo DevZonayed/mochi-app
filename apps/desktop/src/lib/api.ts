@@ -405,6 +405,7 @@ interface Bridge {
   assetImage?: (assetId: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   readFile?: (projectId: string, p: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   listDir?: (projectId: string, p?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  listProjectFiles?: (projectId: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   runCommand?: (projectId: string, command: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   killCommand?: (runId: string) => Promise<{ ok: boolean }>;
   onCmdOutput?: (cb: (p: CmdOutput) => void) => () => void;
@@ -652,6 +653,12 @@ export const api = {
     if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'list failed');
     return r.data as { path: string; entries: DirEntry[] };
   },
+  /** Flat project file index (relative paths) for fast @-mention file search. */
+  listProjectFiles: async (projectId: string): Promise<string[]> => {
+    if (!bridge?.listProjectFiles) return [];
+    try { const r = await bridge.listProjectFiles(projectId); const d = r?.data as { files?: string[] } | undefined; return r?.ok && Array.isArray(d?.files) ? d!.files : []; }
+    catch { return []; }
+  },
   /** Run / Terminal — run a shell command in the project folder (desktop only). */
   runCommand: async (projectId: string, command: string): Promise<{ runId: string } | null> => {
     if (!bridge?.runCommand) return null;
@@ -734,7 +741,7 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; images?: { name?: string; mime: string; dataB64: string }[]; files?: { name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; browser?: boolean; images?: { name?: string; mime: string; dataB64: string }[]; files?: { name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   renameSession: (id: string, title: string) =>

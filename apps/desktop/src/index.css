@@ -91,3 +91,6 @@ label,
   background: color-mix(in srgb, var(--ink) 54%, transparent);
   background-clip: padding-box;
 }
+/* Horizontal strips that scroll sideways when narrow (e.g. the files-panel tabs)
+   must hide the chunky horizontal bar — they scroll by wheel/trackpad instead. */
+.ws-tabs::-webkit-scrollbar { height: 0; width: 0; }

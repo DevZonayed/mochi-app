@@ -20,6 +20,8 @@ import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type
 import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
 import { WhatsNew } from '../lib/WhatsNew';
 import { EngineSetup } from '../EngineSetup';
+import SkillsRegistry from './SkillsRegistry';
+import BudgetDashboard from './BudgetDashboard';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -138,7 +140,8 @@ interface SetNavItem { key: string; icon: IconName; label: string; tint: string;
 const SET_NAV: SetNavItem[] = [
   { key: 'general', icon: 'settings', label: 'General', tint: 'var(--ink-secondary)' },
   { key: 'engines', icon: 'cpu', label: 'Engines', tint: 'var(--purple)' },
-  // Skills + Costs are launchers, not top-nav menus — they open the full screens.
+  // Skills + Costs render as full-bleed panes inside Settings (their full screens,
+  // minus the standalone window chrome) so the Settings sidebar stays put.
   { key: 'skills', icon: 'spark', label: 'Skills & tools', tint: 'var(--indigo)' },
   { key: 'costs', icon: 'gauge', label: 'Costs', tint: 'var(--green)' },
   { key: 'accounts', icon: 'key', label: 'Accounts & keys', tint: 'var(--blue)' },
@@ -798,6 +801,8 @@ export default function Settings() {
   const panes: Record<string, React.ReactNode> = {
     general: <GeneralPane theme={theme} setTheme={setTheme} workspace={workspace} />,
     engines: <EnginesPane />,
+    skills: <SkillsRegistry embedded />,
+    costs: <BudgetDashboard embedded />,
     accounts: <AccountsPane />,
     security: <SecurityPane onExportAudit={() => navigate('/audit')} />,
     devices: <DevicesPane onPair={() => navigate('/device-pairing')} />,
@@ -827,7 +832,7 @@ export default function Settings() {
                 {SET_NAV.map(n => {
                   const on = sec === n.key;
                   return (
-                    <button key={n.key} onClick={() => n.key === 'skills' ? navigate('/skills-registry') : n.key === 'costs' ? navigate('/budget') : setSec(n.key)} className={on ? '' : 'set-nav'} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 38, padding: '0 10px', borderRadius: 8, textAlign: 'left',
+                    <button key={n.key} onClick={() => setSec(n.key)} className={on ? '' : 'set-nav'} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 38, padding: '0 10px', borderRadius: 8, textAlign: 'left',
                       background: on ? 'var(--blue)' : 'transparent', color: on ? '#fff' : 'var(--ink)', font: `${on ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`, transition: 'background 140ms ease' }}>
                       <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: on ? 'rgba(255,255,255,0.2)' : `color-mix(in srgb, ${n.tint} 14%, transparent)`, color: on ? '#fff' : n.tint }}><Icon name={n.icon} size={15} /></span>
                       {n.label}
@@ -836,10 +841,17 @@ export default function Settings() {
                 })}
               </div>
             </aside>
-            {/* pane */}
-            <main style={{ flex: 1, overflowY: 'auto', padding: '28px 32px 40px' }}>
-              <div key={sec} className="pane-fade" style={{ maxWidth: 640 }}>{panes[sec]}</div>
-            </main>
+            {/* pane — Skills/Costs embed their full screens, so they take the pane
+                full-bleed (own scroll + padding) instead of the maxWidth column. */}
+            {sec === 'skills' || sec === 'costs' ? (
+              <main style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                <div key={sec} className="pane-fade" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>{panes[sec]}</div>
+              </main>
+            ) : (
+              <main style={{ flex: 1, overflowY: 'auto', padding: '28px 32px 40px' }}>
+                <div key={sec} className="pane-fade" style={{ maxWidth: 640 }}>{panes[sec]}</div>
+              </main>
+            )}
           </div>
         </div>
       </div>
