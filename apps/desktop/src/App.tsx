@@ -1,6 +1,7 @@
 import React from 'react';
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { UpdateBanner } from './lib/UpdateBanner';
+import { NotificationCenter } from './lib/notify';
 
 /* Real application entry. First run → Onboarding (creates the workspace, sets
    the budget); afterwards the app opens straight in the Workspace. There is no
@@ -74,6 +75,7 @@ export function App() {
         </Routes>
       </React.Suspense>
       <UpdateBanner />
+      <NotificationCenter />
     </HashRouter>
   );
 }
