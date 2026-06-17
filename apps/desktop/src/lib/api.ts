@@ -241,9 +241,12 @@ export interface ModelGroup {
   reason: string;
   models: ModelDescriptor[];
 }
+export interface DevicePresence { connected: boolean; streams: number; lastSeen: number | null; name: string | null }
 export interface PairingInfo {
   token: string;
   relayUrl: string;
+  /** Live remote-device presence (phone/web), reported by the relay. */
+  devices?: DevicePresence;
 }
 export type AppEventKind =
   | 'job-done' | 'job-failed' | 'job-cancelled'
@@ -955,9 +958,10 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onDevices?: (d: DevicePresence) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
+        if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as DevicePresence);
         if (name === 'engine-download' && handlers.onEngineDownload) handlers.onEngineDownload(data as EngineDownloadProgress);
         if (name === 'bg' && handlers.onBg) handlers.onBg(data as BgTask);
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);

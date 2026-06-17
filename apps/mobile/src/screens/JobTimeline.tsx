@@ -16,8 +16,6 @@ function isProjectColor(c: string): c is ProjectColorName {
   return (PROJECT_COLORS as readonly string[]).includes(c);
 }
 
-const TOOL_OUTPUT = 'PASS  test/auth/session.test.ts\nTests: 24 passed\nTime:  3.18s';
-
 /** Breathing dot — mirrors the design's `.breathe` purple pulse. */
 function Breathe({ color, size = 6 }: { color: string; size?: number }) {
   const a = useRef(new Animated.Value(1)).current;
@@ -99,55 +97,6 @@ function Narration({ children, caret }: { children: React.ReactNode; caret?: boo
   );
 }
 
-function Tool({ cmd, time }: { cmd: string; time: string }) {
-  const { theme } = useTheme();
-  const [open, setOpen] = useState(false);
-  return (
-    <View>
-      <Pressable
-        onPress={() => setOpen((o) => !o)}
-        style={{
-          flexDirection: 'row',
-          alignItems: 'center',
-          gap: 8,
-          paddingVertical: 11,
-          paddingHorizontal: 13,
-          borderTopLeftRadius: 11,
-          borderTopRightRadius: 11,
-          borderBottomLeftRadius: open ? 0 : 11,
-          borderBottomRightRadius: open ? 0 : 11,
-          backgroundColor: theme.color.fillSecondary,
-        }}
-      >
-        <View style={{ transform: [{ rotate: open ? '90deg' : '0deg' }] }}>
-          <Icon name="chevronRight" size={13} color={theme.color.inkTertiary} />
-        </View>
-        <Text numberOfLines={1} style={{ flex: 1, fontSize: 14, fontWeight: '500', fontFamily: theme.fontFamily.mono, color: theme.color.ink }}>
-          {cmd}
-        </Text>
-        <Icon name="check" size={13} color={theme.color.green} stroke={2.6} />
-        <Mono style={{ fontSize: 12, color: theme.color.inkTertiary }}>{time}</Mono>
-      </Pressable>
-      {open ? (
-        <View
-          style={{
-            paddingVertical: 11,
-            paddingHorizontal: 13,
-            backgroundColor: theme.color.bgElevated,
-            borderWidth: 0.5,
-            borderTopWidth: 0,
-            borderColor: theme.color.separator,
-            borderBottomLeftRadius: 11,
-            borderBottomRightRadius: 11,
-          }}
-        >
-          <Mono style={{ fontSize: 12, lineHeight: 19, color: theme.color.inkSecondary }}>{TOOL_OUTPUT}</Mono>
-        </View>
-      ) : null}
-    </View>
-  );
-}
-
 /** Format seconds elapsed (since createdAt) as mm:ss. */
 function elapsedLabel(createdAt: number, updatedAt: number): string {
   const secs = Math.max(0, Math.floor((updatedAt - createdAt) / 1000));
@@ -161,7 +110,8 @@ export function JobTimelineScreen() {
   const insets = useSafeAreaInsets();
   const nav = useNavigation<any>();
   const route = useRoute<any>();
-  const routeJobId: string | undefined = route.params?.id;
+  // Callers pass `id` (Budget) or `jobId` (Jobs list) — accept both.
+  const routeJobId: string | undefined = route.params?.id ?? route.params?.jobId;
 
   const [job, setJob] = useState<Job | null>(null);
   const [projects, setProjects] = useState<Record<string, { name: string; color: string }>>({});
@@ -285,14 +235,13 @@ export function JobTimelineScreen() {
         <Narration>
           {job?.input ?? 'Waiting for job input…'}
         </Narration>
-        <Tool cmd="bash · npm test — auth" time="3.2s" />
 
         <PhaseMark label={`${phaseText} ${isLive ? '●' : '✓'}`} />
         <Narration caret={isLive}>
           {bodyText || (job?.error ?? (isLive ? 'Working…' : 'No output yet.'))}
         </Narration>
 
-        <Pressable onPress={() => nav.navigate('DiffReview')}>
+        <Pressable disabled={!job} onPress={() => job && nav.navigate('DiffReview', { jobId: job.id })}>
           <Card style={{ flexDirection: 'row', alignItems: 'center', gap: 11, padding: 14, borderRadius: 14 } as any}>
             <Icon name="command" size={18} color={theme.color.inkSecondary} />
             <Text style={{ flex: 1, fontSize: 15, fontWeight: '600', color: theme.color.ink }}>
@@ -303,8 +252,6 @@ export function JobTimelineScreen() {
             <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
           </Card>
         </Pressable>
-
-        <Tool cmd="bash · npm run typecheck" time="5.1s" />
       </ScrollView>
 
       {/* jump to live pill */}
