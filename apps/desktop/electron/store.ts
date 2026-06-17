@@ -151,6 +151,11 @@ export interface Schedule {
   nextRun: number | null; lastRun?: number | null; createdAt: number;
   /** One-shot "wait & check": fire once at this absolute time, into a chat. */
   fireAt?: number; sessionId?: string; prompt?: string;
+  /** A user-scheduled chat message (vs. a recurring schedule or wait-&-check):
+      the composer intent is captured so it fires exactly as if sent by hand.
+      'auto-continue' is the same one-shot, created automatically when a Claude run
+      is blocked by the usage limit — it fires "continue" into the chat at reset. */
+  kind?: 'message' | 'auto-continue'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean;
 }
 
 export type EngineId = 'claude' | 'codex';
@@ -823,7 +828,7 @@ export class Store {
 
   // ── Schedules ───────────────────────────────────────────────────────
   listSchedules(): Schedule[] { return [...this.data.schedules].sort((a, b) => a.time.localeCompare(b.time)); }
-  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string }): Schedule {
+  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean }): Schedule {
     const at = s.fireAt ? new Date(s.fireAt) : null;
     const time = s.time ?? (at ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}` : '');
     const rec: Schedule = {
@@ -833,6 +838,11 @@ export class Store {
       ...(s.fireAt ? { fireAt: s.fireAt } : {}),
       ...(s.sessionId ? { sessionId: s.sessionId } : {}),
       ...(s.prompt ? { prompt: s.prompt } : {}),
+      ...(s.kind ? { kind: s.kind } : {}),
+      ...(s.effort ? { effort: s.effort } : {}),
+      ...(s.browser ? { browser: true } : {}),
+      ...(s.plan ? { plan: true } : {}),
+      ...(s.goal ? { goal: true } : {}),
     };
     this.data.schedules.push(rec); this.save();
     return rec;

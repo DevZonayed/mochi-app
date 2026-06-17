@@ -29,6 +29,7 @@ import {
   enginesRoot, managedBinary, systemBinary, bundledBinary, downloadEngine, engineState,
   type EngineState, type DownloadProgress,
 } from './engines.js';
+import { resetFromRateLimitInfo, isUsageLimitMessage, parseUsageLimitReset, type RateLimitInfo } from './limit-reset.js';
 
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
 // coding agent needs real headroom — 4 turns dies mid-`ls`.
@@ -41,6 +42,9 @@ const GOAL_MAX_TURNS = 240;
 // task finishes hands-free, bounded enough to keep worst-case cost in check. Past
 // it the run pauses gracefully (work saved, session resumable), never "failed".
 const AUTO_CONTINUE_MAX_TURNS = 120;
+// Cushion added past a reported usage-limit reset before the auto-continue fires, so
+// a slightly-early reset timestamp doesn't immediately re-hit the cap.
+const LIMIT_RESET_BUFFER_MS = 60_000;
 // The nudge sent when resuming a run that stopped only because it hit its turn limit.
 const CONTINUE_PROMPT =
   'Continue exactly where you left off and finish the task. Do not repeat work already done; ' +
@@ -202,6 +206,13 @@ interface EngineRun {
       `sdkSessionId` can be resumed to continue — so the caller keeps going rather than
       surfacing a dead, failed run. */
   hitMaxTurns?: boolean;
+  /** The run was blocked by the claude.ai usage limit (5-hour / weekly cap). Like
+      `hitMaxTurns` the partial work + `sdkSessionId` are intact; `limitResetsAt` (ms,
+      if known) is when the limit lifts, so the caller can schedule a hands-free
+      "continue" rather than failing the run or burning the transient-retry budget. */
+  hitLimit?: boolean;
+  limitResetsAt?: number;
+  limitType?: string;
 }
 
 /** A finished image: a real raster file on this Mac + the Asset it was saved as. */
@@ -675,6 +686,11 @@ async function runClaude(
   let sdkSessionId: string | undefined;
   // Set when the run stops solely because it ran out of turns (vs. finished or crashed).
   let hitMaxTurns = false;
+  // Set when the run is blocked by the claude.ai usage cap; `limitResetsAt` (ms) is
+  // when it lifts, captured from a rejected rate_limit_event or the error message.
+  let hitLimit = false;
+  let limitResetsAt: number | undefined;
+  let limitType: string | undefined;
   // Live usage: count GENERATED (output) tokens — monotonic, unlike input which
   // collapses once context is cached. Track per-message boundaries from the
   // stream (message_start/delta/stop) so the counter never dips between steps.
@@ -747,6 +763,13 @@ async function runClaude(
           }
         }
         progress();
+      } else if (m.type === 'rate_limit_event') {
+        // claude.ai subscription rate-limit telemetry. A 'rejected' status means
+        // THIS request was blocked by the usage cap — capture the reset time so the
+        // caller can schedule a continue. Warnings ('allowed_warning') are ignored.
+        const info = (raw as { rate_limit_info?: RateLimitInfo }).rate_limit_info;
+        const reset = resetFromRateLimitInfo(info);
+        if (reset != null) { hitLimit = true; limitResetsAt = reset; limitType = info?.rateLimitType; }
       } else if (m.type === 'result') {
         usage = m.usage ?? usage;
         cost = m.total_cost_usd ?? 0;
@@ -774,6 +797,15 @@ async function runClaude(
     // whole job 'failed' (which discarded the work and the resume handle).
     if (/maximum number of turns/i.test(msg)) {
       hitMaxTurns = true;
+    } else if (hitLimit || isUsageLimitMessage(msg)) {
+      // Hard usage cap (not a transient overload): the SDK threw rather than yielding
+      // a result. The partial transcript + sdkSessionId we streamed are intact — swallow
+      // and fall through, flagged `hitLimit`, so the caller schedules a continue instead
+      // of failing the job or wasting the transient-retry budget on a call that can't
+      // succeed until the limit resets. Recover a reset time from the message if the
+      // structured event didn't carry one.
+      hitLimit = true;
+      if (limitResetsAt == null) { const t = parseUsageLimitReset(msg); if (t != null) limitResetsAt = t; }
     } else {
       const detail = stderrTail.trim();
       throw new Error(`${msg}${detail ? `\n${detail}` : ''}`);
@@ -796,6 +828,9 @@ async function runClaude(
     sdkSessionId,
     transcript: items,
     hitMaxTurns,
+    hitLimit,
+    limitResetsAt,
+    limitType,
   };
 }
 
@@ -1631,13 +1666,38 @@ export class LocalEngine {
           if (ac.signal.aborted) throw new CancelledError();
         }
       }
+      // Hard usage cap (claude.ai 5-hour / weekly limit): the run was BLOCKED, not
+      // failed — the partial work + sdkSessionId are intact. Queue a hands-free
+      // "continue" for when the limit resets (CronRunner fires it into THIS session,
+      // resuming the conversation), then pause gracefully with a note. This skips the
+      // doomed max-turns/reviewer passes below (they'd just re-hit the same cap).
+      if (master === 'claude' && main.hitLimit && isChat && main.sdkSessionId && !opts.plan && !ac.signal.aborted) {
+        const reset = main.limitResetsAt;
+        if (reset != null && reset > Date.now()) {
+          const fireAt = reset + LIMIT_RESET_BUFFER_MS;
+          try {
+            const sched = this.store.createSchedule({
+              projectId: job.projectId, sessionId: session.id,
+              title: 'Continue when Claude limit resets', prompt: CONTINUE_PROMPT,
+              fireAt, kind: 'auto-continue', effort,
+            });
+            this.emit('schedule', sched);
+          } catch { /* non-fatal — still show the note below */ }
+          const when = new Date(fireAt).toLocaleString();
+          const note = `⏸ Claude usage limit reached. I’ve scheduled a continue for ${when} — this chat will pick up automatically when the limit resets. (Cancel it any time from the scheduled-messages strip.)`;
+          main = { ...main, text: main.text ? `${main.text}\n\n${note}` : note, transcript: [...main.transcript, { kind: 'text', text: note, ts: Date.now() }] };
+        } else {
+          const note = '⏸ Claude usage limit reached, and no reset time was reported. Send “continue” later and I’ll pick up exactly where this left off.';
+          main = { ...main, text: main.text ? `${main.text}\n\n${note}` : note, transcript: [...main.transcript, { kind: 'text', text: note, ts: Date.now() }] };
+        }
+      }
       // The agent hit its per-run turn ceiling while still mid-task. Don't fail (and
       // throw the work away) — RESUME the same session and keep going, up to a bounded
       // total, so a substantive task finishes hands-free. The first run preserved its
       // partial transcript + sdkSessionId (see runClaude's `hitMaxTurns`); each segment
       // streams live and respects cancellation. If it's STILL going at the hard cap, the
       // run ends gracefully below (work + session preserved) rather than as 'failed'.
-      if (master === 'claude' && main.hitMaxTurns && !opts.plan && !ac.signal.aborted) {
+      if (master === 'claude' && main.hitMaxTurns && !main.hitLimit && !opts.plan && !ac.signal.aborted) {
         const segment = EFFORT_TURNS[effort] ?? EFFORT_TURNS.balanced;
         const ceiling = goalMode ? GOAL_MAX_TURNS : AUTO_CONTINUE_MAX_TURNS;
         let turnsSoFar = goalMode ? GOAL_MAX_TURNS : segment; // the first run already spent ~a segment (goal mode already ran to its cap)
@@ -1713,7 +1773,7 @@ export class LocalEngine {
       const reviewerKey = () => (this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined);
       let reviewVerdict: 'approved' | 'needs-work' | null = null;
 
-      if (reviewer !== 'off' && this.available(reviewer) && (wroteFiles || !isChat) && !ac.signal.aborted) {
+      if (reviewer !== 'off' && this.available(reviewer) && (wroteFiles || !isChat) && !main.hitLimit && !ac.signal.aborted) {
         for (let round = 0; round < REVIEW_MAX_ROUNDS; round++) {
           cur = this.store.updateJob(jobId, { progress: 88, stage: `reviewer (${ENGINE_LABEL[reviewer]}) checking…` });
           this.emit('job', cur);

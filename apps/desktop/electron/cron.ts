@@ -77,12 +77,15 @@ export class CronRunner {
     try { this.firePublish?.(now); } catch { /* non-fatal */ }
     for (const s of this.store.listSchedules()) {
       if (!s.enabled) { this.store.setScheduleNextRun(s.id, null); continue; }
-      // One-shot "wait & check": fire once at fireAt, then disable.
+      // One-shot "wait & check" / scheduled message: fire once at fireAt, disable.
       if (s.fireAt) {
         if (s.fireAt > now) { this.store.setScheduleNextRun(s.id, s.fireAt); continue; }
         if (s.lastRun) { this.store.setScheduleEnabled(s.id, false); continue; }
         this.store.markScheduleRun(s.id, now, null);
         this.store.setScheduleEnabled(s.id, false);
+        // Emit the now-disabled record so any live queue UI prunes it as it fires.
+        const done = this.store.listSchedules().find(x => x.id === s.id);
+        if (done) this.emit('schedule', done);
         this.fire(s);
         continue;
       }
@@ -100,14 +103,21 @@ export class CronRunner {
   private fire(s: Schedule): void {
     const project = (s.projectId ? this.store.getProject(s.projectId) : undefined) ?? this.store.listProjects()[0];
     if (!project) return;
-    // A wait-&-check fires its prompt into the originating chat, on that chat's model.
+    // A wait-&-check / scheduled message fires its prompt into the originating
+    // chat, on that chat's model. For a scheduled message the composer intent
+    // (effort, browser, plan, goal) was captured so it runs exactly as if sent
+    // by hand; a plain wait-&-check carries none of those and falls back.
     const session = s.sessionId ? this.store.getSession(s.sessionId) : undefined;
     const input = s.prompt && s.prompt.trim() ? s.prompt : s.title;
-    const job = this.store.createJob(project.id, input, `Scheduled: ${s.title}`, 'balanced', session?.id);
+    const job = this.store.createJob(project.id, input, `Scheduled: ${s.title}`, s.effort ?? 'balanced', session?.id);
     this.emit('job', job);
-    const opts = session?.primary
-      ? { engine: session.primary.engine, model: session.primary.model, reviewer: session.reviewer }
-      : {};
+    const opts = {
+      ...(session?.primary ? { engine: session.primary.engine, model: session.primary.model, reviewer: session.reviewer } : {}),
+      ...(s.effort ? { effort: s.effort } : {}),
+      ...(s.browser ? { browser: true } : {}),
+      ...(s.plan ? { plan: true } : {}),
+      ...(s.goal ? { goal: true } : {}),
+    };
     // Fire-and-forget: the engine updates + emits job state as it progresses.
     void this.engine.run(job.id, opts).catch(() => { /* engine already recorded the failure on the job */ });
   }
