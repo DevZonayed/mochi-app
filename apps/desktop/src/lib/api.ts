@@ -248,9 +248,12 @@ export interface ModelGroup {
   reason: string;
   models: ModelDescriptor[];
 }
+export interface DevicePresence { connected: boolean; streams: number; lastSeen: number | null; name: string | null }
 export interface PairingInfo {
   token: string;
   relayUrl: string;
+  /** Live remote-device presence (phone/web), reported by the relay. */
+  devices?: DevicePresence;
 }
 export type AppEventKind =
   | 'job-done' | 'job-failed' | 'job-cancelled'
@@ -266,6 +269,18 @@ export interface AppEvent {
   projectId?: string | null;
   jobId?: string | null;
 }
+/** A built-in notification chime (synthesised client-side; 'none' = silent). */
+export type NotificationSound = 'chime' | 'ping' | 'marimba' | 'glass' | 'pop' | 'none';
+/** Device-notification preferences (sounds play in the client via Web Audio). */
+export interface NotificationSettings {
+  enabled: boolean;
+  onComplete: boolean;
+  completeSound: NotificationSound;
+  onAttention: boolean;
+  attentionSound: NotificationSound;
+  volume: number;
+  onlyWhenUnfocused: boolean;
+}
 export interface AppSettings {
   defaultEffort: Effort;
   defaultEngine: EngineId | 'auto';
@@ -274,6 +289,8 @@ export interface AppSettings {
   favoriteModels?: string[];
   /** Target repo ("owner/repo") feedback is escalated to as GitHub issues. */
   feedbackRepo?: string;
+  /** Device-notification sound preferences. */
+  notifications?: NotificationSettings;
 }
 
 export type FeedbackCategory = 'bug' | 'idea' | 'other';
@@ -974,9 +991,10 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: DevicePresence) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
+        if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as DevicePresence);
         if (name === 'engine-download' && handlers.onEngineDownload) handlers.onEngineDownload(data as EngineDownloadProgress);
         if (name === 'bg' && handlers.onBg) handlers.onBg(data as BgTask);
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);

@@ -12,7 +12,8 @@ function readOverride(): ThemeMode | null {
 interface ThemeContextValue {
   theme: Theme;
   mode: ThemeMode;
-  /** null = follow the OS appearance */
+  /** The explicit choice: null = follow the OS appearance (Auto). */
+  override: ThemeMode | null;
   setOverride: (mode: ThemeMode | null) => void;
   toggle: () => void;
 }
@@ -33,10 +34,11 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     () => ({
       theme,
       mode,
+      override,
       setOverride,
       toggle: () => setOverride(mode === 'dark' ? 'light' : 'dark'),
     }),
-    [theme, mode],
+    [theme, mode, override],
   );
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;

@@ -1,10 +1,11 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, Animated, Easing, StyleSheet, Image } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Card, Mono } from '../ui';
 import { api, type Asset } from '../api';
+import { useLive } from '../useLive';
 
 type TabKey = 'drafts' | 'rendering' | 'published';
 const TABS: [TabKey, string][] = [
@@ -77,10 +78,9 @@ export function StudioScreen() {
   const [trackW, setTrackW] = useState(0);
   const [assets, setAssets] = useState<Asset[]>([]);
 
-  useEffect(() => {
-    const stop = api.poll(() => { api.listAssets().then(setAssets).catch(() => {}); }, 5000);
-    return stop;
-  }, []);
+  const reload = useCallback(() => { api.listAssets().then(setAssets).catch(() => {}); }, []);
+  useEffect(() => api.poll(reload, 12000), [reload]); // backstop; SSE drives updates
+  useLive(['asset'], reload);
 
   const ti = TABS.findIndex((t) => t[0] === tab);
   const slide = useRef(new Animated.Value(ti)).current;

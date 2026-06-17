@@ -10,7 +10,7 @@ import type { ResearchEngine } from './research.js';
 import type { PublishingEngine } from './publishing.js';
 import type { TelegramBot } from './telegram.js';
 import type { Providers, ProviderId } from './providers.js';
-import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject } from './git.js';
+import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, structuredDiff } from './git.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
 import type { GitService } from './git-service.js';
@@ -477,6 +477,18 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const j = store.getJob(String(p.id ?? ''));
         return j ?? bad('job not found', 404);
       }
+      // Read-only git diff of a job's work (committed + uncommitted, vs the
+      // session's base). Safe to serve remotely — it returns the user's own code,
+      // no secrets — so the phone's Diff Review screen can show real changes.
+      case 'getJobDiff': {
+        const j = store.getJob(String(p.id ?? p.jobId ?? ''));
+        if (!j) return bad('job not found', 404);
+        const proj = store.getProject(j.projectId);
+        if (!proj?.path) return { files: [], additions: 0, deletions: 0, fileCount: 0, truncated: false, base: null, reason: 'this job has no local repository' };
+        const session = j.sessionId ? store.getSession(j.sessionId) : undefined;
+        const dir = session?.worktreePath && existsSync(session.worktreePath) ? session.worktreePath : proj.path;
+        return structuredDiff(dir, session?.baseBranch ?? null);
+      }
       case 'createJob': {
         if (!p.projectId || !p.input) bad('projectId and input required');
         if (!store.getProject(String(p.projectId))) bad('project not found', 404);
@@ -518,10 +530,25 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'listSchedules': return store.listSchedules();
       case 'createSchedule': {
         if (!p.title || typeof p.title !== 'string') bad('title required');
-        return store.createSchedule({ title: p.title as string, projectId: (p.projectId as string) ?? null, time: p.time as string | undefined, cadence: p.cadence as string | undefined });
+        // One-shot "queued message": fireAt + sessionId + prompt → the cron runner
+        // delivers `prompt` into that chat at fireAt (see cron.ts). Validate the
+        // session if given so a phone can't queue into a missing chat.
+        const fireAt = Number.isFinite(Number(p.fireAt)) ? Number(p.fireAt) : undefined;
+        if (p.sessionId && !store.getSession(String(p.sessionId))) bad('session not found', 404);
+        const s = store.createSchedule({
+          title: p.title as string,
+          projectId: (p.projectId as string) ?? null,
+          time: p.time as string | undefined,
+          cadence: p.cadence as string | undefined,
+          fireAt,
+          sessionId: p.sessionId ? String(p.sessionId) : undefined,
+          prompt: p.prompt ? String(p.prompt) : undefined,
+        });
+        emit('schedule', s);
+        return s;
       }
-      case 'toggleSchedule': { store.setScheduleEnabled(String(p.id ?? ''), Boolean(p.enabled)); return { ok: true }; }
-      case 'deleteSchedule': { store.deleteSchedule(String(p.id ?? '')); return { ok: true }; }
+      case 'toggleSchedule': { store.setScheduleEnabled(String(p.id ?? ''), Boolean(p.enabled)); emit('schedule', { id: String(p.id ?? ''), enabled: Boolean(p.enabled) }); return { ok: true }; }
+      case 'deleteSchedule': { store.deleteSchedule(String(p.id ?? '')); emit('schedule', { id: String(p.id ?? ''), deleted: true }); return { ok: true }; }
       // Wait-&-check: schedule a one-shot follow-up that pokes a chat after delayMs.
       case 'scheduleCheck': {
         const delayMs = Number(p.delayMs);
@@ -977,7 +1004,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
 
       // ── Pairing (desktop-only; never enters relay snapshots) ──
-      case 'getPairing': return { token: store.accessToken, relayUrl };
+      case 'getPairing': return { token: store.accessToken, relayUrl, devices: store.getRemotePresence() };
 
       default:
         return bad(`unknown method: ${method}`, 404);

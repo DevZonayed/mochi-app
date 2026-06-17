@@ -16,9 +16,10 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, usePurpose, setPurpose, TrafficLights, Sidebar, Toolbar,
   type Theme, type Purpose,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type DevicePresence, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, IS_LOCAL } from '../lib/api';
 import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
 import { WhatsNew } from '../lib/WhatsNew';
+import { useNotificationSettings, updateNotificationSettings, playSound, SOUND_OPTIONS, type NotificationSound } from '../lib/notify';
 import { EngineSetup } from '../EngineSetup';
 import SkillsRegistry from './SkillsRegistry';
 import BudgetDashboard from './BudgetDashboard';
@@ -139,6 +140,7 @@ interface SetNavItem { key: string; icon: IconName; label: string; tint: string;
 
 const SET_NAV: SetNavItem[] = [
   { key: 'general', icon: 'settings', label: 'General', tint: 'var(--ink-secondary)' },
+  { key: 'notifications', icon: 'bell', label: 'Notifications', tint: 'var(--orange)' },
   { key: 'engines', icon: 'cpu', label: 'Engines', tint: 'var(--purple)' },
   // Skills + Costs render as full-bleed panes inside Settings (their full screens,
   // minus the standalone window chrome) so the Settings sidebar stays put.
@@ -238,6 +240,81 @@ function GeneralPane({ theme, setTheme, workspace }: {
         <GroupedList header="Startup">
           <ToggleRow label="Open Maestro at login" on={settings?.openAtLogin ?? false} onChange={v => patch({ openAtLogin: v })} last />
         </GroupedList>
+      </div>
+    </div>
+  );
+}
+
+/* ── Notifications pane — device-sound prefs ────────────────────────── */
+const selectStyle: React.CSSProperties = {
+  height: 32, padding: '0 10px', borderRadius: 8, border: '0.5px solid var(--separator-strong)',
+  background: 'var(--fill-tertiary)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)',
+  outline: 'none', cursor: 'pointer', appearance: 'none', WebkitAppearance: 'none',
+};
+
+function SoundRow({ label, sub, value, onChange, volume, disabled, last }: {
+  label: React.ReactNode; sub?: React.ReactNode; value: NotificationSound;
+  onChange: (s: NotificationSound) => void; volume: number; disabled?: boolean; last?: boolean;
+}) {
+  return (
+    <Row last={last}>
+      <span style={{ flex: 1, minWidth: 0, opacity: disabled ? 0.45 : 1 }}>
+        <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>{label}</span>
+        {sub && <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{sub}</span>}
+      </span>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, opacity: disabled ? 0.45 : 1, pointerEvents: disabled ? 'none' : 'auto' }}>
+        <select value={value} onChange={e => onChange(e.target.value as NotificationSound)} style={selectStyle}>
+          {SOUND_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <button
+          onClick={() => playSound(value, volume)}
+          disabled={value === 'none'}
+          title="Play test sound" aria-label="Play test sound" className="ghost-btn"
+          style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: value === 'none' ? 'var(--ink-tertiary)' : 'var(--ink)', flexShrink: 0 }}
+        >
+          <Icon name="play" size={14} />
+        </button>
+      </span>
+    </Row>
+  );
+}
+
+function NotificationsPane() {
+  const s = useNotificationSettings();
+  const patch = (p: Parameters<typeof updateNotificationSettings>[0]) => updateNotificationSettings(p);
+  const pct = Math.round(s.volume * 100);
+  return (
+    <div>
+      <PaneHead sub="Hear a sound when an agent finishes a response or a chat needs your attention. Sounds play on this device.">Notifications</PaneHead>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
+        <GroupedList>
+          <ToggleRow label="Play notification sounds" sub="The master switch for every chime below." on={s.enabled} onChange={v => patch({ enabled: v })} last />
+        </GroupedList>
+
+        <div style={{ opacity: s.enabled ? 1 : 0.45, pointerEvents: s.enabled ? 'auto' : 'none', display: 'flex', flexDirection: 'column', gap: 22, transition: 'opacity 160ms ease' }}>
+          <GroupedList header="When a response completes" footer="Plays once an agent finishes its turn.">
+            <ToggleRow label="Play a sound" on={s.onComplete} onChange={v => patch({ onComplete: v })} />
+            <SoundRow label="Sound" value={s.completeSound} onChange={v => patch({ completeSound: v })} volume={s.volume} disabled={!s.onComplete} last />
+          </GroupedList>
+
+          <GroupedList header="When a chat needs attention" footer="An approval gate is waiting, or a job failed.">
+            <ToggleRow label="Play a sound" on={s.onAttention} onChange={v => patch({ onAttention: v })} />
+            <SoundRow label="Sound" value={s.attentionSound} onChange={v => patch({ attentionSound: v })} volume={s.volume} disabled={!s.onAttention} last />
+          </GroupedList>
+
+          <GroupedList header="Output">
+            <Row>
+              <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Volume</span>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 12, width: 220 }}>
+                <input type="range" min={0} max={100} value={pct}
+                  onChange={e => patch({ volume: Number(e.target.value) / 100 })}
+                  style={{ flex: 1, accentColor: 'var(--blue)', cursor: 'pointer' }} />
+                <span style={{ width: 38, textAlign: 'right', font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{pct}%</span>
+              </span>
+            </Row>
+            <ToggleRow label="Only when Maestro isn't focused" sub="Stay quiet while you're actively watching; chime only when the window is in the background." on={s.onlyWhenUnfocused} onChange={v => patch({ onlyWhenUnfocused: v })} last />
+          </GroupedList>
+        </div>
       </div>
     </div>
   );
@@ -586,14 +663,27 @@ function ExtensionPane() {
   );
 }
 
+function deviceStatusLabel(d: DevicePresence): string {
+  if (d.streams > 0) return 'active now';
+  if (!d.lastSeen) return '';
+  const s = Math.max(0, Math.round((Date.now() - d.lastSeen) / 1000));
+  if (s < 60) return `last seen ${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `last seen ${m}m ago`;
+  return `last seen ${Math.round(m / 60)}h ago`;
+}
+
 function DevicesPane({ onPair }: { onPair: () => void }) {
   const [pairing, setPairing] = React.useState<PairingInfo | null>(null);
+  const [presence, setPresence] = React.useState<DevicePresence | null>(null);
   const [copied, setCopied] = React.useState(false);
   React.useEffect(() => {
     if (!IS_LOCAL) return;
     let alive = true;
-    api.getPairing().then(p => { if (alive) setPairing(p); }).catch(() => {});
-    return () => { alive = false; };
+    api.getPairing().then(p => { if (alive) { setPairing(p); setPresence(p.devices ?? null); } }).catch(() => {});
+    // Live presence: the relay tells the Mac when a phone/web remote connects.
+    const off = api.subscribe({ onDevices: (d) => setPresence(d) });
+    return () => { alive = false; off(); };
   }, []);
   const copy = () => {
     if (!pairing) return;
@@ -616,10 +706,21 @@ function DevicesPane({ onPair }: { onPair: () => void }) {
       )}
       <GroupedList footer="Anyone who enters your code can control this Mac, so keep it private. Regenerating the code (Danger zone → reset is not required) would unpair existing devices.">
         <Row>
-          <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'var(--fill-tertiary)', color: 'var(--ink-tertiary)' }}><Icon name="smartphone" size={18} /></span>
+          <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: presence?.connected ? 'color-mix(in srgb, var(--green) 16%, transparent)' : 'var(--fill-tertiary)', color: presence?.connected ? 'var(--green)' : 'var(--ink-tertiary)' }}><Icon name="smartphone" size={18} /></span>
           <span style={{ flex: 1 }}>
-            <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>No paired devices yet</span>
-            <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Pair your phone with the code above to control this Mac remotely.</span>
+            {presence?.connected ? (
+              <>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 7, font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 4, background: 'var(--green)' }} />{presence.name ?? 'A device'} connected
+                </span>
+                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{deviceStatusLabel(presence)}{presence.streams > 0 ? ' · live' : ''}</span>
+              </>
+            ) : (
+              <>
+                <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>No devices connected</span>
+                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{presence?.lastSeen ? deviceStatusLabel(presence) : 'Pair your phone with the code above to control this Mac remotely.'}</span>
+              </>
+            )}
           </span>
         </Row>
         <Row last onClick={onPair}>
@@ -800,6 +901,7 @@ export default function Settings() {
 
   const panes: Record<string, React.ReactNode> = {
     general: <GeneralPane theme={theme} setTheme={setTheme} workspace={workspace} />,
+    notifications: <NotificationsPane />,
     engines: <EnginesPane />,
     skills: <SkillsRegistry embedded />,
     costs: <BudgetDashboard embedded />,

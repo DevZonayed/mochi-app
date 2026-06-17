@@ -7,6 +7,8 @@ import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Card, Mono } from '../ui';
 import { api, type Approval, type ApprovalKind, type Project } from '../api';
+import { biometricGateEnabled, confirmBiometric } from '../biometrics';
+import { useLive } from '../useLive';
 
 type TintKey = 'blue' | 'purple' | 'green' | 'orange' | 'teal' | 'indigo' | 'red';
 type Platform = 'x' | 'linkedin';
@@ -121,15 +123,6 @@ const PLATFORM_GLYPH: Record<Platform, (color: string, size: number) => React.Re
     </Svg>
   ),
 };
-
-function FaceIDGlyph({ size = 40, color = '#fff' }: { size?: number; color?: string }) {
-  return (
-    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
-      <Path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3" stroke={color} strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" />
-      <Path d="M9 10v1M15 10v1M12 9v3l-1 1M9.5 15a3.5 3.5 0 0 0 5 0" stroke={color} strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" />
-    </Svg>
-  );
-}
 
 function PlanBody({ g }: { g: Extract<Gate, { type: 'plan' }> }) {
   const { theme } = useTheme();
@@ -296,43 +289,11 @@ function GateCard({ g, approving, onApprove, onReject }: { g: Gate; approving: b
   );
 }
 
-function FaceIDOverlay({ g, onDone }: { g: Gate; onDone: () => void }) {
-  const { theme } = useTheme();
-  const pulse = useRef(new Animated.Value(1)).current;
-
-  useEffect(() => {
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulse, { toValue: 1.08, duration: 700, useNativeDriver: true }),
-        Animated.timing(pulse, { toValue: 1, duration: 700, useNativeDriver: true }),
-      ]),
-    );
-    loop.start();
-    const t = setTimeout(onDone, 1400);
-    return () => {
-      loop.stop();
-      clearTimeout(t);
-    };
-  }, [pulse, onDone]);
-
-  return (
-    <View style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 70, backgroundColor: 'rgba(10,12,24,0.72)', alignItems: 'center', justifyContent: 'center', gap: 18 }}>
-      <Animated.View style={{ width: 80, height: 80, borderRadius: 22, borderWidth: 3, borderColor: '#fff', alignItems: 'center', justifyContent: 'center', transform: [{ scale: pulse }] }}>
-        <FaceIDGlyph size={40} color="#fff" />
-      </Animated.View>
-      <Text style={{ fontSize: 17, lineHeight: 22, fontWeight: '600', color: '#fff', textAlign: 'center', maxWidth: 240, fontFamily: theme.fontFamily.text }}>
-        Confirm {g.label.toLowerCase()} with Face ID
-      </Text>
-    </View>
-  );
-}
-
 export function ApprovalsScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
   const [gates, setGates] = useState<Gate[]>([]);
   const [approvingId, setApprovingId] = useState<string | null>(null);
-  const [faceid, setFaceid] = useState<Gate | null>(null);
 
   const sub = useMemo(() => (gates.length ? `${gates.length} waiting · approve from anywhere` : null), [gates.length]);
 
@@ -353,6 +314,8 @@ export function ApprovalsScreen() {
       void load();
     }, [load]),
   );
+  // Real-time: a new gate or a resolution on the Mac updates the list instantly.
+  useLive(['approval', 'job', 'session'], () => { void load(); });
 
   // Approve: plays the green-cover animation, hits the API, then refetches.
   const finish = (g: Gate) => {
@@ -365,9 +328,13 @@ export function ApprovalsScreen() {
     }, 420);
   };
 
+  // Real biometric gate when the operator enabled it in Settings (else straight through).
   const approve = (g: Gate) => {
-    if (g.faceid) setFaceid(g);
-    else finish(g);
+    if (biometricGateEnabled()) {
+      void confirmBiometric(`Approve: ${g.label}`).then((ok) => { if (ok) finish(g); });
+    } else {
+      finish(g);
+    }
   };
 
   const reject = (g: Gate) => {
@@ -403,17 +370,6 @@ export function ApprovalsScreen() {
           )}
         </View>
       </ScrollView>
-
-      {faceid ? (
-        <FaceIDOverlay
-          g={faceid}
-          onDone={() => {
-            const g = faceid;
-            setFaceid(null);
-            finish(g);
-          }}
-        />
-      ) : null}
     </View>
   );
 }

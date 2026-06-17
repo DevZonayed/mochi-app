@@ -15,6 +15,9 @@ import { randomUUID } from 'node:crypto';
 export const id = (): string => randomUUID();
 export const now = (): number => Date.now();
 
+/** Live presence of remote devices (phone/web), reported by the relay. Transient. */
+export interface DevicePresence { connected: boolean; streams: number; lastSeen: number | null; name: string | null }
+
 /** Human-enterable pairing token, e.g. "M7K2-Q9XF-4DTB" (no 0/O/1/I). */
 export function newPairingToken(): string {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -281,6 +284,34 @@ export interface CommsStatus {
   whatsapp: { connected: false };
 }
 
+/** A built-in notification chime (synthesised client-side; 'none' = silent). */
+export type NotificationSound = 'chime' | 'ping' | 'marimba' | 'glass' | 'pop' | 'none';
+/** Device-notification preferences. Sounds play in the client (Web Audio); this
+    is just the persisted config so it follows the operator across surfaces. */
+export interface NotificationSettings {
+  /** Master switch — off silences everything. */
+  enabled: boolean;
+  /** Play a sound when an agent finishes a response (a job reaches `done`). */
+  onComplete: boolean;
+  completeSound: NotificationSound;
+  /** Play a sound when a chat needs attention (an approval gate or a failed job). */
+  onAttention: boolean;
+  attentionSound: NotificationSound;
+  /** Output level, 0–1. */
+  volume: number;
+  /** Only chime when the app window isn't focused (so active work stays quiet). */
+  onlyWhenUnfocused: boolean;
+}
+export const DEFAULT_NOTIFICATIONS: NotificationSettings = {
+  enabled: true,
+  onComplete: true,
+  completeSound: 'chime',
+  onAttention: true,
+  attentionSound: 'ping',
+  volume: 0.7,
+  onlyWhenUnfocused: false,
+};
+
 export interface AppSettings {
   defaultEffort: Effort;
   defaultEngine: EngineId | 'auto';
@@ -291,8 +322,10 @@ export interface AppSettings {
   /** Target repo ("owner/repo") that feedback is escalated to as GitHub issues.
       Empty/undefined = issue creation is disabled until the operator sets one. */
   feedbackRepo?: string;
+  /** Device-notification sound preferences. */
+  notifications?: NotificationSettings;
 }
-export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [] };
+export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], notifications: { ...DEFAULT_NOTIFICATIONS } };
 
 export interface BudgetData { cap: number; spent: number; byProject: { projectId: string; name: string; color: string; spent: number }[] }
 export interface CostsData {
@@ -427,6 +460,7 @@ export class Store {
       }
       if (!this.data.settings) { this.data.settings = { ...DEFAULT_SETTINGS }; dirty = true; }
       if (this.data.settings && !this.data.settings.favoriteModels) { this.data.settings.favoriteModels = []; dirty = true; }
+      if (this.data.settings && !this.data.settings.notifications) { this.data.settings.notifications = { ...DEFAULT_NOTIFICATIONS }; dirty = true; }
       if (!this.data.sessions) { this.data.sessions = []; dirty = true; }
       if (!this.data.assets) { this.data.assets = []; dirty = true; }
       if (!this.data.publishDrafts) { this.data.publishDrafts = []; dirty = true; }
@@ -494,6 +528,17 @@ export class Store {
   }
   get accessToken(): string { return this.data.accessToken; }
   get extensionToken(): string { return this.data.extensionToken; }
+
+  // Remote-device presence (transient; reported by the relay, never persisted).
+  private remote: { streams: number; lastSeen: number; name: string | null } = { streams: 0, lastSeen: 0, name: null };
+  setRemotePresence(info: { streams: number; lastSeen: number; name: string | null }): DevicePresence {
+    this.remote = { streams: info.streams, lastSeen: info.lastSeen, name: info.name ?? this.remote.name };
+    return this.getRemotePresence();
+  }
+  getRemotePresence(): DevicePresence {
+    const fresh = Date.now() - this.remote.lastSeen < 90_000;
+    return { connected: this.remote.streams > 0 || fresh, streams: this.remote.streams, lastSeen: this.remote.lastSeen || null, name: this.remote.name };
+  }
 
   routing(): Routing { return { ...this.data.routing }; }
   setRouting(patch: Partial<Routing>): Routing {
