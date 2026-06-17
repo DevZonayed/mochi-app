@@ -16,7 +16,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, usePurpose, setPurpose, TrafficLights, Sidebar, Toolbar,
   type Theme, type Purpose,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type DevicePresence, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, IS_LOCAL } from '../lib/api';
 import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
 import { WhatsNew } from '../lib/WhatsNew';
 import { useNotificationSettings, updateNotificationSettings, playSound, SOUND_OPTIONS, type NotificationSound } from '../lib/notify';
@@ -663,14 +663,27 @@ function ExtensionPane() {
   );
 }
 
+function deviceStatusLabel(d: DevicePresence): string {
+  if (d.streams > 0) return 'active now';
+  if (!d.lastSeen) return '';
+  const s = Math.max(0, Math.round((Date.now() - d.lastSeen) / 1000));
+  if (s < 60) return `last seen ${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `last seen ${m}m ago`;
+  return `last seen ${Math.round(m / 60)}h ago`;
+}
+
 function DevicesPane({ onPair }: { onPair: () => void }) {
   const [pairing, setPairing] = React.useState<PairingInfo | null>(null);
+  const [presence, setPresence] = React.useState<DevicePresence | null>(null);
   const [copied, setCopied] = React.useState(false);
   React.useEffect(() => {
     if (!IS_LOCAL) return;
     let alive = true;
-    api.getPairing().then(p => { if (alive) setPairing(p); }).catch(() => {});
-    return () => { alive = false; };
+    api.getPairing().then(p => { if (alive) { setPairing(p); setPresence(p.devices ?? null); } }).catch(() => {});
+    // Live presence: the relay tells the Mac when a phone/web remote connects.
+    const off = api.subscribe({ onDevices: (d) => setPresence(d) });
+    return () => { alive = false; off(); };
   }, []);
   const copy = () => {
     if (!pairing) return;
@@ -693,10 +706,21 @@ function DevicesPane({ onPair }: { onPair: () => void }) {
       )}
       <GroupedList footer="Anyone who enters your code can control this Mac, so keep it private. Regenerating the code (Danger zone → reset is not required) would unpair existing devices.">
         <Row>
-          <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'var(--fill-tertiary)', color: 'var(--ink-tertiary)' }}><Icon name="smartphone" size={18} /></span>
+          <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: presence?.connected ? 'color-mix(in srgb, var(--green) 16%, transparent)' : 'var(--fill-tertiary)', color: presence?.connected ? 'var(--green)' : 'var(--ink-tertiary)' }}><Icon name="smartphone" size={18} /></span>
           <span style={{ flex: 1 }}>
-            <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>No paired devices yet</span>
-            <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Pair your phone with the code above to control this Mac remotely.</span>
+            {presence?.connected ? (
+              <>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 7, font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 4, background: 'var(--green)' }} />{presence.name ?? 'A device'} connected
+                </span>
+                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{deviceStatusLabel(presence)}{presence.streams > 0 ? ' · live' : ''}</span>
+              </>
+            ) : (
+              <>
+                <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>No devices connected</span>
+                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{presence?.lastSeen ? deviceStatusLabel(presence) : 'Pair your phone with the code above to control this Mac remotely.'}</span>
+              </>
+            )}
           </span>
         </Row>
         <Row last onClick={onPair}>

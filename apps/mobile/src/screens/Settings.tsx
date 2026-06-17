@@ -1,15 +1,19 @@
 import React, { useState } from 'react';
-import { View, Text, Pressable, ScrollView, Animated, StyleSheet, Modal, TextInput, type ViewStyle } from 'react-native';
+import { View, Text, Pressable, ScrollView, Animated, StyleSheet, Modal, TextInput, Alert, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import Constants from 'expo-constants';
 import { useTheme } from '../theme';
+import type { ThemeMode } from '@maestro/design-tokens';
 import { Icon } from '../Icon';
-import { Card, Group, Row } from '../ui';
-import { api, getPairToken, setPairToken, type Workspace } from '../api';
-import { setFlag, ONBOARDED } from '../storage';
+import { Group, Row } from '../ui';
+import { api, getPairToken, setPairToken, API_BASE, type Workspace, type Effort as ApiEffort, type EngineId } from '../api';
+import { setFlag, ONBOARDED, getFlag, BIOMETRIC_GATE, clearCache } from '../storage';
+import { NOTIF_CATEGORIES, getNotifPrefs, setNotifPref } from '../notifPrefs';
+import { biometricAvailable, confirmBiometric } from '../biometrics';
 
 /* iOS-style toggle switch — animated thumb. */
-function MSwitch({ value, onValueChange }: { value: boolean; onValueChange?: (v: boolean) => void }) {
+function MSwitch({ value, disabled, onValueChange }: { value: boolean; disabled?: boolean; onValueChange?: (v: boolean) => void }) {
   const { theme } = useTheme();
   const a = React.useRef(new Animated.Value(value ? 1 : 0)).current;
   React.useEffect(() => {
@@ -18,7 +22,7 @@ function MSwitch({ value, onValueChange }: { value: boolean; onValueChange?: (v:
   const bg = a.interpolate({ inputRange: [0, 1], outputRange: [theme.color.fillSecondary, theme.color.green] });
   const left = a.interpolate({ inputRange: [0, 1], outputRange: [2, 22] });
   return (
-    <Pressable onPress={() => onValueChange?.(!value)} hitSlop={6}>
+    <Pressable onPress={() => !disabled && onValueChange?.(!value)} hitSlop={6} style={{ opacity: disabled ? 0.4 : 1 }}>
       <Animated.View style={{ width: 51, height: 31, borderRadius: 16, backgroundColor: bg, justifyContent: 'center' }}>
         <Animated.View
           style={{
@@ -43,6 +47,8 @@ function MSwitch({ value, onValueChange }: { value: boolean; onValueChange?: (v:
 
 const EFFORT_STOPS = ['FAST', 'BALANCED', 'DEEP', 'MAX'] as const;
 type Effort = (typeof EFFORT_STOPS)[number];
+const toApiEffort = (e: Effort): ApiEffort => e.toLowerCase() as ApiEffort;
+const fromApiEffort = (e: ApiEffort): Effort => e.toUpperCase() as Effort;
 
 function useEffortMeta() {
   const { theme } = useTheme();
@@ -120,38 +126,25 @@ function EffortDial({ value, onChange }: { value: Effort; onChange: (v: Effort) 
   );
 }
 
-type Model = { id: string; name: string; sub: string; cost: number };
-const MODELS: Model[] = [
-  { id: 'auto', name: 'Auto', sub: 'Routed per task', cost: 0 },
-  { id: 'opus', name: 'Opus', sub: 'Most capable', cost: 3 },
-  { id: 'sonnet', name: 'Sonnet', sub: 'Balanced', cost: 2 },
-  { id: 'haiku', name: 'Haiku', sub: 'Fastest', cost: 1 },
-  { id: 'gpt', name: 'GPT-4o', sub: 'Media & vision', cost: 2 },
+/* Engine picker — the real AppSettings.defaultEngine (auto / Claude / Codex). */
+type EngineChoice = EngineId | 'auto';
+const ENGINES: { id: EngineChoice; name: string; sub: string }[] = [
+  { id: 'auto', name: 'Auto', sub: 'Routed per task' },
+  { id: 'claude', name: 'Claude Code', sub: 'Your Claude login' },
+  { id: 'codex', name: 'Codex', sub: 'Your ChatGPT login' },
 ];
 
-function CostDots({ n }: { n: number }) {
-  const { theme } = useTheme();
-  if (!n) return <Text style={{ fontSize: 11, fontWeight: '600', color: theme.color.green }}>auto</Text>;
-  return (
-    <View style={{ flexDirection: 'row', gap: 2 }}>
-      {[1, 2, 3].map((d) => (
-        <View key={d} style={{ width: 5, height: 5, borderRadius: 3, backgroundColor: d <= n ? theme.color.orange : theme.color.inkTertiary, opacity: d <= n ? 1 : 0.3 }} />
-      ))}
-    </View>
-  );
-}
-
-function ModelSwitcher({ value, onChange }: { value: string; onChange: (id: string) => void }) {
+function EngineSwitcher({ value, onChange }: { value: EngineChoice; onChange: (id: EngineChoice) => void }) {
   const { theme } = useTheme();
   const [open, setOpen] = useState(false);
-  const cur = MODELS.find((m) => m.id === value) ?? MODELS[0];
+  const cur = ENGINES.find((m) => m.id === value) ?? ENGINES[0];
   return (
     <>
       <Pressable
         onPress={() => setOpen(true)}
         style={{ flexDirection: 'row', alignItems: 'center', gap: 7, height: 28, paddingHorizontal: 10, borderRadius: 9, backgroundColor: theme.color.fillSecondary }}
       >
-        <Icon name="smartphone" size={15} color={cur.id === 'auto' ? theme.color.inkSecondary : theme.color.ink} />
+        <Icon name="spark" size={15} color={cur.id === 'auto' ? theme.color.inkSecondary : theme.color.ink} />
         <Text style={{ fontSize: 13, fontWeight: '600', color: theme.color.ink }}>{cur.name}</Text>
         <Icon name="chevronDown" size={13} color={theme.color.inkTertiary} />
       </Pressable>
@@ -173,32 +166,22 @@ function ModelSwitcher({ value, onChange }: { value: string; onChange: (id: stri
               elevation: 12,
             }}
           >
-            {MODELS.map((m) => {
+            {ENGINES.map((m) => {
               const on = m.id === value;
               return (
                 <Pressable
                   key={m.id}
-                  onPress={() => {
-                    onChange(m.id);
-                    setOpen(false);
-                  }}
-                  style={{
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    gap: 10,
-                    padding: 9,
-                    borderRadius: 8,
-                    backgroundColor: on ? theme.color.blue + '1A' : 'transparent',
-                  }}
+                  onPress={() => { onChange(m.id); setOpen(false); }}
+                  style={{ flexDirection: 'row', alignItems: 'center', gap: 10, padding: 9, borderRadius: 8, backgroundColor: on ? theme.color.blue + '1A' : 'transparent' }}
                 >
                   <View style={{ width: 30, height: 30, borderRadius: 8, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.fillTertiary }}>
-                    <Icon name="smartphone" size={17} color={m.id === 'auto' ? theme.color.inkSecondary : theme.color.ink} />
+                    <Icon name="spark" size={17} color={m.id === 'auto' ? theme.color.inkSecondary : theme.color.ink} />
                   </View>
                   <View style={{ flex: 1, minWidth: 0 }}>
                     <Text style={{ fontSize: 15, fontWeight: '600', color: theme.color.ink }}>{m.name}</Text>
                     <Text style={{ fontSize: 11, color: theme.color.inkTertiary, marginTop: 2 }}>{m.sub}</Text>
                   </View>
-                  {on ? <Icon name="check" size={16} color={theme.color.blue} stroke={2.6} /> : <CostDots n={m.cost} />}
+                  {on ? <Icon name="check" size={16} color={theme.color.blue} stroke={2.6} /> : null}
                 </Pressable>
               );
             })}
@@ -208,14 +191,6 @@ function ModelSwitcher({ value, onChange }: { value: string; onChange: (id: stri
     </>
   );
 }
-
-const NOTIFS: [string, boolean][] = [
-  ['Gates', true],
-  ['Completions', true],
-  ['Failures', true],
-  ['Budget', true],
-  ['Publishing', false],
-];
 
 /* Send-feedback bottom sheet — submits to the Mac (source: 'phone'). */
 function FeedbackSheet({ visible, onClose }: { visible: boolean; onClose: () => void }) {
@@ -288,42 +263,60 @@ function FeedbackSheet({ visible, onClose }: { visible: boolean; onClose: () => 
   );
 }
 
+const relayHost = API_BASE.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+const appVersion = Constants.expoConfig?.version ?? '—';
+
 export function SettingsScreen() {
-  const { theme } = useTheme();
+  const { theme, override, setOverride } = useTheme();
   const insets = useSafeAreaInsets();
   const nav = useNavigation<any>();
+
   const [eff, setEff] = useState<Effort>('BALANCED');
-  const [model, setModel] = useState('auto');
-  const [themeSeg, setThemeSeg] = useState<'Light' | 'Dark' | 'Auto'>('Light');
-  const [notifs, setNotifs] = useState<boolean[]>(NOTIFS.map(([, v]) => v));
-  const [faceId, setFaceId] = useState(true);
-  const [lockApprove, setLockApprove] = useState(true);
+  const [engine, setEngine] = useState<EngineChoice>('auto');
+  const [notifs, setNotifs] = useState(getNotifPrefs());
+  const [bioGate, setBioGate] = useState(getFlag(BIOMETRIC_GATE));
+  const [bioAvail, setBioAvail] = useState(true);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [conn, setConn] = useState<'idle' | 'testing' | 'ok' | 'fail'>('idle');
+  const [outbox, setOutbox] = useState(api.outbox().length);
   const [fbOpen, setFbOpen] = useState(false);
 
   const testConnection = () => {
     setConn('testing');
-    api.health().then(() => setConn('ok')).catch(() => setConn('fail'));
+    api.verifyPairing().then((r) => setConn(r === 'invalid' || r === 'unreachable' ? 'fail' : 'ok')).catch(() => setConn('fail'));
   };
 
-  // Live workspace/account info for the connection hero (name + budget cap).
+  React.useEffect(() => { void biometricAvailable().then(setBioAvail); }, []);
+  React.useEffect(() => api.onOutbox(() => setOutbox(api.outbox().length)), []);
+
+  // Live workspace + persisted defaults whenever the screen regains focus.
   useFocusEffect(
     React.useCallback(() => {
       let alive = true;
-      api
-        .listWorkspaces()
-        .then((wss) => {
-          if (alive) setWorkspace(wss[0] ?? null);
-        })
-        .catch(() => {
-          if (alive) setWorkspace(null);
-        });
-      return () => {
-        alive = false;
-      };
+      api.listWorkspaces().then((wss) => { if (alive) setWorkspace(wss[0] ?? null); }).catch(() => { if (alive) setWorkspace(null); });
+      api.getSettings().then((s) => {
+        if (!alive || !s) return;
+        setEff(fromApiEffort(s.defaultEffort));
+        setEngine(s.defaultEngine);
+      }).catch(() => {});
+      setOutbox(api.outbox().length);
+      return () => { alive = false; };
     }, []),
   );
+
+  const changeEffort = (e: Effort) => { setEff(e); void api.setSettings({ defaultEffort: toApiEffort(e) }).catch(() => {}); };
+  const changeEngine = (id: EngineChoice) => { setEngine(id); void api.setSettings({ defaultEngine: id }).catch(() => {}); };
+
+  const toggleBio = async (next: boolean) => {
+    if (!next) { setBioGate(false); setFlag(BIOMETRIC_GATE, false); return; }
+    if (!bioAvail) { Alert.alert('No biometrics', 'This device has no Face ID / fingerprint enrolled.'); return; }
+    const ok = await confirmBiometric('Enable biometric approval');
+    if (ok) { setBioGate(true); setFlag(BIOMETRIC_GATE, true); }
+  };
+
+  const themeSegs: { label: string; mode: ThemeMode | null }[] = [
+    { label: 'Light', mode: 'light' }, { label: 'Dark', mode: 'dark' }, { label: 'Auto', mode: null },
+  ];
 
   const rowLabel: ViewStyle = { flex: 1 };
   const labelText = { fontSize: 16, color: theme.color.ink } as const;
@@ -331,13 +324,12 @@ export function SettingsScreen() {
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
       <ScrollView contentContainerStyle={{ paddingTop: insets.top + 6, paddingBottom: 28 }} showsVerticalScrollIndicator={false}>
-        {/* large title */}
         <View style={{ paddingHorizontal: 20, paddingBottom: 10 }}>
           <Text style={{ fontSize: 34, fontWeight: '700', letterSpacing: -0.7, color: theme.color.ink }}>Settings</Text>
         </View>
 
         {/* connection hero */}
-        <Card style={{ marginHorizontal: 16, marginBottom: 22, padding: 18, borderRadius: 16 } as ViewStyle}>
+        <View style={{ marginHorizontal: 16, marginBottom: 22, padding: 18, borderRadius: 16, backgroundColor: theme.color.bgElevated, borderWidth: StyleSheet.hairlineWidth, borderColor: theme.color.separator }}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 13 }}>
             <View style={{ width: 46, height: 46, borderRadius: 13, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}>
               <Icon name="smartphone" size={24} color={theme.color.inkSecondary} />
@@ -358,15 +350,13 @@ export function SettingsScreen() {
               <Text style={{ fontSize: 14, fontWeight: '600', color: theme.color.ink }}>{conn === 'testing' ? 'Testing…' : 'Test connection'}</Text>
             </Pressable>
           </View>
-        </Card>
+        </View>
 
         {/* Pairing */}
         <View style={{ marginBottom: 22 }}>
           <Group header="Pairing" footer="The code from your Mac (Maestro → Settings → Devices). Without it, this phone can't reach your Mac.">
             <Row last>
-              <View style={rowLabel}>
-                <Text style={labelText}>Code</Text>
-              </View>
+              <View style={rowLabel}><Text style={labelText}>Code</Text></View>
               <TextInput
                 defaultValue={getPairToken()}
                 onChangeText={(t: string) => setPairToken(t)}
@@ -382,31 +372,25 @@ export function SettingsScreen() {
 
         {/* Defaults */}
         <View style={{ marginBottom: 22 }}>
-          <Group header="Defaults" footer="Applies to new jobs; projects can override.">
+          <Group header="Defaults" footer="Applies to new jobs you start from this phone; projects can override.">
             <Row>
-              <View style={rowLabel}>
-                <Text style={labelText}>Effort</Text>
-              </View>
-              <EffortDial value={eff} onChange={setEff} />
+              <View style={rowLabel}><Text style={labelText}>Effort</Text></View>
+              <EffortDial value={eff} onChange={changeEffort} />
             </Row>
             <Row last>
-              <View style={rowLabel}>
-                <Text style={labelText}>Model</Text>
-              </View>
-              <ModelSwitcher value={model} onChange={setModel} />
+              <View style={rowLabel}><Text style={labelText}>Engine</Text></View>
+              <EngineSwitcher value={engine} onChange={changeEngine} />
             </Row>
           </Group>
         </View>
 
-        {/* Notifications */}
+        {/* Notifications — toggles filter the Activity feed */}
         <View style={{ marginBottom: 22 }}>
-          <Group header="Notifications" footer="Destructive approvals always confirm in app.">
-            {NOTIFS.map(([name], i) => (
-              <Row key={name} last={i === NOTIFS.length - 1}>
-                <View style={rowLabel}>
-                  <Text style={labelText}>{name}</Text>
-                </View>
-                <MSwitch value={notifs[i]} onValueChange={(v) => setNotifs((arr) => arr.map((x, j) => (j === i ? v : x)))} />
+          <Group header="Activity feed" footer="Choose which events show in Activity. Destructive approvals always confirm in-app.">
+            {NOTIF_CATEGORIES.map((c, i) => (
+              <Row key={c.key} last={i === NOTIF_CATEGORIES.length - 1}>
+                <View style={rowLabel}><Text style={labelText}>{c.label}</Text></View>
+                <MSwitch value={notifs[c.key]} onValueChange={(v) => setNotifs(setNotifPref(c.key, v))} />
               </Row>
             ))}
           </Group>
@@ -414,18 +398,12 @@ export function SettingsScreen() {
 
         {/* Approvals security */}
         <View style={{ marginBottom: 22 }}>
-          <Group header="Approvals security">
-            <Row>
-              <View style={rowLabel}>
-                <Text style={{ fontSize: 16, lineHeight: 19, color: theme.color.ink }}>Face ID for approvals</Text>
-              </View>
-              <MSwitch value={faceId} onValueChange={setFaceId} />
-            </Row>
+          <Group header="Approvals security" footer={bioAvail ? 'Require Face ID / fingerprint before an approval goes through.' : 'No biometrics enrolled on this device.'}>
             <Row last>
               <View style={rowLabel}>
-                <Text style={{ fontSize: 16, lineHeight: 19, color: theme.color.ink }}>Lock-screen approve for safe gates</Text>
+                <Text style={{ fontSize: 16, lineHeight: 19, color: theme.color.ink }}>Biometric approval</Text>
               </View>
-              <MSwitch value={lockApprove} onValueChange={setLockApprove} />
+              <MSwitch value={bioGate} disabled={!bioAvail} onValueChange={(v) => { void toggleBio(v); }} />
             </Row>
           </Group>
         </View>
@@ -434,27 +412,23 @@ export function SettingsScreen() {
         <View style={{ marginBottom: 22 }}>
           <Group header="Appearance">
             <Row last>
-              <View style={rowLabel}>
-                <Text style={labelText}>Theme</Text>
-              </View>
+              <View style={rowLabel}><Text style={labelText}>Theme</Text></View>
               <View style={{ flexDirection: 'row', gap: 3, padding: 2, backgroundColor: theme.color.fillSecondary, borderRadius: 8 }}>
-                {(['Light', 'Dark', 'Auto'] as const).map((o) => {
-                  const on = themeSeg === o;
+                {themeSegs.map((o) => {
+                  const on = override === o.mode;
                   return (
                     <Pressable
-                      key={o}
-                      onPress={() => setThemeSeg(o)}
+                      key={o.label}
+                      onPress={() => setOverride(o.mode)}
                       style={{
                         paddingVertical: 5,
                         paddingHorizontal: 11,
                         borderRadius: 6,
                         backgroundColor: on ? theme.color.bgElevated : 'transparent',
-                        ...(on
-                          ? { shadowColor: '#000', shadowOpacity: 0.14, shadowRadius: 2, shadowOffset: { width: 0, height: 1 }, elevation: 1 }
-                          : {}),
+                        ...(on ? { shadowColor: '#000', shadowOpacity: 0.14, shadowRadius: 2, shadowOffset: { width: 0, height: 1 }, elevation: 1 } : {}),
                       }}
                     >
-                      <Text style={{ fontSize: 13, fontWeight: '600', color: on ? theme.color.ink : theme.color.inkSecondary }}>{o}</Text>
+                      <Text style={{ fontSize: 13, fontWeight: '600', color: on ? theme.color.ink : theme.color.inkSecondary }}>{o.label}</Text>
                     </Pressable>
                   );
                 })}
@@ -466,24 +440,13 @@ export function SettingsScreen() {
         {/* Offline & sync */}
         <View style={{ marginBottom: 22 }}>
           <Group header="Offline & sync">
-            <Row onPress={() => nav.navigate('Outbox')}>
+            <Row last onPress={() => nav.navigate('Outbox')}>
               <View style={{ width: 30, height: 30, borderRadius: 8, backgroundColor: 'rgba(255,149,0,0.14)', alignItems: 'center', justifyContent: 'center' }}>
                 <Icon name="clock" size={16} color={theme.color.orange} />
               </View>
-              <View style={rowLabel}>
-                <Text style={labelText}>Outbox</Text>
-              </View>
-              <Text style={{ fontSize: 14, fontWeight: '500', color: theme.color.inkTertiary }}>2 waiting</Text>
+              <View style={rowLabel}><Text style={labelText}>Outbox</Text></View>
+              <Text style={{ fontSize: 14, fontWeight: '500', color: theme.color.inkTertiary }}>{outbox === 0 ? 'Empty' : `${outbox} logged`}</Text>
               <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
-            </Row>
-            <Row last>
-              <View style={rowLabel}>
-                <Text style={labelText}>Cached media</Text>
-              </View>
-              <Text style={{ fontSize: 14, fontWeight: '500', fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>248 MB</Text>
-              <Pressable hitSlop={6}>
-                <Text style={{ fontSize: 14, fontWeight: '600', color: theme.color.blue, marginLeft: 8 }}>Clear</Text>
-              </Pressable>
             </Row>
           </Group>
         </View>
@@ -494,11 +457,10 @@ export function SettingsScreen() {
             <Row last onPress={() => {
               setPairToken('');
               setFlag(ONBOARDED, false);
+              void clearCache(); // logout wipes cached projects/chats
               nav.reset({ index: 0, routes: [{ name: 'Onboarding' }] });
             }}>
-              <View style={rowLabel}>
-                <Text style={{ fontSize: 16, color: theme.color.red }}>Unpair from Mac</Text>
-              </View>
+              <View style={rowLabel}><Text style={{ fontSize: 16, color: theme.color.red }}>Unpair from Mac</Text></View>
               <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
             </Row>
           </Group>
@@ -511,9 +473,7 @@ export function SettingsScreen() {
               <View style={{ width: 30, height: 30, borderRadius: 8, backgroundColor: theme.color.blue + '24', alignItems: 'center', justifyContent: 'center' }}>
                 <Icon name="send" size={16} color={theme.color.blue} />
               </View>
-              <View style={rowLabel}>
-                <Text style={labelText}>Send feedback</Text>
-              </View>
+              <View style={rowLabel}><Text style={labelText}>Send feedback</Text></View>
               <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
             </Row>
           </Group>
@@ -523,16 +483,12 @@ export function SettingsScreen() {
         <View style={{ marginBottom: 28 }}>
           <Group header="About">
             <Row>
-              <View style={rowLabel}>
-                <Text style={labelText}>Version</Text>
-              </View>
-              <Text style={{ fontSize: 14, fontWeight: '500', fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>1.4.0 (212)</Text>
+              <View style={rowLabel}><Text style={labelText}>Version</Text></View>
+              <Text style={{ fontSize: 14, fontWeight: '500', fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>{appVersion}</Text>
             </Row>
             <Row last>
-              <View style={rowLabel}>
-                <Text style={labelText}>Relay</Text>
-              </View>
-              <Text style={{ fontSize: 13, fontWeight: '500', fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>relay.maestro.app</Text>
+              <View style={rowLabel}><Text style={labelText}>Relay</Text></View>
+              <Text style={{ fontSize: 13, fontWeight: '500', fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>{relayHost}</Text>
             </Row>
           </Group>
         </View>

@@ -6,6 +6,7 @@ import { useTheme } from './theme';
 import { Icon, type IconName } from './Icon';
 import { getFlag, ONBOARDED } from './storage';
 import { api } from './api';
+import { useLive } from './useLive';
 
 import { HomeScreen } from './screens/Home';
 import { JobsScreen } from './screens/Jobs';
@@ -19,16 +20,23 @@ import { NewJobScreen } from './screens/NewJob';
 import { BudgetScreen } from './screens/Budget';
 import { NotificationsScreen } from './screens/Notifications';
 import { OutboxScreen } from './screens/Outbox';
+import { ProjectsScreen } from './screens/Projects';
+import { ProjectSessionsScreen } from './screens/ProjectSessions';
+import { SessionChatScreen } from './screens/SessionChat';
+import { QueueScreen } from './screens/Queue';
 
 export type RootStackParamList = {
   Tabs: undefined;
   Onboarding: undefined;
-  JobTimeline: undefined;
-  DiffReview: undefined;
-  NewJob: undefined;
+  JobTimeline: { id?: string; jobId?: string } | undefined;
+  DiffReview: { jobId?: string } | undefined;
+  NewJob: { projectId?: string } | undefined;
   Budget: undefined;
   Notifications: undefined;
   Outbox: undefined;
+  ProjectSessions: { projectId: string; name: string };
+  SessionChat: { projectId: string; sessionId?: string; title?: string };
+  Queue: undefined;
 };
 
 const Tab = createBottomTabNavigator();
@@ -36,6 +44,7 @@ const Stack = createNativeStackNavigator<RootStackParamList>();
 
 const TAB_ICON: Record<string, IconName> = {
   Home: 'home',
+  Projects: 'folder',
   Jobs: 'jobs',
   Approvals: 'shield',
   Studio: 'clapper',
@@ -44,15 +53,11 @@ const TAB_ICON: Record<string, IconName> = {
 
 function Tabs() {
   const { theme } = useTheme();
-  // Live pending-approvals badge — poll every 15s (RN has no SSE).
+  // Live pending-approvals badge — SSE-driven, with a slow poll backstop.
   const [pending, setPending] = React.useState(0);
-  React.useEffect(() => {
-    let alive = true;
-    const refresh = () => api.listApprovals('pending').then(a => { if (alive) setPending(a.length); }).catch(() => {});
-    refresh();
-    const t = setInterval(refresh, 15000);
-    return () => { alive = false; clearInterval(t); };
-  }, []);
+  const refresh = React.useCallback(() => { api.listApprovals('pending').then(a => setPending(a.length)).catch(() => {}); }, []);
+  React.useEffect(() => { refresh(); const t = setInterval(refresh, 20000); return () => clearInterval(t); }, [refresh]);
+  useLive(['approval'], refresh);
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
@@ -64,6 +69,7 @@ function Tabs() {
       })}
     >
       <Tab.Screen name="Home" component={HomeScreen} />
+      <Tab.Screen name="Projects" component={ProjectsScreen} />
       <Tab.Screen name="Jobs" component={JobsScreen} />
       <Tab.Screen name="Approvals" component={ApprovalsScreen} options={{ tabBarBadge: pending > 0 ? pending : undefined }} />
       <Tab.Screen name="Studio" component={StudioScreen} />
@@ -97,6 +103,9 @@ export function RootNavigator() {
         <Stack.Screen name="Budget" component={BudgetScreen} />
         <Stack.Screen name="Notifications" component={NotificationsScreen} />
         <Stack.Screen name="Outbox" component={OutboxScreen} />
+        <Stack.Screen name="ProjectSessions" component={ProjectSessionsScreen} />
+        <Stack.Screen name="SessionChat" component={SessionChatScreen} />
+        <Stack.Screen name="Queue" component={QueueScreen} />
       </Stack.Navigator>
     </NavigationContainer>
   );

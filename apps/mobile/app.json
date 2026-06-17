@@ -9,14 +9,30 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "ai.maestro.app"
+      "bundleIdentifier": "ai.maestro.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Maestro uses the camera to scan the pairing QR code shown on your Mac."
+      }
     },
     "android": {
       "package": "ai.maestro.app",
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "softwareKeyboardLayoutMode": "resize",
+      "permissions": [
+        "android.permission.CAMERA"
+      ]
     },
     "web": {
       "bundler": "metro"
-    }
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Maestro uses the camera to scan the pairing QR code shown on your Mac."
+        }
+      ],
+      "expo-audio"
+    ]
   }
 }

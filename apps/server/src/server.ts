@@ -92,6 +92,23 @@ export function buildServer(): FastifyInstance {
   // Single-operator product: one deck (the most recent Mac to register).
   let deck: Deck | null = null;
 
+  // ── Remote-device presence ─────────────────────────────────────────
+  // The Mac can't otherwise tell a read-only remote is connected (GETs are served
+  // from the snapshot here, never reaching it). We watch authenticated /api/*
+  // activity + live SSE streams and push a `remote` frame to the host so the
+  // desktop's Devices pane + pairing window reflect reality.
+  let remoteName: string | null = null;
+  let remoteSeenAt = 0;
+  let lastRemoteNotify = 0;
+  function notifyRemote(force = false): void {
+    const t = Date.now();
+    if (!force && t - lastRemoteNotify < 1500) return;
+    lastRemoteNotify = t;
+    try {
+      deck?.ws?.send(JSON.stringify({ type: 'remote', streams: sseClients.size, lastSeen: remoteSeenAt || t, name: remoteName }));
+    } catch { /* socket closed */ }
+  }
+
   // ── Pairing-token auth on the whole remote surface ─────────────────
   // The Mac sets the token (host hello). Remotes send it as a Bearer header
   // or ?token= (the SSE EventSource can't set headers). /health and / stay open.
@@ -105,6 +122,11 @@ export function buildServer(): FastifyInstance {
     const qtoken = (req.query as { token?: string } | undefined)?.token ?? '';
     const presented = bearer || qtoken;
     if (presented !== expected) return reply.code(401).send({ error: 'Unauthorized — pair with the code shown in the Maestro desktop app' });
+    // Authenticated remote activity → let the Mac know a device is alive.
+    const dev = req.headers['x-maestro-device'];
+    if (typeof dev === 'string' && dev) remoteName = dev.slice(0, 40);
+    remoteSeenAt = Date.now();
+    notifyRemote();
   });
 
   // ── SSE fan-out to web clients ─────────────────────────────────────
@@ -172,6 +194,7 @@ export function buildServer(): FastifyInstance {
           isHost = true;
           ws.send(JSON.stringify({ type: 'hello-ok' }));
           sseSend('host', { online: true });
+          notifyRemote(true); // tell the freshly-connected Mac about current remotes
           return;
         }
         if (!isHost || !deck) return;
@@ -295,6 +318,8 @@ export function buildServer(): FastifyInstance {
     const j = (st()?.jobs ?? []).find((x) => x.id === (req.params as { id: string }).id);
     return j ?? reply.code(404).send({ error: 'job not found' });
   });
+  // Diff is computed by git ON THE MAC (read-only) — forward and return its result.
+  app.get('/api/jobs/:id/diff', async (req, reply) => forward(reply, 'getJobDiff', { id: (req.params as { id: string }).id }));
   app.get('/api/approvals', async (req) => {
     const status = (req.query as { status?: string }).status;
     const approvals = st()?.approvals ?? [];
@@ -362,13 +387,18 @@ export function buildServer(): FastifyInstance {
       'Access-Control-Allow-Origin': '*',
     });
     res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, hostOnline: !!deck?.online })}\n\n`);
+    const dev = (req.query as { device?: string }).device;
+    if (typeof dev === 'string' && dev) remoteName = dev.slice(0, 40);
+    remoteSeenAt = Date.now();
     sseClients.add(res);
+    notifyRemote(true); // a live remote stream opened
     const ping = setInterval(() => {
       try { res.write(': ping\n\n'); } catch { /* closed */ }
     }, 25000);
     req.raw.on('close', () => {
       clearInterval(ping);
       sseClients.delete(res);
+      notifyRemote(true); // stream closed → presence drops
     });
   });
 

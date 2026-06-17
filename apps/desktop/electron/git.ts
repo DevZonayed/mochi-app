@@ -385,3 +385,110 @@ export function mergeBaseIntoBranch(dir: string, base: string): { ok: boolean; c
   const conflicts = conf.ok ? conf.out.split('\n').filter(Boolean) : [];
   return conflicts.length ? { ok: false, conflicts } : { ok: false, conflicts: [], reason: m.out.slice(0, 200) };
 }
+
+// ── Structured diff (read-only) — feeds the phone's Diff Review screen ──────
+export type DiffLineKind = 'ctx' | 'add' | 'del' | 'hunk';
+export interface DiffLineOut { t: DiffLineKind; n: string; c: string }
+export interface DiffFileOut { path: string; lang: string; additions: number; deletions: number; binary: boolean; lines: DiffLineOut[] }
+export interface StructuredDiff {
+  files: DiffFileOut[];
+  additions: number;
+  deletions: number;
+  fileCount: number;
+  truncated: boolean;
+  base: string | null;
+  reason?: string;
+}
+
+/** Cap the payload that crosses the relay to the phone (whole-diff line budget). */
+const MAX_DIFF_LINES = 4000;
+
+function langForPath(p: string): string {
+  const ext = p.slice(p.lastIndexOf('.') + 1).toLowerCase();
+  const map: Record<string, string> = {
+    ts: 'TS', tsx: 'TSX', js: 'JS', jsx: 'JSX', mjs: 'JS', cjs: 'JS', json: 'JSON', md: 'MD',
+    css: 'CSS', scss: 'SCSS', html: 'HTML', py: 'PY', go: 'GO', rs: 'RS', rb: 'RB', sh: 'SH',
+    yml: 'YML', yaml: 'YML', sql: 'SQL', toml: 'TOML', swift: 'SWIFT', java: 'JAVA', c: 'C', cpp: 'C++',
+  };
+  return map[ext] ?? (ext ? ext.toUpperCase().slice(0, 4) : '·');
+}
+
+/** Parse a unified `git diff` into per-file hunks with new-file line numbers.
+    Pure (string in → structured out) so it is unit-testable without git. */
+export function parseUnifiedDiff(raw: string): Omit<StructuredDiff, 'base' | 'reason'> {
+  const files: DiffFileOut[] = [];
+  let cur: DiffFileOut | null = null;
+  let newLine = 0;
+  let total = 0;
+  let truncated = false;
+  let additions = 0;
+  let deletions = 0;
+  const push = (l: DiffLineOut): void => {
+    if (!cur) return;
+    if (total >= MAX_DIFF_LINES) { truncated = true; return; }
+    cur.lines.push(l); total++;
+  };
+
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('diff --git')) {
+      cur = { path: '', lang: '·', additions: 0, deletions: 0, binary: false, lines: [] };
+      files.push(cur);
+      continue;
+    }
+    if (!cur) continue;
+    if (line.startsWith('+++ ')) {
+      const p = line.slice(4).replace(/^b\//, '').trim();
+      if (p && p !== '/dev/null') { cur.path = p; cur.lang = langForPath(p); }
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      if (!cur.path) { const p = line.slice(4).replace(/^a\//, '').trim(); if (p && p !== '/dev/null') { cur.path = p; cur.lang = langForPath(p); } }
+      continue;
+    }
+    if (line.startsWith('Binary files')) { cur.binary = true; continue; }
+    if (line.startsWith('@@')) {
+      const m = /\+(\d+)/.exec(line.slice(2));
+      newLine = m ? Number(m[1]) : newLine;
+      push({ t: 'hunk', n: '', c: line });
+      continue;
+    }
+    // Skip extended headers (index/mode/rename/copy/new/deleted).
+    if (/^(index |new file|deleted file|rename |copy |similarity |dissimilarity |old mode|new mode)/.test(line)) continue;
+    const tag = line[0];
+    if (tag === '+') { cur.additions++; additions++; push({ t: 'add', n: String(newLine), c: line.slice(1) }); newLine++; }
+    else if (tag === '-') { cur.deletions++; deletions++; push({ t: 'del', n: '', c: line.slice(1) }); }
+    else if (tag === ' ') { push({ t: 'ctx', n: String(newLine), c: line.slice(1) }); newLine++; }
+    // '\ No newline at end of file' and blank trailing lines fall through.
+  }
+  const clean = files.filter((f) => f.path);
+  return { files: clean, additions, deletions, fileCount: clean.length, truncated };
+}
+
+/** Compute the diff of ALL work since the branch left `base` (committed +
+    uncommitted) via the merge-base; falls back to the working-tree diff. Read-only. */
+export function structuredDiff(dir: string, baseHint?: string | null): StructuredDiff {
+  const empty: StructuredDiff = { files: [], additions: 0, deletions: 0, fileCount: 0, truncated: false, base: null };
+  const git = resolveGit();
+  if (!git || !dir || !existsSync(dir) || !isGitRepo(dir)) return { ...empty, reason: 'not a git repository' };
+
+  const base = (baseHint && baseHint.trim()) || resolveBaseBranch(dir);
+  const ref = localRefExists(dir, `origin/${base}`) ? `origin/${base}` : (localRefExists(dir, base) ? base : null);
+  let against: string | null = null;
+  if (ref) {
+    const mb = execGit(['-C', dir, 'merge-base', ref, 'HEAD']);
+    against = mb.ok && mb.out ? mb.out : ref;
+  }
+
+  const runDiff = (args: string[]): string | null => {
+    try {
+      return execFileSync(git, ['-C', dir, 'diff', '--no-color', '-U3', ...args], { encoding: 'utf8', timeout: 20_000, maxBuffer: 16 * 1024 * 1024 }).toString();
+    } catch { return null; }
+  };
+  // merge-base diff captures committed + uncommitted in one pass; else the
+  // working-tree diff (uncommitted only) — best effort when there's no base.
+  let raw = against ? runDiff([against]) : null;
+  if (raw == null || raw.trim() === '') raw = runDiff([]) ?? raw;
+  if (raw == null) return { ...empty, base, reason: 'could not compute diff' };
+
+  return { ...parseUnifiedDiff(raw), base };
+}

@@ -23,9 +23,9 @@ export type IconName =
   | 'jobs' | 'bell' | 'search' | 'command' | 'plus' | 'calendar' | 'clock'
   | 'telescope' | 'checkCircle' | 'xCircle' | 'more' | 'chevronRight' | 'chevronDown'
   | 'gitMerge' | 'send' | 'settings' | 'x' | 'clapper' | 'sliders' | 'dollar'
-  | 'refresh' | 'image' | 'play' | 'pause';
+  | 'refresh' | 'image' | 'play' | 'pause' | 'camera' | 'chat' | 'bookmark' | 'terminal' | 'file';
 
-const PATHS: Record<IconName, React.ReactNode> = {
+const PATHS: Record<IconName, React.ReactElement> = {
   check: <Polyline points="20 6 9 17 4 12" />,
   arrowRight: <><Line x1="5" y1="12" x2="19" y2="12" /><Polyline points="12 5 19 12 12 19" /></>,
   arrowLeft: <><Line x1="19" y1="12" x2="5" y2="12" /><Polyline points="12 19 5 12 12 5" /></>,
@@ -65,6 +65,11 @@ const PATHS: Record<IconName, React.ReactNode> = {
   image: <><Rect x="3" y="3" width="18" height="18" rx="2" /><Circle cx="9" cy="9" r="2" /><Path d="m21 15-5-5L5 21" /></>,
   play: <Polygon points="6 4 20 12 6 20 6 4" />,
   pause: <><Rect x="6" y="5" width="4" height="14" rx="1" /><Rect x="14" y="5" width="4" height="14" rx="1" /></>,
+  camera: <><Path d="M3 8a2 2 0 0 1 2-2h2l1.5-2h7L19 6h0a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8Z" /><Circle cx="12" cy="13" r="3.5" /></>,
+  chat: <Path d="M21 11.5a8.38 8.38 0 0 1-9 8.5 9.5 9.5 0 0 1-3.5-.7L3 21l1.7-5A8.38 8.38 0 0 1 4 11.5 8.5 8.5 0 0 1 12.5 3 8.38 8.38 0 0 1 21 11.5Z" />,
+  bookmark: <Path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2Z" />,
+  terminal: <><Polyline points="4 17 10 11 4 5" /><Line x1="12" y1="19" x2="20" y2="19" /></>,
+  file: <><Path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" /><Polyline points="14 2 14 8 20 8" /></>,
 };
 
 export function Icon({
@@ -81,7 +86,11 @@ export function Icon({
   return (
     <Svg width={size} height={size} viewBox="0 0 24 24">
       <G fill="none" stroke={color} strokeWidth={stroke} strokeLinecap="round" strokeLinejoin="round">
-        {PATHS[name]}
+        {/* react-native-svg resolves React 18 types (hoisted to root), while this
+           app is on React 19 — the two ReactElement defs don't unify, so this one
+           handoff needs a bridge. Runtime is unaffected. See the root package.json
+           @types/react pin (kept at 18 for the React-18 desktop app). */}
+        {PATHS[name] as unknown as JSX.Element}
       </G>
     </Svg>
   );

@@ -6,6 +6,7 @@
    card), visual style preserved from the prototype. */
 
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
 import QRCode from 'qrcode';
 import { Icon } from '../lib/icons';
 import { useTheme, type Theme } from '../lib/appShell';
@@ -111,14 +112,58 @@ function useScalePair(): number {
 
 export default function DevicePairing() {
   const [theme, setTheme] = useTheme('light');
+  const navigate = useNavigate();
   useScalePair();
   const themeTabs: [Theme, 'sun' | 'moon'][] = [['light', 'sun'], ['dark', 'moon']];
+  const [paired, setPaired] = React.useState<string | null>(null);
+
+  // Done = back to where pairing was opened from (Settings → Devices). Esc too.
+  const close = React.useCallback(() => { navigate('/settings'); }, [navigate]);
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [close]);
+
+  // When a device actually connects, celebrate briefly then return to Settings.
+  React.useEffect(() => {
+    let alive = true;
+    api.getPairing().then((p) => { if (alive && p.devices?.connected) setPaired(p.devices.name ?? 'Your device'); }).catch(() => {});
+    const off = api.subscribe({ onDevices: (d) => { if (d.connected) setPaired(d.name ?? 'Your device'); } });
+    return () => { alive = false; off(); };
+  }, []);
+  React.useEffect(() => {
+    if (!paired) return;
+    const t = setTimeout(() => navigate('/settings'), 1800);
+    return () => clearTimeout(t);
+  }, [paired, navigate]);
 
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
       <style>{styles}</style>
       <div className="win-drag" style={{ width: '100%', height: '100%', overflow: 'hidden', position: 'relative', background: 'var(--backdrop-base)' }}>
         <div className="backdrop" aria-hidden="true"><span className="blob b1" /><span className="blob b2" /><span className="blob b3" /></div>
+
+        {/* Success overlay once a device connects. */}
+        {paired ? (
+          <div style={{ position: 'absolute', inset: 0, zIndex: 40, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--backdrop-base) 78%, transparent)', backdropFilter: 'blur(6px)' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
+              <span style={{ width: 76, height: 76, borderRadius: '50%', display: 'grid', placeItems: 'center', background: 'var(--green)', color: '#fff' }}><Icon name="check" size={40} stroke={3} /></span>
+              <div style={{ font: '700 var(--fs-title1)/1.1 var(--font-display)', color: 'var(--ink)' }}>Paired</div>
+              <div style={{ font: '400 var(--fs-body)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>{paired} is connected.</div>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Done / back — leaving the full-window pairing view (Esc also works). */}
+        <button
+          className="ghost-btn"
+          onClick={close}
+          title="Done (Esc)"
+          style={{ position: 'absolute', top: 16, left: 18, zIndex: 30, display: 'inline-flex', alignItems: 'center', gap: 7, height: 32, padding: '0 14px 0 10px', borderRadius: 'var(--r-pill)', background: 'var(--glass-tint)', border: '0.5px solid var(--glass-border)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)', color: 'var(--ink)', cursor: 'pointer', font: '600 var(--fs-callout)/1 var(--font-text)' }}
+        >
+          <Icon name="arrowLeft" size={16} /> Done
+        </button>
 
         <div style={{ position: 'absolute', top: 16, right: 18, zIndex: 30, display: 'flex', gap: 2, padding: 3, borderRadius: 'var(--r-pill)', background: 'var(--glass-tint)', border: '0.5px solid var(--glass-border)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
           {themeTabs.map(([t, ic]) => <button key={t} onClick={() => setTheme(t)} style={{ width: 30, height: 26, borderRadius: 'var(--r-pill)', display: 'grid', placeItems: 'center', background: theme === t ? 'var(--bg-elevated)' : 'transparent', color: theme === t ? 'var(--ink)' : 'var(--on-glass)' }}><Icon name={ic} size={15} /></button>)}

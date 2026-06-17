@@ -13,6 +13,8 @@ export interface RelayOptions {
   accessToken: string;
   getSnapshot: () => unknown;
   onCommand: (method: string, params: Record<string, unknown>) => Promise<unknown>;
+  /** Relay reports remote-device presence (active SSE streams + last API hit). */
+  onRemote?: (info: { streams: number; lastSeen: number; name: string | null }) => void;
 }
 
 export class RelayClient {
@@ -60,9 +62,10 @@ export class RelayClient {
   }
 
   private async onMessage(raw: string): Promise<void> {
-    let m: { type?: string; id?: string; method?: string; params?: Record<string, unknown> };
+    let m: { type?: string; id?: string; method?: string; params?: Record<string, unknown>; streams?: number; lastSeen?: number; name?: string | null };
     try { m = JSON.parse(raw) as typeof m; } catch { return; }
     if (m.type === 'ping') { this.send({ type: 'pong' }); return; }
+    if (m.type === 'remote') { this.opts.onRemote?.({ streams: m.streams ?? 0, lastSeen: m.lastSeen ?? Date.now(), name: m.name ?? null }); return; }
     if (m.type === 'cmd' && m.id && m.method) {
       try {
         const result = await this.opts.onCommand(m.method, m.params ?? {});

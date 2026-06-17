@@ -305,8 +305,15 @@ export function NewJobScreen() {
   const submit = () => {
     if (running || !proj || !goal.trim()) return;
     setRunning(true);
+    // Autonomy steers the agent via a real instruction prefix on the prompt.
+    const prefix =
+      auto === 'plan'
+        ? 'First, produce a step-by-step plan and wait for my approval before making any changes.\n\n'
+        : auto === 'gated'
+          ? 'Proceed, but stop and ask before any irreversible action (git push, deploy, delete, or spending money).\n\n'
+          : '';
     api
-      .createAndRunJob({ projectId: proj, input: goal.trim(), effort: EFFORT_API[effort], ...(model === 'claude' || model === 'codex' ? { engine: model } : {}) })
+      .createAndRunJob({ projectId: proj, input: prefix + goal.trim(), effort: EFFORT_API[effort], ...(model === 'claude' || model === 'codex' ? { engine: model } : {}) })
       .then(() => {
         nav.goBack();
       })
