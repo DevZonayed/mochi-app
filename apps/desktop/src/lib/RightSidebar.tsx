@@ -7,6 +7,7 @@
 
 import React from 'react';
 import { Icon } from './icons';
+import { FileTypeIcon } from './fileIcons';
 import { api, type Project, type DirEntry, type CmdOutput } from './api';
 
 export interface CheckItem { id: string; title: string; verdict: 'approved' | 'needs-work'; text: string }
@@ -26,10 +27,17 @@ function DirNode({ projectId, entry, depth, onOpenFile }: { projectId: string; e
   };
   return (
     <div>
-      <button onClick={toggle} className="ws-row" title={entry.name} style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left', padding: `4px 8px 4px ${10 + depth * 12}px`, borderRadius: 6, cursor: 'pointer' }}>
+      <button onClick={toggle} className="ws-row" title={entry.name} draggable
+        onDragStart={e => {
+          // Drag a file/folder into the chat composer → it becomes a reference chip.
+          e.dataTransfer.setData('application/x-maestro-path', JSON.stringify([{ name: entry.name, path: entry.path, isDir: entry.kind === 'dir' }]));
+          e.dataTransfer.setData('text/plain', entry.path);
+          e.dataTransfer.effectAllowed = 'copy';
+        }}
+        style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left', padding: `4px 8px 4px ${10 + depth * 12}px`, borderRadius: 6, cursor: 'pointer' }}>
         {entry.kind === 'dir'
           ? <Icon name="chevronRight" size={12} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 140ms var(--spring)' }} />
-          : <Icon name="file" size={12} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} />}
+          : <FileTypeIcon name={entry.name} size={14} />}
         <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-caption)/1.45 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{entry.name}</span>
       </button>
       {open && (

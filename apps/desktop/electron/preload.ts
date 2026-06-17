@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 
 export interface MaestroCallResult {
   ok: boolean;
@@ -20,6 +20,10 @@ contextBridge.exposeInMainWorld('maestro', {
     return () => ipcRenderer.removeListener('maestro:event', listener);
   },
   // Desktop-only native affordances (never available to web/mobile remotes).
+  // Resolve a dropped/picked File to its absolute path on disk. Electron 32+
+  // removed File.path; this is the supported replacement. Used by the composer to
+  // attach a file OR folder by reference (the local agent reads it from disk).
+  getPathForFile: (file: File): string => { try { return webUtils.getPathForFile(file); } catch { return ''; } },
   pickFolder: (): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:pickFolder'),
   revealPath: (p: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('maestro:revealPath', p),
   importAsset: (projectId: string | null): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:importAsset', projectId),
@@ -30,6 +34,7 @@ contextBridge.exposeInMainWorld('maestro', {
   // dispatch, so the phone/web remotes can never read local files.
   readFile: (projectId: string, p: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:readFile', projectId, p),
   listDir: (projectId: string, p?: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:listDir', projectId, p ?? ''),
+  listProjectFiles: (projectId: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:listProjectFiles', projectId),
   // Run / Terminal — run a shell command in the project folder, stream output.
   runCommand: (projectId: string, command: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:runCommand', projectId, command),
   killCommand: (runId: string): Promise<{ ok: boolean }> => ipcRenderer.invoke('maestro:killCommand', runId),

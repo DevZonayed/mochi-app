@@ -15,6 +15,24 @@ import { RightSidebar, type CheckItem } from '../lib/RightSidebar';
 import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
 
+/** A small spinning ring — shown on a session/project that has a job running. */
+function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
+  return <span aria-label="working" style={{ width: size, height: size, borderRadius: '50%', flexShrink: 0, boxSizing: 'border-box', border: `2px solid color-mix(in srgb, ${color} 24%, transparent)`, borderTopColor: color, animation: 'ws-spin 0.7s linear infinite' }} />;
+}
+
+/* Drag-and-drop project reorder — native HTML5 DnD, the same pattern as the
+   Projects gallery. The parent owns the live reorder + persists it on drop. */
+interface Dnd { draggingId: string | null; start: (id: string) => void; over: (id: string) => void; end: () => void }
+function dragProps(dnd: Dnd, id: string) {
+  return {
+    draggable: true,
+    onDragStart: (e: React.DragEvent) => { e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', id); } catch { /* some engines require data set */ } dnd.start(id); },
+    onDragOver: (e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; dnd.over(id); },
+    onDrop: (e: React.DragEvent) => { e.preventDefault(); dnd.end(); },
+    onDragEnd: () => dnd.end(),
+  };
+}
+
 const PAGE_CSS = `
   .ws-row { transition: background 120ms ease; }
   .ws-row:hover { background: var(--fill-tertiary); }
@@ -36,6 +54,7 @@ const PAGE_CSS = `
      chats, so the project you're in (and its collapse/new-chat controls) is
      always reachable in a long list */
   .ws-proj-head { position: sticky; top: 0; z-index: 2; background: var(--bg-grouped); }
+  @keyframes ws-spin { to { transform: rotate(360deg); } }
   /* overflow menu of open tabs — so every open chat is one click away even
      when the tab strip is scrolled past the edge */
   .ws-ovf-item:hover { background: var(--fill-tertiary); }
@@ -105,11 +124,41 @@ export default function Workspace() {
   const [ovfOpen, setOvfOpen] = React.useState(false);
   // active chat's turns, lifted from each ChatThread, for the "Changed files" panel
   const [turnsByTab, setTurnsByTab] = React.useState<Record<string, Job[]>>({});
+  // Sessions with a job running/pending right now — drives the sidebar loading spinners.
+  const [runningSessions, setRunningSessions] = React.useState<Set<string>>(new Set());
   const [addOpen, setAddOpen] = React.useState(false); // add-project menu
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => { try { return localStorage.getItem('maestro.workspace.sidebar') === '0'; } catch { return false; } });
   const toggleSidebar = () => setSidebarCollapsed(c => { const n = !c; try { localStorage.setItem('maestro.workspace.sidebar', n ? '0' : '1'); } catch { /* ignore */ } return n; });
 
   const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
+
+  // Drag-and-drop reorder for the sidebar project list. Reorders `projects` live
+  // as you drag a header over another, then persists the order on drop (the store
+  // sorts by it, so it survives reload + syncs to remotes).
+  const dragIdRef = React.useRef<string | null>(null);
+  const lastOverRef = React.useRef<string | null>(null);
+  const projOrderRef = React.useRef<string[]>([]);
+  const [draggingProj, setDraggingProj] = React.useState<string | null>(null);
+  React.useEffect(() => { projOrderRef.current = projects.map(p => p.id); }, [projects]);
+  const projDnd: Dnd = React.useMemo(() => ({
+    draggingId: draggingProj,
+    start: (id) => { dragIdRef.current = id; lastOverRef.current = id; setDraggingProj(id); },
+    over: (overId) => {
+      const from = dragIdRef.current;
+      if (!from || overId === from || lastOverRef.current === overId) return;
+      lastOverRef.current = overId;
+      setProjects(ps => {
+        const fromIdx = ps.findIndex(p => p.id === from);
+        const toIdx = ps.findIndex(p => p.id === overId);
+        if (fromIdx === -1 || toIdx === -1 || fromIdx === toIdx) return ps;
+        const next = [...ps]; const [moved] = next.splice(fromIdx, 1); next.splice(toIdx, 0, moved); return next;
+      });
+    },
+    end: () => {
+      const moved = dragIdRef.current; dragIdRef.current = null; lastOverRef.current = null; setDraggingProj(null);
+      if (moved) void api.reorderProjects(projOrderRef.current).catch(() => { void api.listProjects().then(setProjects).catch(() => {}); });
+    },
+  }), [draggingProj]);
 
   // initial load: projects + all sessions
   React.useEffect(() => {
@@ -146,6 +195,14 @@ export default function Workspace() {
   // LIVE: keep the tree + tab titles current.
   React.useEffect(() => {
     const unsub = api.subscribe({
+      onJob: (job) => {
+        const sid = job.sessionId; if (!sid) return;
+        const running = job.status === 'running' || job.status === 'pending';
+        setRunningSessions(prev => {
+          if (running === prev.has(sid)) return prev;
+          const next = new Set(prev); if (running) next.add(sid); else next.delete(sid); return next;
+        });
+      },
       onSession: (s) => {
         if ((s as { deleted?: boolean }).deleted) {
           setSessions(ss => ss.filter(x => x.id !== s.id));
@@ -158,6 +215,13 @@ export default function Workspace() {
       onProject: () => { api.listProjects().then(setProjects).catch(() => {}); },
     });
     return unsub;
+  }, []);
+
+  // Seed the "working" indicators with any jobs already running when we open.
+  React.useEffect(() => {
+    let alive = true;
+    api.listJobs().then(jobs => { if (alive) setRunningSessions(new Set(jobs.filter(j => (j.status === 'running' || j.status === 'pending') && j.sessionId).map(j => j.sessionId as string))); }).catch(() => {});
+    return () => { alive = false; };
   }, []);
 
   // Hand-off-from-design: open the freshly-copied coding project + its seeded chat
@@ -341,7 +405,9 @@ export default function Workspace() {
       <div className={`ws-row${isActive ? ' ws-active' : ''}`} onClick={() => openSession(s)} style={{
         display: 'flex', alignItems: 'center', gap: 7, padding: `5px 8px 5px ${indent}px`, borderRadius: 8, cursor: 'pointer',
         background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
-        <Icon name="chat" size={13} style={{ flexShrink: 0, color: open ? projColor(p) : 'var(--ink-tertiary)' }} />
+        {runningSessions.has(s.id)
+          ? <Loader size={13} color={projColor(p)} />
+          : <Icon name="chat" size={13} style={{ flexShrink: 0, color: open ? projColor(p) : 'var(--ink-tertiary)' }} />}
         {renamingId === s.id ? (
           <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
             onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
@@ -482,15 +548,22 @@ export default function Workspace() {
             {visibleProjects.map(p => {
               const chats = sessionsByProject(p.id);
               const isOpen = expanded.has(p.id) || (!!q && chats.length > 0);
+              const projRunning = chats.some(s => runningSessions.has(s.id));
+              const projActive = p.id === activeTab?.projectId;
               return (
                 // Lift the whole project above sibling rows while its "⋯" menu is open, so the
                 // dropdown isn't painted over by the next project's row (each row otherwise
                 // scopes the menu's z-index to its own stacking context).
                 <div key={p.id} className="ws-proj" style={menuProj === p.id ? { position: 'relative', zIndex: 60 } : undefined}>
-                  <div className="ws-row ws-proj-head" onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
-                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer', position: 'relative' }}>
+                  <div className="ws-row ws-proj-head" {...dragProps(projDnd, p.id)} onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
+                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer', position: 'relative', userSelect: 'none',
+                      opacity: draggingProj === p.id ? 0.45 : undefined,
+                      background: projActive ? `color-mix(in srgb, ${projColor(p)} 13%, var(--bg-grouped))` : undefined }}>
+                    {projActive && <span style={{ position: 'absolute', left: 0, top: 5, bottom: 5, width: 2.5, borderRadius: 2, background: projColor(p) }} />}
                     <Icon name="chevronRight" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
-                    <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p) }} />
+                    {projRunning
+                      ? <Loader size={14} color={projColor(p)} />
+                      : <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p) }} />}
                     <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
                     {chats.length > 0 && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{chats.length}</span>}
                     <button className="ws-newchat" title="Project · settings, jobs, memory" onClick={e => { e.stopPropagation(); setMenuProj(m => m === p.id ? null : p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0, position: 'relative' }}>
@@ -560,7 +633,7 @@ export default function Workspace() {
         </div>
 
         {/* ── right: tab bar + active chat ── */}
-        <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+        <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           {/* tab bar */}
           <div style={{ display: 'flex', alignItems: 'stretch', height: 42, flexShrink: 0, borderBottom: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
             <div ref={tabStripRef} className="ws-tabs"

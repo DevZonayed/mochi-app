@@ -171,4 +171,75 @@ describe('ExtensionBridge', () => {
     expect(calls).toContain('addDesignComment');
     expect(calls).toContain('sendChat');
   });
+
+  it('add_comment with no session ("+ New chat") still opens a chat and delivers', async () => {
+    const calls: string[] = [];
+    const dispatch = async (method: string, params: any) => {
+      calls.push(method);
+      if (method === 'addDesignComment') return { comment: { id: 'c2' } };
+      if (method === 'sendChat') { expect(params.sessionId).toBeUndefined(); return { session: { id: 'sNew' }, job: { id: 'jNew' } }; }
+      return { ok: true };
+    };
+    const { port } = startBridge(fakeStore(), dispatch);
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    // sessionId omitted = "+ New chat" in the picker.
+    a.ws.send(JSON.stringify({ id: 8, type: 'add_comment', params: { projectId: 'p1', selector: '.y', label: 'Card', note: 'wrong color', url: 'http://y' } }));
+    const reply = await waitFor(() => a.msgs.find(m => m.id === 8));
+    expect(reply.ok).toBe(true);
+    expect(reply.result.commentId).toBe('c2');
+    expect(reply.result.sessionId).toBe('sNew');
+    expect(calls).toEqual(['addDesignComment', 'sendChat']);
+  });
+
+  // ── app→extension RPC (browser automation, "Round 2") ──
+  /** Make a connected client behave like the extension: reply to app→ext commands. */
+  function autoReplyBrowser(ws: WebSocket, handler: (type: string, params: any) => { ok: boolean; result?: any; error?: string }) {
+    ws.on('message', (raw) => {
+      let m: any; try { m = JSON.parse(raw.toString()); } catch { return; }
+      if (m.id != null && m.type && m.params !== undefined) {
+        const r = handler(m.type, m.params);
+        ws.send(JSON.stringify({ id: m.id, ok: r.ok, result: r.result, error: r.error }));
+      }
+    });
+  }
+
+  it('request() drives the ACTIVE browser and resolves with its reply', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    autoReplyBrowser(a.ws, (type, params) => ({ ok: true, result: { echoed: type, url: params.url } }));
+    expect(bridge.hasActiveBrowser()).toBe(true);
+    expect(bridge.activeProfile()).toBe('A');
+    const res = await bridge.request('navigate', { url: 'https://x.test' }) as any;
+    expect(res).toEqual({ echoed: 'navigate', url: 'https://x.test' });
+  });
+
+  it('request() rejects (503) when no browser is connected', async () => {
+    const { bridge } = startBridge(fakeStore());
+    expect(bridge.hasActiveBrowser()).toBe(false);
+    await expect(bridge.request('navigate', { url: 'x' })).rejects.toThrow(/No browser connected/);
+  });
+
+  it('request() routes to the ACTIVE profile, not a standby one', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    const b = await open(port, hello('b', 'B'));         // b joins on standby
+    await waitFor(() => lastOfType(b.msgs, 'welcome'));
+    bridge.setActiveFromApp('b');                          // make b active
+    await waitFor(() => lastLifecycle(b.msgs)?.type === 'promoted');
+    autoReplyBrowser(a.ws, () => ({ ok: true, result: { who: 'A' } }));
+    autoReplyBrowser(b.ws, () => ({ ok: true, result: { who: 'B' } }));
+    const res = await bridge.request('snapshot', {}) as any;
+    expect(res.who).toBe('B');
+  });
+
+  it('request() surfaces a browser-side error', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    autoReplyBrowser(a.ws, () => ({ ok: false, error: 'tab crashed' }));
+    await expect(bridge.request('click', { ref: '.x' })).rejects.toThrow(/tab crashed/);
+  });
 });

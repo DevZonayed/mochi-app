@@ -199,7 +199,7 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 }
 
 // ── Page root ────────────────────────────────────────────────────────────────
-export default function BudgetDashboard() {
+export default function BudgetDashboard({ embedded = false }: { embedded?: boolean } = {}) {
   const navigate = useNavigate();
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const [costs, setCosts] = React.useState<CostsData | null>(null);
@@ -218,15 +218,16 @@ export default function BudgetDashboard() {
   }, [load]);
 
   React.useEffect(() => {
+    if (embedded) return; // Settings hosts its own ⌘K when this renders as a pane
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
-  }, []);
+  }, [embedded]);
 
   const c = costs ?? { today: 0, thisMonth: 0, projectedMonth: 0, byDay: [], byProject: [], byEngine: [], includedCodexRuns: 0, claudeRuns: 0 };
   const hasSpend = c.thisMonth > 0 || jobs.length > 0;
 
-  return (
-    <AppShell active="budget" onSearch={() => setPaletteOpen(true)}>
+  const body = (
+    <>
       <style>{styles}</style>
       <div style={{ padding: '24px 28px 36px' }}>
         <h1 style={{ margin: '0 0 4px', font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Costs</h1>
@@ -243,7 +244,14 @@ export default function BudgetDashboard() {
         {hasSpend ? <Ledger jobs={jobs} projects={projects} onOpen={(id) => navigate(`/session-transcript/${id}`)} />
           : <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', padding: '40px 0', textAlign: 'center', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No runs yet. Costs appear here as jobs complete.</div>}
       </div>
+    </>
+  );
 
+  if (embedded) return <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>{body}</div>;
+
+  return (
+    <AppShell active="budget" onSearch={() => setPaletteOpen(true)}>
+      {body}
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>
   );
