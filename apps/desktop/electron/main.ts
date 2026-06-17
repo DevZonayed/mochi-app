@@ -333,6 +333,8 @@ app.whenReady().then(() => {
   // Local control channel for the native browser extension (one app-owned port).
   extensionBridge = new ExtensionBridge(store, dispatch, (status) => emit('extension', status, { desktopOnly: true }));
   extensionBridge.start();
+  // Give coding turns the browser_* tools that drive the active Chrome profile.
+  engine.setExtensionBridge(() => extensionBridge);
 
   relay = new RelayClient({
     url: RELAY_URL,
@@ -500,6 +502,33 @@ app.whenReady().then(() => {
         .map(d => ({ name: d.name, path: path.join(real, d.name), kind: d.isDirectory() ? 'dir' : d.isFile() ? 'file' : 'other' }))
         .sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'dir' ? -1 : 1));
       return { ok: true, data: { path: real, entries } };
+    } catch (e) { return { ok: false, error: (e as Error)?.message ?? 'list failed' }; }
+  });
+
+  // Flat list of the project's files (project-relative paths) for fast @-mention
+  // file search. DESKTOP-ONLY, confined to the project root; common build/vendor
+  // dirs are skipped and the walk is capped so even huge repos stay snappy.
+  ipcMain.handle('maestro:listProjectFiles', async (_e, projectId: string) => {
+    try {
+      const root = projectRoot(projectId);
+      const IGNORE = new Set(['.git', 'node_modules', '.DS_Store', 'dist', 'build', '.next', 'out', 'coverage', '.turbo', '.cache', 'target', '.venv', 'venv', '__pycache__', '.idea', '.vscode', '.parcel-cache', 'vendor', '.gradle', 'Pods', '.expo']);
+      const CAP = 20000;
+      const files: string[] = [];
+      const walk = async (dir: string, rel: string): Promise<void> => {
+        if (files.length >= CAP) return;
+        let dirents;
+        try { dirents = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+        for (const d of dirents) {
+          if (files.length >= CAP) return;
+          if (IGNORE.has(d.name)) continue;
+          const childRel = rel ? `${rel}/${d.name}` : d.name;
+          if (d.isDirectory()) await walk(path.join(dir, d.name), childRel);
+          else if (d.isFile()) files.push(childRel);
+        }
+      };
+      await walk(root, '');
+      files.sort();
+      return { ok: true, data: { files, truncated: files.length >= CAP } };
     } catch (e) { return { ok: false, error: (e as Error)?.message ?? 'list failed' }; }
   });
 
