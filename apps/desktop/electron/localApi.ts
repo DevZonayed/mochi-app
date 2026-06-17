@@ -562,6 +562,28 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('schedule', sched);
         return sched;
       }
+      // Scheduled message: fire a real chat message into a session at an absolute
+      // time, carrying the composer's effort/browser/plan/goal so it runs exactly
+      // as if sent by hand. Held in the schedules queue; survives app restart.
+      case 'scheduleMessage': {
+        const fireAt = Number(p.fireAt);
+        if (!Number.isFinite(fireAt)) bad('fireAt (ms timestamp) required');
+        // 30s floor matches the cron tick: anything sooner can't be honoured precisely.
+        if (fireAt < Date.now() + 30_000) bad('fireAt must be at least 30s in the future');
+        const prompt = typeof p.prompt === 'string' ? p.prompt.trim().slice(0, 8000) : '';
+        if (!prompt) bad('prompt (message text) required');
+        if (p.projectId && !store.getProject(String(p.projectId))) bad('project not found', 404);
+        const sched = store.createSchedule({
+          projectId: p.projectId ? String(p.projectId) : null,
+          sessionId: p.sessionId ? String(p.sessionId) : undefined,
+          title: prompt.slice(0, 60), prompt, fireAt,
+          kind: 'message',
+          effort: (p.effort as Effort | undefined),
+          browser: p.browser === true, plan: p.plan === true, goal: p.goal === true,
+        });
+        emit('schedule', sched);
+        return sched;
+      }
 
       // ── Skills / Templates ─────────────────────────────────────
       case 'listSkills': return store.listSkills();

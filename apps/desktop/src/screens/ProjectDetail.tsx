@@ -26,7 +26,7 @@ import {
 } from '../lib/ui';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask } from '../lib/api';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -1929,6 +1929,142 @@ function BgTasksPanel({ tasks, onStop }: { tasks: BgTask[]; onStop: (id: string)
 /* Collapsible "N queued messages" panel — keyboard-navigable, with row actions.
    Rows are drag-and-droppable (and ⌥↑/⌥↓ move the selected one) so the operator
    can prioritize which task runs next: the drainer always fires queue[0]. */
+/* ───────────────── Scheduled messages ─────────────────
+   A message the user scheduled to fire into THIS chat at a chosen time. The
+   record lives in the schedules queue (survives restart); CronRunner turns it
+   into a real job at fireAt. Below: a live-countdown queue + the date/time
+   picker that sits in the composer toolbar. */
+
+const pad2 = (n: number) => String(n).padStart(2, '0');
+const toDateInput = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const toTimeInput = (d: Date) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+function parseDateTime(date: string, time: string): number | null {
+  const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date.trim());
+  const tm = /^(\d{1,2}):(\d{2})$/.exec(time.trim());
+  if (!dm || !tm) return null;
+  const d = new Date(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3]), Number(tm[1]), Number(tm[2]), 0, 0);
+  return Number.isNaN(d.getTime()) ? null : d.getTime();
+}
+const atToday = (h: number, m: number) => { const d = new Date(); d.setHours(h, m, 0, 0); return d.getTime(); };
+const atTomorrow = (h: number, m: number) => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(h, m, 0, 0); return d.getTime(); };
+
+/** "2d 3h 12m" / "1h 04m 09s" / "9m 05s" / "45s" / "now" — leading zero-units dropped. */
+function fmtCountdown(ms: number): string {
+  if (ms <= 0) return 'now';
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${pad2(m)}m ${pad2(sec)}s`;
+  if (m > 0) return `${m}m ${pad2(sec)}s`;
+  return `${sec}s`;
+}
+
+/** Friendly absolute time: "Today 3:00 PM" / "Tomorrow 9:00 AM" / "Fri Jun 19, 9:00 AM". */
+function fmtWhen(ts: number): string {
+  const d = new Date(ts), now = new Date();
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const sameDay = (a: Date, b: Date) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
+  if (sameDay(d, now)) return `Today ${time}`;
+  if (sameDay(d, tomorrow)) return `Tomorrow ${time}`;
+  return `${d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}, ${time}`;
+}
+
+const upsertSchedule = (list: Schedule[], s: Schedule): Schedule[] => {
+  const i = list.findIndex(x => x.id === s.id);
+  if (i === -1) return [...list, s];
+  const next = list.slice(); next[i] = s; return next;
+};
+
+/** The upcoming scheduled messages for this chat, each ticking down to its fire time. */
+function ScheduledQueue({ items, now, onCancel, onEdit }: { items: Schedule[]; now: number; onCancel: (id: string) => void; onEdit: (s: Schedule) => void }) {
+  const [collapsed, setCollapsed] = React.useState(false);
+  return (
+    <div className="q-panel" style={{ marginBottom: 8, borderRadius: 14, overflow: 'hidden', border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', boxShadow: 'var(--card-shadow)' }}>
+      <button onClick={() => setCollapsed(c => !c)} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: 'transparent', cursor: 'pointer', borderBottom: collapsed ? 'none' : '0.5px solid var(--separator)' }}>
+        <Icon name="clock" size={13} style={{ color: 'var(--blue)' }} />
+        <span style={{ flex: 1, textAlign: 'left', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{items.length} scheduled message{items.length === 1 ? '' : 's'}</span>
+        <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)', transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+      </button>
+      {!collapsed && items.map(s => {
+        const left = (s.fireAt ?? 0) - now;
+        const soon = left <= 60_000;
+        const auto = s.kind === 'auto-continue';
+        const accent = auto ? 'var(--purple)' : 'var(--blue)';
+        return (
+          <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderTop: '0.5px solid var(--separator)' }}>
+            <span className={soon ? 'breathe' : undefined} style={{ width: 7, height: 7, borderRadius: 4, flexShrink: 0, background: soon ? 'var(--orange)' : accent }} />
+            <span style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                {auto && (
+                  <span title="Auto-queued because Claude's usage limit was reached" style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexShrink: 0, height: 16, padding: '0 6px', borderRadius: 5,
+                    background: 'color-mix(in srgb, var(--purple) 15%, transparent)', color: 'var(--purple)', font: '700 9px/1 var(--font-text)', letterSpacing: '0.02em', textTransform: 'uppercase' }}>
+                    <Icon name="refresh" size={9} /> Auto-continue
+                  </span>
+                )}
+                <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{auto ? 'Continues this chat when the limit resets' : (s.prompt || s.title)}</span>
+              </span>
+              <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{fmtWhen(s.fireAt ?? 0)}</span>
+            </span>
+            <span title="Fires in" style={{ flexShrink: 0, minWidth: 74, textAlign: 'right', font: '600 var(--fs-footnote)/1 var(--font-mono)', color: soon ? 'var(--orange)' : accent }}>{fmtCountdown(left)}</span>
+            {!auto && (
+              <button title="Edit — bring it back to the composer to change the text or time" onClick={() => onEdit(s)} className="tb-icon" style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', cursor: 'pointer', flexShrink: 0, background: 'transparent', border: 'none' }}><Icon name="calendar" size={14} /></button>
+            )}
+            <button title={auto ? 'Cancel auto-continue' : 'Cancel'} onClick={() => onCancel(s.id)} className="tb-icon" style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', cursor: 'pointer', flexShrink: 0, background: 'transparent', border: 'none' }}><Icon name="x" size={14} /></button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Composer popover: one-tap presets or a precise date + time to schedule the message. */
+function SchedulePicker({ initial, onPick, onClose }: { initial?: number; onPick: (ts: number) => void; onClose: () => void }) {
+  const base = initial && initial > Date.now() ? initial : Date.now() + 60 * 60_000;
+  const [date, setDate] = React.useState(() => toDateInput(new Date(base)));
+  const [time, setTime] = React.useState(() => toTimeInput(new Date(base)));
+  const composed = parseDateTime(date, time);
+  const valid = composed != null && composed > Date.now() + 30_000;
+  const presets = [
+    { label: 'In 15 min', get: () => Date.now() + 15 * 60_000 },
+    { label: 'In 1 hour', get: () => Date.now() + 60 * 60_000 },
+    { label: 'Tonight 8 PM', get: () => atToday(20, 0) },
+    { label: 'Tomorrow 9 AM', get: () => atTomorrow(9, 0) },
+  ].filter(o => o.get() > Date.now() + 30_000);
+  const inputStyle: React.CSSProperties = { height: 32, padding: '0 8px', borderRadius: 8, border: '1px solid var(--separator-strong)', background: 'var(--bg-grouped)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' };
+  return (
+    <>
+      <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
+      <div style={{ position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 41, width: 284,
+        background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.26))', padding: 12 }}>
+        <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 9 }}>Schedule this message</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 11 }}>
+          {presets.map(o => (
+            <button key={o.label} onClick={() => onPick(o.get())} className="mm-row"
+              style={{ height: 28, padding: '0 11px', borderRadius: 'var(--r-pill)', cursor: 'pointer', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', border: 'none' }}>
+              {o.label}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: 'flex', gap: 7, marginBottom: 10 }}>
+          <input type="date" value={date} min={toDateInput(new Date())} onChange={e => setDate(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
+          <input type="time" value={time} onChange={e => setTime(e.target.value)} style={{ ...inputStyle, width: 100 }} />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1.25 var(--font-text)', color: composed != null && !valid ? 'var(--red)' : 'var(--ink-secondary)' }}>
+            {composed == null ? 'Pick a date & time' : valid ? `Fires ${fmtWhen(composed)} · in ${fmtCountdown(composed - Date.now())}` : 'Pick a time at least 30s ahead'}
+          </span>
+          <button disabled={!valid} onClick={() => { if (valid && composed != null) onPick(composed); }}
+            style={{ height: 30, padding: '0 14px', borderRadius: 9, border: 'none', cursor: valid ? 'pointer' : 'default', flexShrink: 0,
+              background: valid ? 'var(--blue)' : 'var(--fill-secondary)', color: valid ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+            Schedule
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
 function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: string[]; onSendNow: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
   const [collapsed, setCollapsed] = React.useState(false);
   const [sel, setSel] = React.useState(-1);
@@ -2215,10 +2351,8 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [goalMode, setGoalModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.goal') === '1'; } catch { return false; } });
   const setPlanMode = (on: boolean) => { setPlanModeState(on); try { localStorage.setItem('maestro.chat.plan', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setGoalModeState(false); try { localStorage.setItem('maestro.chat.goal', '0'); } catch { /* ignore */ } } };
   const setGoalMode = (on: boolean) => { setGoalModeState(on); try { localStorage.setItem('maestro.chat.goal', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setPlanModeState(false); try { localStorage.setItem('maestro.chat.plan', '0'); } catch { /* ignore */ } } };
-  // Browser mode: drive the user's REAL connected Chrome (the Mochi extension) for
-  // this turn via the agent's browser_* tools. Orthogonal to plan/goal; persisted.
-  const [browserMode, setBrowserModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.browser') === '1'; } catch { return false; } });
-  const setBrowserMode = (on: boolean) => { setBrowserModeState(on); try { localStorage.setItem('maestro.chat.browser', on ? '1' : '0'); } catch { /* ignore */ } };
+  // Browser use is driven by an explicit @browser mention in the composer
+  // (composerBrowser) — there's no separate toggle button to keep the bar clean.
   const primaryProvider = React.useMemo(() => {
     for (const g of modelGroups) { const d = g.models.find(m => m.key === primaryKey); if (d) return d.provider; }
     return 'claude';
@@ -2226,8 +2360,12 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [sendError, setSendError] = React.useState('');
   const [slashSel, setSlashSel] = React.useState(0);
   const [mentionSel, setMentionSel] = React.useState(0);
-  const [optsOpen, setOptsOpen] = React.useState(false); // reviewer + schedule popover
+  const [optsOpen, setOptsOpen] = React.useState(false); // reviewer-model popover
   const [schedNote, setSchedNote] = React.useState('');
+  const [schedOpen, setSchedOpen] = React.useState(false); // schedule-this-message date/time picker
+  const [schedEditAt, setSchedEditAt] = React.useState<number | null>(null); // prefill fireAt when editing
+  const [schedules, setSchedules] = React.useState<Schedule[]>([]); // upcoming scheduled messages for this chat
+  const [schedNow, setSchedNow] = React.useState(() => Date.now()); // ticks each second to drive countdowns
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
   const [bgTasks, setBgTasks] = React.useState<BgTask[]>([]); // long-lived processes the agent started (dev servers, watchers)
   const [attachments, setAttachments] = React.useState<Attach[]>([]); // images / text / files
@@ -2296,9 +2434,42 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
         if (t.projectId && projectId && t.projectId !== projectId) return;
         setBgTasks(list => { const i = list.findIndex(x => x.id === t.id); if (i === -1) return [t, ...list]; const next = list.slice(); next[i] = t; return next; });
       },
+      // Scheduled messages for THIS chat: add when created, drop when fired/cancelled.
+      onSchedule: (s) => {
+        if (s.kind !== 'message' && s.kind !== 'auto-continue') return;
+        setSchedules(list => {
+          const keep = s.sessionId === activeRef.current && s.enabled && (s.fireAt ?? 0) > Date.now();
+          const without = list.filter(x => x.id !== s.id);
+          return keep ? [...without, s] : without;
+        });
+      },
     });
     return unsub;
   }, [projectId]);
+
+  // Seed this chat's upcoming scheduled messages (records persist across restart).
+  React.useEffect(() => {
+    if (!activeId) { setSchedules([]); return; }
+    let alive = true;
+    void api.listSchedules()
+      .then(rows => { if (alive) setSchedules(rows.filter(s => (s.kind === 'message' || s.kind === 'auto-continue') && s.sessionId === activeId && s.enabled && (s.fireAt ?? 0) > Date.now())); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [activeId]);
+
+  // Tick the countdown once a second — only while messages are actually waiting.
+  React.useEffect(() => {
+    if (schedules.length === 0) return;
+    const t = window.setInterval(() => setSchedNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [schedules.length]);
+
+  // Visible queue: future messages, soonest first; a fired item lingers ≤35s as a
+  // fallback in case the prune event is missed, then drops on its own.
+  const upcomingSched = React.useMemo(
+    () => schedules.filter(s => (s.fireAt ?? 0) > schedNow - 35_000).sort((a, b) => (a.fireAt ?? 0) - (b.fireAt ?? 0)),
+    [schedules, schedNow],
+  );
 
   // Seed the background-task list for this project (records persist across turns).
   React.useEffect(() => {
@@ -2356,7 +2527,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     try {
       const resp = await api.sendChat({
         projectId, text: body, sessionId: activeRef.current ?? undefined,
-        effort: EFFORT_TO_API[effort], plan: planMode, goal: goalMode, browser: browserMode || composerBrowser,
+        effort: EFFORT_TO_API[effort], plan: planMode, goal: goalMode, browser: composerBrowser,
         ...(primaryKey ? { modelKey: primaryKey } : {}),
         ...(reviewerKey ? { reviewerKey } : {}),
         ...(imgs.length ? { images: imgs } : {}),
@@ -2375,7 +2546,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
       return false;
     }
-  }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, browserMode, composerBrowser, onSessionCreated]);
+  }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, composerBrowser, onSessionCreated]);
 
   // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
   const sendText = React.useCallback((raw: string) => {
@@ -2519,13 +2690,34 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
 
   const fillComposer = (v: string) => { composerRef.current?.setText(v); composerRef.current?.focus(); };
-  // Wait-&-check: schedule a one-shot follow-up that pokes this chat after a delay.
-  const scheduleCheck = (delayMs: number, label: string) => {
-    setOptsOpen(false);
+
+  // Schedule the CURRENT composer message to fire into this chat at an absolute
+  // time, carrying the run intent (effort/browser/plan/goal). Clears on success.
+  const scheduleMessage = (fireAt: number) => {
     if (!projectId) return;
-    void api.scheduleCheck({ projectId, sessionId: activeRef.current ?? undefined, prompt: text.trim() || undefined, delayMs })
-      .then(() => { setSchedNote(`Check scheduled in ${label}`); setTimeout(() => setSchedNote(''), 3500); })
-      .catch(() => {});
+    const body = text.trim();
+    if (!body) { setSchedOpen(false); setSendError('Type a message first, then schedule it.'); return; }
+    void api.scheduleMessage({
+      projectId, sessionId: activeRef.current ?? undefined, prompt: body, fireAt,
+      effort: EFFORT_TO_API[effort], browser: composerBrowser, plan: planMode, goal: goalMode,
+    }).then(s => {
+      composerRef.current?.clear(); setText('');
+      setSchedules(list => upsertSchedule(list, s));
+      setSchedOpen(false); setSchedEditAt(null);
+      setSchedNote(`Scheduled · ${fmtWhen(fireAt)}`); setTimeout(() => setSchedNote(''), 4000);
+    }).catch(e => { setSchedOpen(false); setSendError(e instanceof Error ? e.message : 'Could not schedule — try again.'); });
+  };
+  const cancelSchedule = (id: string) => {
+    setSchedules(list => list.filter(s => s.id !== id)); // optimistic
+    void api.deleteSchedule(id).catch(() => {});
+  };
+  // Edit: pull the message back into the composer (with its time) to change and reschedule.
+  const editSchedule = (s: Schedule) => {
+    cancelSchedule(s.id);
+    setSchedEditAt(s.fireAt ?? null);
+    composerRef.current?.setText(s.prompt || s.title);
+    composerRef.current?.focus();
+    setSchedOpen(true);
   };
 
   // current effort's accent — themes the composer border/glow (MAX = gradient)
@@ -2626,6 +2818,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
           )}
           {bgTasks.some(t => t.status === 'running') && (
             <BgTasksPanel tasks={bgTasks} onStop={stopBg} />
+          )}
+          {upcomingSched.length > 0 && (
+            <ScheduledQueue items={upcomingSched} now={schedNow} onCancel={cancelSchedule} onEdit={editSchedule} />
           )}
           {queue.length > 0 && (
             <QueuePanel queue={queue} onSendNow={sendQueuedNow} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
@@ -2813,16 +3008,22 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   color: goalMode ? 'var(--purple)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                 <Icon name="target" size={14} /> {primaryProvider === 'codex' ? 'Pursue goal' : 'Goal'}
               </button>
-              <button onClick={() => setBrowserMode(!browserMode)} title={browserMode ? 'Browser mode on — the agent drives your connected Chrome (Mochi extension)' : 'Use my browser — drive your real connected Chrome for this task'}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9, cursor: 'pointer',
-                  background: browserMode ? 'color-mix(in srgb, var(--green) 14%, transparent)' : 'var(--fill-secondary)',
-                  border: browserMode ? '1px solid color-mix(in srgb, var(--green) 45%, transparent)' : '1px solid transparent',
-                  color: browserMode ? 'var(--green)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-                <Icon name="globe" size={14} /> Browser
-              </button>
-              {/* secondary options — reviewer model + schedule — tucked behind one button to keep the bar clean */}
+              <span style={{ width: 1, height: 18, background: 'var(--separator)', margin: '0 1px' }} />
+              {/* schedule THIS message — pick a date/time; it fires into the chat then */}
               <div style={{ position: 'relative' }}>
-                <button onClick={() => setOptsOpen(o => !o)} title="Reviewer & schedule"
+                <button onClick={() => { setSchedEditAt(null); setSchedOpen(o => !o); }} disabled={!canSend || !projectId}
+                  title={canSend ? 'Schedule this message to send later' : 'Type a message to schedule it'}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9, cursor: canSend && projectId ? 'pointer' : 'default',
+                    background: schedOpen ? 'color-mix(in srgb, var(--blue) 13%, transparent)' : 'var(--fill-secondary)',
+                    border: schedOpen ? '1px solid color-mix(in srgb, var(--blue) 45%, transparent)' : '1px solid transparent',
+                    color: schedOpen ? 'var(--blue)' : 'var(--ink-secondary)', opacity: canSend && projectId ? 1 : 0.45, font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                  <Icon name="clock" size={14} /> Schedule
+                </button>
+                {schedOpen && <SchedulePicker initial={schedEditAt ?? undefined} onPick={scheduleMessage} onClose={() => setSchedOpen(false)} />}
+              </div>
+              {/* reviewer model — tucked behind one button to keep the bar clean */}
+              <div style={{ position: 'relative' }}>
+                <button onClick={() => setOptsOpen(o => !o)} title="Reviewer model"
                   style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 9px', borderRadius: 9, cursor: 'pointer',
                     background: optsOpen ? 'var(--fill-tertiary)' : 'var(--fill-secondary)', border: '1px solid transparent', color: 'var(--ink-secondary)' }}>
                   <Icon name="sliders" size={14} />
@@ -2835,16 +3036,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                       background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.26))', padding: 11 }}>
                       <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 7 }}>Reviewer model</div>
                       <ModelPicker direction="up" allowOff value={reviewerKey || 'off'} onChange={setReviewerKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
-                      <div style={{ height: '0.5px', background: 'var(--separator)', margin: '12px -11px' }} />
-                      <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 7 }}>Schedule a check</div>
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                        {[{ label: '15 min', ms: 15 * 60_000 }, { label: '1 hour', ms: 60 * 60_000 }, { label: '3 hours', ms: 3 * 60 * 60_000 }, { label: '6 hours', ms: 6 * 60 * 60_000 }].map(o => (
-                          <button key={o.label} onClick={() => scheduleCheck(o.ms, o.label)} className="mm-row"
-                            style={{ height: 28, padding: '0 11px', borderRadius: 'var(--r-pill)', cursor: 'pointer', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }}>
-                            {o.label}
-                          </button>
-                        ))}
-                      </div>
+                      <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 8 }}>A second engine reviews each change and appends its verdict.</div>
                     </div>
                   </>
                 )}
