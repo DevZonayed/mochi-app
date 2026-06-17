@@ -259,6 +259,18 @@ export interface AppEvent {
   projectId?: string | null;
   jobId?: string | null;
 }
+/** A built-in notification chime (synthesised client-side; 'none' = silent). */
+export type NotificationSound = 'chime' | 'ping' | 'marimba' | 'glass' | 'pop' | 'none';
+/** Device-notification preferences (sounds play in the client via Web Audio). */
+export interface NotificationSettings {
+  enabled: boolean;
+  onComplete: boolean;
+  completeSound: NotificationSound;
+  onAttention: boolean;
+  attentionSound: NotificationSound;
+  volume: number;
+  onlyWhenUnfocused: boolean;
+}
 export interface AppSettings {
   defaultEffort: Effort;
   defaultEngine: EngineId | 'auto';
@@ -267,6 +279,8 @@ export interface AppSettings {
   favoriteModels?: string[];
   /** Target repo ("owner/repo") feedback is escalated to as GitHub issues. */
   feedbackRepo?: string;
+  /** Device-notification sound preferences. */
+  notifications?: NotificationSettings;
 }
 
 export type FeedbackCategory = 'bug' | 'idea' | 'other';
