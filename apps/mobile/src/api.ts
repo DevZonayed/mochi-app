@@ -8,7 +8,11 @@ export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
 export type EngineId = 'claude' | 'codex';
-export type ProjectKind = 'coding' | 'content' | 'research' | 'general';
+export type ProjectKind = 'coding' | 'design' | 'content' | 'research' | 'general';
+
+/** A folder/file entry from the Mac's read-only browser (new-project picker). */
+export interface DirEntry { name: string; path: string; isDir: boolean; isRepo: boolean }
+export interface DirListing { path: string; parent: string | null; home: string; entries: DirEntry[]; error?: string }
 
 export interface Workspace { id: string; name: string; budgetCap: number; createdAt: number }
 export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; kind?: ProjectKind; path?: string; repoUrl?: string; createdAt: number }
@@ -70,6 +74,10 @@ export interface CostsData {
 }
 export interface EngineStatus { engine: EngineId; available: boolean; method: 'subscription' | 'apiKey' | 'none'; detail: string; reason: string }
 export type EngineStatuses = Record<EngineId, EngineStatus>;
+
+/** A pickable model (mirrors the desktop catalog). `key` is the stable picker id. */
+export interface ModelDescriptor { key: string; id: string; label: string; provider: string; family?: string; badge?: 'NEW'; tierNote?: string; external?: boolean }
+export interface ModelGroup { provider: string; label: string; runnable: boolean; reason: string; models: ModelDescriptor[] }
 
 /** Operator defaults stored on the Mac (mirrors the desktop AppSettings). */
 export interface AppSettings {
@@ -247,8 +255,10 @@ export const api = {
   createWorkspace: (name: string, budgetCap?: number) => req<Workspace>('/api/workspaces', { method: 'POST', body: JSON.stringify({ name, budgetCap }) }),
 
   listProjects: (workspaceId?: string) => req<Project[]>('/api/projects' + qp({ workspaceId })),
-  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string }) =>
+  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; path?: string; kind?: ProjectKind }) =>
     req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) }),
+  /** Browse a folder on the Mac (read-only) for the new-project location picker. */
+  browseDir: (path?: string) => req<DirListing>('/api/browse' + qp({ path })),
   getProject: (id: string) => req<Project>(`/api/projects/${encodeURIComponent(id)}`),
   deleteProject: (id: string) => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' }),
 
@@ -258,7 +268,7 @@ export const api = {
   listSessions: (projectId?: string) => req<ChatSession[]>('/api/sessions' + qp({ projectId })),
   /** Send a chat turn. Omit sessionId to start a new session. The reply streams
       in via live `job` events; refetch the session's jobs to render it. */
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; effort?: Effort; engine?: EngineId }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; effort?: Effort; engine?: EngineId; modelKey?: string }) =>
     req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) }),
   createJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
     req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) }),
@@ -285,6 +295,8 @@ export const api = {
   toggleSkill: (id: string) => req<Skill>(`/api/skills/${encodeURIComponent(id)}/toggle`, { method: 'POST' }),
 
   listTemplates: () => req<Template[]>('/api/templates'),
+  /** Grouped, pickable models with per-provider runnable state (from the Mac). */
+  listModels: () => req<ModelGroup[]>('/api/models'),
 
   /** Operator defaults, stored on the Mac (effort/engine the new-job composer inherits). */
   getSettings: () => req<AppSettings | null>('/api/settings'),

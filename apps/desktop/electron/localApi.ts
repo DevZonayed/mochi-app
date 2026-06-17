@@ -18,7 +18,7 @@ import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
 import { scanConversations, parseConversation, type ConvSource } from './conversation-sync.js';
-import { existsSync, mkdirSync, cpSync } from 'node:fs';
+import { existsSync, mkdirSync, cpSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
 import { app } from 'electron';
@@ -209,6 +209,28 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
       // ── Coding agent: folders + GitHub clone (git lives on this Mac) ──
       case 'gitAvailable': return { available: gitAvailable() };
+      // Read-only folder browser for the phone's "new project" location picker.
+      // Returns immediate children (names + dir/repo flags) — no file contents.
+      case 'browseDir': {
+        const home = homedir();
+        let dir = typeof p.path === 'string' && p.path ? p.path : home;
+        try { dir = nodePath.resolve(dir); } catch { dir = home; }
+        if (!existsSync(dir)) dir = home;
+        const entries: { name: string; path: string; isDir: boolean; isRepo: boolean }[] = [];
+        let error: string | undefined;
+        try {
+          for (const d of readdirSync(dir, { withFileTypes: true })) {
+            if (d.name.startsWith('.')) continue; // hide dotfiles for a clean picker
+            let isDir = d.isDirectory();
+            const full = nodePath.join(dir, d.name);
+            if (d.isSymbolicLink()) { try { isDir = statSync(full).isDirectory(); } catch { isDir = false; } }
+            entries.push({ name: d.name, path: full, isDir, isRepo: isDir && existsSync(nodePath.join(full, '.git')) });
+          }
+          entries.sort((a, b) => (a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1));
+        } catch (e) { error = e instanceof Error ? e.message.slice(0, 160) : 'cannot read this folder'; }
+        const parent = nodePath.dirname(dir);
+        return { path: dir, parent: parent !== dir ? parent : null, home, entries: entries.slice(0, 1000), error };
+      }
       case 'inspectFolder': {
         const dir = String(p.path ?? '');
         if (!dir) bad('path required');
