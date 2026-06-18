@@ -10,13 +10,14 @@
    No database, no engine, no credentials — if the Mac is offline, commands
    return 503 and reads serve the last mirrored snapshot. */
 
-import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import { randomUUID } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import type { WebSocket } from 'ws';
 import { registerRegistry } from './registry.js';
+import { DeviceRegistry } from './devices.js';
 
 interface Snapshot {
   workspace?: unknown;
@@ -92,22 +93,35 @@ export function buildServer(): FastifyInstance {
   // Single-operator product: one deck (the most recent Mac to register).
   let deck: Deck | null = null;
 
-  // ── Remote-device presence ─────────────────────────────────────────
+  // ── Remote-device presence + per-device control ────────────────────
   // The Mac can't otherwise tell a read-only remote is connected (GETs are served
-  // from the snapshot here, never reaching it). We watch authenticated /api/*
-  // activity + live SSE streams and push a `remote` frame to the host so the
-  // desktop's Devices pane + pairing window reflect reality.
-  let remoteName: string | null = null;
-  let remoteSeenAt = 0;
+  // from the snapshot here, never reaching it). The registry gives every remote a
+  // stable identity (sent as `x-maestro-device-id` header / `?did=` query) so the
+  // desktop's Devices pane can list each device and disconnect any single one.
+  const devices = new DeviceRegistry();
   let lastRemoteNotify = 0;
   function notifyRemote(force = false): void {
     const t = Date.now();
     if (!force && t - lastRemoteNotify < 1500) return;
     lastRemoteNotify = t;
     try {
-      deck?.ws?.send(JSON.stringify({ type: 'remote', streams: sseClients.size, lastSeen: remoteSeenAt || t, name: remoteName }));
+      deck?.ws?.send(JSON.stringify({ type: 'remote', devices: devices.list() }));
     } catch { /* socket closed */ }
   }
+  // A remote presents its identity as a header (REST) or a query param (SSE, where
+  // the browser EventSource can't set headers).
+  const deviceIdOf = (req: FastifyRequest): string | null => {
+    const h = req.headers['x-maestro-device-id'];
+    if (typeof h === 'string' && h) return h;
+    const q = (req.query as { did?: string } | undefined)?.did;
+    return typeof q === 'string' && q ? q : null;
+  };
+  const deviceNameOf = (req: FastifyRequest): string | null => {
+    const h = req.headers['x-maestro-device'];
+    if (typeof h === 'string' && h) return h;
+    const q = (req.query as { device?: string } | undefined)?.device;
+    return typeof q === 'string' && q ? q : null;
+  };
 
   // ── Pairing-token auth on the whole remote surface ─────────────────
   // The Mac sets the token (host hello). Remotes send it as a Bearer header
@@ -122,10 +136,14 @@ export function buildServer(): FastifyInstance {
     const qtoken = (req.query as { token?: string } | undefined)?.token ?? '';
     const presented = bearer || qtoken;
     if (presented !== expected) return reply.code(401).send({ error: 'Unauthorized — pair with the code shown in the Maestro desktop app' });
-    // Authenticated remote activity → let the Mac know a device is alive.
-    const dev = req.headers['x-maestro-device'];
-    if (typeof dev === 'string' && dev) remoteName = dev.slice(0, 40);
-    remoteSeenAt = Date.now();
+    // Disconnected from the Mac → make this device re-pair (distinct code so the
+    // remote can show "reconnect" instead of a generic auth error).
+    const deviceId = deviceIdOf(req);
+    if (devices.isRevoked(deviceId)) {
+      return reply.code(401).send({ error: 'This device was disconnected — enter the code to reconnect.', code: 'device-revoked' });
+    }
+    // Authenticated remote activity → let the Mac know this device is alive.
+    devices.touch(deviceId, deviceNameOf(req));
     notifyRemote();
   });
 
@@ -176,7 +194,7 @@ export function buildServer(): FastifyInstance {
       let isHost = false;
 
       ws.on('message', (buf: Buffer | string) => {
-        let m: { type?: string; role?: string; deckId?: string; secret?: string; accessToken?: string; state?: Snapshot; name?: string; data?: unknown; id?: string; ok?: boolean; result?: unknown; error?: string; statusCode?: number };
+        let m: { type?: string; role?: string; deckId?: string; secret?: string; accessToken?: string; state?: Snapshot; name?: string; data?: unknown; id?: string; ok?: boolean; result?: unknown; error?: string; statusCode?: number; deviceId?: string };
         try { m = JSON.parse(String(buf)) as typeof m; } catch { return; }
 
         if (m.type === 'hello' && m.role === 'host' && m.deckId) {
@@ -187,9 +205,13 @@ export function buildServer(): FastifyInstance {
           }
           if (!deck || deck.deckId !== m.deckId) {
             deck = { deckId: m.deckId, secret: m.secret ?? '', accessToken: m.accessToken ?? '', ws, online: true, lastSeen: Date.now(), state: deck?.state ?? null, pending: new Map() };
+            devices.reset(); // fresh deck → forget any prior devices/revocations
           } else {
             deck.ws = ws; deck.online = true; deck.lastSeen = Date.now();
-            if (m.accessToken) deck.accessToken = m.accessToken;
+            if (m.accessToken && m.accessToken !== deck.accessToken) {
+              deck.accessToken = m.accessToken;
+              devices.reset(); // code regenerated → new pairing epoch; every remote must re-pair
+            }
           }
           isHost = true;
           ws.send(JSON.stringify({ type: 'hello-ok' }));
@@ -214,6 +236,9 @@ export function buildServer(): FastifyInstance {
           }
         } else if (m.type === 'pong') {
           deck.lastSeen = Date.now();
+        } else if (m.type === 'kick' && m.deviceId) {
+          for (const res of devices.kick(m.deviceId)) { try { res.end(); } catch { /* already closed */ } }
+          notifyRemote(true);
         }
       });
 
@@ -391,10 +416,9 @@ export function buildServer(): FastifyInstance {
       'Access-Control-Allow-Origin': '*',
     });
     res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, hostOnline: !!deck?.online })}\n\n`);
-    const dev = (req.query as { device?: string }).device;
-    if (typeof dev === 'string' && dev) remoteName = dev.slice(0, 40);
-    remoteSeenAt = Date.now();
+    const deviceId = deviceIdOf(req);
     sseClients.add(res);
+    devices.addStream(deviceId, deviceNameOf(req), res);
     notifyRemote(true); // a live remote stream opened
     const ping = setInterval(() => {
       try { res.write(': ping\n\n'); } catch { /* closed */ }
@@ -402,6 +426,7 @@ export function buildServer(): FastifyInstance {
     req.raw.on('close', () => {
       clearInterval(ping);
       sseClients.delete(res);
+      devices.removeStream(deviceId, res);
       notifyRemote(true); // stream closed → presence drops
     });
   });
