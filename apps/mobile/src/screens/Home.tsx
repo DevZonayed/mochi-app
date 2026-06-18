@@ -9,6 +9,7 @@ import { api, type DashboardData, type Approval, type Job, type ChatSession, typ
 import { getStr, cacheGet, cacheSet } from '../storage';
 import { eventAllowed } from '../notifPrefs';
 import { useLive } from '../useLive';
+import { ConnPill } from '../ConnPill';
 
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -289,6 +290,7 @@ export function HomeScreen() {
           <View style={{ flex: 1, minWidth: 0 }}>
             <Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkTertiary }}>{dateTimeLine(now)}</Text>
             <Text style={{ fontSize: 30, fontWeight: '700', letterSpacing: -0.6, color: theme.color.ink, marginTop: 3 }}>{greetingFor(new Date(now).getHours())}</Text>
+            <ConnPill />
           </View>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 18, paddingTop: 6 }}>
             <Pressable onPress={() => nav.navigate('Queue')} hitSlop={8}>

@@ -381,6 +381,19 @@ export type LiveEventName =
   | 'job' | 'session' | 'approval' | 'asset' | 'comms' | 'briefs'
   | 'schedule' | 'schedule-late' | 'git-status' | 'extension' | 'host' | 'hello';
 
+/* ── Connection path ──────────────────────────────────────────────────────
+   Which transport the live stream is on RIGHT NOW: 'p2p' (direct WebRTC) once the
+   channel is open, else 'relay'. Subscribable so a UI pill can reflect it. */
+let connPath: 'p2p' | 'relay' = 'relay';
+const connSubs = new Set<() => void>();
+export function getConnPath(): 'p2p' | 'relay' { return connPath; }
+export function subscribeConnPath(cb: () => void): () => void { connSubs.add(cb); return () => { connSubs.delete(cb); }; }
+function setConnPath(p: 'p2p' | 'relay'): void {
+  if (connPath === p) return;
+  connPath = p;
+  for (const cb of connSubs) { try { cb(); } catch { /* ignore */ } }
+}
+
 /** Send WebRTC signaling to the Mac. The relay tags it with this device's id and
     hands it to the host; the Mac's replies come back as SSE `signal` frames. Not a
     tracked mutation (no outbox noise). */
@@ -411,6 +424,7 @@ export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => 
       }
     },
     onEvent: (name, data) => onEvent(name as LiveEventName, data),
+    onActiveChange: (active) => setConnPath(active ? 'p2p' : 'relay'),
   });
   // Only attempt P2P if the Mac enabled it; otherwise stay purely on SSE.
   void api.getSettings().then((s) => { if (s?.p2pEnabled) link.start(); }).catch(() => { /* stay on SSE */ });
@@ -439,6 +453,7 @@ export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => 
   });
   return () => {
     link.stop();
+    setConnPath('relay');
     try {
       es.removeEventListener('signal' as 'message', sigFn as (e: unknown) => void);
       for (const h of handlers) es.removeEventListener(h.name as 'message', h.fn as (e: unknown) => void);
