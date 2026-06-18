@@ -45,16 +45,29 @@ function RecipientField({ wa, onChanged }: { wa: WhatsAppState | null; onChanged
   const [val, setVal] = React.useState(current);
   const [saved, setSaved] = React.useState(false);
   React.useEffect(() => { setVal((wa?.notifyJid ?? '').split('@')[0]); }, [wa?.notifyJid]);
-  const save = async () => { await api.setWhatsappRecipient(val.replace(/[^0-9]/g, '')); setSaved(true); setTimeout(() => setSaved(false), 1500); onChanged(); };
+  const digits = val.replace(/[^0-9]/g, '');
+  const linked = (wa?.jid ?? '').split('@')[0].split(':')[0]; // e.g. 8801611682159
+  // A WhatsApp JID needs full international digits (country code, no +, no leading 0).
+  // A leading 0 or a too-short number is almost certainly a local format that will fail.
+  const looksLocal = !!digits && (digits.startsWith('0') || digits.length < 10);
+  // Suggest a fix using the linked account's country code (1–3 digits before the local part).
+  const suggestion = digits.startsWith('0') && linked ? linked.slice(0, Math.max(0, linked.length - (digits.length - 1))) + digits.slice(1) : '';
+  const save = async (override?: string) => { const d = (override ?? val).replace(/[^0-9]/g, ''); setVal(d); await api.setWhatsappRecipient(d); setSaved(true); setTimeout(() => setSaved(false), 1500); onChanged(); };
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 12, borderRadius: 12, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator)', marginBottom: 14 }}>
       <span style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Your number — where summaries & confirmations go</span>
-      <span style={{ font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-secondary)' }}>The linked account above is your “PA” number. Enter the <b style={{ color: 'var(--ink)' }}>personal</b> number you actually want to receive on (country code, digits only). Leave blank to use the linked number itself.</span>
+      <span style={{ font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-secondary)' }}>The linked account above is your “PA” number{linked ? ` (${linked})` : ''}. Enter the <b style={{ color: 'var(--ink)' }}>personal</b> number you want to receive on — full international format, <b style={{ color: 'var(--ink)' }}>country code, no “+” and no leading 0</b>. Leave blank to use the linked number.</span>
       <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
         <input value={val} onChange={e => setVal(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') void save(); }} placeholder="e.g. 8801604123482"
-          style={{ flex: 1, height: 38, padding: '0 12px', boxSizing: 'border-box', borderRadius: 10, border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-mono)' }} />
-        <button onClick={save} style={{ height: 38, padding: '0 16px', borderRadius: 10, background: val.replace(/[^0-9]/g, '') !== current ? 'var(--green)' : 'var(--fill-secondary)', color: val.replace(/[^0-9]/g, '') !== current ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{saved ? 'Saved ✓' : 'Save'}</button>
+          style={{ flex: 1, height: 38, padding: '0 12px', boxSizing: 'border-box', borderRadius: 10, border: `1px solid ${looksLocal ? 'var(--orange, #d9821b)' : 'var(--separator-strong)'}`, background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-mono)' }} />
+        <button onClick={() => save()} style={{ height: 38, padding: '0 16px', borderRadius: 10, background: digits !== current ? 'var(--green)' : 'var(--fill-secondary)', color: digits !== current ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{saved ? 'Saved ✓' : 'Save'}</button>
       </div>
+      {digits && !looksLocal && <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Will message: +{digits}</span>}
+      {looksLocal && (
+        <span style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--orange, #d9821b)' }}>
+          That looks like a local number — WhatsApp needs the full international form.{suggestion ? <> Did you mean <button onClick={() => void save(suggestion)} style={{ background: 'none', color: 'var(--blue)', font: 'inherit', textDecoration: 'underline', padding: 0 }}>{suggestion}</button>?</> : ''}
+        </span>
+      )}
     </div>
   );
 }

@@ -84,7 +84,7 @@ function ChatList({ chats, selectedId, query, setQuery, onSelect }: { chats: WaC
       </div>
       <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
         {filtered.length === 0 ? (
-          <div style={{ padding: '40px 24px', textAlign: 'center', font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>{query ? 'No chats match.' : 'No chats yet. They appear as WhatsApp syncs.'}</div>
+          <div style={{ padding: '40px 24px', textAlign: 'center', font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>{query ? 'No chats match.' : 'No chats yet. WhatsApp only sends history on a fresh link — re-link in Comms to pull your chats.'}</div>
         ) : filtered.map(c => (
           <button key={c.chatId} onClick={() => onSelect(c.chatId)} className={`wa-row${c.chatId === selectedId ? ' sel' : ''}`}
             style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 12, padding: '10px 16px', textAlign: 'left', borderBottom: '0.5px solid color-mix(in srgb, var(--separator) 50%, transparent)' }}>
@@ -312,8 +312,12 @@ export default function WhatsAppScreen() {
           <ChatList chats={chats} selectedId={selectedId} query={query} setQuery={setQuery} onSelect={openChat} />
           {selected ? (
             <Conversation chat={selected} messages={messages} onSend={sendText} onSendFile={sendFile} onReact={react} onLoadMore={loadMore} hasMore={hasMore} busy={busy} />
+          ) : chats.length ? (
+            <Centered icon="whatsapp" title="Select a chat" sub="Pick a conversation on the left to read and reply." />
           ) : (
-            <Centered icon="whatsapp" title={chats.length ? 'Select a chat' : 'Syncing your chats…'} sub={chats.length ? 'Pick a conversation on the left to read and reply.' : 'WhatsApp is streaming your history to this Mac. This can take a moment after linking.'} />
+            <Centered icon="whatsapp" title="No chats synced yet" sub="WhatsApp only streams your history on a fresh link (not on reconnect). Re-link to pull your chats + messages — after that they’re saved here and survive restarts.">
+              <button onClick={() => navigate('/comms')} style={{ marginTop: 14, height: 40, padding: '0 18px', borderRadius: 11, background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Re-link in Comms</button>
+            </Centered>
           )}
         </div>
       )}
