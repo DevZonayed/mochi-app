@@ -60,6 +60,9 @@ importers:
       '@maestro/design-tokens':
         specifier: workspace:*
         version: link:../../packages/design-tokens
+      '@maestro/realtime':
+        specifier: workspace:*
+        version: link:../../packages/realtime
       '@types/node':
         specifier: ^22.10.0
         version: 22.19.20
