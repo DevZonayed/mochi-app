@@ -389,6 +389,40 @@ interface StoreData {
       at <project>/.claude/skills/<slug>/; this records the metadata for the UI +
       Codex prompt-injection. Keyed by projectId. Mac-local. */
   installedSkills?: Record<string, InstalledSkill[]>;
+  /** Custom MCP servers the operator connected (a global library). Enabled ones
+      are merged into every agent run — Claude's `mcpServers`, Codex's
+      `-c mcp_servers.<name>=…`. Mac-local; secrets referenced by env-var name. */
+  mcpServers?: CustomMcpServer[];
+}
+
+/** A literal key/value pair — an env var or an HTTP header. */
+export interface McpKv { key: string; value: string }
+
+/** A custom MCP server the operator connected via Settings → MCP servers.
+    `stdio` launches a local `command`/`args` with `env`; `http` connects to a
+    streamable-HTTP endpoint. Secrets are referenced BY ENV-VAR NAME
+    (bearerTokenEnv, envPassthrough, headerEnv) and resolved from the host
+    environment at spawn time — the secret value itself is never persisted. */
+export interface CustomMcpServer {
+  id: string;
+  name: string;
+  enabled: boolean;
+  transport: 'stdio' | 'http';
+  // stdio transport
+  command?: string;
+  args?: string[];
+  env?: McpKv[];               // literal key=value (non-secret config)
+  envPassthrough?: string[];   // host env var NAMES forwarded as-is
+  cwd?: string;
+  // http (streamable) transport
+  url?: string;
+  bearerTokenEnv?: string;     // env var NAME holding the bearer token
+  headers?: McpKv[];           // literal header key=value
+  headerEnv?: { key: string; valueEnv: string }[]; // header <- host env var NAME
+  /** Registry skill ids attached to this server — installed on-demand and
+      surfaced to the agent whenever this server is active in a run. */
+  skillIds: string[];
+  createdAt: number;
 }
 
 /** A registry skill installed into a project (metadata mirror of the on-disk folder). */
@@ -449,6 +483,7 @@ export class Store {
       if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
       if (!this.data.designComments) { this.data.designComments = {}; dirty = true; }
       if (!this.data.installedSkills) { this.data.installedSkills = {}; dirty = true; }
+      if (!this.data.mcpServers) { this.data.mcpServers = []; dirty = true; }
       // SP1: seed model-level roles on older stores from the engine-level fields.
       if (this.data.routing && !this.data.routing.roles) {
         const r = this.data.routing;
@@ -633,6 +668,36 @@ export class Store {
     list.push(full);
     this.save();
     return full;
+  }
+
+  // ── Custom MCP servers (operator-connected; merged into agent runs) ─────
+  listMcpServers(): CustomMcpServer[] { return this.data.mcpServers ? [...this.data.mcpServers] : []; }
+  getMcpServer(serverId: string): CustomMcpServer | undefined { return this.data.mcpServers?.find(s => s.id === serverId); }
+  addMcpServer(input: Omit<CustomMcpServer, 'id' | 'createdAt'>): CustomMcpServer {
+    if (!this.data.mcpServers) this.data.mcpServers = [];
+    const rec: CustomMcpServer = { ...input, id: id(), createdAt: now() };
+    this.data.mcpServers.push(rec);
+    this.save();
+    return rec;
+  }
+  updateMcpServer(serverId: string, patch: Partial<Omit<CustomMcpServer, 'id' | 'createdAt'>>): CustomMcpServer {
+    const cur = this.getMcpServer(serverId);
+    if (!cur) throw Object.assign(new Error('mcp server not found'), { statusCode: 404 });
+    Object.assign(cur, patch);
+    this.save();
+    return cur;
+  }
+  setMcpServerEnabled(serverId: string, enabled: boolean): CustomMcpServer | null {
+    const cur = this.getMcpServer(serverId);
+    if (!cur) return null;
+    cur.enabled = enabled;
+    this.save();
+    return cur;
+  }
+  removeMcpServer(serverId: string): void {
+    if (!this.data.mcpServers) return;
+    this.data.mcpServers = this.data.mcpServers.filter(s => s.id !== serverId);
+    this.save();
   }
 
   // ── Workspace ───────────────────────────────────────────────────────
