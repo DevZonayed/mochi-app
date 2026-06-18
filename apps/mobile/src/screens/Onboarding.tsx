@@ -8,6 +8,7 @@ import { Icon } from '../Icon';
 import { MaestroMark } from '../Icon';
 import { api, setPairToken, getPairToken } from '../api';
 import { setFlag, ONBOARDED } from '../storage';
+import { registerForPush } from '../push';
 
 const BLUE = '#007AFF';
 const GREEN = '#34C759';
@@ -130,6 +131,7 @@ function Scanner({ insets, onScan }: { insets: { top: number; bottom: number }; 
     setBusy(false);
     if (res === 'invalid') { setError('That code didn’t match — check Settings ▸ Devices on your Mac.'); lockRef.current = false; return; }
     if (res === 'unreachable') { setError('Couldn’t reach the relay — check your connection and try again.'); lockRef.current = false; return; }
+    void registerForPush(); // now paired — register this phone for closed-app notifications
     onScan(); // 'ok' (verified) or 'mac-offline' (saved; will connect when the Mac is online)
   };
 

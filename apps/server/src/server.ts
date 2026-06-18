@@ -138,6 +138,57 @@ export function buildServer(): FastifyInstance {
     }
   }
 
+  // ── Expo push (alerts while the phone app is CLOSED) ───────────────
+  // SSE only reaches a running app; a closed phone misses every event. The phone
+  // registers its Expo push token here, and we mirror the Mac's job/approval/
+  // schedule events to Expo's push service so a closed app still gets a real OS
+  // notification. This is pure transport (the same events SSE already carries) —
+  // the Mac stays the brain. In-memory by design (the relay owns no DB): the phone
+  // re-registers on every launch/foreground, so a redeploy self-heals.
+  const pushTokens = new Map<string, number>(); // expoToken → lastSeen ms
+  const pushSeen = new Set<string>();           // dedupe keys (bounded)
+  function rememberPushKey(k: string): boolean {
+    if (pushSeen.has(k)) return false;
+    pushSeen.add(k);
+    if (pushSeen.size > 1000) { const first = pushSeen.values().next().value; if (first) pushSeen.delete(first); }
+    return true;
+  }
+  async function sendExpoPush(title: string, body: string): Promise<void> {
+    const tokens = [...pushTokens.keys()];
+    if (!tokens.length) return;
+    const messages = tokens.map((to) => ({ to, title, body, sound: 'default', priority: 'high', channelId: 'alerts' }));
+    try {
+      const res = await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(messages),
+      });
+      // Expo returns per-message receipts; prune any token it reports as gone.
+      const json = (await res.json().catch(() => null)) as { data?: { status?: string; details?: { error?: string } }[] } | null;
+      if (Array.isArray(json?.data)) {
+        json!.data!.forEach((r, i) => {
+          if (r?.status === 'error' && r.details?.error === 'DeviceNotRegistered') pushTokens.delete(tokens[i]);
+        });
+      }
+    } catch { /* push service unreachable — SSE still carries foreground alerts */ }
+  }
+  // Mirror the alert-worthy events to push, matching the phone's in-app LiveNotifier.
+  function maybePush(name: string, data: unknown): void {
+    if (!pushTokens.size) return;
+    if (name === 'job') {
+      const j = data as { id?: string; status?: string; title?: string } | null;
+      if (!j?.id) return;
+      if (j.status === 'done' && rememberPushKey(`${j.id}:done`)) void sendExpoPush('Conversation complete', j.title || 'A run finished on your Mac.');
+      else if (j.status === 'failed' && rememberPushKey(`${j.id}:failed`)) void sendExpoPush('Job failed', j.title || 'A run failed on your Mac.');
+    } else if (name === 'approval') {
+      const a = data as { id?: string; status?: string; title?: string } | null;
+      if (a?.id && a.status === 'pending' && rememberPushKey(`appr:${a.id}`)) void sendExpoPush('Needs your attention', a.title || 'An approval is waiting.');
+    } else if (name === 'schedule-late') {
+      const s = data as { id?: string; title?: string; firedAt?: number } | null;
+      if (rememberPushKey(`late:${s?.id ?? ''}:${s?.firedAt ?? ''}`)) void sendExpoPush('Scheduled task ran late', s?.title ? `“${s.title}” caught up.` : 'A schedule caught up after a missed time.');
+    }
+  }
+
   // ── Forward a command to the Mac and await its result ─────────────
   function cmd<T = unknown>(method: string, params: Record<string, unknown>): Promise<T> {
     if (!deck || !deck.online || !deck.ws) {
@@ -204,6 +255,7 @@ export function buildServer(): FastifyInstance {
           deck.lastSeen = Date.now();
         } else if (m.type === 'event' && m.name) {
           sseSend(m.name, m.data);
+          maybePush(m.name, m.data); // closed-app OS notification (live SSE handles the open app)
         } else if (m.type === 'result' && m.id) {
           const p = deck.pending.get(m.id);
           if (p) {
@@ -379,6 +431,18 @@ export function buildServer(): FastifyInstance {
   app.post('/api/feedback/:id/update', async (req, reply) =>
     forward(reply, 'updateFeedback', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/feedback/:id/delete', async (req, reply) => forward(reply, 'deleteFeedback', { id: (req.params as { id: string }).id }));
+
+  // ── Push registration (phone registers its Expo token for closed-app alerts) ──
+  app.post('/api/push/register', async (req) => {
+    const { token } = (req.body ?? {}) as { token?: string };
+    if (typeof token === 'string' && token.trim()) pushTokens.set(token.trim(), Date.now());
+    return { ok: true, devices: pushTokens.size };
+  });
+  app.post('/api/push/unregister', async (req) => {
+    const { token } = (req.body ?? {}) as { token?: string };
+    if (typeof token === 'string') pushTokens.delete(token.trim());
+    return { ok: true, devices: pushTokens.size };
+  });
 
   // ── SSE stream (host events relayed to web clients) ────────────────
   app.get('/api/stream', (req, reply) => {

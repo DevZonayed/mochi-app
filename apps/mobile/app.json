@@ -32,7 +32,8 @@
           "cameraPermission": "Maestro uses the camera to scan the pairing QR code shown on your Mac."
         }
       ],
-      "expo-audio"
+      "expo-audio",
+      "expo-notifications"
     ]
   }
 }
