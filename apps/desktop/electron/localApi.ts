@@ -1088,6 +1088,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'waSetTyping': { if (!p.chatId) bad('chatId required'); await whatsapp.setTyping(String(p.chatId), !!p.on); return { ok: true }; }
       case 'waFetchAvatar': { if (!p.chatId) bad('chatId required'); return { url: await whatsapp.fetchAvatar(String(p.chatId)) }; }
       case 'setWhatsappAgentSend': { const next = store.setWhatsappState({ agentSendToOthers: !!p.on }); emit('comms', store.commsStatus()); return next; }
+      case 'setWhatsappRecipient': {
+        const digits = String(p.number ?? '').replace(/[^0-9]/g, ''); // '' clears it
+        const next = store.setWhatsappState({ notifyJid: digits ? `${digits}@s.whatsapp.net` : null });
+        emit('comms', store.commsStatus());
+        return next;
+      }
       case 'listProjectWaChats': { if (!p.projectId) bad('projectId required'); return store.listProjectWaChats(String(p.projectId)); }
       case 'addProjectWaChat': {
         if (!p.projectId || !p.chatId) bad('projectId and chatId required');

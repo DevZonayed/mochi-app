@@ -39,6 +39,26 @@ function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void 
   );
 }
 
+// ── Your personal "receive on" number (distinct from the linked PA account) ──
+function RecipientField({ wa, onChanged }: { wa: WhatsAppState | null; onChanged: () => void }) {
+  const current = (wa?.notifyJid ?? '').split('@')[0];
+  const [val, setVal] = React.useState(current);
+  const [saved, setSaved] = React.useState(false);
+  React.useEffect(() => { setVal((wa?.notifyJid ?? '').split('@')[0]); }, [wa?.notifyJid]);
+  const save = async () => { await api.setWhatsappRecipient(val.replace(/[^0-9]/g, '')); setSaved(true); setTimeout(() => setSaved(false), 1500); onChanged(); };
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 12, borderRadius: 12, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator)', marginBottom: 14 }}>
+      <span style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Your number — where summaries & confirmations go</span>
+      <span style={{ font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-secondary)' }}>The linked account above is your “PA” number. Enter the <b style={{ color: 'var(--ink)' }}>personal</b> number you actually want to receive on (country code, digits only). Leave blank to use the linked number itself.</span>
+      <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+        <input value={val} onChange={e => setVal(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') void save(); }} placeholder="e.g. 8801604123482"
+          style={{ flex: 1, height: 38, padding: '0 12px', boxSizing: 'border-box', borderRadius: 10, border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-mono)' }} />
+        <button onClick={save} style={{ height: 38, padding: '0 16px', borderRadius: 10, background: val.replace(/[^0-9]/g, '') !== current ? 'var(--green)' : 'var(--fill-secondary)', color: val.replace(/[^0-9]/g, '') !== current ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{saved ? 'Saved ✓' : 'Save'}</button>
+      </div>
+    </div>
+  );
+}
+
 // ── WhatsApp card (link + connection + send gate) ───────────────────────────
 function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tracked: number; onChanged: () => void }) {
   const navigate = useNavigate();
@@ -96,6 +116,10 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
           {IS_LOCAL && <button onClick={approve} disabled={busy} style={{ height: 34, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', flexShrink: 0 }}>{busy ? '…' : 'Allow'}</button>}
         </div>
       )}
+
+      {/* Where summaries + agent confirmations are delivered (your personal number,
+          not the linked PA account). */}
+      {connected && IS_LOCAL && <RecipientField wa={wa} onChanged={onChanged} />}
 
       {/* Agent send-gate: the agent can always message your own number; messaging
           other contacts is off until you allow it here. */}

@@ -128,13 +128,19 @@ function kindOfJid(jid: string): WaChatKind {
 /** The user part of a JID, ignoring any device suffix ('1555:3@s.whatsapp.net' → '1555'). */
 function userOf(jid: string): string { return (jid.split('@')[0] || '').split(':')[0]; }
 
-/** Agent send-gate: messaging your OWN number is always allowed; messaging anyone
-    else requires the operator's opt-in (off by default — guards against an agent
-    blasting your real contacts). */
-export function waSendAllowed(targetJid: string, ownJid: string | null, canSendOthers: boolean): boolean {
+/** Normalize a phone number (digits, optionally with +/spaces) to a WhatsApp JID. */
+export function numberToJid(num: string): string {
+  const d = (num || '').replace(/[^0-9]/g, '');
+  return d ? `${d}@s.whatsapp.net` : '';
+}
+
+/** Agent send-gate: messaging any of YOUR OWN numbers (the linked account or the
+    configured notify number) is always allowed; messaging anyone else requires the
+    operator's opt-in (off by default — guards against an agent blasting your contacts). */
+export function waSendAllowed(targetJid: string, selfJids: (string | null | undefined)[], canSendOthers: boolean): boolean {
   if (canSendOthers) return true;
-  if (!ownJid) return false;
-  return userOf(targetJid) === userOf(ownJid);
+  const t = userOf(targetJid);
+  return selfJids.some(j => !!j && userOf(j) === t);
 }
 
 /** Human-readable line for the transcript: plain text, or a `[kind] caption` note
@@ -373,9 +379,11 @@ export class WhatsAppClient {
     });
   }
 
-  /** Send a message to the operator's own number (the summary destination). */
+  /** Send a message to the operator's notify destination — their configured personal
+      number if set, otherwise the linked account's own "note to self". */
   async sendToSelf(text: string): Promise<boolean> {
-    const jid = this.store.whatsappState().jid;
+    const st = this.store.whatsappState();
+    const jid = st.notifyJid || st.jid;
     if (!this.sock || !jid) return false;
     try {
       await this.sock.sendMessage(jid, { text });

@@ -172,6 +172,13 @@ function Conversation({ chat, messages, onSend, onSendFile, onReact, onLoadMore,
       {/* messages */}
       <div ref={scroller} onScroll={e => { const el = e.currentTarget; atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}
         style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: '14px 18px', background: 'var(--bg-grouped)' }}>
+        {!busy && messages.length === 0 && (
+          <div style={{ height: '100%', display: 'grid', placeItems: 'center', textAlign: 'center', padding: 24 }}>
+            <div style={{ maxWidth: 320, font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+              No messages synced for this chat yet. WhatsApp streams history after linking — give it a moment, or re-link in <b style={{ color: 'var(--ink-secondary)' }}>Comms</b> to pull full history.
+            </div>
+          </div>
+        )}
         {hasMore && <div style={{ textAlign: 'center', marginBottom: 10 }}><button onClick={onLoadMore} disabled={busy} style={{ height: 30, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', font: '500 var(--fs-caption)/1 var(--font-text)' }}>{busy ? 'Loading…' : 'Load earlier messages'}</button></div>}
         {messages.map(m => {
           const day = dayLabel(m.ts);

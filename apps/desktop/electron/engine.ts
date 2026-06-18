@@ -93,8 +93,10 @@ const WHATSAPP_DIRECTIVE =
   `about WhatsApp — to read their chats/messages, see who messaged them, or SEND a message (e.g. "message ` +
   `my number", "send me a confirmation/update", "reply to X", "text the team") — use the ` +
   `mcp__maestro__wa_list_chats / wa_get_messages / wa_send_message / wa_mark_read tools. Do NOT claim ` +
-  `WhatsApp is unavailable. Messaging the user's OWN number always works; messaging other contacts is ` +
-  `blocked unless they enabled it (the send tool will tell you). Chats assigned to THIS project are marked [project] — prefer them.`;
+  `WhatsApp is unavailable. Messaging the user's OWN number always works (their linked account OR the ` +
+  `personal number they set in Comms — for "message my number"/"send me a confirmation", call wa_send_message ` +
+  `with no chatId/phone and it goes to that personal number); messaging other contacts is blocked unless they ` +
+  `enabled it (the send tool will tell you). Chats assigned to THIS project are marked [project] — prefer them.`;
 
 const DESIGN_DIRECTIVE =
   `\n\n---\n\n[Design mode] You are a senior product designer working in a live design ` +
@@ -462,6 +464,7 @@ interface BrowserCtx {
    other contacts gated behind an opt-in). Off in plan mode / when not linked. */
 interface CommsCtx {
   ownJid: () => string | null;
+  notifyJid: () => string | null;
   canSendOthers: () => boolean;
   projectChatIds: () => string[];
   listChats: () => Array<{ chatId: string; name: string; kind: string; unreadCount: number; lastMessageAt: number; lastMessageText: string }>;
@@ -754,9 +757,10 @@ async function runClaude(
               'Send a WhatsApp message. Give EITHER chatId (from wa_list_chats) OR phone (digits incl. country code, no +). Messaging the user\'s OWN number always works; other contacts require the user to have enabled "agent can message contacts" — if blocked, relay the tool\'s note to the user.',
               { chatId: z.string().optional(), phone: z.string().optional().describe('Recipient phone in digits, e.g. "15551234567".'), text: z.string().describe('The message to send.') },
               wrap(async (a: { chatId?: string; phone?: string; text: string }) => {
-                const target = a.chatId || (a.phone ? `${a.phone.replace(/[^0-9]/g, '')}@s.whatsapp.net` : '');
-                if (!target) return txt('Provide a chatId (from wa_list_chats) or a phone number.');
-                if (!waSendAllowed(target, commsCtx.ownJid(), commsCtx.canSendOthers())) return txt('Blocked: messaging contacts other than your own number is OFF by default (a safety gate). The user can turn on "Let the agent message contacts" on the WhatsApp screen. Message NOT sent.');
+                // No chatId/phone → send to the user themselves (their personal notify number, else the linked account).
+                const target = a.chatId || (a.phone ? `${a.phone.replace(/[^0-9]/g, '')}@s.whatsapp.net` : '') || commsCtx.notifyJid() || commsCtx.ownJid() || '';
+                if (!target) return txt('No recipient: pass a chatId (from wa_list_chats) or a phone number, or have the user set their personal number in Comms.');
+                if (!waSendAllowed(target, [commsCtx.ownJid(), commsCtx.notifyJid()], commsCtx.canSendOthers())) return txt('Blocked: messaging contacts other than your own number(s) is OFF by default (a safety gate). The user can turn on "Let the agent message contacts" in Comms. Message NOT sent.');
                 const ok = await commsCtx.sendText(target, a.text);
                 return txt(ok ? `Sent to ${target}.` : `Could not send to ${target} — is WhatsApp still linked?`);
               })),
@@ -1957,6 +1961,7 @@ export class LocalEngine {
       // backed by THIS Mac's socket + store, scoped to this project's assigned chats.
       const commsCtx: CommsCtx | undefined = (this.comms && this.store.whatsappState().connected && !opts.plan) ? {
         ownJid: () => this.store.whatsappState().jid,
+        notifyJid: () => this.store.whatsappState().notifyJid ?? null,
         canSendOthers: () => !!this.store.whatsappState().agentSendToOthers,
         projectChatIds: () => this.store.listProjectWaChats(job.projectId ?? ''),
         listChats: () => this.store.waListChats().map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, unreadCount: c.unreadCount, lastMessageAt: c.lastMessageAt, lastMessageText: c.lastMessageText })),

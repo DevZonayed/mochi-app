@@ -325,8 +325,12 @@ export interface WhatsAppState {
       Off by default — the agent can always message your own number (confirmations,
       updates), but messaging real contacts requires this opt-in. */
   agentSendToOthers?: boolean;
+  /** The operator's PERSONAL number (JID) where summaries + agent confirmations are
+      sent. Distinct from `jid` (the linked account — often a separate "app" number).
+      When unset, notifications fall back to the linked account's own "note to self". */
+  notifyJid?: string | null;
 }
-export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null, agentSendToOthers: false };
+export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null, agentSendToOthers: false, notifyJid: null };
 
 /** One captured WhatsApp message (normalized, text-only — media is noted as a kind). */
 export interface WaMessage { id: string; chatId: string; fromMe: boolean; senderName: string; text: string; ts: number }

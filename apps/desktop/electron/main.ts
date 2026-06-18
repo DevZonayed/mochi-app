@@ -397,7 +397,7 @@ app.whenReady().then(() => {
         || method === 'waListChats' || method === 'waGetMessages' || method === 'waChatInfo'
         || method === 'waSendText' || method === 'waSendMedia' || method === 'waReact'
         || method === 'waMarkRead' || method === 'waSetTyping' || method === 'waFetchAvatar'
-        || method === 'addProjectWaChat' || method === 'removeProjectWaChat' || method === 'listProjectWaChats' || method === 'setWhatsappAgentSend'
+        || method === 'addProjectWaChat' || method === 'removeProjectWaChat' || method === 'listProjectWaChats' || method === 'setWhatsappAgentSend' || method === 'setWhatsappRecipient'
         // feedbackCreateIssue spends THIS Mac's GitHub token — keep it local-only
         // (a remote can still submit/list/triage feedback; just not file issues).
         || method === 'feedbackCreateIssue') {

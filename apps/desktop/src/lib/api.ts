@@ -426,7 +426,7 @@ export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; 
 export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; provider?: CommsProvider; projectId: string | null; sessionId?: string | null; permissions: ChatPermissions; boundAt: number }
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
 export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
-export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummary?: { text: string; chatName: string; at: number } | null; agentSendToOthers?: boolean }
+export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummary?: { text: string; chatName: string; at: number } | null; agentSendToOthers?: boolean; notifyJid?: string | null }
 export type WaChatKind = 'dm' | 'group' | 'channel';
 export interface WaChatSummary { chatId: string; name: string; kind: WaChatKind; lastMessageAt: number; lastReportedAt: number; count: number }
 /** A WhatsApp chat as shown in the WhatsApp workspace (mirrors electron WaChatMeta). */
@@ -887,6 +887,8 @@ export const api = {
   approveWhatsappSend: () => call<WhatsAppState>('approveWhatsappSend', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
   /** Allow/disallow the in-app agent messaging contacts other than your own number (off by default). */
   setWhatsappAgentSend: (on: boolean) => call<WhatsAppState>('setWhatsappAgentSend', { on }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Set the personal number (digits) where summaries + agent confirmations are sent; '' clears it. */
+  setWhatsappRecipient: (number: string) => call<WhatsAppState>('setWhatsappRecipient', { number }, () => Promise.reject(new ApiError(403, 'desktop only'))),
 
   // WhatsApp workspace — full chat list + messages + control. Desktop-only: these
   // carry personal message content and send on your number, so the relay blocks them.

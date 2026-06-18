@@ -69,12 +69,14 @@ describe('normalizeWaMessage', () => {
 });
 
 describe('waSendAllowed — agent send gate', () => {
-  it('always allows messaging your own number (device suffix ignored)', () => {
-    expect(waSendAllowed('15551234567@s.whatsapp.net', '15551234567:3@s.whatsapp.net', false)).toBe(true);
+  it('always allows the linked number OR the configured notify number (device suffix ignored)', () => {
+    expect(waSendAllowed('15551234567@s.whatsapp.net', ['15551234567:3@s.whatsapp.net', null], false)).toBe(true);
+    // the user's personal "notify" number is also always allowed
+    expect(waSendAllowed('999@s.whatsapp.net', ['15551234567@s.whatsapp.net', '999@s.whatsapp.net'], false)).toBe(true);
   });
   it('blocks messaging anyone else unless the operator opted in', () => {
-    expect(waSendAllowed('999@s.whatsapp.net', '15551234567@s.whatsapp.net', false)).toBe(false);
-    expect(waSendAllowed('999@s.whatsapp.net', '15551234567@s.whatsapp.net', true)).toBe(true);
+    expect(waSendAllowed('888@s.whatsapp.net', ['15551234567@s.whatsapp.net', null], false)).toBe(false);
+    expect(waSendAllowed('888@s.whatsapp.net', ['15551234567@s.whatsapp.net', null], true)).toBe(true);
   });
 });
 
@@ -204,6 +206,18 @@ describe('WhatsAppClient — connection + send', () => {
     const s = new Store();
     const client = new WhatsAppClient(s, vi.fn());
     expect(await client.sendToSelf('nope')).toBe(false);
+  });
+
+  it('sendToSelf routes to the configured notify number when set (else the linked number)', async () => {
+    const s = new Store();
+    const { sock, sent } = mockSocket('111:2@s.whatsapp.net');
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => sock });
+    await client.connect();
+    s.setWhatsappState({ connected: true, jid: '111@s.whatsapp.net', notifyJid: '99999@s.whatsapp.net' });
+
+    await client.sendToSelf('summary');
+
+    expect(sent.at(-1)!.jid).toBe('99999@s.whatsapp.net'); // the personal number, not the linked PA number
   });
 
   it('sendText delivers to a chat and stores the outgoing message locally', async () => {
