@@ -138,6 +138,35 @@ export function buildServer(): FastifyInstance {
     }
   }
 
+  // ── OS push fan-out (parallel to the SSE fan-out above) ────────────
+  // Same role as SSE: relay the host's job/approval events to the operator's
+  // phones — but as Expo push, so they land even when the app is closed. Tokens
+  // live in memory (each app launch re-registers); no DB, no domain logic — the
+  // event itself already says what's notify-worthy. Mirrors LiveNotifier.tsx.
+  const pushTokens = new Set<string>();
+  async function pushFanout(name: string, data: unknown) {
+    if (pushTokens.size === 0) return;
+    let title = ''; let body = ''; let payload: Record<string, unknown> = {};
+    if (name === 'job') {
+      const j = (data ?? {}) as { id?: string; status?: string; title?: string };
+      if (j.status === 'done') { title = 'Conversation complete'; body = j.title || 'A run finished on your Mac.'; payload = { kind: 'job-done', jobId: j.id }; }
+      else if (j.status === 'failed') { title = 'Job failed'; body = j.title || 'A run failed on your Mac.'; payload = { kind: 'job-failed', jobId: j.id }; }
+      else return;
+    } else if (name === 'approval') {
+      const a = (data ?? {}) as { id?: string; status?: string; title?: string };
+      if (a.status !== 'pending') return;
+      title = 'Needs your attention'; body = a.title || 'An approval is waiting.'; payload = { kind: 'approval-created', approvalId: a.id };
+    } else { return; }
+    const messages = [...pushTokens].map((to) => ({ to, title, body, sound: 'default', channelId: 'alerts', priority: 'high', data: payload }));
+    try {
+      await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(messages),
+      });
+    } catch { /* push is best-effort */ }
+  }
+
   // ── Forward a command to the Mac and await its result ─────────────
   function cmd<T = unknown>(method: string, params: Record<string, unknown>): Promise<T> {
     if (!deck || !deck.online || !deck.ws) {
@@ -204,6 +233,7 @@ export function buildServer(): FastifyInstance {
           deck.lastSeen = Date.now();
         } else if (m.type === 'event' && m.name) {
           sseSend(m.name, m.data);
+          void pushFanout(m.name, m.data);
         } else if (m.type === 'result' && m.id) {
           const p = deck.pending.get(m.id);
           if (p) {
@@ -377,6 +407,13 @@ export function buildServer(): FastifyInstance {
   app.post('/api/feedback/:id/update', async (req, reply) =>
     forward(reply, 'updateFeedback', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/feedback/:id/delete', async (req, reply) => forward(reply, 'deleteFeedback', { id: (req.params as { id: string }).id }));
+
+  // ── Push registration — a paired phone registers its Expo push token ──
+  app.post('/api/push/register', async (req) => {
+    const { token } = (req.body ?? {}) as { token?: string };
+    if (typeof token === 'string' && token.startsWith('ExponentPushToken')) pushTokens.add(token);
+    return { ok: true };
+  });
 
   // ── SSE stream (host events relayed to web clients) ────────────────
   app.get('/api/stream', (req, reply) => {

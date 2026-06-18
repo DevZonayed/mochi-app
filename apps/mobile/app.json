@@ -19,7 +19,10 @@
       "edgeToEdgeEnabled": true,
       "softwareKeyboardLayoutMode": "resize",
       "permissions": [
-        "android.permission.CAMERA"
+        "android.permission.CAMERA",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
       ]
     },
     "web": {
@@ -32,7 +35,22 @@
           "cameraPermission": "Maestro uses the camera to scan the pairing QR code shown on your Mac."
         }
       ],
-      "expo-audio"
-    ]
+      "expo-audio",
+      [
+        "expo-notifications",
+        {
+          "color": "#0a0b10",
+          "sounds": [
+            "./assets/alert.wav"
+          ]
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "28b856bc-5534-4a50-b6af-70cd5803ee68"
+      }
+    },
+    "owner": "devzonayed"
   }
 }

@@ -20,13 +20,16 @@ export async function setupAlerts(): Promise<void> {
   configured = true;
   try {
     Notifications.setNotificationHandler({
-      handleNotification: async () => ({ shouldShowBanner: true, shouldShowList: true, shouldPlaySound: true, shouldSetBadge: true }),
+      // The app shows its own in-app banner + chime for foreground events (see
+      // LiveNotifier), so suppress the OS banner while foreground to avoid doubles.
+      // Background/killed pushes are rendered by the system, not this handler.
+      handleNotification: async () => ({ shouldShowBanner: false, shouldShowList: false, shouldPlaySound: false, shouldSetBadge: true }),
     });
     if (Platform.OS === 'android') {
       await Notifications.setNotificationChannelAsync('alerts', {
         name: 'Maestro alerts',
         importance: Notifications.AndroidImportance.MAX,
-        sound: 'default',
+        sound: 'alert.wav',
         vibrationPattern: [0, 260, 180, 260],
         enableVibrate: true,
       });

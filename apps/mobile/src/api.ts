@@ -306,6 +306,11 @@ export const api = {
   submitFeedback: (input: { category: 'bug' | 'idea' | 'other'; message: string }) =>
     req<{ id: string }>('/api/feedback', { method: 'POST', body: JSON.stringify({ ...input, source: 'phone' }) }),
 
+  /** Register this device's Expo push token so the relay can push job/approval
+      alerts to the phone even when the app is closed. Best-effort. */
+  registerPush: (token: string) =>
+    req<{ ok: boolean }>('/api/push/register', { method: 'POST', body: JSON.stringify({ token, device: DEVICE_NAME }) }),
+
   /** Verify the current pair token against the relay (a read-only auth probe).
      'ok' = token works · 'invalid' = wrong code (401) · 'mac-offline' = no Mac
      reachable to validate against (503) · 'unreachable' = network/relay down. */

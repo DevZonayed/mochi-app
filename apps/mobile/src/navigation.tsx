@@ -1,5 +1,5 @@
 import React from 'react';
-import { NavigationContainer, DefaultTheme, DarkTheme, type Theme as NavTheme } from '@react-navigation/native';
+import { NavigationContainer, createNavigationContainerRef, DefaultTheme, DarkTheme, type Theme as NavTheme } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useTheme } from './theme';
@@ -41,6 +41,9 @@ export type RootStackParamList = {
 
 const Tab = createBottomTabNavigator();
 const Stack = createNativeStackNavigator<RootStackParamList>();
+
+/** Navigate from outside React (e.g. notification taps in push.ts). */
+export const navigationRef = createNavigationContainerRef<RootStackParamList>();
 
 const TAB_ICON: Record<string, IconName> = {
   Home: 'home',
@@ -89,7 +92,7 @@ export function RootNavigator() {
     },
   };
   return (
-    <NavigationContainer theme={navTheme}>
+    <NavigationContainer ref={navigationRef} theme={navTheme}>
       <Stack.Navigator screenOptions={{ headerShown: false }} initialRouteName={getFlag(ONBOARDED) ? 'Tabs' : 'Onboarding'}>
         <Stack.Screen name="Tabs" component={Tabs} />
         <Stack.Screen name="Onboarding" component={OnboardingScreen} />

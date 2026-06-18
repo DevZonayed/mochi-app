@@ -7,6 +7,7 @@ import { RootNavigator } from './src/navigation';
 import { LiveNotifier } from './src/LiveNotifier';
 import { hydrate } from './src/storage';
 import { reloadPairToken } from './src/api';
+import { registerForPush, wireNotificationResponses } from './src/push';
 
 export default function App() {
   // Load persisted settings (pair token, theme, prefs) before first render so the
@@ -17,9 +18,12 @@ export default function App() {
     hydrate().then(() => {
       reloadPairToken();
       if (alive) setReady(true);
+      void registerForPush();
     });
     return () => { alive = false; };
   }, []);
+  // Route notification taps to the right screen (job timeline / approvals).
+  React.useEffect(() => wireNotificationResponses(), []);
 
   return (
     <SafeAreaProvider>
