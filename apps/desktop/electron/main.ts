@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, protocol } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, shell, protocol, Notification } from 'electron';
 import path from 'node:path';
 import { existsSync, realpathSync, mkdirSync, promises as fsp } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -273,6 +273,11 @@ app.whenReady().then(() => {
     if (name === 'settings' && data && typeof data === 'object') applyLoginItem(!!(data as { openAtLogin?: boolean }).openAtLogin);
     // A new pending approval (e.g. reviewer NEEDS WORK) → push to Telegram gates.
     if (name === 'approval' && telegram && (data as Approval)?.status === 'pending') telegram.notifyApproval(data as Approval);
+    // A recurring schedule fired late (catch-up after the Mac was asleep) — tell the operator.
+    if (name === 'schedule-late' && Notification.isSupported()) {
+      const d = data as { title?: string };
+      try { new Notification({ title: 'Scheduled task ran late', body: `“${d?.title ?? 'A schedule'}” missed its time and just ran (catch-up).` }).show(); } catch { /* non-fatal */ }
+    }
     // The relay is a pure conduit to the phone — never hand it the Mac-local path,
     // the base64 thumbnail, the content hash, or the fal queue URLs an Asset carries.
     // (Desktop windows above already got the full object; only the relay is slimmed.)
