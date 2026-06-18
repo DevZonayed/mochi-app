@@ -10,6 +10,8 @@ import type { MediaEngine } from './media.js';
 import type { ResearchEngine } from './research.js';
 import type { PublishingEngine } from './publishing.js';
 import type { TelegramBot } from './telegram.js';
+import type { WhatsAppClient } from './whatsapp.js';
+import { approveWhatsappSend } from './whatsapp-analyze.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, structuredDiff } from './git.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
@@ -99,7 +101,7 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null) {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null) {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -1022,21 +1024,38 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!p.chatId) bad('chatId required');
         const pending = store.listPendingChats().find(c => c.chatId === String(p.chatId));
         const perms = (p.permissions && typeof p.permissions === 'object') ? p.permissions as Record<string, boolean> : {};
+        const provider = p.provider === 'whatsapp' ? 'whatsapp' as const : (pending ? 'telegram' as const : (p.provider === 'telegram' ? 'telegram' as const : undefined));
         const b = store.bindChat({
           chatId: String(p.chatId), name: String(p.name ?? pending?.name ?? p.chatId), kind: (pending?.kind ?? 'dm'),
+          provider,
           projectId: (p.projectId as string) ?? null,
+          ...(p.sessionId !== undefined ? { sessionId: (p.sessionId as string) ?? null } : {}),
           permissions: { startJobs: perms.startJobs ?? true, receiveReports: perms.receiveReports ?? true, approveGates: perms.approveGates ?? false },
         });
         emit('comms', store.commsStatus());
         return b;
       }
-      case 'unbindChat': { store.unbindChat(String(p.chatId ?? '')); emit('comms', store.commsStatus()); return { ok: true }; }
+      case 'unbindChat': {
+        const chatId = String(p.chatId ?? '');
+        // A WhatsApp chat: also stop its quiet timer and forget its captured log.
+        if (store.getChatBinding(chatId)?.provider === 'whatsapp') { store.cancelWhatsappTimer(chatId); store.forgetWaChat(chatId); }
+        store.unbindChat(chatId); emit('comms', store.commsStatus()); return { ok: true };
+      }
       case 'setChatPermissions': {
         if (!p.chatId || !p.permissions || typeof p.permissions !== 'object') bad('chatId and permissions required');
         const b = store.setChatPermissions(String(p.chatId), p.permissions as Record<string, boolean>);
         emit('comms', store.commsStatus());
         return b;
       }
+
+      // ── Comms (WhatsApp — desktop-owned Baileys socket) ────────
+      case 'whatsappStatus': return store.whatsappState();
+      case 'listWaChats': return store.listWaChats();
+      case 'whatsappLink': return whatsapp.link({ phone: p.phone ? String(p.phone) : undefined });
+      case 'whatsappQr': return { dataUrl: whatsapp.currentQr() };
+      case 'disconnectWhatsApp': { whatsapp.disconnect(); return { ok: true }; }
+      case 'unlinkWhatsApp': { await whatsapp.unlink(); return { ok: true }; }
+      case 'approveWhatsappSend': { await approveWhatsappSend({ store, client: whatsapp, emit }); return store.whatsappState(); }
 
       // ── Feedback (collected from desktop / web / phone) ────────
       case 'listFeedback': return store.listFeedback();
