@@ -15,7 +15,11 @@ import { fileIconHtml } from '../lib/fileIcons';
 
 export type ComposerChip =
   | { kind: 'mention'; id: string; label: string; icon: IconName }
-  | { kind: 'file'; name: string; path: string; isDir: boolean };
+  | { kind: 'file'; name: string; path: string; isDir: boolean }
+  // An inline capsule for a composer attachment (pasted image, pasted text, picked
+  // file). Carries the parent's attachment `id`; the bytes/content ride along in the
+  // send payload, so the chip serializes to "" (no on-disk path to inline).
+  | { kind: 'attach'; id: string; name: string; label?: string };
 
 export interface RichComposerHandle {
   focus(): void;
@@ -44,7 +48,7 @@ interface Props {
   disabled?: boolean;
   style?: React.CSSProperties;
   onTextChange: (text: string) => void;
-  onChips?: (info: { hasBrowser: boolean; files: { name: string; path: string; isDir: boolean }[] }) => void;
+  onChips?: (info: { hasBrowser: boolean; files: { name: string; path: string; isDir: boolean }[]; attachIds: string[] }) => void;
   onMention?: (query: string | null) => void;
   onKeyDown?: (e: React.KeyboardEvent<HTMLDivElement>) => void;
   onPaste?: (e: React.ClipboardEvent<HTMLDivElement>) => void;
@@ -79,7 +83,8 @@ export const RichComposer = React.forwardRef<RichComposerHandle, Props>(function
       const chips = Array.from(root.querySelectorAll('[data-chip]')) as HTMLElement[];
       const hasBrowser = chips.some(c => c.dataset.chip === 'mention' && c.dataset.id === 'browser');
       const files = chips.filter(c => c.dataset.chip === 'file').map(c => ({ name: c.dataset.name ?? '', path: c.dataset.path ?? '', isDir: c.dataset.dir === '1' }));
-      props.onChips({ hasBrowser, files });
+      const attachIds = chips.filter(c => c.dataset.chip === 'attach').map(c => c.dataset.attachId ?? '').filter(Boolean);
+      props.onChips({ hasBrowser, files, attachIds });
     }
   }, [serialize, props]);
 
@@ -87,10 +92,11 @@ export const RichComposer = React.forwardRef<RichComposerHandle, Props>(function
     const span = document.createElement('span');
     span.contentEditable = 'false';
     span.dataset.chip = chip.kind;
-    const accent = chip.kind === 'mention' ? 'var(--green)' : (chip.isDir ? 'var(--purple)' : 'var(--blue)');
+    const accent = chip.kind === 'mention' ? 'var(--green)' : chip.kind === 'file' ? (chip.isDir ? 'var(--purple)' : 'var(--blue)') : 'var(--blue)';
     span.setAttribute('style', `display:inline-flex;align-items:center;gap:4px;vertical-align:baseline;margin:0 1px;padding:1px 3px 1px 7px;border-radius:6px;font:600 12px/1.45 var(--font-text);background:color-mix(in srgb, ${accent} 14%, transparent);border:1px solid color-mix(in srgb, ${accent} 38%, transparent);color:${accent};user-select:none;white-space:nowrap;max-width:240px;`);
     let icon: string, label: string;
     if (chip.kind === 'mention') { icon = SVG[chip.icon] ?? ''; label = chip.label; span.dataset.id = chip.id; span.dataset.text = ''; }
+    else if (chip.kind === 'attach') { icon = fileIconHtml(chip.name, 15); label = chip.label ?? chip.name; span.dataset.attachId = chip.id; span.dataset.text = ''; }
     else { icon = chip.isDir ? SVG.folder : fileIconHtml(chip.name, 15); label = chip.name; span.dataset.name = chip.name; span.dataset.path = chip.path; span.dataset.dir = chip.isDir ? '1' : '0'; span.dataset.text = '`' + chip.path + '`'; }
     span.innerHTML = `${icon}<span style="overflow:hidden;text-overflow:ellipsis;">${esc(label)}</span><button type="button" tabindex="-1" data-rm="1" aria-label="Remove" style="display:inline-flex;align-items:center;border:none;background:transparent;color:inherit;cursor:pointer;padding:0 1px;opacity:.6;">${SVG.x}</button>`;
     return span;

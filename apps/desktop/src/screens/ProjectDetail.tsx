@@ -2408,6 +2408,9 @@ const TEXT_EXT = /\.(txt|md|markdown|mdx|rst|json|jsonc|ya?ml|toml|ini|cfg|conf|
 const isTextFile = (f: File): boolean =>
   f.type.startsWith('text/') || /json|xml|javascript|typescript|ecmascript|csv|yaml|x-sh|x-python|x-ruby|toml|markdown/.test(f.type) || TEXT_EXT.test(f.name) || (!f.type && f.size <= 512 * 1024);
 const fmtBytes = (n?: number): string => (n == null ? '' : n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
+// Label shown on an attachment's inline composer chip (the sentinel pasted-text
+// name reads nicer as "Pasted text"; everything else uses its filename).
+const attachLabel = (a: Attach): string => (a.kind === 'text' && a.name === 'Pasted text.txt' ? 'Pasted text' : a.name);
 
 export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, onOpenImage, flush, autoFocus }: {
   projectId: string | null;
@@ -2478,14 +2481,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [schedNow, setSchedNow] = React.useState(() => Date.now()); // ticks each second to drive countdowns
   const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
   const [bgTasks, setBgTasks] = React.useState<BgTask[]>([]); // long-lived processes the agent started (dev servers, watchers)
-  const [attachments, setAttachments] = React.useState<Attach[]>([]); // images / text / files
-  // Hover preview for a text attachment — a smooth, scrollable peek of the content.
-  const [hoverAtt, setHoverAtt] = React.useState<{ id: string; rect: DOMRect } | null>(null);
-  const hoverTimer = React.useRef<number | undefined>(undefined);
-  const openPreview = (id: string, el: HTMLElement) => { window.clearTimeout(hoverTimer.current); setHoverAtt({ id, rect: el.getBoundingClientRect() }); };
-  const keepPreview = () => window.clearTimeout(hoverTimer.current);
-  const closePreviewSoon = () => { window.clearTimeout(hoverTimer.current); hoverTimer.current = window.setTimeout(() => setHoverAtt(null), 180); };
-  React.useEffect(() => () => window.clearTimeout(hoverTimer.current), []);
+  const [attachments, setAttachments] = React.useState<Attach[]>([]); // images / text / files (shown as inline composer chips)
   const [dragOver, setDragOver] = React.useState(false);
   const fileRef = React.useRef<HTMLInputElement>(null);
   const attachmentsRef = React.useRef(attachments);
@@ -2717,7 +2713,16 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   //    or any other file (saved + read by the agent). ─────────────────────────
   const MAX_ATTACH = 8;
   const newId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  const pushAttach = React.useCallback((a: Attach) => { setSendError(''); setAttachments(arr => arr.length >= MAX_ATTACH ? arr : [...arr, a]); }, []);
+  // Add an attachment: keep the bytes/content in `attachments` (the send payload's
+  // source of truth) AND drop an inline capsule into the composer for it. Removing
+  // the chip (✕ or backspace) syncs back via the composer's onChips → reconcile.
+  const pushAttach = React.useCallback((a: Attach) => {
+    if (attachmentsRef.current.length >= MAX_ATTACH) return;
+    setSendError('');
+    attachmentsRef.current = [...attachmentsRef.current, a]; // advance now so rapid async pushes respect the cap
+    setAttachments(arr => (arr.length >= MAX_ATTACH ? arr : [...arr, a]));
+    composerRef.current?.insertChips([{ kind: 'attach', id: a.id, name: a.name, label: attachLabel(a) }]);
+  }, []);
   const addFiles = React.useCallback((files: FileList | File[] | null) => {
     if (!files) return;
     const all = Array.from(files);
@@ -2787,7 +2792,14 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       pushAttach({ id: newId(), kind: 'text', name: 'Pasted text.txt', content: txt });
     }
   }, [addFiles, pushAttach]);
-  const removeAttachment = (id: string) => { setSendError(''); setAttachments(a => a.filter(x => x.id !== id)); };
+  // Restore attachments after a failed send: put the data back AND re-insert the
+  // inline chips (a bare setAttachments would leave the array without its capsules,
+  // which the next onChips reconcile would then immediately prune away).
+  const restoreAtts = React.useCallback((atts: Attach[]) => {
+    attachmentsRef.current = atts;
+    setAttachments(atts);
+    composerRef.current?.insertChips(atts.map(a => ({ kind: 'attach', id: a.id, name: a.name, label: attachLabel(a) })));
+  }, []);
   const canSend = !!text.trim() || attachments.length > 0;
 
   // Compose-and-send: text-only follows the normal queue/idle path; a message with
@@ -2798,15 +2810,15 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     if ((!t && !imgs.length) || !projectId) return;
     if (!imgs.length) { sendText(text); return; }
     composerRef.current?.clear(); setAttachments([]);
-    if (streaming) void sendNow(t, imgs).then(ok => { if (!ok) setAttachments(imgs); });
-    else void sendRaw(t, imgs).then(ok => { if (!ok) { composerRef.current?.setText(t); setAttachments(imgs); } });
-  }, [text, attachments, projectId, streaming, sendText, sendNow, sendRaw]);
+    if (streaming) void sendNow(t, imgs).then(ok => { if (!ok) restoreAtts(imgs); });
+    else void sendRaw(t, imgs).then(ok => { if (!ok) { composerRef.current?.setText(t); restoreAtts(imgs); } });
+  }, [text, attachments, projectId, streaming, sendText, sendNow, sendRaw, restoreAtts]);
   const sendComposedNow = React.useCallback(() => {
     const t = text.trim(); const imgs = attachments;
     if ((!t && !imgs.length) || !projectId) return;
     setAttachments([]);
-    void sendNow(t, imgs.length ? imgs : undefined).then(ok => { if (!ok) setAttachments(imgs); });
-  }, [text, attachments, projectId, sendNow]);
+    void sendNow(t, imgs.length ? imgs : undefined).then(ok => { if (!ok) restoreAtts(imgs); });
+  }, [text, attachments, projectId, sendNow, restoreAtts]);
 
   const removeFromQueue = (i: number) => mutateQueue(q => q.filter((_, j) => j !== i));
   // Reorder = reprioritize: the drainer always fires queue[0] next.
@@ -3036,71 +3048,25 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
             style={{ borderRadius: 18, border: `1px solid ${dragOver ? 'var(--blue)' : 'var(--separator-strong)'}`, background: 'var(--bg-elevated)',
             boxShadow: dragOver ? '0 0 0 3px color-mix(in srgb, var(--blue) 22%, transparent)' : 'var(--card-shadow)', padding: '10px 10px 8px 14px',
             transition: 'border-color 120ms ease, box-shadow 120ms ease', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
-            {attachments.length > 0 && (
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 9 }}>
-                {attachments.map(a => a.kind === 'image' ? (
-                  <div key={a.id} style={{ position: 'relative', width: 58, height: 58, borderRadius: 10, overflow: 'hidden', border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0 }}>
-                    <img src={a.dataUrl} alt={a.name} title={a.name} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
-                    <button onClick={() => removeAttachment(a.id)} title="Remove" style={{ position: 'absolute', top: 2, right: 2, width: 18, height: 18, borderRadius: '50%', border: 'none', display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.6)', color: '#fff', cursor: 'pointer', padding: 0 }}>
-                      <Icon name="x" size={11} stroke={2.8} />
-                    </button>
-                  </div>
-                ) : a.kind === 'ref' ? (
-                  <div key={a.id} title={a.path}
-                    style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: 8, maxWidth: 240, height: 40, padding: '0 30px 0 9px', borderRadius: 10, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0 }}>
-                    <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: a.isDir ? 'color-mix(in srgb, var(--purple) 16%, transparent)' : 'color-mix(in srgb, var(--blue) 16%, transparent)', color: a.isDir ? 'var(--purple)' : 'var(--blue)' }}><Icon name={a.isDir ? 'folder' : 'file'} size={14} /></span>
-                    <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
-                      <span style={{ font: '600 var(--fs-caption)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.name}</span>
-                      <span style={{ font: '400 9px/1.1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{a.isDir ? 'folder · read from disk' : 'file · read from disk'}</span>
-                    </span>
-                    <button onClick={() => removeAttachment(a.id)} title="Remove" style={{ position: 'absolute', top: 11, right: 8, width: 18, height: 18, borderRadius: '50%', border: 'none', display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', cursor: 'pointer', padding: 0 }}>
-                      <Icon name="x" size={10} stroke={2.8} />
-                    </button>
-                  </div>
-                ) : (
-                  <div key={a.id} title={a.kind === 'text' ? 'Hover to preview' : a.name} className={a.kind === 'text' ? 'att-chip' : undefined}
-                    onMouseEnter={a.kind === 'text' ? (e => openPreview(a.id, e.currentTarget)) : undefined}
-                    onMouseLeave={a.kind === 'text' ? closePreviewSoon : undefined}
-                    style={{ position: 'relative', display: 'flex', alignItems: 'center', gap: 8, maxWidth: 220, height: 40, padding: '0 30px 0 9px', borderRadius: 10, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', flexShrink: 0, cursor: a.kind === 'text' ? 'zoom-in' : 'default' }}>
-                    <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={14} /></span>
-                    <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
-                      <span style={{ font: '600 var(--fs-caption)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.kind === 'text' ? (a.name === 'Pasted text.txt' ? 'Pasted text' : a.name) : a.name}</span>
-                      <span style={{ font: '400 9px/1.1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{a.kind === 'text' ? `${a.content.split('\n').length} lines · ${fmtBytes(a.content.length)}` : fmtBytes(a.size)}</span>
-                    </span>
-                    <button onClick={() => removeAttachment(a.id)} title="Remove" style={{ position: 'absolute', top: 11, right: 8, width: 18, height: 18, borderRadius: '50%', border: 'none', display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', cursor: 'pointer', padding: 0 }}>
-                      <Icon name="x" size={10} stroke={2.8} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-            {hoverAtt && (() => {
-              const a = attachments.find(x => x.id === hoverAtt.id);
-              if (!a || a.kind !== 'text') return null;
-              const r = hoverAtt.rect;
-              const W = Math.min(560, window.innerWidth - 32);
-              const left = Math.max(16, Math.min(r.left, window.innerWidth - W - 16));
-              const maxH = Math.max(140, Math.min(440, r.top - 24));
-              const body = a.content.length > 20000 ? a.content.slice(0, 20000) + '\n\n…(preview truncated — full text is sent)' : a.content;
-              return (
-                <div className="att-card" onMouseEnter={keepPreview} onMouseLeave={closePreviewSoon}
-                  style={{ position: 'fixed', left, bottom: Math.max(8, window.innerHeight - r.top + 6), width: W, maxHeight: maxH, zIndex: 1200, display: 'flex', flexDirection: 'column', borderRadius: 12, overflow: 'hidden', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 16px 48px rgba(0,0,0,0.34)' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', borderBottom: '0.5px solid var(--separator)', flexShrink: 0 }}>
-                    <span style={{ width: 22, height: 22, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={12} /></span>
-                    <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.name === 'Pasted text.txt' ? 'Pasted text' : a.name}</span>
-                    <span style={{ flexShrink: 0, font: '500 9px/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{a.content.split('\n').length} lines · {fmtBytes(a.content.length)}</span>
-                  </div>
-                  <pre className="att-scroll" style={{ margin: 0, flex: 1, minHeight: 0, overflow: 'auto', padding: '10px 13px', font: '400 11.5px/1.55 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: 'var(--bg-grouped)' }}>{body}</pre>
-                </div>
-              );
-            })()}
+            {/* Attachments (pasted images, pasted text, picked files) render as inline
+                capsule chips INSIDE the composer — see pushAttach → RichComposer 'attach'
+                chips — so there are no separate preview cards or hover popovers here. */}
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
               <RichComposer
                 ref={composerRef}
                 disabled={!projectId}
                 placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
                 onTextChange={setText}
-                onChips={info => setComposerBrowser(info.hasBrowser)}
+                onChips={info => {
+                  setComposerBrowser(info.hasBrowser);
+                  // Keep `attachments` in lockstep with the inline chips: when a chip is
+                  // removed (✕ or backspace) its data drops out of the send payload too.
+                  const ids = new Set(info.attachIds);
+                  setAttachments(prev => {
+                    const next = prev.filter(a => a.kind === 'ref' || ids.has(a.id));
+                    return next.length === prev.length ? prev : next;
+                  });
+                }}
                 onMention={q => { setMentionQuery(q); if (q === null) setMentionSel(0); }}
                 onPaste={onPaste}
                 onKeyDown={e => {
