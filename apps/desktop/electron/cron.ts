@@ -11,6 +11,15 @@ import type { LocalEngine } from './engine.js';
 
 const TICK_MS = 30_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const LATE_TOLERANCE_MS = 90_000;
+
+/** Default catch-up window for a missed clock-mode slot: until the end of the
+    local day the slot belonged to (so a 9am miss can still fire any time that day). */
+function endOfDayWindow(dueAt: number): number {
+  const end = new Date(dueAt);
+  end.setHours(23, 59, 59, 999);
+  return Math.max(0, end.getTime() - dueAt);
+}
 
 function parseHHMM(time: string): { h: number; m: number } | null {
   const m = /^(\d{1,2}):(\d{2})$/.exec(time.trim());
@@ -39,6 +48,13 @@ export function cadenceDays(s: Schedule): Set<number> | null {
 
 /** Next occurrence of the schedule strictly after `from`. */
 export function nextOccurrence(s: Schedule, from: number): number | null {
+  // Interval-mode: every N minutes from anchorAt (defaults to createdAt).
+  if (s.everyMinutes && s.everyMinutes > 0) {
+    const every = s.everyMinutes * 60_000;
+    const anchor = s.anchorAt ?? s.createdAt;
+    const steps = Math.floor((from - anchor) / every) + 1; // strictly after `from`
+    return anchor + steps * every;
+  }
   const hm = parseHHMM(s.time);
   if (!hm) return null;
   const days = cadenceDays(s);
@@ -58,10 +74,14 @@ export class CronRunner {
   constructor(private store: Store, private engine: LocalEngine, private emit: (name: string, data: unknown) => void, private firePublish?: (nowMs: number) => void) {}
 
   start(): void {
-    // Initialise nextRun for display, forward-only from now.
     const now = Date.now();
     for (const s of this.store.listSchedules()) {
-      this.store.setScheduleNextRun(s.id, s.enabled ? (s.fireAt ?? nextOccurrence(s, now)) : null);
+      if (!s.enabled) { this.store.setScheduleNextRun(s.id, null); continue; }
+      // One-shots keep their fireAt. Recurring: keep a persisted nextRun (even if
+      // it's already in the past — the first tick decides fire/catch-up/roll-forward);
+      // only compute a fresh one when none is stored.
+      const next = s.fireAt ?? s.nextRun ?? nextOccurrence(s, now);
+      this.store.setScheduleNextRun(s.id, next);
     }
     this.timer = setInterval(() => this.tick(), TICK_MS);
   }
@@ -97,15 +117,30 @@ export class CronRunner {
       if (next > now) { this.store.setScheduleNextRun(s.id, next); continue; }
       // Due. Guard against double-fire inside the same minute.
       if (s.lastRun && now - s.lastRun < 90_000) continue;
+      const late = now - next > LATE_TOLERANCE_MS;
+      // Interval-mode never "catches up" a stale slot — it just advances from now.
+      const isInterval = !!(s.everyMinutes && s.everyMinutes > 0);
+      if (late && !isInterval) {
+        const windowMs = s.catchUpWindowMs ?? endOfDayWindow(next);
+        const withinWindow = now <= next + windowMs;
+        const alreadyDone = s.lastDueAt === next;
+        if (!s.catchUp || !withinWindow || alreadyDone) {
+          // Missed and not eligible for catch-up: roll forward, do not fire.
+          this.store.setScheduleNextRun(s.id, nextOccurrence(s, now));
+          continue;
+        }
+      }
+      const dueAt = next;
       next = nextOccurrence(s, now);
-      this.store.markScheduleRun(s.id, now, next);
-      this.fire(s);
+      this.store.markScheduleRun(s.id, now, next, { dueAt, late });
+      this.fire(s, { late });
     }
   }
 
-  private fire(s: Schedule): void {
+  private fire(s: Schedule, opts?: { late?: boolean }): void {
     const project = (s.projectId ? this.store.getProject(s.projectId) : undefined) ?? this.store.listProjects()[0];
     if (!project) return;
+    if (opts?.late) this.emit('schedule-late', { id: s.id, title: s.title, dueAt: s.lastDueAt ?? null, firedAt: Date.now() });
     // A wait-&-check / scheduled message fires its prompt into the originating
     // chat, on that chat's model. For a scheduled message the composer intent
     // (effort, browser, plan, goal) was captured so it runs exactly as if sent
@@ -114,7 +149,7 @@ export class CronRunner {
     const input = s.prompt && s.prompt.trim() ? s.prompt : s.title;
     const job = this.store.createJob(project.id, input, `Scheduled: ${s.title}`, s.effort ?? 'balanced', session?.id);
     this.emit('job', job);
-    const opts = {
+    const runOpts = {
       ...(session?.primary ? { engine: session.primary.engine, model: session.primary.model, reviewer: session.reviewer } : {}),
       ...(s.effort ? { effort: s.effort } : {}),
       ...(s.browser ? { browser: true } : {}),
@@ -122,6 +157,6 @@ export class CronRunner {
       ...(s.goal ? { goal: true } : {}),
     };
     // Fire-and-forget: the engine updates + emits job state as it progresses.
-    void this.engine.run(job.id, opts).catch(() => { /* engine already recorded the failure on the job */ });
+    void this.engine.run(job.id, runOpts).catch(() => { /* engine already recorded the failure on the job */ });
   }
 }
