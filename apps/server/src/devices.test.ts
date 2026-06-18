@@ -130,4 +130,20 @@ describe('DeviceRegistry', () => {
     r.touch('a', 'Renamed');
     expect(r.list()[0].name).toBe('Renamed');
   });
+
+  it('streamsFor returns a device open streams; empty for unknown ids', () => {
+    const r = new DeviceRegistry();
+    const a1 = fakeRes();
+    const a2 = fakeRes();
+    const b1 = fakeRes();
+    r.addStream('dev-a', 'iPhone', a1);
+    r.addStream('dev-a', 'iPhone', a2);
+    r.addStream('dev-b', 'iPad', b1);
+    expect(r.streamsFor('dev-a')).toEqual(expect.arrayContaining([a1, a2]));
+    expect(r.streamsFor('dev-a')).toHaveLength(2);
+    expect(r.streamsFor('dev-b')).toEqual([b1]);
+    expect(r.streamsFor('nope')).toEqual([]);
+    r.removeStream('dev-a', a1);
+    expect(r.streamsFor('dev-a')).toEqual([a2]);
+  });
 });
