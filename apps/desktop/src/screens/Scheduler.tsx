@@ -12,7 +12,7 @@ import React from 'react';
 import { Icon, type IconName } from '../lib/icons';
 import { Switch } from '../lib/ui';
 import { AppShell } from '../lib/appShell';
-import { api, type Schedule, type Project } from '../lib/api';
+import { api, type Schedule, type Project, type ChatSession } from '../lib/api';
 
 // page-specific CSS lifted from Scheduler.html <style> (hover/animation hooks)
 const SCHEDULER_CSS = `
@@ -297,12 +297,20 @@ function ListView({ onPick, rows: allRows, projMeta, onToggle, onDelete }: ListV
 // New/Edit schedule sheet (sc-sheet)
 // ──────────────────────────────────────────────────────────────────────────
 
-interface ParsedWhen { time: string; cron: string; summary: string; label: string }
+interface ParsedWhen { time: string; cron: string; summary: string; label: string; everyMinutes?: number }
 
 // tiny natural-language → cron parser (demo-grade)
 function parseWhen(text: string): ParsedWhen {
   const t = text.toLowerCase().trim();
   const dayMap: Record<string, string> = { mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat', sun: 'Sun' };
+  // Interval cadence: "every 2 hours" / "every 90 min".
+  const iv = t.match(/every\s+(\d+)\s*(h|hour|hours|m|min|mins|minute|minutes)\b/);
+  if (iv) {
+    const n = parseInt(iv[1], 10);
+    const everyMinutes = /^h/.test(iv[2]) ? n * 60 : n;
+    const label = everyMinutes % 60 === 0 ? `Every ${everyMinutes / 60}h` : `Every ${everyMinutes}m`;
+    return { time: '', cron: '', summary: label, label: 'interval', everyMinutes };
+  }
   let time = '09:00', cron = '0 9 * * *', summary = 'Every day at 09:00';
   const tm = t.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
   let hh = 9, mm = 0;
@@ -339,22 +347,62 @@ function SheetSection({ n, title, children }: { n: string; title: string; childr
   );
 }
 
+export interface ScheduleSaveData { id?: string; title: string; time: string; cadence: string; projectId?: string; sessionId?: string; prompt?: string; everyMinutes?: number; catchUp?: boolean }
+
 interface ScheduleSheetProps {
   open: boolean;
   onClose: () => void;
-  onSave: (data: { title: string; time: string; cadence: string; projectId?: string }) => void;
-  initial: SchedRow | null;
+  onSave: (data: ScheduleSaveData) => void;
+  initial: Schedule | null;
   projects: Project[];
 }
 
-function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) {
+/** Reconstruct a "when" phrase from a saved schedule so the parser round-trips on edit. */
+function whenFromSchedule(s: Schedule): string {
+  if (s.everyMinutes && s.everyMinutes > 0) {
+    return s.everyMinutes % 60 === 0 ? `every ${s.everyMinutes / 60} hours` : `every ${s.everyMinutes} minutes`;
+  }
+  const cad = (s.cadence && s.cadence !== 'daily' && s.cadence !== 'once') ? s.cadence : 'every day';
+  return `${cad} ${s.time || '09:00'}`;
+}
+
+function ScheduleSheet({ open, onClose, onSave, initial, projects }: ScheduleSheetProps) {
   const [when, setWhen] = React.useState('every weekday 9am');
   const [projectId, setProjectId] = React.useState('');
+  const [sessionId, setSessionId] = React.useState('');
+  const [prompt, setPrompt] = React.useState('');
+  const [catchUp, setCatchUp] = React.useState(false);
   const [advanced, setAdvanced] = React.useState(false);
-  React.useEffect(() => { if (open) { setWhen('every weekday 9am'); setProjectId(''); setAdvanced(false); } }, [open]);
+  const [sessions, setSessions] = React.useState<ChatSession[]>([]);
+  React.useEffect(() => {
+    if (!open) return;
+    setWhen(initial ? whenFromSchedule(initial) : 'every weekday 9am');
+    setProjectId(initial?.projectId ?? '');
+    setSessionId(initial?.sessionId ?? '');
+    setPrompt(initial?.prompt ?? '');
+    setCatchUp(!!initial?.catchUp);
+    setAdvanced(false);
+  }, [open, initial]);
+  // Load the chosen project's sessions so a recurring run can target one chat.
+  React.useEffect(() => {
+    if (!open || !projectId) { setSessions([]); return; }
+    let alive = true;
+    api.listSessions(projectId).then(rows => { if (alive) setSessions(rows); }).catch(() => { if (alive) setSessions([]); });
+    return () => { alive = false; };
+  }, [open, projectId]);
   if (!open) return null;
 
   const parsed = parseWhen(when);
+  const save = () => onSave({
+    id: initial?.id,
+    title: prompt.trim() ? prompt.trim().slice(0, 60) : parsed.summary,
+    time: parsed.time, cadence: parsed.label,
+    everyMinutes: parsed.everyMinutes,
+    projectId: projectId || undefined,
+    sessionId: sessionId || undefined,
+    prompt: prompt.trim() || undefined,
+    catchUp,
+  });
 
   return (
     <div onMouseDown={onClose} style={{ position: 'absolute', inset: 0, zIndex: 80, display: 'grid', placeItems: 'center', padding: 32,
@@ -364,8 +412,8 @@ function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) 
         {/* header */}
         <div style={{ display: 'flex', alignItems: 'center', padding: '18px 20px', borderBottom: '0.5px solid var(--separator)' }}>
           <div style={{ flex: 1 }}>
-            <h2 style={{ margin: 0, font: '700 var(--fs-title2)/1.1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>New schedule</h2>
-            <p style={{ margin: '3px 0 0', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>Fires on this Mac at its time — missed times roll forward to the next occurrence.</p>
+            <h2 style={{ margin: 0, font: '700 var(--fs-title2)/1.1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>{initial ? 'Edit schedule' : 'New schedule'}</h2>
+            <p style={{ margin: '3px 0 0', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>Fires on this Mac at its time. Turn on catch-up so a missed run still fires later the same day.</p>
           </div>
           <button onClick={onClose} className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="x" size={18} /></button>
         </div>
@@ -385,6 +433,19 @@ function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) 
               </span>
               <Icon name="chevronDown" size={16} style={{ color: 'var(--ink-tertiary)' }} />
             </label>
+            {projectId && sessions.length > 0 && (
+              <label className="sheet-pick" style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', minHeight: 46, marginTop: 8, padding: '8px 14px',
+                background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)' }}>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ display: 'block', font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginBottom: 3 }}>Run in chat (optional)</span>
+                  <select value={sessionId} onChange={e => setSessionId(e.target.value)} className="sel" style={{ width: '100%', border: 'none', outline: 'none', background: 'transparent', font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink)' }}>
+                    <option value="">Any chat in the project</option>
+                    {sessions.map(se => <option key={se.id} value={se.id}>{se.title}</option>)}
+                  </select>
+                </span>
+                <Icon name="chevronDown" size={16} style={{ color: 'var(--ink-tertiary)' }} />
+              </label>
+            )}
           </SheetSection>
 
           {/* 2 when */}
@@ -411,7 +472,15 @@ function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) 
 
           {/* 3 what fires */}
           <SheetSection n="3" title="What runs">
-            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '12px 14px', background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)' }}>
+            <textarea value={prompt} onChange={e => setPrompt(e.target.value)} rows={3}
+              placeholder="What should run each time? e.g. Pull ~50 WhatsApp messages, summarize the conversation, and send me the summary in my private chat."
+              style={{ width: '100%', resize: 'vertical', padding: '11px 14px', background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)',
+                font: '400 var(--fs-body)/1.4 var(--font-text)', color: 'var(--ink)', outline: 'none' }} />
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12, cursor: 'pointer' }}>
+              <Switch on={catchUp} onChange={setCatchUp} />
+              <span style={{ font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>Catch up if missed — if the Mac was asleep at the scheduled time, run it later the same day.</span>
+            </label>
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginTop: 12, padding: '12px 14px', background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)' }}>
               <Icon name="shield" size={15} style={{ color: 'var(--green)', flexShrink: 0, marginTop: 1 }} />
               <span style={{ font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
                 Each firing creates a real job and runs it through your engine routing on this Mac — it shows up in Jobs and on your phone like any hand-started run, and its cost lands in Costs.
@@ -423,7 +492,7 @@ function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) 
         {/* footer */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 14, padding: '14px 20px', borderTop: '0.5px solid var(--separator)' }}>
           <button onClick={onClose} style={{ height: 40, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
-          <button onClick={() => onSave({ title: parsed.summary, time: parsed.time, cadence: parsed.label, projectId: projectId || undefined })} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Save schedule</button>
+          <button onClick={save} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>{initial ? 'Save changes' : 'Save schedule'}</button>
         </div>
       </div>
     </div>
@@ -550,12 +619,16 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 
 // derive a human cron line from the API's time + cadence fields
 function cronLine(s: Schedule): string {
+  if (s.everyMinutes && s.everyMinutes > 0) {
+    const h = Math.floor(s.everyMinutes / 60), m = s.everyMinutes % 60;
+    return `Every ${h ? `${h}h` : ''}${m ? ` ${m}m` : ''}`.trim() + (s.catchUp ? ' · catch-up' : '');
+  }
   const cad = (s.cadence || '').trim();
   const time = (s.time || '').trim();
   if (!cad && !time) return 'On demand';
   if (!time) return cad;
-  if (!cad || /every\s*day/i.test(cad) || cad === '*') return `Every day at ${time}`;
-  return `${cad} at ${time}`;
+  const base = (!cad || /every\s*day/i.test(cad) || cad === '*') ? `Every day at ${time}` : `${cad} at ${time}`;
+  return base + (s.catchUp ? ' · catch-up' : '');
 }
 
 // derive a relative "next run" string from the API's nextRun timestamp
@@ -574,7 +647,7 @@ function nextLine(nextRun: number | null): string {
 export default function Scheduler() {
   const [view, setView] = React.useState('calendar');
   const [sheetOpen, setSheetOpen] = React.useState(false);
-  const [editing, setEditing] = React.useState<SchedRow | null>(null);
+  const [editing, setEditing] = React.useState<Schedule | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const [schedules, setSchedules] = React.useState<Schedule[]>([]);
   const [projects, setProjects] = React.useState<Project[]>([]);
@@ -636,10 +709,21 @@ export default function Scheduler() {
     }
   }, [schedules]);
 
-  const onCreateSchedule = React.useCallback(async (data: { title: string; time: string; cadence: string; projectId?: string }) => {
+  const onSaveSchedule = React.useCallback(async (data: ScheduleSaveData) => {
     setSheetOpen(false);
     try {
-      await api.createSchedule(data);
+      if (data.id) {
+        await api.updateSchedule(data.id, {
+          title: data.title, prompt: data.prompt, time: data.time, cadence: data.cadence,
+          everyMinutes: data.everyMinutes, catchUp: data.catchUp,
+          sessionId: data.sessionId, projectId: data.projectId,
+        });
+      } else {
+        await api.createSchedule({
+          title: data.title, projectId: data.projectId, time: data.time, cadence: data.cadence,
+          everyMinutes: data.everyMinutes, catchUp: data.catchUp, prompt: data.prompt, sessionId: data.sessionId,
+        });
+      }
       await loadSchedules();
     } catch { /* fail soft */ }
   }, [loadSchedules]);
@@ -650,8 +734,8 @@ export default function Scheduler() {
   }, []);
 
   const openNew = () => { setEditing(null); setSheetOpen(true); };
-  const openEdit = (s: SchedRow) => { setEditing(s); setSheetOpen(true); };
-  const openFromCalendar = () => { setEditing(null); setSheetOpen(true); };
+  const openEdit = (row: SchedRow) => { setEditing(schedules.find(s => s.id === row.id) ?? null); setSheetOpen(true); };
+  const openFromCalendar = (s: Schedule) => { setEditing(s); setSheetOpen(true); };
 
   return (
     <AppShell active="scheduler" onSearch={() => setPaletteOpen(true)}>
@@ -673,7 +757,7 @@ export default function Scheduler() {
         {/* durability reassurance */}
         <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: 18, font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
           <Icon name="shield" size={14} style={{ color: 'var(--green)' }} />
-          Schedules fire on this Mac while Maestro is running — a missed time rolls forward to the next occurrence.
+          Schedules fire on this Mac while Maestro is running. A missed time rolls forward — or, with catch-up on, still runs later the same day.
         </div>
 
         {/* body */}
@@ -684,7 +768,7 @@ export default function Scheduler() {
         </div>
       </div>
 
-      <ScheduleSheet open={sheetOpen} onClose={() => setSheetOpen(false)} onSave={onCreateSchedule} initial={editing} projects={projects} />
+      <ScheduleSheet open={sheetOpen} onClose={() => setSheetOpen(false)} onSave={onSaveSchedule} initial={editing} projects={projects} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>
   );
