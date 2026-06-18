@@ -10,6 +10,8 @@ import { PublishingEngine } from './publishing.js';
 import { CodexBridge } from './codex-bridge.js';
 import { ExtensionBridge } from './extension-bridge.js';
 import { TelegramBot } from './telegram.js';
+import { WhatsAppClient } from './whatsapp.js';
+import { makeWhatsappAnalyzer } from './whatsapp-analyze.js';
 import { Providers } from './providers.js';
 import type { Approval, Job } from './store.js';
 import { createDispatch } from './localApi.js';
@@ -347,8 +349,11 @@ app.whenReady().then(() => {
   });
   telegram = new TelegramBot(store, engine, providers, emit);
   telegram.resumeOnBoot();
+  // WhatsApp: the Mac owns one Baileys socket for the operator's own number.
+  const whatsapp = new WhatsAppClient(store, emit);
+  whatsapp.resumeOnBoot();
   const gitService = new GitService(store, emit, providers);
-  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, providers, emit, RELAY_URL, gitService, () => extensionBridge);
+  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge);
   // Local control channel for the native browser extension (one app-owned port).
   extensionBridge = new ExtensionBridge(store, dispatch, (status) => emit('extension', status, { desktopOnly: true }));
   extensionBridge.start();
@@ -401,14 +406,14 @@ app.whenReady().then(() => {
   });
   relay.start();
 
-  const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs));
+  const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs), makeWhatsappAnalyzer({ store, engine, client: whatsapp, emit }));
   cron.start();
   // Poll PR/git status for active sessions; the renderer + phone update via git-status events.
   const gitPoll = setInterval(() => { for (const s of gitService.pollable()) void gitService.fullStatus(s, { withPr: true }).catch(() => { /* transient */ }); }, 30_000);
   // Auto-update (electron-updater → GitHub Releases). Desktop-only: its events
   // never cross the relay. Polling starts after the window exists (see below).
   const updater = new Updater(emit);
-  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); relay?.stop(); telegram?.stop(); codexBridge.stop(); extensionBridge?.stop(); updater.stop(); engine.bgStopAll(); });
+  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); relay?.stop(); telegram?.stop(); whatsapp.disconnect(); codexBridge.stop(); extensionBridge?.stop(); updater.stop(); engine.bgStopAll(); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {

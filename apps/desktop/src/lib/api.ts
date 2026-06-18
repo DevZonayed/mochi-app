@@ -413,13 +413,17 @@ export interface PublishDraft {
   status: PublishStatus; provenance: string; exportedPaths: string[]; createdAt: number; updatedAt: number;
 }
 export interface PublishLedgerRow { id: string; draftId: string; at: number; platforms: string[]; action: 'exported' | 'published-manual'; ok: boolean; hash: string; paths: string[] }
+export type CommsProvider = 'telegram' | 'whatsapp';
 export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; approveGates: boolean }
-export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; projectId: string | null; permissions: ChatPermissions; boundAt: number }
+export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; provider?: CommsProvider; projectId: string | null; sessionId?: string | null; permissions: ChatPermissions; boundAt: number }
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
 export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
+export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummary?: { text: string; chatName: string; at: number } | null }
+export interface WaChatSummary { chatId: string; name: string; kind: 'dm' | 'group'; lastMessageAt: number; lastReportedAt: number; count: number }
+export type WhatsAppLink = { method: 'qr'; dataUrl: string } | { method: 'pairing'; code: string };
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
-  whatsapp: { connected: false };
+  whatsapp: { connected: boolean; jid: string | null; name: string | null; tracked: number; sendApproved: boolean };
 }
 export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
 export interface FolderInspect { ok: boolean; path: string; info: RepoInfo; error?: string }
@@ -773,11 +777,23 @@ export const api = {
   listCommEvents: () => call<CommEvent[]>('listCommEvents', {}, () => req<CommEvent[]>('/api/comms/events')),
   connectTelegram: (token: string) => call<{ username: string }>('connectTelegram', { token }, () => req<{ username: string }>('/api/comms/telegram/connect', { method: 'POST', body: JSON.stringify({ token }) })),
   disconnectTelegram: () => call<{ ok: boolean }>('disconnectTelegram', {}, () => req<{ ok: boolean }>('/api/comms/telegram/disconnect', { method: 'POST' })),
-  bindChat: (input: { chatId: string; name?: string; projectId?: string | null; permissions?: Partial<ChatPermissions> }) =>
+  bindChat: (input: { chatId: string; name?: string; provider?: CommsProvider; projectId?: string | null; sessionId?: string | null; permissions?: Partial<ChatPermissions> }) =>
     call<ChatBinding>('bindChat', { ...input }, () => req<ChatBinding>('/api/comms/bind', { method: 'POST', body: JSON.stringify(input) })),
   unbindChat: (chatId: string) => call<{ ok: boolean }>('unbindChat', { chatId }, () => req<{ ok: boolean }>('/api/comms/unbind', { method: 'POST', body: JSON.stringify({ chatId }) })),
   setChatPermissions: (chatId: string, permissions: Partial<ChatPermissions>) =>
     call<ChatBinding>('setChatPermissions', { chatId, permissions }, () => req<ChatBinding>('/api/comms/permissions', { method: 'POST', body: JSON.stringify({ chatId, permissions }) })),
+
+  // Comms (WhatsApp — desktop owns the Baileys socket; management is desktop-only)
+  whatsappStatus: () => call<WhatsAppState>('whatsappStatus', {}, () => Promise.resolve({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null } as WhatsAppState)),
+  listWaChats: () => call<WaChatSummary[]>('listWaChats', {}, () => Promise.resolve([] as WaChatSummary[])),
+  /** Begin linking the operator's number. QR by default, or a pairing code if a phone is given. */
+  whatsappLink: (phone?: string) => call<WhatsAppLink>('whatsappLink', { phone }, () => Promise.reject(new ApiError(403, 'Linking WhatsApp is only available in the desktop app'))),
+  /** The current QR data-URL while a link is pending (refreshes as the QR rotates). */
+  whatsappQr: () => call<{ dataUrl: string | null }>('whatsappQr', {}, () => Promise.resolve({ dataUrl: null })),
+  disconnectWhatsApp: () => call<{ ok: boolean }>('disconnectWhatsApp', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  unlinkWhatsApp: () => call<{ ok: boolean }>('unlinkWhatsApp', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Approve sending summaries to your own number (one-time gate); flushes any held summary. */
+  approveWhatsappSend: () => call<WhatsAppState>('approveWhatsappSend', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
 
   /** Native import picker — desktop only; resolves the imported asset or null. */
   importAsset: async (projectId: string | null): Promise<Asset | null> => {
