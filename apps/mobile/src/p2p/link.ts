@@ -19,6 +19,8 @@ export interface P2PLinkDeps {
   fetchIce: () => Promise<IceServer[]>;
   /** Deliver a P2P-sourced host event to the live sink (useLive). */
   onEvent: (name: string, data: unknown) => void;
+  /** Notified when the direct channel opens (true) or drops (false). */
+  onActiveChange?: (active: boolean) => void;
 }
 
 export interface P2PLink {
@@ -54,6 +56,7 @@ export function createP2PLink(deps: P2PLinkDeps): P2PLink {
     messenger = new ReliableMessenger(p, {
       onState: (s) => {
         active = s === 'connected';
+        deps.onActiveChange?.(active);
       },
       onDeliver: (env: Envelope) => {
         if (env.kind === 'event') {
