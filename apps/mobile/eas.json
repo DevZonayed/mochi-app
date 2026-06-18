@@ -7,17 +7,14 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
-      "android": { "buildType": "apk" },
-      "env": { "NPM_CONFIG_IGNORE_SCRIPTS": "true" }
+      "android": { "buildType": "apk" }
     },
     "preview": {
       "distribution": "internal",
-      "android": { "buildType": "apk" },
-      "env": { "NPM_CONFIG_IGNORE_SCRIPTS": "true" }
+      "android": { "buildType": "apk" }
     },
     "production": {
-      "autoIncrement": true,
-      "env": { "NPM_CONFIG_IGNORE_SCRIPTS": "true" }
+      "autoIncrement": true
     }
   },
   "submit": {
