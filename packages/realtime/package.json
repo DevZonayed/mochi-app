@@ -1,0 +1,20 @@
+{
+  "name": "@maestro/realtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Transport-agnostic realtime core (envelope, Transport, ConnectionManager, ReliableMessenger, ICE) shared by desktop + mobile.",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "exports": { ".": "./index.ts" },
+  "files": ["index.ts", "src"],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.9"
+  }
+}
