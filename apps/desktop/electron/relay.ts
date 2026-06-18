@@ -24,6 +24,8 @@ export interface RelayOptions {
   onCommand: (method: string, params: Record<string, unknown>) => Promise<unknown>;
   /** Relay reports the current remote-device list (presence + per-device identity). */
   onRemote?: (devices: RemoteDevice[]) => void;
+  /** A remote's WebRTC signaling (offer/answer/ICE) arrived for one device. */
+  onSignal?: (did: string, signal: unknown) => void;
 }
 
 export class RelayClient {
@@ -71,10 +73,11 @@ export class RelayClient {
   }
 
   private async onMessage(raw: string): Promise<void> {
-    let m: { type?: string; id?: string; method?: string; params?: Record<string, unknown>; devices?: RemoteDevice[] };
+    let m: { type?: string; id?: string; method?: string; params?: Record<string, unknown>; devices?: RemoteDevice[]; did?: string; signal?: unknown };
     try { m = JSON.parse(raw) as typeof m; } catch { return; }
     if (m.type === 'ping') { this.send({ type: 'pong' }); return; }
     if (m.type === 'remote') { this.opts.onRemote?.(Array.isArray(m.devices) ? m.devices : []); return; }
+    if (m.type === 'signal' && m.did) { this.opts.onSignal?.(m.did, m.signal); return; }
     if (m.type === 'cmd' && m.id && m.method) {
       try {
         const result = await this.opts.onCommand(m.method, m.params ?? {});
@@ -93,6 +96,11 @@ export class RelayClient {
 
   event(name: string, data: unknown): void {
     this.send({ type: 'event', name, data });
+  }
+
+  /** Send a WebRTC signaling payload (offer/ICE) to one remote — the relay routes by device id. */
+  signal(did: string, payload: unknown): void {
+    this.send({ type: 'signal', did, signal: payload });
   }
 
   /** Disconnect one remote device — the relay closes its streams and revokes its id. */
