@@ -13,6 +13,17 @@ import { useLive } from '../useLive';
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
+/** A gentle little nudge at the foot of the dashboard. */
+const MOTIVATIONS = [
+  'Your agents are on it — go make something great. ✨',
+  'Small steps, shipped daily. You’ve got this. 🚀',
+  'The Mac does the typing; you do the dreaming. 💭',
+  'One prompt at a time. 🌱',
+  'Steady hands, big ships. ⛵',
+  'Dream it, queue it, ship it. 🛠️',
+  'Today’s a good day to build. ☀️',
+];
+
 /** Time-of-day greeting. */
 function greetingFor(h: number): string {
   if (h < 5) return 'Good night';
@@ -167,6 +178,8 @@ export function HomeScreen() {
   const [projects, setProjects] = useState<Project[]>(() => cacheGet('projects', []));
   const [allJobs, setAllJobs] = useState<Job[]>(() => cacheGet('jobs', []));
   const [now, setNow] = useState(Date.now());
+  // A cute line picked once per visit.
+  const [quip] = useState(() => MOTIVATIONS[Math.floor(Math.random() * MOTIVATIONS.length)]);
   // Live clock for the greeting (minute granularity is enough).
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(t); }, []);
 
@@ -270,7 +283,7 @@ export function HomeScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
-      <ScrollView contentContainerStyle={{ paddingTop: insets.top + 6, paddingBottom: 96 }} showsVerticalScrollIndicator={false}>
+      <ScrollView contentContainerStyle={{ paddingTop: insets.top + 6, paddingBottom: 28 }} showsVerticalScrollIndicator={false}>
         {/* greeting + live time */}
         <View style={{ paddingHorizontal: 20, paddingBottom: 16, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' }}>
           <View style={{ flex: 1, minWidth: 0 }}>
@@ -362,33 +375,10 @@ export function HomeScreen() {
             </React.Fragment>
           ))}
         </Pressable>
-      </ScrollView>
 
-      {/* New job — Home is the jobs hub now (no Jobs tab). */}
-      <Pressable
-        onPress={() => nav.navigate('NewJob')}
-        style={({ pressed }) => ({
-          position: 'absolute',
-          bottom: insets.bottom + 16,
-          right: 18,
-          flexDirection: 'row',
-          alignItems: 'center',
-          gap: 8,
-          height: 52,
-          paddingHorizontal: 20,
-          borderRadius: 26,
-          backgroundColor: theme.color.blue,
-          shadowColor: theme.color.blue,
-          shadowOpacity: 0.4,
-          shadowRadius: 12,
-          shadowOffset: { width: 0, height: 8 },
-          elevation: 6,
-          transform: [{ scale: pressed ? 0.95 : 1 }],
-        })}
-      >
-        <Icon name="plus" size={22} color="#fff" stroke={2.4} />
-        <Text style={{ fontSize: 16, fontWeight: '600', color: '#fff' }}>New job</Text>
-      </Pressable>
+        {/* a little nudge */}
+        <Text style={{ textAlign: 'center', paddingHorizontal: 44, paddingTop: 6, fontSize: 13, lineHeight: 19, color: theme.color.inkTertiary }}>{quip}</Text>
+      </ScrollView>
     </View>
   );
 }
