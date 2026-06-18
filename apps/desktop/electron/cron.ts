@@ -54,8 +54,10 @@ export function nextOccurrence(s: Schedule, from: number): number | null {
 export class CronRunner {
   private timer: ReturnType<typeof setInterval> | null = null;
 
-  /** firePublish: optional hook to export scheduled publish drafts whose time has come. */
-  constructor(private store: Store, private engine: LocalEngine, private emit: (name: string, data: unknown) => void, private firePublish?: (nowMs: number) => void) {}
+  /** firePublish: optional hook to export scheduled publish drafts whose time has come.
+      analyzeWhatsapp: optional hook a 'whatsapp-analyze' quiet timer fires when a
+      tracked WhatsApp chat goes silent — it reads the chat and reports a summary. */
+  constructor(private store: Store, private engine: LocalEngine, private emit: (name: string, data: unknown) => void, private firePublish?: (nowMs: number) => void, private analyzeWhatsapp?: (s: Schedule) => void) {}
 
   start(): void {
     // Initialise nextRun for display, forward-only from now.
@@ -104,6 +106,12 @@ export class CronRunner {
   }
 
   private fire(s: Schedule): void {
+    // A quiet WhatsApp chat fired: hand it to the analyzer (read + summarize +
+    // report to self). It does NOT become a normal chat job in a project.
+    if (s.kind === 'whatsapp-analyze') {
+      try { this.analyzeWhatsapp?.(s); } catch { /* the analyzer records its own failures */ }
+      return;
+    }
     const project = (s.projectId ? this.store.getProject(s.projectId) : undefined) ?? this.store.listProjects()[0];
     if (!project) return;
     // A wait-&-check / scheduled message fires its prompt into the originating
