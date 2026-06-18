@@ -7,6 +7,7 @@ import { Icon, type IconName } from './Icon';
 import { getFlag, ONBOARDED } from './storage';
 import { api } from './api';
 import { useLive } from './useLive';
+import { navRef } from './navRef';
 
 import { HomeScreen } from './screens/Home';
 import { ApprovalsScreen } from './screens/Approvals';
@@ -89,7 +90,7 @@ export function RootNavigator() {
     },
   };
   return (
-    <NavigationContainer theme={navTheme}>
+    <NavigationContainer theme={navTheme} ref={navRef}>
       <Stack.Navigator screenOptions={{ headerShown: false }} initialRouteName={getFlag(ONBOARDED) ? 'Tabs' : 'Onboarding'}>
         <Stack.Screen name="Tabs" component={Tabs} />
         <Stack.Screen name="Onboarding" component={OnboardingScreen} />
