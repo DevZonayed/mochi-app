@@ -309,9 +309,12 @@ export interface WhatsAppState {
   jid: string | null;
   name: string | null;
   linkedAt: number | null;
+  /** The one-time send gate: until the operator approves, no summary is sent. */
   sendApproved: boolean;
+  /** A summary produced before the operator approved sending — flushed on approval. */
+  pendingSummary?: { text: string; chatName: string; at: number } | null;
 }
-export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false };
+export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null };
 
 /** One captured WhatsApp message (normalized, text-only — media is noted as a kind). */
 export interface WaMessage { id: string; chatId: string; fromMe: boolean; senderName: string; text: string; ts: number }
