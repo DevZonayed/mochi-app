@@ -9,14 +9,14 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import {
-  GroupedList, Row, Switch, EffortDial, ModelSwitcher,
+  GroupedList, Row, Switch, EffortDial, ModelSwitcher, CopyCode,
   type EffortStop,
 } from '../lib/ui';
 import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, usePurpose, setPurpose, TrafficLights, Sidebar, Toolbar,
   type Theme, type Purpose,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type DevicePresence, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type DevicePresence, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, type GithubDevice, IS_LOCAL } from '../lib/api';
 import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
 import { WhatsNew } from '../lib/WhatsNew';
 import { useNotificationSettings, updateNotificationSettings, playSound, SOUND_OPTIONS, type NotificationSound } from '../lib/notify';
@@ -465,6 +465,11 @@ function AccountsPane() {
 
   // Codex ChatGPT OAuth (desktop-only): drives the bundled CLI + system browser.
   const [codexBusy, setCodexBusy] = React.useState(false);
+  // GitHub OAuth (device flow via the gh CLI): downloads gh on first use, opens the
+  // browser, no token to paste. `githubDevice` carries the one-time code / progress.
+  const [githubBusy, setGithubBusy] = React.useState(false);
+  const [githubDevice, setGithubDevice] = React.useState<GithubDevice | null>(null);
+  const [showPat, setShowPat] = React.useState(false);
 
   const refetch = React.useCallback(() => { api.listProviders().then(setConns).catch(() => {}); }, []);
   React.useEffect(() => { refetch(); }, [refetch]);
@@ -486,6 +491,23 @@ function AccountsPane() {
     setCodexBusy(true);
     try { await api.codexLogout(); refetch(); refreshModelGroups(); } catch { /* ignore */ } finally { setCodexBusy(false); }
   };
+
+  // GitHub OAuth via the gh device flow — resolves once the browser authorization
+  // completes; live frames (gh download %, one-time code) arrive on onGithubDevice.
+  const githubLogin = async () => {
+    setGithubBusy(true); setGithubDevice(null); setErrors(e => ({ ...e, github: '' }));
+    const unsub = api.subscribe({ onGithubDevice: (d) => setGithubDevice(d) });
+    try {
+      await api.githubLogin();
+      setShowPat(false);
+      refetch();
+    } catch (err) {
+      setErrors(e => ({ ...e, github: err instanceof ApiError ? err.message : 'GitHub sign-in failed' }));
+    } finally {
+      unsub(); setGithubBusy(false); setGithubDevice(null);
+    }
+  };
+  const githubCancel = () => { api.githubLoginCancel().catch(() => {}); setGithubBusy(false); setGithubDevice(null); };
 
   const connect = async (id: ProviderId) => {
     const key = (keys[id] || '').trim();
@@ -514,6 +536,7 @@ function AccountsPane() {
           const c = connOf(p.id);
           const connected = !!c;
           const isOpenai = p.id === 'openai';
+          const isGithub = p.id === 'github';
           // Codex ChatGPT OAuth button — available whether or not already signed
           // in (first sign-in, re-auth, or switch from an API key to a login).
           const chatgptBtn = isOpenai ? (
@@ -549,11 +572,40 @@ function AccountsPane() {
               ) : (
                 <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                   {isOpenai && chatgptBtn}
-                  <input type="password" value={keys[p.id] || ''} placeholder={p.hint}
-                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setKeys(k => ({ ...k, [p.id]: e.target.value }))}
-                    onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') connect(p.id); }}
-                    style={{ flex: 1, minWidth: 0, maxWidth: 184, height: 32, border: '0.5px solid var(--separator-strong)', borderRadius: 8, outline: 'none', background: 'var(--fill-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', padding: '0 10px' }} />
-                  <button onClick={() => connect(p.id)} disabled={busy[p.id] || !(keys[p.id] || '').trim()} style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: busy[p.id] || !(keys[p.id] || '').trim() ? 0.5 : 1 }}>{busy[p.id] ? '…' : 'Connect'}</button>
+                  {isGithub ? (
+                    githubBusy ? (
+                      <>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>
+                          {githubDevice?.stage === 'downloading-cli' ? `Downloading GitHub CLI… ${githubDevice.pct}%`
+                            : githubDevice?.stage === 'code' ? <><CopyCode code={githubDevice.userCode} /> · authorize in your browser</>
+                              : 'Starting…'}
+                        </span>
+                        <button onClick={githubCancel} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Cancel</button>
+                      </>
+                    ) : (
+                      <>
+                        <button onClick={githubLogin} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', whiteSpace: 'nowrap' }}><Icon name="lock" size={12} /> Sign in with GitHub</button>
+                        <button onClick={() => setShowPat(s => !s)} className="ghost-btn" title="Advanced: paste a Personal Access Token instead" style={{ height: 32, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Token</button>
+                        {showPat && (
+                          <>
+                            <input type="password" value={keys[p.id] || ''} placeholder={p.hint}
+                              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setKeys(k => ({ ...k, [p.id]: e.target.value }))}
+                              onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') connect(p.id); }}
+                              style={{ flexBasis: '100%', minWidth: 0, height: 32, border: '0.5px solid var(--separator-strong)', borderRadius: 8, outline: 'none', background: 'var(--fill-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', padding: '0 10px' }} />
+                            <button onClick={() => connect(p.id)} disabled={busy[p.id] || !(keys[p.id] || '').trim()} style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: busy[p.id] || !(keys[p.id] || '').trim() ? 0.5 : 1 }}>{busy[p.id] ? '…' : 'Connect'}</button>
+                          </>
+                        )}
+                      </>
+                    )
+                  ) : (
+                    <>
+                      <input type="password" value={keys[p.id] || ''} placeholder={p.hint}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setKeys(k => ({ ...k, [p.id]: e.target.value }))}
+                        onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') connect(p.id); }}
+                        style={{ flex: 1, minWidth: 0, maxWidth: 184, height: 32, border: '0.5px solid var(--separator-strong)', borderRadius: 8, outline: 'none', background: 'var(--fill-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', padding: '0 10px' }} />
+                      <button onClick={() => connect(p.id)} disabled={busy[p.id] || !(keys[p.id] || '').trim()} style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: busy[p.id] || !(keys[p.id] || '').trim() ? 0.5 : 1 }}>{busy[p.id] ? '…' : 'Connect'}</button>
+                    </>
+                  )}
                 </span>
               )}
             </Row>

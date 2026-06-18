@@ -16,6 +16,17 @@ export function ghCliToken(): string | null {
   }
 }
 
+/** Read the token from a SPECIFIC `gh` binary (e.g. our managed download, which
+    isn't on PATH). Used right after an in-app `gh auth login`. */
+export function ghTokenFrom(ghPath: string): string | null {
+  try {
+    const out = execFileSync(ghPath, ['auth', 'token', '--hostname', 'github.com'], { encoding: 'utf8', timeout: 8000 }).trim();
+    return out.length > 20 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface GithubConnection {
   connected: boolean;
   login: string | null;

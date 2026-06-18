@@ -10,7 +10,7 @@
 
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, ApiError } from '../lib/api';
+import { api, ApiError, type GithubDevice } from '../lib/api';
 import {
   Icon,
   MaestroMark,
@@ -24,6 +24,7 @@ import {
   Row,
   StatusPill,
   EffortDial,
+  CopyCode,
 } from '../lib/ui';
 import { EngineSetup } from '../EngineSetup';
 
@@ -270,9 +271,14 @@ interface ProvidersStepProps {
   errors: Record<ProviderKey, string>;
   onKeyChange: (key: ProviderKey, val: string) => void;
   onConnect: (key: ProviderKey) => void;
+  githubDevice: GithubDevice | null;
+  onGithubLogin: () => void;
+  onGithubCancel: () => void;
+  showGithubPat: boolean;
+  onToggleGithubPat: () => void;
 }
 
-function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect }: ProvidersStepProps) {
+function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect, githubDevice, onGithubLogin, onGithubCancel, showGithubPat, onToggleGithubPat }: ProvidersStepProps) {
   const rows: { key: ProviderKey; name: string; meta: string; glyph: React.ReactNode; brand: string; hint: string }[] = [
     { key: 'anthropic', name: 'Anthropic', meta: 'Claude · coding & reasoning', glyph: <AnthropicGlyph size={24} />, brand: '#D97757', hint: 'sk-ant-…' },
     { key: 'openai', name: 'OpenAI', meta: 'GPT · media & vision', glyph: <OpenAIGlyph size={22} />, brand: 'var(--ink)', hint: 'sk-…' },
@@ -307,6 +313,36 @@ function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect }: Prov
               {connected ? (
                 <span style={{ flex: 1, display: 'flex', justifyContent: 'flex-end' }}>
                   <StatusPill state="connected" />
+                </span>
+              ) : r.key === 'github' ? (
+                // GitHub: OAuth sign-in (gh device flow) — no token to paste.
+                <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+                  {st === 'waiting' ? (
+                    <>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>
+                        {githubDevice?.stage === 'downloading-cli' ? `Getting GitHub CLI… ${githubDevice.pct}%`
+                          : githubDevice?.stage === 'code' ? <><CopyCode code={githubDevice.userCode} /> · authorize in browser</>
+                            : 'Starting…'}
+                      </span>
+                      <PillButton kind="plain" onClick={onGithubCancel} style={{ height: 34, padding: '0 12px', fontSize: 14 }}>Cancel</PillButton>
+                    </>
+                  ) : (
+                    <>
+                      <PillButton kind="primary" onClick={onGithubLogin} style={{ height: 34, padding: '0 14px', fontSize: 14 }}>
+                        {st === 'error' ? 'Try again' : 'Sign in with GitHub'}
+                      </PillButton>
+                      <PillButton kind="quiet" onClick={onToggleGithubPat} style={{ height: 34, padding: '0 10px', fontSize: 13 }}>Token</PillButton>
+                      {showGithubPat && (
+                        <>
+                          <input type="password" value={keys.github} placeholder={r.hint}
+                            onChange={(e: React.ChangeEvent<HTMLInputElement>) => onKeyChange('github', e.target.value)}
+                            onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter' && keys.github.trim()) onConnect('github'); }}
+                            style={{ flexBasis: '100%', minWidth: 0, height: 34, border: '0.5px solid var(--separator-strong)', borderRadius: 8, outline: 'none', background: 'var(--fill-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', padding: '0 10px' }} />
+                          <PillButton kind="plain" disabled={!keys.github.trim()} onClick={() => onConnect('github')} style={{ height: 34, padding: '0 14px', fontSize: 14, background: 'var(--fill-secondary)', color: 'var(--blue)' }}>Connect</PillButton>
+                        </>
+                      )}
+                    </>
+                  )}
                 </span>
               ) : (
                 <span style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' }}>
@@ -606,6 +642,32 @@ export default function Onboarding() {
     }
   };
 
+  // GitHub OAuth (gh device flow): no token to paste. Resolves once the browser
+  // authorization completes; live frames (gh download %, one-time code) arrive on
+  // onGithubDevice and surface on the GitHub row.
+  const [githubDevice, setGithubDevice] = React.useState<GithubDevice | null>(null);
+  const [showGithubPat, setShowGithubPat] = React.useState(false);
+  const githubLogin = async () => {
+    setProviders(p => ({ ...p, github: 'waiting' }));
+    setProviderErrors(e => ({ ...e, github: '' }));
+    setGithubDevice(null);
+    const unsub = api.subscribe({ onGithubDevice: setGithubDevice });
+    try {
+      await api.githubLogin();
+      setProviders(p => ({ ...p, github: 'connected' }));
+    } catch (err) {
+      setProviders(p => ({ ...p, github: 'error' }));
+      setProviderErrors(e => ({ ...e, github: err instanceof ApiError ? err.message : 'GitHub sign-in failed' }));
+    } finally {
+      unsub(); setGithubDevice(null);
+    }
+  };
+  const githubCancel = () => {
+    api.githubLoginCancel().catch(() => {});
+    setGithubDevice(null);
+    setProviders(p => ({ ...p, github: p.github === 'waiting' ? 'idle' : p.github }));
+  };
+
   const finish = () => {
     setPhase('finishing');
     try {
@@ -630,7 +692,8 @@ export default function Onboarding() {
   const steps: React.ReactNode[] = [
     <WelcomeStep />,
     <WorkspaceStep value={workspace} onChange={setWorkspace} />,
-    <ProvidersStep providers={providers} keys={keys} errors={providerErrors} onKeyChange={(k, v) => setKeys(s => ({ ...s, [k]: v }))} onConnect={connect} />,
+    <ProvidersStep providers={providers} keys={keys} errors={providerErrors} onKeyChange={(k, v) => setKeys(s => ({ ...s, [k]: v }))} onConnect={connect}
+      githubDevice={githubDevice} onGithubLogin={githubLogin} onGithubCancel={githubCancel} showGithubPat={showGithubPat} onToggleGithubPat={() => setShowGithubPat(s => !s)} />,
     <BudgetStep amount={budget} onAmount={setBudget} />,
     <PairStep secondsLeft={secondsLeft} onRefresh={() => setSecondsLeft(120)} />,
   ];

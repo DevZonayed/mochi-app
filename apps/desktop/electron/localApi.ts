@@ -3,6 +3,7 @@
    executes locally on this Mac against the local store + local engine. */
 
 import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem, FeedbackCategory, FeedbackContext, FeedbackSource, CustomMcpServer, McpKv } from './store.js';
+import { answerMessage, nextExtend } from './ask-question.js';
 import { resolveModelKey, buildModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
@@ -13,6 +14,7 @@ import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, structuredDiff } from './git.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
+import { ghState } from './gh-cli.js';
 import type { GitService } from './git-service.js';
 import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
@@ -654,6 +656,41 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('schedule', sched);
         return sched;
       }
+      // Answer a surfaced AskUserQuestion: cancel its auto-answer countdown and send
+      // the choice back as the model-recognized `[User answered AskUserQuestion]:`
+      // message, resuming the session so the agent continues with the answer.
+      case 'answerQuestion': {
+        const sessionId = String(p.sessionId ?? '');
+        const answer = typeof p.answer === 'string' ? p.answer.trim().slice(0, 8000) : '';
+        if (!sessionId) bad('sessionId required');
+        if (!answer) bad('answer required');
+        const session = store.getSession(sessionId);
+        if (!session) return bad('session not found', 404);
+        // Cancel any pending auto-answer countdown for this session.
+        for (const s of store.listSchedules()) {
+          if (s.kind === 'auto-answer' && s.sessionId === sessionId) { store.deleteSchedule(s.id); emit('schedule', { id: s.id, deleted: true }); }
+        }
+        const text = answerMessage(answer);
+        const job = store.createJob(session.projectId, text, text.slice(0, 60), undefined, session.id);
+        emit('job', job);
+        const opts = session.primary ? { engine: session.primary.engine, model: session.primary.model, reviewer: session.reviewer } : {};
+        void engine.run(job.id, opts).catch(() => { /* engine records failure on the job */ });
+        return job;
+      }
+      // Extend an AskUserQuestion countdown by the next escalating step (+5, +10, +15…).
+      // Once the next step would exceed the 30-min cap, pause it gracefully instead —
+      // the question then waits indefinitely for a manual reply.
+      case 'extendQuestion': {
+        const sessionId = String(p.sessionId ?? '');
+        const s = store.listSchedules().find(x => x.kind === 'auto-answer' && x.sessionId === sessionId && x.enabled && !x.paused);
+        if (!s) return bad('no pending question to extend', 404);
+        const out = nextExtend(s.armedAt ?? s.createdAt, s.extends ?? 0);
+        const updated = out.capped
+          ? store.updateSchedule(s.id, { paused: true })
+          : store.updateSchedule(s.id, { fireAt: out.deadline, extends: out.extends });
+        emit('schedule', updated);
+        return updated;
+      }
 
       // ── Skills / Templates ─────────────────────────────────────
       case 'listSkills': return store.listSkills();
@@ -823,6 +860,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!token) bad('gh CLI is not authenticated — run `gh auth login`, or paste a token', 400);
         return providers.connect('github', token as string);
       }
+      // OAuth sign-in via the GitHub CLI device flow (downloads gh on first use,
+      // opens the browser, stores the token). Long-lived; emits 'github-device'.
+      case 'githubLogin': return engine.githubLogin();
+      case 'githubLoginCancel': return engine.githubLoginCancel();
+      // Whether `gh` is already present (system or managed) — gates the UI hint.
+      case 'ghCliState': return ghState();
 
       // ── Media Studio (real fal generation) ─────────────────────
       case 'mediaRates': return media.rates();
