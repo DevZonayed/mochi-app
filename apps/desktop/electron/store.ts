@@ -157,8 +157,14 @@ export interface Schedule {
   /** A user-scheduled chat message (vs. a recurring schedule or wait-&-check):
       the composer intent is captured so it fires exactly as if sent by hand.
       'auto-continue' is the same one-shot, created automatically when a Claude run
-      is blocked by the usage limit — it fires "continue" into the chat at reset. */
-  kind?: 'message' | 'auto-continue'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean;
+      is blocked by the usage limit — it fires "continue" into the chat at reset.
+      'auto-answer' fires the recommended option into the chat when an unanswered
+      AskUserQuestion times out (the countdown the user sees on the question card). */
+  kind?: 'message' | 'auto-continue' | 'auto-answer'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean;
+  /** auto-answer only: when it was armed (base for the escalating-extend math),
+      how many times the user extended, and whether it's been paused past the cap
+      (paused = no auto-answer; the question waits indefinitely for a manual reply). */
+  armedAt?: number; extends?: number; paused?: boolean;
 }
 
 export type EngineId = 'claude' | 'codex';
@@ -873,7 +879,7 @@ export class Store {
 
   // ── Schedules ───────────────────────────────────────────────────────
   listSchedules(): Schedule[] { return [...this.data.schedules].sort((a, b) => a.time.localeCompare(b.time)); }
-  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean }): Schedule {
+  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue' | 'auto-answer'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean; armedAt?: number; extends?: number }): Schedule {
     const at = s.fireAt ? new Date(s.fireAt) : null;
     const time = s.time ?? (at ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}` : '');
     const rec: Schedule = {
@@ -888,9 +894,21 @@ export class Store {
       ...(s.browser ? { browser: true } : {}),
       ...(s.plan ? { plan: true } : {}),
       ...(s.goal ? { goal: true } : {}),
+      ...(s.armedAt ? { armedAt: s.armedAt } : {}),
+      ...(s.extends ? { extends: s.extends } : {}),
     };
     this.data.schedules.push(rec); this.save();
     return rec;
+  }
+  /** Patch a schedule's timing/extend state (used by the AskUserQuestion extend +
+      graceful-pause flow). Re-derives nextRun from fireAt. Returns the updated record. */
+  updateSchedule(scheduleId: string, patch: Partial<Pick<Schedule, 'fireAt' | 'extends' | 'paused' | 'enabled' | 'prompt'>>): Schedule {
+    const s = this.data.schedules.find(x => x.id === scheduleId);
+    if (!s) throw Object.assign(new Error('schedule not found'), { statusCode: 404 });
+    Object.assign(s, patch);
+    if (patch.fireAt !== undefined) s.nextRun = patch.fireAt ?? null;
+    this.save();
+    return s;
   }
   setScheduleEnabled(scheduleId: string, enabled: boolean): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);

@@ -118,6 +118,37 @@ export function StatusPill({ state }: { state: StatusPillState }) {
   );
 }
 
+/** A monospace code chip you click to copy (e.g. the GitHub device-flow code).
+    Flashes a green check + "Copied" for ~1.5s on success. */
+export function CopyCode({ code, title = 'Click to copy' }: { code: string; title?: string }) {
+  const [copied, setCopied] = React.useState(false);
+  const timer = React.useRef<number | undefined>(undefined);
+  React.useEffect(() => () => window.clearTimeout(timer.current), []);
+  const copy = () => {
+    const done = () => { setCopied(true); window.clearTimeout(timer.current); timer.current = window.setTimeout(() => setCopied(false), 1500); };
+    try {
+      if (navigator.clipboard?.writeText) { void navigator.clipboard.writeText(code).then(done).catch(() => {}); return; }
+    } catch { /* fall through to execCommand */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = code; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+      done();
+    } catch { /* clipboard unavailable */ }
+  };
+  return (
+    <button onClick={copy} title={copied ? 'Copied!' : title} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 6, height: 24, padding: '0 9px', borderRadius: 7, cursor: 'pointer',
+      border: `1px solid ${copied ? 'color-mix(in srgb, var(--green) 45%, transparent)' : 'var(--separator-strong)'}`,
+      background: copied ? 'color-mix(in srgb, var(--green) 12%, transparent)' : 'var(--fill-tertiary)',
+      color: 'var(--ink)', font: '700 13px/1 var(--font-mono)', letterSpacing: '0.08em', transition: 'background 120ms ease, border-color 120ms ease',
+    }}>
+      {code}
+      <Icon name="check" size={12} stroke={2.6} style={{ color: copied ? 'var(--green)' : 'var(--ink-tertiary)', opacity: copied ? 1 : 0.55 }} />
+    </button>
+  );
+}
+
 export interface SpinnerProps {
   size?: number;
   color?: string;

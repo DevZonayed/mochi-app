@@ -162,13 +162,19 @@ export interface Schedule {
   fireAt?: number;
   sessionId?: string;
   prompt?: string;
-  /** A user-scheduled chat message, or an auto-continue queued when a Claude run
-      is blocked by the usage limit (fires "continue" into the chat at reset). */
-  kind?: 'message' | 'auto-continue';
+  /** A user-scheduled chat message, an auto-continue queued when a Claude run is
+      blocked by the usage limit, or an auto-answer countdown for an unanswered
+      AskUserQuestion (fires the recommended option into the chat on timeout). */
+  kind?: 'message' | 'auto-continue' | 'auto-answer';
   effort?: Effort;
   browser?: boolean;
   plan?: boolean;
   goal?: boolean;
+  /** auto-answer only: armed time (base for the escalating-extend math), extend
+      count, and whether it's paused past the 30-min cap (waits for a manual reply). */
+  armedAt?: number;
+  extends?: number;
+  paused?: boolean;
 }
 export interface Skill {
   id: string;
@@ -249,6 +255,12 @@ export interface ModelGroup {
   models: ModelDescriptor[];
 }
 export interface DevicePresence { connected: boolean; streams: number; lastSeen: number | null; name: string | null }
+/** Whether the `gh` CLI is available (system or our managed download). */
+export interface GhState { installed: boolean; source: 'system' | 'managed' | 'none'; version: string | null; path: string | null; supported: boolean }
+/** Live frames during a GitHub OAuth sign-in: downloading gh, then the one-time code. */
+export type GithubDevice =
+  | { stage: 'downloading-cli'; pct: number }
+  | { stage: 'code'; userCode: string; verificationUri: string };
 export interface PairingInfo {
   token: string;
   relayUrl: string;
@@ -836,6 +848,15 @@ export const api = {
   scheduleMessage: (input: { projectId: string; sessionId?: string; prompt: string; fireAt: number; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean }) =>
     call<Schedule>('scheduleMessage', { ...input }, () =>
       req<Schedule>('/api/schedules/message', { method: 'POST', body: JSON.stringify(input) })),
+  // Answer a surfaced AskUserQuestion — cancels its countdown, resumes the session
+  // with the choice tagged so the model treats it as the direct answer.
+  answerQuestion: (input: { sessionId: string; answer: string }) =>
+    call<Job>('answerQuestion', { ...input }, () =>
+      req<Job>('/api/questions/answer', { method: 'POST', body: JSON.stringify(input) })),
+  // Extend an AskUserQuestion countdown by the next escalating step (or pause past the cap).
+  extendQuestion: (sessionId: string) =>
+    call<Schedule>('extendQuestion', { sessionId }, () =>
+      req<Schedule>('/api/questions/extend', { method: 'POST', body: JSON.stringify({ sessionId }) })),
   toggleSchedule: (id: string, enabled: boolean) =>
     call<{ ok: boolean }>('toggleSchedule', { id, enabled }, () =>
       req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) })),
@@ -938,6 +959,12 @@ export const api = {
   // GitHub connection + per-session PR lifecycle (desktop-only on the relay).
   githubStatus: () => call<GithubConnection>('githubStatus', {}, () => req<GithubConnection>('/api/github/status')),
   importGithubFromCli: () => call<ProviderConn>('importGithubFromCli', {}, () => req<ProviderConn>('/api/github/import-cli', { method: 'POST' })),
+  // OAuth sign-in via the gh CLI device flow (downloads gh on first use). Long-lived;
+  // resolves with the live connection once authorized. Listen on onGithubDevice for the
+  // one-time code + download progress.
+  githubLogin: () => call<GithubConnection>('githubLogin', {}, () => req<GithubConnection>('/api/github/login', { method: 'POST' })),
+  githubLoginCancel: () => call<{ ok: boolean }>('githubLoginCancel', {}, () => req<{ ok: boolean }>('/api/github/login/cancel', { method: 'POST' })),
+  ghCliState: () => call<GhState>('ghCliState', {}, () => req<GhState>('/api/github/cli-state')),
   getSessionGitStatus: (sessionId: string, withPr = true) =>
     call<SessionGitStatus>('getSessionGitStatus', { sessionId, withPr }, () => req<SessionGitStatus>(`/api/sessions/${sessionId}/git-status`)),
   refreshSessionGitStatus: (sessionId: string) =>
@@ -991,7 +1018,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: DevicePresence) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: DevicePresence) => void; onGithubDevice?: (d: GithubDevice) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as DevicePresence);
@@ -1009,6 +1036,7 @@ export const api = {
         if (name === 'feedback' && handlers.onFeedback) handlers.onFeedback(data as Feedback & { deleted?: boolean });
         if (name === 'git-status' && handlers.onGitStatus) handlers.onGitStatus(data as SessionGitStatus);
         if (name === 'schedule' && handlers.onSchedule) handlers.onSchedule(data as Schedule);
+        if (name === 'github-device' && handlers.onGithubDevice) handlers.onGithubDevice(data as GithubDevice);
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
@@ -1026,6 +1054,7 @@ export const api = {
     if (handlers.onFeedback) es.addEventListener('feedback', (e: MessageEvent) => { try { handlers.onFeedback!(JSON.parse(e.data) as Feedback & { deleted?: boolean }); } catch { /* ignore */ } });
     if (handlers.onGitStatus) es.addEventListener('git-status', (e: MessageEvent) => { try { handlers.onGitStatus!(JSON.parse(e.data) as SessionGitStatus); } catch { /* ignore */ } });
     if (handlers.onSchedule) es.addEventListener('schedule', (e: MessageEvent) => { try { handlers.onSchedule!(JSON.parse(e.data) as Schedule); } catch { /* ignore */ } });
+    if (handlers.onGithubDevice) es.addEventListener('github-device', (e: MessageEvent) => { try { handlers.onGithubDevice!(JSON.parse(e.data) as GithubDevice); } catch { /* ignore */ } });
     return () => es.close();
   },
   /** Convenience: subscribe to job updates only. */

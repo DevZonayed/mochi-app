@@ -30,6 +30,10 @@ import {
   type EngineState, type DownloadProgress,
 } from './engines.js';
 import { resetFromRateLimitInfo, isUsageLimitMessage, parseUsageLimitReset, type RateLimitInfo } from './limit-reset.js';
+import { parseAsk, timeoutAnswer, ASK_BASE_MS } from './ask-question.js';
+import { resolveGh, downloadGh } from './gh-cli.js';
+import { ghTokenFrom, githubConnectionStatus, type GithubConnection } from './github-auth.js';
+import { shell } from 'electron';
 
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
 // coding agent needs real headroom — 4 turns dies mid-`ls`.
@@ -51,6 +55,22 @@ const CONTINUE_PROMPT =
   'pick up from the last step and carry on to completion.';
 // How many times to silently retry a transient engine crash before failing the run.
 const ENGINE_MAX_RETRIES = 2;
+// AskUserQuestion handling. This app renders the tool as an interactive card with a
+// live countdown + a pre-marked recommended option; the headless SDK reports the call
+// as "dismissed"/"cancelled" (no interactive dialog handler), which the model would
+// otherwise narrate ("looks like it was dismissed — type your answer in chat"). This
+// directive reframes that so Claude asks, then waits quietly for the real answer (which
+// arrives as a "[User answered AskUserQuestion]:" message, or the recommended default).
+const ASK_DIRECTIVE =
+  `\n\n---\n\n[AskUserQuestion in this app] Your AskUserQuestion calls are shown to the user as an ` +
+  `interactive card with a live countdown and the recommended option pre-marked. The underlying SDK ` +
+  `frequently reports the call as "dismissed", "cancelled", or "rejected", or returns no answer — this ` +
+  `is EXPECTED and does NOT mean the user declined or that anything failed. The user's choice arrives ` +
+  `shortly afterward as a separate message beginning "[User answered AskUserQuestion]:", or their ` +
+  `recommended option is auto-selected if they're away. Therefore, after calling AskUserQuestion, do NOT ` +
+  `say the prompt was dismissed/cancelled, do NOT apologize, and do NOT ask the user to type their answers ` +
+  `in chat. End with at most one short line like "Pick an option above — I'll go with the recommended ` +
+  `default if you're busy," then stop and wait for their answer.`;
 // Design mode (the Design genre): steer the agent to produce ONE self-contained,
 // live-previewable HTML artifact — the OpenDesign "agent-native design" model, but
 // on Maestro's own engines + image-gen. Prepended to every turn of a design project.
@@ -1026,6 +1046,7 @@ export class LocalEngine {
   private running = new Map<string, { ac: AbortController; child?: ChildProcess }>();
   /** In-flight `codex login` child (browser OAuth), if any. */
   private codexLoginChild?: ChildProcess;
+  private githubLoginChild?: ChildProcess;
   /** In-flight engine binary downloads → their abort handle (one per engine). */
   private engineInstalls = new Map<EngineId, AbortController>();
 
@@ -1263,6 +1284,65 @@ export class LocalEngine {
     return { ok: true };
   }
 
+  /** Sign in to GitHub via OAuth using the `gh` CLI's device flow — no Personal
+      Access Token, no client secret. Downloads `gh` on first use (like the engines),
+      drives `gh auth login --web` (surfacing the one-time code + opening the browser),
+      then stores the resulting token in the same Keychain slot a PAT used. Emits
+      'github-device' frames so the UI can show the code / download progress. */
+  async githubLogin(): Promise<GithubConnection> {
+    if (!this.providers) throw Object.assign(new Error('GitHub sign-in unavailable.'), { statusCode: 500 });
+    let gh = resolveGh();
+    if (!gh) {
+      this.emit('github-device', { stage: 'downloading-cli', pct: 0 });
+      try {
+        const r = await downloadGh(undefined, (p) => { if (p.phase === 'download') this.emit('github-device', { stage: 'downloading-cli', pct: p.pct ?? 0 }); });
+        gh = r.path;
+      } catch (e) {
+        throw Object.assign(new Error(`Couldn't download the GitHub CLI: ${e instanceof Error ? e.message : String(e)}`), { statusCode: 502 });
+      }
+    }
+    const ghBin = gh;
+    // Supersede any pending login.
+    try { this.githubLoginChild?.kill('SIGTERM'); } catch { /* gone */ }
+    return new Promise<GithubConnection>((resolve, reject) => {
+      let buf = '', codeSent = false;
+      const child = spawn(ghBin, ['auth', 'login', '--hostname', 'github.com', '--git-protocol', 'https', '--web', '--scopes', 'repo,read:org,workflow'],
+        { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, GH_NO_UPDATE_NOTIFIER: '1' } });
+      this.githubLoginChild = child;
+      const timer = setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* gone */ } reject(Object.assign(new Error('GitHub sign-in timed out — no response after 5 minutes.'), { statusCode: 408 })); }, 5 * 60 * 1000);
+      const onData = (d: Buffer) => {
+        const s = String(d); buf += s;
+        // Surface the one-time code + open the device-authorization page, once.
+        if (!codeSent) {
+          const m = /one-time code:\s*([A-Z0-9]{4}-[A-Z0-9]{4})/i.exec(buf);
+          if (m) { codeSent = true; this.emit('github-device', { stage: 'code', userCode: m[1], verificationUri: 'https://github.com/login/device' }); void shell.openExternal('https://github.com/login/device').catch(() => {}); }
+        }
+        // gh pauses for input ("Press Enter to open…", git-credential question) — accept defaults.
+        if (/press enter|\(Y\/n\)|\(y\/N\)|\?\s/i.test(s)) { try { child.stdin?.write('\n'); } catch { /* closed */ } }
+      };
+      child.stdout?.on('data', onData);
+      child.stderr?.on('data', onData);
+      child.on('error', (e) => { clearTimeout(timer); this.githubLoginChild = undefined; reject(Object.assign(new Error(`GitHub sign-in failed to start: ${e.message}`), { statusCode: 500 })); });
+      child.on('close', (code) => {
+        clearTimeout(timer); this.githubLoginChild = undefined;
+        if (code !== 0) { reject(Object.assign(new Error(buf.trim().slice(-300) || `GitHub sign-in exited ${code ?? 'unknown'}.`), { statusCode: 500 })); return; }
+        const token = ghTokenFrom(ghBin);
+        if (!token) { reject(Object.assign(new Error('Signed in, but could not read the token back from gh.'), { statusCode: 500 })); return; }
+        this.providers!.connect('github', token)
+          .then(() => githubConnectionStatus(token))
+          .then(resolve)
+          .catch(reject);
+      });
+    });
+  }
+
+  /** Abort an in-flight GitHub sign-in. */
+  githubLoginCancel(): { ok: true } {
+    try { this.githubLoginChild?.kill('SIGTERM'); } catch { /* gone */ }
+    this.githubLoginChild = undefined;
+    return { ok: true };
+  }
+
   /** Remove stored Codex ChatGPT credentials. */
   codexLogout(): { ok: true } {
     const bin = resolveCodex();
@@ -1347,6 +1427,27 @@ export class LocalEngine {
       parts.push(block);
     }
     return parts.join('\n\n');
+  }
+
+  /** Arm an auto-answer countdown for an unanswered AskUserQuestion at the tail of a
+      finished chat turn. No-op unless the model genuinely ended ON the question (it
+      asked and didn't act afterwards) and nothing is already armed for this session. */
+  private armAskFollowup(sessionId: string, projectId: string, items: TranscriptItem[], effort: Effort): void {
+    let askIdx = -1;
+    for (let i = items.length - 1; i >= 0; i--) { if (items[i].kind === 'ask') { askIdx = i; break; } }
+    if (askIdx === -1) return;
+    // If the model used a tool AFTER asking, it proceeded on its own — don't auto-answer.
+    for (let i = askIdx + 1; i < items.length; i++) { if (items[i].kind === 'tool') return; }
+    const questions = parseAsk(items[askIdx].ask);
+    if (!questions.length) return;
+    if (this.store.listSchedules().some(s => s.kind === 'auto-answer' && s.sessionId === sessionId && s.enabled)) return;
+    const armedAt = Date.now();
+    const sched = this.store.createSchedule({
+      projectId, sessionId, kind: 'auto-answer',
+      title: 'Auto-answer question', prompt: timeoutAnswer(questions),
+      fireAt: armedAt + ASK_BASE_MS, armedAt, extends: 0, effort,
+    });
+    this.emit('schedule', sched);
   }
 
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
@@ -1476,6 +1577,10 @@ export class LocalEngine {
         prompt = `${base}${cur.input}`;
       }
       if (goalMode) prompt += GOAL_DIRECTIVE;
+      // AskUserQuestion in this app renders as an interactive countdown card; the SDK
+      // reports the call as "dismissed" headless, which the model otherwise narrates.
+      // Tell Claude that's expected so it waits gracefully instead of apologizing.
+      if (master === 'claude') prompt += ASK_DIRECTIVE;
       // Long-lived commands (dev servers/watchers) → run_in_background, not the blocking
       // foreground shell. Mounted on real Claude runs, and on Codex runs with a project
       // (the stdio bridge forwards the same tools there).
@@ -1827,6 +1932,13 @@ export class LocalEngine {
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
       this.emit('job', done);
+      // AskUserQuestion follow-up: if this chat turn ended on a question the user
+      // hasn't answered (the SDK auto-dismisses it headless), arm a countdown that
+      // auto-sends the recommended option after ASK_BASE_MS. The question card shows
+      // the countdown + an extend button; answering/extending reschedules or cancels.
+      if (isChat && !opts.plan && !ac.signal.aborted) {
+        try { this.armAskFollowup(session.id, job.projectId, allItems, effort); } catch { /* best-effort */ }
+      }
       // Continuum: append a terse checkpoint link for turns that changed files (or
       // any design turn) so the chain reflects real deltas, not chatter.
       if ((wroteFiles || project?.kind === 'design') && !opts.plan) {

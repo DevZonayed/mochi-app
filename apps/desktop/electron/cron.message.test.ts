@@ -124,4 +124,43 @@ describe('CronRunner — scheduled message', () => {
     expect(jobs[0].sessionId).toBe(session.id);
     expect(s.listSchedules()[0].enabled).toBe(false); // one-shot consumed
   });
+
+  it('fires a due auto-answer (AskUserQuestion timeout) into its session', () => {
+    const { s, project, session } = setup();
+    const { engine, run } = makeEngine();
+    const cron = new CronRunner(s, engine, vi.fn()) as unknown as { tick(): void };
+
+    s.createSchedule({
+      projectId: project.id, sessionId: session.id, kind: 'auto-answer',
+      title: 'Auto-answer question', prompt: '[User answered AskUserQuestion]: Use a recommended default',
+      fireAt: Date.now() - 1_000, armedAt: Date.now() - 5 * 60_000, extends: 0,
+    });
+
+    cron.tick();
+
+    expect(run).toHaveBeenCalledTimes(1);
+    const jobs = s.listJobs(project.id, session.id);
+    expect(jobs[0].input).toMatch(/^\[User answered AskUserQuestion\]:/);
+    expect(s.listSchedules()[0].enabled).toBe(false);
+  });
+
+  it('never fires a paused auto-answer (user extended past the cap)', () => {
+    const { s, project, session } = setup();
+    const { engine, run } = makeEngine();
+    const cron = new CronRunner(s, engine, vi.fn()) as unknown as { tick(): void };
+
+    const sched = s.createSchedule({
+      projectId: project.id, sessionId: session.id, kind: 'auto-answer',
+      title: 'Auto-answer question', prompt: '[User answered AskUserQuestion]: A',
+      fireAt: Date.now() - 1_000, armedAt: Date.now() - 60_000,
+    });
+    s.updateSchedule(sched.id, { paused: true });
+
+    cron.tick();
+
+    expect(run).not.toHaveBeenCalled();
+    expect(s.listJobs(project.id, session.id)).toHaveLength(0);
+    expect(s.listSchedules()[0].enabled).toBe(true);  // still pending a manual reply
+    expect(s.listSchedules()[0].paused).toBe(true);
+  });
 });
