@@ -274,7 +274,8 @@ export interface ModelGroup {
   reason: string;
   models: ModelDescriptor[];
 }
-export interface DevicePresence { connected: boolean; streams: number; lastSeen: number | null; name: string | null }
+/** One connected/recent remote device, reported by the relay's device registry. */
+export interface RemoteDevice { id: string; name: string | null; live: boolean; lastSeen: number }
 /** Whether the `gh` CLI is available (system or our managed download). */
 export interface GhState { installed: boolean; source: 'system' | 'managed' | 'none'; version: string | null; path: string | null; supported: boolean }
 /** Live frames during a GitHub OAuth sign-in: downloading gh, then the one-time code. */
@@ -284,8 +285,8 @@ export type GithubDevice =
 export interface PairingInfo {
   token: string;
   relayUrl: string;
-  /** Live remote-device presence (phone/web), reported by the relay. */
-  devices?: DevicePresence;
+  /** Live remote devices (phone/web), reported by the relay. */
+  devices?: RemoteDevice[];
 }
 export type AppEventKind =
   | 'job-done' | 'job-failed' | 'job-cancelled'
@@ -503,6 +504,67 @@ export function getRemoteToken(): string { return remoteToken; }
 export function setRemoteToken(token: string): void {
   remoteToken = token.trim();
   try { localStorage.setItem(TOKEN_KEY, remoteToken); } catch { /* storage unavailable */ }
+  freshDeviceId(); // (re-)pairing → new identity so a prior kick (old id revoked) doesn't carry over
+}
+
+/* ── Per-device identity (browser remotes) ─────────────────────────────
+   A stable id lets the Mac list + disconnect THIS device specifically. It's
+   re-minted on every (re-)pair so a kicked device returns as a fresh identity
+   (the relay revoked the OLD id, not the new one). */
+const DEVICE_ID_KEY = 'maestro.remote.deviceId';
+function mintId(): string {
+  try { if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID(); } catch { /* fall through */ }
+  return `dev-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+}
+function ensureDeviceId(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    let id = localStorage.getItem(DEVICE_ID_KEY);
+    if (!id) { id = mintId(); localStorage.setItem(DEVICE_ID_KEY, id); }
+    return id;
+  } catch { return ''; }
+}
+function freshDeviceId(): void {
+  try { localStorage.setItem(DEVICE_ID_KEY, mintId()); } catch { /* storage unavailable */ }
+}
+/** Best-effort readable label for this browser, from the UA (e.g. "Chrome · macOS"). */
+function deviceLabel(): string {
+  if (typeof navigator === 'undefined') return 'Web remote';
+  const ua = navigator.userAgent;
+  const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Chrome\//.test(ua) ? 'Chrome'
+    : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  const os = /iPhone|iPad/.test(ua) ? 'iOS' : /Android/.test(ua) ? 'Android' : /Mac OS X/.test(ua) ? 'macOS'
+    : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : '';
+  return os ? `${browser} · ${os}` : browser;
+}
+
+/* ── Re-pair gate (browser remotes) ────────────────────────────────────
+   When the relay rejects our token (this device was kicked, or the code was
+   regenerated), drop the token and tell the app to show a code-entry gate so the
+   user can reconnect — instead of failing silently forever. */
+let unpaired = !IS_LOCAL && !remoteToken;
+let unpairedReason = '';
+const unpairListeners = new Set<(reason: string) => void>();
+export function isUnpaired(): boolean { return unpaired; }
+export function unpairReason(): string { return unpairedReason; }
+export function onUnpaired(cb: (reason: string) => void): () => void {
+  unpairListeners.add(cb);
+  return () => { unpairListeners.delete(cb); };
+}
+function setUnpaired(state: boolean, reason: string): void {
+  unpaired = state;
+  unpairedReason = reason;
+  for (const cb of unpairListeners) { try { cb(reason); } catch { /* ignore */ } }
+}
+function handleUnauthorized(reason: string): void {
+  setRemoteToken(''); // also re-mints the device id for the next pair
+  setUnpaired(true, reason);
+}
+/** Re-pair from the gate: store + verify the new code, then resume. Throws (401) if it doesn't match. */
+export async function repair(code: string): Promise<void> {
+  setRemoteToken(code); // mints a fresh device id
+  await req('/api/engine-status');
+  setUnpaired(false, '');
 }
 
 const REGISTRY_ADMIN_TOKEN_KEY = 'maestro.registry.admin.token';
@@ -523,6 +585,8 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     headers: {
       ...(hasBody ? { 'content-type': 'application/json' } : {}),
       ...(remoteToken ? { authorization: `Bearer ${remoteToken}` } : {}),
+      // Per-device identity so the Mac can list + disconnect THIS browser specifically.
+      ...(!IS_LOCAL ? { 'x-maestro-device-id': ensureDeviceId(), 'x-maestro-device': deviceLabel() } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -534,6 +598,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* non-JSON error body */
     }
+    // A 401 on an /api/* call from a browser remote means our token/device was
+    // rejected (kicked, or the code was regenerated) → drop it + show the re-pair gate.
+    if (res.status === 401 && !IS_LOCAL && path.startsWith('/api/')) handleUnauthorized(detail);
     throw new ApiError(res.status, detail);
   }
   if (res.status === 204) return undefined as T;
@@ -1053,9 +1120,15 @@ export const api = {
     call<Roles>('setRoles', { ...patch }, () =>
       req<Roles>('/api/roles', { method: 'POST', body: JSON.stringify(patch) })),
 
-  // Pairing (desktop-only — the code remotes must enter)
+  // Pairing + device management (desktop-only)
   getPairing: () =>
     call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
+  /** Disconnect one remote device — closes its live streams and forces it to re-pair. */
+  kickDevice: (deviceId: string) =>
+    call<{ ok: boolean }>('kickDevice', { deviceId }, () => Promise.reject(new ApiError(403, 'Only the Mac can disconnect devices'))),
+  /** Regenerate the pairing code — unpairs every device. Returns the new code. */
+  regeneratePairingCode: () =>
+    call<{ token: string }>('regeneratePairingCode', {}, () => Promise.reject(new ApiError(403, 'Only the Mac can regenerate the code'))),
 
   /** Auto-update — desktop only; `undefined` in web/phone remotes (updates are
       about this Mac's own binary, so they're never exposed over the relay). */
@@ -1071,10 +1144,10 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: DevicePresence) => void; onGithubDevice?: (d: GithubDevice) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
-        if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as DevicePresence);
+        if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as RemoteDevice[]);
         if (name === 'engine-download' && handlers.onEngineDownload) handlers.onEngineDownload(data as EngineDownloadProgress);
         if (name === 'bg' && handlers.onBg) handlers.onBg(data as BgTask);
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
@@ -1093,7 +1166,8 @@ export const api = {
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
-    const es = new EventSource(API_BASE + '/api/stream' + (remoteToken ? `?token=${encodeURIComponent(remoteToken)}` : ''));
+    const sseQs = qp({ token: remoteToken || undefined, did: ensureDeviceId() || undefined, device: deviceLabel() });
+    const es = new EventSource(API_BASE + '/api/stream' + (sseQs ? `?${sseQs}` : ''));
     if (handlers.onBg) es.addEventListener('bg', (e: MessageEvent) => { try { handlers.onBg!(JSON.parse(e.data) as BgTask); } catch { /* ignore */ } });
     if (handlers.onJob) es.addEventListener('job', (e: MessageEvent) => { try { handlers.onJob!(JSON.parse(e.data) as Job); } catch { /* ignore */ } });
     if (handlers.onApproval) es.addEventListener('approval', (e: MessageEvent) => { try { handlers.onApproval!(JSON.parse(e.data) as Approval); } catch { /* ignore */ } });

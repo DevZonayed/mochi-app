@@ -5,6 +5,15 @@
 
 import WebSocket from 'ws';
 
+/** One connected/recent remote, as reported by the relay's device registry. */
+export interface RemoteDevice {
+  id: string;
+  name: string | null;
+  /** Has at least one open SSE stream right now. */
+  live: boolean;
+  lastSeen: number;
+}
+
 export interface RelayOptions {
   url: string;
   deckId: string;
@@ -13,8 +22,8 @@ export interface RelayOptions {
   accessToken: string;
   getSnapshot: () => unknown;
   onCommand: (method: string, params: Record<string, unknown>) => Promise<unknown>;
-  /** Relay reports remote-device presence (active SSE streams + last API hit). */
-  onRemote?: (info: { streams: number; lastSeen: number; name: string | null }) => void;
+  /** Relay reports the current remote-device list (presence + per-device identity). */
+  onRemote?: (devices: RemoteDevice[]) => void;
 }
 
 export class RelayClient {
@@ -62,10 +71,10 @@ export class RelayClient {
   }
 
   private async onMessage(raw: string): Promise<void> {
-    let m: { type?: string; id?: string; method?: string; params?: Record<string, unknown>; streams?: number; lastSeen?: number; name?: string | null };
+    let m: { type?: string; id?: string; method?: string; params?: Record<string, unknown>; devices?: RemoteDevice[] };
     try { m = JSON.parse(raw) as typeof m; } catch { return; }
     if (m.type === 'ping') { this.send({ type: 'pong' }); return; }
-    if (m.type === 'remote') { this.opts.onRemote?.({ streams: m.streams ?? 0, lastSeen: m.lastSeen ?? Date.now(), name: m.name ?? null }); return; }
+    if (m.type === 'remote') { this.opts.onRemote?.(Array.isArray(m.devices) ? m.devices : []); return; }
     if (m.type === 'cmd' && m.id && m.method) {
       try {
         const result = await this.opts.onCommand(m.method, m.params ?? {});
@@ -84,6 +93,18 @@ export class RelayClient {
 
   event(name: string, data: unknown): void {
     this.send({ type: 'event', name, data });
+  }
+
+  /** Disconnect one remote device — the relay closes its streams and revokes its id. */
+  kick(deviceId: string): void {
+    this.send({ type: 'kick', deviceId });
+  }
+
+  /** Rotate the pairing token: drop the socket so we re-`hello` with the new token.
+     The relay treats a changed token as a new pairing epoch (all remotes must re-pair). */
+  updateToken(accessToken: string): void {
+    this.opts.accessToken = accessToken;
+    try { this.ws?.close(); } catch { /* 'close' schedules a reconnect with the new token */ }
   }
 
   private send(obj: unknown): void {

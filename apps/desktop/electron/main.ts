@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell, protocol, Notification } fr
 import path from 'node:path';
 import { existsSync, realpathSync, mkdirSync, promises as fsp } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { Store } from './store.js';
+import { Store, newPairingToken } from './store.js';
 import { LocalEngine } from './engine.js';
 import { MediaEngine } from './media.js';
 import { ResearchEngine } from './research.js';
@@ -382,7 +382,7 @@ app.whenReady().then(() => {
       // *ProjectMemory + snapshotProject methods read/write project files and run
       // git on the Mac — none may answer over the relay (phone/web are read-mostly
       // remote controls, not local-execution surfaces).
-      if (method === 'getPairing' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject' || method === 'archiveSessionWorktree' || method === 'importGithubFromCli' || method === 'getSessionGitStatus' || method === 'refreshSessionGitStatus' || method === 'pushSession' || method === 'createSessionPR' || method === 'mergeSessionPR' || method === 'resolveSession'
+      if (method === 'getPairing' || method === 'kickDevice' || method === 'regeneratePairingCode' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject' || method === 'archiveSessionWorktree' || method === 'importGithubFromCli' || method === 'getSessionGitStatus' || method === 'refreshSessionGitStatus' || method === 'pushSession' || method === 'createSessionPR' || method === 'mergeSessionPR' || method === 'resolveSession'
         || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment'
         || method === 'extensionStatus' || method === 'extensionSetActive'
         || method === 'copyDesignToCode'
@@ -407,7 +407,7 @@ app.whenReady().then(() => {
     },
     // The relay reports remote-device presence → mirror it into the store and tell
     // the desktop UI (Devices pane + pairing window). Desktop-only; never relayed.
-    onRemote: (info) => { emit('devices', store.setRemotePresence(info), { desktopOnly: true }); },
+    onRemote: (devices) => { emit('devices', store.setRemoteDevices(devices), { desktopOnly: true }); },
   });
   relay.start();
 
@@ -423,6 +423,22 @@ app.whenReady().then(() => {
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {
+      // Device management + update.* control THIS Mac (its relay client / binary)
+      // and are handled locally — never via the shared dispatch (which the relay
+      // also calls), so a remote can't disconnect devices or rotate the code.
+      if (method === 'kickDevice') {
+        const deviceId = String((params as { deviceId?: unknown })?.deviceId ?? '').trim();
+        if (!deviceId) throw Object.assign(new Error('deviceId required'), { statusCode: 400 });
+        relay?.kick(deviceId);
+        return { ok: true, data: { ok: true } };
+      }
+      if (method === 'regeneratePairingCode') {
+        const token = newPairingToken();
+        store.setAccessToken(token);
+        relay?.updateToken(token);
+        emit('devices', store.setRemoteDevices([]), { desktopOnly: true });
+        return { ok: true, data: { token } };
+      }
       // update.* controls this Mac's binary → handled locally, never via the
       // shared dispatch (which the relay also calls).
       // Local IPC = the desktop app: stamp feedback provenance authoritatively.

@@ -2,6 +2,7 @@ import React from 'react';
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { UpdateBanner } from './lib/UpdateBanner';
 import { NotificationCenter } from './lib/notify';
+import { RemotePairGate } from './lib/RemotePairGate';
 
 /* Real application entry. First run → Onboarding (creates the workspace, sets
    the budget); afterwards the app opens straight in the Workspace. There is no
@@ -45,6 +46,7 @@ function entryPath(): string {
 export function App() {
   return (
     <HashRouter>
+      <RemotePairGate>
       <React.Suspense fallback={null}>
         <Routes>
           <Route path="/" element={<Navigate to={entryPath()} replace />} />
@@ -76,6 +78,7 @@ export function App() {
       </React.Suspense>
       <UpdateBanner />
       <NotificationCenter />
+      </RemotePairGate>
     </HashRouter>
   );
 }
