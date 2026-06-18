@@ -170,6 +170,15 @@ export interface Schedule {
       how many times the user extended, and whether it's been paused past the cap
       (paused = no auto-answer; the question waits indefinitely for a manual reply). */
   armedAt?: number; extends?: number; paused?: boolean;
+  /** Interval cadence: fire every N minutes from `anchorAt` (defaults to createdAt).
+      When set (>0) the schedule is interval-mode and ignores time/cadence. */
+  everyMinutes?: number; anchorAt?: number;
+  /** Clock-mode catch-up: if a daily/weekly slot was missed while the Mac was
+      asleep, fire it once when next awake, provided now <= dueTime + window.
+      catchUpWindowMs defaults to "rest of the local day". lastDueAt is the
+      intended slot timestamp of the last fire (dedupe key); lastFireLate marks
+      that the last fire was a catch-up (drives the "ran late" notice). */
+  catchUp?: boolean; catchUpWindowMs?: number; lastDueAt?: number; lastFireLate?: boolean;
 }
 
 export type EngineId = 'claude' | 'codex';
@@ -995,12 +1004,12 @@ export class Store {
 
   // ── Schedules ───────────────────────────────────────────────────────
   listSchedules(): Schedule[] { return [...this.data.schedules].sort((a, b) => a.time.localeCompare(b.time)); }
-  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue' | 'auto-answer' | 'whatsapp-analyze'; chatId?: string; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean; armedAt?: number; extends?: number }): Schedule {
+  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue' | 'auto-answer' | 'whatsapp-analyze'; chatId?: string; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean; armedAt?: number; extends?: number; everyMinutes?: number; anchorAt?: number; catchUp?: boolean; catchUpWindowMs?: number }): Schedule {
     const at = s.fireAt ? new Date(s.fireAt) : null;
     const time = s.time ?? (at ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}` : '');
     const rec: Schedule = {
       id: id(), projectId: s.projectId ?? null, title: s.title, time,
-      cadence: s.fireAt ? 'once' : (s.cadence ?? 'daily'),
+      cadence: s.fireAt ? 'once' : (s.everyMinutes ? 'interval' : (s.cadence ?? 'daily')),
       enabled: true, nextRun: s.fireAt ?? null, createdAt: now(),
       ...(s.fireAt ? { fireAt: s.fireAt } : {}),
       ...(s.sessionId ? { sessionId: s.sessionId } : {}),
@@ -1013,13 +1022,20 @@ export class Store {
       ...(s.goal ? { goal: true } : {}),
       ...(s.armedAt ? { armedAt: s.armedAt } : {}),
       ...(s.extends ? { extends: s.extends } : {}),
+      ...(s.everyMinutes ? { everyMinutes: s.everyMinutes } : {}),
+      ...(s.anchorAt ? { anchorAt: s.anchorAt } : {}),
+      ...(s.catchUp ? { catchUp: true } : {}),
+      ...(s.catchUpWindowMs ? { catchUpWindowMs: s.catchUpWindowMs } : {}),
     };
     this.data.schedules.push(rec); this.save();
     return rec;
   }
   /** Patch a schedule's timing/extend state (used by the AskUserQuestion extend +
       graceful-pause flow). Re-derives nextRun from fireAt. Returns the updated record. */
-  updateSchedule(scheduleId: string, patch: Partial<Pick<Schedule, 'fireAt' | 'extends' | 'paused' | 'enabled' | 'prompt'>>): Schedule {
+  updateSchedule(scheduleId: string, patch: Partial<Pick<Schedule,
+    'fireAt' | 'extends' | 'paused' | 'enabled' | 'prompt' | 'title' | 'time' | 'cadence'
+    | 'everyMinutes' | 'anchorAt' | 'catchUp' | 'catchUpWindowMs'
+    | 'effort' | 'browser' | 'plan' | 'goal' | 'sessionId' | 'projectId'>>): Schedule {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (!s) throw Object.assign(new Error('schedule not found'), { statusCode: 404 });
     Object.assign(s, patch);
@@ -1031,9 +1047,14 @@ export class Store {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (s) { s.enabled = enabled; this.save(); }
   }
-  markScheduleRun(scheduleId: string, ts: number, nextRun: number | null): void {
+  markScheduleRun(scheduleId: string, ts: number, nextRun: number | null, opts?: { dueAt?: number; late?: boolean }): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);
-    if (s) { s.lastRun = ts; s.nextRun = nextRun; this.save(); }
+    if (s) {
+      s.lastRun = ts; s.nextRun = nextRun;
+      if (opts?.dueAt !== undefined) s.lastDueAt = opts.dueAt;
+      s.lastFireLate = !!opts?.late;
+      this.save();
+    }
   }
   setScheduleNextRun(scheduleId: string, nextRun: number | null): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);

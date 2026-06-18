@@ -158,6 +158,7 @@ export interface Schedule {
   cadence: string;
   enabled: boolean;
   nextRun: number | null;
+  lastRun?: number | null;
   createdAt: number;
   fireAt?: number;
   sessionId?: string;
@@ -175,6 +176,12 @@ export interface Schedule {
   armedAt?: number;
   extends?: number;
   paused?: boolean;
+  /** Interval cadence (every N minutes) — when set, fires on an interval, not a clock time. */
+  everyMinutes?: number;
+  /** Clock-mode catch-up: fire a missed daily/weekly slot later the same day. */
+  catchUp?: boolean;
+  /** True when the most recent fire was a late catch-up (drives the "ran late" notice). */
+  lastFireLate?: boolean;
 }
 export interface Skill {
   id: string;
@@ -865,7 +872,7 @@ export const api = {
 
   // Schedules
   listSchedules: () => call<Schedule[]>('listSchedules', {}, () => req<Schedule[]>('/api/schedules')),
-  createSchedule: (input: { title: string; projectId?: string; time?: string; cadence?: string }) =>
+  createSchedule: (input: { title: string; projectId?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; prompt?: string; sessionId?: string; effort?: Effort; browser?: boolean }) =>
     call<Schedule>('createSchedule', { ...input }, () =>
       req<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(input) })),
   // Wait-&-check: poke a chat with a one-shot follow-up after delayMs.
@@ -889,6 +896,9 @@ export const api = {
   toggleSchedule: (id: string, enabled: boolean) =>
     call<{ ok: boolean }>('toggleSchedule', { id, enabled }, () =>
       req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) })),
+  updateSchedule: (id: string, patch: { title?: string; prompt?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; enabled?: boolean; effort?: Effort; browser?: boolean; sessionId?: string; projectId?: string }) =>
+    call<Schedule>('updateSchedule', { id, ...patch }, () =>
+      req<Schedule>(`/api/schedules/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) })),
   deleteSchedule: (id: string) =>
     call<{ ok: boolean }>('deleteSchedule', { id }, () => req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 
