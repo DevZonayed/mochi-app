@@ -101,6 +101,8 @@ export interface Schedule {
   nextRun: number | null; lastRun?: number | null; createdAt: number;
   /** One-shot queued message: deliver `prompt` into `sessionId` at `fireAt`. */
   fireAt?: number; sessionId?: string; prompt?: string;
+  /** Recurring: interval cadence (every N min) and catch-up for a missed daily slot. */
+  everyMinutes?: number; catchUp?: boolean; lastFireLate?: boolean;
 }
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
@@ -286,9 +288,12 @@ export const api = {
 
   listSchedules: () => req<Schedule[]>('/api/schedules'),
   toggleSchedule: (id: string, enabled: boolean) => req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) }),
-  /** Create a schedule. With fireAt+sessionId+prompt it's a one-shot queued message. */
-  createSchedule: (input: { title: string; projectId?: string | null; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string }) =>
+  /** Create a schedule. With fireAt+sessionId+prompt it's a one-shot queued message;
+      with everyMinutes or time+cadence it's a recurring schedule. */
+  createSchedule: (input: { title: string; projectId?: string | null; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; everyMinutes?: number; catchUp?: boolean }) =>
     req<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(input) }),
+  updateSchedule: (id: string, patch: { title?: string; prompt?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; enabled?: boolean; sessionId?: string; projectId?: string }) =>
+    req<Schedule>(`/api/schedules/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   deleteSchedule: (id: string) => req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/delete`, { method: 'POST' }),
 
   listSkills: () => req<Skill[]>('/api/skills'),
@@ -339,14 +344,14 @@ export const api = {
 /** Live host events the relay fans out over SSE (the same names the Mac emits). */
 export type LiveEventName =
   | 'job' | 'session' | 'approval' | 'asset' | 'comms' | 'briefs'
-  | 'schedule' | 'git-status' | 'extension' | 'host' | 'hello';
+  | 'schedule' | 'schedule-late' | 'git-status' | 'extension' | 'host' | 'hello';
 
 /** Open the relay's SSE stream (real-time, no polling) and invoke `onEvent(name,
     data)` for each host event. Returns a disposer. react-native-sse is an XHR-based
     EventSource that works in Expo Go (RN has no native EventSource) and reconnects
     automatically. The pairing token rides as a Bearer header. */
 export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => void): () => void {
-  const NAMES: LiveEventName[] = ['job', 'session', 'approval', 'asset', 'comms', 'briefs', 'schedule', 'git-status', 'extension', 'host', 'hello'];
+  const NAMES: LiveEventName[] = ['job', 'session', 'approval', 'asset', 'comms', 'briefs', 'schedule', 'schedule-late', 'git-status', 'extension', 'host', 'hello'];
   const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME), {
     headers: pairToken ? { Authorization: `Bearer ${pairToken}` } : undefined,
     // Keep the long-lived stream open; reconnect a few seconds after any drop.

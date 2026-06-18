@@ -25,6 +25,8 @@ import { ensureSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
+import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
+import type { CronRunner } from './cron.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import type { Providers } from './providers.js';
 import {
@@ -456,6 +458,7 @@ async function runClaude(
   bgCtx?: BgCtx,
   browserCtx?: BrowserCtx,
   customMcp?: { servers: Record<string, ClaudeMcpConfig>; allowedTools: string[] },
+  scheduleCtx?: ScheduleCtx,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -489,7 +492,7 @@ async function runClaude(
     ].filter(Boolean).join(', ');
     return `- ${s.id} — ${s.name}: ${s.description || '(no description)'}${bits ? ` [${bits}]` : ''}`;
   };
-  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx) && !plan)
+  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
@@ -640,6 +643,68 @@ async function runClaude(
               { ref: z.string().describe('CSS selector for the input.'), text: z.string().describe('The text to type.'), submit: z.boolean().optional().describe('Press Enter after typing (e.g. to run a search).') },
               wrap(async (a: { ref: string; text: string; submit?: boolean }) => { await browserCtx.call('type', { ref: a.ref, text: a.text, submit: !!a.submit }); return txt(`Typed into ${a.ref}${a.submit ? ' and submitted' : ''}. Use browser_snapshot/browser_read to see the result.`); })),
           ] : []),
+          ...(scheduleCtx ? [
+            tool('schedule_list',
+              'List recurring/scheduled tasks. Use to see what is already scheduled before creating or editing. Optionally filter by project.',
+              { projectId: z.string().optional().describe('Only schedules for this project id.') },
+              wrap(async (a: { projectId?: string }) => {
+                const rows = scheduleCtx.list({ projectId: a.projectId });
+                if (!rows.length) return txt('No schedules yet.');
+                return txt(rows.map(r => `- ${r.id} — "${r.title}" [${r.enabled ? 'on' : 'off'}] ${r.recurrence}${r.projectId ? ` · project ${r.projectId}` : ''}${r.sessionId ? ` · session ${r.sessionId}` : ''}${r.lastFireLate ? ' · last run was LATE' : ''}\n    prompt: ${r.prompt.slice(0, 160)}`).join('\n'));
+              })),
+            tool('schedule_create',
+              'Create a recurring or interval schedule that fires a PROMPT into a project/session as a real job (it runs with that project\'s memory + tools). Use for any "every N hours / every day at TIME / each morning" automation. For "every 2 hours" pass everyMinutes=120; for "every day at 9am" pass time="09:00", cadence="daily". Set catchUp=true so a missed run (Mac asleep) still fires later that day. Discover targets with projects_list/sessions_list first.',
+              { projectId: z.string().optional().describe('Project to run in (use projects_list).'),
+                sessionId: z.string().optional().describe('Chat session to run in (use sessions_list). Inherits its engine/model + memory.'),
+                title: z.string().describe('Short label, e.g. "WhatsApp morning summary".'),
+                prompt: z.string().describe('What the run should DO, e.g. "Pull ~50 WhatsApp messages via the comms MCP, summarize, and send to my private chat."'),
+                everyMinutes: z.number().optional().describe('Interval cadence in minutes (120 = every 2h). Omit for a clock-time schedule.'),
+                time: z.string().optional().describe('HH:MM 24h clock time for daily/weekly cadence.'),
+                cadence: z.string().optional().describe('"daily" | "weekdays" | "weekend" | a day list like "Mon, Wed, Fri". Default daily.'),
+                effort: z.enum(['fast', 'balanced', 'deep', 'max']).optional(),
+                browser: z.boolean().optional().describe('Run with the real-Chrome browser tools enabled.'),
+                catchUp: z.boolean().optional().describe('If a clock-time run is missed, fire it once later the same day.') },
+              wrap(async (a: { projectId?: string; sessionId?: string; title: string; prompt: string; everyMinutes?: number; time?: string; cadence?: string; effort?: Effort; browser?: boolean; catchUp?: boolean }) => {
+                const rec = scheduleCtx.create({ projectId: a.projectId ?? null, sessionId: a.sessionId, title: a.title, prompt: a.prompt,
+                  recurrence: { everyMinutes: a.everyMinutes, time: a.time, cadence: a.cadence }, effort: a.effort, browser: a.browser, catchUp: a.catchUp });
+                return txt(`Created schedule ${rec.id} "${rec.title}". It will fire its prompt as a job on schedule. Use schedule_run_now("${rec.id}") to test it immediately.`);
+              })),
+            tool('schedule_update',
+              'Edit an existing schedule (title, prompt, timing, target, on/off). Pass only the fields to change. Get ids from schedule_list.',
+              { id: z.string(), title: z.string().optional(), prompt: z.string().optional(),
+                everyMinutes: z.number().optional(), time: z.string().optional(), cadence: z.string().optional(),
+                effort: z.enum(['fast', 'balanced', 'deep', 'max']).optional(), browser: z.boolean().optional(),
+                catchUp: z.boolean().optional(), enabled: z.boolean().optional(),
+                sessionId: z.string().optional(), projectId: z.string().optional() },
+              wrap(async (a: { id: string } & Record<string, unknown>) => {
+                const { id, ...patch } = a;
+                const rec = scheduleCtx.update(id, patch as Parameters<ScheduleCtx['update']>[1]);
+                return txt(`Updated schedule ${rec.id} "${rec.title}".`);
+              })),
+            tool('schedule_delete', 'Delete a schedule permanently. Get the id from schedule_list.',
+              { id: z.string() },
+              wrap(async (a: { id: string }) => { scheduleCtx.del(a.id); return txt(`Deleted schedule ${a.id}.`); })),
+            tool('schedule_toggle', 'Enable or disable a schedule without deleting it.',
+              { id: z.string(), enabled: z.boolean() },
+              wrap(async (a: { id: string; enabled: boolean }) => { scheduleCtx.toggle(a.id, a.enabled); return txt(`Schedule ${a.id} is now ${a.enabled ? 'enabled' : 'disabled'}.`); })),
+            tool('schedule_run_now', 'Fire a schedule immediately (to test it), in addition to its normal timing.',
+              { id: z.string() },
+              wrap(async (a: { id: string }) => txt(scheduleCtx.runNow(a.id) ? `Fired schedule ${a.id} now — check the session for the new job.` : `No schedule ${a.id}.`))),
+            tool('projects_list', 'List the user\'s projects (id, name, whether it has saved memory, session count). Use to pick where a schedule should run.',
+              {},
+              wrap(async () => {
+                const rows = scheduleCtx.listProjects();
+                if (!rows.length) return txt('No projects.');
+                return txt(rows.map(p => `- ${p.id} — ${p.name}${p.hasMemory ? ' [has memory]' : ''} · ${p.sessionCount} session(s)`).join('\n'));
+              })),
+            tool('sessions_list', 'List chat sessions in a project (id, title). Use to target a schedule at a specific chat.',
+              { projectId: z.string() },
+              wrap(async (a: { projectId: string }) => {
+                const rows = scheduleCtx.listSessions(a.projectId);
+                if (!rows.length) return txt('No sessions in that project.');
+                return txt(rows.map(s => `- ${s.id} — ${s.title}`).join('\n'));
+              })),
+          ] : []),
         ],
       })
     : null;
@@ -648,6 +713,7 @@ async function runClaude(
     ...(skillsCtx ? ['search_skills', 'get_skill', 'download_skill', 'add_skill_to_project', 'list_project_skills', 'remove_project_skill'] : []),
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
     ...(browserCtx ? ['browser_status', 'browser_navigate', 'browser_snapshot', 'browser_read', 'browser_links', 'browser_click', 'browser_type'] : []),
+    ...(scheduleCtx ? ['schedule_list', 'schedule_create', 'schedule_update', 'schedule_delete', 'schedule_toggle', 'schedule_run_now', 'projects_list', 'sessions_list'] : []),
   ].map(n => `mcp__maestro__${n}`);
   // Merge the operator's custom MCP servers (Settings → MCP servers) alongside the
   // in-process `maestro` server. Each enabled server's tools are auto-allowed via a
@@ -1078,6 +1144,10 @@ export class LocalEngine {
      generate_image tool; publishing registers codex-produced PNGs as Assets. */
   private imageGen?: ImageGenFn;
   setImageGen(fn: ImageGenFn) { this.imageGen = fn; }
+  // The cron runner is created after the engine in main.ts; injected so the agent's
+  // schedule_* tools can manage + fire schedules through the same runner.
+  private cron?: CronRunner;
+  setCron(c: CronRunner) { this.cron = c; }
   /** The browser-extension control channel (ExtensionBridge), injected from main.ts.
       A getter (not the instance) so a late/missing bridge is harmless — browser tools
       simply report "no browser connected" until a Chrome profile pairs + activates. */
@@ -1816,6 +1886,9 @@ export class LocalEngine {
         profile: () => bridge.activeProfile(),
         call: (type, params, timeoutMs) => bridge.request(type, params ?? {}, timeoutMs),
       } : undefined;
+      // Schedule capability: let the agent inspect + manage recurring/scheduled
+      // tasks and discover projects/sessions to target. Off in plan mode.
+      const scheduleCtx: ScheduleCtx | undefined = (this.cron && !opts.plan) ? makeScheduleCtx(this.store, this.cron) : undefined;
       // Browser mode (composer toggle): the maestro MCP tools are deferred, so an
       // explicit directive ensures the agent loads + uses the real-Chrome tools.
       if (opts.browser && browserCtx) prompt += BROWSER_DIRECTIVE;
@@ -1824,7 +1897,7 @@ export class LocalEngine {
       const claudeCustomMcp = buildClaudeCustomMcp(enabledMcpServers, process.env);
       const codexCustomFrags = buildCodexCustomMcp(enabledMcpServers, process.env).fragments;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp)
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx)
         : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the

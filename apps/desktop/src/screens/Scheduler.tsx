@@ -12,7 +12,7 @@ import React from 'react';
 import { Icon, type IconName } from '../lib/icons';
 import { Switch } from '../lib/ui';
 import { AppShell } from '../lib/appShell';
-import { api, type Schedule, type Project } from '../lib/api';
+import { api, type Schedule, type Project, type ChatSession } from '../lib/api';
 
 // page-specific CSS lifted from Scheduler.html <style> (hover/animation hooks)
 const SCHEDULER_CSS = `
@@ -54,8 +54,9 @@ const WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as cons
 
 interface WeekDay { d: string; n: number }
 
-// The real current week (Mon..Sun containing today) + which column is today.
-function buildWeek(): { weekDays: WeekDay[]; todayIdx: number } {
+// The real current week (Mon..Sun containing today) + which column is today +
+// the week's Monday (so one-shot schedules can be placed on their real day).
+function buildWeek(): { weekDays: WeekDay[]; todayIdx: number; monday: Date } {
   const now = new Date();
   const todayIdx = (now.getDay() + 6) % 7; // Mon=0 .. Sun=6
   const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - todayIdx);
@@ -63,7 +64,14 @@ function buildWeek(): { weekDays: WeekDay[]; todayIdx: number } {
     const dt = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + i);
     return { d, n: dt.getDate() };
   });
-  return { weekDays, todayIdx };
+  return { weekDays, todayIdx, monday };
+}
+
+/* Auto-answer / auto-continue schedules are system-managed, transient one-shots
+   (a question countdown, a usage-limit resume) — they belong to the chat, not the
+   user's schedule calendar. The Scheduler only shows schedules the user owns. */
+function isUserSchedule(s: Schedule): boolean {
+  return s.kind !== 'auto-answer' && s.kind !== 'auto-continue';
 }
 
 // 'HH:MM' → hour as a float (9.5 = 09:30); null when empty/unparseable.
@@ -90,6 +98,10 @@ function cadenceColumns(s: Schedule): number[] {
     const d = Object.keys(map).filter(k => c.includes(k)).map(k => map[k]);
     days = d.length ? new Set(d) : null;
   }
+  // One-shot ('once') and interval schedules have no weekday pattern — never
+  // splatter them across the week (that was the calendar-mess bug). One-shots
+  // are placed on their real fireAt day; intervals aren't on the clock grid.
+  if (c === 'once' || c === 'interval') return [];
   const cols: number[] = [];
   for (let col = 0; col < 7; col++) { if (!days || days.has((col + 1) % 7)) cols.push(col); }
   return cols;
@@ -98,9 +110,22 @@ function cadenceColumns(s: Schedule): number[] {
 // One placed chip: a live schedule on a specific day-column at a specific hour.
 interface CalOccurrence { schedule: Schedule; col: number; hour: number }
 
-function expandSchedules(schedules: Schedule[]): CalOccurrence[] {
+function expandSchedules(schedules: Schedule[], monday: Date): CalOccurrence[] {
   const out: CalOccurrence[] = [];
+  const weekStart = monday.getTime();
+  const weekEnd = weekStart + 7 * 24 * 60 * 60_000;
   schedules.forEach(s => {
+    if (!isUserSchedule(s)) return;          // hide system schedules from the calendar
+    if (s.everyMinutes && s.everyMinutes > 0) return; // interval → shown in the list, not the clock grid
+    // One-shot: place on its actual day, and only if it falls in the visible week.
+    if (s.fireAt) {
+      if (s.lastRun || !s.enabled) return; // already fired / cancelled — not upcoming
+      if (s.fireAt < weekStart || s.fireAt >= weekEnd) return;
+      const d = new Date(s.fireAt);
+      const col = (d.getDay() + 6) % 7; // Mon=0..Sun=6
+      out.push({ schedule: s, col, hour: d.getHours() + d.getMinutes() / 60 });
+      return;
+    }
     const hour = timeToHour(s.time);
     if (hour == null) return; // on-demand / no time → not placeable on the grid
     cadenceColumns(s).forEach(col => out.push({ schedule: s, col, hour }));
@@ -126,8 +151,8 @@ function fmtTime(t: number): string {
 interface CalendarViewProps { schedules: Schedule[]; projMeta: Record<string, ProjMeta>; onPick: (s: Schedule) => void }
 
 function CalendarView({ schedules, projMeta, onPick }: CalendarViewProps) {
-  const { weekDays, todayIdx } = React.useMemo(buildWeek, []);
-  const occ = React.useMemo(() => expandSchedules(schedules), [schedules]);
+  const { weekDays, todayIdx, monday } = React.useMemo(buildWeek, []);
+  const occ = React.useMemo(() => expandSchedules(schedules, monday), [schedules, monday]);
   // widen the visible window to include any schedule outside the 6–22 default
   const gridStart = React.useMemo(() => Math.max(0, occ.reduce((a, o) => Math.min(a, Math.floor(o.hour)), DEFAULT_GRID_START)), [occ]);
   const gridEnd = React.useMemo(() => Math.min(23, occ.reduce((a, o) => Math.max(a, Math.ceil(o.hour)), DEFAULT_GRID_END)), [occ]);
@@ -256,7 +281,7 @@ function ScheduleRow({ s, last, onPick, projMeta, onToggle, onDelete }: Schedule
       <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', whiteSpace: 'nowrap', color: paused ? 'var(--ink-tertiary)' : 'var(--ink)' }}>{s.next === '—' ? '—' : s.next.startsWith('in') ? s.next : `in ${s.next}`}</span>
       <span style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8 }} onClick={e => e.stopPropagation()}>
         <button title="Remove schedule" onClick={() => onDelete(s.id)} style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center',
-          background: 'transparent', color: 'var(--ink-tertiary)', opacity: hover ? 1 : 0, transition: 'opacity 140ms ease', cursor: 'pointer' }}>
+          background: hover ? 'color-mix(in srgb, var(--red) 12%, transparent)' : 'transparent', color: hover ? 'var(--red)' : 'var(--ink-tertiary)', opacity: hover ? 1 : 0.55, transition: 'opacity 140ms ease, background 140ms ease', cursor: 'pointer' }}>
           <Icon name="x" size={14} />
         </button>
         <Switch on={!paused} onChange={v => { setPaused(!v); onToggle(s.id, v); }} />
@@ -297,36 +322,6 @@ function ListView({ onPick, rows: allRows, projMeta, onToggle, onDelete }: ListV
 // New/Edit schedule sheet (sc-sheet)
 // ──────────────────────────────────────────────────────────────────────────
 
-interface ParsedWhen { time: string; cron: string; summary: string; label: string }
-
-// tiny natural-language → cron parser (demo-grade)
-function parseWhen(text: string): ParsedWhen {
-  const t = text.toLowerCase().trim();
-  const dayMap: Record<string, string> = { mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat', sun: 'Sun' };
-  let time = '09:00', cron = '0 9 * * *', summary = 'Every day at 09:00';
-  const tm = t.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
-  let hh = 9, mm = 0;
-  if (tm) {
-    hh = parseInt(tm[1], 10); mm = tm[2] ? parseInt(tm[2], 10) : 0;
-    if (tm[3] === 'pm' && hh < 12) hh += 12;
-    if (tm[3] === 'am' && hh === 12) hh = 0;
-  }
-  time = `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
-  let dayPart = '*', label = 'Every day';
-  if (/weekday|every weekday|mon-fri|monday to friday/.test(t)) { dayPart = '1-5'; label = 'Weekdays'; }
-  else {
-    const found = Object.keys(dayMap).filter(k => t.includes(k));
-    if (found.length) {
-      const dayNum: Record<string, number> = { sun:0,mon:1,tue:2,wed:3,thu:4,fri:5,sat:6 };
-      dayPart = found.map(k => dayNum[k]).join(',');
-      label = found.map(k => dayMap[k]).join(', ');
-    }
-  }
-  cron = `${mm} ${hh} * * ${dayPart}`;
-  summary = `${label} at ${time}`;
-  return { time, cron, summary, label };
-}
-
 function SheetSection({ n, title, children }: { n: string; title: string; children?: React.ReactNode }) {
   return (
     <div style={{ marginBottom: 18 }}>
@@ -339,22 +334,97 @@ function SheetSection({ n, title, children }: { n: string; title: string; childr
   );
 }
 
+export interface ScheduleSaveData { id?: string; title: string; time: string; cadence: string; projectId?: string; sessionId?: string; prompt?: string; everyMinutes?: number; catchUp?: boolean }
+
 interface ScheduleSheetProps {
   open: boolean;
   onClose: () => void;
-  onSave: (data: { title: string; time: string; cadence: string; projectId?: string }) => void;
-  initial: SchedRow | null;
+  onSave: (data: ScheduleSaveData) => void;
+  onDelete?: (id: string) => void;
+  initial: Schedule | null;
   projects: Project[];
 }
 
-function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) {
-  const [when, setWhen] = React.useState('every weekday 9am');
+type WhenMode = 'interval' | 'daily' | 'days';
+const DOW = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const; // index 0=Mon
+const HOUR_PRESETS = [1, 2, 3, 4, 6, 8, 12, 24];
+
+/** Map a saved schedule's cadence string back into the structured day picker (index 0=Mon). */
+function daysFromCadence(cadence: string): number[] {
+  const c = (cadence || '').toLowerCase();
+  if (/weekday/.test(c)) return [0, 1, 2, 3, 4];
+  if (/weekend/.test(c)) return [5, 6];
+  const out: number[] = [];
+  DOW.forEach((d, i) => { if (c.includes(d.toLowerCase())) out.push(i); });
+  return out;
+}
+
+function ScheduleSheet({ open, onClose, onSave, onDelete, initial, projects }: ScheduleSheetProps) {
   const [projectId, setProjectId] = React.useState('');
-  const [advanced, setAdvanced] = React.useState(false);
-  React.useEffect(() => { if (open) { setWhen('every weekday 9am'); setProjectId(''); setAdvanced(false); } }, [open]);
+  const [runIn, setRunIn] = React.useState<'new' | 'session'>('new');
+  const [sessionId, setSessionId] = React.useState('');
+  const [mode, setMode] = React.useState<WhenMode>('daily');
+  const [everyHours, setEveryHours] = React.useState(3);
+  const [time, setTime] = React.useState('09:00');
+  const [days, setDays] = React.useState<number[]>([0, 1, 2, 3, 4]);
+  const [prompt, setPrompt] = React.useState('');
+  const [catchUp, setCatchUp] = React.useState(true);
+  const [sessions, setSessions] = React.useState<ChatSession[]>([]);
+  React.useEffect(() => {
+    if (!open) return;
+    setProjectId(initial?.projectId ?? '');
+    setRunIn(initial?.sessionId ? 'session' : 'new');
+    setSessionId(initial?.sessionId ?? '');
+    setPrompt(initial?.prompt ?? '');
+    setCatchUp(initial ? !!initial.catchUp : true);
+    setTime(initial?.time || '09:00');
+    if (initial?.everyMinutes && initial.everyMinutes > 0) { setMode('interval'); setEveryHours(Math.max(1, Math.round(initial.everyMinutes / 60))); }
+    else {
+      const ds = initial ? daysFromCadence(initial.cadence) : [];
+      if (ds.length) { setMode('days'); setDays(ds); }
+      else { setMode('daily'); setDays([0, 1, 2, 3, 4]); }
+    }
+  }, [open, initial]);
+  // Load the chosen project's sessions so a run can target one specific chat.
+  React.useEffect(() => {
+    if (!open || !projectId) { setSessions([]); return; }
+    let alive = true;
+    api.listSessions(projectId).then(rows => { if (alive) setSessions(rows); }).catch(() => { if (alive) setSessions([]); });
+    return () => { alive = false; };
+  }, [open, projectId]);
   if (!open) return null;
 
-  const parsed = parseWhen(when);
+  const sortedDays = [...days].sort((a, b) => a - b);
+  const cadenceStr = sortedDays.length === 5 && sortedDays.join() === '0,1,2,3,4' ? 'weekdays'
+    : sortedDays.length === 2 && sortedDays.join() === '5,6' ? 'weekend'
+    : sortedDays.map(i => DOW[i]).join(', ');
+  const summary = mode === 'interval' ? `Every ${everyHours} hour${everyHours === 1 ? '' : 's'}`
+    : mode === 'daily' ? `Every day at ${time}`
+    : sortedDays.length ? `${cadenceStr} at ${time}` : 'Pick at least one day';
+  const valid = prompt.trim().length > 0 && (mode === 'interval' ? everyHours > 0 : mode === 'daily' ? /^\d{1,2}:\d{2}$/.test(time) : sortedDays.length > 0 && /^\d{1,2}:\d{2}$/.test(time));
+  const toggleDay = (i: number) => setDays(d => d.includes(i) ? d.filter(x => x !== i) : [...d, i]);
+
+  const save = () => {
+    if (!valid) return;
+    onSave({
+      id: initial?.id,
+      title: prompt.trim().slice(0, 60),
+      time: mode === 'interval' ? '' : time,
+      cadence: mode === 'interval' ? 'interval' : mode === 'daily' ? 'daily' : cadenceStr,
+      everyMinutes: mode === 'interval' ? everyHours * 60 : undefined,
+      projectId: projectId || undefined,
+      sessionId: runIn === 'session' ? (sessionId || undefined) : undefined,
+      prompt: prompt.trim(),
+      catchUp: mode !== 'interval' ? catchUp : false,
+    });
+  };
+  const pill = (active: boolean): React.CSSProperties => ({
+    height: 34, padding: '0 13px', borderRadius: 'var(--r-pill)', cursor: 'pointer', whiteSpace: 'nowrap',
+    border: active ? '1px solid color-mix(in srgb, var(--blue) 55%, transparent)' : '0.5px solid var(--separator)',
+    background: active ? 'color-mix(in srgb, var(--blue) 16%, transparent)' : 'var(--bg-grouped)',
+    color: active ? 'var(--blue)' : 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)',
+  });
+  const timeStyle: React.CSSProperties = { height: 38, padding: '0 12px', borderRadius: 10, border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-mono)' };
 
   return (
     <div onMouseDown={onClose} style={{ position: 'absolute', inset: 0, zIndex: 80, display: 'grid', placeItems: 'center', padding: 32,
@@ -364,66 +434,108 @@ function ScheduleSheet({ open, onClose, onSave, projects }: ScheduleSheetProps) 
         {/* header */}
         <div style={{ display: 'flex', alignItems: 'center', padding: '18px 20px', borderBottom: '0.5px solid var(--separator)' }}>
           <div style={{ flex: 1 }}>
-            <h2 style={{ margin: 0, font: '700 var(--fs-title2)/1.1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>New schedule</h2>
-            <p style={{ margin: '3px 0 0', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>Fires on this Mac at its time — missed times roll forward to the next occurrence.</p>
+            <h2 style={{ margin: 0, font: '700 var(--fs-title2)/1.1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>{initial ? 'Edit schedule' : 'New schedule'}</h2>
+            <p style={{ margin: '3px 0 0', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>Fires on this Mac at its time. Turn on catch-up so a missed run still fires later the same day.</p>
           </div>
           <button onClick={onClose} className="tb-icon" style={{ width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' }}><Icon name="x" size={18} /></button>
         </div>
 
         <div style={{ padding: 20, overflowY: 'auto' }}>
-          {/* 1 project */}
-          <SheetSection n="1" title="Project">
-            <label className="sheet-pick" style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%', minHeight: 52, padding: '10px 14px',
-              background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)' }}>
-              <span style={{ width: 30, height: 30, borderRadius: 8, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 14%, transparent)', color: 'var(--blue)' }}><Icon name="layers" size={16} /></span>
-              <span style={{ flex: 1, minWidth: 0 }}>
-                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginBottom: 3 }}>Project</span>
-                <select value={projectId} onChange={e => setProjectId(e.target.value)} className="sel" style={{ width: '100%', border: 'none', outline: 'none', background: 'transparent', font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink)' }}>
-                  <option value="">No project (workspace)</option>
-                  {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                </select>
-              </span>
-              <Icon name="chevronDown" size={16} style={{ color: 'var(--ink-tertiary)' }} />
-            </label>
-          </SheetSection>
-
-          {/* 2 when */}
-          <SheetSection n="2" title="When">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, height: 46, padding: '0 14px', background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)' }}>
-              <Icon name="calendar" size={17} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} />
-              <input value={when} onChange={e => setWhen(e.target.value)} placeholder="every Monday 9am"
-                style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }} />
+          {/* 1 project + where it runs */}
+          <SheetSection n="1" title="Project & where it runs">
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+              <button onClick={() => { setProjectId(''); setRunIn('new'); setSessionId(''); }} style={pill(!projectId)}>Workspace</button>
+              {projects.map(p => <button key={p.id} onClick={() => { setProjectId(p.id); setSessionId(''); }} style={pill(projectId === p.id)}>{p.name}</button>)}
             </div>
-            <div className="parse-line" key={parsed.summary} style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 9, padding: '0 4px' }}>
-              <Icon name="check" size={14} stroke={2.6} style={{ color: 'var(--green)', flexShrink: 0 }} />
-              <span style={{ font: '500 var(--fs-footnote)/1.3 var(--font-mono)', whiteSpace: 'nowrap', color: 'var(--ink-secondary)' }}>{parsed.summary}</span>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, marginTop: 10 }}>
+              <button onClick={() => { setRunIn('new'); setSessionId(''); }} style={pill(runIn === 'new')}>A fresh run each time</button>
+              <button onClick={() => setRunIn('session')} style={pill(runIn === 'session')}>A specific chat</button>
             </div>
-            <button onClick={() => setAdvanced(a => !a)} className="link-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, marginTop: 10, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--blue)' }}>
-              <Icon name="chevronRight" size={13} style={{ transform: advanced ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} /> Advanced cron
-            </button>
-            {advanced && (
-              <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 10, height: 42, padding: '0 14px', background: 'var(--fill-tertiary)', borderRadius: 10, border: '0.5px solid var(--separator)' }}>
-                <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>cron</span>
-                <input defaultValue={parsed.cron} key={parsed.cron} style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '500 var(--fs-callout)/1 var(--font-mono)', color: 'var(--ink)' }} />
-              </div>
+            <p style={{ margin: '8px 2px 0', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+              {runIn === 'new' ? 'Each run starts a clean job (no prior chat history).' : 'Each run continues the chosen chat, keeping its memory + context.'}
+            </p>
+            {runIn === 'session' && (
+              projectId
+                ? (sessions.length
+                    ? <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, marginTop: 10 }}>
+                        {sessions.map(se => <button key={se.id} onClick={() => setSessionId(se.id)} style={pill(sessionId === se.id)}>{se.title}</button>)}
+                      </div>
+                    : <p style={{ margin: '8px 2px 0', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>This project has no chats yet — pick “A fresh run each time”, or open a chat first.</p>)
+                : <p style={{ margin: '8px 2px 0', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Pick a project above to choose one of its chats.</p>
             )}
           </SheetSection>
 
-          {/* 3 what fires */}
-          <SheetSection n="3" title="What runs">
-            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: '12px 14px', background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)' }}>
+          {/* 2 when — button driven */}
+          <SheetSection n="2" title="When">
+            <div style={{ display: 'flex', gap: 7, marginBottom: 12 }}>
+              <button onClick={() => setMode('interval')} style={pill(mode === 'interval')}>Every N hours</button>
+              <button onClick={() => setMode('daily')} style={pill(mode === 'daily')}>Daily</button>
+              <button onClick={() => setMode('days')} style={pill(mode === 'days')}>Specific days</button>
+            </div>
+            {mode === 'interval' && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+                {HOUR_PRESETS.map(h => <button key={h} onClick={() => setEveryHours(h)} style={pill(everyHours === h)}>{h}h</button>)}
+              </div>
+            )}
+            {mode === 'daily' && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span style={{ font: '500 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>at</span>
+                <input type="time" value={time} onChange={e => setTime(e.target.value)} style={timeStyle} />
+              </div>
+            )}
+            {mode === 'days' && (
+              <>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+                  <button onClick={() => setDays([0, 1, 2, 3, 4])} style={pill(false)}>Weekdays</button>
+                  <button onClick={() => setDays([5, 6])} style={pill(false)}>Weekend</button>
+                  <button onClick={() => setDays([0, 1, 2, 3, 4, 5, 6])} style={pill(false)}>Every day</button>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+                  {DOW.map((d, i) => <button key={d} onClick={() => toggleDay(i)} style={{ ...pill(days.includes(i)), width: 48, padding: 0, textAlign: 'center' }}>{d}</button>)}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <span style={{ font: '500 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>at</span>
+                  <input type="time" value={time} onChange={e => setTime(e.target.value)} style={timeStyle} />
+                </div>
+              </>
+            )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, padding: '0 2px' }}>
+              <Icon name="check" size={14} stroke={2.6} style={{ color: 'var(--green)', flexShrink: 0 }} />
+              <span style={{ font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>{summary}</span>
+            </div>
+            {mode !== 'interval' && (
+              <label style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12, cursor: 'pointer' }}>
+                <Switch on={catchUp} onChange={setCatchUp} />
+                <span style={{ font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>Catch up if missed — run it later the same day if the Mac was asleep.</span>
+              </label>
+            )}
+          </SheetSection>
+
+          {/* 3 prompt */}
+          <SheetSection n="3" title="What runs each time">
+            <textarea value={prompt} onChange={e => setPrompt(e.target.value)} rows={4} autoFocus
+              placeholder="Describe what to do, e.g. Pull my latest ~50 WhatsApp messages, summarize the conversation, and send the summary to my private chat."
+              style={{ width: '100%', resize: 'vertical', padding: '11px 14px', background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)',
+                font: '400 var(--fs-body)/1.4 var(--font-text)', color: 'var(--ink)', outline: 'none' }} />
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginTop: 12, padding: '12px 14px', background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)', border: '0.5px solid var(--separator)' }}>
               <Icon name="shield" size={15} style={{ color: 'var(--green)', flexShrink: 0, marginTop: 1 }} />
               <span style={{ font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
-                Each firing creates a real job and runs it through your engine routing on this Mac — it shows up in Jobs and on your phone like any hand-started run, and its cost lands in Costs.
+                Each firing creates a real job on this Mac — it shows up in Jobs and on your phone like a hand-started run, with its cost in Costs.
               </span>
             </div>
           </SheetSection>
         </div>
 
         {/* footer */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 14, padding: '14px 20px', borderTop: '0.5px solid var(--separator)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 20px', borderTop: '0.5px solid var(--separator)' }}>
+          {initial && onDelete && (
+            <button onClick={() => { onDelete(initial.id); onClose(); }} style={{ height: 40, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'color-mix(in srgb, var(--red) 12%, transparent)', color: 'var(--red)', font: '600 var(--fs-callout)/1 var(--font-text)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <Icon name="x" size={15} /> Delete
+            </button>
+          )}
+          <span style={{ flex: 1 }} />
           <button onClick={onClose} style={{ height: 40, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
-          <button onClick={() => onSave({ title: parsed.summary, time: parsed.time, cadence: parsed.label, projectId: projectId || undefined })} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Save schedule</button>
+          <button onClick={save} disabled={!valid} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', cursor: valid ? 'pointer' : 'default', background: valid ? 'var(--blue)' : 'var(--fill-secondary)', color: valid ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: valid ? '0 6px 18px rgba(0,122,255,0.3)' : 'none' }}>{initial ? 'Save changes' : 'Save schedule'}</button>
         </div>
       </div>
     </div>
@@ -550,12 +662,16 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 
 // derive a human cron line from the API's time + cadence fields
 function cronLine(s: Schedule): string {
+  if (s.everyMinutes && s.everyMinutes > 0) {
+    const h = Math.floor(s.everyMinutes / 60), m = s.everyMinutes % 60;
+    return `Every ${h ? `${h}h` : ''}${m ? ` ${m}m` : ''}`.trim() + (s.catchUp ? ' · catch-up' : '');
+  }
   const cad = (s.cadence || '').trim();
   const time = (s.time || '').trim();
   if (!cad && !time) return 'On demand';
   if (!time) return cad;
-  if (!cad || /every\s*day/i.test(cad) || cad === '*') return `Every day at ${time}`;
-  return `${cad} at ${time}`;
+  const base = (!cad || /every\s*day/i.test(cad) || cad === '*') ? `Every day at ${time}` : `${cad} at ${time}`;
+  return base + (s.catchUp ? ' · catch-up' : '');
 }
 
 // derive a relative "next run" string from the API's nextRun timestamp
@@ -574,7 +690,7 @@ function nextLine(nextRun: number | null): string {
 export default function Scheduler() {
   const [view, setView] = React.useState('calendar');
   const [sheetOpen, setSheetOpen] = React.useState(false);
-  const [editing, setEditing] = React.useState<SchedRow | null>(null);
+  const [editing, setEditing] = React.useState<Schedule | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const [schedules, setSchedules] = React.useState<Schedule[]>([]);
   const [projects, setProjects] = React.useState<Project[]>([]);
@@ -607,7 +723,8 @@ export default function Scheduler() {
   }, [projects]);
 
   // adapt live schedules into the existing SchedRow shape the list renders
-  const rows = React.useMemo<SchedRow[]>(() => schedules.map(s => ({
+  // (auto-answer / auto-continue are system-managed — hidden from the Scheduler)
+  const rows = React.useMemo<SchedRow[]>(() => schedules.filter(isUserSchedule).map(s => ({
     id: s.id,
     proj: s.projectId ?? '',
     name: s.title,
@@ -636,10 +753,21 @@ export default function Scheduler() {
     }
   }, [schedules]);
 
-  const onCreateSchedule = React.useCallback(async (data: { title: string; time: string; cadence: string; projectId?: string }) => {
+  const onSaveSchedule = React.useCallback(async (data: ScheduleSaveData) => {
     setSheetOpen(false);
     try {
-      await api.createSchedule(data);
+      if (data.id) {
+        await api.updateSchedule(data.id, {
+          title: data.title, prompt: data.prompt, time: data.time, cadence: data.cadence,
+          everyMinutes: data.everyMinutes, catchUp: data.catchUp,
+          sessionId: data.sessionId, projectId: data.projectId,
+        });
+      } else {
+        await api.createSchedule({
+          title: data.title, projectId: data.projectId, time: data.time, cadence: data.cadence,
+          everyMinutes: data.everyMinutes, catchUp: data.catchUp, prompt: data.prompt, sessionId: data.sessionId,
+        });
+      }
       await loadSchedules();
     } catch { /* fail soft */ }
   }, [loadSchedules]);
@@ -650,8 +778,8 @@ export default function Scheduler() {
   }, []);
 
   const openNew = () => { setEditing(null); setSheetOpen(true); };
-  const openEdit = (s: SchedRow) => { setEditing(s); setSheetOpen(true); };
-  const openFromCalendar = () => { setEditing(null); setSheetOpen(true); };
+  const openEdit = (row: SchedRow) => { setEditing(schedules.find(s => s.id === row.id) ?? null); setSheetOpen(true); };
+  const openFromCalendar = (s: Schedule) => { setEditing(s); setSheetOpen(true); };
 
   return (
     <AppShell active="scheduler" onSearch={() => setPaletteOpen(true)}>
@@ -673,7 +801,7 @@ export default function Scheduler() {
         {/* durability reassurance */}
         <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: 18, font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
           <Icon name="shield" size={14} style={{ color: 'var(--green)' }} />
-          Schedules fire on this Mac while Maestro is running — a missed time rolls forward to the next occurrence.
+          Schedules fire on this Mac while Maestro is running. A missed time rolls forward — or, with catch-up on, still runs later the same day.
         </div>
 
         {/* body */}
@@ -684,7 +812,7 @@ export default function Scheduler() {
         </div>
       </div>
 
-      <ScheduleSheet open={sheetOpen} onClose={() => setSheetOpen(false)} onSave={onCreateSchedule} initial={editing} projects={projects} />
+      <ScheduleSheet open={sheetOpen} onClose={() => setSheetOpen(false)} onSave={onSaveSchedule} onDelete={onDelete} initial={editing} projects={projects} />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>
   );
