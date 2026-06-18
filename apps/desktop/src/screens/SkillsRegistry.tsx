@@ -11,7 +11,7 @@ import { useNavigate } from 'react-router-dom';
 import { pathForNav } from '../lib/routes';
 import { Icon, type IconName } from '../lib/icons';
 import { Spinner } from '../lib/ui';
-import { api, type Skill as ApiSkill } from '../lib/api';
+import { api, getRegistryAdminToken, setRegistryAdminToken, type Skill as ApiSkill, type RegistrySkillSummary } from '../lib/api';
 import {
   APP_W,
   APP_H,
@@ -69,8 +69,8 @@ const PAGE_CSS = `
   @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
   @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
 
-  *::-webkit-scrollbar { width: 9px; height: 9px; }
-  *::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  *::-webkit-scrollbar { width: 11px; height: 11px; }
+  *::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
   input::placeholder { color: var(--ink-tertiary); }
   ::selection { background: rgba(0,122,255,0.22); }
 `;
@@ -86,10 +86,15 @@ interface Skill {
   desc: string;
   signed: boolean;
   scan: ScanState;
-  uses: string;
   installed: boolean;
   mine: boolean;
   tags: string[];
+  risk?: string;
+  sha256?: string | null;
+  mirrorRepo?: string | null;
+  forkStatus?: string | null;
+  auditStatus?: string | null;
+  disabledReason?: string | null;
 }
 
 const SK_PALETTE = ['var(--blue)', 'var(--purple)', 'var(--teal)', 'var(--indigo)', 'var(--orange)', 'var(--green)'];
@@ -124,38 +129,38 @@ function SkillGlyph({ name, size = 40, radius = 11 }: SkillGlyphProps) {
 
 // scan: ok | pending | quarantined ; signed: bool
 //
-// Live data: the registry list is populated from api.listSkills() on mount and
-// mapped into this local render shape. The API model carries the load-bearing
-// fields (id, name, description, category, version, enabled). Decorative bits
-// the API does not model (signature/scan badges, use counts, "mine"/tags used
-// only for the local filter+search) are derived deterministically from the
-// skill so the rows stay visually stable across refetches.
-function skHash(s: string): number {
-  let h = 0;
-  for (const ch of s) h = (h * 31 + ch.charCodeAt(0)) & 0xffff;
-  return h;
-}
-function fmtUses(n: number): string {
-  return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : String(n);
-}
-/** Map a live API skill into the existing row shape, preserving render exactly. */
-function toSkill(a: ApiSkill): Skill {
-  const h = skHash(a.id + a.name);
-  const scan: ScanState = h % 11 === 0 ? 'quarantined' : h % 5 === 0 ? 'pending' : 'ok';
-  const tags = a.category
-    ? a.category.toLowerCase().split(/[\s,/]+/).filter(Boolean)
-    : [];
+// All status is derived from real registry signals (enabled state + audit risk).
+// Nothing is fabricated from a hash — a skill only shows pending/quarantined when
+// the registry actually says so.
+/** Map a live API/registry skill into the existing row shape. */
+function toSkill(a: ApiSkill | RegistrySkillSummary): Skill {
+  const reg = a as RegistrySkillSummary;
+  const local = a as ApiSkill;
+  const isRegistry = 'risk' in a || 'tags' in a; // a public/registry skill vs. a local host capability
+  const enabled = 'enabled' in a ? a.enabled !== false : local.enabled;
+  const risk = (reg.risk || '').toUpperCase();
+  const scan: ScanState = !enabled ? 'quarantined' : risk === 'HIGH' || risk === 'CRITICAL' ? 'quarantined' : risk === 'MEDIUM' ? 'pending' : 'ok';
+  const tags = 'tags' in a && Array.isArray(a.tags)
+    ? a.tags
+    : local.category
+      ? local.category.toLowerCase().split(/[\s,/]+/).filter(Boolean)
+      : [];
   return {
     id: a.id,
     name: a.name,
-    ver: a.version,
+    ver: ('version' in a && a.version) ? a.version : local.version,
     desc: a.description,
-    signed: scan !== 'quarantined',
+    signed: enabled && scan !== 'quarantined',
     scan,
-    uses: fmtUses(80 + (h % 1500)),
-    installed: a.enabled,
-    mine: h % 2 === 0,
+    installed: enabled,
+    mine: !isRegistry, // "yours" = a local host capability, not a public-registry entry
     tags,
+    risk: reg.risk,
+    sha256: reg.sha256,
+    mirrorRepo: reg.sourceRepo || reg.mirrorRepo,
+    forkStatus: reg.sourceStatus || reg.forkStatus,
+    auditStatus: reg.auditStatus,
+    disabledReason: reg.disabledReason,
   };
 }
 
@@ -200,7 +205,6 @@ function SkillRow({ s, last, onOpen }: { s: Skill; last: boolean; onOpen: (s: Sk
         <div style={{ font: '400 var(--fs-subhead)/1.35 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.desc}</div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-        <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{s.uses} uses</span>
         <SigShield signed={s.signed} />
         <ScanChip scan={s.scan} />
         <Icon name="chevronRight" size={16} style={{ color: 'var(--ink-tertiary)' }} />
@@ -245,10 +249,19 @@ const VERSIONS: VersionEntry[] = [
   { ver: '2.2.0', date: 'Jan 8, 2026', scan: 'ok', note: 'Initial public version' },
 ];
 
-function SkillDetail({ s, onBack, onAdd }: { s: Skill; onBack: () => void; onAdd: (s: Skill) => void }) {
+function SkillDetail({ s, onBack, onAdd, onRescan }: { s: Skill; onBack: () => void; onAdd: (s: Skill) => void; onRescan: (s: Skill) => void }) {
   const [tab, setTab] = React.useState(s.scan === 'quarantined' ? 'security' : 'about');
   const [copied, setCopied] = React.useState(false);
-  const sha = 'sha256:9f2c4a' + (s.id === 's9' ? 'b81e' : '7d10') + '…e3a1';
+  const [skillMd, setSkillMd] = React.useState('');
+  const [detail, setDetail] = React.useState<Partial<RegistrySkillSummary & { excerpt?: string; rawBase?: string; skillPath?: string }>>({});
+  React.useEffect(() => {
+    if (!s.id.includes('/')) return;
+    let on = true;
+    api.registryGetSkill(s.id).then(d => { if (on) setDetail(d); }).catch(() => {});
+    api.registrySkillContent(s.id).then(c => { if (on) setSkillMd(c.skillMd); }).catch(() => {});
+    return () => { on = false; };
+  }, [s.id]);
+  const sha = s.sha256 || detail.sha256 || 'sha256 pending';
   const tabs = ['About', 'Capabilities', 'Versions', 'Security'];
 
   return (
@@ -273,20 +286,28 @@ function SkillDetail({ s, onBack, onAdd }: { s: Skill; onBack: () => void; onAdd
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 9 }}>
               <SigShield signed={s.signed} />
-              <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{s.signed ? 'Signed by you · key ····7F2A' : 'Unsigned — publisher unverified'}</span>
+              <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{s.installed ? 'Enabled in registry' : (s.disabledReason || 'Disabled in registry')}</span>
             </div>
-            <button onClick={() => { setCopied(true); setTimeout(() => setCopied(false), 1400); }} className="sha-copy" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '6px 10px', borderRadius: 8, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)' }}>
+            <button onClick={() => { void navigator.clipboard?.writeText(sha); setCopied(true); setTimeout(() => setCopied(false), 1400); }} className="sha-copy" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '6px 10px', borderRadius: 8, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)' }}>
               <span style={{ font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{sha}</span>
               <Icon name={copied ? 'check' : 'layers'} size={13} style={{ color: copied ? 'var(--green)' : 'var(--ink-tertiary)' }} />
               <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: copied ? 'var(--green)' : 'var(--ink-tertiary)' }}>{copied ? 'Copied' : 'Copy'}</span>
             </button>
           </div>
-          <button onClick={() => onAdd(s)} className="primary-cta" style={{
-            height: 40, padding: '0 18px', borderRadius: 'var(--r-pill)', alignSelf: 'flex-start', flexShrink: 0,
-            background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)', display: 'inline-flex', alignItems: 'center', gap: 7,
-          }}>
-            <Icon name="plus" size={16} stroke={2.4} /> Add to project…
-          </button>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, flexShrink: 0 }}>
+            <button onClick={() => onRescan(s)} className="split-quiet" style={{
+              height: 40, padding: '0 14px', borderRadius: 'var(--r-pill)', alignSelf: 'flex-start',
+              background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-callout)/1 var(--font-text)', display: 'inline-flex', alignItems: 'center', gap: 7,
+            }}>
+              <Icon name="refresh" size={16} stroke={2.4} /> Rescan
+            </button>
+            <button onClick={() => onAdd(s)} className="primary-cta" style={{
+              height: 40, padding: '0 18px', borderRadius: 'var(--r-pill)', alignSelf: 'flex-start',
+              background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)', display: 'inline-flex', alignItems: 'center', gap: 7,
+            }}>
+              <Icon name={s.installed ? 'lock' : 'check'} size={16} stroke={2.4} /> {s.installed ? 'Disable' : 'Enable'}
+            </button>
+          </div>
         </div>
 
         {/* tabs */}
@@ -306,7 +327,7 @@ function SkillDetail({ s, onBack, onAdd }: { s: Skill; onBack: () => void; onAdd
         </div>
 
         <div className="tab-body" key={tab}>
-          {tab === 'about' && <AboutTab />}
+          {tab === 'about' && <AboutTab s={s} detail={detail} skillMd={skillMd} />}
           {tab === 'capabilities' && <CapabilitiesTab />}
           {tab === 'versions' && <VersionsTab />}
           {tab === 'security' && <SecurityTab quarantined={s.scan === 'quarantined'} />}
@@ -316,22 +337,23 @@ function SkillDetail({ s, onBack, onAdd }: { s: Skill; onBack: () => void; onAdd
   );
 }
 
-function AboutTab() {
+function AboutTab({ s, detail, skillMd }: { s: Skill; detail: Partial<RegistrySkillSummary & { excerpt?: string; rawBase?: string; skillPath?: string }>; skillMd: string }) {
+  const body = skillMd || detail.excerpt || s.desc || SKILL_DOC.body;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
         <div style={{ background: 'var(--bg-elevated)', borderRadius: 14, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 18 }}>
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--blue)', marginBottom: 9 }}><Icon name="spark" size={13} /> What</div>
-          <div style={{ font: '400 var(--fs-body)/1.5 var(--font-text)', color: 'var(--ink)', textWrap: 'pretty' } as React.CSSProperties}>{SKILL_DOC.what}</div>
+          <div style={{ font: '400 var(--fs-body)/1.5 var(--font-text)', color: 'var(--ink)', textWrap: 'pretty' } as React.CSSProperties}>{s.desc || SKILL_DOC.what}</div>
         </div>
         <div style={{ background: 'var(--bg-elevated)', borderRadius: 14, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 18 }}>
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--purple)', marginBottom: 9 }}><Icon name="clock" size={13} /> When</div>
-          <div style={{ font: '400 var(--fs-body)/1.5 var(--font-text)', color: 'var(--ink)', textWrap: 'pretty' } as React.CSSProperties}>{SKILL_DOC.when}</div>
+          <div style={{ font: '400 var(--fs-body)/1.5 var(--font-text)', color: 'var(--ink)', textWrap: 'pretty' } as React.CSSProperties}>{detail.rawBase || detail.directory || s.mirrorRepo || SKILL_DOC.when}</div>
         </div>
       </div>
       <div>
         <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 9 }}>SKILL.md</div>
-        <p style={{ margin: 0, font: '400 var(--fs-body)/1.7 var(--font-text)', color: 'var(--ink-secondary)', maxWidth: 680, textWrap: 'pretty' } as React.CSSProperties}>{SKILL_DOC.body}</p>
+        <pre style={{ margin: 0, maxHeight: 360, overflow: 'auto', whiteSpace: 'pre-wrap', font: '400 var(--fs-caption)/1.55 var(--font-mono)', color: 'var(--ink-secondary)', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, padding: 14 }}>{body.length > 8000 ? body.slice(0, 8000) + '\n\n[preview truncated]' : body}</pre>
       </div>
     </div>
   );
@@ -439,16 +461,30 @@ function SecurityTab({ quarantined }: { quarantined: boolean }) {
 
 /* ───────────────────────── publish sheet ───────────────────────── */
 
-function PublishSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
+function PublishSheet({ open, onClose, onPublished }: { open: boolean; onClose: () => void; onPublished: (s: Skill) => void }) {
   const [stage, setStage] = React.useState(0); // 0 drop, 1 ready, 2..4 scanning, 5 done
-  React.useEffect(() => { if (open) setStage(0); }, [open]);
+  const [source, setSource] = React.useState('');
+  const [err, setErr] = React.useState('');
+  React.useEffect(() => { if (open) { setStage(0); setSource(''); setErr(''); } }, [open]);
   if (!open) return null;
 
-  const drop = () => { setStage(1); };
-  const publish = () => {
+  const drop = () => { if (source.trim()) setStage(1); };
+  // Real publish: the relay fetches + hashes + scans + lists the skill in one
+  // call. We show "working" (stage 2) while that request is in flight and jump to
+  // done (stage 5) only when it actually succeeds — no timed fake progress.
+  const publish = async () => {
+    const url = source.trim();
+    if (!url) { setErr('Source URL required'); return; }
+    setErr('');
     setStage(2);
-    let s = 2;
-    const t = setInterval(() => { s += 1; setStage(s); if (s >= 5) clearInterval(t); }, 850);
+    try {
+      const rec = await api.registryAdminAddSkill({ url });
+      setStage(5);
+      onPublished(toSkill(rec));
+    } catch (e) {
+      setStage(1);
+      setErr(e instanceof Error ? e.message : 'Could not add skill');
+    }
   };
 
   const scanSteps = [
@@ -476,25 +512,28 @@ function PublishSheet({ open, onClose }: { open: boolean; onClose: () => void })
 
         <div style={{ padding: 20, overflowY: 'auto' }}>
           {stage === 0 ? (
-            <button onClick={drop} className="drop-zone" style={{
+            <div className="drop-zone" style={{
               width: '100%', padding: '40px 20px', borderRadius: 16, border: '2px dashed var(--separator-strong)', background: 'var(--fill-tertiary)',
               display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12,
             }}>
               <span style={{ width: 56, height: 56, borderRadius: 16, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 13%, transparent)', color: 'var(--blue)' }}><Icon name="enter" size={28} style={{ transform: 'rotate(90deg)' }} /></span>
-              <span style={{ font: '600 var(--fs-callout)/1.3 var(--font-text)', color: 'var(--ink)' }}>Drop your skill bundle here</span>
-              <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>.zip with SKILL.md + manifest · or click to browse</span>
-            </button>
+              <span style={{ font: '600 var(--fs-callout)/1.3 var(--font-text)', color: 'var(--ink)' }}>Add from live source</span>
+              <input autoFocus value={source} onChange={e => setSource(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') drop(); }}
+                placeholder="https://www.skills.sh/owner/repo/skill or https://github.com/owner/repo"
+                style={{ width: '100%', maxWidth: 420, height: 36, padding: '0 12px', borderRadius: 10, border: '0.5px solid var(--separator)', background: 'var(--bg-elevated)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none' }} />
+              <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: err ? 'var(--red)' : 'var(--ink-tertiary)' }}>{err || 'skills.sh URL, GitHub repo, or direct SKILL.md URL'}</span>
+            </div>
           ) : (
             <React.Fragment>
               {/* manifest preview */}
               <div style={{ display: 'flex', gap: 13, padding: 15, borderRadius: 14, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', marginBottom: 14 }}>
-                <SkillGlyph name="newsletter-writer" size={44} radius={12} />
+                <SkillGlyph name={source.split('/').filter(Boolean).pop() || 'new skill'} size={44} radius={12} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                    <span style={{ font: '600 var(--fs-callout)/1.3 var(--font-mono)', color: 'var(--ink)', whiteSpace: 'nowrap' }}>newsletter-writer</span>
+                    <span style={{ font: '600 var(--fs-callout)/1.3 var(--font-mono)', color: 'var(--ink)', whiteSpace: 'nowrap' }}>{source.split('/').filter(Boolean).pop() || 'new skill'}</span>
                     <span style={{ height: 18, padding: '0 7px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', font: '600 var(--fs-caption)/18px var(--font-mono)', color: 'var(--ink-secondary)', flexShrink: 0 }}>v0.9.0</span>
                   </div>
-                  <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 4 }}>Drafts on-brand newsletters from a week of project activity. 3 capabilities declared.</div>
+                  <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 4 }}>{source}</div>
                 </div>
               </div>
 
@@ -540,8 +579,11 @@ function PublishSheet({ open, onClose }: { open: boolean; onClose: () => void })
             {stage === 5 ? 'Published · agents can now find it by meaning.' : 'Your registry is private to this workspace.'}
           </span>
           <button onClick={onClose} style={{ height: 40, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{stage === 5 ? 'Done' : 'Cancel'}</button>
+          {stage === 0 && (
+            <button onClick={drop} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: source.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: source.trim() ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: source.trim() ? '0 6px 18px rgba(0,122,255,0.3)' : 'none' }}>Continue</button>
+          )}
           {stage >= 1 && stage < 2 && (
-            <button onClick={publish} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Sign &amp; publish</button>
+	            <button onClick={() => void publish()} className="primary-cta" style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Sign &amp; publish</button>
           )}
           {stage >= 2 && stage < 5 && (
             <button disabled style={{ height: 40, padding: '0 20px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)', display: 'inline-flex', alignItems: 'center', gap: 7 }}><Spinner size={13} /> Scanning…</button>
@@ -562,7 +604,7 @@ function AddedToast({ skill, onDone }: { skill: Skill; onDone: () => void }) {
       borderRadius: 'var(--r-pill)', background: 'var(--on-glass)', color: 'var(--bg-elevated)', boxShadow: '0 12px 32px rgba(10,15,40,0.4)',
     }}>
       <span style={{ width: 20, height: 20, borderRadius: '50%', background: 'var(--green)', display: 'grid', placeItems: 'center' }}><Icon name="check" size={13} stroke={3} style={{ color: '#fff' }} /></span>
-      <span style={{ font: '600 var(--fs-subhead)/1 var(--font-text)' }}>Added <b style={{ fontFamily: 'var(--font-mono)' }}>{skill.name}</b> to Atlas API</span>
+      <span style={{ font: '600 var(--fs-subhead)/1 var(--font-text)' }}>Updated <b style={{ fontFamily: 'var(--font-mono)' }}>{skill.name}</b></span>
     </div>
   );
 }
@@ -700,19 +742,42 @@ export default function SkillsRegistry() {
   const [added, setAdded] = React.useState<Skill | null>(null);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const [skills, setSkills] = React.useState<Skill[]>([]); // live registry
+  const [adminToken, setAdminTokenState] = React.useState(() => getRegistryAdminToken());
+  const [loadMode, setLoadMode] = React.useState('public');
+  const [syncing, setSyncing] = React.useState(false);
+
+  const refreshRegistry = React.useCallback(async () => {
+    setRegistryAdminToken(adminToken);
+    try {
+      const admin = await api.registryAdminListSkills({ includeDisabled: true, limit: 500 });
+      setSkills(admin.results.map(toSkill));
+      setLoadMode('admin');
+      return;
+    } catch { /* fall through */ }
+    try {
+      const pub = await api.searchSkills('', 500);
+      setSkills(pub.results.map(toSkill));
+      setLoadMode('public');
+      return;
+    } catch { /* fall through */ }
+    try {
+      const list = await api.listSkills();
+      setSkills(list.map(toSkill));
+      setLoadMode('bundled');
+    } catch {
+      setSkills([]);
+      setLoadMode('offline');
+    }
+  }, [adminToken]);
 
   React.useEffect(() => {
     let alive = true;
     (async () => {
-      try {
-        const list = await api.listSkills();
-        if (alive) setSkills(list.map(toSkill));
-      } catch {
-        if (alive) setSkills([]);
-      }
+      await refreshRegistry();
+      if (!alive) return;
     })();
     return () => { alive = false; };
-  }, []);
+  }, [refreshRegistry]);
 
   React.useEffect(() => {
     const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
@@ -726,9 +791,32 @@ export default function SkillsRegistry() {
   const onToggleSkill = async (s: Skill) => {
     setAdded(s); // preserve the existing "added" toast animation
     try {
-      const updated = await api.toggleSkill(s.id);
-      setSkills(prev => prev.map(p => (p.id === updated.id ? { ...p, installed: updated.enabled } : p)));
+      if (s.id.includes('/')) {
+        await api.registryAdminPatchSkill(s.id, { enabled: !s.installed, disabledReason: s.installed ? 'Disabled from Maestro portal' : '' });
+        setSkills(prev => prev.map(p => (p.id === s.id ? { ...p, installed: !s.installed, scan: s.installed ? 'quarantined' : 'ok' } : p)));
+      } else {
+        const updated = await api.toggleSkill(s.id);
+        setSkills(prev => prev.map(p => (p.id === updated.id ? { ...p, installed: updated.enabled } : p)));
+      }
     } catch { /* fail soft — keep current state */ }
+  };
+  const onRescanSkill = async (s: Skill) => {
+    if (!s.id.includes('/')) return;
+    try {
+      const updated = toSkill(await api.registryAdminRescanSkill(s.id));
+      setSkills(prev => prev.map(p => (p.id === updated.id ? updated : p)));
+      setOpen(updated);
+      setAdded(updated);
+    } catch { /* admin token missing or audit unavailable; keep current state */ }
+  };
+  const syncSources = async (dryRun: boolean) => {
+    setSyncing(true);
+    try {
+      const r = await api.registryAdminSyncSources({ dryRun, limit: dryRun ? 20 : undefined });
+      setAdded({ id: 'sync', name: `${dryRun ? 'Dry-run' : 'Synced'} ${r.attempted}/${r.repos} original sources`, ver: 'latest', desc: '', signed: true, scan: 'ok', installed: true, mine: true, tags: [] });
+      await refreshRegistry();
+    } catch { /* admin token missing or source unavailable */ }
+    setSyncing(false);
   };
 
   let rows = skills.filter(s => segMatch(s, seg));
@@ -750,7 +838,7 @@ export default function SkillsRegistry() {
             <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} />
 
             {open ? (
-              <SkillDetail s={open} onBack={() => setOpen(null)} onAdd={onToggleSkill} />
+              <SkillDetail s={open} onBack={() => setOpen(null)} onAdd={onToggleSkill} onRescan={onRescanSkill} />
             ) : (
               <main style={{ flex: 1, overflowY: 'auto', padding: '24px 28px 36px' }}>
                 <div style={{ maxWidth: 920, margin: '0 auto' }}>
@@ -758,14 +846,24 @@ export default function SkillsRegistry() {
                   <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 16, marginBottom: 18 }}>
                     <div>
                       <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Skills</h1>
-                      <p style={{ margin: '6px 0 0', font: '400 var(--fs-subhead)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>Your private registry — npm for skills, found by meaning, zero payments.</p>
+                      <p style={{ margin: '6px 0 0', font: '400 var(--fs-subhead)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>Your private registry — {loadMode} mode · {skills.length} loaded.</p>
                     </div>
-                    <button onClick={() => setPublish(true)} className="primary-cta" style={{
-                      display: 'inline-flex', alignItems: 'center', gap: 7, height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)',
-                      background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.30)',
-                    }}>
-                      <Icon name="plus" size={16} stroke={2.4} /> Publish skill
-                    </button>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                      <input value={adminToken} onChange={e => setAdminTokenState(e.target.value)} onBlur={() => void refreshRegistry()} placeholder="Admin token"
+                        style={{ width: 190, height: 34, padding: '0 10px', borderRadius: 9, border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', color: 'var(--ink)', font: '400 var(--fs-caption)/1 var(--font-mono)', outline: 'none' }} />
+                      <button onClick={() => void syncSources(true)} disabled={syncing} className="split-quiet" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 34, padding: '0 12px', borderRadius: 9, background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                        <Icon name="gitMerge" size={14} /> Dry run
+                      </button>
+                      <button onClick={() => void syncSources(false)} disabled={syncing} className="split-quiet" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 34, padding: '0 12px', borderRadius: 9, background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                        <Icon name="refresh" size={14} /> Sync sources
+                      </button>
+                      <button onClick={() => setPublish(true)} className="primary-cta" style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 7, height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)',
+                        background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.30)',
+                      }}>
+                        <Icon name="plus" size={16} stroke={2.4} /> Add skill
+                      </button>
+                    </div>
                   </div>
 
                   {/* search */}
@@ -817,7 +915,7 @@ export default function SkillsRegistry() {
             )}
           </div>
 
-          <PublishSheet open={publish} onClose={() => setPublish(false)} />
+          <PublishSheet open={publish} onClose={() => setPublish(false)} onPublished={(s) => setSkills(prev => [s, ...prev.filter(x => x.id !== s.id)])} />
           {added && <AddedToast skill={added} onDone={() => setAdded(null)} />}
           <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
         </div>

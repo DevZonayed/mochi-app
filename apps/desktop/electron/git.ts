@@ -26,6 +26,23 @@ export function resolveGit(): string | null {
 
 export function gitAvailable(): boolean { return resolveGit() !== null; }
 
+/** Commit a snapshot of a project folder so its design + attachments are
+    referable by a short hash (the "commit shortcut"). Inits a git repo on first
+    use; commits with a local Maestro identity so it works without global config. */
+export function snapshotProject(dir: string, message: string): { ok: boolean; hash?: string; reason?: string } {
+  const git = resolveGit();
+  if (!git) return { ok: false, reason: 'git is not installed' };
+  if (!dir || !existsSync(dir)) return { ok: false, reason: 'this project has no folder yet' };
+  try {
+    if (!isGitRepo(dir)) execFileSync(git, ['-C', dir, 'init', '-q'], { timeout: 10_000 });
+    execFileSync(git, ['-C', dir, 'add', '-A'], { timeout: 30_000 });
+    execFileSync(git, ['-C', dir, '-c', 'user.name=Maestro', '-c', 'user.email=maestro@local',
+      'commit', '-q', '--allow-empty', '-m', (message || 'snapshot').slice(0, 200)], { timeout: 30_000 });
+    const hash = execFileSync(git, ['-C', dir, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', timeout: 5_000 }).trim();
+    return { ok: true, hash };
+  } catch (e) { return { ok: false, reason: e instanceof Error ? e.message.slice(0, 200) : 'snapshot failed' }; }
+}
+
 export function isGitRepo(dir: string): boolean {
   try { return existsSync(path.join(dir, '.git')); } catch { return false; }
 }
@@ -42,6 +59,36 @@ export function repoInfo(dir: string): RepoInfo {
     catch { return null; }
   };
   return { branch: run(['rev-parse', '--abbrev-ref', 'HEAD']), remote: run(['remote', 'get-url', 'origin']), isRepo: true };
+}
+
+/** A git-safe branch slug from a chat title: lowercased, dashed, capped. */
+export function branchSlug(title: string): string {
+  const s = (title || 'chat').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32);
+  return s || 'chat';
+}
+
+/** Best-effort branch-per-chat (Conductor-style isolation). On a git repo, check
+    out `branch`, creating it from HEAD if needed. Guarded: never clobbers an
+    uncommitted working tree — if dirty and the target differs from the current
+    branch, it leaves things as-is and reports why. Pure best-effort: any failure
+    just means the chat runs on whatever branch is current. */
+export function ensureBranch(dir: string, branch: string): { ok: boolean; branch: string | null; reason?: string } {
+  const git = resolveGit();
+  if (!git || !isGitRepo(dir)) return { ok: false, branch: null, reason: 'not a git repo' };
+  const run = (args: string[]): { out: string; code: number } => {
+    try { return { out: execFileSync(git, ['-C', dir, ...args], { encoding: 'utf8', timeout: 8000 }).trim(), code: 0 }; }
+    catch (e) { return { out: '', code: (e as { status?: number }).status ?? 1 }; }
+  };
+  try {
+    const cur = run(['rev-parse', '--abbrev-ref', 'HEAD']).out || null;
+    if (cur === branch) return { ok: true, branch };
+    const dirty = run(['status', '--porcelain']).out.length > 0;
+    if (dirty) return { ok: false, branch: cur, reason: 'working tree has uncommitted changes' };
+    const exists = run(['rev-parse', '--verify', '--quiet', branch]).code === 0;
+    const co = exists ? run(['checkout', branch]) : run(['checkout', '-b', branch]);
+    if (co.code !== 0) return { ok: false, branch: cur, reason: 'checkout failed' };
+    return { ok: true, branch };
+  } catch (e) { return { ok: false, branch: null, reason: (e as Error).message }; }
 }
 
 /** Derive a safe folder name from a clone URL (…/user/repo(.git) → repo). */

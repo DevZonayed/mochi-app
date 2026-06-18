@@ -16,10 +16,10 @@ import {
   type EffortStop,
 } from '../lib/ui';
 import {
-  APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, TrafficLights, Sidebar, Toolbar,
-  type Theme,
+  APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, usePurpose, setPurpose, TrafficLights, Sidebar, Toolbar,
+  type Theme, type Purpose,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type EngineStatuses, type AppSettings, type ChromeProfile, IS_LOCAL } from '../lib/api';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
@@ -40,8 +40,8 @@ const styles = `
   @keyframes sheetPop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
   @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
   @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
-  *::-webkit-scrollbar { width: 9px; height: 9px; }
-  *::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  *::-webkit-scrollbar { width: 11px; height: 11px; }
+  *::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
   ::selection { background: rgba(0,122,255,0.22); }
 `;
 
@@ -140,6 +140,9 @@ interface SetNavItem { key: string; icon: IconName; label: string; tint: string;
 const SET_NAV: SetNavItem[] = [
   { key: 'general', icon: 'settings', label: 'General', tint: 'var(--ink-secondary)' },
   { key: 'engines', icon: 'cpu', label: 'Engines', tint: 'var(--purple)' },
+  // Skills + Costs are launchers, not top-nav menus — they open the full screens.
+  { key: 'skills', icon: 'spark', label: 'Skills & tools', tint: 'var(--indigo)' },
+  { key: 'costs', icon: 'gauge', label: 'Costs', tint: 'var(--green)' },
   { key: 'accounts', icon: 'key', label: 'Accounts & keys', tint: 'var(--blue)' },
   { key: 'comms', icon: 'command', label: 'Comms', tint: 'var(--teal)' },
   { key: 'costs', icon: 'gauge', label: 'Costs', tint: 'var(--green)' },
@@ -201,6 +204,15 @@ function GeneralPane({ theme, setTheme, workspace }: {
 
   const eff: EffortStop = settings ? EFFORT_TO_STOP[settings.defaultEffort] ?? 'BALANCED' : 'BALANCED';
   const model = settings?.defaultEngine ?? 'auto';
+  const purpose = usePurpose();
+  const PURPOSE_LABEL: Record<Purpose, string> = { coding: 'Coding', design: 'Design', video: 'Video', general: 'General' };
+  const labelToPurpose = (l: string): Purpose => (l === 'Coding' ? 'coding' : l === 'Design' ? 'design' : l === 'Video' ? 'video' : 'general');
+  const PURPOSE_SUB: Record<Purpose, string> = {
+    coding: 'Workspace-focused: no sidebar, a slim top nav, the coding workspace front and centre.',
+    design: 'An agent-native design canvas: describe it, the agent builds a live, self-contained design you can refine and hand off to code.',
+    video: 'A video-focused layout is coming — for now this looks like General.',
+    general: 'The classic layout: full sidebar with every surface.',
+  };
 
   const patch = (p: Partial<AppSettings>) => { setSettings(s => (s ? { ...s, ...p } : s)); void api.setSettings(p).catch(() => {}); };
   const saveName = (name: string) => { const n = name.trim(); if (n && n !== workspace?.name) void api.createWorkspace(n).catch(() => {}); };
@@ -212,6 +224,15 @@ function GeneralPane({ theme, setTheme, workspace }: {
         <GroupedList header="Workspace">
           <Row><span style={{ width: 110, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Name</span><input key={workspace?.id ?? 'ws'} defaultValue={workspace?.name ?? 'Maestro'} onBlur={e => saveName(e.target.value)} style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)', padding: '13px 0' }} /></Row>
           <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Appearance</span><Seg options={['Light', 'Dark', 'Auto']} value={getThemePref() === 'auto' ? 'Auto' : getThemePref() === 'dark' ? 'Dark' : 'Light'} onChange={v => setThemePref(v === 'Auto' ? 'auto' : v === 'Dark' ? 'dark' : 'light')} /></Row>
+        </GroupedList>
+        <GroupedList header="Workspace mode" footer={PURPOSE_SUB[purpose]}>
+          <Row last>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Main purpose</span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>The whole layout reshapes to fit what you do most.</span>
+            </span>
+            <Seg options={['Coding', 'Design', 'Video', 'General']} value={PURPOSE_LABEL[purpose]} onChange={v => setPurpose(labelToPurpose(v))} />
+          </Row>
         </GroupedList>
         <GroupedList header="Defaults" footer="Applies to new jobs; a project or the composer can override per run.">
           <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default effort</span><EffortDial value={eff} onChange={v => patch({ defaultEffort: STOP_TO_EFFORT[v] })} compact /></Row>
@@ -227,8 +248,8 @@ function GeneralPane({ theme, setTheme, workspace }: {
 
 /* ── Engines pane — which engine plays which role ───────────────────── */
 const STUDIO_ROLE_ROWS: { key: 'image' | 'video'; label: string; sub: string }[] = [
-  { key: 'image', label: 'Image generation', sub: 'Used by Media Studio (preview).' },
-  { key: 'video', label: 'Video generation', sub: 'Used by Media Studio (preview).' },
+  { key: 'image', label: 'Image generation', sub: 'In chat: Codex = free, built-in · Claude = fal.ai (uses your fal credits).' },
+  { key: 'video', label: 'Video generation', sub: 'Used by Media Studio (fal.ai).' },
 ];
 const ENGINE_OPTIONS = ['Claude Code', 'Codex'] as const;
 const labelToEngine = (l: string): 'claude' | 'codex' => (l === 'Codex' ? 'codex' : 'claude');
@@ -240,6 +261,22 @@ function EnginesPane() {
   const [roles, setRolesState] = React.useState<Roles | null>(null);
   const groups = useModelGroups();
   const [favorites, setFavorites] = React.useState<string[]>([]);
+  const [browserAvail, setBrowserAvail] = React.useState<{ ok: boolean; reason?: string } | null>(null);
+  const [appSettings, setAppSettings] = React.useState<AppSettings | null>(null);
+  const [chromeProfiles, setChromeProfiles] = React.useState<ChromeProfile[]>([]);
+  React.useEffect(() => {
+    void api.browserAvailable().then(setBrowserAvail).catch(() => setBrowserAvail({ ok: false }));
+    void api.getSettings().then(setAppSettings).catch(() => {});
+    void api.listChromeProfiles().then(setChromeProfiles).catch(() => {});
+  }, []);
+  const setChromeProfile = (dir: string) => {
+    setAppSettings(s => (s ? { ...s, chromeProfile: dir } : s));
+    void api.setSettings({ chromeProfile: dir }).then(setAppSettings).catch(() => {});
+  };
+  const setChromeProfileMode = (mode: 'copy' | 'live') => {
+    setAppSettings(s => (s ? { ...s, chromeProfileMode: mode } : s));
+    void api.setSettings({ chromeProfileMode: mode }).then(setAppSettings).catch(() => {});
+  };
 
   const refetch = React.useCallback(() => {
     Promise.all([api.getRouting(), api.engineStatus(), api.getRoles()])
@@ -269,6 +306,10 @@ function EnginesPane() {
     const value = labelToEngine(label);
     setRouting(r => (r ? { ...r, [key]: value } as Routing : r));
     void api.setRouting({ [key]: value } as Partial<Routing>).then(setRouting).catch(() => {});
+  };
+  const setBrowserMode = (mode: 'on' | 'off') => {
+    setRouting(r => (r ? { ...r, browser: mode } : r));
+    void api.setRouting({ browser: mode }).then(setRouting).catch(() => {});
   };
 
   // ONE source of truth: the same status the run path uses, so the pane can
@@ -313,6 +354,48 @@ function EnginesPane() {
             </Row>
           ))}
         </GroupedList>
+        <GroupedList header="Browser" footer="One browser per project — shared across the project's chats (logins & cookies carry over), driven by whichever engine runs the job. When on, Codex runs with full access (matching how Claude already runs) so it can use the browser too.">
+          <Row last={chromeProfiles.length === 0}>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Browser automation</span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: browserAvail && !browserAvail.ok ? 'var(--orange, #d9821b)' : 'var(--ink-secondary)', marginTop: 2 }}>
+                {browserAvail ? (browserAvail.ok ? 'A real Chrome is ready for your agents to drive.' : (browserAvail.reason ?? 'Google Chrome not found.')) : 'Checking for Chrome…'}
+              </span>
+            </span>
+            {routing
+              ? <Seg options={['On', 'Off']} value={routing.browser === 'off' ? 'Off' : 'On'} onChange={v => setBrowserMode(v === 'On' ? 'on' : 'off')} />
+              : <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</span>}
+          </Row>
+          {chromeProfiles.length > 0 && (
+            <Row last={!appSettings?.chromeProfile}>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Chrome profile</span>
+                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
+                  {appSettings?.chromeProfile ? 'Maestro inherits this profile’s logins & history — never touching your real Chrome.' : 'Isolated: a fresh browser per project (no sign-ins carried over).'}
+                </span>
+              </span>
+              <select value={appSettings?.chromeProfile || ''} onChange={e => setChromeProfile(e.target.value)}
+                style={{ height: 30, maxWidth: 200, padding: '0 8px', borderRadius: 8, border: '1px solid var(--hairline)', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
+                <option value="">Isolated (per project)</option>
+                {chromeProfiles.map(p => <option key={p.dir} value={p.dir}>{p.name}</option>)}
+              </select>
+            </Row>
+          )}
+          {chromeProfiles.length > 0 && appSettings?.chromeProfile && (
+            <Row last>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>How to use it</span>
+                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
+                  {(appSettings?.chromeProfileMode ?? 'copy') === 'live'
+                    ? 'Live: drives your real Chrome profile (always in sync) — quit Chrome before running.'
+                    : 'Copy: signs in Maestro’s own browser using this profile’s cookies (one-time Keychain “Allow”). Your Chrome is never opened.'}
+                </span>
+              </span>
+              <Seg options={['Copy', 'Live']} value={(appSettings?.chromeProfileMode ?? 'copy') === 'live' ? 'Live' : 'Copy'} onChange={v => setChromeProfileMode(v === 'Live' ? 'live' : 'copy')} />
+            </Row>
+          )}
+        </GroupedList>
+
         <GroupedList header="Engine status" footer="Engines use your own sign-ins on this Mac — Claude Code (`claude login`) and Codex (ChatGPT). Cursor needs its agent CLI installed.">
           {ENGINE_STATUS_ROWS.map((row) => {
             const s = engines?.[row.id];
@@ -353,6 +436,7 @@ const REAL_PROVIDERS: { id: ProviderId; name: string; tint: string; glyph: strin
   { id: 'anthropic', name: 'Anthropic', tint: '#D97757', glyph: 'A', meta: 'Claude · coding & reasoning', hint: 'sk-ant-…' },
   { id: 'openai', name: 'OpenAI', tint: 'var(--ink)', glyph: 'O', meta: 'GPT · media & vision', hint: 'sk-…' },
   { id: 'fal', name: 'fal.ai', tint: 'var(--purple)', glyph: 'f', meta: 'Media · image, video, voice', hint: 'key_id:key_secret' },
+  { id: 'github', name: 'GitHub', tint: 'var(--ink)', glyph: 'G', meta: 'Repos · clone & create', hint: 'ghp_… (Personal Access Token)' },
 ];
 const OTHER_PROVIDERS = [
   { name: 'Replicate', tint: 'var(--teal)', glyph: 'R' },
@@ -651,7 +735,7 @@ export default function Settings() {
                 {SET_NAV.map(n => {
                   const on = sec === n.key;
                   return (
-                    <button key={n.key} onClick={() => setSec(n.key)} className={on ? '' : 'set-nav'} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 38, padding: '0 10px', borderRadius: 8, textAlign: 'left',
+                    <button key={n.key} onClick={() => n.key === 'skills' ? navigate('/skills-registry') : n.key === 'costs' ? navigate('/budget') : setSec(n.key)} className={on ? '' : 'set-nav'} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 38, padding: '0 10px', borderRadius: 8, textAlign: 'left',
                       background: on ? 'var(--blue)' : 'transparent', color: on ? '#fff' : 'var(--ink)', font: `${on ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`, transition: 'background 140ms ease' }}>
                       <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: on ? 'rgba(255,255,255,0.2)' : `color-mix(in srgb, ${n.tint} 14%, transparent)`, color: on ? '#fff' : n.tint }}><Icon name={n.icon} size={15} /></span>
                       {n.label}

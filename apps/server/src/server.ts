@@ -16,6 +16,7 @@ import websocket from '@fastify/websocket';
 import { randomUUID } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import type { WebSocket } from 'ws';
+import { registerRegistry } from './registry.js';
 
 interface Snapshot {
   workspace?: unknown;
@@ -360,6 +361,9 @@ export function buildServer(): FastifyInstance {
       sseClients.delete(res);
     });
   });
+
+  // Skill registry (read-only reference content, public, /registry/* — see registry.ts).
+  registerRegistry(app);
 
   return app;
 }

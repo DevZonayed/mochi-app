@@ -29,7 +29,7 @@ export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
-export type ProjectKind = 'coding' | 'content' | 'research' | 'general';
+export type ProjectKind = 'coding' | 'design' | 'content' | 'research' | 'general';
 
 export interface Workspace { id: string; name: string; budgetCap: number; createdAt: number }
 export interface Project {
@@ -40,26 +40,67 @@ export interface Project {
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
     final result. The chat renders these as separate blocks with timings. */
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result' | 'ask';
-  /** text/result: the content. tool: short detail (command, file, query…). ask: prompt. */
+  kind: 'text' | 'tool' | 'result' | 'ask' | 'review' | 'image';
+  /** text/result: the content. tool: short detail (command, file, query…). ask: prompt. review: the findings. image: a short caption (the prompt). */
   text: string;
-  /** tool only */
+  /** tool: tool name. review: the reviewer engine's label. */
   name?: string;
   toolStatus?: 'running' | 'done' | 'error';
+  /** review only: the reviewer's verdict. */
+  verdict?: 'approved' | 'needs-work';
+  /** review only: the primary went on to fix the flagged findings → show as resolved. */
+  resolved?: boolean;
   durMs?: number;
   /** file-writing tools only: a capped snapshot of the content written, for the hover preview. */
   preview?: string;
   /** ask only: JSON of the AskUserQuestion input ({ questions:[{question,header,options,multiSelect}] }). */
   ask?: string;
+  /** image only: the Asset id this image was registered as (resolved to bytes on the Mac via the maestro:assetImage IPC — never sent to the relay). */
+  assetId?: string;
+  /** image only: absolute local path on this Mac (used for reveal-in-Finder/copy; STRIPPED from the relay snapshot). */
+  imagePath?: string;
+  /** image only: alt text / the generation prompt. */
+  alt?: string;
+  /** image only: pixel dimensions, when known. */
+  width?: number;
+  height?: number;
   ts: number;
+}
+
+/** An image attached to a user message (pasted, dropped, or picked) — vision
+    input for the agent. Stored as an Asset; the bytes stay on the Mac (imagePath
+    is stripped from the relay snapshot). */
+export interface ChatImage { assetId: string; imagePath: string; mime: string; name?: string; width?: number; height?: number }
+
+/** A non-image file attached to a user message. 'text' (pasted text or a code/
+    text file) carries its content inline (the engine inlines it; content is
+    stripped from the relay snapshot). 'file' (any binary, e.g. a PDF) is saved on
+    the Mac and the engine references its path (also stripped from the relay). */
+export interface ChatFile {
+  name: string;
+  kind: 'text' | 'file';
+  mime?: string;
+  bytes?: number;
+  /** text only: the file's content, inlined into the prompt. Stripped from the relay. */
+  content?: string;
+  /** file only: Mac-local saved path. Stripped from the relay. */
+  path?: string;
+  /** short display preview (first chars / filename). */
+  preview?: string;
 }
 
 export interface Job {
   id: string; projectId: string; title: string; status: JobStatus; phase: string; progress: number;
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
   engine?: EngineId; model?: string;
+  /** Goal mode: this turn ran autonomously toward the goal (SP2). */
+  goal?: boolean;
   /** Chat turn: set when this job is one turn of a project chat session. */
   sessionId?: string;
+  /** Images attached to the user's message (vision input). */
+  inputImages?: ChatImage[];
+  /** Non-image files attached to the user's message (text inlined, files referenced). */
+  inputFiles?: ChatFile[];
   /** Structured run log (assistant text blocks, tool calls, result) — capped. */
   transcript?: TranscriptItem[];
   createdAt: number; updatedAt: number;
@@ -76,6 +117,8 @@ export interface ChatSession {
   /** Per-chat model overrides; absent = the workspace role defaults apply. */
   primary?: RoleChoice;
   reviewer?: RoleChoice | 'off';
+  /** Isolated git branch for this chat (Conductor-style), once checked out. */
+  branch?: string;
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
@@ -110,8 +153,11 @@ export interface Routing {
   video: EngineId;
   /** Model-level primary/reviewer roles (SP1). */
   roles?: Roles;
+  /** Native browser automation — 'on' makes a real Chrome available to whichever
+      engine runs the job (Claude + Codex alike); 'off' withholds the tools. */
+  browser?: 'on' | 'off';
 }
-export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex', roles: { ...DEFAULT_ROLES } };
+export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex', roles: { ...DEFAULT_ROLES }, browser: 'on' };
 
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
@@ -214,6 +260,14 @@ export interface AppSettings {
   rescanCadence: 'daily' | 'weekly' | 'onchange';
   /** Picker keys the user starred — surfaced first in the model picker. */
   favoriteModels?: string[];
+  /** Chrome profile directory (e.g. 'Default', 'Profile 1') the browser should
+      inherit cookies/logins/passwords from. Empty/undefined = isolated per-project
+      profiles (Maestro-managed). */
+  chromeProfile?: string;
+  /** How a chosen Chrome profile is used: 'copy' (default) warm-starts Maestro's
+      own browser from a one-time copy of the profile's logins; 'live' drives the
+      real Chrome profile (requires the user's Chrome to be quit). */
+  chromeProfileMode?: 'copy' | 'live';
 }
 export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [] };
 
@@ -269,6 +323,48 @@ interface StoreData {
   whatsapp: WhatsAppState;
   /** Locally (safeStorage-)encrypted provider API keys, base64. Never leaves this Mac. */
   providerKeys: Record<string, { cipherB64: string; last4: string; createdAt: number }>;
+  /** Browser memory: per-domain operating notes the agent saves and auto-recalls
+      (selectors, login quirks, where buttons are) so it doesn't re-learn a site
+      every visit. Mac-local; never in relay snapshots. */
+  browserMemory?: Record<string, { note: string; updatedAt: number }>;
+  /** Per-design element comments (Mochi-style): a CSS selector into the live
+      design artifact + the operator's note. The design agent reads these to
+      revise specific elements. Keyed by projectId. Mac-local; never relayed. */
+  designComments?: Record<string, DesignComment[]>;
+  /** Skills installed into a project (from the registry). The files live on disk
+      at <project>/.claude/skills/<slug>/; this records the metadata for the UI +
+      Codex prompt-injection. Keyed by projectId. Mac-local. */
+  installedSkills?: Record<string, InstalledSkill[]>;
+}
+
+/** A registry skill installed into a project (metadata mirror of the on-disk folder). */
+export interface InstalledSkill {
+  id: string;          // registry id, e.g. anthropics/skills/frontend-design
+  slug: string;        // on-disk folder name under .claude/skills/
+  name: string;
+  description?: string;
+  risk?: string;
+  source?: string;     // upstream GitHub url
+  version?: string;
+  sha256?: string;
+  enabled?: boolean;
+  disabledReason?: string | null;
+  mirrorRepo?: string | null;
+  auditStatus?: string | null;
+  /** Who installed it: 'operator' from the UI, 'agent' when the model self-installed mid-run. */
+  addedBy?: 'operator' | 'agent';
+  installedAt: number;
+}
+
+/** A note anchored to a specific element of a live design (by CSS selector). */
+export interface DesignComment {
+  id: string;
+  projectId: string;
+  selector: string;
+  label: string;            // human glyph for the element, e.g. `button · "Get started"`
+  note: string;
+  status: 'open' | 'resolved';
+  createdAt: number;
 }
 
 const CATALOG_VERSION = 2;
@@ -302,6 +398,11 @@ export class Store {
       // migrations for stores written by older builds (dirty-flag pattern)
       if (!this.data.accessToken) { this.data.accessToken = newPairingToken(); dirty = true; }
       if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
+      // Native browser automation — default-on for stores written before it existed.
+      if (this.data.routing && !this.data.routing.browser) { this.data.routing.browser = 'on'; dirty = true; }
+      if (!this.data.browserMemory) { this.data.browserMemory = {}; dirty = true; }
+      if (!this.data.designComments) { this.data.designComments = {}; dirty = true; }
+      if (!this.data.installedSkills) { this.data.installedSkills = {}; dirty = true; }
       // SP1: seed model-level roles on older stores from the engine-level fields.
       if (this.data.routing && !this.data.routing.roles) {
         const r = this.data.routing;
@@ -407,6 +508,95 @@ export class Store {
     return this.getSettings();
   }
 
+  // ── Browser memory (per-domain operating notes the agent recalls) ───────
+  getBrowserMemory(domain: string): string {
+    return this.data.browserMemory?.[(domain || '').toLowerCase()]?.note ?? '';
+  }
+  setBrowserMemory(domain: string, note: string): void {
+    const key = (domain || '').toLowerCase().trim();
+    if (!key) return;
+    if (!this.data.browserMemory) this.data.browserMemory = {};
+    const trimmed = (note ?? '').slice(0, 4000);
+    if (!trimmed) { delete this.data.browserMemory[key]; }
+    else { this.data.browserMemory[key] = { note: trimmed, updatedAt: Date.now() }; }
+    // Cap total domains — evict the least-recently-updated past 300.
+    const entries = Object.entries(this.data.browserMemory);
+    if (entries.length > 300) {
+      entries.sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+      for (const [k] of entries.slice(0, entries.length - 300)) delete this.data.browserMemory[k];
+    }
+    this.save();
+  }
+
+  // ── Design comments (per-element notes the design agent revises against) ──
+  listDesignComments(projectId: string): DesignComment[] {
+    return this.data.designComments?.[projectId] ?? [];
+  }
+  addDesignComment(projectId: string, c: { selector: string; label: string; note: string }): DesignComment {
+    if (!this.data.designComments) this.data.designComments = {};
+    const list = this.data.designComments[projectId] ?? (this.data.designComments[projectId] = []);
+    const comment: DesignComment = {
+      id: id(), projectId,
+      selector: (c.selector || '').slice(0, 600),
+      label: (c.label || '').slice(0, 200),
+      note: (c.note || '').slice(0, 2000),
+      status: 'open', createdAt: Date.now(),
+    };
+    list.push(comment);
+    if (list.length > 200) list.splice(0, list.length - 200); // cap per design
+    this.save();
+    return comment;
+  }
+  setDesignCommentStatus(projectId: string, commentId: string, status: 'open' | 'resolved'): void {
+    const c = this.data.designComments?.[projectId]?.find(x => x.id === commentId);
+    if (!c) return;
+    c.status = status; this.save();
+  }
+  deleteDesignComment(projectId: string, commentId: string): void {
+    const list = this.data.designComments?.[projectId]; if (!list) return;
+    this.data.designComments![projectId] = list.filter(x => x.id !== commentId);
+    this.save();
+  }
+
+  // ── Installed skills (registry skills copied into a project) ─────────────
+  listInstalledSkills(projectId: string): InstalledSkill[] {
+    return this.data.installedSkills?.[projectId] ?? [];
+  }
+  recordSkillInstall(projectId: string, s: Omit<InstalledSkill, 'installedAt'>): InstalledSkill {
+    if (!this.data.installedSkills) this.data.installedSkills = {};
+    const list = this.data.installedSkills[projectId] ?? (this.data.installedSkills[projectId] = []);
+    const rec: InstalledSkill = { ...s, installedAt: Date.now() };
+    const i = list.findIndex(x => x.id === s.id || x.slug === s.slug);
+    if (i >= 0) list[i] = rec; else list.push(rec);
+    this.save();
+    return rec;
+  }
+  removeInstalledSkill(projectId: string, idOrSlug: string): void {
+    const list = this.data.installedSkills?.[projectId]; if (!list) return;
+    this.data.installedSkills![projectId] = list.filter(x => x.id !== idOrSlug && x.slug !== idOrSlug);
+    this.save();
+  }
+  /** Flip a project skill's enabled flag (the on-disk SKILL.md move is done by the caller). */
+  setInstalledSkillEnabled(projectId: string, idOrSlug: string, enabled: boolean): InstalledSkill | null {
+    const list = this.data.installedSkills?.[projectId]; if (!list) return null;
+    const rec = list.find(x => x.id === idOrSlug || x.slug === idOrSlug); if (!rec) return null;
+    rec.enabled = enabled;
+    if (enabled) rec.disabledReason = null;
+    this.save();
+    return rec;
+  }
+  /** Upsert a bare record for a skill found on disk but not yet tracked (e.g. dropped in manually). */
+  ensureInstalledSkill(projectId: string, rec: Omit<InstalledSkill, 'installedAt'>): InstalledSkill {
+    if (!this.data.installedSkills) this.data.installedSkills = {};
+    const list = this.data.installedSkills[projectId] ?? (this.data.installedSkills[projectId] = []);
+    const existing = list.find(x => x.id === rec.id || x.slug === rec.slug);
+    if (existing) return existing;
+    const full: InstalledSkill = { ...rec, installedAt: Date.now() };
+    list.push(full);
+    this.save();
+    return full;
+  }
+
   // ── Workspace ───────────────────────────────────────────────────────
   workspace(): Workspace | null { return this.data.workspace; }
   createWorkspace(name: string, budgetCap = 200): Workspace {
@@ -476,7 +666,7 @@ export class Store {
     this.data.sessions.push(s); this.save();
     return s;
   }
-  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer'>>): ChatSession {
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch'>>): ChatSession {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     Object.assign(s, patch, { updatedAt: now() });
@@ -511,18 +701,20 @@ export class Store {
     return projectId ? all.filter(j => j.projectId === projectId) : all.slice(0, 200);
   }
   getJob(jobId: string): Job | undefined { return this.data.jobs.find(j => j.id === jobId); }
-  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string): Job {
+  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[], inputFiles?: ChatFile[]): Job {
     const t = now();
     const j: Job = {
-      id: id(), projectId, title: title || input.slice(0, 60), status: 'pending', phase: 'Queued', progress: 0,
+      id: id(), projectId, title: title || input.slice(0, 60) || (inputImages?.length ? 'Image' : inputFiles?.length ? inputFiles[0].name : 'Message'), status: 'pending', phase: 'Queued', progress: 0,
       input, output: null, error: null, effort: effort ?? this.data.settings.defaultEffort, cost: 0, tokens: 0, stage: '',
       sessionId,
+      ...(inputImages && inputImages.length ? { inputImages } : {}),
+      ...(inputFiles && inputFiles.length ? { inputFiles } : {}),
       createdAt: t, updatedAt: t,
     };
     this.data.jobs.push(j); this.save();
     return j;
   }
-  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'transcript'>>): Job {
+  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript'>>): Job {
     const cur = this.getJob(jobId);
     if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });
@@ -637,6 +829,41 @@ export class Store {
     return all.slice(0, 200);
   }
   getAsset(assetId: string): Asset | undefined { return this.data.assets.find(a => a.id === assetId); }
+  /** Relay-safe projection of an Asset: drops the Mac-local path, the base64
+      thumbnail, the content hash, and the fal queue URLs. Used for BOTH the
+      snapshot and the live 'asset' event so none of those ever cross the relay. */
+  slimAssetForRelay(a: Asset): Partial<Asset> {
+    return {
+      id: a.id, projectId: a.projectId, source: a.source, kind: a.kind, stage: a.stage,
+      prompt: a.prompt ? a.prompt.slice(0, 200) : undefined, model: a.model, status: a.status,
+      url: a.url, name: a.name, bytes: a.bytes, tint: a.tint, cost: a.cost,
+      durationS: a.durationS, width: a.width, height: a.height, error: a.error,
+      createdAt: a.createdAt, updatedAt: a.updatedAt,
+    };
+  }
+  /** Relay-safe projection of a Job: truncate long output, trim the run log, and
+      strip every Mac-local image path (attached inputImages AND transcript image
+      items) so the phone never learns a filesystem path. Used by BOTH the snapshot
+      and the live 'job' event / command results, so no channel can leak it. */
+  slimJobForRelay(j: Job): Job {
+    const out = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
+    const tr = j.transcript;
+    const slimItem = (t: TranscriptItem): TranscriptItem => {
+      if (t.kind === 'image') { const { imagePath: _omit, ...rest } = t; return rest; }
+      return t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t;
+    };
+    const transcript = !tr ? undefined
+      : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image')) ? tr
+      : tr.slice(-60).map(slimItem);
+    const needsImgStrip = j.inputImages?.some(im => im.imagePath !== undefined);
+    const inputImages = needsImgStrip ? j.inputImages!.map(({ imagePath: _omit, ...rest }) => rest as ChatImage) : j.inputImages;
+    // Attached files: strip the inlined text content + the Mac-local path; the
+    // phone keeps only name/kind/mime/bytes/preview.
+    const needsFileStrip = j.inputFiles?.some(f => f.content !== undefined || f.path !== undefined);
+    const inputFiles = needsFileStrip ? j.inputFiles!.map(({ content: _c, path: _p, ...rest }) => rest as ChatFile) : j.inputFiles;
+    if (out === j.output && transcript === tr && inputImages === j.inputImages && inputFiles === j.inputFiles) return j;
+    return { ...j, output: out, transcript, ...(inputImages !== j.inputImages ? { inputImages } : {}), ...(inputFiles !== j.inputFiles ? { inputFiles } : {}) };
+  }
   createAsset(args: Partial<Asset> & { source: Asset['source']; kind: AssetKind; status: AssetStatus }): Asset {
     const t = now();
     const a: Asset = {
@@ -1020,23 +1247,8 @@ export class Store {
   /** Full snapshot pushed to the relay so phone/web remotes can mirror this Mac.
       Slimmed: queue/file paths and thumbs never leave the Mac; long outputs truncate. */
   snapshot(providers: unknown): Record<string, unknown> {
-    const slimJob = (j: Job): Job => {
-      const out = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
-      // Remotes get a trimmed run log: last 60 items, long text blocks truncated.
-      // Skip the allocation entirely when nothing actually needs trimming.
-      const tr = j.transcript;
-      const transcript = !tr ? undefined
-        : (tr.length <= 60 && !tr.some(t => t.text.length > 4000)) ? tr
-        : tr.slice(-60).map(t => (t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t));
-      return out === j.output && transcript === tr ? j : { ...j, output: out, transcript };
-    };
-    const slimAsset = (a: Asset) => ({
-      id: a.id, projectId: a.projectId, source: a.source, kind: a.kind, stage: a.stage,
-      prompt: a.prompt ? a.prompt.slice(0, 200) : undefined, model: a.model, status: a.status,
-      url: a.url, name: a.name, bytes: a.bytes, tint: a.tint, cost: a.cost,
-      durationS: a.durationS, width: a.width, height: a.height, error: a.error,
-      createdAt: a.createdAt, updatedAt: a.updatedAt,
-    });
+    const slimJob = (j: Job): Job => this.slimJobForRelay(j);
+    const slimAsset = (a: Asset) => this.slimAssetForRelay(a);
     const dashboard = this.dashboard();
     return {
       workspace: this.data.workspace,
