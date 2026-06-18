@@ -39,6 +39,19 @@ let win: BrowserWindow | null = null;
 if (process.env.MAESTRO_SMOKE) {
   try { app.setPath('userData', path.join(app.getPath('temp'), 'maestro-smoke-' + Date.now())); } catch { /* pre-ready getPath may vary */ }
 }
+// Clean-room test instance (MAESTRO_USER_DATA_DIR=<dir>): run against a fresh,
+// isolated profile so the app behaves like a first launch — empty projects,
+// no connected accounts, onboarding shown. Useful for testing setup/auth flows
+// without touching your real data. Engines are shared by default (see line ~275)
+// so the heavy binaries aren't re-downloaded.
+if (process.env.MAESTRO_USER_DATA_DIR) {
+  try {
+    const raw = process.env.MAESTRO_USER_DATA_DIR;
+    const dir = raw.startsWith('~/') || raw === '~' ? path.join(app.getPath('home'), raw.slice(1)) : path.resolve(raw);
+    mkdirSync(dir, { recursive: true });
+    app.setPath('userData', dir);
+  } catch { /* fall back to the default profile */ }
+}
 
 /* The Design genre's live preview serves a project's folder over a private,
    standard scheme so the artifact (design/index.html) + its images/fonts resolve
@@ -270,9 +283,15 @@ app.whenReady().then(() => {
     relay?.pushSnapshot();
   };
 
-  // Engine binaries (Codex / Claude) are downloaded on demand into userData
-  // rather than bundled — point the store at this Mac's per-user data dir.
-  setEnginesRoot(path.join(app.getPath('userData'), 'engines'));
+  // Engine binaries (Codex / Claude / gh) are downloaded on demand into userData
+  // rather than bundled — point the store at this Mac's per-user data dir. A
+  // clean-room test instance can set MAESTRO_ENGINES_DIR to the real profile's
+  // engines so it shares them instead of re-downloading hundreds of MB.
+  {
+    const raw = process.env.MAESTRO_ENGINES_DIR;
+    const enginesDir = raw ? (raw.startsWith('~/') || raw === '~' ? path.join(app.getPath('home'), raw.slice(1)) : path.resolve(raw)) : path.join(app.getPath('userData'), 'engines');
+    setEnginesRoot(enginesDir);
+  }
 
   const engine = new LocalEngine(store, emit, providers);
   const media = new MediaEngine(store, emit, () => providers.getLocalKey('fal'));

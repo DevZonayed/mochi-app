@@ -357,6 +357,10 @@ interface ProjectJob {
 
 /* ── live-data adapters: map api.Job → the ProjectJob shape the render expects ── */
 const EFFORT_TO_API: Record<EffortStop, Effort> = { FAST: 'fast', BALANCED: 'balanced', DEEP: 'deep', MAX: 'max' };
+// Chat content width. The transcript + composer share this so they stay aligned;
+// wide enough to fill the pane (no wasted side gutters) but capped so prose stays
+// readable on ultra-wide monitors. Bump toward 100% for fully edge-to-edge.
+const CHAT_W = 1180;
 
 const API_STATUS_TO_LOCAL: Record<Job['status'], JobStatus> = {
   pending: 'scheduled',
@@ -1330,8 +1334,29 @@ function parseAsk(json?: string): AskQuestion[] {
   } catch { return []; }
 }
 
+/* AskUserQuestion auto-answer: which option is the recommended one (mirrors the
+   engine's pick so the highlighted option matches what fires on timeout), the next
+   escalating-extend step, and the graceful-pause note shown past the 30-min cap. */
+const ASK_RECO_RE = /\b(recommend|recommended|default|suggested|suggest|preferred)\b/i;
+const isRecommendedOpt = (o: { label: string; description?: string }) => ASK_RECO_RE.test(o.label) || (!!o.description && ASK_RECO_RE.test(o.description));
+const ASK_GRACEFUL_NOTE = '⏸ Paused — reply whenever you get a moment and I’ll pick up right from here.';
+/** Next extend increment in minutes (+5, +10, +15…), and whether it would hit the 30-min cap. */
+const nextExtendStep = (extendsSoFar: number) => 5 * (extendsSoFar + 1);
+const extendWouldCap = (extendsSoFar: number) => {
+  const k = extendsSoFar + 1; // base 5 + 5*(1+2+…+k); cap 30 min
+  return 5 * (1 + (k * (k + 1)) / 2) > 30;
+};
+
+/** Self-ticking countdown for the auto-answer deadline — owns its 1s timer so the
+    surrounding turn isn't re-rendered every second. */
+function AskCountdown({ deadline }: { deadline: number }) {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => { const t = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(t); }, []);
+  return <>{fmtCountdown(deadline - now)}</>;
+}
+
 /** One option as a compact selectable row (used when options carry descriptions). */
-function OptionRow({ label, description, on, multi, answered, onPick }: { label: string; description?: string; on: boolean; multi: boolean; answered: boolean; onPick: () => void }) {
+function OptionRow({ label, description, on, multi, answered, onPick, recommended }: { label: string; description?: string; on: boolean; multi: boolean; answered: boolean; onPick: () => void; recommended?: boolean }) {
   return (
     <button disabled={answered} onClick={onPick} className="opt-row" style={{
       display: 'flex', alignItems: description ? 'flex-start' : 'center', gap: 9, width: '100%', padding: '6px 9px', borderRadius: 9, textAlign: 'left',
@@ -1341,17 +1366,27 @@ function OptionRow({ label, description, on, multi, answered, onPick }: { label:
         {on && <Icon name="check" size={9} stroke={3.2} />}
       </span>
       <span style={{ minWidth: 0, flex: 1 }}>
-        <span style={{ display: 'block', font: '500 13.5px/1.3 var(--font-text)', color: 'var(--ink)' }}>{label}</span>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6, font: '500 13.5px/1.3 var(--font-text)', color: 'var(--ink)' }}>
+          {label}
+          {recommended && <span style={{ flexShrink: 0, height: 15, padding: '0 6px', borderRadius: 5, display: 'inline-flex', alignItems: 'center', background: 'color-mix(in srgb, var(--blue) 15%, transparent)', color: 'var(--blue)', font: '700 8.5px/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase' }}>Recommended</span>}
+        </span>
         {description && <span style={{ display: 'block', font: '400 12px/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 1 }}>{description}</span>}
       </span>
     </button>
   );
 }
 
-function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (text: string) => void; answered: boolean }) {
+function QuestionCard({ ask, onAnswer, answered, pending, onExtend, onCancel }: { ask?: string; onAnswer: (text: string) => void; answered: boolean; pending?: Schedule | null; onExtend?: () => void; onCancel?: () => void }) {
   const questions = parseAsk(ask);
   const [picked, setPicked] = React.useState<Record<number, Set<string>>>({});
   const [custom, setCustom] = React.useState('');
+  // Live auto-answer countdown state (only on the active, unanswered card).
+  const counting = !answered && !!pending && !pending.paused && !!pending.fireAt;
+  const paused = !answered && !!pending?.paused;
+  const extendsSoFar = pending?.extends ?? 0;
+  const willCap = extendWouldCap(extendsSoFar);
+  // Highlight the option that will fire on timeout, per question (first one only matters).
+  const recoLabels = counting ? questions.map(q => (q.options.find(isRecommendedOpt) ?? q.options[0])?.label) : [];
   if (questions.length === 0) return null;
   const sendCustom = () => { const v = custom.trim(); if (v) { setCustom(''); onAnswer(v); } };
 
@@ -1380,28 +1415,57 @@ function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (te
       <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, marginBottom: 7, font: '600 var(--fs-caption)/1 var(--font-text)', color: answered ? 'var(--green)' : 'var(--ink-tertiary)' }}>
         <Icon name={answered ? 'check' : 'enter'} size={11} stroke={answered ? 2.6 : 2} /> {answered ? 'Answered' : 'Claude is asking'}
       </div>
+      {/* Auto-answer countdown — fires the recommended option on timeout; extend to buy time. */}
+      {counting && pending?.fireAt && (
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 10, padding: '7px 10px', borderRadius: 9,
+          background: 'color-mix(in srgb, var(--blue) 8%, transparent)', border: '0.5px solid color-mix(in srgb, var(--blue) 28%, transparent)' }}>
+          <Icon name="clock" size={13} style={{ color: 'var(--blue)' }} />
+          <span style={{ font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
+            Going with the recommended option in <span style={{ fontWeight: 700, color: 'var(--blue)', fontFamily: 'var(--font-mono)' }}><AskCountdown deadline={pending.fireAt} /></span>
+          </span>
+          <span style={{ flex: 1, minWidth: 4 }} />
+          <button onClick={onExtend} title={willCap ? 'Max wait reached — this pauses it for a manual reply' : `Add ${nextExtendStep(extendsSoFar)} more minutes`}
+            style={{ height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)', cursor: 'pointer', border: '1px solid color-mix(in srgb, var(--blue) 40%, transparent)',
+              background: 'var(--bg-elevated)', color: 'var(--blue)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+            {willCap ? 'Pause — I’ll wait' : `Extend +${nextExtendStep(extendsSoFar)}m`}
+          </button>
+          <button onClick={onCancel} title="Stop the countdown (the question stays — answer whenever)"
+            style={{ height: 26, width: 26, borderRadius: 7, display: 'grid', placeItems: 'center', cursor: 'pointer', border: 'none', background: 'transparent', color: 'var(--ink-tertiary)' }}>
+            <Icon name="x" size={13} />
+          </button>
+        </div>
+      )}
+      {paused && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10, padding: '7px 10px', borderRadius: 9,
+          background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>
+          <Icon name="pause" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} /> {ASK_GRACEFUL_NOTE}
+        </div>
+      )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
         {questions.map((q, qi) => {
           const hasDesc = q.options.some(o => o.description);
           const sel = picked[qi] ?? new Set<string>();
+          const reco = recoLabels[qi];
           const onPick = (label: string) => { if (q.multiSelect) toggle(qi, label, true); else { toggle(qi, label, false); if (!needsSubmit) onAnswer(label); } };
           return (
             <div key={qi}>
               <div style={{ font: '600 14px/1.35 var(--font-text)', color: 'var(--ink)', marginBottom: 8 }}>{q.question}</div>
               {hasDesc ? (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                  {q.options.map((o, oi) => <OptionRow key={oi} label={o.label} description={o.description} on={sel.has(o.label)} multi={!!q.multiSelect} answered={answered} onPick={() => onPick(o.label)} />)}
+                  {q.options.map((o, oi) => <OptionRow key={oi} label={o.label} description={o.description} on={sel.has(o.label)} multi={!!q.multiSelect} answered={answered} onPick={() => onPick(o.label)} recommended={o.label === reco} />)}
                 </div>
               ) : (
                 // No descriptions → efficient quick-reply chips.
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                   {q.options.map((o, oi) => {
                     const on = sel.has(o.label);
+                    const isReco = o.label === reco;
                     return (
                       <button key={oi} disabled={answered} onClick={() => onPick(o.label)} className="opt-chip" style={{
                         display: 'inline-flex', alignItems: 'center', gap: 6, height: 30, padding: '0 12px', borderRadius: 'var(--r-pill)', cursor: answered ? 'default' : 'pointer',
                         background: on ? 'var(--blue)' : 'var(--bg-elevated)', color: on ? '#fff' : 'var(--ink)',
-                        border: `1px solid ${on ? 'var(--blue)' : 'var(--separator-strong)'}`, font: '600 13px/1 var(--font-text)' }}>
+                        border: `1px solid ${on ? 'var(--blue)' : isReco ? 'color-mix(in srgb, var(--blue) 50%, transparent)' : 'var(--separator-strong)'}`,
+                        boxShadow: isReco && !on ? '0 0 0 2px color-mix(in srgb, var(--blue) 14%, transparent)' : 'none', font: '600 13px/1 var(--font-text)' }}>
                         {q.multiSelect && on && <Icon name="check" size={12} stroke={3} />}{o.label}
                       </button>
                     );
@@ -1498,12 +1562,12 @@ function UserBubble({ text, images, files }: { text: string; images?: ChatImage[
   return (
     <div className="chat-msg" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
       {images && images.length > 0 && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: '78%' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: 'min(78%, 640px)' }}>
           {images.map((im, i) => <UserImageThumb key={`${im.assetId}-${i}`} img={im} />)}
         </div>
       )}
       {files && files.length > 0 && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: '78%' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: 'min(78%, 640px)' }}>
           {files.map((f, i) => (
             <div key={i} title={f.name} style={{ display: 'flex', alignItems: 'center', gap: 8, maxWidth: 240, height: 42, padding: '0 12px 0 9px', borderRadius: 11, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-elevated)' }}>
               <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={14} /></span>
@@ -1516,7 +1580,7 @@ function UserBubble({ text, images, files }: { text: string; images?: ChatImage[
         </div>
       )}
       {text && (
-        <div style={{ maxWidth: '78%', padding: '10px 14px', borderRadius: '18px 18px 5px 18px',
+        <div style={{ maxWidth: 'min(78%, 640px)', padding: '10px 14px', borderRadius: '18px 18px 5px 18px',
           background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
           color: '#fff', font: '400 14px/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
           boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
@@ -1705,7 +1769,7 @@ function StreamingBody({ text, keyBase }: { text: string; keyBase: string }): Re
   return <>{renderChatBody(text.slice(0, shownLen), keyBase)}</>;
 }
 
-function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { caretAt?: number; onAnswer?: (t: string) => void; answered?: boolean; jobId?: string }): React.ReactNode[] {
+function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { caretAt?: number; onAnswer?: (t: string) => void; answered?: boolean; jobId?: string; pendingAsk?: Schedule | null; onExtendAsk?: () => void; onCancelAsk?: () => void }): React.ReactNode[] {
   const blocks: React.ReactNode[] = [];
   let i = 0;
   while (i < items.length) {
@@ -1715,7 +1779,7 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
       while (i < items.length && items[i].kind === 'tool') { run.push(items[i]); i++; }
       blocks.push(<ToolGroup key={`${keyPrefix}g${i}`} items={run} />);
     } else if (it.kind === 'ask') {
-      blocks.push(<QuestionCard key={`${keyPrefix}q${i}`} ask={it.ask} onAnswer={opts.onAnswer ?? (() => {})} answered={!!opts.answered} />);
+      blocks.push(<QuestionCard key={`${keyPrefix}q${i}`} ask={it.ask} onAnswer={opts.onAnswer ?? (() => {})} answered={!!opts.answered} pending={opts.pendingAsk ?? null} onExtend={opts.onExtendAsk} onCancel={opts.onCancelAsk} />);
       i++;
     } else if (it.kind === 'review') {
       blocks.push(<ReviewCard key={`${keyPrefix}rv${i}`} item={it} />);
@@ -1742,7 +1806,7 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
 /* React.memo so a ChatPane re-render (typing in the composer, a job event for
    ANOTHER turn) doesn't re-parse the markdown of every settled turn. Only turns
    whose job object actually changed re-render; onRetry/onAnswer are stable. */
-const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer, isLast }: { job: Job; onRetry: (input: string) => void; onAnswer: (text: string) => void; isLast: boolean }) {
+const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer, isLast, pendingAsk, onExtendAsk, onCancelAsk }: { job: Job; onRetry: (input: string) => void; onAnswer: (text: string) => void; isLast: boolean; pendingAsk?: Schedule | null; onExtendAsk?: () => void; onCancelAsk?: () => void }) {
   const live = job.status === 'running' || job.status === 'pending';
   const engineLabel = job.engine === 'codex' ? 'Codex' : 'Claude Code';
   const provider = job.engine === 'codex' ? 'openai' as const : 'anthropic' as const;
@@ -1790,7 +1854,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
     } else {
       body = (
         <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
-          {renderTranscript(transcript, 'a', { caretAt: live ? lastIdx : undefined, onAnswer, answered: !isLast, jobId: job.id })}
+          {renderTranscript(transcript, 'a', { caretAt: live ? lastIdx : undefined, onAnswer, answered: !isLast, jobId: job.id, pendingAsk, onExtendAsk, onCancelAsk })}
         </div>
       );
     }
@@ -2434,25 +2498,30 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
         if (t.projectId && projectId && t.projectId !== projectId) return;
         setBgTasks(list => { const i = list.findIndex(x => x.id === t.id); if (i === -1) return [t, ...list]; const next = list.slice(); next[i] = t; return next; });
       },
-      // Scheduled messages for THIS chat: add when created, drop when fired/cancelled.
+      // Scheduled messages + auto-answer countdowns for THIS chat: add on create,
+      // drop on fire/cancel. auto-answer is kept while enabled (incl. paused) so the
+      // question card can show its countdown / paused note; messages need fireAt>now.
       onSchedule: (s) => {
-        if (s.kind !== 'message' && s.kind !== 'auto-continue') return;
+        const ss = s as Schedule & { deleted?: boolean };
+        if (ss.deleted) { setSchedules(list => list.filter(x => x.id !== ss.id)); return; }
+        if (ss.kind !== 'message' && ss.kind !== 'auto-continue' && ss.kind !== 'auto-answer') return;
         setSchedules(list => {
-          const keep = s.sessionId === activeRef.current && s.enabled && (s.fireAt ?? 0) > Date.now();
-          const without = list.filter(x => x.id !== s.id);
-          return keep ? [...without, s] : without;
+          const without = list.filter(x => x.id !== ss.id);
+          const keep = ss.sessionId === activeRef.current && ss.enabled && (ss.kind === 'auto-answer' || (ss.fireAt ?? 0) > Date.now());
+          return keep ? [...without, ss] : without;
         });
       },
     });
     return unsub;
   }, [projectId]);
 
-  // Seed this chat's upcoming scheduled messages (records persist across restart).
+  // Seed this chat's upcoming schedules (persist across restart): messages with a
+  // future fire time, plus any live auto-answer countdown.
   React.useEffect(() => {
     if (!activeId) { setSchedules([]); return; }
     let alive = true;
     void api.listSchedules()
-      .then(rows => { if (alive) setSchedules(rows.filter(s => (s.kind === 'message' || s.kind === 'auto-continue') && s.sessionId === activeId && s.enabled && (s.fireAt ?? 0) > Date.now())); })
+      .then(rows => { if (alive) setSchedules(rows.filter(s => s.sessionId === activeId && s.enabled && (s.kind === 'auto-answer' || ((s.kind === 'message' || s.kind === 'auto-continue') && (s.fireAt ?? 0) > Date.now())))); })
       .catch(() => {});
     return () => { alive = false; };
   }, [activeId]);
@@ -2467,9 +2536,37 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   // Visible queue: future messages, soonest first; a fired item lingers ≤35s as a
   // fallback in case the prune event is missed, then drops on its own.
   const upcomingSched = React.useMemo(
-    () => schedules.filter(s => (s.fireAt ?? 0) > schedNow - 35_000).sort((a, b) => (a.fireAt ?? 0) - (b.fireAt ?? 0)),
+    () => schedules.filter(s => (s.kind === 'message' || s.kind === 'auto-continue') && (s.fireAt ?? 0) > schedNow - 35_000).sort((a, b) => (a.fireAt ?? 0) - (b.fireAt ?? 0)),
     [schedules, schedNow],
   );
+  // The live AskUserQuestion auto-answer countdown for this chat (at most one).
+  const pendingAsk = React.useMemo(
+    () => schedules.find(s => s.kind === 'auto-answer' && s.sessionId === activeId && s.enabled) ?? null,
+    [schedules, activeId],
+  );
+  const schedulesRef = React.useRef(schedules);
+  schedulesRef.current = schedules;
+  // Answer a surfaced question: cancels the countdown and resumes the session with the
+  // choice tagged `[User answered AskUserQuestion]:` so the agent treats it as the answer.
+  const answerLiveQuestion = React.useCallback((text: string) => {
+    const sid = activeRef.current; const t = text.trim();
+    if (!sid || !t) return;
+    setSchedules(list => list.filter(s => !(s.kind === 'auto-answer' && s.sessionId === sid))); // drop countdown
+    void api.answerQuestion({ sessionId: sid, answer: t })
+      .then(job => setTurns(ts => [...ts.filter(x => x.id !== job.id), job].sort((a, b) => a.createdAt - b.createdAt)))
+      .catch(e => setSendError(e instanceof Error ? e.message : 'Could not send your answer — try again.'));
+  }, []);
+  const extendLiveQuestion = React.useCallback(() => {
+    const sid = activeRef.current; if (!sid) return;
+    void api.extendQuestion(sid).then(s => setSchedules(list => upsertSchedule(list, s))).catch(() => {});
+  }, []);
+  const cancelLiveQuestion = React.useCallback(() => {
+    const sid = activeRef.current; if (!sid) return;
+    const pend = schedulesRef.current.find(s => s.kind === 'auto-answer' && s.sessionId === sid);
+    if (!pend) return;
+    setSchedules(list => list.filter(s => s.id !== pend.id));
+    void api.deleteSchedule(pend.id).catch(() => {});
+  }, []);
 
   // Seed the background-task list for this project (records persist across turns).
   React.useEffect(() => {
@@ -2761,7 +2858,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
         background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
       <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
-        <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
+        <div style={{ maxWidth: CHAT_W, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
           {turns.length === 0 && (
             <div style={{ padding: '52px 20px 20px', textAlign: 'center' }}>
               <span style={{ width: 56, height: 56, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
@@ -2789,7 +2886,10 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
             {turns.map((t, i) => (
               <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
                 <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />
-                <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText} onAnswer={sendText} />
+                <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText}
+                  onAnswer={i === turns.length - 1 ? answerLiveQuestion : sendText}
+                  pendingAsk={i === turns.length - 1 ? pendingAsk : null}
+                  onExtendAsk={extendLiveQuestion} onCancelAsk={cancelLiveQuestion} />
               </div>
             ))}
           </ImageOpenContext.Provider>
@@ -2811,7 +2911,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
 
       {/* composer — one floating card */}
       <div style={{ position: 'relative', zIndex: 2, padding: '0 20px 16px' }}>
-        <div style={{ maxWidth: 760, margin: '0 auto' }}>
+        <div style={{ maxWidth: CHAT_W, margin: '0 auto' }}>
           {sendError && (
             <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 7, padding: '8px 11px', borderRadius: 10, background: 'color-mix(in srgb, var(--red) 9%, var(--bg-elevated))',
               font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)' }}><Icon name="alert" size={13} /> {sendError}</div>

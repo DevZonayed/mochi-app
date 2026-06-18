@@ -77,6 +77,9 @@ export class CronRunner {
     try { this.firePublish?.(now); } catch { /* non-fatal */ }
     for (const s of this.store.listSchedules()) {
       if (!s.enabled) { this.store.setScheduleNextRun(s.id, null); continue; }
+      // A paused auto-answer (user extended past the cap) holds the question open
+      // indefinitely — never auto-fire; it waits for a manual reply / cancel.
+      if (s.paused) { this.store.setScheduleNextRun(s.id, null); continue; }
       // One-shot "wait & check" / scheduled message: fire once at fireAt, disable.
       if (s.fireAt) {
         if (s.fireAt > now) { this.store.setScheduleNextRun(s.id, s.fireAt); continue; }
