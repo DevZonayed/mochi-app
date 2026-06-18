@@ -209,6 +209,19 @@ export interface Template {
   engine: string;
   createdAt: number;
 }
+/** A literal key/value pair — an env var or an HTTP header. */
+export interface McpKv { key: string; value: string }
+/** A custom MCP server connected via Settings → MCP servers (a Mac-local library).
+    Secrets are referenced by env-var name (bearerTokenEnv / envPassthrough /
+    headerEnv) and resolved on the Mac at spawn time — never stored. */
+export interface CustomMcpServer {
+  id: string; name: string; enabled: boolean; transport: 'stdio' | 'http';
+  command?: string; args?: string[]; env?: McpKv[]; envPassthrough?: string[]; cwd?: string;
+  url?: string; bearerTokenEnv?: string; headers?: McpKv[]; headerEnv?: { key: string; valueEnv: string }[];
+  skillIds: string[]; createdAt: number;
+}
+/** Form payload for creating/updating a custom MCP server (no id/createdAt). */
+export type McpServerInput = Omit<CustomMcpServer, 'id' | 'createdAt'>;
 export interface BudgetData {
   cap: number;
   spent: number;
@@ -920,6 +933,20 @@ export const api = {
     call<{ ok: boolean; skill: InstalledSkill | null }>('setProjectSkillEnabled', { projectId, skillId, enabled }, () => Promise.reject(new Error('desktop only'))),
   toggleSkill: (id: string) =>
     call<Skill>('toggleSkill', { id }, () => req<Skill>(`/api/skills/${encodeURIComponent(id)}/toggle`, { method: 'POST' })),
+
+  // Custom MCP servers — a Mac-local library (the Mac owns all config/execution),
+  // so these are desktop-only (no relay fallback). Enabled servers are merged into
+  // every agent run, and any skills attached to a server are surfaced when it's active.
+  listMcpServers: () =>
+    call<CustomMcpServer[]>('listMcpServers', {}, () => Promise.reject(new Error('desktop only'))),
+  addMcpServer: (input: McpServerInput) =>
+    call<CustomMcpServer>('addMcpServer', { ...input }, () => Promise.reject(new Error('desktop only'))),
+  updateMcpServer: (id: string, input: McpServerInput) =>
+    call<CustomMcpServer>('updateMcpServer', { id, ...input }, () => Promise.reject(new Error('desktop only'))),
+  setMcpServerEnabled: (id: string, enabled: boolean) =>
+    call<CustomMcpServer>('setMcpServerEnabled', { id, enabled }, () => Promise.reject(new Error('desktop only'))),
+  removeMcpServer: (id: string) =>
+    call<{ ok: boolean }>('removeMcpServer', { id }, () => Promise.reject(new Error('desktop only'))),
 
   // Templates
   listTemplates: () => call<Template[]>('listTemplates', {}, () => req<Template[]>('/api/templates')),

@@ -2,7 +2,7 @@
    (over IPC) and remote controls (phone/web via the relay). Every command
    executes locally on this Mac against the local store + local engine. */
 
-import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem, FeedbackCategory, FeedbackContext, FeedbackSource } from './store.js';
+import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem, FeedbackCategory, FeedbackContext, FeedbackSource, CustomMcpServer, McpKv } from './store.js';
 import { answerMessage, nextExtend } from './ask-question.js';
 import { resolveModelKey, buildModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
@@ -20,7 +20,7 @@ import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
 import { scanConversations, parseConversation, type ConvSource } from './conversation-sync.js';
-import { existsSync, mkdirSync, cpSync } from 'node:fs';
+import { existsSync, mkdirSync, cpSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
 import { app } from 'electron';
@@ -45,6 +45,54 @@ function projectRootOf(proj: { name?: string; path?: string }): string {
 
 function asEngine(v: unknown): EngineId | undefined {
   return typeof v === 'string' && ENGINE_VALUES.has(v) ? (v as EngineId) : undefined;
+}
+
+/* ── Custom MCP server input normalization (validate + cap, drop empty rows) ── */
+const recOf = (x: unknown): Record<string, unknown> => (x && typeof x === 'object' ? (x as Record<string, unknown>) : {});
+const mcpStr = (v: unknown, max = 2000): string => (typeof v === 'string' ? v : '').slice(0, max);
+const mcpStrArr = (v: unknown, max = 64): string[] =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').map(x => x.slice(0, 2000)).slice(0, max) : [];
+const mcpKvArr = (v: unknown, max = 64): McpKv[] =>
+  Array.isArray(v)
+    ? v.map(recOf).map(x => ({ key: mcpStr(x.key, 256), value: mcpStr(x.value, 8192) })).filter(x => x.key.trim() !== '').slice(0, max)
+    : [];
+
+/** Validate + normalize a raw custom-MCP-server payload into a store-ready record.
+    Throws (400) on a missing required field. Secrets are never read here — only
+    env-var NAME references are stored; values resolve at spawn time. */
+function normalizeMcpInput(p: Params): Omit<CustomMcpServer, 'id' | 'createdAt'> {
+  const name = mcpStr(p.name, 80).trim();
+  if (!name) bad('name required');
+  const transport = p.transport === 'http' ? 'http' : 'stdio';
+  const enabled = p.enabled === undefined ? true : Boolean(p.enabled);
+  const skillIds = [...new Set(mcpStrArr(p.skillIds, 32).map(s => s.trim()).filter(Boolean))];
+  if (transport === 'stdio') {
+    const command = mcpStr(p.command, 1000).trim();
+    if (!command) bad('command required for a stdio MCP server');
+    return {
+      name, enabled, transport, skillIds, command,
+      args: mcpStrArr(p.args, 64),
+      env: mcpKvArr(p.env),
+      envPassthrough: mcpStrArr(p.envPassthrough, 64).map(s => s.trim()).filter(Boolean),
+      cwd: mcpStr(p.cwd, 1000).trim() || undefined,
+      // Clear any HTTP fields so switching transport on update leaves no stale config.
+      url: undefined, bearerTokenEnv: undefined, headers: undefined, headerEnv: undefined,
+    };
+  }
+  const url = mcpStr(p.url, 2000).trim();
+  if (!url) bad('url required for an HTTP MCP server');
+  if (!/^https?:\/\//i.test(url)) bad('url must start with http:// or https://');
+  const headerEnv = Array.isArray(p.headerEnv)
+    ? p.headerEnv.map(recOf).map(x => ({ key: mcpStr(x.key, 256).trim(), valueEnv: mcpStr(x.valueEnv, 256).trim() })).filter(x => x.key && x.valueEnv).slice(0, 64)
+    : [];
+  return {
+    name, enabled, transport, skillIds, url,
+    bearerTokenEnv: mcpStr(p.bearerTokenEnv, 256).trim() || undefined,
+    headers: mcpKvArr(p.headers),
+    headerEnv,
+    // Clear any stdio fields so switching transport on update leaves no stale config.
+    command: undefined, args: undefined, env: undefined, envPassthrough: undefined, cwd: undefined,
+  };
 }
 /** Model override: an alias (opus/sonnet/haiku) or a full model id — never shell-special. */
 function asModel(v: unknown): string | undefined {
@@ -211,6 +259,28 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
       // ── Coding agent: folders + GitHub clone (git lives on this Mac) ──
       case 'gitAvailable': return { available: gitAvailable() };
+      // Read-only folder browser for the phone's "new project" location picker.
+      // Returns immediate children (names + dir/repo flags) — no file contents.
+      case 'browseDir': {
+        const home = homedir();
+        let dir = typeof p.path === 'string' && p.path ? p.path : home;
+        try { dir = nodePath.resolve(dir); } catch { dir = home; }
+        if (!existsSync(dir)) dir = home;
+        const entries: { name: string; path: string; isDir: boolean; isRepo: boolean }[] = [];
+        let error: string | undefined;
+        try {
+          for (const d of readdirSync(dir, { withFileTypes: true })) {
+            if (d.name.startsWith('.')) continue; // hide dotfiles for a clean picker
+            let isDir = d.isDirectory();
+            const full = nodePath.join(dir, d.name);
+            if (d.isSymbolicLink()) { try { isDir = statSync(full).isDirectory(); } catch { isDir = false; } }
+            entries.push({ name: d.name, path: full, isDir, isRepo: isDir && existsSync(nodePath.join(full, '.git')) });
+          }
+          entries.sort((a, b) => (a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1));
+        } catch (e) { error = e instanceof Error ? e.message.slice(0, 160) : 'cannot read this folder'; }
+        const parent = nodePath.dirname(dir);
+        return { path: dir, parent: parent !== dir ? parent : null, home, entries: entries.slice(0, 1000), error };
+      }
       case 'inspectFolder': {
         const dir = String(p.path ?? '');
         if (!dir) bad('path required');
@@ -721,6 +791,32 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const idOrSlug = String(p.skillId ?? p.slug ?? '');
         removeSkillFiles(projectRootOf(proj), idOrSlug); // skills-registry slugs the last path segment
         store.removeInstalledSkill(proj.id, idOrSlug);
+        return { ok: true };
+      }
+
+      // ── Custom MCP servers (operator library; merged into every run) ───
+      case 'listMcpServers': return store.listMcpServers();
+      case 'addMcpServer': {
+        const rec = store.addMcpServer(normalizeMcpInput(p));
+        emit('mcpServers', store.listMcpServers());
+        return rec;
+      }
+      case 'updateMcpServer': {
+        const serverId = String(p.id ?? '');
+        if (!serverId) bad('id required');
+        const rec = store.updateMcpServer(serverId, normalizeMcpInput(p));
+        emit('mcpServers', store.listMcpServers());
+        return rec;
+      }
+      case 'setMcpServerEnabled': {
+        const rec = store.setMcpServerEnabled(String(p.id ?? ''), Boolean(p.enabled));
+        if (!rec) return bad('mcp server not found', 404);
+        emit('mcpServers', store.listMcpServers());
+        return rec;
+      }
+      case 'removeMcpServer': {
+        store.removeMcpServer(String(p.id ?? ''));
+        emit('mcpServers', store.listMcpServers());
         return { ok: true };
       }
 

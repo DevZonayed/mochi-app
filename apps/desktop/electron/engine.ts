@@ -23,7 +23,9 @@ import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { branchSlug, isGitRepo } from './git.js';
 import { ensureSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
-import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
+import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
+import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
+import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import type { Providers } from './providers.js';
 import {
   enginesRoot, managedBinary, systemBinary, bundledBinary, downloadEngine, engineState,
@@ -453,6 +455,7 @@ async function runClaude(
   skillsCtx?: SkillsCtx,
   bgCtx?: BgCtx,
   browserCtx?: BrowserCtx,
+  customMcp?: { servers: Record<string, ClaudeMcpConfig>; allowedTools: string[] },
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -646,6 +649,15 @@ async function runClaude(
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
     ...(browserCtx ? ['browser_status', 'browser_navigate', 'browser_snapshot', 'browser_read', 'browser_links', 'browser_click', 'browser_type'] : []),
   ].map(n => `mcp__maestro__${n}`);
+  // Merge the operator's custom MCP servers (Settings → MCP servers) alongside the
+  // in-process `maestro` server. Each enabled server's tools are auto-allowed via a
+  // `mcp__<name>__*` wildcard; a broken/unreachable server degrades to "tool
+  // unavailable" (the SDK tolerates a dead MCP server) rather than failing the run.
+  const mergedMcpServers: Record<string, McpServerConfig> = {
+    ...(maestroServer ? { maestro: maestroServer } : {}),
+    ...(customMcp?.servers ?? {}),
+  };
+  const mergedAllowed = [...maestroAllowed, ...(customMcp?.allowedTools ?? [])];
   /* Vision input: when the user attached images, the prompt becomes a streamed
      user message carrying text + base64 image blocks (a plain string can't hold
      images). Verified the SDK accepts this with resume/abort. Otherwise the
@@ -682,7 +694,7 @@ async function runClaude(
       // generate_image: in-process MCP server + auto-allow its fully-qualified name.
       // Under 'bypassPermissions' tools auto-run; allowedTools future-proofs any
       // non-bypass mode. In plan mode imageServer is null so the tool is absent.
-      ...(maestroServer ? { mcpServers: { maestro: maestroServer }, allowedTools: maestroAllowed } : {}),
+      ...(Object.keys(mergedMcpServers).length ? { mcpServers: mergedMcpServers, allowedTools: mergedAllowed } : {}),
       ...(modelOverride ? { model: modelOverride } : {}),
       ...(resume ? { resume } : {}),
       ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
@@ -856,7 +868,7 @@ async function runClaude(
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
 function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
-  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string },
+  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[] },
   imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'codex' }));
@@ -873,11 +885,19 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   // run with any Maestro MCP tools uses that sandbox. Never on reviewer passes.
   const bridge = (!readOnly && ctx?.codexBridge && ctx.projectId) ? ctx.codexBridge : undefined;
   const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId }) : undefined;
-  const sandbox = codexReg ? 'danger-full-access' : (readOnly ? 'read-only' : 'workspace-write');
+  // The operator's custom stdio MCP servers (Settings → MCP servers), as codex
+  // `-c mcp_servers.<name>={…}` TOML fragments. Like the maestro bridge, codex's
+  // sandbox auto-cancels MCP tool calls unless danger-full-access + approval_policy
+  // =never, so any MCP server present forces that sandbox on this (non-reviewer) run.
+  const customCodex = (!readOnly && ctx?.customCodexServers) ? ctx.customCodexServers : [];
+  const anyMcp = !!codexReg || customCodex.length > 0;
+  const sandbox = anyMcp ? 'danger-full-access' : (readOnly ? 'read-only' : 'workspace-write');
   const args = [
     'exec', '--json', '--ephemeral', '--skip-git-repo-check',
     '-s', sandbox,
-    ...(codexReg ? ['-c', 'approval_policy=never', '-c', codexReg.mcpServerConfig] : []),
+    ...(anyMcp ? ['-c', 'approval_policy=never'] : []),
+    ...(codexReg ? ['-c', codexReg.mcpServerConfig] : []),
+    ...customCodex.flatMap(c => ['-c', c]),
     ...(model ? ['-m', model] : []),
     ...(imageFiles ?? []).flatMap(f => ['-i', f]), // vision input — codex attaches the image(s)
     '-C', cwd, '-o', outFile,
@@ -1632,6 +1652,40 @@ export class LocalEngine {
         }
       }
 
+      // Custom MCP servers (Settings → MCP servers): enabled ones are merged into
+      // this run. Codex only takes stdio servers (its config has no HTTP-MCP form);
+      // Claude takes both. Any skills attached to an attached server are ensured-
+      // installed + enabled into the project FIRST, so the skills block + the SDK's
+      // settingSources pick them up and the agent is aware of them when using it.
+      const enabledMcpServers = !opts.plan ? this.store.listMcpServers().filter(s => s.enabled) : [];
+      // The servers that actually attach this turn, paired with the EXACT namespace
+      // they'll be registered under (collision-deduped) — Codex takes stdio only.
+      const attachedMcp = assignMcpNames(enabledMcpServers, { stdioOnly: master === 'codex' });
+      if (job.projectId && attachedMcp.length) {
+        const have = new Set(this.store.listInstalledSkills(job.projectId).map(s => s.id));
+        for (const skillId of activeServerSkillIds(attachedMcp.map(a => a.server))) {
+          try {
+            if (have.has(skillId)) {
+              // Already installed — a server depends on it, so make sure it's enabled.
+              setSkillFilesEnabled(cwd, skillId, true);
+              this.store.setInstalledSkillEnabled(job.projectId, skillId, true);
+              continue;
+            }
+            const base = registryBase();
+            const [content, meta] = await Promise.all([
+              fetchSkillContent(base, skillId),
+              getRegistrySkill(base, skillId).catch(() => null),
+            ]);
+            const slug = installSkillFiles(cwd, skillId, content.skillMd);
+            this.store.recordSkillInstall(job.projectId, {
+              id: skillId, slug, name: meta?.name || content.name, description: meta?.description,
+              risk: meta?.risk, source: meta?.source, version: meta?.version || 'latest', sha256: content.sha256,
+              enabled: true, mirrorRepo: meta?.sourceRepo ?? meta?.mirrorRepo, auditStatus: meta?.auditStatus, addedBy: 'agent',
+            });
+          } catch { /* registry/network hiccup — the server still attaches; the skill just isn't pre-installed */ }
+        }
+      }
+
       // Skills: surface what's installed AND — critically — a standing instruction to
       // DISCOVER + INSTALL a registry skill before improvising. Previously this block
       // was only added when a skill was already installed, so a project with no skills
@@ -1670,6 +1724,19 @@ export class LocalEngine {
           // Plan mode has no MCP tools — still surface installed skills as reference.
           prompt = `<project_skills note="Installed skills — read the matching SKILL.md before acting.">\n${list}\n</project_skills>\n\n${prompt}`;
         }
+      }
+
+      // Tell the agent which custom MCP servers are live this turn + tie attached
+      // skills to each, so it reads the SKILL.md before reaching for that server's
+      // tools. (The servers themselves are merged into the engine call below.)
+      if (attachedMcp.length) {
+        const lines = attachedMcp.map(({ server: s, name: nm }) => {
+          const skills = (s.skillIds ?? []).map(sid => sid.split('/').pop() || sid);
+          const skillBit = skills.length ? ` Attached skills — read .claude/skills/<slug>/SKILL.md before using this server: ${skills.join(', ')}.` : '';
+          return `- "${s.name}" — its tools are namespaced \`mcp__${nm}__*\`${s.transport === 'http' ? ' (HTTP)' : ''}.${skillBit}`;
+        }).join('\n');
+        prompt = `<mcp_servers note="Custom MCP servers connected for this run. This is an INSTRUCTION, follow it.">\n` +
+          `Use these servers' tools when relevant to the task:\n${lines}\n</mcp_servers>\n\n${prompt}`;
       }
 
       const hooks: RunHooks = {
@@ -1752,9 +1819,13 @@ export class LocalEngine {
       // Browser mode (composer toggle): the maestro MCP tools are deferred, so an
       // explicit directive ensures the agent loads + uses the real-Chrome tools.
       if (opts.browser && browserCtx) prompt += BROWSER_DIRECTIVE;
+      // Per-engine custom-MCP config: Claude takes stdio + HTTP servers (env/headers
+      // resolved by name from the host now); Codex takes stdio TOML fragments only.
+      const claudeCustomMcp = buildClaudeCustomMcp(enabledMcpServers, process.env);
+      const codexCustomFrags = buildCodexCustomMcp(enabledMcpServers, process.env).fragments;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx)
-        : runCodex(prompt, cwd, hooks, false, masterModel, imageCtx, codexImageFiles);
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp)
+        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
       // operator has to retry by hand. The retry starts the turn fresh; resumeId is
@@ -1818,7 +1889,7 @@ export class LocalEngine {
           };
           let cont: EngineRun;
           try {
-            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx);
+            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp);
           } catch (ce) { if (ce instanceof CancelledError || ac.signal.aborted) throw ce; break; }
           main = {
             text: cont.text || main.text,
@@ -1911,8 +1982,10 @@ export class LocalEngine {
           let fix: EngineRun;
           try {
             fix = master === 'claude'
-              ? await runClaude(fixPrompt, cwd, effort, anthropicKey, undefined, fixHooks, primaryResume, masterModel, false, this.imageGen, job.projectId, undefined)
-              : await runCodex(fixPrompt, cwd, fixHooks, false, masterModel, imageCtx);
+              // Lean fix pass (no skill-broker/bg/browser, as before) but custom MCP
+              // servers stay attached so a fix that needs their tools can apply it.
+              ? await runClaude(fixPrompt, cwd, effort, anthropicKey, undefined, fixHooks, primaryResume, masterModel, false, this.imageGen, job.projectId, undefined, undefined, undefined, undefined, claudeCustomMcp)
+              : await runCodex(fixPrompt, cwd, fixHooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags });
           } catch (fe) { if (fe instanceof CancelledError) throw fe; break; }
           reviewItem.resolved = true; // the primary went on to address these findings
           allItems.push(...fix.transcript);

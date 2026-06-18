@@ -9,9 +9,7 @@ import { api } from './api';
 import { useLive } from './useLive';
 
 import { HomeScreen } from './screens/Home';
-import { JobsScreen } from './screens/Jobs';
 import { ApprovalsScreen } from './screens/Approvals';
-import { StudioScreen } from './screens/Studio';
 import { SettingsScreen } from './screens/Settings';
 import { OnboardingScreen } from './screens/Onboarding';
 import { JobTimelineScreen } from './screens/JobTimeline';
@@ -24,6 +22,7 @@ import { ProjectsScreen } from './screens/Projects';
 import { ProjectSessionsScreen } from './screens/ProjectSessions';
 import { SessionChatScreen } from './screens/SessionChat';
 import { QueueScreen } from './screens/Queue';
+import { CreateProjectScreen } from './screens/CreateProject';
 
 export type RootStackParamList = {
   Tabs: undefined;
@@ -37,6 +36,7 @@ export type RootStackParamList = {
   ProjectSessions: { projectId: string; name: string };
   SessionChat: { projectId: string; sessionId?: string; title?: string };
   Queue: undefined;
+  CreateProject: undefined;
 };
 
 const Tab = createBottomTabNavigator();
@@ -45,9 +45,7 @@ const Stack = createNativeStackNavigator<RootStackParamList>();
 const TAB_ICON: Record<string, IconName> = {
   Home: 'home',
   Projects: 'folder',
-  Jobs: 'jobs',
   Approvals: 'shield',
-  Studio: 'clapper',
   Settings: 'settings',
 };
 
@@ -70,9 +68,7 @@ function Tabs() {
     >
       <Tab.Screen name="Home" component={HomeScreen} />
       <Tab.Screen name="Projects" component={ProjectsScreen} />
-      <Tab.Screen name="Jobs" component={JobsScreen} />
       <Tab.Screen name="Approvals" component={ApprovalsScreen} options={{ tabBarBadge: pending > 0 ? pending : undefined }} />
-      <Tab.Screen name="Studio" component={StudioScreen} />
       <Tab.Screen name="Settings" component={SettingsScreen} />
     </Tab.Navigator>
   );
@@ -106,6 +102,7 @@ export function RootNavigator() {
         <Stack.Screen name="ProjectSessions" component={ProjectSessionsScreen} />
         <Stack.Screen name="SessionChat" component={SessionChatScreen} />
         <Stack.Screen name="Queue" component={QueueScreen} />
+        <Stack.Screen name="CreateProject" component={CreateProjectScreen} options={{ presentation: 'modal' }} />
       </Stack.Navigator>
     </NavigationContainer>
   );
