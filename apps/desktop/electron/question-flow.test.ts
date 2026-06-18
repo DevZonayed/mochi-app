@@ -19,9 +19,9 @@ function setup() {
   const run = vi.fn().mockResolvedValue(undefined);
   const engine = { run } as unknown as LocalEngine;
   const emit = vi.fn();
-  // media/research/publishing/telegram/providers aren't touched by these cases.
+  // media/research/publishing/telegram/whatsapp/providers aren't touched by these cases.
   const stub = {} as never;
-  const dispatch = createDispatch(s, engine, stub, stub, stub, stub, stub, emit);
+  const dispatch = createDispatch(s, engine, stub, stub, stub, stub, stub, stub, emit);
   return { s, project, session, run, emit, dispatch };
 }
 
