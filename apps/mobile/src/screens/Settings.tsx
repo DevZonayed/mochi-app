@@ -9,6 +9,7 @@ import { Icon } from '../Icon';
 import { Group, Row } from '../ui';
 import { api, getPairToken, setPairToken, API_BASE, type Workspace, type Effort as ApiEffort, type EngineId } from '../api';
 import { setFlag, ONBOARDED, getFlag, BIOMETRIC_GATE, clearCache } from '../storage';
+import { unregisterPush } from '../push';
 import { NOTIF_CATEGORIES, getNotifPrefs, setNotifPref } from '../notifPrefs';
 import { biometricAvailable, confirmBiometric } from '../biometrics';
 
@@ -455,6 +456,7 @@ export function SettingsScreen() {
         <View style={{ marginBottom: 22 }}>
           <Group header="This device" footer="Unpairing clears the code on this phone; pair again from your Mac's code to reconnect.">
             <Row last onPress={() => {
+              void unregisterPush(); // drop this phone's push token from the relay (before the token clears)
               setPairToken('');
               setFlag(ONBOARDED, false);
               void clearCache(); // logout wipes cached projects/chats
