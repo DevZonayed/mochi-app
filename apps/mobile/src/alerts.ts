@@ -20,7 +20,16 @@ export async function setupAlerts(): Promise<void> {
   configured = true;
   try {
     Notifications.setNotificationHandler({
-      handleNotification: async () => ({ shouldShowBanner: true, shouldShowList: true, shouldPlaySound: true, shouldSetBadge: true }),
+      handleNotification: async (n) => {
+        // A remote push that lands while the app is in the FOREGROUND is redundant
+        // with the SSE-driven in-app banner + chime (LiveNotifier) — keep it silent
+        // to avoid a double alert. Closed/background pushes never hit this handler
+        // (the app isn't running) so the OS shows them natively. Local notifs from
+        // fireAlert (trigger !== 'push') still present as before.
+        const isRemote = (n.request.trigger as { type?: string } | null)?.type === 'push';
+        if (isRemote) return { shouldShowBanner: false, shouldShowList: true, shouldPlaySound: false, shouldSetBadge: true };
+        return { shouldShowBanner: true, shouldShowList: true, shouldPlaySound: true, shouldSetBadge: true };
+      },
     });
     if (Platform.OS === 'android') {
       await Notifications.setNotificationChannelAsync('alerts', {
