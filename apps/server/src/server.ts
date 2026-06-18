@@ -18,6 +18,7 @@ import type { ServerResponse } from 'node:http';
 import type { WebSocket } from 'ws';
 import { registerRegistry } from './registry.js';
 import { DeviceRegistry } from './devices.js';
+import { turnConfigFromEnv } from './turn.js';
 
 interface Snapshot {
   workspace?: unknown;
@@ -155,6 +156,14 @@ export function buildServer(): FastifyInstance {
       try { res.write(payload); } catch { sseClients.delete(res); }
     }
   }
+  // Device-targeted SSE (WebRTC signaling to ONE remote, not a broadcast).
+  function sseSendTo(did: string | null | undefined, event: string, data: unknown) {
+    if (!did) return;
+    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const res of devices.streamsFor(did)) {
+      try { res.write(payload); } catch { /* closed */ }
+    }
+  }
 
   // ── Forward a command to the Mac and await its result ─────────────
   function cmd<T = unknown>(method: string, params: Record<string, unknown>): Promise<T> {
@@ -194,7 +203,7 @@ export function buildServer(): FastifyInstance {
       let isHost = false;
 
       ws.on('message', (buf: Buffer | string) => {
-        let m: { type?: string; role?: string; deckId?: string; secret?: string; accessToken?: string; state?: Snapshot; name?: string; data?: unknown; id?: string; ok?: boolean; result?: unknown; error?: string; statusCode?: number; deviceId?: string };
+        let m: { type?: string; role?: string; deckId?: string; secret?: string; accessToken?: string; state?: Snapshot; name?: string; data?: unknown; id?: string; ok?: boolean; result?: unknown; error?: string; statusCode?: number; deviceId?: string; did?: string; signal?: unknown };
         try { m = JSON.parse(String(buf)) as typeof m; } catch { return; }
 
         if (m.type === 'hello' && m.role === 'host' && m.deckId) {
@@ -239,6 +248,9 @@ export function buildServer(): FastifyInstance {
         } else if (m.type === 'kick' && m.deviceId) {
           for (const res of devices.kick(m.deviceId)) { try { res.end(); } catch { /* already closed */ } }
           notifyRemote(true);
+        } else if (m.type === 'signal' && m.did) {
+          // WebRTC signaling from the Mac to one specific remote (offer/answer/ICE).
+          sseSendTo(m.did, 'signal', m.signal);
         }
       });
 
@@ -404,6 +416,26 @@ export function buildServer(): FastifyInstance {
   app.post('/api/feedback/:id/update', async (req, reply) =>
     forward(reply, 'updateFeedback', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/feedback/:id/delete', async (req, reply) => forward(reply, 'deleteFeedback', { id: (req.params as { id: string }).id }));
+
+  // ── WebRTC signaling passthrough + TURN creds (P2P transport setup) ──
+  // Signaling rides the already-authenticated relay: the phone POSTs its SDP/ICE
+  // here, we hand it to the Mac (host WS), and the Mac's replies come back over
+  // the device's own SSE stream as `event: signal`. No new server, no second QR.
+  app.post('/api/signal', async (req, reply) => {
+    if (!deck || !deck.online || !deck.ws) {
+      return reply.code(503).send({ error: 'Your Mac is offline — open the Maestro desktop app' });
+    }
+    const did = deviceIdOf(req);
+    const body = (req.body ?? {}) as { signal?: unknown };
+    try {
+      deck.ws.send(JSON.stringify({ type: 'signal', did, signal: body.signal }));
+    } catch {
+      return reply.code(502).send({ error: 'relay write failed' });
+    }
+    return { ok: true };
+  });
+  // Time-limited TURN creds (HMAC); all-null when coturn isn't configured → clients use public STUN.
+  app.get('/api/turn-credentials', async () => turnConfigFromEnv());
 
   // ── SSE stream (host events relayed to web clients) ────────────────
   app.get('/api/stream', (req, reply) => {

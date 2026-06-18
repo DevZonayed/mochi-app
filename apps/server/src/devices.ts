@@ -105,6 +105,12 @@ export class DeviceRegistry {
     e.lastSeen = this.now();
   }
 
+  /** Open SSE streams for one device — used to deliver device-targeted signaling. */
+  streamsFor(id: string | null | undefined): ServerResponse[] {
+    const e = this.devices.get(this.key(id));
+    return e ? [...e.streams] : [];
+  }
+
   /** Disconnect + revoke a device. Returns its open streams for the caller to `.end()`. */
   kick(id: string | null | undefined): ServerResponse[] {
     const key = this.key(id);
