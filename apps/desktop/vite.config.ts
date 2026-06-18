@@ -8,10 +8,11 @@ export default defineConfig({
     electron({
       main: {
         entry: 'electron/main.ts',
-        // The Claude Agent SDK is ESM + spawns the `claude` binary, and
-        // playwright-core drives the system Chrome — keep them external so they
-        // load from node_modules at runtime (both are dynamically imported).
-        vite: { build: { rollupOptions: { external: ['@anthropic-ai/claude-agent-sdk', 'ws', 'playwright-core'] } } },
+        // External = loaded from node_modules at runtime (all dynamically
+        // imported), never bundled: the Claude Agent SDK (ESM, spawns `claude`),
+        // playwright-core (drives system Chrome), and Baileys (large, dynamic-
+        // require WhatsApp lib, lazy-imported in the provider's connect()).
+        vite: { build: { rollupOptions: { external: ['@anthropic-ai/claude-agent-sdk', 'ws', 'playwright-core', '@whiskeysockets/baileys'] } } },
       },
       preload: { input: 'electron/preload.ts' },
       renderer: {},

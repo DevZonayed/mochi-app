@@ -6,7 +6,7 @@
 import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, MaestroMark } from './icons';
-import { NAV_ROUTES, ALL_NAV, CODING_NAV, DESIGN_NAV, pathForNav } from './routes';
+import { PRIMARY_NAV, SECONDARY_NAV, ALL_NAV, CODING_NAV, DESIGN_NAV, pathForNav, type NavRoute } from './routes';
 import { api } from './api';
 import { CountUp } from './ui';
 
@@ -222,6 +222,31 @@ export interface SidebarProps {
   onWorkspace?: () => void;
 }
 
+/* One sidebar row, shared by the primary loop and the "More" group. The live
+   approvals badge only renders for the approvals row when something is waiting. */
+function NavItem({ route, active, pending, onNav }: { route: NavRoute; active: boolean; pending: number; onNav?: (key: string) => void }) {
+  const badge = route.key === 'approvals' ? (pending > 0 ? pending : 0) : 0;
+  return (
+    <button onClick={() => onNav && onNav(route.key)} style={{
+      display: 'flex', alignItems: 'center', gap: 11, height: 36, padding: '0 10px', borderRadius: 8, textAlign: 'left',
+      background: active ? 'var(--blue)' : 'transparent',
+      color: active ? '#fff' : 'var(--ink-secondary)',
+      font: `${active ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`,
+      transition: 'background 140ms ease, color 140ms ease',
+    }} className={active ? '' : 'nav-item'}>
+      <Icon name={route.icon} size={18} stroke={active ? 2 : 1.85} />
+      <span style={{ flex: 1 }}>{route.label}</span>
+      {badge > 0 && (
+        <span style={{
+          minWidth: 18, height: 18, padding: '0 5px', borderRadius: 'var(--r-pill)',
+          background: active ? 'rgba(255,255,255,0.25)' : 'var(--red)', color: '#fff',
+          font: '700 var(--fs-caption)/18px var(--font-text)', textAlign: 'center',
+        }}>{badge}</span>
+      )}
+    </button>
+  );
+}
+
 export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
   const pending = usePendingApprovals();
   const workspaceName = useWorkspaceName();
@@ -255,32 +280,11 @@ export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
         </button>
       </div>
 
-      {/* nav */}
+      {/* nav — primary loop on top; supporting tools in a muted "More" group */}
       <nav style={{ flex: 1, overflow: 'auto', padding: '6px 10px', display: 'flex', flexDirection: 'column', gap: 1 }}>
-        {NAV_ROUTES.map(n => {
-          const on = active === n.key;
-          // Live badge: approvals shows the real pending count, only when > 0.
-          const badge = n.key === 'approvals' ? (pending > 0 ? pending : 0) : 0;
-          return (
-            <button key={n.key} onClick={() => onNav && onNav(n.key)} style={{
-              display: 'flex', alignItems: 'center', gap: 11, height: 36, padding: '0 10px', borderRadius: 8, textAlign: 'left',
-              background: on ? 'var(--blue)' : 'transparent',
-              color: on ? '#fff' : 'var(--ink-secondary)',
-              font: `${on ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`,
-              transition: 'background 140ms ease, color 140ms ease',
-            }} className={on ? '' : 'nav-item'}>
-              <Icon name={n.icon} size={18} stroke={on ? 2 : 1.85} />
-              <span style={{ flex: 1 }}>{n.label}</span>
-              {badge > 0 && (
-                <span style={{
-                  minWidth: 18, height: 18, padding: '0 5px', borderRadius: 'var(--r-pill)',
-                  background: on ? 'rgba(255,255,255,0.25)' : 'var(--red)', color: '#fff',
-                  font: '700 var(--fs-caption)/18px var(--font-text)', textAlign: 'center',
-                }}>{badge}</span>
-              )}
-            </button>
-          );
-        })}
+        {PRIMARY_NAV.map(n => <NavItem key={n.key} route={n} active={active === n.key} pending={pending} onNav={onNav} />)}
+        <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', padding: '16px 10px 7px' }}>More</div>
+        {SECONDARY_NAV.map(n => <NavItem key={n.key} route={n} active={active === n.key} pending={pending} onNav={onNav} />)}
       </nav>
 
       {/* settings pinned */}
@@ -316,7 +320,7 @@ export function BudgetChip() {
     return () => { alive = false; unsub(); };
   }, []);
   return (
-    <button onClick={() => navigate('/budget')} title="Costs this month" style={{
+    <button onClick={() => navigate('/settings', { state: { section: 'costs' } })} title="Costs this month" style={{
       display: 'inline-flex', alignItems: 'center', gap: 8, height: 34, padding: '0 13px',
       borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)', cursor: 'pointer',
     }}>

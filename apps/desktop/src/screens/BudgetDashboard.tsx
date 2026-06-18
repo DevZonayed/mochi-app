@@ -198,10 +198,10 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
   );
 }
 
-// ── Page root ────────────────────────────────────────────────────────────────
-export default function BudgetDashboard() {
+// ── Costs body (chrome-less) ───────────────────────────────────────────────────
+/* Used standalone (wrapped in AppShell below) and embedded as a Settings pane. */
+export function BudgetPanel({ embedded = false }: { embedded?: boolean } = {}) {
   const navigate = useNavigate();
-  const [paletteOpen, setPaletteOpen] = React.useState(false);
   const [costs, setCosts] = React.useState<CostsData | null>(null);
   const [jobs, setJobs] = React.useState<Job[]>([]);
   const [projects, setProjects] = React.useState<Record<string, Project>>({});
@@ -217,33 +217,39 @@ export default function BudgetDashboard() {
     return unsub;
   }, [load]);
 
-  React.useEffect(() => {
-    const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
-    window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
-  }, []);
-
   const c = costs ?? { today: 0, thisMonth: 0, projectedMonth: 0, byDay: [], byProject: [], byEngine: [], includedCodexRuns: 0, claudeRuns: 0 };
   const hasSpend = c.thisMonth > 0 || jobs.length > 0;
 
   return (
-    <AppShell active="budget" onSearch={() => setPaletteOpen(true)}>
+    <div style={{ padding: embedded ? 0 : '24px 28px 36px' }}>
       <style>{styles}</style>
-      <div style={{ padding: '24px 28px 36px' }}>
-        <h1 style={{ margin: '0 0 4px', font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Costs</h1>
-        <p style={{ margin: '0 0 22px', font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>What you've spent — no caps, since jobs run on your own subscriptions.</p>
+      <h1 style={{ margin: '0 0 4px', font: `700 ${embedded ? 'var(--fs-title1)' : 'var(--fs-large-title)'}/1 var(--font-display)`, letterSpacing: '-0.02em', color: 'var(--ink)' }}>Costs</h1>
+      <p style={{ margin: '0 0 22px', font: '400 var(--fs-subhead)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>What you've spent — no caps, since jobs run on your own subscriptions.</p>
 
-        <HeroBand costs={c} />
+      <HeroBand costs={c} />
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 320px', gap: 18, marginBottom: 24, alignItems: 'start' }}>
-          <Breakdown costs={c} />
-          <IncludedCard costs={c} />
-        </div>
-
-        <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 12 }}>Ledger</div>
-        {hasSpend ? <Ledger jobs={jobs} projects={projects} onOpen={(id) => navigate(`/session-transcript/${id}`)} />
-          : <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', padding: '40px 0', textAlign: 'center', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No runs yet. Costs appear here as jobs complete.</div>}
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 320px', gap: 18, marginBottom: 24, alignItems: 'start' }}>
+        <Breakdown costs={c} />
+        <IncludedCard costs={c} />
       </div>
 
+      <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 12 }}>Ledger</div>
+      {hasSpend ? <Ledger jobs={jobs} projects={projects} onOpen={(id) => navigate(`/session-transcript/${id}`)} />
+        : <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', padding: '40px 0', textAlign: 'center', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No runs yet. Costs appear here as jobs complete.</div>}
+    </div>
+  );
+}
+
+// ── Page root ────────────────────────────────────────────────────────────────
+export default function BudgetDashboard() {
+  const [paletteOpen, setPaletteOpen] = React.useState(false);
+  React.useEffect(() => {
+    const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } };
+    window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
+  }, []);
+  return (
+    <AppShell active="budget" onSearch={() => setPaletteOpen(true)}>
+      <BudgetPanel />
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>
   );

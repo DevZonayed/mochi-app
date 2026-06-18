@@ -313,9 +313,13 @@ export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; 
 export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; projectId: string | null; permissions: ChatPermissions; boundAt: number }
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
 export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
+export type WaMsgKind = 'text' | 'image' | 'video' | 'audio' | 'document' | 'location' | 'poll' | 'system';
+export interface WaMedia { mimetype: string | null; fileName: string | null; sizeBytes: number | null }
+export interface WaMessage { msgId: string; chatId: string; fromMe: boolean; senderId: string; senderName: string; ts: number; kind: WaMsgKind; text: string; media: WaMedia | null; replyTo: string | null; source: 'live' | 'backfill' }
+export interface WaChat { chatId: string; name: string | null; kind: 'dm' | 'group'; count: number; newestTs: number; oldestTs: number }
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
-  whatsapp: { connected: false };
+  whatsapp: { connected: boolean; jid: string | null; name: string | null; connectedAt: number | null; chats: number; qr: string | null };
 }
 export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
 export interface FolderInspect { ok: boolean; path: string; info: RepoInfo; error?: string }
@@ -607,6 +611,12 @@ export const api = {
   listCommEvents: () => call<CommEvent[]>('listCommEvents', {}, () => req<CommEvent[]>('/api/comms/events')),
   connectTelegram: (token: string) => call<{ username: string }>('connectTelegram', { token }, () => req<{ username: string }>('/api/comms/telegram/connect', { method: 'POST', body: JSON.stringify({ token }) })),
   disconnectTelegram: () => call<{ ok: boolean }>('disconnectTelegram', {}, () => req<{ ok: boolean }>('/api/comms/telegram/disconnect', { method: 'POST' })),
+  // Comms (WhatsApp / Baileys) — desktop-owned; the QR + status ride the `comms` event stream.
+  connectWhatsApp: () => call<CommsStatus>('connectWhatsApp', {}, () => req<CommsStatus>('/api/comms/whatsapp/connect', { method: 'POST' })),
+  disconnectWhatsApp: () => call<{ ok: boolean }>('disconnectWhatsApp', {}, () => req<{ ok: boolean }>('/api/comms/whatsapp/disconnect', { method: 'POST' })),
+  listWaChats: () => call<WaChat[]>('listWaChats', {}, () => req<WaChat[]>('/api/comms/whatsapp/chats')),
+  listWaMessages: (chatId: string, opts: { limit?: number; before?: number } = {}) =>
+    call<WaMessage[]>('listWaMessages', { chatId, ...opts }, () => req<WaMessage[]>(`/api/comms/whatsapp/messages${qp({ chatId, limit: opts.limit?.toString(), before: opts.before?.toString() })}`)),
   bindChat: (input: { chatId: string; name?: string; projectId?: string | null; permissions?: Partial<ChatPermissions> }) =>
     call<ChatBinding>('bindChat', { ...input }, () => req<ChatBinding>('/api/comms/bind', { method: 'POST', body: JSON.stringify(input) })),
   unbindChat: (chatId: string) => call<{ ok: boolean }>('unbindChat', { chatId }, () => req<{ ok: boolean }>('/api/comms/unbind', { method: 'POST', body: JSON.stringify({ chatId }) })),
