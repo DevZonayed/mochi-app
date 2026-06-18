@@ -242,6 +242,9 @@ function GeneralPane({ theme, setTheme, workspace }: {
         <GroupedList header="Startup">
           <ToggleRow label="Open Maestro at login" on={settings?.openAtLogin ?? false} onChange={v => patch({ openAtLogin: v })} last />
         </GroupedList>
+        <GroupedList header="Connection" footer="Direct mode links this Mac and your phone over an encrypted WebRTC channel for lower latency, and falls back to the relay automatically. Needs the phone's dev build; restrictive networks need a TURN server.">
+          <ToggleRow label="Direct device connection (P2P)" sub="Experimental — desktop ↔ phone peer-to-peer when the network allows." on={settings?.p2pEnabled ?? false} onChange={v => patch({ p2pEnabled: v })} last />
+        </GroupedList>
       </div>
     </div>
   );
