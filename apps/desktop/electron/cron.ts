@@ -137,6 +137,14 @@ export class CronRunner {
     }
   }
 
+  /** Fire a schedule right now (manual / agent-triggered), bypassing timing. */
+  fireNow(scheduleId: string): boolean {
+    const s = this.store.listSchedules().find(x => x.id === scheduleId);
+    if (!s) return false;
+    this.fire(s);
+    return true;
+  }
+
   private fire(s: Schedule, opts?: { late?: boolean }): void {
     const project = (s.projectId ? this.store.getProject(s.projectId) : undefined) ?? this.store.listProjects()[0];
     if (!project) return;
