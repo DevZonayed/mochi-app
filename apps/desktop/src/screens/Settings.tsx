@@ -16,7 +16,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, usePurpose, setPurpose, TrafficLights, Sidebar, Toolbar,
   type Theme, type Purpose,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type DevicePresence, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, type GithubDevice, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type PairingInfo, type RemoteDevice, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, type GithubDevice, IS_LOCAL } from '../lib/api';
 import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
 import { WhatsNew } from '../lib/WhatsNew';
 import { useNotificationSettings, updateNotificationSettings, playSound, SOUND_OPTIONS, type NotificationSound } from '../lib/notify';
@@ -717,8 +717,8 @@ function ExtensionPane() {
   );
 }
 
-function deviceStatusLabel(d: DevicePresence): string {
-  if (d.streams > 0) return 'active now';
+function deviceStatusLabel(d: RemoteDevice): string {
+  if (d.live) return 'active now · live';
   if (!d.lastSeen) return '';
   const s = Math.max(0, Math.round((Date.now() - d.lastSeen) / 1000));
   if (s < 60) return `last seen ${s}s ago`;
@@ -727,30 +727,47 @@ function deviceStatusLabel(d: DevicePresence): string {
   return `last seen ${Math.round(m / 60)}h ago`;
 }
 
+const devIcon = (bg: string, color: string, name: IconName, stroke?: number) => (
+  <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: bg, color }}><Icon name={name} size={18} stroke={stroke} /></span>
+);
+
 function DevicesPane({ onPair }: { onPair: () => void }) {
   const [pairing, setPairing] = React.useState<PairingInfo | null>(null);
-  const [presence, setPresence] = React.useState<DevicePresence | null>(null);
+  const [devices, setDevices] = React.useState<RemoteDevice[]>([]);
   const [copied, setCopied] = React.useState(false);
+  const [busyId, setBusyId] = React.useState<string | null>(null);
+  const [regenOpen, setRegenOpen] = React.useState(false);
   React.useEffect(() => {
     if (!IS_LOCAL) return;
     let alive = true;
-    api.getPairing().then(p => { if (alive) { setPairing(p); setPresence(p.devices ?? null); } }).catch(() => {});
-    // Live presence: the relay tells the Mac when a phone/web remote connects.
-    const off = api.subscribe({ onDevices: (d) => setPresence(d) });
+    api.getPairing().then(p => { if (alive) { setPairing(p); setDevices(p.devices ?? []); } }).catch(() => {});
+    // Live presence: the relay reports the current remote-device list.
+    const off = api.subscribe({ onDevices: (d) => setDevices(d) });
     return () => { alive = false; off(); };
   }, []);
   const copy = () => {
     if (!pairing) return;
     void navigator.clipboard?.writeText(pairing.token).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1600); });
   };
+  const disconnect = async (deviceId: string) => {
+    setBusyId(deviceId);
+    try { await api.kickDevice(deviceId); setDevices(ds => ds.filter(d => d.id !== deviceId)); }
+    catch { /* the next presence frame reconciles */ }
+    finally { setBusyId(null); }
+  };
+  const regenerate = async () => {
+    setRegenOpen(false);
+    try { const r = await api.regeneratePairingCode(); setPairing(p => (p ? { ...p, token: r.token } : p)); setDevices([]); }
+    catch { /* ignore */ }
+  };
   return (
     <div>
       <PaneHead>Devices</PaneHead>
       {pairing && (
         <>
-          <GroupedList header="Pairing code" footer="Enter this code on your phone (Onboarding → Enter code) or open the web remote with ?token=<code>. Remotes can't reach this Mac without it.">
+          <GroupedList header="Pairing code" footer="Enter this code on your phone (Onboarding → Enter code) or open the web remote with ?token=<code>. Anyone with the code can control this Mac, so keep it private.">
             <Row last>
-              <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 13%, transparent)', color: 'var(--blue)' }}><Icon name="key" size={17} /></span>
+              {devIcon('color-mix(in srgb, var(--blue) 13%, transparent)', 'var(--blue)', 'key')}
               <span style={{ flex: 1, font: '600 var(--fs-headline)/1 var(--font-mono)', letterSpacing: '0.08em', color: 'var(--ink)' }}>{pairing.token}</span>
               <button onClick={copy} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: copied ? 'rgba(52,199,89,0.14)' : 'var(--fill-secondary)', color: copied ? 'var(--green)' : 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{copied ? 'Copied ✓' : 'Copy'}</button>
             </Row>
@@ -758,31 +775,59 @@ function DevicesPane({ onPair }: { onPair: () => void }) {
           <div style={{ height: 18 }} />
         </>
       )}
-      <GroupedList footer="Anyone who enters your code can control this Mac, so keep it private. Regenerating the code (Danger zone → reset is not required) would unpair existing devices.">
-        <Row>
-          <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: presence?.connected ? 'color-mix(in srgb, var(--green) 16%, transparent)' : 'var(--fill-tertiary)', color: presence?.connected ? 'var(--green)' : 'var(--ink-tertiary)' }}><Icon name="smartphone" size={18} /></span>
-          <span style={{ flex: 1 }}>
-            {presence?.connected ? (
-              <>
-                <span style={{ display: 'flex', alignItems: 'center', gap: 7, font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>
-                  <span style={{ width: 8, height: 8, borderRadius: 4, background: 'var(--green)' }} />{presence.name ?? 'A device'} connected
-                </span>
-                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{deviceStatusLabel(presence)}{presence.streams > 0 ? ' · live' : ''}</span>
-              </>
-            ) : (
-              <>
-                <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>No devices connected</span>
-                <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{presence?.lastSeen ? deviceStatusLabel(presence) : 'Pair your phone with the code above to control this Mac remotely.'}</span>
-              </>
-            )}
-          </span>
-        </Row>
-        <Row last onClick={onPair}>
-          <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 13%, transparent)', color: 'var(--blue)' }}><Icon name="plus" size={18} stroke={2.4} /></span>
+      <GroupedList header="Connected devices" footer="Disconnect drops a device immediately and makes it re-enter the code. Other devices stay connected.">
+        {devices.length === 0 ? (
+          <Row last>
+            {devIcon('var(--fill-tertiary)', 'var(--ink-tertiary)', 'smartphone')}
+            <span style={{ flex: 1 }}>
+              <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>No devices connected</span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Pair your phone or open the web remote with the code above.</span>
+            </span>
+          </Row>
+        ) : devices.map((d, i) => (
+          <Row key={d.id} last={i === devices.length - 1}>
+            {devIcon(d.live ? 'color-mix(in srgb, var(--green) 16%, transparent)' : 'var(--fill-tertiary)', d.live ? 'var(--green)' : 'var(--ink-tertiary)', 'smartphone')}
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 7, font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>
+                {d.live && <span style={{ width: 8, height: 8, borderRadius: 4, background: 'var(--green)', flexShrink: 0 }} />}
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.name ?? 'A device'}</span>
+              </span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{deviceStatusLabel(d)}</span>
+            </span>
+            <button onClick={() => void disconnect(d.id)} disabled={busyId === d.id} className="ghost-btn" style={{ height: 30, padding: '0 12px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--red)', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: busyId === d.id ? 0.5 : 1 }}>{busyId === d.id ? '…' : 'Disconnect'}</button>
+          </Row>
+        ))}
+      </GroupedList>
+      <div style={{ height: 18 }} />
+      <GroupedList footer="Regenerating gives you a brand-new code and disconnects every paired device at once.">
+        <Row onClick={onPair}>
+          {devIcon('color-mix(in srgb, var(--blue) 13%, transparent)', 'var(--blue)', 'plus', 2.4)}
           <span style={{ flex: 1, font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--blue)' }}>Pair new device</span>
           <Icon name="chevronRight" size={16} style={{ color: 'var(--ink-tertiary)' }} />
         </Row>
+        <Row last onClick={() => setRegenOpen(true)}>
+          {devIcon('color-mix(in srgb, var(--red) 13%, transparent)', 'var(--red)', 'refresh')}
+          <span style={{ flex: 1, font: '600 var(--fs-callout)/1 var(--font-text)', color: 'var(--red)' }}>Regenerate code</span>
+          <Icon name="chevronRight" size={16} style={{ color: 'var(--ink-tertiary)' }} />
+        </Row>
       </GroupedList>
+      {regenOpen && <RegenSheet onCancel={() => setRegenOpen(false)} onConfirm={() => void regenerate()} />}
+    </div>
+  );
+}
+
+function RegenSheet({ onCancel, onConfirm }: { onCancel: () => void; onConfirm: () => void }) {
+  return (
+    <div onMouseDown={onCancel} style={{ position: 'absolute', inset: 0, zIndex: 80, display: 'grid', placeItems: 'center', padding: 32, background: 'rgba(10,12,24,0.4)', backdropFilter: 'blur(3px)', WebkitBackdropFilter: 'blur(3px)' }}>
+      <div onMouseDown={e => e.stopPropagation()} className="sheet-pop" style={{ width: 420, background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--glass-border)', boxShadow: '0 40px 100px rgba(10,15,40,0.5)', padding: 24, textAlign: 'center' }}>
+        <span style={{ display: 'inline-grid', placeItems: 'center', width: 52, height: 52, borderRadius: '50%', background: 'rgba(255,59,48,0.14)', color: 'var(--red)', marginBottom: 15 }}><Icon name="refresh" size={26} /></span>
+        <h2 style={{ margin: '0 0 8px', font: '700 var(--fs-title2)/1.2 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Regenerate the pairing code?</h2>
+        <p style={{ margin: '0 0 18px', font: '400 var(--fs-subhead)/1.45 var(--font-text)', color: 'var(--ink-secondary)', textWrap: 'pretty' }}>This creates a new code and <b style={{ color: 'var(--ink)' }}>disconnects every paired device</b>. Each will need the new code to reconnect.</p>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button onClick={onCancel} style={{ flex: 1, height: 44, borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
+          <button onClick={onConfirm} style={{ flex: 1, height: 44, borderRadius: 'var(--r-pill)', background: 'var(--red)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(255,59,48,0.32)' }}>Regenerate</button>
+        </div>
+      </div>
     </div>
   );
 }

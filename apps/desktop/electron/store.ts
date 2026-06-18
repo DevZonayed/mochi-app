@@ -12,12 +12,10 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { quietDeadline } from './whatsapp-quiet.js';
+import type { RemoteDevice } from './relay.js';
 
 export const id = (): string => randomUUID();
 export const now = (): number => Date.now();
-
-/** Live presence of remote devices (phone/web), reported by the relay. Transient. */
-export interface DevicePresence { connected: boolean; streams: number; lastSeen: number | null; name: string | null }
 
 /** Human-enterable pairing token, e.g. "M7K2-Q9XF-4DTB" (no 0/O/1/I). */
 export function newPairingToken(): string {
@@ -628,17 +626,18 @@ export class Store {
     return { deckId: this.data.deckId, deckSecret: this.data.deckSecret };
   }
   get accessToken(): string { return this.data.accessToken; }
+  /** Rotate the pairing code (regenerate): persists a fresh token; unpairs every remote. */
+  setAccessToken(token: string): void { this.data.accessToken = token; this.save(); }
   get extensionToken(): string { return this.data.extensionToken; }
 
-  // Remote-device presence (transient; reported by the relay, never persisted).
-  private remote: { streams: number; lastSeen: number; name: string | null } = { streams: 0, lastSeen: 0, name: null };
-  setRemotePresence(info: { streams: number; lastSeen: number; name: string | null }): DevicePresence {
-    this.remote = { streams: info.streams, lastSeen: info.lastSeen, name: info.name ?? this.remote.name };
-    return this.getRemotePresence();
+  // Remote-device presence (transient; the relay reports the full list, never persisted).
+  private remoteDevices: RemoteDevice[] = [];
+  setRemoteDevices(devices: RemoteDevice[]): RemoteDevice[] {
+    this.remoteDevices = devices;
+    return this.remoteDevices;
   }
-  getRemotePresence(): DevicePresence {
-    const fresh = Date.now() - this.remote.lastSeen < 90_000;
-    return { connected: this.remote.streams > 0 || fresh, streams: this.remote.streams, lastSeen: this.remote.lastSeen || null, name: this.remote.name };
+  getRemoteDevices(): RemoteDevice[] {
+    return this.remoteDevices;
   }
 
   routing(): Routing { return { ...this.data.routing }; }

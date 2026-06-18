@@ -128,8 +128,8 @@ export default function DevicePairing() {
   // When a device actually connects, celebrate briefly then return to Settings.
   React.useEffect(() => {
     let alive = true;
-    api.getPairing().then((p) => { if (alive && p.devices?.connected) setPaired(p.devices.name ?? 'Your device'); }).catch(() => {});
-    const off = api.subscribe({ onDevices: (d) => { if (d.connected) setPaired(d.name ?? 'Your device'); } });
+    api.getPairing().then((p) => { if (!alive) return; const d = (p.devices ?? []).find((x) => x.live); if (d) setPaired(d.name ?? 'Your device'); }).catch(() => {});
+    const off = api.subscribe({ onDevices: (ds) => { const d = ds.find((x) => x.live); if (d) setPaired(d.name ?? 'Your device'); } });
     return () => { alive = false; off(); };
   }, []);
   React.useEffect(() => {
@@ -160,7 +160,7 @@ export default function DevicePairing() {
           className="ghost-btn"
           onClick={close}
           title="Done (Esc)"
-          style={{ position: 'absolute', top: 16, left: 18, zIndex: 30, display: 'inline-flex', alignItems: 'center', gap: 7, height: 32, padding: '0 14px 0 10px', borderRadius: 'var(--r-pill)', background: 'var(--glass-tint)', border: '0.5px solid var(--glass-border)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)', color: 'var(--ink)', cursor: 'pointer', font: '600 var(--fs-callout)/1 var(--font-text)' }}
+          style={{ position: 'absolute', top: 16, left: 80, zIndex: 30, display: 'inline-flex', alignItems: 'center', gap: 7, height: 32, padding: '0 14px 0 10px', borderRadius: 'var(--r-pill)', background: 'var(--glass-tint)', border: '0.5px solid var(--glass-border)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)', color: 'var(--ink)', cursor: 'pointer', font: '600 var(--fs-callout)/1 var(--font-text)' }}
         >
           <Icon name="arrowLeft" size={16} /> Done
         </button>

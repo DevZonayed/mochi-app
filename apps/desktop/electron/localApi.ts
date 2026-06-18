@@ -1178,7 +1178,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
 
       // ── Pairing (desktop-only; never enters relay snapshots) ──
-      case 'getPairing': return { token: store.accessToken, relayUrl, devices: store.getRemotePresence() };
+      case 'getPairing': return { token: store.accessToken, relayUrl, devices: store.getRemoteDevices() };
 
       default:
         return bad(`unknown method: ${method}`, 404);
