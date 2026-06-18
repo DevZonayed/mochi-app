@@ -87,6 +87,8 @@ export interface AppSettings {
   rescanCadence: 'daily' | 'weekly' | 'onchange';
   favoriteModels?: string[];
   feedbackRepo?: string;
+  /** Opt-in: phone tries a direct WebRTC channel to the Mac (mirrors desktop). */
+  p2pEnabled?: boolean;
 }
 
 export type AssetKind = 'image' | 'video' | 'audio' | 'voiceover' | 'other';
@@ -126,6 +128,9 @@ import { Platform } from 'react-native';
 export const DEVICE_NAME = Platform.OS === 'ios' ? 'iPhone' : Platform.OS === 'android' ? 'Android phone' : 'Web remote';
 import { getStr, setStr, PAIR_TOKEN, DEVICE_ID } from './storage';
 import { gotoRepair } from './navRef';
+import { buildIceServers } from '@maestro/realtime';
+import { createP2PLink } from './p2p/link';
+import type { Signal } from './p2p/transport';
 
 /* Pairing token — the relay refuses /api/* without the code shown in the
    Maestro desktop app (Settings → Devices). Stored locally on this phone. */
@@ -332,6 +337,7 @@ export const api = {
   /** Operator defaults, stored on the Mac (effort/engine the new-job composer inherits). */
   getSettings: () => req<AppSettings | null>('/api/settings'),
   setSettings: (patch: Partial<AppSettings>) => req<AppSettings>('/api/settings', { method: 'POST', body: JSON.stringify(patch) }),
+  turnCredentials: () => req<{ host: string | null; username: string | null; credential: string | null; ttl: number }>('/api/turn-credentials'),
 
   /** Send feedback from this phone — stored on the Mac (source: 'phone'). */
   submitFeedback: (input: { category: 'bug' | 'idea' | 'other'; message: string }) =>
@@ -375,29 +381,66 @@ export type LiveEventName =
   | 'job' | 'session' | 'approval' | 'asset' | 'comms' | 'briefs'
   | 'schedule' | 'schedule-late' | 'git-status' | 'extension' | 'host' | 'hello';
 
+/** Send WebRTC signaling to the Mac. The relay tags it with this device's id and
+    hands it to the host; the Mac's replies come back as SSE `signal` frames. Not a
+    tracked mutation (no outbox noise). */
+export async function postSignal(signal: unknown): Promise<void> {
+  await req('/api/signal', { method: 'POST', body: JSON.stringify({ signal }) });
+}
+
 /** Open the relay's SSE stream (real-time, no polling) and invoke `onEvent(name,
     data)` for each host event. Returns a disposer. react-native-sse is an XHR-based
     EventSource that works in Expo Go (RN has no native EventSource) and reconnects
-    automatically. The pairing token rides as a Bearer header. */
+    automatically. The pairing token rides as a Bearer header.
+
+    When the Mac's `p2pEnabled` flag is on, a direct WebRTC channel is attempted;
+    once it's open, host events arrive over P2P and the duplicate SSE app-events are
+    suppressed (commands stay on REST). The link is native-free until started, so
+    Expo Go / web simply keep using SSE. */
 export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => void): () => void {
   const NAMES: LiveEventName[] = ['job', 'session', 'approval', 'asset', 'comms', 'briefs', 'schedule', 'schedule-late', 'git-status', 'extension', 'host', 'hello'];
+
+  const link = createP2PLink({
+    postSignal: (s) => { void postSignal(s); },
+    fetchIce: async () => {
+      try {
+        const t = await api.turnCredentials();
+        return buildIceServers(t.host && t.username && t.credential ? { host: t.host, username: t.username, credential: t.credential } : undefined);
+      } catch {
+        return buildIceServers();
+      }
+    },
+    onEvent: (name, data) => onEvent(name as LiveEventName, data),
+  });
+  // Only attempt P2P if the Mac enabled it; otherwise stay purely on SSE.
+  void api.getSettings().then((s) => { if (s?.p2pEnabled) link.start(); }).catch(() => { /* stay on SSE */ });
+
   const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME) + '&did=' + encodeURIComponent(getDeviceId()), {
     headers: pairToken ? { Authorization: `Bearer ${pairToken}` } : undefined,
     // Keep the long-lived stream open; reconnect a few seconds after any drop.
     pollingInterval: 4000,
   });
+
+  // Signaling rides the SSE stream as a `signal` frame → feed the answerer.
+  const sigFn = (e: { type: string; data?: string | null }) => {
+    try { link.onRemoteSignal((e.data ? JSON.parse(e.data) : {}) as Signal); } catch { /* non-JSON */ }
+  };
+  es.addEventListener('signal' as 'message', sigFn as (e: unknown) => void);
+
   const handlers = NAMES.map((name) => {
     const fn = (e: { type: string; data?: string | null }) => {
       let data: unknown = null;
       try { data = e.data ? JSON.parse(e.data) : null; } catch { /* non-JSON frame */ }
-      onEvent(name, data);
+      if (!link.isActive()) onEvent(name, data); // P2P up → events arrive over the channel instead
     };
     // react-native-sse dispatches `event: <name>` frames to listeners by name.
     es.addEventListener(name as 'message', fn as (e: unknown) => void);
     return { name, fn };
   });
   return () => {
+    link.stop();
     try {
+      es.removeEventListener('signal' as 'message', sigFn as (e: unknown) => void);
       for (const h of handlers) es.removeEventListener(h.name as 'message', h.fn as (e: unknown) => void);
       es.close();
     } catch { /* already closed */ }
