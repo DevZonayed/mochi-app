@@ -33,6 +33,8 @@ export function setFlag(key: string, val: boolean): void {
 
 export const ONBOARDED = 'maestro.mobile.onboarded';
 export const PAIR_TOKEN = 'maestro.mobile.token';
+/** Stable per-install device id (minted on pair) so the Mac can list + disconnect THIS device. */
+export const DEVICE_ID = 'maestro.mobile.deviceId';
 /** Which AppEvent kinds surface in the Activity feed (per-category toggles). */
 export const NOTIF_PREFS = 'maestro.mobile.notifPrefs';
 /** Require device biometrics (Face ID / fingerprint) before approving a gate. */

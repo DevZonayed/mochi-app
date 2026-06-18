@@ -124,7 +124,8 @@ import { Platform } from 'react-native';
 
 /** A human label for this device, sent so the Mac can show "iPhone connected". */
 export const DEVICE_NAME = Platform.OS === 'ios' ? 'iPhone' : Platform.OS === 'android' ? 'Android phone' : 'Web remote';
-import { getStr, setStr, PAIR_TOKEN } from './storage';
+import { getStr, setStr, PAIR_TOKEN, DEVICE_ID } from './storage';
+import { gotoRepair } from './navRef';
 
 /* Pairing token — the relay refuses /api/* without the code shown in the
    Maestro desktop app (Settings → Devices). Stored locally on this phone. */
@@ -133,9 +134,30 @@ export function getPairToken(): string { return pairToken; }
 export function setPairToken(token: string): void {
   pairToken = token.trim();
   setStr(PAIR_TOKEN, pairToken);
+  freshDeviceId(); // (re-)pair → new identity so a prior kick (old id revoked) doesn't carry over
 }
 /** Re-read the token from storage after async hydration (see storage.hydrate). */
 export function reloadPairToken(): void { pairToken = getStr(PAIR_TOKEN); }
+
+/* Per-device identity — a stable id lets the Mac list + disconnect THIS phone. */
+function mintDeviceId(): string {
+  return `dev-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+}
+export function getDeviceId(): string {
+  let id = getStr(DEVICE_ID);
+  if (!id) { id = mintDeviceId(); setStr(DEVICE_ID, id); }
+  return id;
+}
+function freshDeviceId(): void { setStr(DEVICE_ID, mintDeviceId()); }
+
+/* Re-pair gate: when the relay rejects our token (this device was kicked, or the
+   code was regenerated), drop the token and bounce to Onboarding so the user can
+   reconnect — instead of failing silently. Suppressed around verifyPairing's probe. */
+let authRedirectEnabled = true;
+function handleUnauthorized(): void {
+  setPairToken(''); // clears token + mints a fresh device id for the next pair
+  gotoRepair();
+}
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -204,6 +226,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
         ...(hasBody ? { 'content-type': 'application/json' } : {}),
         ...(pairToken ? { authorization: `Bearer ${pairToken}` } : {}),
         'x-maestro-device': DEVICE_NAME,
+        'x-maestro-device-id': getDeviceId(),
         ...(init?.headers ?? {}),
       },
     });
@@ -215,6 +238,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
       } catch {
         /* non-JSON error body */
       }
+      // Our token/device was rejected (kicked, or the code was regenerated) → drop
+      // it and bounce to the enter-code screen so the user can reconnect.
+      if (res.status === 401 && authRedirectEnabled) handleUnauthorized();
       throw new ApiError(res.status, detail);
     }
     if (intent) recordOutbox(intent, 'applied');
@@ -315,12 +341,15 @@ export const api = {
      'ok' = token works · 'invalid' = wrong code (401) · 'mac-offline' = no Mac
      reachable to validate against (503) · 'unreachable' = network/relay down. */
   verifyPairing: async (): Promise<'ok' | 'invalid' | 'mac-offline' | 'unreachable'> => {
+    authRedirectEnabled = false; // this probe handles 401 itself (don't bounce to Onboarding)
     try {
       await req('/api/engine-status');
       return 'ok';
     } catch (e) {
       if (e instanceof ApiError) return e.status === 401 ? 'invalid' : e.status === 503 ? 'mac-offline' : 'invalid';
       return 'unreachable';
+    } finally {
+      authRedirectEnabled = true;
     }
   },
 
@@ -352,7 +381,7 @@ export type LiveEventName =
     automatically. The pairing token rides as a Bearer header. */
 export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => void): () => void {
   const NAMES: LiveEventName[] = ['job', 'session', 'approval', 'asset', 'comms', 'briefs', 'schedule', 'schedule-late', 'git-status', 'extension', 'host', 'hello'];
-  const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME), {
+  const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME) + '&did=' + encodeURIComponent(getDeviceId()), {
     headers: pairToken ? { Authorization: `Bearer ${pairToken}` } : undefined,
     // Keep the long-lived stream open; reconnect a few seconds after any drop.
     pollingInterval: 4000,
