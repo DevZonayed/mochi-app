@@ -63,7 +63,9 @@ function defaultSummarize(deps: WaAnalyzeDeps): NonNullable<WaAnalyzeDeps['summa
 async function runAnalysis(deps: WaAnalyzeDeps, s: Schedule): Promise<void> {
   const chatId = s.chatId;
   if (!chatId) return;
-  const msgs = deps.store.getWaTranscript(chatId, { sinceReported: true });
+  // Cap the prompt: summarize at most the most-recent 300 new messages (a quiet
+  // burst is rarely larger, and this bounds cost even if a big backlog slips in).
+  const msgs = deps.store.getWaTranscript(chatId, { sinceReported: true }).slice(-300);
   if (msgs.length === 0) return; // nothing new since the last summary — quiet, once
   const chat = deps.store.listWaChats().find(c => c.chatId === chatId);
   const chatName = chat?.name ?? chatId;

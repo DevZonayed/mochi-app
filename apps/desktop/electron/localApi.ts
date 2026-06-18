@@ -1037,8 +1037,9 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'unbindChat': {
         const chatId = String(p.chatId ?? '');
-        // A WhatsApp chat: also stop its quiet timer and forget its captured log.
-        if (store.getChatBinding(chatId)?.provider === 'whatsapp') { store.cancelWhatsappTimer(chatId); store.forgetWaChat(chatId); }
+        // A WhatsApp chat: stop its quiet timer. KEEP the captured log — the chat
+        // still shows in the WhatsApp screen; only a full unlink wipes message logs.
+        if (store.getChatBinding(chatId)?.provider === 'whatsapp') store.cancelWhatsappTimer(chatId);
         store.unbindChat(chatId); emit('comms', store.commsStatus()); return { ok: true };
       }
       case 'setChatPermissions': {
@@ -1056,6 +1057,50 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'disconnectWhatsApp': { whatsapp.disconnect(); return { ok: true }; }
       case 'unlinkWhatsApp': { await whatsapp.unlink(); return { ok: true }; }
       case 'approveWhatsappSend': { await approveWhatsappSend({ store, client: whatsapp, emit }); return store.whatsappState(); }
+
+      // ── WhatsApp full chat store + control (Mac-local; blocked over the relay) ──
+      case 'waListChats': return store.waListChats();
+      case 'waGetMessages': {
+        if (!p.chatId) bad('chatId required');
+        const limit = typeof p.limit === 'number' ? p.limit : undefined;
+        const before = typeof p.before === 'number' ? p.before : undefined;
+        return store.waMessages(String(p.chatId), { limit, before });
+      }
+      case 'waChatInfo': { if (!p.chatId) bad('chatId required'); return store.waGetChat(String(p.chatId)) ?? null; }
+      case 'waSendText': {
+        if (!p.chatId || typeof p.text !== 'string' || !p.text.trim()) bad('chatId and text required');
+        return { ok: await whatsapp.sendText(String(p.chatId), String(p.text)) };
+      }
+      case 'waSendMedia': {
+        if (!p.chatId) bad('chatId required');
+        const kind = (p.kind === 'image' || p.kind === 'video' || p.kind === 'audio' || p.kind === 'document') ? p.kind : 'document';
+        let data: Buffer | null = null;
+        if (typeof p.path === 'string' && p.path) { try { data = await (await import('node:fs/promises')).readFile(p.path); } catch { bad('could not read that file'); } }
+        else if (typeof p.dataB64 === 'string' && p.dataB64) data = Buffer.from(p.dataB64, 'base64');
+        if (!data) bad('path or dataB64 required');
+        return { ok: await whatsapp.sendMedia(String(p.chatId), { kind, data: data as Buffer, mimetype: p.mimetype ? String(p.mimetype) : undefined, fileName: p.fileName ? String(p.fileName) : undefined, caption: p.caption ? String(p.caption) : undefined }) };
+      }
+      case 'waReact': {
+        if (!p.chatId || !p.msgId) bad('chatId and msgId required');
+        return { ok: await whatsapp.sendReaction(String(p.chatId), String(p.msgId), String(p.emoji ?? '')) };
+      }
+      case 'waMarkRead': { if (!p.chatId) bad('chatId required'); await whatsapp.markRead(String(p.chatId)); return { ok: true }; }
+      case 'waSetTyping': { if (!p.chatId) bad('chatId required'); await whatsapp.setTyping(String(p.chatId), !!p.on); return { ok: true }; }
+      case 'waFetchAvatar': { if (!p.chatId) bad('chatId required'); return { url: await whatsapp.fetchAvatar(String(p.chatId)) }; }
+      case 'setWhatsappAgentSend': { const next = store.setWhatsappState({ agentSendToOthers: !!p.on }); emit('comms', store.commsStatus()); return next; }
+      case 'listProjectWaChats': { if (!p.projectId) bad('projectId required'); return store.listProjectWaChats(String(p.projectId)); }
+      case 'addProjectWaChat': {
+        if (!p.projectId || !p.chatId) bad('projectId and chatId required');
+        const ids = store.addProjectWaChat(String(p.projectId), String(p.chatId));
+        emit('comms', store.commsStatus());
+        return ids;
+      }
+      case 'removeProjectWaChat': {
+        if (!p.projectId || !p.chatId) bad('projectId and chatId required');
+        const ids = store.removeProjectWaChat(String(p.projectId), String(p.chatId));
+        emit('comms', store.commsStatus());
+        return ids;
+      }
 
       // ── Feedback (collected from desktop / web / phone) ────────
       case 'listFeedback': return store.listFeedback();

@@ -12,6 +12,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { quietDeadline } from './whatsapp-quiet.js';
+import { WaStore, type WaChatMeta, type WaStoredMessage, type WaMessageInput, type WaChatKind } from './wa-store.js';
 import type { RemoteDevice } from './relay.js';
 
 export const id = (): string => randomUUID();
@@ -320,8 +321,12 @@ export interface WhatsAppState {
   sendApproved: boolean;
   /** A summary produced before the operator approved sending — flushed on approval. */
   pendingSummary?: { text: string; chatName: string; at: number } | null;
+  /** Whether the in-app agent may message contacts OTHER than your own number.
+      Off by default — the agent can always message your own number (confirmations,
+      updates), but messaging real contacts requires this opt-in. */
+  agentSendToOthers?: boolean;
 }
-export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null };
+export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null, agentSendToOthers: false };
 
 /** One captured WhatsApp message (normalized, text-only — media is noted as a kind). */
 export interface WaMessage { id: string; chatId: string; fromMe: boolean; senderName: string; text: string; ts: number }
@@ -333,8 +338,6 @@ export interface WaChat {
   lastReportedAt: number;
   messages: WaMessage[];
 }
-/** Per-chat capture cap — keeps the JSON store bounded; oldest messages roll off. */
-export const WA_MSG_CAP = 300;
 
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
@@ -525,13 +528,31 @@ const ASSET_TINTS = ['#5b8cff', '#9b6bff', '#41c8d4', '#ff9f6b', '#6bd49a', '#ff
 export class Store {
   private file: string;
   private data!: StoreData;
+  /** Full WhatsApp chat + message store (every chat, JSONL-backed). The
+      monolithic `waChats` field is legacy — migrated into this on first load. */
+  readonly wa: WaStore;
 
   constructor() {
     const dir = app.getPath('userData');
     mkdirSync(dir, { recursive: true });
     this.file = join(dir, 'maestro-store.json');
+    this.wa = new WaStore(join(dir, 'whatsapp', 'primary', 'store'));
     this.load();
+    this.migrateInlineWaChats();
     this.seedCatalog();
+  }
+
+  /** One-time lift of any legacy inline `waChats` (captured by older builds into
+      maestro-store.json) into the JSONL-backed WaStore, then clear the inline copy. */
+  private migrateInlineWaChats(): void {
+    const inline = this.data.waChats;
+    if (!inline || Object.keys(inline).length === 0) return;
+    for (const c of Object.values(inline)) {
+      this.wa.upsertChat({ chatId: c.chatId, name: c.name, kind: c.kind, lastMessageAt: c.lastMessageAt, lastReportedAt: c.lastReportedAt });
+      for (const m of c.messages) this.wa.appendMessage({ chatId: c.chatId, fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: 'text' }, { bumpUnread: false });
+    }
+    this.data.waChats = {};
+    this.save();
   }
 
   private load(): void {
@@ -1258,6 +1279,13 @@ export class Store {
   bindChat(args: { chatId: string; name: string; kind: 'dm' | 'group'; provider?: CommsProvider; projectId?: string | null; sessionId?: string | null; permissions?: Partial<ChatPermissions> }): ChatBinding {
     const existing = this.getChatBinding(args.chatId);
     const perms: ChatPermissions = { startJobs: true, receiveReports: true, approveGates: false, ...(args.permissions ?? {}) };
+    // Tracking a WhatsApp chat that already synced history: seed the summary
+    // watermark to its latest message so the first quiet-period summary covers only
+    // what arrives AFTER tracking — not the entire synced backlog.
+    if ((args.provider ?? existing?.provider) === 'whatsapp') {
+      const meta = this.wa.getChat(args.chatId);
+      if (meta) this.wa.markReported(args.chatId, meta.lastMessageAt);
+    }
     if (existing) {
       Object.assign(existing, {
         name: args.name, kind: args.kind, provider: args.provider ?? existing.provider ?? 'telegram',
@@ -1344,39 +1372,56 @@ export class Store {
     this.save();
     return this.whatsappState();
   }
-  /** Append a captured message to its chat's rolling log (cap WA_MSG_CAP), creating
-      the chat record on first sight. Returns the chat. Frequent — debounced save. */
-  recordWaMessage(m: { chatId: string; name?: string; kind?: 'dm' | 'group'; fromMe: boolean; senderName: string; text: string; ts: number }): WaChat {
-    let chat = this.data.waChats[m.chatId];
-    if (!chat) chat = this.data.waChats[m.chatId] = { chatId: m.chatId, name: m.name ?? m.chatId, kind: m.kind ?? 'dm', lastMessageAt: 0, lastReportedAt: 0, messages: [] };
-    if (m.name) chat.name = m.name;
-    if (m.kind) chat.kind = m.kind;
-    chat.messages.push({ id: id(), chatId: m.chatId, fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts });
-    if (chat.messages.length > WA_MSG_CAP) chat.messages.splice(0, chat.messages.length - WA_MSG_CAP);
-    chat.lastMessageAt = Math.max(chat.lastMessageAt, m.ts);
-    this.saveSoon();
-    return chat;
+  /** Capture a message (legacy shim → WaStore). Used by the quiet-timer ingest path
+      and tests; WaStore appends O(1) to the chat's JSONL log. */
+  recordWaMessage(m: { chatId: string; name?: string; kind?: 'dm' | 'group'; fromMe: boolean; senderName: string; text: string; ts: number }): void {
+    if (m.name || m.kind) this.wa.upsertChat({ chatId: m.chatId, ...(m.name ? { name: m.name } : {}), ...(m.kind ? { kind: m.kind } : {}) });
+    this.wa.appendMessage({ chatId: m.chatId, fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: 'text' });
   }
-  /** Read a chat's captured transcript. `sinceReported` returns only messages
-      newer than the last summary watermark — what a quiet period needs to analyze. */
+  /** Read a chat's transcript. `sinceReported` returns only messages newer than the
+      last summary watermark — what a quiet period needs to analyze. */
   getWaTranscript(chatId: string, opts: { sinceReported?: boolean } = {}): WaMessage[] {
-    const chat = this.data.waChats[chatId];
-    if (!chat) return [];
-    const msgs = opts.sinceReported ? chat.messages.filter(m => m.ts > chat.lastReportedAt) : chat.messages;
-    return msgs.map(m => ({ ...m }));
+    return this.wa.getMessages(chatId, { sinceReported: opts.sinceReported });
   }
   /** Advance a chat's report watermark so the next quiet period only sees newer messages. */
-  markWaReported(chatId: string, ts: number): void {
-    const chat = this.data.waChats[chatId];
-    if (chat) { chat.lastReportedAt = Math.max(chat.lastReportedAt, ts); this.save(); }
-  }
-  /** Tracked-chat summaries (no inlined message bodies — for the snapshot/UI). */
-  listWaChats(): Array<Omit<WaChat, 'messages'> & { count: number }> {
-    return Object.values(this.data.waChats).map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, lastMessageAt: c.lastMessageAt, lastReportedAt: c.lastReportedAt, count: c.messages.length }));
+  markWaReported(chatId: string, ts: number): void { this.wa.markReported(chatId, ts); }
+  /** Captured chats with message counts (back-compat shape for the Comms Bindings tab). */
+  listWaChats(): Array<{ chatId: string; name: string; kind: WaChatKind; lastMessageAt: number; lastReportedAt: number; count: number }> {
+    return this.wa.listChats().map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, lastMessageAt: c.lastMessageAt, lastReportedAt: c.lastReportedAt, count: this.wa.count(c.chatId) }));
   }
   /** Forget a chat's captured log entirely (on untrack/unbind). */
-  forgetWaChat(chatId: string): void {
-    if (this.data.waChats[chatId]) { delete this.data.waChats[chatId]; this.save(); }
+  forgetWaChat(chatId: string): void { this.wa.forget(chatId); }
+
+  // ── WhatsApp full chat store (the WhatsApp screen + agent wa_* tools) ──
+  /** Every captured chat (DMs, groups, channels), pinned-then-newest-first. */
+  waListChats(): WaChatMeta[] { return this.wa.listChats(); }
+  waGetChat(chatId: string): WaChatMeta | undefined { return this.wa.getChat(chatId); }
+  /** A chat's messages for the UI: most-recent `limit`, page older with `before`. */
+  waMessages(chatId: string, opts: { limit?: number; before?: number } = {}): WaStoredMessage[] { return this.wa.getMessages(chatId, opts); }
+  waUpsertChat(meta: { chatId: string } & Partial<WaChatMeta>): WaChatMeta { return this.wa.upsertChat(meta); }
+  waAppendMessage(input: WaMessageInput, opts?: { bumpUnread?: boolean }): WaStoredMessage | null { return this.wa.appendMessage(input, opts); }
+  waUpdateMessage(chatId: string, msgIdOrId: string, patch: Partial<WaStoredMessage>): void { this.wa.updateMessage(chatId, msgIdOrId, patch); }
+  waMarkRead(chatId: string): void { this.wa.markRead(chatId); }
+  waSetUnread(chatId: string, n: number): void { this.wa.setUnread(chatId, n); }
+
+  // ── Per-project WhatsApp chat assignment ────────────────────────────
+  // Backed by whatsapp ChatBindings (single source of truth), so assigning a chat
+  // here also makes it "tracked" (incoming messages route to the project + the
+  // quiet-timer machinery applies) and it shows in the Comms Bindings tab.
+  listProjectWaChats(projectId: string): string[] {
+    return this.data.chatBindings.filter(b => b.provider === 'whatsapp' && b.projectId === projectId).map(b => b.chatId);
+  }
+  addProjectWaChat(projectId: string, chatId: string): string[] {
+    const meta = this.wa.getChat(chatId);
+    this.bindChat({ chatId, name: meta?.name ?? chatId, kind: meta?.kind === 'group' ? 'group' : 'dm', provider: 'whatsapp', projectId });
+    return this.listProjectWaChats(projectId);
+  }
+  removeProjectWaChat(projectId: string, chatId: string): string[] {
+    // Stop routing/summaries but KEEP the captured history (it still shows in the
+    // WhatsApp screen) — only a full unlink wipes message logs.
+    this.cancelWhatsappTimer(chatId);
+    this.unbindChat(chatId);
+    return this.listProjectWaChats(projectId);
   }
 
   // ── Feedback (collected from desktop / web / phone) ─────────────────

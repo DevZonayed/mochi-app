@@ -269,7 +269,8 @@ app.whenReady().then(() => {
     // Streaming frames (50ms cadence) are local-only: the relay/phone gets the
     // ~1s checkpoint updates instead of a snapshot push per frame. `desktopOnly`
     // events (e.g. auto-update — about THIS Mac's binary) likewise stay local.
-    if (opts?.live || opts?.desktopOnly) return;
+    // `wa-*` events carry WhatsApp chat/message content — Mac-local only, never relayed.
+    if (opts?.live || opts?.desktopOnly || name.startsWith('wa-')) return;
     // Keep every connected browser-extension profile's project+chat list live.
     extensionBridge?.onAppEvent(name);
     if (name === 'settings' && data && typeof data === 'object') applyLoginItem(!!(data as { openAtLogin?: boolean }).openAtLogin);
@@ -356,6 +357,9 @@ app.whenReady().then(() => {
   telegram.resumeOnBoot();
   // WhatsApp: the Mac owns one Baileys socket for the operator's own number.
   const whatsapp = new WhatsAppClient(store, emit);
+  // Give the in-app agent WhatsApp read/send tools backed by this same socket
+  // (fixes "no WhatsApp integration available" — the tools live in the maestro MCP).
+  engine.setComms(whatsapp);
   whatsapp.resumeOnBoot();
   const gitService = new GitService(store, emit, providers);
   const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge);
@@ -388,6 +392,12 @@ app.whenReady().then(() => {
         || method === 'copyDesignToCode'
         || method === 'addSkillToProject' || method === 'removeSkillFromProject'
         || method === 'scanConversations' || method === 'importConversations'
+        // WhatsApp chat content + sending are Mac-local only: a remote must never
+        // read messages or send on the linked personal number over the relay.
+        || method === 'waListChats' || method === 'waGetMessages' || method === 'waChatInfo'
+        || method === 'waSendText' || method === 'waSendMedia' || method === 'waReact'
+        || method === 'waMarkRead' || method === 'waSetTyping' || method === 'waFetchAvatar'
+        || method === 'addProjectWaChat' || method === 'removeProjectWaChat' || method === 'listProjectWaChats' || method === 'setWhatsappAgentSend'
         // feedbackCreateIssue spends THIS Mac's GitHub token — keep it local-only
         // (a remote can still submit/list/triage feedback; just not file issues).
         || method === 'feedbackCreateIssue') {

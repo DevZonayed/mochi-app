@@ -5,6 +5,7 @@
    WhatsApp is an honest preview (not wired). */
 
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
 import { api, type CommsStatus, type ChatBinding, type PendingChat, type CommEvent, type Project, type ChatPermissions, type WhatsAppState, type WaChatSummary, type ChatSession, type CommsProvider, ApiError, IS_LOCAL } from '../lib/api';
@@ -40,6 +41,7 @@ function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void 
 
 // ── WhatsApp card (link + connection + send gate) ───────────────────────────
 function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tracked: number; onChanged: () => void }) {
+  const navigate = useNavigate();
   const [qr, setQr] = React.useState<string | null>(null);
   const [pairing, setPairing] = React.useState<string | null>(null);
   const [linking, setLinking] = React.useState(false);
@@ -95,9 +97,22 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
         </div>
       )}
 
+      {/* Agent send-gate: the agent can always message your own number; messaging
+          other contacts is off until you allow it here. */}
+      {connected && IS_LOCAL && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 12, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator)', marginBottom: 14 }}>
+          <span style={{ flex: 1 }}>
+            <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Let the agent message contacts</span>
+            <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>The agent can always message your own number. Turn this on to let it message other people too.</span>
+          </span>
+          <Toggle on={!!wa?.agentSendToOthers} onChange={v => void api.setWhatsappAgentSend(v).then(onChanged)} />
+        </div>
+      )}
+
       {connected ? (
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <div style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Assign chats to a project + session under Bindings. A chat that goes quiet for 15 min gets summarized to you.</div>
+          <div style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Open the WhatsApp space to read and reply to every chat. Assign chats to a project under Bindings; a chat that goes quiet for 15 min is summarized to you.</div>
+          {IS_LOCAL && <button onClick={() => navigate('/whatsapp')} style={{ height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Open WhatsApp</button>}
           {IS_LOCAL && <button onClick={disconnect} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--ink)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Pause</button>}
           {IS_LOCAL && <button onClick={unlink} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Unlink</button>}
         </div>
@@ -122,7 +137,7 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
         <>
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12, borderRadius: 12, background: 'color-mix(in srgb, var(--red) 9%, transparent)', border: '0.5px solid color-mix(in srgb, var(--red) 30%, transparent)', marginBottom: 14 }}>
             <Icon name="alert" size={16} style={{ color: 'var(--red)', flexShrink: 0, marginTop: 1 }} />
-            <span style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>This links your <b style={{ color: 'var(--ink)' }}>personal</b> number via an unofficial connection. WhatsApp may ban numbers that automate — this is your own informed choice. Maestro only reads tracked chats and messages summaries to you.</span>
+            <span style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>This links your <b style={{ color: 'var(--ink)' }}>personal</b> number via an unofficial connection. WhatsApp may ban numbers that automate — this is your own informed choice. Your chats are read and stored only on this Mac (never sent to the relay).</span>
           </div>
           <button onClick={startLink} disabled={busy} style={{ height: 42, padding: '0 20px', borderRadius: 11, background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{busy ? 'Starting…' : linked ? 'Re-link number' : 'Link your number'}</button>
           {err && <div style={{ marginTop: 10, font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--red)' }}>{err}</div>}
