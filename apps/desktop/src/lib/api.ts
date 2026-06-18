@@ -158,6 +158,7 @@ export interface Schedule {
   cadence: string;
   enabled: boolean;
   nextRun: number | null;
+  lastRun?: number | null;
   createdAt: number;
   fireAt?: number;
   sessionId?: string;
