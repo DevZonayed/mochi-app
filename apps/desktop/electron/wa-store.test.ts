@@ -121,6 +121,16 @@ describe('WaStore — messages', () => {
     expect(wa2.getMessages('a@s').map(m => m.text)).toEqual(['one', 'two']);
   });
 
+  it('self-heals: keeps persisting after its dir is deleted out from under it', () => {
+    const wa = new WaStore(base);
+    wa.appendMessage({ chatId: 'a@s', msgId: '1', fromMe: false, senderName: 'A', text: 'before', ts: 1 });
+    rmSync(base, { recursive: true, force: true }); // e.g. an unlink rm -rf wiped the folder
+    const m = wa.appendMessage({ chatId: 'a@s', msgId: '2', fromMe: false, senderName: 'A', text: 'after wipe', ts: 2 });
+    expect(m).toBeTruthy();
+    // the new write must actually land on disk (recreate the dir), not silently vanish
+    expect(new WaStore(base).getMessages('a@s').map(x => x.text)).toEqual(['after wipe']);
+  });
+
   it('forget removes the chat and its messages', () => {
     const wa = new WaStore(base);
     wa.appendMessage({ chatId: 'a@s', msgId: '1', fromMe: false, senderName: 'A', text: 'hi', ts: 1 });

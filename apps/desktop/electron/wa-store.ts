@@ -92,11 +92,16 @@ export class WaStore {
       for (const [k, v] of Object.entries(raw)) this.chats.set(k, v);
     } catch { /* first run / corrupt — start empty */ }
   }
+  /** Recreate the store dir before a write — self-heals if it was deleted out from
+      under us (e.g. an unlink rm -rf), so writes never silently vanish into a gone dir. */
+  private ensureDir(): void { try { mkdirSync(this.msgDir, { recursive: true }); } catch { /* */ } }
+
   private saveChats(): void {
     if (this.deferSave) { this.chatsDirty = true; return; } // flushed once by bulk()
     const obj: Record<string, WaChatMeta> = {};
     for (const [k, v] of this.chats) obj[k] = v;
-    try { writeFileSync(this.chatsFile, JSON.stringify(obj)); } catch { /* disk hiccup — retry next write */ }
+    this.ensureDir();
+    try { writeFileSync(this.chatsFile, JSON.stringify(obj)); } catch (e) { console.error('[wa-store] saveChats failed:', e); }
   }
 
   /** Apply many mutations writing chats.json only once at the end. Used by history
@@ -172,7 +177,8 @@ export class WaStore {
   }
   private writeMessages(chatId: string, msgs: WaStoredMessage[]): void {
     const body = msgs.map(m => JSON.stringify(m)).join('\n');
-    try { writeFileSync(this.msgFile(chatId), body + (msgs.length ? '\n' : '')); } catch { /* disk hiccup */ }
+    this.ensureDir();
+    try { writeFileSync(this.msgFile(chatId), body + (msgs.length ? '\n' : '')); } catch (e) { console.error('[wa-store] writeMessages failed:', e); }
     this.counts.set(chatId, msgs.length);
   }
   private lineCount(chatId: string): number {
@@ -220,7 +226,8 @@ export class WaStore {
     // Count BEFORE the write: with a cold cache, lineCount reads the file — doing it
     // after the append would include the new line and over-count by one.
     const n = this.lineCount(chatId) + 1;
-    try { appendFileSync(this.msgFile(chatId), JSON.stringify(msg) + '\n'); } catch { /* disk hiccup */ }
+    this.ensureDir();
+    try { appendFileSync(this.msgFile(chatId), JSON.stringify(msg) + '\n'); } catch (e) { console.error('[wa-store] append failed:', e); }
     this.counts.set(chatId, n);
 
     const cur = this.chats.get(chatId);

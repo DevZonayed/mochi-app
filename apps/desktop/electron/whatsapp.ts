@@ -476,8 +476,11 @@ export class WhatsAppClient {
   async unlink(): Promise<void> {
     this.disconnect();
     this.contacts.clear();
-    try { this.store.wa.clear(); } catch { /* */ } // wipe captured chats/messages from memory
-    try { const { rm } = await import('node:fs/promises'); await rm(join(app.getPath('userData'), 'whatsapp', ACCOUNT), { recursive: true, force: true }); } catch { /* */ }
+    try { this.store.wa.clear(); } catch { /* */ } // wipe captured chats/messages (keeps the store dir)
+    // Remove ONLY the auth — NOT the whole `whatsapp/<account>` folder, which also
+    // holds the message store dir the live WaStore writes to (deleting it made every
+    // post-relink write silently fail into a gone directory).
+    try { const { rm } = await import('node:fs/promises'); await rm(join(app.getPath('userData'), 'whatsapp', ACCOUNT, 'auth'), { recursive: true, force: true }); } catch { /* */ }
     this.store.setWhatsappState({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, agentSendToOthers: false });
     this.emit('wa-chats', null);
     this.emit('comms', this.store.commsStatus());
