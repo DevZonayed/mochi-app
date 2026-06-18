@@ -23,6 +23,7 @@ import { useNotificationSettings, updateNotificationSettings, playSound, SOUND_O
 import { EngineSetup } from '../EngineSetup';
 import SkillsRegistry from './SkillsRegistry';
 import BudgetDashboard from './BudgetDashboard';
+import McpServersPane from './McpServersPane';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -145,6 +146,7 @@ const SET_NAV: SetNavItem[] = [
   // Skills + Costs render as full-bleed panes inside Settings (their full screens,
   // minus the standalone window chrome) so the Settings sidebar stays put.
   { key: 'skills', icon: 'spark', label: 'Skills & tools', tint: 'var(--indigo)' },
+  { key: 'mcp', icon: 'terminal', label: 'MCP servers', tint: 'var(--teal)' },
   { key: 'costs', icon: 'gauge', label: 'Costs', tint: 'var(--green)' },
   { key: 'accounts', icon: 'key', label: 'Accounts & keys', tint: 'var(--blue)' },
   { key: 'security', icon: 'shield', label: 'Security', tint: 'var(--green)' },
@@ -904,6 +906,7 @@ export default function Settings() {
     notifications: <NotificationsPane />,
     engines: <EnginesPane />,
     skills: <SkillsRegistry embedded />,
+    mcp: <McpServersPane />,
     costs: <BudgetDashboard embedded />,
     accounts: <AccountsPane />,
     security: <SecurityPane onExportAudit={() => navigate('/audit')} />,
