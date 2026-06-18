@@ -615,11 +615,27 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           fireAt,
           sessionId: p.sessionId ? String(p.sessionId) : undefined,
           prompt: p.prompt ? String(p.prompt) : undefined,
+          everyMinutes: Number.isFinite(Number(p.everyMinutes)) && Number(p.everyMinutes) > 0 ? Number(p.everyMinutes) : undefined,
+          catchUp: p.catchUp === true,
+          effort: p.effort as Effort | undefined,
+          browser: p.browser === true, plan: p.plan === true,
         });
         emit('schedule', s);
         return s;
       }
       case 'toggleSchedule': { store.setScheduleEnabled(String(p.id ?? ''), Boolean(p.enabled)); emit('schedule', { id: String(p.id ?? ''), enabled: Boolean(p.enabled) }); return { ok: true }; }
+      case 'updateSchedule': {
+        const id = String(p.id ?? '');
+        if (!id) bad('id required');
+        if (p.sessionId && !store.getSession(String(p.sessionId))) bad('session not found', 404);
+        const patch: Record<string, unknown> = {};
+        for (const k of ['title', 'prompt', 'time', 'cadence', 'everyMinutes', 'catchUp', 'enabled', 'effort', 'browser', 'plan', 'sessionId', 'projectId'] as const) {
+          if (p[k] !== undefined) patch[k] = p[k];
+        }
+        const s = store.updateSchedule(id, patch);
+        emit('schedule', s);
+        return s;
+      }
       case 'deleteSchedule': { store.deleteSchedule(String(p.id ?? '')); emit('schedule', { id: String(p.id ?? ''), deleted: true }); return { ok: true }; }
       // Wait-&-check: schedule a one-shot follow-up that pokes a chat after delayMs.
       case 'scheduleCheck': {

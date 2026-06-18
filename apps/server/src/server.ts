@@ -362,6 +362,8 @@ export function buildServer(): FastifyInstance {
   app.post('/api/approvals/:id/approve', async (req, reply) => forward(reply, 'approveApproval', { id: (req.params as { id: string }).id }));
   app.post('/api/approvals/:id/deny', async (req, reply) => forward(reply, 'denyApproval', { id: (req.params as { id: string }).id }));
   app.post('/api/schedules', async (req, reply) => forward(reply, 'createSchedule', (req.body ?? {}) as Record<string, unknown>));
+  app.patch('/api/schedules/:id', async (req, reply) =>
+    forward(reply, 'updateSchedule', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/schedules/check', async (req, reply) => forward(reply, 'scheduleCheck', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/schedules/:id/toggle', async (req, reply) =>
     forward(reply, 'toggleSchedule', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));

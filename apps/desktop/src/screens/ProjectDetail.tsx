@@ -2083,12 +2083,21 @@ function ScheduledQueue({ items, now, onCancel, onEdit }: { items: Schedule[]; n
 }
 
 /** Composer popover: one-tap presets or a precise date + time to schedule the message. */
-function SchedulePicker({ initial, onPick, onClose }: { initial?: number; onPick: (ts: number) => void; onClose: () => void }) {
+interface RepeatOpts { everyMinutes?: number; time?: string; cadence?: string; catchUp: boolean }
+function SchedulePicker({ initial, onPick, onRepeat, onClose }: { initial?: number; onPick: (ts: number) => void; onRepeat: (o: RepeatOpts) => void; onClose: () => void }) {
   const base = initial && initial > Date.now() ? initial : Date.now() + 60 * 60_000;
+  const [mode, setMode] = React.useState<'once' | 'repeat'>('once');
   const [date, setDate] = React.useState(() => toDateInput(new Date(base)));
   const [time, setTime] = React.useState(() => toTimeInput(new Date(base)));
+  // Repeat state: either an interval (every N hours) or a daily clock time.
+  const [repeatKind, setRepeatKind] = React.useState<'interval' | 'daily'>('daily');
+  const [everyHours, setEveryHours] = React.useState('3');
+  const [dailyTime, setDailyTime] = React.useState('09:00');
+  const [catchUp, setCatchUp] = React.useState(true);
   const composed = parseDateTime(date, time);
   const valid = composed != null && composed > Date.now() + 30_000;
+  const hoursNum = Number(everyHours);
+  const repeatValid = repeatKind === 'interval' ? Number.isFinite(hoursNum) && hoursNum > 0 : /^\d{1,2}:\d{2}$/.test(dailyTime);
   const presets = [
     { label: 'In 15 min', get: () => Date.now() + 15 * 60_000 },
     { label: 'In 1 hour', get: () => Date.now() + 60 * 60_000 },
@@ -2096,34 +2105,71 @@ function SchedulePicker({ initial, onPick, onClose }: { initial?: number; onPick
     { label: 'Tomorrow 9 AM', get: () => atTomorrow(9, 0) },
   ].filter(o => o.get() > Date.now() + 30_000);
   const inputStyle: React.CSSProperties = { height: 32, padding: '0 8px', borderRadius: 8, border: '1px solid var(--separator-strong)', background: 'var(--bg-grouped)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' };
+  const tab = (k: 'once' | 'repeat', label: string) => (
+    <button onClick={() => setMode(k)} style={{ flex: 1, height: 26, borderRadius: 7, border: 'none', cursor: 'pointer',
+      background: mode === k ? 'var(--bg-elevated)' : 'transparent', color: mode === k ? 'var(--ink)' : 'var(--ink-secondary)',
+      boxShadow: mode === k ? '0 1px 3px rgba(0,0,0,0.14)' : 'none', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{label}</button>
+  );
+  const confirmRepeat = () => {
+    if (!repeatValid) return;
+    if (repeatKind === 'interval') onRepeat({ everyMinutes: Math.round(hoursNum * 60), catchUp });
+    else onRepeat({ time: dailyTime, cadence: 'daily', catchUp });
+  };
   return (
     <>
       <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
       <div style={{ position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 41, width: 284,
         background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.26))', padding: 12 }}>
         <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 9 }}>Schedule this message</div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 11 }}>
-          {presets.map(o => (
-            <button key={o.label} onClick={() => onPick(o.get())} className="mm-row"
-              style={{ height: 28, padding: '0 11px', borderRadius: 'var(--r-pill)', cursor: 'pointer', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', border: 'none' }}>
-              {o.label}
+        <div style={{ display: 'flex', gap: 3, padding: 2, marginBottom: 11, background: 'var(--fill-secondary)', borderRadius: 9 }}>{tab('once', 'Once')}{tab('repeat', 'Repeat')}</div>
+        {mode === 'once' ? (
+          <>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 11 }}>
+              {presets.map(o => (
+                <button key={o.label} onClick={() => onPick(o.get())} className="mm-row"
+                  style={{ height: 28, padding: '0 11px', borderRadius: 'var(--r-pill)', cursor: 'pointer', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', border: 'none' }}>
+                  {o.label}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: 'flex', gap: 7, marginBottom: 10 }}>
+              <input type="date" value={date} min={toDateInput(new Date())} onChange={e => setDate(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
+              <input type="time" value={time} onChange={e => setTime(e.target.value)} style={{ ...inputStyle, width: 100 }} />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1.25 var(--font-text)', color: composed != null && !valid ? 'var(--red)' : 'var(--ink-secondary)' }}>
+                {composed == null ? 'Pick a date & time' : valid ? `Fires ${fmtWhen(composed)} · in ${fmtCountdown(composed - Date.now())}` : 'Pick a time at least 30s ahead'}
+              </span>
+              <button disabled={!valid} onClick={() => { if (valid && composed != null) onPick(composed); }}
+                style={{ height: 30, padding: '0 14px', borderRadius: 9, border: 'none', cursor: valid ? 'pointer' : 'default', flexShrink: 0,
+                  background: valid ? 'var(--blue)' : 'var(--fill-secondary)', color: valid ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                Schedule
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div style={{ display: 'flex', gap: 3, padding: 2, marginBottom: 10, background: 'var(--fill-secondary)', borderRadius: 9 }}>
+              <button onClick={() => setRepeatKind('daily')} style={{ flex: 1, height: 26, borderRadius: 7, border: 'none', cursor: 'pointer', background: repeatKind === 'daily' ? 'var(--bg-elevated)' : 'transparent', color: repeatKind === 'daily' ? 'var(--ink)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Daily at</button>
+              <button onClick={() => setRepeatKind('interval')} style={{ flex: 1, height: 26, borderRadius: 7, border: 'none', cursor: 'pointer', background: repeatKind === 'interval' ? 'var(--bg-elevated)' : 'transparent', color: repeatKind === 'interval' ? 'var(--ink)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Every N hours</button>
+            </div>
+            {repeatKind === 'daily'
+              ? <input type="time" value={dailyTime} onChange={e => setDailyTime(e.target.value)} style={{ ...inputStyle, width: '100%', marginBottom: 10 }} />
+              : <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10 }}>
+                  <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Every</span>
+                  <input type="number" min={1} value={everyHours} onChange={e => setEveryHours(e.target.value)} style={{ ...inputStyle, width: 64 }} />
+                  <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>hours</span>
+                </div>}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 11, cursor: 'pointer', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
+              <input type="checkbox" checked={catchUp} onChange={e => setCatchUp(e.target.checked)} /> Catch up if missed (same day)
+            </label>
+            <button disabled={!repeatValid} onClick={confirmRepeat}
+              style={{ width: '100%', height: 30, borderRadius: 9, border: 'none', cursor: repeatValid ? 'pointer' : 'default',
+                background: repeatValid ? 'var(--blue)' : 'var(--fill-secondary)', color: repeatValid ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+              Schedule repeating
             </button>
-          ))}
-        </div>
-        <div style={{ display: 'flex', gap: 7, marginBottom: 10 }}>
-          <input type="date" value={date} min={toDateInput(new Date())} onChange={e => setDate(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
-          <input type="time" value={time} onChange={e => setTime(e.target.value)} style={{ ...inputStyle, width: 100 }} />
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1.25 var(--font-text)', color: composed != null && !valid ? 'var(--red)' : 'var(--ink-secondary)' }}>
-            {composed == null ? 'Pick a date & time' : valid ? `Fires ${fmtWhen(composed)} · in ${fmtCountdown(composed - Date.now())}` : 'Pick a time at least 30s ahead'}
-          </span>
-          <button disabled={!valid} onClick={() => { if (valid && composed != null) onPick(composed); }}
-            style={{ height: 30, padding: '0 14px', borderRadius: 9, border: 'none', cursor: valid ? 'pointer' : 'default', flexShrink: 0,
-              background: valid ? 'var(--blue)' : 'var(--fill-secondary)', color: valid ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-            Schedule
-          </button>
-        </div>
+          </>
+        )}
       </div>
     </>
   );
@@ -2804,6 +2850,24 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       setSchedNote(`Scheduled · ${fmtWhen(fireAt)}`); setTimeout(() => setSchedNote(''), 4000);
     }).catch(e => { setSchedOpen(false); setSendError(e instanceof Error ? e.message : 'Could not schedule — try again.'); });
   };
+  // Schedule the CURRENT composer message to RECUR (interval or daily) into this
+  // chat, carrying the run intent. Clears the composer on success.
+  const scheduleRecurring = (o: { everyMinutes?: number; time?: string; cadence?: string; catchUp: boolean }) => {
+    if (!projectId) return;
+    const body = text.trim();
+    if (!body) { setSchedOpen(false); setSendError('Type a message first, then schedule it.'); return; }
+    void api.createSchedule({
+      title: body.slice(0, 60), projectId, sessionId: activeRef.current ?? undefined, prompt: body,
+      everyMinutes: o.everyMinutes, time: o.time, cadence: o.cadence, catchUp: o.catchUp,
+      effort: EFFORT_TO_API[effort], browser: composerBrowser,
+    }).then(s => {
+      composerRef.current?.clear(); setText('');
+      setSchedules(list => upsertSchedule(list, s));
+      setSchedOpen(false); setSchedEditAt(null);
+      setSchedNote(o.everyMinutes ? `Repeats every ${o.everyMinutes >= 60 ? `${Math.round(o.everyMinutes / 60)}h` : `${o.everyMinutes}m`}` : `Repeats daily at ${o.time}`);
+      setTimeout(() => setSchedNote(''), 4000);
+    }).catch(e => { setSchedOpen(false); setSendError(e instanceof Error ? e.message : 'Could not schedule — try again.'); });
+  };
   const cancelSchedule = (id: string) => {
     setSchedules(list => list.filter(s => s.id !== id)); // optimistic
     void api.deleteSchedule(id).catch(() => {});
@@ -3119,7 +3183,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                     color: schedOpen ? 'var(--blue)' : 'var(--ink-secondary)', opacity: canSend && projectId ? 1 : 0.45, font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                   <Icon name="clock" size={14} /> Schedule
                 </button>
-                {schedOpen && <SchedulePicker initial={schedEditAt ?? undefined} onPick={scheduleMessage} onClose={() => setSchedOpen(false)} />}
+                {schedOpen && <SchedulePicker initial={schedEditAt ?? undefined} onPick={scheduleMessage} onRepeat={scheduleRecurring} onClose={() => setSchedOpen(false)} />}
               </div>
               {/* reviewer model — tucked behind one button to keep the bar clean */}
               <div style={{ position: 'relative' }}>

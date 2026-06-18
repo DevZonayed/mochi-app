@@ -34,7 +34,15 @@ export function LiveNotifier() {
     Animated.timing(slide, { toValue: -160, duration: 220, useNativeDriver: true }).start(() => setBanner(null));
   };
 
-  useLive(['job', 'approval'], (name, data) => {
+  useLive(['job', 'approval', 'schedule-late'], (name, data) => {
+    if (name === 'schedule-late') {
+      const s = data as { id?: string; title?: string; firedAt?: number } | null;
+      const k = `late:${s?.id ?? ''}:${s?.firedAt ?? ''}`;
+      if (seen.current.has(k)) return; seen.current.add(k);
+      fireAlert('Scheduled task ran late', s?.title ? `“${s.title}” caught up.` : 'A schedule caught up after a missed time.');
+      show({ tint: theme.color.orange, icon: 'clock', title: 'Ran late', body: s?.title ? `“${s.title}” caught up.` : 'A schedule caught up after a missed time.' });
+      return;
+    }
     if (name === 'job') {
       const j = data as { id?: string; status?: string; title?: string } | null;
       if (!j?.id) return;
