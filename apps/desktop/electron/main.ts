@@ -396,7 +396,7 @@ app.whenReady().then(() => {
         // read messages or send on the linked personal number over the relay.
         || method === 'waListChats' || method === 'waGetMessages' || method === 'waChatInfo'
         || method === 'waSendText' || method === 'waSendMedia' || method === 'waReact'
-        || method === 'waMarkRead' || method === 'waSetTyping' || method === 'waFetchAvatar'
+        || method === 'waMarkRead' || method === 'waSetTyping' || method === 'waFetchAvatar' || method === 'waDownloadMedia'
         || method === 'addProjectWaChat' || method === 'removeProjectWaChat' || method === 'listProjectWaChats' || method === 'setWhatsappAgentSend' || method === 'setWhatsappRecipient'
         // feedbackCreateIssue spends THIS Mac's GitHub token — keep it local-only
         // (a remote can still submit/list/triage feedback; just not file issues).

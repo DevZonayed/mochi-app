@@ -80,6 +80,46 @@ describe('waSendAllowed — agent send gate', () => {
   });
 });
 
+describe('normalizeWaMessage — media descriptors + extra kinds', () => {
+  it('extracts an image media descriptor (thumbnail + download keys)', () => {
+    const m = normalizeWaMessage({
+      key: { remoteJid: 'a@s.whatsapp.net', id: 'i1' },
+      message: { imageMessage: { caption: 'look', mimetype: 'image/jpeg', url: 'https://x', directPath: '/v/x', mediaKey: Buffer.from('key1'), jpegThumbnail: Buffer.from('thumbbytes') } },
+      messageTimestamp: 100, pushName: 'A',
+    })!;
+    expect(m.kind).toBe('image');
+    expect(m.text).toBe('look');
+    expect(m.media?.mediaType).toBe('image');
+    expect(m.media?.mimetype).toBe('image/jpeg');
+    expect(m.media?.thumbBase64).toBe(Buffer.from('thumbbytes').toString('base64'));
+    expect(m.media?.mediaKeyB64).toBe(Buffer.from('key1').toString('base64'));
+    expect(m.media?.directPath).toBe('/v/x');
+  });
+  it('classifies sticker, audio (with duration) and contact', () => {
+    expect(normalizeWaMessage({ key: { remoteJid: 'a@s', id: 's1' }, message: { stickerMessage: { mimetype: 'image/webp', mediaKey: Buffer.from('k'), url: 'u' } }, messageTimestamp: 1 })!.kind).toBe('sticker');
+    const a = normalizeWaMessage({ key: { remoteJid: 'a@s', id: 'au1' }, message: { audioMessage: { mimetype: 'audio/ogg', mediaKey: Buffer.from('k'), url: 'u', seconds: 12, ptt: true } }, messageTimestamp: 1 })!;
+    expect(a.kind).toBe('audio'); expect(a.media?.seconds).toBe(12);
+    const c = normalizeWaMessage({ key: { remoteJid: 'a@s', id: 'c1' }, message: { contactMessage: { displayName: 'Bob' } }, messageTimestamp: 1 })!;
+    expect(c.kind).toBe('contact'); expect(c.text).toBe('Bob');
+  });
+  it('marks unknown/protocol frames as system with empty text + no media', () => {
+    const m = normalizeWaMessage({ key: { remoteJid: 'a@s', id: 'p1' }, message: { protocolMessage: { type: 0 } }, messageTimestamp: 1 })!;
+    expect(m.kind).toBe('system'); expect(m.text).toBe(''); expect(m.media).toBeUndefined();
+  });
+});
+
+describe('WhatsAppClient.ingest — skip blank frames', () => {
+  it('does not store empty system/protocol frames (so they never render as blank bubbles)', () => {
+    const s = new Store();
+    const client = new WhatsAppClient(s, vi.fn());
+    client.ingest({ key: { remoteJid: 'z@s.whatsapp.net', id: 'p1' }, message: { protocolMessage: { type: 0 } }, messageTimestamp: 1 });
+    expect(s.waMessages('z@s.whatsapp.net')).toHaveLength(0);
+    expect(s.waGetChat('z@s.whatsapp.net')).toBeUndefined(); // not even a chat row
+    client.ingest({ key: { remoteJid: 'z@s.whatsapp.net', id: 't1' }, message: { conversation: 'real' }, messageTimestamp: 2, pushName: 'A' });
+    expect(s.waMessages('z@s.whatsapp.net').map(m => m.text)).toEqual(['real']);
+  });
+});
+
 describe('WhatsAppClient.ingest — capture routing', () => {
   it('records a tracked chat and arms its quiet timer', () => {
     const s = new Store();

@@ -34,7 +34,24 @@ export interface WaChatMeta {
 }
 
 export interface WaReaction { emoji: string; fromMe: boolean }
-export interface WaMediaRef { kind: string; mimetype?: string; fileName?: string; thumbBase64?: string }
+/** A media attachment: a small inline thumbnail (shown immediately) + the descriptor
+    needed to download the full bytes on demand. */
+export interface WaMediaRef {
+  kind: string;                 // image | video | audio | document | sticker
+  mimetype?: string;
+  fileName?: string;
+  seconds?: number;             // audio/video duration
+  sizeBytes?: number;
+  /** base64 JPEG preview from WhatsApp (no download needed). */
+  thumbBase64?: string;
+  // ── on-demand full download (Baileys downloadContentFromMessage) ──
+  mediaType?: string;           // baileys content type (image|video|audio|document|sticker)
+  directPath?: string;
+  url?: string;
+  mediaKeyB64?: string;
+  /** Cached path once the full media has been downloaded. */
+  localPath?: string;
+}
 
 export interface WaStoredMessage {
   id: string;

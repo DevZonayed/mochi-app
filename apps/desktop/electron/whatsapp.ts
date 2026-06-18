@@ -13,7 +13,7 @@ import { app, powerMonitor } from 'electron';
 import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import type { Store } from './store.js';
-import type { WaChatKind, WaStoredMessage } from './wa-store.js';
+import type { WaChatKind, WaStoredMessage, WaMediaRef } from './wa-store.js';
 
 const ACCOUNT = 'primary';
 
@@ -37,6 +37,8 @@ export interface WaNormalized {
   text: string; kind: string; ts: number; isGroup: boolean;
   /** Quoted/replied-to message text, if any. */
   quotedText?: string;
+  /** Media attachment descriptor (image/video/audio/document/sticker). */
+  media?: WaMediaRef;
 }
 
 /** Shapes from baileys' contacts.upsert / chats.upsert / messaging-history.set
@@ -68,18 +70,56 @@ function toEpochSeconds(t: Raw['messageTimestamp']): number {
   return 0;
 }
 
-function classify(node: Record<string, unknown> | null): { kind: string; text: string } {
+/* eslint-disable @typescript-eslint/no-explicit-any */
+/** A WhatsApp number/Long → JS number. */
+function numFrom(v: any): number | undefined {
+  if (v == null) return undefined;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string') { const n = Number(v); return Number.isFinite(n) ? n : undefined; }
+  if (typeof v.toNumber === 'function') { try { return v.toNumber(); } catch { return undefined; } }
+  if (typeof v.low === 'number') return (v.high * 4294967296) + (v.low >>> 0);
+  return undefined;
+}
+const b64 = (v: any): string | undefined => (v ? Buffer.from(v as Uint8Array).toString('base64') : undefined);
+/** Build the media descriptor (thumbnail + download keys) from a baileys media node. */
+function mediaOf(mm: any, mediaType: WaMediaRef['mediaType']): WaMediaRef {
+  return {
+    kind: mediaType!, mediaType,
+    mimetype: mm.mimetype ? String(mm.mimetype) : undefined,
+    fileName: mm.fileName ? String(mm.fileName) : undefined,
+    seconds: numFrom(mm.seconds),
+    sizeBytes: numFrom(mm.fileLength),
+    thumbBase64: b64(mm.jpegThumbnail),
+    directPath: mm.directPath ? String(mm.directPath) : undefined,
+    url: mm.url ? String(mm.url) : undefined,
+    mediaKeyB64: b64(mm.mediaKey),
+  };
+}
+
+function classify(node: Record<string, unknown> | null): { kind: string; text: string; media?: WaMediaRef } {
   if (!node) return { kind: 'system', text: '' };
-  const n = node as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  const n = node as Record<string, any>;
   if (n.conversation) return { kind: 'text', text: String(n.conversation) };
   if (n.extendedTextMessage) return { kind: 'text', text: String(n.extendedTextMessage.text || '') };
-  if (n.imageMessage) return { kind: 'image', text: String(n.imageMessage.caption || '') };
-  if (n.videoMessage) return { kind: 'video', text: String(n.videoMessage.caption || '') };
-  if (n.audioMessage) return { kind: 'audio', text: '' };
-  if (n.documentMessage) return { kind: 'document', text: String(n.documentMessage.caption || n.documentMessage.fileName || '') };
-  if (n.locationMessage) { const l = n.locationMessage; return { kind: 'location', text: `${l.name ? l.name + ' ' : ''}(${l.degreesLatitude},${l.degreesLongitude})` }; }
+  if (n.imageMessage) return { kind: 'image', text: String(n.imageMessage.caption || ''), media: mediaOf(n.imageMessage, 'image') };
+  if (n.videoMessage) return { kind: 'video', text: String(n.videoMessage.caption || ''), media: mediaOf(n.videoMessage, 'video') };
+  if (n.audioMessage) return { kind: 'audio', text: '', media: mediaOf(n.audioMessage, 'audio') };
+  if (n.documentMessage) return { kind: 'document', text: String(n.documentMessage.caption || ''), media: mediaOf(n.documentMessage, 'document') };
+  if (n.stickerMessage) return { kind: 'sticker', text: '', media: mediaOf(n.stickerMessage, 'sticker') };
+  if (n.contactMessage) return { kind: 'contact', text: String(n.contactMessage.displayName || 'Contact') };
+  if (n.contactsArrayMessage) { const c = n.contactsArrayMessage; return { kind: 'contact', text: String(c.displayName || `${(c.contacts || []).length} contacts`) }; }
+  if (n.locationMessage || n.liveLocationMessage) { const l = n.locationMessage || n.liveLocationMessage; return { kind: 'location', text: `${l.name ? l.name + ' ' : ''}(${l.degreesLatitude},${l.degreesLongitude})` }; }
   if (n.pollCreationMessage || n.pollCreationMessageV3) { const p = n.pollCreationMessage || n.pollCreationMessageV3; return { kind: 'poll', text: String(p.name || '') }; }
   return { kind: 'system', text: '' };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+/** A file extension for downloaded media (from the filename, else the mimetype). */
+function extOf(mimetype: string, fileName?: string): string {
+  if (fileName && fileName.includes('.')) return '.' + fileName.split('.').pop();
+  const map: Record<string, string> = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif', 'video/mp4': '.mp4', 'audio/ogg': '.ogg', 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'application/pdf': '.pdf' };
+  const base = mimetype.split(';')[0];
+  return map[base] || (base.split('/')[1] ? '.' + base.split('/')[1] : '.bin');
 }
 
 function quotedTextOf(node: Record<string, unknown> | null): string {
@@ -97,7 +137,7 @@ export function normalizeWaMessage(raw: Raw): WaNormalized | null {
   if (!chatId) return null;
   const isGroup = chatId.endsWith('@g.us');
   const node = unwrap(raw.message);
-  const { kind, text } = classify(node);
+  const { kind, text, media } = classify(node);
   const quoted = quotedTextOf(node);
   return {
     chatId,
@@ -110,6 +150,7 @@ export function normalizeWaMessage(raw: Raw): WaNormalized | null {
     ts: toEpochSeconds(raw.messageTimestamp) * 1000,
     isGroup,
     ...(quoted ? { quotedText: quoted } : {}),
+    ...(media ? { media } : {}),
   };
 }
 
@@ -230,6 +271,9 @@ export class WhatsAppClient {
       (null on a duplicate msgId). `live:false` = back-fill from history sync. */
   private capture(msg: WaNormalized, live: boolean): WaStoredMessage | null {
     const chatId = msg.chatId;
+    // Skip protocol/unsupported frames with nothing to show — otherwise they render
+    // as blank bubbles and pollute the chat's last-message preview.
+    if (msg.kind === 'system' && !msg.text && !msg.media) return null;
     const kind = kindOfJid(chatId);
     const existing = this.store.waGetChat(chatId);
     // Resolve a human name: a known name wins; for a DM fall back to contact/pushName; else the JID.
@@ -246,6 +290,7 @@ export class WhatsAppClient {
       kind: msg.kind,
       ts: msg.ts || Date.now(),
       ...(msg.quotedText ? { quotedText: msg.quotedText } : {}),
+      ...(msg.media ? { media: msg.media } : {}),
     }, { bumpUnread: live });
   }
 
@@ -455,6 +500,43 @@ export class WhatsAppClient {
       const lastIn = this.store.waMessages(chatId, { limit: 20 }).filter(m => !m.fromMe).slice(-1)[0];
       if (lastIn?.msgId && this.sock?.readMessages) await this.sock.readMessages([{ remoteJid: chatId, id: lastIn.msgId, fromMe: false }]);
     } catch { /* read receipt is best-effort */ }
+  }
+
+  /** Download a media message's full bytes on demand (decrypt from WhatsApp's CDN
+      using the stored keys), cache to disk, and return a data-URL the UI can render
+      directly. Mac-local; null if the media is unavailable (e.g. an expired URL). */
+  async downloadMedia(chatId: string, msgId: string): Promise<{ dataUrl: string; mimetype: string; fileName?: string } | null> {
+    const m = this.store.waMessages(chatId, { limit: 5000 }).find(x => x.msgId === msgId || x.id === msgId);
+    const media = m?.media;
+    if (!media || !media.mediaType) return null;
+    const mimetype = media.mimetype || 'application/octet-stream';
+    const toDataUrl = (buf: Buffer) => `data:${mimetype};base64,${buf.toString('base64')}`;
+    // Serve the cached copy if we already downloaded it.
+    if (media.localPath) {
+      try { const { readFile } = await import('node:fs/promises'); return { dataUrl: toDataUrl(await readFile(media.localPath)), mimetype, fileName: media.fileName }; }
+      catch { /* cache gone — re-download */ }
+    }
+    if (!media.mediaKeyB64 || !(media.directPath || media.url)) return null;
+    try {
+      const baileys = await import('@whiskeysockets/baileys');
+      const downloadContentFromMessage = (baileys as unknown as { downloadContentFromMessage: (m: unknown, t: string, o: unknown) => Promise<AsyncIterable<Buffer>> }).downloadContentFromMessage;
+      const stream = await downloadContentFromMessage(
+        { url: media.url, directPath: media.directPath, mediaKey: Buffer.from(media.mediaKeyB64, 'base64') },
+        media.mediaType, {},
+      );
+      const chunks: Buffer[] = [];
+      for await (const c of stream) chunks.push(c as Buffer);
+      const buf = Buffer.concat(chunks);
+      try {
+        const { mkdir, writeFile } = await import('node:fs/promises');
+        const dir = join(app.getPath('userData'), 'whatsapp', ACCOUNT, 'store', 'media');
+        await mkdir(dir, { recursive: true });
+        const p = join(dir, `${(msgId || m!.id).replace(/[^a-zA-Z0-9._-]/g, '_')}${extOf(mimetype, media.fileName)}`);
+        await writeFile(p, buf);
+        this.store.waUpdateMessage(chatId, msgId, { media: { ...media, localPath: p } });
+      } catch { /* caching is best-effort */ }
+      return { dataUrl: toDataUrl(buf), mimetype, fileName: media.fileName };
+    } catch { return null; }
   }
 
   /** Reconnect on boot if a number was previously linked. */

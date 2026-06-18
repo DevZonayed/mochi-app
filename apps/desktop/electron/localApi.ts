@@ -1087,6 +1087,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'waMarkRead': { if (!p.chatId) bad('chatId required'); await whatsapp.markRead(String(p.chatId)); return { ok: true }; }
       case 'waSetTyping': { if (!p.chatId) bad('chatId required'); await whatsapp.setTyping(String(p.chatId), !!p.on); return { ok: true }; }
       case 'waFetchAvatar': { if (!p.chatId) bad('chatId required'); return { url: await whatsapp.fetchAvatar(String(p.chatId)) }; }
+      case 'waDownloadMedia': {
+        if (!p.chatId || !p.msgId) bad('chatId and msgId required');
+        return (await whatsapp.downloadMedia(String(p.chatId), String(p.msgId))) ?? null;
+      }
       case 'setWhatsappAgentSend': { const next = store.setWhatsappState({ agentSendToOthers: !!p.on }); emit('comms', store.commsStatus()); return next; }
       case 'setWhatsappRecipient': {
         const digits = String(p.number ?? '').replace(/[^0-9]/g, ''); // '' clears it

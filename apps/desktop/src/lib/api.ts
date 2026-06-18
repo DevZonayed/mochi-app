@@ -436,7 +436,8 @@ export interface WaChat {
   unreadCount: number; pinned?: boolean; muted?: boolean; isContact?: boolean; lastReportedAt: number;
 }
 export interface WaReaction { emoji: string; fromMe: boolean }
-export interface WaMediaRef { kind: string; mimetype?: string; fileName?: string; thumbBase64?: string }
+export interface WaMediaRef { kind: string; mimetype?: string; fileName?: string; seconds?: number; sizeBytes?: number; thumbBase64?: string }
+export interface WaMediaData { dataUrl: string; mimetype: string; fileName?: string }
 /** A WhatsApp message in the conversation view (mirrors electron WaStoredMessage). */
 export interface WaMessage {
   id: string; msgId?: string; chatId: string; fromMe: boolean; senderId?: string;
@@ -903,6 +904,8 @@ export const api = {
   waMarkRead: (chatId: string) => call<{ ok: boolean }>('waMarkRead', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
   waSetTyping: (chatId: string, on: boolean) => call<{ ok: boolean }>('waSetTyping', { chatId, on }, () => Promise.reject(new ApiError(403, 'desktop only'))),
   waFetchAvatar: (chatId: string) => call<{ url: string | null }>('waFetchAvatar', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Download a media message's full bytes on demand → a data-URL the UI renders directly. */
+  waDownloadMedia: (chatId: string, msgId: string) => call<WaMediaData | null>('waDownloadMedia', { chatId, msgId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
 
   // Per-project WhatsApp chat assignment (desktop-only). Assigning a chat tracks it
   // for the project: incoming messages route here and the agent prefers it.

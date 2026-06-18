@@ -8,7 +8,7 @@ import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
-import { api, type WaChat, type WaMessage, type WhatsAppState, IS_LOCAL } from '../lib/api';
+import { api, type WaChat, type WaMessage, type WaMediaData, type WhatsAppState, IS_LOCAL } from '../lib/api';
 
 const CSS = `
   .wa-row:hover { background: var(--fill-tertiary); }
@@ -108,17 +108,70 @@ function ChatList({ chats, selectedId, query, setQuery, onSelect }: { chats: WaC
   );
 }
 
+// ── media: inline thumbnail + on-demand full load (image/video/audio/document) ──
+function humanSize(b: number): string { return b < 1024 ? `${b} B` : b < 1048576 ? `${Math.round(b / 1024)} KB` : `${(b / 1048576).toFixed(1)} MB`; }
+function MediaChip({ icon, label, sub, onClick, loading, err }: { icon: IconNameLike; label: string; sub?: string; onClick: () => void; loading: boolean; err: boolean }) {
+  return (
+    <button onClick={onClick} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', borderRadius: 8, background: 'var(--fill-secondary)', maxWidth: 260, marginBottom: 4, textAlign: 'left' }}>
+      <Icon name={loading ? 'refresh' : icon} size={16} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+      <span style={{ minWidth: 0 }}>
+        <span style={{ display: 'block', font: '500 var(--fs-caption)/1.2 var(--font-text)', color: err ? 'var(--red)' : 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{err ? 'Couldn’t load — tap to retry' : label}</span>
+        {sub ? <span style={{ display: 'block', font: '400 10px/1.2 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{sub}</span> : null}
+      </span>
+    </button>
+  );
+}
+type IconNameLike = 'image' | 'play' | 'clapper' | 'file' | 'refresh';
+function MediaBlock({ m, onLoad }: { m: WaMessage; onLoad: (msgId: string) => Promise<WaMediaData | null> }) {
+  const [full, setFull] = React.useState<string | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [err, setErr] = React.useState(false);
+  const md = m.media!;
+  const thumb = md.thumbBase64 ? `data:image/jpeg;base64,${md.thumbBase64}` : null;
+  const dur = md.seconds ? `${Math.floor(md.seconds / 60)}:${String(md.seconds % 60).padStart(2, '0')}` : '';
+  const get = async (): Promise<WaMediaData | null> => {
+    if (!m.msgId || loading) return null;
+    setLoading(true); setErr(false);
+    const r = await onLoad(m.msgId).catch(() => null);
+    setLoading(false); if (!r) setErr(true);
+    return r;
+  };
+  const showInline = async () => { const r = await get(); if (r) setFull(r.dataUrl); };
+  const download = async () => { const r = await get(); if (r) { const a = document.createElement('a'); a.href = r.dataUrl; a.download = r.fileName || m.kind; a.click(); } };
+  const box: React.CSSProperties = { borderRadius: 8, display: 'block', marginBottom: m.text ? 6 : 2 };
+
+  if (m.kind === 'image' || m.kind === 'sticker') {
+    const src = full || thumb;
+    if (!src) return <MediaChip icon="image" label={m.kind === 'sticker' ? 'Sticker' : 'Photo'} onClick={showInline} loading={loading} err={err} />;
+    return <img src={src} onClick={() => { if (!full) void showInline(); }} title={full ? '' : 'Click to load full image'} style={{ ...box, width: m.kind === 'sticker' ? 120 : 240, maxWidth: '100%', cursor: full ? 'default' : 'zoom-in' }} />;
+  }
+  if (m.kind === 'video') {
+    if (full) return <video src={full} controls autoPlay style={{ ...box, width: 280, maxWidth: '100%' }} />;
+    return (
+      <div onClick={showInline} style={{ ...box, position: 'relative', width: 240, minHeight: thumb ? undefined : 120, cursor: 'pointer', background: 'var(--fill-secondary)', overflow: 'hidden' }}>
+        {thumb && <img src={thumb} style={{ width: '100%', display: 'block' }} />}
+        <span style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}><span style={{ width: 44, height: 44, borderRadius: '50%', background: 'rgba(0,0,0,0.55)', color: '#fff', display: 'grid', placeItems: 'center' }}><Icon name={loading ? 'refresh' : 'play'} size={20} /></span></span>
+        {dur ? <span style={{ position: 'absolute', right: 6, bottom: 6, font: '500 10px/1 var(--font-text)', color: '#fff', background: 'rgba(0,0,0,0.55)', padding: '2px 5px', borderRadius: 4 }}>{dur}</span> : null}
+      </div>
+    );
+  }
+  if (m.kind === 'audio') {
+    if (full) return <audio src={full} controls autoPlay style={{ height: 38, maxWidth: 240, marginBottom: 4 }} />;
+    return <MediaChip icon="play" label={`Voice message${dur ? ' · ' + dur : ''}`} onClick={showInline} loading={loading} err={err} />;
+  }
+  return <MediaChip icon="file" label={md.fileName || 'Document'} sub={md.sizeBytes ? humanSize(md.sizeBytes) : 'Tap to download'} onClick={download} loading={loading} err={err} />;
+}
+
 // ── right: one message bubble ────────────────────────────────────────────────
-function Bubble({ m, isGroup }: { m: WaMessage; isGroup: boolean }) {
+function Bubble({ m, isGroup, onLoadMedia }: { m: WaMessage; isGroup: boolean; onLoadMedia: (msgId: string) => Promise<WaMediaData | null> }) {
   const out = m.fromMe;
-  const isMedia = m.kind !== 'text' && m.kind !== 'system';
   const tick = m.status === 'read' ? { t: '✓✓', c: 'var(--blue)' } : m.status === 'delivered' ? { t: '✓✓', c: 'var(--ink-tertiary)' } : { t: '✓', c: 'var(--ink-tertiary)' };
   return (
     <div style={{ display: 'flex', justifyContent: out ? 'flex-end' : 'flex-start', padding: '1px 0' }}>
       <div style={{ maxWidth: '72%', padding: '7px 10px 5px', borderRadius: 12, borderTopRightRadius: out ? 3 : 12, borderTopLeftRadius: out ? 12 : 3, background: out ? 'color-mix(in srgb, var(--green) 22%, var(--bg-elevated))' : 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)' }}>
         {isGroup && !out && <div style={{ font: '600 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--blue)', marginBottom: 2 }}>{m.senderName}</div>}
         {m.quotedText ? <div style={{ borderLeft: '3px solid var(--green)', padding: '3px 8px', margin: '0 0 4px', borderRadius: 4, background: 'var(--fill-secondary)', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 240 }}>{m.quotedText}</div> : null}
-        {isMedia && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 8px', marginBottom: m.text ? 4 : 0, borderRadius: 8, background: 'var(--fill-secondary)', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)' }}><Icon name={m.kind === 'image' ? 'image' : m.kind === 'audio' ? 'play' : m.kind === 'video' ? 'clapper' : 'file'} size={13} />{m.media?.fileName ?? m.kind}</span>}
+        {m.media ? <MediaBlock m={m} onLoad={onLoadMedia} /> : null}
         {m.text ? <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{m.text}</div> : null}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4, marginTop: 2, font: '400 10px/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
           {clock(m.ts)}{out && <span style={{ color: tick.c }}>{tick.t}</span>}
@@ -134,9 +187,9 @@ function Bubble({ m, isGroup }: { m: WaMessage; isGroup: boolean }) {
 }
 
 // ── right: conversation pane ─────────────────────────────────────────────────
-function Conversation({ chat, messages, onSend, onSendFile, onReact, onLoadMore, hasMore, busy }: {
+function Conversation({ chat, messages, onSend, onSendFile, onReact, onLoadMore, onLoadMedia, hasMore, busy }: {
   chat: WaChat; messages: WaMessage[]; onSend: (t: string) => void; onSendFile: (f: File, caption: string) => void;
-  onReact: (msgId: string, emoji: string) => void; onLoadMore: () => void; hasMore: boolean; busy: boolean;
+  onReact: (msgId: string, emoji: string) => void; onLoadMore: () => void; onLoadMedia: (msgId: string) => Promise<WaMediaData | null>; hasMore: boolean; busy: boolean;
 }) {
   const [draft, setDraft] = React.useState('');
   const [reactFor, setReactFor] = React.useState<string | null>(null);
@@ -181,6 +234,9 @@ function Conversation({ chat, messages, onSend, onSendFile, onReact, onLoadMore,
         )}
         {hasMore && <div style={{ textAlign: 'center', marginBottom: 10 }}><button onClick={onLoadMore} disabled={busy} style={{ height: 30, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', font: '500 var(--fs-caption)/1 var(--font-text)' }}>{busy ? 'Loading…' : 'Load earlier messages'}</button></div>}
         {messages.map(m => {
+          // Defensive: never render a blank bubble (no text, no media) — e.g. legacy
+          // protocol frames captured before the skip-on-capture fix.
+          if (!m.text && !m.media) return null;
           const day = dayLabel(m.ts);
           const sep = day !== lastDay; lastDay = day;
           return (
@@ -188,7 +244,7 @@ function Conversation({ chat, messages, onSend, onSendFile, onReact, onLoadMore,
               {sep && <div style={{ textAlign: 'center', margin: '12px 0' }}><span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', background: 'var(--bg-elevated)', borderRadius: 'var(--r-pill)', padding: '4px 12px', border: '0.5px solid var(--separator)' }}>{day}</span></div>}
               <div className="wa-msg-grp" style={{ position: 'relative', display: 'flex', justifyContent: m.fromMe ? 'flex-end' : 'flex-start', alignItems: 'center', gap: 6 }}>
                 {m.fromMe && m.msgId && <ReactButton open={reactFor === m.id} onToggle={() => setReactFor(reactFor === m.id ? null : m.id)} onPick={e => { onReact(m.msgId!, e); setReactFor(null); }} />}
-                <Bubble m={m} isGroup={chat.kind === 'group'} />
+                <Bubble m={m} isGroup={chat.kind === 'group'} onLoadMedia={onLoadMedia} />
                 {!m.fromMe && m.msgId && <ReactButton open={reactFor === m.id} onToggle={() => setReactFor(reactFor === m.id ? null : m.id)} onPick={e => { onReact(m.msgId!, e); setReactFor(null); }} />}
               </div>
             </React.Fragment>
@@ -279,6 +335,7 @@ export default function WhatsAppScreen() {
       .catch(() => {}).finally(() => setBusy(false));
   }, [selectedId, messages]);
 
+  const loadMedia = React.useCallback((msgId: string) => selectedId ? api.waDownloadMedia(selectedId, msgId) : Promise.resolve(null), [selectedId]);
   const sendText = (t: string) => { if (selectedId) void api.waSendText(selectedId, t).catch(() => {}); };
   const react = (msgId: string, emoji: string) => {
     if (!selectedId) return;
@@ -311,7 +368,7 @@ export default function WhatsAppScreen() {
         <div style={{ display: 'flex', height: '100%', minHeight: 0 }}>
           <ChatList chats={chats} selectedId={selectedId} query={query} setQuery={setQuery} onSelect={openChat} />
           {selected ? (
-            <Conversation chat={selected} messages={messages} onSend={sendText} onSendFile={sendFile} onReact={react} onLoadMore={loadMore} hasMore={hasMore} busy={busy} />
+            <Conversation chat={selected} messages={messages} onSend={sendText} onSendFile={sendFile} onReact={react} onLoadMore={loadMore} onLoadMedia={loadMedia} hasMore={hasMore} busy={busy} />
           ) : chats.length ? (
             <Centered icon="whatsapp" title="Select a chat" sub="Pick a conversation on the left to read and reply." />
           ) : (
