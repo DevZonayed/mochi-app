@@ -13,8 +13,6 @@ export const NOTIF_CATEGORIES: NotifCategory[] = [
   { key: 'completions', label: 'Completions', kinds: ['job-done', 'clone-done'] },
   { key: 'failures', label: 'Failures', kinds: ['job-failed', 'clone-failed', 'job-cancelled'] },
   { key: 'media', label: 'Media', kinds: ['asset'] },
-  { key: 'publishing', label: 'Publishing', kinds: ['publish'] },
-  { key: 'schedules', label: 'Schedules', kinds: ['schedule-fired'] },
 ];
 
 export type NotifPrefs = Record<string, boolean>;
