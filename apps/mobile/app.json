@@ -16,6 +16,7 @@
     },
     "android": {
       "package": "ai.maestro.app",
+      "googleServicesFile": "./google-services.json",
       "edgeToEdgeEnabled": true,
       "softwareKeyboardLayoutMode": "resize",
       "permissions": [
