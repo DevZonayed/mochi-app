@@ -19,7 +19,9 @@
       "edgeToEdgeEnabled": true,
       "softwareKeyboardLayoutMode": "resize",
       "permissions": [
-        "android.permission.CAMERA"
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
       ]
     },
     "web": {
@@ -33,7 +35,14 @@
         }
       ],
       "expo-audio",
-      "@config-plugins/react-native-webrtc"
-    ]
+      "@config-plugins/react-native-webrtc",
+      "expo-notifications"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "28b856bc-5534-4a50-b6af-70cd5803ee68"
+      }
+    },
+    "owner": "devzonayed"
   }
 }
