@@ -407,6 +407,7 @@ app.whenReady().then(() => {
   relay.start();
 
   const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs));
+  engine.setCron(cron); // so the agent's schedule_* tools manage + fire through this runner
   cron.start();
   // Poll PR/git status for active sessions; the renderer + phone update via git-status events.
   const gitPoll = setInterval(() => { for (const s of gitService.pollable()) void gitService.fullStatus(s, { withPr: true }).catch(() => { /* transient */ }); }, 30_000);
