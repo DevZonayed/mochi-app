@@ -7,6 +7,7 @@ import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Card, Mono } from '../ui';
 import { api, type Effort as ApiEffort } from '../api';
+import { pullSync, useSyncStore } from '../syncStore';
 
 type Effort = 'FAST' | 'BALANCED' | 'DEEP' | 'MAX';
 type ModelId = 'auto' | 'claude' | 'codex';
@@ -273,7 +274,12 @@ export function NewJobScreen() {
     return palette[color] ?? color ?? theme.color.inkTertiary;
   };
 
-  const [projects, setProjects] = useState<LiveProj[]>([]);
+  // Projects come from the SyncStore so this picker opens instantly.
+  const storeProjects = useSyncStore((s) => s.projects);
+  const projects = React.useMemo<LiveProj[]>(
+    () => storeProjects.map((p) => ({ id: p.id, name: p.name, color: resolveColor(p.color) })),
+    [storeProjects, theme],
+  );
   const [proj, setProj] = useState<string | null>(null);
   const [goal, setGoal] = useState('');
   const [effort, setEffort] = useState<Effort>('BALANCED');
@@ -281,24 +287,10 @@ export function NewJobScreen() {
   const [auto, setAuto] = useState<AutoKey>('plan');
   const [running, setRunning] = useState(false);
 
-  useEffect(() => {
-    let alive = true;
-    api
-      .listProjects()
-      .then((list) => {
-        if (!alive) return;
-        const mapped = list.map((p) => ({ id: p.id, name: p.name, color: resolveColor(p.color) }));
-        setProjects(mapped);
-        setProj((cur) => cur ?? mapped[0]?.id ?? null);
-      })
-      .catch(() => {
-        /* fail soft — picker stays empty */
-      });
-    return () => {
-      alive = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Default the picker to the first project once the store has data, and keep
+  // a one-shot pullSync going on mount so a fresh install can prefill too.
+  useEffect(() => { void pullSync(); }, []);
+  useEffect(() => { setProj((cur) => cur ?? projects[0]?.id ?? null); }, [projects]);
 
   const selectedProject = projects.find((p) => p.id === proj) ?? null;
 

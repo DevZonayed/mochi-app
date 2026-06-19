@@ -1,11 +1,12 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { View, Text, Pressable, ScrollView, Animated, StyleSheet, Modal, TextInput } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
-import { api, type Schedule, type Project, type ChatSession } from '../api';
+import { api, type Schedule, type ChatSession, type Project } from '../api';
 import { useLive } from '../useLive';
+import { pullSync, useSyncStore } from '../syncStore';
 
 function MSwitch({ value, onValueChange }: { value: boolean; onValueChange: (v: boolean) => void }) {
   const { theme } = useTheme();
@@ -223,15 +224,17 @@ export function QueueScreen() {
   const nav = useNavigation<any>();
 
   const [schedules, setSchedules] = useState<Schedule[]>([]);
-  const [projects, setProjects] = useState<Record<string, Project>>({});
-  const [projectList, setProjectList] = useState<Project[]>([]);
+  // Projects come from the SyncStore (instant on tab open). Schedules still
+  // have their own endpoint — they're low volume + change rarely.
+  const projectList = useSyncStore((s) => s.projects);
+  const projects = useMemo(() => Object.fromEntries(projectList.map((p) => [p.id, p])), [projectList]);
   const [now, setNow] = useState(Date.now());
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<Schedule | null>(null);
 
   const load = useCallback(() => {
     api.listSchedules().then(setSchedules).catch(() => {});
-    api.listProjects().then((ps) => { setProjects(Object.fromEntries(ps.map((p) => [p.id, p]))); setProjectList(ps); }).catch(() => {});
+    void pullSync(); // keeps store projects (used here for chips) fresh
   }, []);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));

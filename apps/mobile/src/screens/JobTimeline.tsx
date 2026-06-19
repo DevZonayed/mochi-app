@@ -6,6 +6,7 @@ import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { Card, Mono } from '../ui';
 import { api, type Job } from '../api';
+import { useSyncStore } from '../syncStore';
 
 type Meter = { value: string; label: string; accent?: boolean };
 
@@ -114,30 +115,18 @@ export function JobTimelineScreen() {
   const routeJobId: string | undefined = route.params?.id ?? route.params?.jobId;
 
   const [job, setJob] = useState<Job | null>(null);
-  const [projects, setProjects] = useState<Record<string, { name: string; color: string }>>({});
   // Latest status, read inside the poll callback to avoid a stale closure.
   const statusRef = useRef<Job['status'] | null>(null);
 
-  // Resolve the job's project → { name, color } from live projects.
-  useEffect(() => {
-    let alive = true;
-    api
-      .listProjects()
-      .then((list) => {
-        if (!alive) return;
-        const map: Record<string, { name: string; color: string }> = {};
-        for (const p of list) {
-          map[p.id] = { name: p.name, color: isProjectColor(p.color) ? theme.color[p.color] : theme.color.blue };
-        }
-        setProjects(map);
-      })
-      .catch(() => {
-        /* fail soft — header falls back to neutral labels */
-      });
-    return () => {
-      alive = false;
-    };
-  }, [theme]);
+  // Project header → { name, color } resolved from the SyncStore (no extra fetch).
+  const storeProjects = useSyncStore((s) => s.projects);
+  const projects = React.useMemo(() => {
+    const map: Record<string, { name: string; color: string }> = {};
+    for (const p of storeProjects) {
+      map[p.id] = { name: p.name, color: isProjectColor(p.color) ? theme.color[p.color] : theme.color.blue };
+    }
+    return map;
+  }, [storeProjects, theme]);
 
   // Load the target job (by route id, else first running / first), then poll while running.
   useEffect(() => {

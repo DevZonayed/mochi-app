@@ -47,6 +47,9 @@ export interface Project {
   /** Manual display order from drag-and-drop. Lower = earlier. Unset → sorts by createdAt. */
   order?: number;
   createdAt: number;
+  /** Set on create + bumped on every mutation (incl. reorder). Drives the
+      relay's delta-sync filter (/api/sync?since=ts). */
+  updatedAt: number;
 }
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
     final result. The chat renders these as separate blocks with timings. */
@@ -148,6 +151,17 @@ export interface ChatSession {
 export interface Approval {
   id: string; projectId: string | null; kind: ApprovalKind; title: string; subtitle: string; detail: string;
   status: ApprovalStatus; jobId?: string | null; createdAt: number; resolvedAt: number | null;
+  /** Set on create + bumped on every status change. Drives the relay's
+      delta-sync filter (/api/sync?since=ts). */
+  updatedAt: number;
+}
+
+/** Soft-deletion marker so a delta-sync caller learns about removals. The Mac
+    keeps the last ~1000 across all entity kinds in `data.tombstones`. */
+export interface Tombstone {
+  kind: 'project' | 'session' | 'job' | 'asset' | 'approval';
+  id: string;
+  ts: number;
 }
 export interface Schedule {
   id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean;
@@ -442,6 +456,9 @@ interface StoreData {
   briefs: Brief[];
   researchRuns: ResearchRun[];
   events: AppEvent[];
+  /** Soft-deletion markers (last ~1000 across kinds). Lets delta-sync clients
+      learn about removals without diffing the whole list. */
+  tombstones?: Tombstone[];
   chatBindings: ChatBinding[];
   pendingChats: PendingChat[];
   commEvents: CommEvent[];
@@ -528,6 +545,11 @@ export interface DesignComment {
 }
 
 const CATALOG_VERSION = 2;
+/** Delta-sync: how many soft-deletion markers to keep before evicting the
+    oldest. Sized for ~1 week of typical churn on a busy user. A client whose
+    last sync predates the oldest tombstone should treat the next pull as a
+    full re-sync (drop local store, GET /api/sync?since=0). */
+const MAX_TOMBSTONES = 1000;
 const SEED_PROJECT_NAMES = ['Atlas API', 'Q3 Content', 'Market Scan', 'Brand Refresh', 'Infra / CI'];
 const SEED_JOB_TITLE = 'Merge PR #482 — auth refactor';
 
@@ -593,6 +615,11 @@ export class Store {
       if (!this.data.briefs) { this.data.briefs = []; dirty = true; }
       if (!this.data.researchRuns) { this.data.researchRuns = []; dirty = true; }
       if (!this.data.events) { this.data.events = []; dirty = true; }
+      if (!this.data.tombstones) { this.data.tombstones = []; dirty = true; }
+      // Backfill `updatedAt` on entities written by an older build (delta-sync
+      // protocol needs it on every row, but it's been added incrementally).
+      for (const p of this.data.projects) if (p.updatedAt === undefined) { p.updatedAt = p.createdAt; dirty = true; }
+      for (const a of this.data.approvals) if (a.updatedAt === undefined) { a.updatedAt = a.resolvedAt ?? a.createdAt; dirty = true; }
       if (!this.data.chatBindings) { this.data.chatBindings = []; dirty = true; }
       if (!this.data.pendingChats) { this.data.pendingChats = []; dirty = true; }
       if (!this.data.commEvents) { this.data.commEvents = []; dirty = true; }
@@ -637,6 +664,7 @@ export class Store {
         workspace: null,
         projects: [], jobs: [], sessions: [], approvals: [], schedules: [], skills: [], templates: [],
         assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
+        tombstones: [],
         chatBindings: [], pendingChats: [], commEvents: [], feedback: [],
         telegram: { offset: 0, botUsername: null, connectedAt: null },
         whatsapp: { ...DEFAULT_WHATSAPP_STATE, pendingSummaries: [] }, waChats: {},
@@ -832,11 +860,12 @@ export class Store {
   }
   createProject(args: { name: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }): Project {
     const ws = this.data.workspace ?? this.createWorkspace('My Workspace');
+    const t = now();
     const p: Project = {
       id: id(), workspaceId: ws.id, name: this.uniqueProjectName(args.name),
       template: args.template ?? 'claude-code', instructions: args.instructions ?? '', color: args.color ?? 'blue',
       kind: args.kind, path: args.path, repoUrl: args.repoUrl,
-      createdAt: now(),
+      createdAt: t, updatedAt: t,
     };
     this.data.projects.push(p); this.save();
     return p;
@@ -844,30 +873,45 @@ export class Store {
   updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template'>>): Project {
     const cur = this.getProject(projectId);
     if (!cur) throw Object.assign(new Error('project not found'), { statusCode: 404 });
-    Object.assign(cur, patch);
+    Object.assign(cur, patch, { updatedAt: now() });
     this.save();
     return cur;
   }
   /** Persist a manual display order from drag-and-drop. Each id's position in
-      `orderedIds` becomes its `order`; ids not present keep their current order. */
+      `orderedIds` becomes its `order`; ids not present keep their current order.
+      Bumps `updatedAt` on the touched projects so delta-sync clients reorder too. */
   reorderProjects(orderedIds: string[]): Project[] {
+    const t = now();
     orderedIds.forEach((pid, i) => {
       const p = this.data.projects.find(x => x.id === pid);
-      if (p) p.order = i;
+      if (p) { p.order = i; p.updatedAt = t; }
     });
     this.save();
     return this.listProjects();
   }
-  /** Remove a project + its jobs/sessions/schedules. Files on disk are untouched. */
+  /** Remove a project + its jobs/sessions/schedules. Files on disk are untouched.
+      Records tombstones for every removed entity so delta-sync clients learn. */
   deleteProject(projectId: string): void {
     const i = this.data.projects.findIndex(p => p.id === projectId);
     if (i === -1) throw Object.assign(new Error('project not found'), { statusCode: 404 });
     this.data.projects.splice(i, 1);
+    this.recordTombstone('project', projectId);
+    for (const j of this.data.jobs) if (j.projectId === projectId) this.recordTombstone('job', j.id);
+    for (const s of this.data.sessions) if (s.projectId === projectId) this.recordTombstone('session', s.id);
     this.data.jobs = this.data.jobs.filter(j => j.projectId !== projectId);
     this.data.sessions = this.data.sessions.filter(s => s.projectId !== projectId);
     this.data.schedules = this.data.schedules.filter(s => s.projectId !== projectId);
     for (const a of this.data.assets) if (a.projectId === projectId) a.projectId = null;
     this.save();
+  }
+
+  /** Append a soft-deletion marker so the relay can serve it through
+      /api/sync?since=<ts>. Capped to the last MAX_TOMBSTONES entries — older
+      ones drop, so very stale clients should treat that as "full re-sync". */
+  private recordTombstone(kind: Tombstone['kind'], entityId: string): void {
+    const list = this.data.tombstones ?? (this.data.tombstones = []);
+    list.push({ kind, id: entityId, ts: now() });
+    if (list.length > MAX_TOMBSTONES) list.splice(0, list.length - MAX_TOMBSTONES);
   }
 
   // ── Chat sessions ───────────────────────────────────────────────────
@@ -915,8 +959,11 @@ export class Store {
     const i = this.data.sessions.findIndex(s => s.id === sessionId);
     if (i === -1) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     this.data.sessions.splice(i, 1);
-    // Turns stay in the jobs ledger (costs/audit) but leave the chat.
-    for (const j of this.data.jobs) if (j.sessionId === sessionId) j.sessionId = undefined;
+    this.recordTombstone('session', sessionId);
+    // Turns stay in the jobs ledger (costs/audit) but leave the chat. Bump
+    // each affected job's `updatedAt` so a delta-sync client re-fetches them.
+    const t = now();
+    for (const j of this.data.jobs) if (j.sessionId === sessionId) { j.sessionId = undefined; j.updatedAt = t; }
     this.save();
   }
   /** External-conversation ids already imported into a project (re-scan dedupe). */
@@ -995,6 +1042,7 @@ export class Store {
     const i = this.data.jobs.findIndex(j => j.id === jobId);
     if (i === -1) throw Object.assign(new Error('job not found'), { statusCode: 404 });
     this.data.jobs.splice(i, 1);
+    this.recordTombstone('job', jobId);
     this.save();
   }
   /** Boot sweep: jobs left 'running'/'pending' by a previous app instance can
@@ -1020,10 +1068,11 @@ export class Store {
     return status ? all.filter(a => a.status === status) : all.slice(0, 200);
   }
   createApproval(a: { projectId?: string | null; kind?: ApprovalKind; title: string; subtitle?: string; detail?: string; jobId?: string | null }): Approval {
+    const t = now();
     const rec: Approval = {
       id: id(), projectId: a.projectId ?? null, kind: a.kind ?? 'review', title: a.title,
       subtitle: a.subtitle ?? '', detail: a.detail ?? '', status: 'pending', jobId: a.jobId ?? null,
-      createdAt: now(), resolvedAt: null,
+      createdAt: t, resolvedAt: null, updatedAt: t,
     };
     this.data.approvals.push(rec); this.save();
     return rec;
@@ -1031,7 +1080,8 @@ export class Store {
   resolveApproval(approvalId: string, status: 'approved' | 'denied'): Approval {
     const cur = this.data.approvals.find(a => a.id === approvalId);
     if (!cur) throw Object.assign(new Error('approval not found'), { statusCode: 404 });
-    cur.status = status; cur.resolvedAt = now();
+    const t = now();
+    cur.status = status; cur.resolvedAt = t; cur.updatedAt = t;
     this.save();
     return cur;
   }
@@ -1207,6 +1257,7 @@ export class Store {
     const i = this.data.assets.findIndex(a => a.id === assetId);
     if (i === -1) throw Object.assign(new Error('asset not found'), { statusCode: 404 });
     const [removed] = this.data.assets.splice(i, 1);
+    this.recordTombstone('asset', assetId);
     this.save();
     return removed;
   }
@@ -1597,6 +1648,9 @@ export class Store {
       briefs: this.listBriefs(),
       researchRuns: this.listResearchRuns(),
       events: this.listEvents(),
+      // Soft-deletion markers — relays serve these via /api/sync?since=<ts> so
+      // mobile clients learn what to forget without diffing the whole list.
+      tombstones: this.data.tombstones ?? [],
       chatBindings: this.listChatBindings(),
       pendingChats: this.listPendingChats(),
       commEvents: this.listCommEvents(),

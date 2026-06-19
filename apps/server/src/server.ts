@@ -20,23 +20,30 @@ import { registerRegistry } from './registry.js';
 import { DeviceRegistry } from './devices.js';
 import { turnConfigFromEnv } from './turn.js';
 
-interface Snapshot {
+/** A soft-deletion marker emitted by the Mac when an entity is removed. The
+    relay forwards these through /api/sync?since=<ts> so mobile clients learn
+    what to drop without diffing the whole list. */
+export interface Tombstone { kind: 'project' | 'session' | 'job' | 'asset' | 'approval'; id: string; ts: number }
+
+export interface Snapshot {
   workspace?: unknown;
   workspaces?: unknown[];
-  projects?: { id?: string }[];
-  jobs?: { id?: string; projectId?: string; sessionId?: string }[];
-  sessions?: { id?: string; projectId?: string }[];
-  approvals?: { id?: string; status?: string }[];
+  projects?: { id?: string; updatedAt?: number }[];
+  jobs?: { id?: string; projectId?: string; sessionId?: string; updatedAt?: number }[];
+  sessions?: { id?: string; projectId?: string; updatedAt?: number }[];
+  approvals?: { id?: string; status?: string; updatedAt?: number }[];
   schedules?: unknown[];
   skills?: unknown[];
   templates?: unknown[];
-  assets?: { id?: string; projectId?: string | null; status?: string }[];
+  assets?: { id?: string; projectId?: string | null; status?: string; updatedAt?: number }[];
   mediaRates?: unknown;
   publishDrafts?: unknown[];
   publishLedger?: unknown[];
   briefs?: unknown[];
   researchRuns?: unknown[];
-  events?: unknown[];
+  events?: { id?: string; ts?: number }[];
+  /** Soft-deletion markers, last ~1000. Drives the delta-sync `deleted` field. */
+  tombstones?: Tombstone[];
   chatBindings?: unknown[];
   pendingChats?: unknown[];
   commEvents?: unknown[];
@@ -77,6 +84,50 @@ const EMPTY_DASHBOARD = {
 };
 
 const CMD_TIMEOUT_MS = 10 * 60 * 1000; // jobs run real models on the Mac — be generous
+
+/** Public response shape of GET /api/sync?since=<ts>. */
+export interface SyncDelta {
+  at: number;
+  host: { online: boolean };
+  changed: {
+    projects: Snapshot['projects'];
+    sessions: Snapshot['sessions'];
+    jobs: Snapshot['jobs'];
+    approvals: Snapshot['approvals'];
+    assets: Snapshot['assets'];
+    events: Snapshot['events'];
+  };
+  deleted: { projects: string[]; sessions: string[]; jobs: string[]; approvals: string[]; assets: string[] };
+}
+
+/** Pure filter behind /api/sync — split out so vitest can exercise the slicing
+    logic without booting the WebSocket host. `since=0` returns the entire
+    current snapshot (cold-start path). All entity arrays default to []. */
+export function buildSyncDelta(snap: Snapshot, since: number, hostOnline: boolean): SyncDelta {
+  const above = (u?: number) => (u ?? 0) > since;
+  const tombs = snap.tombstones ?? [];
+  const tombIds = (kind: Tombstone['kind']) =>
+    tombs.filter((t) => t.kind === kind && t.ts > since).map((t) => t.id);
+  return {
+    at: snap.at ?? Date.now(),
+    host: { online: hostOnline },
+    changed: {
+      projects:  (snap.projects  ?? []).filter((x) => above(x.updatedAt)),
+      sessions:  (snap.sessions  ?? []).filter((x) => above(x.updatedAt)),
+      jobs:      (snap.jobs      ?? []).filter((x) => above(x.updatedAt)),
+      approvals: (snap.approvals ?? []).filter((x) => above(x.updatedAt)),
+      assets:    (snap.assets    ?? []).filter((x) => above(x.updatedAt)),
+      events:    (snap.events    ?? []).filter((e) => above(e.ts)),
+    },
+    deleted: {
+      projects:  tombIds('project'),
+      sessions:  tombIds('session'),
+      jobs:      tombIds('job'),
+      approvals: tombIds('approval'),
+      assets:    tombIds('asset'),
+    },
+  };
+}
 
 // Mobile + desktop composers ship attachments as base64 JSON to /api/chat. The
 // Mac's ingestor caps each image/file at 16 MB raw → ~22 MB after base64; with
@@ -377,6 +428,18 @@ export function buildServer(): FastifyInstance {
   app.get('/api/budget', async () => st()?.budget ?? EMPTY_DASHBOARD.budget);
   app.get('/api/costs', async () => st()?.costs ?? { today: 0, thisMonth: 0, projectedMonth: 0, byDay: [], byProject: [], byEngine: [], includedCodexRuns: 0, claudeRuns: 0 });
   app.get('/api/events', async () => st()?.events ?? []);
+  // ── Delta sync (mobile's primary read path) ────────────────────────
+  // GET /api/sync?since=<ts> — see `buildSyncDelta()` for the exact filter.
+  // Cold-start callers pass `since=0` for the full state. Stale callers whose
+  // `since` predates the oldest tombstone should drop their local store and
+  // re-sync (the Mac caps tombstones at ~1000 ≈ 1 week of churn).
+  app.get('/api/sync', async (_req, reply) => {
+    const sinceQ = (_req.query as { since?: string }).since;
+    const since = Number.isFinite(Number(sinceQ)) ? Math.max(0, Number(sinceQ)) : 0;
+    const s = st();
+    if (!s) return reply.code(503).send({ error: 'Your Mac is offline — open the Maestro desktop app' });
+    return buildSyncDelta(s, since, !!deck?.online);
+  });
   app.get('/api/settings', async () => st()?.settings ?? null);
   app.get('/api/engine-status', async () => st()?.engineStatus ?? { claude: { engine: 'claude', available: false, method: 'none', detail: 'Mac offline', reason: 'Desktop not connected.' }, codex: { engine: 'codex', available: false, method: 'none', detail: 'Mac offline', reason: 'Desktop not connected.' } });
   // ── Media Studio (assets mirror; generation forwards to the Mac's fal key) ──
@@ -538,6 +601,11 @@ export function buildServer(): FastifyInstance {
   });
 
   // ── SSE stream (host events relayed to web clients) ────────────────
+  // ?since=<ts> on connect — relay replays any events from the snapshot's
+  // event log with `ts > since` BEFORE going live. Lets a mobile client that
+  // backgrounded through a burst catch up without polling /api/sync first.
+  // Replay uses `event: replay` (vs the usual live `job`/`approval`/…) so
+  // consumers can optionally treat it as a one-shot catch-up batch.
   app.get('/api/stream', (req, reply) => {
     reply.hijack();
     const res = reply.raw;
@@ -547,7 +615,18 @@ export function buildServer(): FastifyInstance {
       Connection: 'keep-alive',
       'Access-Control-Allow-Origin': '*',
     });
-    res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, hostOnline: !!deck?.online })}\n\n`);
+    res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, hostOnline: !!deck?.online, at: st()?.at ?? Date.now() })}\n\n`);
+    // One-shot replay of missed events. The Mac caps its event log at ~200 so
+    // very stale clients may miss older alerts — they'll catch up on the next
+    // /api/sync?since=<ts> pull (which carries the full delta).
+    const sinceQ = (req.query as { since?: string }).since;
+    const since = Number.isFinite(Number(sinceQ)) ? Math.max(0, Number(sinceQ)) : 0;
+    if (since > 0) {
+      const evs = (st()?.events ?? []).filter((e) => (e.ts ?? 0) > since);
+      for (const e of evs) {
+        try { res.write(`event: replay\ndata: ${JSON.stringify(e)}\n\n`); } catch { /* closed */ }
+      }
+    }
     const deviceId = deviceIdOf(req);
     sseClients.add(res);
     devices.addStream(deviceId, deviceNameOf(req), res);
