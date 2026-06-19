@@ -10,13 +10,15 @@
    No database, no engine, no credentials — if the Mac is offline, commands
    return 503 and reads serve the last mirrored snapshot. */
 
-import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import { randomUUID } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import type { WebSocket } from 'ws';
 import { registerRegistry } from './registry.js';
+import { DeviceRegistry } from './devices.js';
+import { turnConfigFromEnv } from './turn.js';
 
 interface Snapshot {
   workspace?: unknown;
@@ -92,22 +94,35 @@ export function buildServer(): FastifyInstance {
   // Single-operator product: one deck (the most recent Mac to register).
   let deck: Deck | null = null;
 
-  // ── Remote-device presence ─────────────────────────────────────────
+  // ── Remote-device presence + per-device control ────────────────────
   // The Mac can't otherwise tell a read-only remote is connected (GETs are served
-  // from the snapshot here, never reaching it). We watch authenticated /api/*
-  // activity + live SSE streams and push a `remote` frame to the host so the
-  // desktop's Devices pane + pairing window reflect reality.
-  let remoteName: string | null = null;
-  let remoteSeenAt = 0;
+  // from the snapshot here, never reaching it). The registry gives every remote a
+  // stable identity (sent as `x-maestro-device-id` header / `?did=` query) so the
+  // desktop's Devices pane can list each device and disconnect any single one.
+  const devices = new DeviceRegistry();
   let lastRemoteNotify = 0;
   function notifyRemote(force = false): void {
     const t = Date.now();
     if (!force && t - lastRemoteNotify < 1500) return;
     lastRemoteNotify = t;
     try {
-      deck?.ws?.send(JSON.stringify({ type: 'remote', streams: sseClients.size, lastSeen: remoteSeenAt || t, name: remoteName }));
+      deck?.ws?.send(JSON.stringify({ type: 'remote', devices: devices.list() }));
     } catch { /* socket closed */ }
   }
+  // A remote presents its identity as a header (REST) or a query param (SSE, where
+  // the browser EventSource can't set headers).
+  const deviceIdOf = (req: FastifyRequest): string | null => {
+    const h = req.headers['x-maestro-device-id'];
+    if (typeof h === 'string' && h) return h;
+    const q = (req.query as { did?: string } | undefined)?.did;
+    return typeof q === 'string' && q ? q : null;
+  };
+  const deviceNameOf = (req: FastifyRequest): string | null => {
+    const h = req.headers['x-maestro-device'];
+    if (typeof h === 'string' && h) return h;
+    const q = (req.query as { device?: string } | undefined)?.device;
+    return typeof q === 'string' && q ? q : null;
+  };
 
   // ── Pairing-token auth on the whole remote surface ─────────────────
   // The Mac sets the token (host hello). Remotes send it as a Bearer header
@@ -122,10 +137,14 @@ export function buildServer(): FastifyInstance {
     const qtoken = (req.query as { token?: string } | undefined)?.token ?? '';
     const presented = bearer || qtoken;
     if (presented !== expected) return reply.code(401).send({ error: 'Unauthorized — pair with the code shown in the Maestro desktop app' });
-    // Authenticated remote activity → let the Mac know a device is alive.
-    const dev = req.headers['x-maestro-device'];
-    if (typeof dev === 'string' && dev) remoteName = dev.slice(0, 40);
-    remoteSeenAt = Date.now();
+    // Disconnected from the Mac → make this device re-pair (distinct code so the
+    // remote can show "reconnect" instead of a generic auth error).
+    const deviceId = deviceIdOf(req);
+    if (devices.isRevoked(deviceId)) {
+      return reply.code(401).send({ error: 'This device was disconnected — enter the code to reconnect.', code: 'device-revoked' });
+    }
+    // Authenticated remote activity → let the Mac know this device is alive.
+    devices.touch(deviceId, deviceNameOf(req));
     notifyRemote();
   });
 
@@ -137,34 +156,64 @@ export function buildServer(): FastifyInstance {
       try { res.write(payload); } catch { sseClients.delete(res); }
     }
   }
+  // Device-targeted SSE (WebRTC signaling to ONE remote, not a broadcast).
+  function sseSendTo(did: string | null | undefined, event: string, data: unknown) {
+    if (!did) return;
+    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const res of devices.streamsFor(did)) {
+      try { res.write(payload); } catch { /* closed */ }
+    }
+  }
 
-  // ── OS push fan-out (parallel to the SSE fan-out above) ────────────
-  // Same role as SSE: relay the host's job/approval events to the operator's
-  // phones — but as Expo push, so they land even when the app is closed. Tokens
-  // live in memory (each app launch re-registers); no DB, no domain logic — the
-  // event itself already says what's notify-worthy. Mirrors LiveNotifier.tsx.
-  const pushTokens = new Set<string>();
-  async function pushFanout(name: string, data: unknown) {
-    if (pushTokens.size === 0) return;
-    let title = ''; let body = ''; let payload: Record<string, unknown> = {};
-    if (name === 'job') {
-      const j = (data ?? {}) as { id?: string; status?: string; title?: string };
-      if (j.status === 'done') { title = 'Conversation complete'; body = j.title || 'A run finished on your Mac.'; payload = { kind: 'job-done', jobId: j.id }; }
-      else if (j.status === 'failed') { title = 'Job failed'; body = j.title || 'A run failed on your Mac.'; payload = { kind: 'job-failed', jobId: j.id }; }
-      else return;
-    } else if (name === 'approval') {
-      const a = (data ?? {}) as { id?: string; status?: string; title?: string };
-      if (a.status !== 'pending') return;
-      title = 'Needs your attention'; body = a.title || 'An approval is waiting.'; payload = { kind: 'approval-created', approvalId: a.id };
-    } else { return; }
-    const messages = [...pushTokens].map((to) => ({ to, title, body, sound: 'default', channelId: 'alerts', priority: 'high', data: payload }));
+  // ── Expo push (alerts while the phone app is CLOSED) ───────────────
+  // SSE only reaches a running app; a closed phone misses every event. The phone
+  // registers its Expo push token here, and we mirror the Mac's job/approval/
+  // schedule events to Expo's push service so a closed app still gets a real OS
+  // notification. This is pure transport (the same events SSE already carries) —
+  // the Mac stays the brain. In-memory by design (the relay owns no DB): the phone
+  // re-registers on every launch/foreground, so a redeploy self-heals.
+  const pushTokens = new Map<string, number>(); // expoToken → lastSeen ms
+  const pushSeen = new Set<string>();           // dedupe keys (bounded)
+  function rememberPushKey(k: string): boolean {
+    if (pushSeen.has(k)) return false;
+    pushSeen.add(k);
+    if (pushSeen.size > 1000) { const first = pushSeen.values().next().value; if (first) pushSeen.delete(first); }
+    return true;
+  }
+  async function sendExpoPush(title: string, body: string): Promise<void> {
+    const tokens = [...pushTokens.keys()];
+    if (!tokens.length) return;
+    const messages = tokens.map((to) => ({ to, title, body, sound: 'default', priority: 'high', channelId: 'alerts' }));
     try {
-      await fetch('https://exp.host/--/api/v2/push/send', {
+      const res = await fetch('https://exp.host/--/api/v2/push/send', {
         method: 'POST',
         headers: { 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify(messages),
       });
-    } catch { /* push is best-effort */ }
+      // Expo returns per-message receipts; prune any token it reports as gone.
+      const json = (await res.json().catch(() => null)) as { data?: { status?: string; details?: { error?: string } }[] } | null;
+      if (Array.isArray(json?.data)) {
+        json!.data!.forEach((r, i) => {
+          if (r?.status === 'error' && r.details?.error === 'DeviceNotRegistered') pushTokens.delete(tokens[i]);
+        });
+      }
+    } catch { /* push service unreachable — SSE still carries foreground alerts */ }
+  }
+  // Mirror the alert-worthy events to push, matching the phone's in-app LiveNotifier.
+  function maybePush(name: string, data: unknown): void {
+    if (!pushTokens.size) return;
+    if (name === 'job') {
+      const j = data as { id?: string; status?: string; title?: string } | null;
+      if (!j?.id) return;
+      if (j.status === 'done' && rememberPushKey(`${j.id}:done`)) void sendExpoPush('Conversation complete', j.title || 'A run finished on your Mac.');
+      else if (j.status === 'failed' && rememberPushKey(`${j.id}:failed`)) void sendExpoPush('Job failed', j.title || 'A run failed on your Mac.');
+    } else if (name === 'approval') {
+      const a = data as { id?: string; status?: string; title?: string } | null;
+      if (a?.id && a.status === 'pending' && rememberPushKey(`appr:${a.id}`)) void sendExpoPush('Needs your attention', a.title || 'An approval is waiting.');
+    } else if (name === 'schedule-late') {
+      const s = data as { id?: string; title?: string; firedAt?: number } | null;
+      if (rememberPushKey(`late:${s?.id ?? ''}:${s?.firedAt ?? ''}`)) void sendExpoPush('Scheduled task ran late', s?.title ? `“${s.title}” caught up.` : 'A schedule caught up after a missed time.');
+    }
   }
 
   // ── Forward a command to the Mac and await its result ─────────────
@@ -205,7 +254,7 @@ export function buildServer(): FastifyInstance {
       let isHost = false;
 
       ws.on('message', (buf: Buffer | string) => {
-        let m: { type?: string; role?: string; deckId?: string; secret?: string; accessToken?: string; state?: Snapshot; name?: string; data?: unknown; id?: string; ok?: boolean; result?: unknown; error?: string; statusCode?: number };
+        let m: { type?: string; role?: string; deckId?: string; secret?: string; accessToken?: string; state?: Snapshot; name?: string; data?: unknown; id?: string; ok?: boolean; result?: unknown; error?: string; statusCode?: number; deviceId?: string; did?: string; signal?: unknown };
         try { m = JSON.parse(String(buf)) as typeof m; } catch { return; }
 
         if (m.type === 'hello' && m.role === 'host' && m.deckId) {
@@ -216,9 +265,13 @@ export function buildServer(): FastifyInstance {
           }
           if (!deck || deck.deckId !== m.deckId) {
             deck = { deckId: m.deckId, secret: m.secret ?? '', accessToken: m.accessToken ?? '', ws, online: true, lastSeen: Date.now(), state: deck?.state ?? null, pending: new Map() };
+            devices.reset(); // fresh deck → forget any prior devices/revocations
           } else {
             deck.ws = ws; deck.online = true; deck.lastSeen = Date.now();
-            if (m.accessToken) deck.accessToken = m.accessToken;
+            if (m.accessToken && m.accessToken !== deck.accessToken) {
+              deck.accessToken = m.accessToken;
+              devices.reset(); // code regenerated → new pairing epoch; every remote must re-pair
+            }
           }
           isHost = true;
           ws.send(JSON.stringify({ type: 'hello-ok' }));
@@ -233,7 +286,7 @@ export function buildServer(): FastifyInstance {
           deck.lastSeen = Date.now();
         } else if (m.type === 'event' && m.name) {
           sseSend(m.name, m.data);
-          void pushFanout(m.name, m.data);
+          maybePush(m.name, m.data); // closed-app OS notification (live SSE handles the open app)
         } else if (m.type === 'result' && m.id) {
           const p = deck.pending.get(m.id);
           if (p) {
@@ -244,6 +297,12 @@ export function buildServer(): FastifyInstance {
           }
         } else if (m.type === 'pong') {
           deck.lastSeen = Date.now();
+        } else if (m.type === 'kick' && m.deviceId) {
+          for (const res of devices.kick(m.deviceId)) { try { res.end(); } catch { /* already closed */ } }
+          notifyRemote(true);
+        } else if (m.type === 'signal' && m.did) {
+          // WebRTC signaling from the Mac to one specific remote (offer/answer/ICE).
+          sseSendTo(m.did, 'signal', m.signal);
         }
       });
 
@@ -392,6 +451,8 @@ export function buildServer(): FastifyInstance {
   app.post('/api/approvals/:id/approve', async (req, reply) => forward(reply, 'approveApproval', { id: (req.params as { id: string }).id }));
   app.post('/api/approvals/:id/deny', async (req, reply) => forward(reply, 'denyApproval', { id: (req.params as { id: string }).id }));
   app.post('/api/schedules', async (req, reply) => forward(reply, 'createSchedule', (req.body ?? {}) as Record<string, unknown>));
+  app.patch('/api/schedules/:id', async (req, reply) =>
+    forward(reply, 'updateSchedule', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/schedules/check', async (req, reply) => forward(reply, 'scheduleCheck', (req.body ?? {}) as Record<string, unknown>));
   app.post('/api/schedules/:id/toggle', async (req, reply) =>
     forward(reply, 'toggleSchedule', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
@@ -408,11 +469,36 @@ export function buildServer(): FastifyInstance {
     forward(reply, 'updateFeedback', { ...(req.body ?? {}) as Record<string, unknown>, id: (req.params as { id: string }).id }));
   app.post('/api/feedback/:id/delete', async (req, reply) => forward(reply, 'deleteFeedback', { id: (req.params as { id: string }).id }));
 
-  // ── Push registration — a paired phone registers its Expo push token ──
+  // ── WebRTC signaling passthrough + TURN creds (P2P transport setup) ──
+  // Signaling rides the already-authenticated relay: the phone POSTs its SDP/ICE
+  // here, we hand it to the Mac (host WS), and the Mac's replies come back over
+  // the device's own SSE stream as `event: signal`. No new server, no second QR.
+  app.post('/api/signal', async (req, reply) => {
+    if (!deck || !deck.online || !deck.ws) {
+      return reply.code(503).send({ error: 'Your Mac is offline — open the Maestro desktop app' });
+    }
+    const did = deviceIdOf(req);
+    const body = (req.body ?? {}) as { signal?: unknown };
+    try {
+      deck.ws.send(JSON.stringify({ type: 'signal', did, signal: body.signal }));
+    } catch {
+      return reply.code(502).send({ error: 'relay write failed' });
+    }
+    return { ok: true };
+  });
+  // Time-limited TURN creds (HMAC); all-null when coturn isn't configured → clients use public STUN.
+  app.get('/api/turn-credentials', async () => turnConfigFromEnv());
+
+  // ── Push registration (phone registers its Expo token for closed-app alerts) ──
   app.post('/api/push/register', async (req) => {
     const { token } = (req.body ?? {}) as { token?: string };
-    if (typeof token === 'string' && token.startsWith('ExponentPushToken')) pushTokens.add(token);
-    return { ok: true };
+    if (typeof token === 'string' && token.trim()) pushTokens.set(token.trim(), Date.now());
+    return { ok: true, devices: pushTokens.size };
+  });
+  app.post('/api/push/unregister', async (req) => {
+    const { token } = (req.body ?? {}) as { token?: string };
+    if (typeof token === 'string') pushTokens.delete(token.trim());
+    return { ok: true, devices: pushTokens.size };
   });
 
   // ── SSE stream (host events relayed to web clients) ────────────────
@@ -426,10 +512,9 @@ export function buildServer(): FastifyInstance {
       'Access-Control-Allow-Origin': '*',
     });
     res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, hostOnline: !!deck?.online })}\n\n`);
-    const dev = (req.query as { device?: string }).device;
-    if (typeof dev === 'string' && dev) remoteName = dev.slice(0, 40);
-    remoteSeenAt = Date.now();
+    const deviceId = deviceIdOf(req);
     sseClients.add(res);
+    devices.addStream(deviceId, deviceNameOf(req), res);
     notifyRemote(true); // a live remote stream opened
     const ping = setInterval(() => {
       try { res.write(': ping\n\n'); } catch { /* closed */ }
@@ -437,6 +522,7 @@ export function buildServer(): FastifyInstance {
     req.raw.on('close', () => {
       clearInterval(ping);
       sseClients.delete(res);
+      devices.removeStream(deviceId, res);
       notifyRemote(true); // stream closed → presence drops
     });
   });

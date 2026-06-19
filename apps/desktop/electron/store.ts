@@ -11,12 +11,12 @@ import { app } from 'electron';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { quietDeadline } from './whatsapp-quiet.js';
+import { WaStore, type WaChatMeta, type WaStoredMessage, type WaMessageInput, type WaChatKind } from './wa-store.js';
+import type { RemoteDevice } from './relay.js';
 
 export const id = (): string => randomUUID();
 export const now = (): number => Date.now();
-
-/** Live presence of remote devices (phone/web), reported by the relay. Transient. */
-export interface DevicePresence { connected: boolean; streams: number; lastSeen: number | null; name: string | null }
 
 /** Human-enterable pairing token, e.g. "M7K2-Q9XF-4DTB" (no 0/O/1/I). */
 export function newPairingToken(): string {
@@ -159,12 +159,25 @@ export interface Schedule {
       'auto-continue' is the same one-shot, created automatically when a Claude run
       is blocked by the usage limit — it fires "continue" into the chat at reset.
       'auto-answer' fires the recommended option into the chat when an unanswered
-      AskUserQuestion times out (the countdown the user sees on the question card). */
-  kind?: 'message' | 'auto-continue' | 'auto-answer'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean;
+      AskUserQuestion times out (the countdown the user sees on the question card).
+      'whatsapp-analyze' is the per-chat quiet timer: it fires once a tracked
+      WhatsApp chat has sat silent for 15 min, summarizing it back to the operator. */
+  kind?: 'message' | 'auto-continue' | 'auto-answer' | 'whatsapp-analyze'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean;
+  /** whatsapp-analyze only: the WhatsApp chat (JID) whose silence this timer watches. */
+  chatId?: string;
   /** auto-answer only: when it was armed (base for the escalating-extend math),
       how many times the user extended, and whether it's been paused past the cap
       (paused = no auto-answer; the question waits indefinitely for a manual reply). */
   armedAt?: number; extends?: number; paused?: boolean;
+  /** Interval cadence: fire every N minutes from `anchorAt` (defaults to createdAt).
+      When set (>0) the schedule is interval-mode and ignores time/cadence. */
+  everyMinutes?: number; anchorAt?: number;
+  /** Clock-mode catch-up: if a daily/weekly slot was missed while the Mac was
+      asleep, fire it once when next awake, provided now <= dueTime + window.
+      catchUpWindowMs defaults to "rest of the local day". lastDueAt is the
+      intended slot timestamp of the last fire (dedupe key); lastFireLate marks
+      that the last fire was a catch-up (drives the "ran late" notice). */
+  catchUp?: boolean; catchUpWindowMs?: number; lastDueAt?: number; lastFireLate?: boolean;
 }
 
 export type EngineId = 'claude' | 'codex';
@@ -280,14 +293,61 @@ export interface Feedback {
   updatedAt: number;
 }
 
+export type CommsProvider = 'telegram' | 'whatsapp';
 export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; approveGates: boolean }
-export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; projectId: string | null; permissions: ChatPermissions; boundAt: number }
+export interface ChatBinding {
+  chatId: string; name: string; kind: 'dm' | 'group';
+  /** Which channel this chat lives on. Absent on legacy (Telegram) bindings. */
+  provider?: CommsProvider;
+  projectId: string | null;
+  /** WhatsApp quiet-timer: the session this chat's summaries are filed under. */
+  sessionId?: string | null;
+  permissions: ChatPermissions; boundAt: number;
+}
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
 export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
 export interface TelegramState { offset: number; botUsername: string | null; connectedAt: number | null }
+
+/** WhatsApp account/connection state. The desktop owns one Baileys socket; this
+    is the persisted view of it. `sendApproved` is the one-time confirmation gate:
+    no summary is ever sent until the operator approves the first send. */
+export interface WhatsAppState {
+  connected: boolean;
+  /** The linked number's own JID (where summaries are sent — "message yourself"). */
+  jid: string | null;
+  name: string | null;
+  linkedAt: number | null;
+  /** The one-time send gate: until the operator approves, no summary is sent. */
+  sendApproved: boolean;
+  /** Durable outbox of summaries awaiting delivery — held until sending is approved
+      AND the socket is connected, then flushed (retried). Survives restarts so a
+      power-off mid-window never drops a summary (it's delivered on next availability). */
+  pendingSummaries?: { id: string; text: string; chatName: string; at: number }[];
+  /** Whether the in-app agent may message contacts OTHER than your own number.
+      Off by default — the agent can always message your own number (confirmations,
+      updates), but messaging real contacts requires this opt-in. */
+  agentSendToOthers?: boolean;
+  /** The operator's PERSONAL number (JID) where summaries + agent confirmations are
+      sent. Distinct from `jid` (the linked account — often a separate "app" number).
+      When unset, notifications fall back to the linked account's own "note to self". */
+  notifyJid?: string | null;
+}
+export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [], agentSendToOthers: false, notifyJid: null };
+
+/** One captured WhatsApp message (normalized, text-only — media is noted as a kind). */
+export interface WaMessage { id: string; chatId: string; fromMe: boolean; senderName: string; text: string; ts: number }
+/** A tracked WhatsApp chat's capture log + the watermark of what's been summarized. */
+export interface WaChat {
+  chatId: string; name: string; kind: 'dm' | 'group';
+  lastMessageAt: number;
+  /** ts of the newest message already folded into a sent summary (quiet-once). */
+  lastReportedAt: number;
+  messages: WaMessage[];
+}
+
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
-  whatsapp: { connected: false };
+  whatsapp: { connected: boolean; jid: string | null; name: string | null; tracked: number; sendApproved: boolean };
 }
 
 /** A built-in notification chime (synthesised client-side; 'none' = silent). */
@@ -330,8 +390,10 @@ export interface AppSettings {
   feedbackRepo?: string;
   /** Device-notification sound preferences. */
   notifications?: NotificationSettings;
+  /** Opt-in: try a direct desktop↔phone WebRTC channel before the relay (default off). */
+  p2pEnabled?: boolean;
 }
-export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], notifications: { ...DEFAULT_NOTIFICATIONS } };
+export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], p2pEnabled: false, notifications: { ...DEFAULT_NOTIFICATIONS } };
 
 export interface BudgetData { cap: number; spent: number; byProject: { projectId: string; name: string; color: string; spent: number }[] }
 export interface CostsData {
@@ -385,6 +447,10 @@ interface StoreData {
   commEvents: CommEvent[];
   feedback: Feedback[];
   telegram: TelegramState;
+  /** WhatsApp account/connection state (the desktop-owned Baileys socket). */
+  whatsapp: WhatsAppState;
+  /** Per-chat captured WhatsApp messages + report watermark, keyed by chat JID. */
+  waChats: Record<string, WaChat>;
   /** Locally (safeStorage-)encrypted provider API keys, base64. Never leaves this Mac. */
   providerKeys: Record<string, { cipherB64: string; last4: string; createdAt: number }>;
   /** Per-design element comments (Mochi-style): a CSS selector into the live
@@ -470,13 +536,31 @@ const ASSET_TINTS = ['#5b8cff', '#9b6bff', '#41c8d4', '#ff9f6b', '#6bd49a', '#ff
 export class Store {
   private file: string;
   private data!: StoreData;
+  /** Full WhatsApp chat + message store (every chat, JSONL-backed). The
+      monolithic `waChats` field is legacy — migrated into this on first load. */
+  readonly wa: WaStore;
 
   constructor() {
     const dir = app.getPath('userData');
     mkdirSync(dir, { recursive: true });
     this.file = join(dir, 'maestro-store.json');
+    this.wa = new WaStore(join(dir, 'whatsapp', 'primary', 'store'));
     this.load();
+    this.migrateInlineWaChats();
     this.seedCatalog();
+  }
+
+  /** One-time lift of any legacy inline `waChats` (captured by older builds into
+      maestro-store.json) into the JSONL-backed WaStore, then clear the inline copy. */
+  private migrateInlineWaChats(): void {
+    const inline = this.data.waChats;
+    if (!inline || Object.keys(inline).length === 0) return;
+    for (const c of Object.values(inline)) {
+      this.wa.upsertChat({ chatId: c.chatId, name: c.name, kind: c.kind, lastMessageAt: c.lastMessageAt, lastReportedAt: c.lastReportedAt });
+      for (const m of c.messages) this.wa.appendMessage({ chatId: c.chatId, fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: 'text' }, { bumpUnread: false });
+    }
+    this.data.waChats = {};
+    this.save();
   }
 
   private load(): void {
@@ -514,6 +598,14 @@ export class Store {
       if (!this.data.commEvents) { this.data.commEvents = []; dirty = true; }
       if (!this.data.feedback) { this.data.feedback = []; dirty = true; }
       if (!this.data.telegram) { this.data.telegram = { offset: 0, botUsername: null, connectedAt: null }; dirty = true; }
+      if (!this.data.whatsapp) { this.data.whatsapp = { ...DEFAULT_WHATSAPP_STATE, pendingSummaries: [] }; dirty = true; }
+      if (this.data.whatsapp && !this.data.whatsapp.pendingSummaries) {
+        const old = (this.data.whatsapp as { pendingSummary?: { text: string; chatName: string; at: number } | null }).pendingSummary;
+        this.data.whatsapp.pendingSummaries = old ? [{ id: id(), text: old.text, chatName: old.chatName, at: old.at }] : [];
+        delete (this.data.whatsapp as { pendingSummary?: unknown }).pendingSummary;
+        dirty = true;
+      }
+      if (!this.data.waChats) { this.data.waChats = {}; dirty = true; }
 
       // One-time demo-data purge: only fires on the full seed fingerprint so a
       // real project that happens to share a name never gets wiped.
@@ -547,6 +639,7 @@ export class Store {
         assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
         chatBindings: [], pendingChats: [], commEvents: [], feedback: [],
         telegram: { offset: 0, botUsername: null, connectedAt: null },
+        whatsapp: { ...DEFAULT_WHATSAPP_STATE, pendingSummaries: [] }, waChats: {},
         providerKeys: {},
       };
       this.save();
@@ -568,17 +661,18 @@ export class Store {
     return { deckId: this.data.deckId, deckSecret: this.data.deckSecret };
   }
   get accessToken(): string { return this.data.accessToken; }
+  /** Rotate the pairing code (regenerate): persists a fresh token; unpairs every remote. */
+  setAccessToken(token: string): void { this.data.accessToken = token; this.save(); }
   get extensionToken(): string { return this.data.extensionToken; }
 
-  // Remote-device presence (transient; reported by the relay, never persisted).
-  private remote: { streams: number; lastSeen: number; name: string | null } = { streams: 0, lastSeen: 0, name: null };
-  setRemotePresence(info: { streams: number; lastSeen: number; name: string | null }): DevicePresence {
-    this.remote = { streams: info.streams, lastSeen: info.lastSeen, name: info.name ?? this.remote.name };
-    return this.getRemotePresence();
+  // Remote-device presence (transient; the relay reports the full list, never persisted).
+  private remoteDevices: RemoteDevice[] = [];
+  setRemoteDevices(devices: RemoteDevice[]): RemoteDevice[] {
+    this.remoteDevices = devices;
+    return this.remoteDevices;
   }
-  getRemotePresence(): DevicePresence {
-    const fresh = Date.now() - this.remote.lastSeen < 90_000;
-    return { connected: this.remote.streams > 0 || fresh, streams: this.remote.streams, lastSeen: this.remote.lastSeen || null, name: this.remote.name };
+  getRemoteDevices(): RemoteDevice[] {
+    return this.remoteDevices;
   }
 
   routing(): Routing { return { ...this.data.routing }; }
@@ -944,30 +1038,38 @@ export class Store {
 
   // ── Schedules ───────────────────────────────────────────────────────
   listSchedules(): Schedule[] { return [...this.data.schedules].sort((a, b) => a.time.localeCompare(b.time)); }
-  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue' | 'auto-answer'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean; armedAt?: number; extends?: number }): Schedule {
+  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue' | 'auto-answer' | 'whatsapp-analyze'; chatId?: string; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean; armedAt?: number; extends?: number; everyMinutes?: number; anchorAt?: number; catchUp?: boolean; catchUpWindowMs?: number }): Schedule {
     const at = s.fireAt ? new Date(s.fireAt) : null;
     const time = s.time ?? (at ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}` : '');
     const rec: Schedule = {
       id: id(), projectId: s.projectId ?? null, title: s.title, time,
-      cadence: s.fireAt ? 'once' : (s.cadence ?? 'daily'),
+      cadence: s.fireAt ? 'once' : (s.everyMinutes ? 'interval' : (s.cadence ?? 'daily')),
       enabled: true, nextRun: s.fireAt ?? null, createdAt: now(),
       ...(s.fireAt ? { fireAt: s.fireAt } : {}),
       ...(s.sessionId ? { sessionId: s.sessionId } : {}),
       ...(s.prompt ? { prompt: s.prompt } : {}),
       ...(s.kind ? { kind: s.kind } : {}),
+      ...(s.chatId ? { chatId: s.chatId } : {}),
       ...(s.effort ? { effort: s.effort } : {}),
       ...(s.browser ? { browser: true } : {}),
       ...(s.plan ? { plan: true } : {}),
       ...(s.goal ? { goal: true } : {}),
       ...(s.armedAt ? { armedAt: s.armedAt } : {}),
       ...(s.extends ? { extends: s.extends } : {}),
+      ...(s.everyMinutes ? { everyMinutes: s.everyMinutes } : {}),
+      ...(s.anchorAt ? { anchorAt: s.anchorAt } : {}),
+      ...(s.catchUp ? { catchUp: true } : {}),
+      ...(s.catchUpWindowMs ? { catchUpWindowMs: s.catchUpWindowMs } : {}),
     };
     this.data.schedules.push(rec); this.save();
     return rec;
   }
   /** Patch a schedule's timing/extend state (used by the AskUserQuestion extend +
       graceful-pause flow). Re-derives nextRun from fireAt. Returns the updated record. */
-  updateSchedule(scheduleId: string, patch: Partial<Pick<Schedule, 'fireAt' | 'extends' | 'paused' | 'enabled' | 'prompt'>>): Schedule {
+  updateSchedule(scheduleId: string, patch: Partial<Pick<Schedule,
+    'fireAt' | 'extends' | 'paused' | 'enabled' | 'prompt' | 'title' | 'time' | 'cadence'
+    | 'everyMinutes' | 'anchorAt' | 'catchUp' | 'catchUpWindowMs'
+    | 'effort' | 'browser' | 'plan' | 'goal' | 'sessionId' | 'projectId'>>): Schedule {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (!s) throw Object.assign(new Error('schedule not found'), { statusCode: 404 });
     Object.assign(s, patch);
@@ -979,9 +1081,14 @@ export class Store {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (s) { s.enabled = enabled; this.save(); }
   }
-  markScheduleRun(scheduleId: string, ts: number, nextRun: number | null): void {
+  markScheduleRun(scheduleId: string, ts: number, nextRun: number | null, opts?: { dueAt?: number; late?: boolean }): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);
-    if (s) { s.lastRun = ts; s.nextRun = nextRun; this.save(); }
+    if (s) {
+      s.lastRun = ts; s.nextRun = nextRun;
+      if (opts?.dueAt !== undefined) s.lastDueAt = opts.dueAt;
+      s.lastFireLate = !!opts?.late;
+      this.save();
+    }
   }
   setScheduleNextRun(scheduleId: string, nextRun: number | null): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);
@@ -991,6 +1098,34 @@ export class Store {
     const i = this.data.schedules.findIndex(s => s.id === scheduleId);
     if (i === -1) throw Object.assign(new Error('schedule not found'), { statusCode: 404 });
     this.data.schedules.splice(i, 1);
+    this.save();
+  }
+  /** Arm (or RESET) a tracked WhatsApp chat's quiet timer. An inbound message
+      pushes the chat's one-shot 'whatsapp-analyze' schedule out to now + 15 min;
+      a chat that already has a live (enabled) timer is reset in place, so ONLY
+      that chat is touched and an active conversation never fires mid-stream. A
+      consumed (disabled) timer is left alone — the next message arms a fresh one,
+      which is how analysis re-arms after each quiet period. */
+  armWhatsappTimer(input: { chatId: string; projectId: string | null; sessionId?: string }): Schedule {
+    const fireAt = quietDeadline(now());
+    const existing = this.data.schedules.find(
+      s => s.kind === 'whatsapp-analyze' && s.chatId === input.chatId && s.enabled,
+    );
+    if (existing) return this.updateSchedule(existing.id, { fireAt });
+    return this.createSchedule({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      title: `WhatsApp quiet: ${input.chatId}`,
+      fireAt,
+      kind: 'whatsapp-analyze',
+      chatId: input.chatId,
+    });
+  }
+  /** Cancel a chat's quiet timer (e.g. on untrack/unbind) so it never fires. */
+  cancelWhatsappTimer(chatId: string): void {
+    for (const s of this.data.schedules) {
+      if (s.kind === 'whatsapp-analyze' && s.chatId === chatId && s.enabled) { s.enabled = false; s.nextRun = null; }
+    }
     this.save();
   }
 
@@ -1155,15 +1290,30 @@ export class Store {
   // ── Comms (Telegram) ────────────────────────────────────────────────
   listChatBindings(): ChatBinding[] { return [...this.data.chatBindings]; }
   getChatBinding(chatId: string): ChatBinding | undefined { return this.data.chatBindings.find(b => b.chatId === chatId); }
-  bindChat(args: { chatId: string; name: string; kind: 'dm' | 'group'; projectId?: string | null; permissions?: Partial<ChatPermissions> }): ChatBinding {
+  bindChat(args: { chatId: string; name: string; kind: 'dm' | 'group'; provider?: CommsProvider; projectId?: string | null; sessionId?: string | null; permissions?: Partial<ChatPermissions> }): ChatBinding {
     const existing = this.getChatBinding(args.chatId);
     const perms: ChatPermissions = { startJobs: true, receiveReports: true, approveGates: false, ...(args.permissions ?? {}) };
+    // Tracking a WhatsApp chat that already synced history: seed the summary
+    // watermark to its latest message so the first quiet-period summary covers only
+    // what arrives AFTER tracking — not the entire synced backlog.
+    if ((args.provider ?? existing?.provider) === 'whatsapp') {
+      const meta = this.wa.getChat(args.chatId);
+      if (meta) this.wa.markReported(args.chatId, meta.lastMessageAt);
+    }
     if (existing) {
-      Object.assign(existing, { name: args.name, kind: args.kind, projectId: args.projectId ?? existing.projectId, permissions: perms });
+      Object.assign(existing, {
+        name: args.name, kind: args.kind, provider: args.provider ?? existing.provider ?? 'telegram',
+        projectId: args.projectId ?? existing.projectId,
+        ...(args.sessionId !== undefined ? { sessionId: args.sessionId } : {}),
+        permissions: perms,
+      });
       this.save();
       return existing;
     }
-    const rec: ChatBinding = { chatId: args.chatId, name: args.name, kind: args.kind, projectId: args.projectId ?? null, permissions: perms, boundAt: now() };
+    const rec: ChatBinding = {
+      chatId: args.chatId, name: args.name, kind: args.kind, provider: args.provider ?? 'telegram',
+      projectId: args.projectId ?? null, sessionId: args.sessionId ?? null, permissions: perms, boundAt: now(),
+    };
     this.data.chatBindings.push(rec);
     this.removePendingChat(args.chatId);
     this.save();
@@ -1209,6 +1359,7 @@ export class Store {
   commsStatus(): CommsStatus {
     const key = this.providerKeyMeta('telegram');
     const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+    const wa = this.data.whatsapp;
     return {
       telegram: {
         connected: !!key,
@@ -1218,8 +1369,90 @@ export class Store {
         bindings: this.data.chatBindings.length,
         pending: this.data.pendingChats.length,
       },
-      whatsapp: { connected: false },
+      whatsapp: {
+        connected: wa.connected,
+        jid: wa.jid,
+        name: wa.name,
+        tracked: this.data.chatBindings.filter(b => b.provider === 'whatsapp').length,
+        sendApproved: wa.sendApproved,
+      },
     };
+  }
+
+  // ── Comms (WhatsApp) ────────────────────────────────────────────────
+  whatsappState(): WhatsAppState { return { ...this.data.whatsapp }; }
+  setWhatsappState(patch: Partial<WhatsAppState>): WhatsAppState {
+    this.data.whatsapp = { ...this.data.whatsapp, ...patch };
+    this.save();
+    return this.whatsappState();
+  }
+  /** Durable summary outbox: queue on generation, flush (drop) on successful send. */
+  queueSummary(input: { text: string; chatName: string }): void {
+    const wa = this.data.whatsapp;
+    if (!wa.pendingSummaries) wa.pendingSummaries = [];
+    wa.pendingSummaries.push({ id: id(), text: input.text, chatName: input.chatName, at: now() });
+    if (wa.pendingSummaries.length > 100) wa.pendingSummaries.splice(0, wa.pendingSummaries.length - 100);
+    this.save();
+  }
+  listPendingSummaries(): Array<{ id: string; text: string; chatName: string; at: number }> {
+    return [...(this.data.whatsapp.pendingSummaries ?? [])];
+  }
+  dropPendingSummary(summaryId: string): void {
+    const wa = this.data.whatsapp;
+    if (!wa.pendingSummaries) return;
+    wa.pendingSummaries = wa.pendingSummaries.filter(p => p.id !== summaryId);
+    this.save();
+  }
+  /** Capture a message (legacy shim → WaStore). Used by the quiet-timer ingest path
+      and tests; WaStore appends O(1) to the chat's JSONL log. */
+  recordWaMessage(m: { chatId: string; name?: string; kind?: 'dm' | 'group'; fromMe: boolean; senderName: string; text: string; ts: number }): void {
+    if (m.name || m.kind) this.wa.upsertChat({ chatId: m.chatId, ...(m.name ? { name: m.name } : {}), ...(m.kind ? { kind: m.kind } : {}) });
+    this.wa.appendMessage({ chatId: m.chatId, fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: 'text' });
+  }
+  /** Read a chat's transcript. `sinceReported` returns only messages newer than the
+      last summary watermark — what a quiet period needs to analyze. */
+  getWaTranscript(chatId: string, opts: { sinceReported?: boolean } = {}): WaMessage[] {
+    return this.wa.getMessages(chatId, { sinceReported: opts.sinceReported });
+  }
+  /** Advance a chat's report watermark so the next quiet period only sees newer messages. */
+  markWaReported(chatId: string, ts: number): void { this.wa.markReported(chatId, ts); }
+  /** Captured chats with message counts (back-compat shape for the Comms Bindings tab). */
+  listWaChats(): Array<{ chatId: string; name: string; kind: WaChatKind; lastMessageAt: number; lastReportedAt: number; count: number }> {
+    return this.wa.listChats().map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, lastMessageAt: c.lastMessageAt, lastReportedAt: c.lastReportedAt, count: this.wa.count(c.chatId) }));
+  }
+  /** Forget a chat's captured log entirely (on untrack/unbind). */
+  forgetWaChat(chatId: string): void { this.wa.forget(chatId); }
+
+  // ── WhatsApp full chat store (the WhatsApp screen + agent wa_* tools) ──
+  /** Every captured chat (DMs, groups, channels), pinned-then-newest-first. */
+  waListChats(): WaChatMeta[] { return this.wa.listChats(); }
+  waGetChat(chatId: string): WaChatMeta | undefined { return this.wa.getChat(chatId); }
+  /** A chat's messages for the UI: most-recent `limit`, page older with `before`. */
+  waMessages(chatId: string, opts: { limit?: number; before?: number } = {}): WaStoredMessage[] { return this.wa.getMessages(chatId, opts); }
+  waUpsertChat(meta: { chatId: string } & Partial<WaChatMeta>): WaChatMeta { return this.wa.upsertChat(meta); }
+  waAppendMessage(input: WaMessageInput, opts?: { bumpUnread?: boolean }): WaStoredMessage | null { return this.wa.appendMessage(input, opts); }
+  waUpdateMessage(chatId: string, msgIdOrId: string, patch: Partial<WaStoredMessage>): void { this.wa.updateMessage(chatId, msgIdOrId, patch); }
+  waMarkRead(chatId: string): void { this.wa.markRead(chatId); }
+  waSetUnread(chatId: string, n: number): void { this.wa.setUnread(chatId, n); }
+
+  // ── Per-project WhatsApp chat assignment ────────────────────────────
+  // Backed by whatsapp ChatBindings (single source of truth), so assigning a chat
+  // here also makes it "tracked" (incoming messages route to the project + the
+  // quiet-timer machinery applies) and it shows in the Comms Bindings tab.
+  listProjectWaChats(projectId: string): string[] {
+    return this.data.chatBindings.filter(b => b.provider === 'whatsapp' && b.projectId === projectId).map(b => b.chatId);
+  }
+  addProjectWaChat(projectId: string, chatId: string): string[] {
+    const meta = this.wa.getChat(chatId);
+    this.bindChat({ chatId, name: meta?.name ?? chatId, kind: meta?.kind === 'group' ? 'group' : 'dm', provider: 'whatsapp', projectId });
+    return this.listProjectWaChats(projectId);
+  }
+  removeProjectWaChat(projectId: string, chatId: string): string[] {
+    // Stop routing/summaries but KEEP the captured history (it still shows in the
+    // WhatsApp screen) — only a full unlink wipes message logs.
+    this.cancelWhatsappTimer(chatId);
+    this.unbindChat(chatId);
+    return this.listProjectWaChats(projectId);
   }
 
   // ── Feedback (collected from desktop / web / phone) ─────────────────

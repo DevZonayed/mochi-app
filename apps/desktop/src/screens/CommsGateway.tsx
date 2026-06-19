@@ -5,9 +5,14 @@
    WhatsApp is an honest preview (not wired). */
 
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
-import { api, type CommsStatus, type ChatBinding, type PendingChat, type CommEvent, type Project, type ChatPermissions, ApiError, IS_LOCAL } from '../lib/api';
+import { api, type CommsStatus, type ChatBinding, type PendingChat, type CommEvent, type Project, type ChatPermissions, type WhatsAppState, type WaChatSummary, type ChatSession, type CommsProvider, ApiError, IS_LOCAL } from '../lib/api';
+
+/** Pending chats don't carry a provider; a WhatsApp JID always contains '@'
+    (…@s.whatsapp.net / …@g.us), a Telegram chat id is numeric — so the id tells us. */
+function providerOf(chatId: string): CommsProvider { return chatId.includes('@') ? 'whatsapp' : 'telegram'; }
 
 const CSS = `
   .tab-fade { animation: tfade 240ms var(--spring); }
@@ -21,6 +26,10 @@ function TelegramGlyph({ size = 22 }: { size?: number }) {
 function WhatsAppGlyph({ size = 22 }: { size?: number }) {
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none"><path d="M12 3a9 9 0 0 0-7.7 13.6L3 21l4.5-1.2A9 9 0 1 0 12 3Z" fill="none" stroke="currentColor" strokeWidth="1.8" /></svg>;
 }
+/** The right glyph (and tint) for a chat's channel. */
+function ProviderGlyph({ provider, size = 17 }: { provider: CommsProvider; size?: number }) {
+  return provider === 'whatsapp' ? <WhatsAppGlyph size={size} /> : <TelegramGlyph size={size} />;
+}
 
 function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -30,8 +39,153 @@ function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void 
   );
 }
 
+// ── Your personal "receive on" number (distinct from the linked PA account) ──
+function RecipientField({ wa, onChanged }: { wa: WhatsAppState | null; onChanged: () => void }) {
+  const current = (wa?.notifyJid ?? '').split('@')[0];
+  const [val, setVal] = React.useState(current);
+  const [saved, setSaved] = React.useState(false);
+  React.useEffect(() => { setVal((wa?.notifyJid ?? '').split('@')[0]); }, [wa?.notifyJid]);
+  const digits = val.replace(/[^0-9]/g, '');
+  const linked = (wa?.jid ?? '').split('@')[0].split(':')[0]; // e.g. 8801611682159
+  // A WhatsApp JID needs full international digits (country code, no +, no leading 0).
+  // A leading 0 or a too-short number is almost certainly a local format that will fail.
+  const looksLocal = !!digits && (digits.startsWith('0') || digits.length < 10);
+  // Suggest a fix using the linked account's country code (1–3 digits before the local part).
+  const suggestion = digits.startsWith('0') && linked ? linked.slice(0, Math.max(0, linked.length - (digits.length - 1))) + digits.slice(1) : '';
+  const save = async (override?: string) => { const d = (override ?? val).replace(/[^0-9]/g, ''); setVal(d); await api.setWhatsappRecipient(d); setSaved(true); setTimeout(() => setSaved(false), 1500); onChanged(); };
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 12, borderRadius: 12, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator)', marginBottom: 14 }}>
+      <span style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Your number — where summaries & confirmations go</span>
+      <span style={{ font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-secondary)' }}>The linked account above is your “PA” number{linked ? ` (${linked})` : ''}. Enter the <b style={{ color: 'var(--ink)' }}>personal</b> number you want to receive on — full international format, <b style={{ color: 'var(--ink)' }}>country code, no “+” and no leading 0</b>. Leave blank to use the linked number.</span>
+      <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+        <input value={val} onChange={e => setVal(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') void save(); }} placeholder="e.g. 8801604123482"
+          style={{ flex: 1, height: 38, padding: '0 12px', boxSizing: 'border-box', borderRadius: 10, border: `1px solid ${looksLocal ? 'var(--orange, #d9821b)' : 'var(--separator-strong)'}`, background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-mono)' }} />
+        <button onClick={() => save()} style={{ height: 38, padding: '0 16px', borderRadius: 10, background: digits !== current ? 'var(--green)' : 'var(--fill-secondary)', color: digits !== current ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{saved ? 'Saved ✓' : 'Save'}</button>
+      </div>
+      {digits && !looksLocal && <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Will message: +{digits}</span>}
+      {looksLocal && (
+        <span style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--orange, #d9821b)' }}>
+          That looks like a local number — WhatsApp needs the full international form.{suggestion ? <> Did you mean <button onClick={() => void save(suggestion)} style={{ background: 'none', color: 'var(--blue)', font: 'inherit', textDecoration: 'underline', padding: 0 }}>{suggestion}</button>?</> : ''}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ── WhatsApp card (link + connection + send gate) ───────────────────────────
+function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tracked: number; onChanged: () => void }) {
+  const navigate = useNavigate();
+  const [qr, setQr] = React.useState<string | null>(null);
+  const [pairing, setPairing] = React.useState<string | null>(null);
+  const [linking, setLinking] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState('');
+  const connected = !!wa?.connected;
+  const linked = wa?.linkedAt != null;
+
+  const startLink = async () => {
+    setBusy(true); setErr(''); setPairing(null);
+    try {
+      const r = await api.whatsappLink();
+      if (r.method === 'qr') { setQr(r.dataUrl); setLinking(true); } else setPairing(r.code);
+    } catch (e) { setErr(e instanceof ApiError ? e.message : 'Could not start linking'); }
+    finally { setBusy(false); }
+  };
+  // While a QR is pending: refresh it as it rotates and watch for the link landing.
+  React.useEffect(() => {
+    if (!linking) return;
+    const t = setInterval(() => {
+      api.whatsappQr().then(r => { if (r.dataUrl) setQr(r.dataUrl); }).catch(() => {});
+      api.whatsappStatus().then(s => { if (s.connected) { setLinking(false); setQr(null); onChanged(); } }).catch(() => {});
+    }, 2500);
+    return () => clearInterval(t);
+  }, [linking, onChanged]);
+
+  const disconnect = async () => { setBusy(true); try { await api.disconnectWhatsApp(); onChanged(); } finally { setBusy(false); } };
+  const unlink = async () => { setBusy(true); try { await api.unlinkWhatsApp(); setLinking(false); setQr(null); onChanged(); } finally { setBusy(false); } };
+  const approve = async () => { setBusy(true); try { await api.approveWhatsappSend(); onChanged(); } finally { setBusy(false); } };
+
+  return (
+    <div style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 22 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 16 }}>
+        <span style={{ width: 44, height: 44, borderRadius: 12, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--green) 16%, transparent)', color: 'var(--green)' }}><WhatsAppGlyph /></span>
+        <div style={{ flex: 1 }}>
+          <div style={{ font: '700 var(--fs-title2)/1.1 var(--font-display)', color: 'var(--ink)' }}>WhatsApp</div>
+          <div style={{ font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
+            {connected ? <>Linked{wa?.name ? <> as <b style={{ color: 'var(--ink)' }}>{wa.name}</b></> : ''} · {tracked} tracked chat{tracked !== 1 ? 's' : ''}</>
+              : 'Summarize quiet chats and send the digest to your own number.'}
+          </div>
+        </div>
+        {connected && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'rgba(52,199,89,0.14)', color: 'var(--green)', font: '600 var(--fs-caption)/1 var(--font-text)' }}><span style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--green)' }} /> Live</span>}
+      </div>
+
+      {/* The one-time send gate: never message your number until you allow it. */}
+      {connected && wa && !wa.sendApproved && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 12, borderRadius: 12, background: 'color-mix(in srgb, var(--orange, #ff9f0a) 12%, transparent)', border: '0.5px solid color-mix(in srgb, var(--orange, #ff9f0a) 40%, transparent)', marginBottom: 14 }}>
+          <Icon name="shield" size={18} style={{ color: 'var(--orange, #ff9f0a)', flexShrink: 0 }} />
+          <span style={{ flex: 1, font: '400 var(--fs-footnote)/1.35 var(--font-text)', color: 'var(--ink)' }}>
+            Before Maestro messages summaries to your own number, it needs your OK.{wa.pendingSummaries?.length ? ` ${wa.pendingSummaries.length} waiting.` : ''}
+          </span>
+          {IS_LOCAL && <button onClick={approve} disabled={busy} style={{ height: 34, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', flexShrink: 0 }}>{busy ? '…' : 'Allow'}</button>}
+        </div>
+      )}
+
+      {/* Where summaries + agent confirmations are delivered (your personal number,
+          not the linked PA account). */}
+      {connected && IS_LOCAL && <RecipientField wa={wa} onChanged={onChanged} />}
+
+      {/* Agent send-gate: the agent can always message your own number; messaging
+          other contacts is off until you allow it here. */}
+      {connected && IS_LOCAL && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 12, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator)', marginBottom: 14 }}>
+          <span style={{ flex: 1 }}>
+            <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Let the agent message contacts</span>
+            <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>The agent can always message your own number. Turn this on to let it message other people too.</span>
+          </span>
+          <Toggle on={!!wa?.agentSendToOthers} onChange={v => void api.setWhatsappAgentSend(v).then(onChanged)} />
+        </div>
+      )}
+
+      {connected ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Open the WhatsApp space to read and reply to every chat. Assign chats to a project under Bindings; a chat that goes quiet for 15 min is summarized to you.</div>
+          {IS_LOCAL && <button onClick={() => navigate('/whatsapp')} style={{ height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Open WhatsApp</button>}
+          {IS_LOCAL && <button onClick={disconnect} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--ink)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Pause</button>}
+          {IS_LOCAL && <button onClick={unlink} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Unlink</button>}
+        </div>
+      ) : !IS_LOCAL ? (
+        <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Link your WhatsApp number from the desktop app.</div>
+      ) : qr ? (
+        <div style={{ display: 'flex', gap: 18, alignItems: 'center' }}>
+          <img src={qr} alt="WhatsApp QR" width={180} height={180} style={{ borderRadius: 12, background: '#fff', padding: 8, boxSizing: 'border-box' }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ font: '600 var(--fs-callout)/1.3 var(--font-text)', color: 'var(--ink)', marginBottom: 6 }}>Scan to link your number</div>
+            <ol style={{ margin: 0, paddingLeft: 18, font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+              <li>Open WhatsApp on your phone</li>
+              <li>Settings → Linked Devices → Link a Device</li>
+              <li>Point it at this code</li>
+            </ol>
+            <button onClick={unlink} disabled={busy} style={{ marginTop: 10, height: 32, padding: '0 12px', borderRadius: 8, background: 'transparent', color: 'var(--ink-tertiary)', border: '0.5px solid var(--separator)', font: '500 var(--fs-caption)/1 var(--font-text)' }}>Cancel</button>
+          </div>
+        </div>
+      ) : pairing ? (
+        <div style={{ font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink)' }}>Pairing code: <b style={{ font: 'var(--fs-title2) var(--font-mono)', letterSpacing: '0.1em' }}>{pairing}</b><div style={{ color: 'var(--ink-tertiary)', marginTop: 4 }}>Enter it in WhatsApp → Linked Devices → Link with phone number.</div></div>
+      ) : (
+        <>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12, borderRadius: 12, background: 'color-mix(in srgb, var(--red) 9%, transparent)', border: '0.5px solid color-mix(in srgb, var(--red) 30%, transparent)', marginBottom: 14 }}>
+            <Icon name="alert" size={16} style={{ color: 'var(--red)', flexShrink: 0, marginTop: 1 }} />
+            <span style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>This links your <b style={{ color: 'var(--ink)' }}>personal</b> number via an unofficial connection. WhatsApp may ban numbers that automate — this is your own informed choice. Your chats are read and stored only on this Mac (never sent to the relay).</span>
+          </div>
+          <button onClick={startLink} disabled={busy} style={{ height: 42, padding: '0 20px', borderRadius: 11, background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{busy ? 'Starting…' : linked ? 'Re-link number' : 'Link your number'}</button>
+          {err && <div style={{ marginTop: 10, font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--red)' }}>{err}</div>}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── Channels ──────────────────────────────────────────────────────────────
-function ChannelsTab({ status, onChanged }: { status: CommsStatus | null; onChanged: () => void }) {
+function ChannelsTab({ status, wa, onChanged }: { status: CommsStatus | null; wa: WhatsAppState | null; onChanged: () => void }) {
   const [token, setToken] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState('');
@@ -79,84 +233,114 @@ function ChannelsTab({ status, onChanged }: { status: CommsStatus | null; onChan
         ) : <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Connect the Telegram bot from the desktop app.</div>}
       </div>
 
-      {/* WhatsApp — honest preview */}
-      <div style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 22, opacity: 0.7 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-          <span style={{ width: 44, height: 44, borderRadius: 12, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--green) 16%, transparent)', color: 'var(--green)' }}><WhatsAppGlyph /></span>
-          <div style={{ flex: 1 }}>
-            <div style={{ font: '700 var(--fs-title2)/1.1 var(--font-display)', color: 'var(--ink)' }}>WhatsApp</div>
-            <div style={{ font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Coming next — Telegram is the supported channel today.</div>
-          </div>
-          <span style={{ height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink-tertiary)', font: '600 var(--fs-caption)/26px var(--font-text)' }}>Soon</span>
-        </div>
-      </div>
+      {/* WhatsApp — quiet-timer sync */}
+      <WhatsAppCard wa={wa} tracked={status?.whatsapp.tracked ?? 0} onChanged={onChanged} />
     </div>
   );
 }
 
 // ── Bindings ──────────────────────────────────────────────────────────────
 function BindSheet({ pending, projects, onClose, onBound }: { pending: PendingChat; projects: Project[]; onClose: () => void; onBound: () => void }) {
+  const isWa = providerOf(pending.chatId) === 'whatsapp';
   const [projectId, setProjectId] = React.useState('');
+  const [sessionId, setSessionId] = React.useState('');
+  const [sessions, setSessions] = React.useState<ChatSession[]>([]);
   const [perms, setPerms] = React.useState<ChatPermissions>({ startJobs: true, receiveReports: true, approveGates: false });
   const [busy, setBusy] = React.useState(false);
+
+  // WhatsApp files a chat under a session — load the chosen project's sessions.
+  React.useEffect(() => {
+    if (!isWa) return;
+    setSessionId('');
+    if (!projectId) { setSessions([]); return; }
+    api.listSessions(projectId).then(s => setSessions(s.filter(x => !x.archived))).catch(() => setSessions([]));
+  }, [isWa, projectId]);
+
   const bind = async () => {
     setBusy(true);
-    try { await api.bindChat({ chatId: pending.chatId, name: pending.name, projectId: projectId || null, permissions: perms }); onBound(); }
-    catch { /* fail soft */ } finally { setBusy(false); }
+    try {
+      await api.bindChat(isWa
+        ? { chatId: pending.chatId, name: pending.name, provider: 'whatsapp', projectId: projectId || null, sessionId: sessionId || null }
+        : { chatId: pending.chatId, name: pending.name, projectId: projectId || null, permissions: perms });
+      onBound();
+    } catch { /* fail soft */ } finally { setBusy(false); }
   };
   const rows: [keyof ChatPermissions, string, string][] = [
     ['startJobs', 'Start jobs', 'Run tasks from this chat'],
     ['receiveReports', 'Receive reports', 'Get the result when a job finishes'],
     ['approveGates', 'Approve gates', 'Approve / deny pending gates inline'],
   ];
+  const labelStyle: React.CSSProperties = { display: 'block', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 };
+  const selectStyle: React.CSSProperties = { width: '100%', height: 40, borderRadius: 10, border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', padding: '0 10px', font: '400 var(--fs-body)/1 var(--font-text)' };
   return (
     <div onMouseDown={onClose} style={{ position: 'absolute', inset: 0, zIndex: 80, display: 'grid', placeItems: 'center', padding: 32, background: 'rgba(10,12,24,0.32)', backdropFilter: 'blur(3px)' }}>
       <div onMouseDown={e => e.stopPropagation()} style={{ width: 440, background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--glass-border)', boxShadow: '0 40px 100px rgba(10,15,40,0.5)', padding: 22 }}>
-        <h2 style={{ margin: '0 0 4px', font: '700 var(--fs-title2)/1.1 var(--font-display)', color: 'var(--ink)' }}>Bind “{pending.name}”</h2>
-        <p style={{ margin: '0 0 16px', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>Let this chat control Maestro with the permissions you choose.</p>
+        <h2 style={{ margin: '0 0 4px', font: '700 var(--fs-title2)/1.1 var(--font-display)', color: 'var(--ink)' }}>{isWa ? 'Track' : 'Bind'} “{pending.name}”</h2>
+        <p style={{ margin: '0 0 16px', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>{isWa ? 'File this chat under a project and session. When it goes quiet for 15 minutes, Maestro summarizes it to your number.' : 'Let this chat control Maestro with the permissions you choose.'}</p>
         <label style={{ display: 'block', marginBottom: 16 }}>
-          <span style={{ display: 'block', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 }}>Default project</span>
-          <select value={projectId} onChange={e => setProjectId(e.target.value)} style={{ width: '100%', height: 40, borderRadius: 10, border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', padding: '0 10px', font: '400 var(--fs-body)/1 var(--font-text)' }}>
+          <span style={labelStyle}>{isWa ? 'Project' : 'Default project'}</span>
+          <select value={projectId} onChange={e => setProjectId(e.target.value)} style={selectStyle}>
             <option value="">First project</option>
             {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
         </label>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 18 }}>
-          {rows.map(([k, label, sub]) => (
-            <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              <span style={{ flex: 1 }}><span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{label}</span><span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>{sub}</span></span>
-              <Toggle on={perms[k]} onChange={v => setPerms(pr => ({ ...pr, [k]: v }))} />
-            </div>
-          ))}
-        </div>
+        {isWa ? (
+          <label style={{ display: 'block', marginBottom: 18 }}>
+            <span style={labelStyle}>Session</span>
+            <select value={sessionId} onChange={e => setSessionId(e.target.value)} disabled={!projectId} style={{ ...selectStyle, opacity: projectId ? 1 : 0.5 }}>
+              <option value="">{projectId ? 'No specific session' : 'Pick a project first'}</option>
+              {sessions.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}
+            </select>
+          </label>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 18 }}>
+            {rows.map(([k, label, sub]) => (
+              <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ flex: 1 }}><span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{label}</span><span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>{sub}</span></span>
+                <Toggle on={perms[k]} onChange={v => setPerms(pr => ({ ...pr, [k]: v }))} />
+              </div>
+            ))}
+          </div>
+        )}
         <div style={{ display: 'flex', gap: 10 }}>
           <button onClick={onClose} style={{ flex: 1, height: 42, borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
-          <button onClick={bind} disabled={busy} style={{ flex: 1, height: 42, borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{busy ? 'Binding…' : 'Bind chat'}</button>
+          <button onClick={bind} disabled={busy} style={{ flex: 1, height: 42, borderRadius: 'var(--r-pill)', background: isWa ? 'var(--green)' : 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{busy ? 'Saving…' : isWa ? 'Track chat' : 'Bind chat'}</button>
         </div>
       </div>
     </div>
   );
 }
 
-function BindingsTab({ bindings, pending, projects, onChanged }: { bindings: ChatBinding[]; pending: PendingChat[]; projects: Project[]; onChanged: () => void }) {
+function ago(ts: number): string {
+  if (!ts) return 'never';
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+function BindingsTab({ bindings, pending, projects, sessions, waChats, onChanged }: { bindings: ChatBinding[]; pending: PendingChat[]; projects: Project[]; sessions: ChatSession[]; waChats: WaChatSummary[]; onChanged: () => void }) {
   const [bindTarget, setBindTarget] = React.useState<PendingChat | null>(null);
   const projName = (id: string | null) => projects.find(p => p.id === id)?.name ?? 'First project';
+  const sessName = (id?: string | null) => (id ? sessions.find(s => s.id === id)?.title : undefined);
+  const tint = (provider: CommsProvider) => provider === 'whatsapp' ? 'var(--green)' : 'var(--blue)';
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 22, maxWidth: 760 }}>
       <div>
         <div style={{ font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-secondary)', marginBottom: 11 }}>Pending · {pending.length}</div>
-        {pending.length === 0 ? <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>No chats waiting. Message your bot from Telegram and it’ll appear here to bind.</div>
+        {pending.length === 0 ? <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>No chats waiting. Message your Telegram bot or send to a linked WhatsApp chat, and it’ll appear here.</div>
           : <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {pending.map(c => (
+              {pending.map(c => { const prov = providerOf(c.chatId); return (
                 <div key={c.chatId} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 12, borderRadius: 12, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)' }}>
-                  <span style={{ width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 13%, transparent)', color: 'var(--blue)' }}><TelegramGlyph size={17} /></span>
+                  <span style={{ width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${tint(prov)} 13%, transparent)`, color: tint(prov) }}><ProviderGlyph provider={prov} /></span>
                   <span style={{ flex: 1, minWidth: 0 }}>
                     <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{c.name}</span>
                     <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>“{c.firstText}”</span>
                   </span>
-                  <button onClick={() => setBindTarget(c)} style={{ height: 32, padding: '0 14px', borderRadius: 8, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Bind</button>
+                  <button onClick={() => setBindTarget(c)} style={{ height: 32, padding: '0 14px', borderRadius: 8, background: tint(prov), color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{prov === 'whatsapp' ? 'Track' : 'Bind'}</button>
                 </div>
-              ))}
+              ); })}
             </div>}
       </div>
 
@@ -164,23 +348,31 @@ function BindingsTab({ bindings, pending, projects, onChanged }: { bindings: Cha
         <div style={{ font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-secondary)', marginBottom: 11 }}>Bound chats · {bindings.length}</div>
         {bindings.length === 0 ? <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>No bound chats yet.</div>
           : <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {bindings.map(b => (
+              {bindings.map(b => { const prov = b.provider ?? 'telegram'; const isWa = prov === 'whatsapp'; const wc = isWa ? waChats.find(w => w.chatId === b.chatId) : undefined; return (
                 <div key={b.chatId} style={{ padding: 14, borderRadius: 14, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-                    <span style={{ width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 13%, transparent)', color: 'var(--blue)' }}><TelegramGlyph size={17} /></span>
-                    <span style={{ flex: 1 }}><span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{b.name}</span><span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-tertiary)' }}>{projName(b.projectId)}</span></span>
-                    <button onClick={() => void api.unbindChat(b.chatId).then(onChanged)} style={{ height: 30, padding: '0 12px', borderRadius: 8, background: 'transparent', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Unbind</button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: isWa ? 0 : 12 }}>
+                    <span style={{ width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${tint(prov)} 13%, transparent)`, color: tint(prov) }}><ProviderGlyph provider={prov} /></span>
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{b.name}</span>
+                      <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-tertiary)' }}>{projName(b.projectId)}{isWa && sessName(b.sessionId) ? ` · ${sessName(b.sessionId)}` : ''}</span>
+                    </span>
+                    {isWa && <span title="Summarized to your number after 15 min of silence" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 24, padding: '0 9px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}><Icon name="clock" size={12} /> Quiet 15m</span>}
+                    <button onClick={() => void api.unbindChat(b.chatId).then(onChanged)} style={{ height: 30, padding: '0 12px', borderRadius: 8, background: 'transparent', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>{isWa ? 'Untrack' : 'Unbind'}</button>
                   </div>
-                  <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}>
-                    {([['startJobs', 'Start jobs'], ['receiveReports', 'Reports'], ['approveGates', 'Approve gates']] as [keyof ChatPermissions, string][]).map(([k, label]) => (
-                      <label key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                        <Toggle on={b.permissions[k]} onChange={v => void api.setChatPermissions(b.chatId, { [k]: v }).then(onChanged)} />
-                        <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{label}</span>
-                      </label>
-                    ))}
-                  </div>
+                  {isWa ? (
+                    <div style={{ marginTop: 8, font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>{wc ? `${wc.count} message${wc.count !== 1 ? 's' : ''} captured · last summary ${ago(wc.lastReportedAt)}` : 'No messages captured yet.'}</div>
+                  ) : (
+                    <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}>
+                      {([['startJobs', 'Start jobs'], ['receiveReports', 'Reports'], ['approveGates', 'Approve gates']] as [keyof ChatPermissions, string][]).map(([k, label]) => (
+                        <label key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                          <Toggle on={b.permissions[k]} onChange={v => void api.setChatPermissions(b.chatId, { [k]: v }).then(onChanged)} />
+                          <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
                 </div>
-              ))}
+              ); })}
             </div>}
       </div>
 
@@ -216,20 +408,26 @@ const TABS: [string, string][] = [['channels', 'Channels'], ['bindings', 'Bindin
 export default function CommsGateway() {
   const [tab, setTab] = React.useState('channels');
   const [status, setStatus] = React.useState<CommsStatus | null>(null);
+  const [wa, setWa] = React.useState<WhatsAppState | null>(null);
   const [bindings, setBindings] = React.useState<ChatBinding[]>([]);
   const [pending, setPending] = React.useState<PendingChat[]>([]);
   const [events, setEvents] = React.useState<CommEvent[]>([]);
   const [projects, setProjects] = React.useState<Project[]>([]);
+  const [sessions, setSessions] = React.useState<ChatSession[]>([]);
+  const [waChats, setWaChats] = React.useState<WaChatSummary[]>([]);
 
   const refetch = React.useCallback(() => {
     api.commsStatus().then(setStatus).catch(() => {});
+    api.whatsappStatus().then(setWa).catch(() => {});
     api.listChatBindings().then(setBindings).catch(() => {});
     api.listPendingChats().then(setPending).catch(() => {});
     api.listCommEvents().then(setEvents).catch(() => {});
+    api.listWaChats().then(setWaChats).catch(() => {});
   }, []);
   React.useEffect(() => {
     refetch();
     api.listProjects().then(setProjects).catch(() => {});
+    api.listSessions().then(setSessions).catch(() => {});
     const unsub = api.subscribe({ onComms: refetch });
     const poll = setInterval(refetch, 8000); // pending chats arrive via long-poll on the Mac
     return () => { unsub(); clearInterval(poll); };
@@ -240,7 +438,7 @@ export default function CommsGateway() {
       <style>{CSS}</style>
       <div style={{ padding: '24px 28px 36px' }}>
         <h1 style={{ margin: '0 0 4px', font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Comms</h1>
-        <p style={{ margin: '0 0 20px', font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Drive Maestro from a Telegram chat — jobs and approvals run on this Mac.</p>
+        <p style={{ margin: '0 0 20px', font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Drive Maestro from Telegram, and let WhatsApp chats summarize themselves to your number when they go quiet — all on this Mac.</p>
 
         <div style={{ display: 'inline-flex', padding: 3, background: 'var(--fill-secondary)', borderRadius: 11, marginBottom: 22 }}>
           {TABS.map(([k, label]) => (
@@ -251,8 +449,8 @@ export default function CommsGateway() {
         </div>
 
         <div key={tab} className="tab-fade">
-          {tab === 'channels' && <ChannelsTab status={status} onChanged={refetch} />}
-          {tab === 'bindings' && <BindingsTab bindings={bindings} pending={pending} projects={projects} onChanged={refetch} />}
+          {tab === 'channels' && <ChannelsTab status={status} wa={wa} onChanged={refetch} />}
+          {tab === 'bindings' && <BindingsTab bindings={bindings} pending={pending} projects={projects} sessions={sessions} waChats={waChats} onChanged={refetch} />}
           {tab === 'activity' && <ActivityTab events={events} />}
         </div>
       </div>

@@ -20,16 +20,22 @@ export async function setupAlerts(): Promise<void> {
   configured = true;
   try {
     Notifications.setNotificationHandler({
-      // The app shows its own in-app banner + chime for foreground events (see
-      // LiveNotifier), so suppress the OS banner while foreground to avoid doubles.
-      // Background/killed pushes are rendered by the system, not this handler.
-      handleNotification: async () => ({ shouldShowBanner: false, shouldShowList: false, shouldPlaySound: false, shouldSetBadge: true }),
+      handleNotification: async (n) => {
+        // A remote push that lands while the app is in the FOREGROUND is redundant
+        // with the SSE-driven in-app banner + chime (LiveNotifier) — keep it silent
+        // to avoid a double alert. Closed/background pushes never hit this handler
+        // (the app isn't running) so the OS shows them natively. Local notifs from
+        // fireAlert (trigger !== 'push') still present as before.
+        const isRemote = (n.request.trigger as { type?: string } | null)?.type === 'push';
+        if (isRemote) return { shouldShowBanner: false, shouldShowList: true, shouldPlaySound: false, shouldSetBadge: true };
+        return { shouldShowBanner: true, shouldShowList: true, shouldPlaySound: true, shouldSetBadge: true };
+      },
     });
     if (Platform.OS === 'android') {
       await Notifications.setNotificationChannelAsync('alerts', {
         name: 'Maestro alerts',
         importance: Notifications.AndroidImportance.MAX,
-        sound: 'alert.wav',
+        sound: 'default',
         vibrationPattern: [0, 260, 180, 260],
         enableVibrate: true,
       });

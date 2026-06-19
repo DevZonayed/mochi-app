@@ -2,6 +2,7 @@ import React from 'react';
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { UpdateBanner } from './lib/UpdateBanner';
 import { NotificationCenter } from './lib/notify';
+import { RemotePairGate } from './lib/RemotePairGate';
 
 /* Real application entry. First run → Onboarding (creates the workspace, sets
    the budget); afterwards the app opens straight in the Workspace. There is no
@@ -25,6 +26,7 @@ const MediaStudio = React.lazy(() => import('./screens/MediaStudio'));
 const PublishingCenter = React.lazy(() => import('./screens/PublishingCenter'));
 const TrendIntelligence = React.lazy(() => import('./screens/TrendIntelligence'));
 const CommsGateway = React.lazy(() => import('./screens/CommsGateway'));
+const WhatsApp = React.lazy(() => import('./screens/WhatsApp'));
 const BudgetDashboard = React.lazy(() => import('./screens/BudgetDashboard'));
 const Settings = React.lazy(() => import('./screens/Settings'));
 const Feedback = React.lazy(() => import('./screens/Feedback'));
@@ -45,6 +47,7 @@ function entryPath(): string {
 export function App() {
   return (
     <HashRouter>
+      <RemotePairGate>
       <React.Suspense fallback={null}>
         <Routes>
           <Route path="/" element={<Navigate to={entryPath()} replace />} />
@@ -66,6 +69,7 @@ export function App() {
           <Route path="/publishing" element={<PublishingCenter />} />
           <Route path="/trends" element={<TrendIntelligence />} />
           <Route path="/comms" element={<CommsGateway />} />
+          <Route path="/whatsapp" element={<WhatsApp />} />
           <Route path="/budget" element={<BudgetDashboard />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/feedback" element={<Feedback />} />
@@ -76,6 +80,7 @@ export function App() {
       </React.Suspense>
       <UpdateBanner />
       <NotificationCenter />
+      </RemotePairGate>
     </HashRouter>
   );
 }

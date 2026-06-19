@@ -10,6 +10,8 @@ import type { MediaEngine } from './media.js';
 import type { ResearchEngine } from './research.js';
 import type { PublishingEngine } from './publishing.js';
 import type { TelegramBot } from './telegram.js';
+import type { WhatsAppClient } from './whatsapp.js';
+import { approveWhatsappSend } from './whatsapp-analyze.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, structuredDiff } from './git.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
@@ -99,7 +101,7 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null) {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null) {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -615,11 +617,27 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           fireAt,
           sessionId: p.sessionId ? String(p.sessionId) : undefined,
           prompt: p.prompt ? String(p.prompt) : undefined,
+          everyMinutes: Number.isFinite(Number(p.everyMinutes)) && Number(p.everyMinutes) > 0 ? Number(p.everyMinutes) : undefined,
+          catchUp: p.catchUp === true,
+          effort: p.effort as Effort | undefined,
+          browser: p.browser === true, plan: p.plan === true,
         });
         emit('schedule', s);
         return s;
       }
       case 'toggleSchedule': { store.setScheduleEnabled(String(p.id ?? ''), Boolean(p.enabled)); emit('schedule', { id: String(p.id ?? ''), enabled: Boolean(p.enabled) }); return { ok: true }; }
+      case 'updateSchedule': {
+        const id = String(p.id ?? '');
+        if (!id) bad('id required');
+        if (p.sessionId && !store.getSession(String(p.sessionId))) bad('session not found', 404);
+        const patch: Record<string, unknown> = {};
+        for (const k of ['title', 'prompt', 'time', 'cadence', 'everyMinutes', 'catchUp', 'enabled', 'effort', 'browser', 'plan', 'sessionId', 'projectId'] as const) {
+          if (p[k] !== undefined) patch[k] = p[k];
+        }
+        const s = store.updateSchedule(id, patch);
+        emit('schedule', s);
+        return s;
+      }
       case 'deleteSchedule': { store.deleteSchedule(String(p.id ?? '')); emit('schedule', { id: String(p.id ?? ''), deleted: true }); return { ok: true }; }
       // Wait-&-check: schedule a one-shot follow-up that pokes a chat after delayMs.
       case 'scheduleCheck': {
@@ -1006,20 +1024,92 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!p.chatId) bad('chatId required');
         const pending = store.listPendingChats().find(c => c.chatId === String(p.chatId));
         const perms = (p.permissions && typeof p.permissions === 'object') ? p.permissions as Record<string, boolean> : {};
+        const provider = p.provider === 'whatsapp' ? 'whatsapp' as const : (pending ? 'telegram' as const : (p.provider === 'telegram' ? 'telegram' as const : undefined));
         const b = store.bindChat({
           chatId: String(p.chatId), name: String(p.name ?? pending?.name ?? p.chatId), kind: (pending?.kind ?? 'dm'),
+          provider,
           projectId: (p.projectId as string) ?? null,
+          ...(p.sessionId !== undefined ? { sessionId: (p.sessionId as string) ?? null } : {}),
           permissions: { startJobs: perms.startJobs ?? true, receiveReports: perms.receiveReports ?? true, approveGates: perms.approveGates ?? false },
         });
         emit('comms', store.commsStatus());
         return b;
       }
-      case 'unbindChat': { store.unbindChat(String(p.chatId ?? '')); emit('comms', store.commsStatus()); return { ok: true }; }
+      case 'unbindChat': {
+        const chatId = String(p.chatId ?? '');
+        // A WhatsApp chat: stop its quiet timer. KEEP the captured log — the chat
+        // still shows in the WhatsApp screen; only a full unlink wipes message logs.
+        if (store.getChatBinding(chatId)?.provider === 'whatsapp') store.cancelWhatsappTimer(chatId);
+        store.unbindChat(chatId); emit('comms', store.commsStatus()); return { ok: true };
+      }
       case 'setChatPermissions': {
         if (!p.chatId || !p.permissions || typeof p.permissions !== 'object') bad('chatId and permissions required');
         const b = store.setChatPermissions(String(p.chatId), p.permissions as Record<string, boolean>);
         emit('comms', store.commsStatus());
         return b;
+      }
+
+      // ── Comms (WhatsApp — desktop-owned Baileys socket) ────────
+      case 'whatsappStatus': return store.whatsappState();
+      case 'listWaChats': return store.listWaChats();
+      case 'whatsappLink': return whatsapp.link({ phone: p.phone ? String(p.phone) : undefined });
+      case 'whatsappQr': return { dataUrl: whatsapp.currentQr() };
+      case 'disconnectWhatsApp': { whatsapp.disconnect(); return { ok: true }; }
+      case 'unlinkWhatsApp': { await whatsapp.unlink(); return { ok: true }; }
+      case 'approveWhatsappSend': { await approveWhatsappSend({ store, client: whatsapp, emit }); return store.whatsappState(); }
+
+      // ── WhatsApp full chat store + control (Mac-local; blocked over the relay) ──
+      case 'waListChats': return store.waListChats();
+      case 'waGetMessages': {
+        if (!p.chatId) bad('chatId required');
+        const limit = typeof p.limit === 'number' ? p.limit : undefined;
+        const before = typeof p.before === 'number' ? p.before : undefined;
+        return store.waMessages(String(p.chatId), { limit, before });
+      }
+      case 'waChatInfo': { if (!p.chatId) bad('chatId required'); return store.waGetChat(String(p.chatId)) ?? null; }
+      case 'waSendText': {
+        if (!p.chatId || typeof p.text !== 'string' || !p.text.trim()) bad('chatId and text required');
+        return { ok: await whatsapp.sendText(String(p.chatId), String(p.text)) };
+      }
+      case 'waSendMedia': {
+        if (!p.chatId) bad('chatId required');
+        const kind = (p.kind === 'image' || p.kind === 'video' || p.kind === 'audio' || p.kind === 'document') ? p.kind : 'document';
+        let data: Buffer | null = null;
+        if (typeof p.path === 'string' && p.path) { try { data = await (await import('node:fs/promises')).readFile(p.path); } catch { bad('could not read that file'); } }
+        else if (typeof p.dataB64 === 'string' && p.dataB64) data = Buffer.from(p.dataB64, 'base64');
+        if (!data) bad('path or dataB64 required');
+        return { ok: await whatsapp.sendMedia(String(p.chatId), { kind, data: data as Buffer, mimetype: p.mimetype ? String(p.mimetype) : undefined, fileName: p.fileName ? String(p.fileName) : undefined, caption: p.caption ? String(p.caption) : undefined }) };
+      }
+      case 'waReact': {
+        if (!p.chatId || !p.msgId) bad('chatId and msgId required');
+        return { ok: await whatsapp.sendReaction(String(p.chatId), String(p.msgId), String(p.emoji ?? '')) };
+      }
+      case 'waMarkRead': { if (!p.chatId) bad('chatId required'); await whatsapp.markRead(String(p.chatId)); return { ok: true }; }
+      case 'waSetTyping': { if (!p.chatId) bad('chatId required'); await whatsapp.setTyping(String(p.chatId), !!p.on); return { ok: true }; }
+      case 'waFetchAvatar': { if (!p.chatId) bad('chatId required'); return { url: await whatsapp.fetchAvatar(String(p.chatId)) }; }
+      case 'waDownloadMedia': {
+        if (!p.chatId || !p.msgId) bad('chatId and msgId required');
+        return (await whatsapp.downloadMedia(String(p.chatId), String(p.msgId))) ?? null;
+      }
+      case 'setWhatsappAgentSend': { const next = store.setWhatsappState({ agentSendToOthers: !!p.on }); emit('comms', store.commsStatus()); return next; }
+      case 'setWhatsappRecipient': {
+        const digits = String(p.number ?? '').replace(/[^0-9]/g, ''); // '' clears it
+        const next = store.setWhatsappState({ notifyJid: digits ? `${digits}@s.whatsapp.net` : null });
+        emit('comms', store.commsStatus());
+        return next;
+      }
+      case 'listProjectWaChats': { if (!p.projectId) bad('projectId required'); return store.listProjectWaChats(String(p.projectId)); }
+      case 'addProjectWaChat': {
+        if (!p.projectId || !p.chatId) bad('projectId and chatId required');
+        const ids = store.addProjectWaChat(String(p.projectId), String(p.chatId));
+        emit('comms', store.commsStatus());
+        return ids;
+      }
+      case 'removeProjectWaChat': {
+        if (!p.projectId || !p.chatId) bad('projectId and chatId required');
+        const ids = store.removeProjectWaChat(String(p.projectId), String(p.chatId));
+        emit('comms', store.commsStatus());
+        return ids;
       }
 
       // ── Feedback (collected from desktop / web / phone) ────────
@@ -1143,7 +1233,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
 
       // ── Pairing (desktop-only; never enters relay snapshots) ──
-      case 'getPairing': return { token: store.accessToken, relayUrl, devices: store.getRemotePresence() };
+      case 'getPairing': return { token: store.accessToken, relayUrl, devices: store.getRemoteDevices() };
 
       default:
         return bad(`unknown method: ${method}`, 404);

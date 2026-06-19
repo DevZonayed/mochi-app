@@ -158,6 +158,7 @@ export interface Schedule {
   cadence: string;
   enabled: boolean;
   nextRun: number | null;
+  lastRun?: number | null;
   createdAt: number;
   fireAt?: number;
   sessionId?: string;
@@ -175,6 +176,12 @@ export interface Schedule {
   armedAt?: number;
   extends?: number;
   paused?: boolean;
+  /** Interval cadence (every N minutes) — when set, fires on an interval, not a clock time. */
+  everyMinutes?: number;
+  /** Clock-mode catch-up: fire a missed daily/weekly slot later the same day. */
+  catchUp?: boolean;
+  /** True when the most recent fire was a late catch-up (drives the "ran late" notice). */
+  lastFireLate?: boolean;
 }
 export interface Skill {
   id: string;
@@ -267,7 +274,8 @@ export interface ModelGroup {
   reason: string;
   models: ModelDescriptor[];
 }
-export interface DevicePresence { connected: boolean; streams: number; lastSeen: number | null; name: string | null }
+/** One connected/recent remote device, reported by the relay's device registry. */
+export interface RemoteDevice { id: string; name: string | null; live: boolean; lastSeen: number }
 /** Whether the `gh` CLI is available (system or our managed download). */
 export interface GhState { installed: boolean; source: 'system' | 'managed' | 'none'; version: string | null; path: string | null; supported: boolean }
 /** Live frames during a GitHub OAuth sign-in: downloading gh, then the one-time code. */
@@ -277,8 +285,8 @@ export type GithubDevice =
 export interface PairingInfo {
   token: string;
   relayUrl: string;
-  /** Live remote-device presence (phone/web), reported by the relay. */
-  devices?: DevicePresence;
+  /** Live remote devices (phone/web), reported by the relay. */
+  devices?: RemoteDevice[];
 }
 export type AppEventKind =
   | 'job-done' | 'job-failed' | 'job-cancelled'
@@ -316,6 +324,8 @@ export interface AppSettings {
   feedbackRepo?: string;
   /** Device-notification sound preferences. */
   notifications?: NotificationSettings;
+  /** Opt-in: try a direct desktop↔phone WebRTC channel before the relay (default off). */
+  p2pEnabled?: boolean;
 }
 
 export type FeedbackCategory = 'bug' | 'idea' | 'other';
@@ -413,13 +423,35 @@ export interface PublishDraft {
   status: PublishStatus; provenance: string; exportedPaths: string[]; createdAt: number; updatedAt: number;
 }
 export interface PublishLedgerRow { id: string; draftId: string; at: number; platforms: string[]; action: 'exported' | 'published-manual'; ok: boolean; hash: string; paths: string[] }
+export type CommsProvider = 'telegram' | 'whatsapp';
 export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; approveGates: boolean }
-export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; projectId: string | null; permissions: ChatPermissions; boundAt: number }
+export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; provider?: CommsProvider; projectId: string | null; sessionId?: string | null; permissions: ChatPermissions; boundAt: number }
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
 export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
+export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummaries?: { id: string; text: string; chatName: string; at: number }[]; agentSendToOthers?: boolean; notifyJid?: string | null }
+export type WaChatKind = 'dm' | 'group' | 'channel';
+export interface WaChatSummary { chatId: string; name: string; kind: WaChatKind; lastMessageAt: number; lastReportedAt: number; count: number }
+/** A WhatsApp chat as shown in the WhatsApp workspace (mirrors electron WaChatMeta). */
+export interface WaChat {
+  chatId: string; name: string; kind: WaChatKind; avatarUrl?: string | null;
+  lastMessageAt: number; lastMessageText: string; lastMessageFromMe: boolean;
+  unreadCount: number; pinned?: boolean; muted?: boolean; isContact?: boolean; lastReportedAt: number;
+}
+export interface WaReaction { emoji: string; fromMe: boolean }
+export interface WaMediaRef { kind: string; mimetype?: string; fileName?: string; seconds?: number; sizeBytes?: number; thumbBase64?: string }
+export interface WaMediaData { dataUrl: string; mimetype: string; fileName?: string }
+/** A WhatsApp message in the conversation view (mirrors electron WaStoredMessage). */
+export interface WaMessage {
+  id: string; msgId?: string; chatId: string; fromMe: boolean; senderId?: string;
+  senderName: string; text: string; kind: string; ts: number;
+  quotedText?: string; reactions?: WaReaction[]; media?: WaMediaRef; status?: 'sent' | 'delivered' | 'read';
+}
+/** Live wa-message event payload (Mac-local; never relayed). */
+export interface WaMessageEvent { chatId: string; message: WaMessage; chat?: WaChat }
+export type WhatsAppLink = { method: 'qr'; dataUrl: string } | { method: 'pairing'; code: string };
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
-  whatsapp: { connected: false };
+  whatsapp: { connected: boolean; jid: string | null; name: string | null; tracked: number; sendApproved: boolean };
 }
 export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
 export interface FolderInspect { ok: boolean; path: string; info: RepoInfo; error?: string }
@@ -492,6 +524,67 @@ export function getRemoteToken(): string { return remoteToken; }
 export function setRemoteToken(token: string): void {
   remoteToken = token.trim();
   try { localStorage.setItem(TOKEN_KEY, remoteToken); } catch { /* storage unavailable */ }
+  freshDeviceId(); // (re-)pairing → new identity so a prior kick (old id revoked) doesn't carry over
+}
+
+/* ── Per-device identity (browser remotes) ─────────────────────────────
+   A stable id lets the Mac list + disconnect THIS device specifically. It's
+   re-minted on every (re-)pair so a kicked device returns as a fresh identity
+   (the relay revoked the OLD id, not the new one). */
+const DEVICE_ID_KEY = 'maestro.remote.deviceId';
+function mintId(): string {
+  try { if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID(); } catch { /* fall through */ }
+  return `dev-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+}
+function ensureDeviceId(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    let id = localStorage.getItem(DEVICE_ID_KEY);
+    if (!id) { id = mintId(); localStorage.setItem(DEVICE_ID_KEY, id); }
+    return id;
+  } catch { return ''; }
+}
+function freshDeviceId(): void {
+  try { localStorage.setItem(DEVICE_ID_KEY, mintId()); } catch { /* storage unavailable */ }
+}
+/** Best-effort readable label for this browser, from the UA (e.g. "Chrome · macOS"). */
+function deviceLabel(): string {
+  if (typeof navigator === 'undefined') return 'Web remote';
+  const ua = navigator.userAgent;
+  const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Chrome\//.test(ua) ? 'Chrome'
+    : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  const os = /iPhone|iPad/.test(ua) ? 'iOS' : /Android/.test(ua) ? 'Android' : /Mac OS X/.test(ua) ? 'macOS'
+    : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : '';
+  return os ? `${browser} · ${os}` : browser;
+}
+
+/* ── Re-pair gate (browser remotes) ────────────────────────────────────
+   When the relay rejects our token (this device was kicked, or the code was
+   regenerated), drop the token and tell the app to show a code-entry gate so the
+   user can reconnect — instead of failing silently forever. */
+let unpaired = !IS_LOCAL && !remoteToken;
+let unpairedReason = '';
+const unpairListeners = new Set<(reason: string) => void>();
+export function isUnpaired(): boolean { return unpaired; }
+export function unpairReason(): string { return unpairedReason; }
+export function onUnpaired(cb: (reason: string) => void): () => void {
+  unpairListeners.add(cb);
+  return () => { unpairListeners.delete(cb); };
+}
+function setUnpaired(state: boolean, reason: string): void {
+  unpaired = state;
+  unpairedReason = reason;
+  for (const cb of unpairListeners) { try { cb(reason); } catch { /* ignore */ } }
+}
+function handleUnauthorized(reason: string): void {
+  setRemoteToken(''); // also re-mints the device id for the next pair
+  setUnpaired(true, reason);
+}
+/** Re-pair from the gate: store + verify the new code, then resume. Throws (401) if it doesn't match. */
+export async function repair(code: string): Promise<void> {
+  setRemoteToken(code); // mints a fresh device id
+  await req('/api/engine-status');
+  setUnpaired(false, '');
 }
 
 const REGISTRY_ADMIN_TOKEN_KEY = 'maestro.registry.admin.token';
@@ -512,6 +605,8 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     headers: {
       ...(hasBody ? { 'content-type': 'application/json' } : {}),
       ...(remoteToken ? { authorization: `Bearer ${remoteToken}` } : {}),
+      // Per-device identity so the Mac can list + disconnect THIS browser specifically.
+      ...(!IS_LOCAL ? { 'x-maestro-device-id': ensureDeviceId(), 'x-maestro-device': deviceLabel() } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -523,6 +618,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* non-JSON error body */
     }
+    // A 401 on an /api/* call from a browser remote means our token/device was
+    // rejected (kicked, or the code was regenerated) → drop it + show the re-pair gate.
+    if (res.status === 401 && !IS_LOCAL && path.startsWith('/api/')) handleUnauthorized(detail);
     throw new ApiError(res.status, detail);
   }
   if (res.status === 204) return undefined as T;
@@ -773,11 +871,49 @@ export const api = {
   listCommEvents: () => call<CommEvent[]>('listCommEvents', {}, () => req<CommEvent[]>('/api/comms/events')),
   connectTelegram: (token: string) => call<{ username: string }>('connectTelegram', { token }, () => req<{ username: string }>('/api/comms/telegram/connect', { method: 'POST', body: JSON.stringify({ token }) })),
   disconnectTelegram: () => call<{ ok: boolean }>('disconnectTelegram', {}, () => req<{ ok: boolean }>('/api/comms/telegram/disconnect', { method: 'POST' })),
-  bindChat: (input: { chatId: string; name?: string; projectId?: string | null; permissions?: Partial<ChatPermissions> }) =>
+  bindChat: (input: { chatId: string; name?: string; provider?: CommsProvider; projectId?: string | null; sessionId?: string | null; permissions?: Partial<ChatPermissions> }) =>
     call<ChatBinding>('bindChat', { ...input }, () => req<ChatBinding>('/api/comms/bind', { method: 'POST', body: JSON.stringify(input) })),
   unbindChat: (chatId: string) => call<{ ok: boolean }>('unbindChat', { chatId }, () => req<{ ok: boolean }>('/api/comms/unbind', { method: 'POST', body: JSON.stringify({ chatId }) })),
   setChatPermissions: (chatId: string, permissions: Partial<ChatPermissions>) =>
     call<ChatBinding>('setChatPermissions', { chatId, permissions }, () => req<ChatBinding>('/api/comms/permissions', { method: 'POST', body: JSON.stringify({ chatId, permissions }) })),
+
+  // Comms (WhatsApp — desktop owns the Baileys socket; management is desktop-only)
+  whatsappStatus: () => call<WhatsAppState>('whatsappStatus', {}, () => Promise.resolve({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [] } as WhatsAppState)),
+  listWaChats: () => call<WaChatSummary[]>('listWaChats', {}, () => Promise.resolve([] as WaChatSummary[])),
+  /** Begin linking the operator's number. QR by default, or a pairing code if a phone is given. */
+  whatsappLink: (phone?: string) => call<WhatsAppLink>('whatsappLink', { phone }, () => Promise.reject(new ApiError(403, 'Linking WhatsApp is only available in the desktop app'))),
+  /** The current QR data-URL while a link is pending (refreshes as the QR rotates). */
+  whatsappQr: () => call<{ dataUrl: string | null }>('whatsappQr', {}, () => Promise.resolve({ dataUrl: null })),
+  disconnectWhatsApp: () => call<{ ok: boolean }>('disconnectWhatsApp', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  unlinkWhatsApp: () => call<{ ok: boolean }>('unlinkWhatsApp', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Approve sending summaries to your own number (one-time gate); flushes any held summary. */
+  approveWhatsappSend: () => call<WhatsAppState>('approveWhatsappSend', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Allow/disallow the in-app agent messaging contacts other than your own number (off by default). */
+  setWhatsappAgentSend: (on: boolean) => call<WhatsAppState>('setWhatsappAgentSend', { on }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Set the personal number (digits) where summaries + agent confirmations are sent; '' clears it. */
+  setWhatsappRecipient: (number: string) => call<WhatsAppState>('setWhatsappRecipient', { number }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+
+  // WhatsApp workspace — full chat list + messages + control. Desktop-only: these
+  // carry personal message content and send on your number, so the relay blocks them.
+  waListChats: () => call<WaChat[]>('waListChats', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waGetMessages: (chatId: string, opts: { limit?: number; before?: number } = {}) =>
+    call<WaMessage[]>('waGetMessages', { chatId, ...opts }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waChatInfo: (chatId: string) => call<WaChat | null>('waChatInfo', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waSendText: (chatId: string, text: string) => call<{ ok: boolean }>('waSendText', { chatId, text }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waSendMedia: (chatId: string, media: { path?: string; dataB64?: string; kind: string; mimetype?: string; fileName?: string; caption?: string }) =>
+    call<{ ok: boolean }>('waSendMedia', { chatId, ...media }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waReact: (chatId: string, msgId: string, emoji: string) => call<{ ok: boolean }>('waReact', { chatId, msgId, emoji }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waMarkRead: (chatId: string) => call<{ ok: boolean }>('waMarkRead', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waSetTyping: (chatId: string, on: boolean) => call<{ ok: boolean }>('waSetTyping', { chatId, on }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waFetchAvatar: (chatId: string) => call<{ url: string | null }>('waFetchAvatar', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Download a media message's full bytes on demand → a data-URL the UI renders directly. */
+  waDownloadMedia: (chatId: string, msgId: string) => call<WaMediaData | null>('waDownloadMedia', { chatId, msgId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+
+  // Per-project WhatsApp chat assignment (desktop-only). Assigning a chat tracks it
+  // for the project: incoming messages route here and the agent prefers it.
+  listProjectWaChats: (projectId: string) => call<string[]>('listProjectWaChats', { projectId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  addProjectWaChat: (projectId: string, chatId: string) => call<string[]>('addProjectWaChat', { projectId, chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  removeProjectWaChat: (projectId: string, chatId: string) => call<string[]>('removeProjectWaChat', { projectId, chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
 
   /** Native import picker — desktop only; resolves the imported asset or null. */
   importAsset: async (projectId: string | null): Promise<Asset | null> => {
@@ -849,7 +985,7 @@ export const api = {
 
   // Schedules
   listSchedules: () => call<Schedule[]>('listSchedules', {}, () => req<Schedule[]>('/api/schedules')),
-  createSchedule: (input: { title: string; projectId?: string; time?: string; cadence?: string }) =>
+  createSchedule: (input: { title: string; projectId?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; prompt?: string; sessionId?: string; effort?: Effort; browser?: boolean }) =>
     call<Schedule>('createSchedule', { ...input }, () =>
       req<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(input) })),
   // Wait-&-check: poke a chat with a one-shot follow-up after delayMs.
@@ -873,6 +1009,9 @@ export const api = {
   toggleSchedule: (id: string, enabled: boolean) =>
     call<{ ok: boolean }>('toggleSchedule', { id, enabled }, () =>
       req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) })),
+  updateSchedule: (id: string, patch: { title?: string; prompt?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; enabled?: boolean; effort?: Effort; browser?: boolean; sessionId?: string; projectId?: string }) =>
+    call<Schedule>('updateSchedule', { id, ...patch }, () =>
+      req<Schedule>(`/api/schedules/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) })),
   deleteSchedule: (id: string) =>
     call<{ ok: boolean }>('deleteSchedule', { id }, () => req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 
@@ -1027,9 +1166,15 @@ export const api = {
     call<Roles>('setRoles', { ...patch }, () =>
       req<Roles>('/api/roles', { method: 'POST', body: JSON.stringify(patch) })),
 
-  // Pairing (desktop-only — the code remotes must enter)
+  // Pairing + device management (desktop-only)
   getPairing: () =>
     call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
+  /** Disconnect one remote device — closes its live streams and forces it to re-pair. */
+  kickDevice: (deviceId: string) =>
+    call<{ ok: boolean }>('kickDevice', { deviceId }, () => Promise.reject(new ApiError(403, 'Only the Mac can disconnect devices'))),
+  /** Regenerate the pairing code — unpairs every device. Returns the new code. */
+  regeneratePairingCode: () =>
+    call<{ token: string }>('regeneratePairingCode', {}, () => Promise.reject(new ApiError(403, 'Only the Mac can regenerate the code'))),
 
   /** Auto-update — desktop only; `undefined` in web/phone remotes (updates are
       about this Mac's own binary, so they're never exposed over the relay). */
@@ -1045,10 +1190,10 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: DevicePresence) => void; onGithubDevice?: (d: GithubDevice) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
-        if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as DevicePresence);
+        if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as RemoteDevice[]);
         if (name === 'engine-download' && handlers.onEngineDownload) handlers.onEngineDownload(data as EngineDownloadProgress);
         if (name === 'bg' && handlers.onBg) handlers.onBg(data as BgTask);
         if (name === 'job' && handlers.onJob) handlers.onJob(data as Job);
@@ -1064,10 +1209,14 @@ export const api = {
         if (name === 'git-status' && handlers.onGitStatus) handlers.onGitStatus(data as SessionGitStatus);
         if (name === 'schedule' && handlers.onSchedule) handlers.onSchedule(data as Schedule);
         if (name === 'github-device' && handlers.onGithubDevice) handlers.onGithubDevice(data as GithubDevice);
+        if (name === 'wa-message' && handlers.onWaMessage) handlers.onWaMessage(data as WaMessageEvent);
+        if (name === 'wa-chats' && handlers.onWaChats) handlers.onWaChats();
+        if (name === 'wa-message-update' && handlers.onWaMessageUpdate) handlers.onWaMessageUpdate(data as { chatId: string });
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
-    const es = new EventSource(API_BASE + '/api/stream' + (remoteToken ? `?token=${encodeURIComponent(remoteToken)}` : ''));
+    const sseQs = qp({ token: remoteToken || undefined, did: ensureDeviceId() || undefined, device: deviceLabel() });
+    const es = new EventSource(API_BASE + '/api/stream' + (sseQs ? `?${sseQs}` : ''));
     if (handlers.onBg) es.addEventListener('bg', (e: MessageEvent) => { try { handlers.onBg!(JSON.parse(e.data) as BgTask); } catch { /* ignore */ } });
     if (handlers.onJob) es.addEventListener('job', (e: MessageEvent) => { try { handlers.onJob!(JSON.parse(e.data) as Job); } catch { /* ignore */ } });
     if (handlers.onApproval) es.addEventListener('approval', (e: MessageEvent) => { try { handlers.onApproval!(JSON.parse(e.data) as Approval); } catch { /* ignore */ } });

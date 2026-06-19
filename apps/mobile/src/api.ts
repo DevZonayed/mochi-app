@@ -87,6 +87,8 @@ export interface AppSettings {
   rescanCadence: 'daily' | 'weekly' | 'onchange';
   favoriteModels?: string[];
   feedbackRepo?: string;
+  /** Opt-in: phone tries a direct WebRTC channel to the Mac (mirrors desktop). */
+  p2pEnabled?: boolean;
 }
 
 export type AssetKind = 'image' | 'video' | 'audio' | 'voiceover' | 'other';
@@ -101,6 +103,8 @@ export interface Schedule {
   nextRun: number | null; lastRun?: number | null; createdAt: number;
   /** One-shot queued message: deliver `prompt` into `sessionId` at `fireAt`. */
   fireAt?: number; sessionId?: string; prompt?: string;
+  /** Recurring: interval cadence (every N min) and catch-up for a missed daily slot. */
+  everyMinutes?: number; catchUp?: boolean; lastFireLate?: boolean;
 }
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
@@ -122,7 +126,11 @@ import { Platform } from 'react-native';
 
 /** A human label for this device, sent so the Mac can show "iPhone connected". */
 export const DEVICE_NAME = Platform.OS === 'ios' ? 'iPhone' : Platform.OS === 'android' ? 'Android phone' : 'Web remote';
-import { getStr, setStr, PAIR_TOKEN } from './storage';
+import { getStr, setStr, PAIR_TOKEN, DEVICE_ID } from './storage';
+import { gotoRepair } from './navRef';
+import { buildIceServers } from '@maestro/realtime';
+import { createP2PLink } from './p2p/link';
+import type { Signal } from './p2p/transport';
 
 /* Pairing token — the relay refuses /api/* without the code shown in the
    Maestro desktop app (Settings → Devices). Stored locally on this phone. */
@@ -131,9 +139,30 @@ export function getPairToken(): string { return pairToken; }
 export function setPairToken(token: string): void {
   pairToken = token.trim();
   setStr(PAIR_TOKEN, pairToken);
+  freshDeviceId(); // (re-)pair → new identity so a prior kick (old id revoked) doesn't carry over
 }
 /** Re-read the token from storage after async hydration (see storage.hydrate). */
 export function reloadPairToken(): void { pairToken = getStr(PAIR_TOKEN); }
+
+/* Per-device identity — a stable id lets the Mac list + disconnect THIS phone. */
+function mintDeviceId(): string {
+  return `dev-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+}
+export function getDeviceId(): string {
+  let id = getStr(DEVICE_ID);
+  if (!id) { id = mintDeviceId(); setStr(DEVICE_ID, id); }
+  return id;
+}
+function freshDeviceId(): void { setStr(DEVICE_ID, mintDeviceId()); }
+
+/* Re-pair gate: when the relay rejects our token (this device was kicked, or the
+   code was regenerated), drop the token and bounce to Onboarding so the user can
+   reconnect — instead of failing silently. Suppressed around verifyPairing's probe. */
+let authRedirectEnabled = true;
+function handleUnauthorized(): void {
+  setPairToken(''); // clears token + mints a fresh device id for the next pair
+  gotoRepair();
+}
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -202,6 +231,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
         ...(hasBody ? { 'content-type': 'application/json' } : {}),
         ...(pairToken ? { authorization: `Bearer ${pairToken}` } : {}),
         'x-maestro-device': DEVICE_NAME,
+        'x-maestro-device-id': getDeviceId(),
         ...(init?.headers ?? {}),
       },
     });
@@ -213,6 +243,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
       } catch {
         /* non-JSON error body */
       }
+      // Our token/device was rejected (kicked, or the code was regenerated) → drop
+      // it and bounce to the enter-code screen so the user can reconnect.
+      if (res.status === 401 && authRedirectEnabled) handleUnauthorized();
       throw new ApiError(res.status, detail);
     }
     if (intent) recordOutbox(intent, 'applied');
@@ -286,9 +319,12 @@ export const api = {
 
   listSchedules: () => req<Schedule[]>('/api/schedules'),
   toggleSchedule: (id: string, enabled: boolean) => req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) }),
-  /** Create a schedule. With fireAt+sessionId+prompt it's a one-shot queued message. */
-  createSchedule: (input: { title: string; projectId?: string | null; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string }) =>
+  /** Create a schedule. With fireAt+sessionId+prompt it's a one-shot queued message;
+      with everyMinutes or time+cadence it's a recurring schedule. */
+  createSchedule: (input: { title: string; projectId?: string | null; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; everyMinutes?: number; catchUp?: boolean }) =>
     req<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(input) }),
+  updateSchedule: (id: string, patch: { title?: string; prompt?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; enabled?: boolean; sessionId?: string; projectId?: string }) =>
+    req<Schedule>(`/api/schedules/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   deleteSchedule: (id: string) => req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/delete`, { method: 'POST' }),
 
   listSkills: () => req<Skill[]>('/api/skills'),
@@ -301,26 +337,30 @@ export const api = {
   /** Operator defaults, stored on the Mac (effort/engine the new-job composer inherits). */
   getSettings: () => req<AppSettings | null>('/api/settings'),
   setSettings: (patch: Partial<AppSettings>) => req<AppSettings>('/api/settings', { method: 'POST', body: JSON.stringify(patch) }),
+  turnCredentials: () => req<{ host: string | null; username: string | null; credential: string | null; ttl: number }>('/api/turn-credentials'),
 
   /** Send feedback from this phone — stored on the Mac (source: 'phone'). */
   submitFeedback: (input: { category: 'bug' | 'idea' | 'other'; message: string }) =>
     req<{ id: string }>('/api/feedback', { method: 'POST', body: JSON.stringify({ ...input, source: 'phone' }) }),
 
-  /** Register this device's Expo push token so the relay can push job/approval
-      alerts to the phone even when the app is closed. Best-effort. */
-  registerPush: (token: string) =>
-    req<{ ok: boolean }>('/api/push/register', { method: 'POST', body: JSON.stringify({ token, device: DEVICE_NAME }) }),
+  /** Register this phone's Expo push token so the relay can alert a CLOSED app. */
+  registerPush: (token: string) => req<{ ok: boolean; devices: number }>('/api/push/register', { method: 'POST', body: JSON.stringify({ token }) }),
+  /** Drop this phone's push token (called on unpair). */
+  unregisterPush: (token: string) => req<{ ok: boolean; devices: number }>('/api/push/unregister', { method: 'POST', body: JSON.stringify({ token }) }),
 
   /** Verify the current pair token against the relay (a read-only auth probe).
      'ok' = token works · 'invalid' = wrong code (401) · 'mac-offline' = no Mac
      reachable to validate against (503) · 'unreachable' = network/relay down. */
   verifyPairing: async (): Promise<'ok' | 'invalid' | 'mac-offline' | 'unreachable'> => {
+    authRedirectEnabled = false; // this probe handles 401 itself (don't bounce to Onboarding)
     try {
       await req('/api/engine-status');
       return 'ok';
     } catch (e) {
       if (e instanceof ApiError) return e.status === 401 ? 'invalid' : e.status === 503 ? 'mac-offline' : 'invalid';
       return 'unreachable';
+    } finally {
+      authRedirectEnabled = true;
     }
   },
 
@@ -344,31 +384,83 @@ export const api = {
 /** Live host events the relay fans out over SSE (the same names the Mac emits). */
 export type LiveEventName =
   | 'job' | 'session' | 'approval' | 'asset' | 'comms' | 'briefs'
-  | 'schedule' | 'git-status' | 'extension' | 'host' | 'hello';
+  | 'schedule' | 'schedule-late' | 'git-status' | 'extension' | 'host' | 'hello';
+
+/* ── Connection path ──────────────────────────────────────────────────────
+   Which transport the live stream is on RIGHT NOW: 'p2p' (direct WebRTC) once the
+   channel is open, else 'relay'. Subscribable so a UI pill can reflect it. */
+let connPath: 'p2p' | 'relay' = 'relay';
+const connSubs = new Set<() => void>();
+export function getConnPath(): 'p2p' | 'relay' { return connPath; }
+export function subscribeConnPath(cb: () => void): () => void { connSubs.add(cb); return () => { connSubs.delete(cb); }; }
+function setConnPath(p: 'p2p' | 'relay'): void {
+  if (connPath === p) return;
+  connPath = p;
+  for (const cb of connSubs) { try { cb(); } catch { /* ignore */ } }
+}
+
+/** Send WebRTC signaling to the Mac. The relay tags it with this device's id and
+    hands it to the host; the Mac's replies come back as SSE `signal` frames. Not a
+    tracked mutation (no outbox noise). */
+export async function postSignal(signal: unknown): Promise<void> {
+  await req('/api/signal', { method: 'POST', body: JSON.stringify({ signal }) });
+}
 
 /** Open the relay's SSE stream (real-time, no polling) and invoke `onEvent(name,
     data)` for each host event. Returns a disposer. react-native-sse is an XHR-based
     EventSource that works in Expo Go (RN has no native EventSource) and reconnects
-    automatically. The pairing token rides as a Bearer header. */
+    automatically. The pairing token rides as a Bearer header.
+
+    When the Mac's `p2pEnabled` flag is on, a direct WebRTC channel is attempted;
+    once it's open, host events arrive over P2P and the duplicate SSE app-events are
+    suppressed (commands stay on REST). The link is native-free until started, so
+    Expo Go / web simply keep using SSE. */
 export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => void): () => void {
-  const NAMES: LiveEventName[] = ['job', 'session', 'approval', 'asset', 'comms', 'briefs', 'schedule', 'git-status', 'extension', 'host', 'hello'];
-  const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME), {
+  const NAMES: LiveEventName[] = ['job', 'session', 'approval', 'asset', 'comms', 'briefs', 'schedule', 'schedule-late', 'git-status', 'extension', 'host', 'hello'];
+
+  const link = createP2PLink({
+    postSignal: (s) => { void postSignal(s); },
+    fetchIce: async () => {
+      try {
+        const t = await api.turnCredentials();
+        return buildIceServers(t.host && t.username && t.credential ? { host: t.host, username: t.username, credential: t.credential } : undefined);
+      } catch {
+        return buildIceServers();
+      }
+    },
+    onEvent: (name, data) => onEvent(name as LiveEventName, data),
+    onActiveChange: (active) => setConnPath(active ? 'p2p' : 'relay'),
+  });
+  // Only attempt P2P if the Mac enabled it; otherwise stay purely on SSE.
+  void api.getSettings().then((s) => { if (s?.p2pEnabled) link.start(); }).catch(() => { /* stay on SSE */ });
+
+  const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME) + '&did=' + encodeURIComponent(getDeviceId()), {
     headers: pairToken ? { Authorization: `Bearer ${pairToken}` } : undefined,
     // Keep the long-lived stream open; reconnect a few seconds after any drop.
     pollingInterval: 4000,
   });
+
+  // Signaling rides the SSE stream as a `signal` frame → feed the answerer.
+  const sigFn = (e: { type: string; data?: string | null }) => {
+    try { link.onRemoteSignal((e.data ? JSON.parse(e.data) : {}) as Signal); } catch { /* non-JSON */ }
+  };
+  es.addEventListener('signal' as 'message', sigFn as (e: unknown) => void);
+
   const handlers = NAMES.map((name) => {
     const fn = (e: { type: string; data?: string | null }) => {
       let data: unknown = null;
       try { data = e.data ? JSON.parse(e.data) : null; } catch { /* non-JSON frame */ }
-      onEvent(name, data);
+      if (!link.isActive()) onEvent(name, data); // P2P up → events arrive over the channel instead
     };
     // react-native-sse dispatches `event: <name>` frames to listeners by name.
     es.addEventListener(name as 'message', fn as (e: unknown) => void);
     return { name, fn };
   });
   return () => {
+    link.stop();
+    setConnPath('relay');
     try {
+      es.removeEventListener('signal' as 'message', sigFn as (e: unknown) => void);
       for (const h of handlers) es.removeEventListener(h.name as 'message', h.fn as (e: unknown) => void);
       es.close();
     } catch { /* already closed */ }

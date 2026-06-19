@@ -25,6 +25,9 @@ import { ensureSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
+import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
+import { waSendAllowed } from './whatsapp.js';
+import type { CronRunner } from './cron.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import type { Providers } from './providers.js';
 import {
@@ -84,6 +87,16 @@ const BROWSER_DIRECTIVE =
   `under Settings → Browser extension). Then browser_navigate to the relevant site and read it with ` +
   `browser_snapshot / browser_read before acting. Accomplish the task on the live page; only fall back to ` +
   `WebSearch if no browser is connected.`;
+
+const WHATSAPP_DIRECTIVE =
+  `\n\n---\n\n[WhatsApp connected] This Mac is linked to the user's WhatsApp. When the user asks anything ` +
+  `about WhatsApp — to read their chats/messages, see who messaged them, or SEND a message (e.g. "message ` +
+  `my number", "send me a confirmation/update", "reply to X", "text the team") — use the ` +
+  `mcp__maestro__wa_list_chats / wa_get_messages / wa_send_message / wa_mark_read tools. Do NOT claim ` +
+  `WhatsApp is unavailable. Messaging the user's OWN number always works (their linked account OR the ` +
+  `personal number they set in Comms — for "message my number"/"send me a confirmation", call wa_send_message ` +
+  `with no chatId/phone and it goes to that personal number); messaging other contacts is blocked unless they ` +
+  `enabled it (the send tool will tell you). Chats assigned to THIS project are marked [project] — prefer them.`;
 
 const DESIGN_DIRECTIVE =
   `\n\n---\n\n[Design mode] You are a senior product designer working in a live design ` +
@@ -446,6 +459,22 @@ interface BrowserCtx {
   call: (type: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
 }
 
+/* WhatsApp capability for the agent — backed by THIS Mac's Baileys socket + store.
+   The agent can read the user's chats/messages and send (its OWN number freely;
+   other contacts gated behind an opt-in). Off in plan mode / when not linked. */
+interface CommsCtx {
+  ownJid: () => string | null;
+  notifyJid: () => string | null;
+  canSendOthers: () => boolean;
+  projectChatIds: () => string[];
+  listChats: () => Array<{ chatId: string; name: string; kind: string; unreadCount: number; lastMessageAt: number; lastMessageText: string }>;
+  getMessages: (chatId: string, limit: number) => Array<{ fromMe: boolean; senderName: string; text: string; ts: number; kind: string }>;
+  sendText: (chatId: string, text: string) => Promise<boolean>;
+  markRead: (chatId: string) => Promise<void>;
+}
+/** The subset of WhatsAppClient the engine drives for the agent (injected via setComms). */
+export interface WaAgentClient { sendText(chatId: string, text: string): Promise<boolean>; markRead(chatId: string): Promise<void> }
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -456,6 +485,8 @@ async function runClaude(
   bgCtx?: BgCtx,
   browserCtx?: BrowserCtx,
   customMcp?: { servers: Record<string, ClaudeMcpConfig>; allowedTools: string[] },
+  scheduleCtx?: ScheduleCtx,
+  commsCtx?: CommsCtx,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -489,7 +520,7 @@ async function runClaude(
     ].filter(Boolean).join(', ');
     return `- ${s.id} — ${s.name}: ${s.description || '(no description)'}${bits ? ` [${bits}]` : ''}`;
   };
-  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx) && !plan)
+  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || commsCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
@@ -640,6 +671,103 @@ async function runClaude(
               { ref: z.string().describe('CSS selector for the input.'), text: z.string().describe('The text to type.'), submit: z.boolean().optional().describe('Press Enter after typing (e.g. to run a search).') },
               wrap(async (a: { ref: string; text: string; submit?: boolean }) => { await browserCtx.call('type', { ref: a.ref, text: a.text, submit: !!a.submit }); return txt(`Typed into ${a.ref}${a.submit ? ' and submitted' : ''}. Use browser_snapshot/browser_read to see the result.`); })),
           ] : []),
+          ...(scheduleCtx ? [
+            tool('schedule_list',
+              'List recurring/scheduled tasks. Use to see what is already scheduled before creating or editing. Optionally filter by project.',
+              { projectId: z.string().optional().describe('Only schedules for this project id.') },
+              wrap(async (a: { projectId?: string }) => {
+                const rows = scheduleCtx.list({ projectId: a.projectId });
+                if (!rows.length) return txt('No schedules yet.');
+                return txt(rows.map(r => `- ${r.id} — "${r.title}" [${r.enabled ? 'on' : 'off'}] ${r.recurrence}${r.projectId ? ` · project ${r.projectId}` : ''}${r.sessionId ? ` · session ${r.sessionId}` : ''}${r.lastFireLate ? ' · last run was LATE' : ''}\n    prompt: ${r.prompt.slice(0, 160)}`).join('\n'));
+              })),
+            tool('schedule_create',
+              'Create a recurring or interval schedule that fires a PROMPT into a project/session as a real job (it runs with that project\'s memory + tools). Use for any "every N hours / every day at TIME / each morning" automation. For "every 2 hours" pass everyMinutes=120; for "every day at 9am" pass time="09:00", cadence="daily". Set catchUp=true so a missed run (Mac asleep) still fires later that day. Discover targets with projects_list/sessions_list first.',
+              { projectId: z.string().optional().describe('Project to run in (use projects_list).'),
+                sessionId: z.string().optional().describe('Chat session to run in (use sessions_list). Inherits its engine/model + memory.'),
+                title: z.string().describe('Short label, e.g. "WhatsApp morning summary".'),
+                prompt: z.string().describe('What the run should DO, e.g. "Pull ~50 WhatsApp messages via the comms MCP, summarize, and send to my private chat."'),
+                everyMinutes: z.number().optional().describe('Interval cadence in minutes (120 = every 2h). Omit for a clock-time schedule.'),
+                time: z.string().optional().describe('HH:MM 24h clock time for daily/weekly cadence.'),
+                cadence: z.string().optional().describe('"daily" | "weekdays" | "weekend" | a day list like "Mon, Wed, Fri". Default daily.'),
+                effort: z.enum(['fast', 'balanced', 'deep', 'max']).optional(),
+                browser: z.boolean().optional().describe('Run with the real-Chrome browser tools enabled.'),
+                catchUp: z.boolean().optional().describe('If a clock-time run is missed, fire it once later the same day.') },
+              wrap(async (a: { projectId?: string; sessionId?: string; title: string; prompt: string; everyMinutes?: number; time?: string; cadence?: string; effort?: Effort; browser?: boolean; catchUp?: boolean }) => {
+                const rec = scheduleCtx.create({ projectId: a.projectId ?? null, sessionId: a.sessionId, title: a.title, prompt: a.prompt,
+                  recurrence: { everyMinutes: a.everyMinutes, time: a.time, cadence: a.cadence }, effort: a.effort, browser: a.browser, catchUp: a.catchUp });
+                return txt(`Created schedule ${rec.id} "${rec.title}". It will fire its prompt as a job on schedule. Use schedule_run_now("${rec.id}") to test it immediately.`);
+              })),
+            tool('schedule_update',
+              'Edit an existing schedule (title, prompt, timing, target, on/off). Pass only the fields to change. Get ids from schedule_list.',
+              { id: z.string(), title: z.string().optional(), prompt: z.string().optional(),
+                everyMinutes: z.number().optional(), time: z.string().optional(), cadence: z.string().optional(),
+                effort: z.enum(['fast', 'balanced', 'deep', 'max']).optional(), browser: z.boolean().optional(),
+                catchUp: z.boolean().optional(), enabled: z.boolean().optional(),
+                sessionId: z.string().optional(), projectId: z.string().optional() },
+              wrap(async (a: { id: string } & Record<string, unknown>) => {
+                const { id, ...patch } = a;
+                const rec = scheduleCtx.update(id, patch as Parameters<ScheduleCtx['update']>[1]);
+                return txt(`Updated schedule ${rec.id} "${rec.title}".`);
+              })),
+            tool('schedule_delete', 'Delete a schedule permanently. Get the id from schedule_list.',
+              { id: z.string() },
+              wrap(async (a: { id: string }) => { scheduleCtx.del(a.id); return txt(`Deleted schedule ${a.id}.`); })),
+            tool('schedule_toggle', 'Enable or disable a schedule without deleting it.',
+              { id: z.string(), enabled: z.boolean() },
+              wrap(async (a: { id: string; enabled: boolean }) => { scheduleCtx.toggle(a.id, a.enabled); return txt(`Schedule ${a.id} is now ${a.enabled ? 'enabled' : 'disabled'}.`); })),
+            tool('schedule_run_now', 'Fire a schedule immediately (to test it), in addition to its normal timing.',
+              { id: z.string() },
+              wrap(async (a: { id: string }) => txt(scheduleCtx.runNow(a.id) ? `Fired schedule ${a.id} now — check the session for the new job.` : `No schedule ${a.id}.`))),
+            tool('projects_list', 'List the user\'s projects (id, name, whether it has saved memory, session count). Use to pick where a schedule should run.',
+              {},
+              wrap(async () => {
+                const rows = scheduleCtx.listProjects();
+                if (!rows.length) return txt('No projects.');
+                return txt(rows.map(p => `- ${p.id} — ${p.name}${p.hasMemory ? ' [has memory]' : ''} · ${p.sessionCount} session(s)`).join('\n'));
+              })),
+            tool('sessions_list', 'List chat sessions in a project (id, title). Use to target a schedule at a specific chat.',
+              { projectId: z.string() },
+              wrap(async (a: { projectId: string }) => {
+                const rows = scheduleCtx.listSessions(a.projectId);
+                if (!rows.length) return txt('No sessions in that project.');
+                return txt(rows.map(s => `- ${s.id} — ${s.title}`).join('\n'));
+              })),
+          ] : []),
+          ...(commsCtx ? [
+            tool('wa_list_chats',
+              'List the user\'s WhatsApp chats (DMs, groups, channels) on this Mac, most-recent first. Use when the user asks about their WhatsApp — who messaged, unread chats, or to find a chat to read/reply to. Chats assigned to THIS project are marked [project].',
+              { query: z.string().optional().describe('Filter by name / last-message substring.'), limit: z.number().optional().describe('Max chats (default 30).') },
+              wrap(async (a: { query?: string; limit?: number }) => {
+                const assigned = new Set(commsCtx.projectChatIds());
+                let chats = commsCtx.listChats();
+                if (a.query) { const q = a.query.toLowerCase(); chats = chats.filter(c => (c.name + ' ' + c.lastMessageText).toLowerCase().includes(q)); }
+                chats = chats.slice(0, a.limit ?? 30);
+                if (!chats.length) return txt('No WhatsApp chats found yet (they fill in as WhatsApp syncs).');
+                return txt(chats.map(c => `- ${c.chatId} — ${c.name} [${c.kind}]${assigned.has(c.chatId) ? ' [project]' : ''}${c.unreadCount ? ` · ${c.unreadCount} unread` : ''} · last: ${(c.lastMessageText || '').slice(0, 70)}`).join('\n'));
+              })),
+            tool('wa_get_messages',
+              'Read recent messages from a WhatsApp chat. Pass the chatId from wa_list_chats.',
+              { chatId: z.string(), limit: z.number().optional().describe('How many recent messages (default 30).') },
+              wrap(async (a: { chatId: string; limit?: number }) => {
+                const msgs = commsCtx.getMessages(a.chatId, a.limit ?? 30);
+                if (!msgs.length) return txt('No messages captured for that chat yet.');
+                return txt(msgs.map(m => `[${new Date(m.ts).toISOString().slice(11, 16)}] ${m.fromMe ? 'You' : m.senderName}: ${m.kind !== 'text' ? `[${m.kind}] ` : ''}${m.text}`).join('\n'));
+              })),
+            tool('wa_send_message',
+              'Send a WhatsApp message. Give EITHER chatId (from wa_list_chats) OR phone (digits incl. country code, no +). Messaging the user\'s OWN number always works; other contacts require the user to have enabled "agent can message contacts" — if blocked, relay the tool\'s note to the user.',
+              { chatId: z.string().optional(), phone: z.string().optional().describe('Recipient phone in digits, e.g. "15551234567".'), text: z.string().describe('The message to send.') },
+              wrap(async (a: { chatId?: string; phone?: string; text: string }) => {
+                // No chatId/phone → send to the user themselves (their personal notify number, else the linked account).
+                const target = a.chatId || (a.phone ? `${a.phone.replace(/[^0-9]/g, '')}@s.whatsapp.net` : '') || commsCtx.notifyJid() || commsCtx.ownJid() || '';
+                if (!target) return txt('No recipient: pass a chatId (from wa_list_chats) or a phone number, or have the user set their personal number in Comms.');
+                if (!waSendAllowed(target, [commsCtx.ownJid(), commsCtx.notifyJid()], commsCtx.canSendOthers())) return txt('Blocked: messaging contacts other than your own number(s) is OFF by default (a safety gate). The user can turn on "Let the agent message contacts" in Comms. Message NOT sent.');
+                const ok = await commsCtx.sendText(target, a.text);
+                return txt(ok ? `Sent to ${target}.` : `Could not send to ${target} — is WhatsApp still linked?`);
+              })),
+            tool('wa_mark_read', 'Mark a WhatsApp chat as read (clears its unread badge).',
+              { chatId: z.string() },
+              wrap(async (a: { chatId: string }) => { await commsCtx.markRead(a.chatId); return txt(`Marked ${a.chatId} read.`); })),
+          ] : []),
         ],
       })
     : null;
@@ -648,6 +776,8 @@ async function runClaude(
     ...(skillsCtx ? ['search_skills', 'get_skill', 'download_skill', 'add_skill_to_project', 'list_project_skills', 'remove_project_skill'] : []),
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
     ...(browserCtx ? ['browser_status', 'browser_navigate', 'browser_snapshot', 'browser_read', 'browser_links', 'browser_click', 'browser_type'] : []),
+    ...(scheduleCtx ? ['schedule_list', 'schedule_create', 'schedule_update', 'schedule_delete', 'schedule_toggle', 'schedule_run_now', 'projects_list', 'sessions_list'] : []),
+    ...(commsCtx ? ['wa_list_chats', 'wa_get_messages', 'wa_send_message', 'wa_mark_read'] : []),
   ].map(n => `mcp__maestro__${n}`);
   // Merge the operator's custom MCP servers (Settings → MCP servers) alongside the
   // in-process `maestro` server. Each enabled server's tools are auto-allowed via a
@@ -1078,6 +1208,14 @@ export class LocalEngine {
      generate_image tool; publishing registers codex-produced PNGs as Assets. */
   private imageGen?: ImageGenFn;
   setImageGen(fn: ImageGenFn) { this.imageGen = fn; }
+  // The cron runner is created after the engine in main.ts; injected so the agent's
+  // schedule_* tools can manage + fire schedules through the same runner.
+  private cron?: CronRunner;
+  setCron(c: CronRunner) { this.cron = c; }
+  // The WhatsApp client (desktop-owned Baileys socket), injected from main.ts after
+  // it's built — backs the agent's wa_* tools (read the user's chats, send messages).
+  private comms?: WaAgentClient;
+  setComms(c: WaAgentClient) { this.comms = c; }
   /** The browser-extension control channel (ExtensionBridge), injected from main.ts.
       A getter (not the instance) so a late/missing bridge is harmless — browser tools
       simply report "no browser connected" until a Chrome profile pairs + activates. */
@@ -1816,15 +1954,33 @@ export class LocalEngine {
         profile: () => bridge.activeProfile(),
         call: (type, params, timeoutMs) => bridge.request(type, params ?? {}, timeoutMs),
       } : undefined;
+      // Schedule capability: let the agent inspect + manage recurring/scheduled
+      // tasks and discover projects/sessions to target. Off in plan mode.
+      const scheduleCtx: ScheduleCtx | undefined = (this.cron && !opts.plan) ? makeScheduleCtx(this.store, this.cron) : undefined;
+      // WhatsApp capability: when a number is linked, give the agent read/send tools
+      // backed by THIS Mac's socket + store, scoped to this project's assigned chats.
+      const commsCtx: CommsCtx | undefined = (this.comms && this.store.whatsappState().connected && !opts.plan) ? {
+        ownJid: () => this.store.whatsappState().jid,
+        notifyJid: () => this.store.whatsappState().notifyJid ?? null,
+        canSendOthers: () => !!this.store.whatsappState().agentSendToOthers,
+        projectChatIds: () => this.store.listProjectWaChats(job.projectId ?? ''),
+        listChats: () => this.store.waListChats().map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, unreadCount: c.unreadCount, lastMessageAt: c.lastMessageAt, lastMessageText: c.lastMessageText })),
+        getMessages: (chatId, limit) => this.store.waMessages(chatId, { limit }).map(m => ({ fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: m.kind })),
+        sendText: (chatId, text) => this.comms!.sendText(chatId, text),
+        markRead: (chatId) => this.comms!.markRead(chatId),
+      } : undefined;
       // Browser mode (composer toggle): the maestro MCP tools are deferred, so an
       // explicit directive ensures the agent loads + uses the real-Chrome tools.
       if (opts.browser && browserCtx) prompt += BROWSER_DIRECTIVE;
+      // WhatsApp linked → tell the agent it CAN read/send (the tools are deferred, so
+      // the directive ensures it reaches for them instead of saying it can't).
+      if (commsCtx) prompt += WHATSAPP_DIRECTIVE;
       // Per-engine custom-MCP config: Claude takes stdio + HTTP servers (env/headers
       // resolved by name from the host now); Codex takes stdio TOML fragments only.
       const claudeCustomMcp = buildClaudeCustomMcp(enabledMcpServers, process.env);
       const codexCustomFrags = buildCodexCustomMcp(enabledMcpServers, process.env).fragments;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp)
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, commsCtx)
         : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the

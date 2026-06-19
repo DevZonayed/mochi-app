@@ -43,4 +43,13 @@ contextBridge.exposeInMainWorld('maestro', {
     ipcRenderer.on('maestro:cmd-output', l);
     return () => ipcRenderer.removeListener('maestro:cmd-output', l);
   },
+  // Direct P2P (WebRTC): the renderer hosts the RTCPeerConnection, main stays the brain.
+  // renderer→main is fire-and-forget on :out; main→renderer pushes on :in.
+  sendP2P: (msg: unknown): void => ipcRenderer.send('maestro:p2p:out', msg),
+  onP2P: (cb: (msg: unknown) => void): (() => void) => {
+    const l = (_e: unknown, payload: unknown) => cb(payload);
+    ipcRenderer.on('maestro:p2p:in', l);
+    return () => ipcRenderer.removeListener('maestro:p2p:in', l);
+  },
+  p2pIce: (): Promise<unknown> => ipcRenderer.invoke('maestro:p2pIce'),
 });

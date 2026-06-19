@@ -9,6 +9,9 @@
       ],
       "@maestro/design-tokens/theme": [
         "../../packages/design-tokens/src/theme.ts"
+      ],
+      "@maestro/realtime": [
+        "../../packages/realtime/index.ts"
       ]
     }
   },

@@ -37,15 +37,8 @@
         }
       ],
       "expo-audio",
-      [
-        "expo-notifications",
-        {
-          "color": "#0a0b10",
-          "sounds": [
-            "./assets/alert.wav"
-          ]
-        }
-      ]
+      "@config-plugins/react-native-webrtc",
+      "expo-notifications"
     ],
     "extra": {
       "eas": {
