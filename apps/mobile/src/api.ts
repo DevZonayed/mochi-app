@@ -300,8 +300,15 @@ export const api = {
   /** Chat sessions inside a project (the desktop's project → sessions tree). */
   listSessions: (projectId?: string) => req<ChatSession[]>('/api/sessions' + qp({ projectId })),
   /** Send a chat turn. Omit sessionId to start a new session. The reply streams
-      in via live `job` events; refetch the session's jobs to render it. */
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; effort?: Effort; engine?: EngineId; modelKey?: string }) =>
+      in via live `job` events; refetch the session's jobs to render it.
+      Attachments piggy-back as `images[]` (vision input) and `files[]` (text
+      inlined into the prompt, binary saved on the Mac) — mirrors the desktop
+      composer's payload shape so the same Mac-side ingestor handles both. */
+  sendChat: (input: {
+    projectId: string; text: string; sessionId?: string; effort?: Effort; engine?: EngineId; modelKey?: string;
+    images?: { name?: string; mime: string; dataB64: string }[];
+    files?: { name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[];
+  }) =>
     req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) }),
   createJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
     req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) }),
