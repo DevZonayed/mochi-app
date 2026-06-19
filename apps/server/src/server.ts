@@ -20,23 +20,30 @@ import { registerRegistry } from './registry.js';
 import { DeviceRegistry } from './devices.js';
 import { turnConfigFromEnv } from './turn.js';
 
-interface Snapshot {
+/** A soft-deletion marker emitted by the Mac when an entity is removed. The
+    relay forwards these through /api/sync?since=<ts> so mobile clients learn
+    what to drop without diffing the whole list. */
+export interface Tombstone { kind: 'project' | 'session' | 'job' | 'asset' | 'approval'; id: string; ts: number }
+
+export interface Snapshot {
   workspace?: unknown;
   workspaces?: unknown[];
-  projects?: { id?: string }[];
-  jobs?: { id?: string; projectId?: string; sessionId?: string }[];
-  sessions?: { id?: string; projectId?: string }[];
-  approvals?: { id?: string; status?: string }[];
+  projects?: { id?: string; updatedAt?: number }[];
+  jobs?: { id?: string; projectId?: string; sessionId?: string; updatedAt?: number }[];
+  sessions?: { id?: string; projectId?: string; updatedAt?: number }[];
+  approvals?: { id?: string; status?: string; updatedAt?: number }[];
   schedules?: unknown[];
   skills?: unknown[];
   templates?: unknown[];
-  assets?: { id?: string; projectId?: string | null; status?: string }[];
+  assets?: { id?: string; projectId?: string | null; status?: string; updatedAt?: number }[];
   mediaRates?: unknown;
   publishDrafts?: unknown[];
   publishLedger?: unknown[];
   briefs?: unknown[];
   researchRuns?: unknown[];
-  events?: unknown[];
+  events?: { id?: string; ts?: number }[];
+  /** Soft-deletion markers, last ~1000. Drives the delta-sync `deleted` field. */
+  tombstones?: Tombstone[];
   chatBindings?: unknown[];
   pendingChats?: unknown[];
   commEvents?: unknown[];
@@ -78,8 +85,60 @@ const EMPTY_DASHBOARD = {
 
 const CMD_TIMEOUT_MS = 10 * 60 * 1000; // jobs run real models on the Mac — be generous
 
+/** Public response shape of GET /api/sync?since=<ts>. */
+export interface SyncDelta {
+  at: number;
+  host: { online: boolean };
+  changed: {
+    projects: Snapshot['projects'];
+    sessions: Snapshot['sessions'];
+    jobs: Snapshot['jobs'];
+    approvals: Snapshot['approvals'];
+    assets: Snapshot['assets'];
+    events: Snapshot['events'];
+  };
+  deleted: { projects: string[]; sessions: string[]; jobs: string[]; approvals: string[]; assets: string[] };
+}
+
+/** Pure filter behind /api/sync — split out so vitest can exercise the slicing
+    logic without booting the WebSocket host. `since=0` returns the entire
+    current snapshot (cold-start path). All entity arrays default to []. */
+export function buildSyncDelta(snap: Snapshot, since: number, hostOnline: boolean): SyncDelta {
+  const above = (u?: number) => (u ?? 0) > since;
+  const tombs = snap.tombstones ?? [];
+  const tombIds = (kind: Tombstone['kind']) =>
+    tombs.filter((t) => t.kind === kind && t.ts > since).map((t) => t.id);
+  return {
+    at: snap.at ?? Date.now(),
+    host: { online: hostOnline },
+    changed: {
+      projects:  (snap.projects  ?? []).filter((x) => above(x.updatedAt)),
+      sessions:  (snap.sessions  ?? []).filter((x) => above(x.updatedAt)),
+      jobs:      (snap.jobs      ?? []).filter((x) => above(x.updatedAt)),
+      approvals: (snap.approvals ?? []).filter((x) => above(x.updatedAt)),
+      assets:    (snap.assets    ?? []).filter((x) => above(x.updatedAt)),
+      events:    (snap.events    ?? []).filter((e) => above(e.ts)),
+    },
+    deleted: {
+      projects:  tombIds('project'),
+      sessions:  tombIds('session'),
+      jobs:      tombIds('job'),
+      approvals: tombIds('approval'),
+      assets:    tombIds('asset'),
+    },
+  };
+}
+
+// Mobile + desktop composers ship attachments as base64 JSON to /api/chat. The
+// Mac's ingestor caps each image/file at 16 MB raw → ~22 MB after base64; with
+// up to 8 attachments plus prompt text the worst-case payload is ~180 MB. Fastify
+// defaults to 1 MB and would reject anything bigger before we get a chance to
+// forward, so raise the body limit. Kept slightly above the theoretical max so a
+// legitimate full-cap payload still goes through without us being a bottleneck.
+const RELAY_BODY_LIMIT = 200 * 1024 * 1024;
+
 export function buildServer(): FastifyInstance {
-  const app = Fastify({ logger: true });
+  const app = Fastify({ logger: true, bodyLimit: RELAY_BODY_LIMIT });
   app.register(cors, { origin: true });
 
   // Tolerate empty JSON bodies on bodyless POSTs (approve/deny/toggle).
@@ -180,10 +239,20 @@ export function buildServer(): FastifyInstance {
     if (pushSeen.size > 1000) { const first = pushSeen.values().next().value; if (first) pushSeen.delete(first); }
     return true;
   }
-  async function sendExpoPush(title: string, body: string): Promise<void> {
+  /** Payload mirrored into Expo's `data` field so a notification tap can deep-link
+      the phone to the right session chat (or Approvals when no session applies).
+      Kept small — Expo caps push data at 4KB. */
+  type PushNavData = {
+    kind: 'job-done' | 'job-failed' | 'approval' | 'schedule-late';
+    projectId?: string;
+    sessionId?: string;
+    jobId?: string;
+    approvalId?: string;
+  };
+  async function sendExpoPush(title: string, body: string, data?: PushNavData): Promise<void> {
     const tokens = [...pushTokens.keys()];
     if (!tokens.length) return;
-    const messages = tokens.map((to) => ({ to, title, body, sound: 'default', priority: 'high', channelId: 'alerts' }));
+    const messages = tokens.map((to) => ({ to, title, body, sound: 'default', priority: 'high', channelId: 'alerts', ...(data ? { data } : {}) }));
     try {
       const res = await fetch('https://exp.host/--/api/v2/push/send', {
         method: 'POST',
@@ -200,19 +269,37 @@ export function buildServer(): FastifyInstance {
     } catch { /* push service unreachable — SSE still carries foreground alerts */ }
   }
   // Mirror the alert-worthy events to push, matching the phone's in-app LiveNotifier.
+  // Each push carries a `data` payload (projectId/sessionId/jobId) so the phone can
+  // deep-link the tap to the originating session chat (or Approvals as a fallback).
   function maybePush(name: string, data: unknown): void {
     if (!pushTokens.size) return;
     if (name === 'job') {
-      const j = data as { id?: string; status?: string; title?: string } | null;
+      const j = data as { id?: string; status?: string; title?: string; projectId?: string; sessionId?: string } | null;
       if (!j?.id) return;
-      if (j.status === 'done' && rememberPushKey(`${j.id}:done`)) void sendExpoPush('Conversation complete', j.title || 'A run finished on your Mac.');
-      else if (j.status === 'failed' && rememberPushKey(`${j.id}:failed`)) void sendExpoPush('Job failed', j.title || 'A run failed on your Mac.');
+      const nav = { projectId: j.projectId, sessionId: j.sessionId, jobId: j.id };
+      if (j.status === 'done' && rememberPushKey(`${j.id}:done`)) void sendExpoPush('Conversation complete', j.title || 'A run finished on your Mac.', { kind: 'job-done', ...nav });
+      else if (j.status === 'failed' && rememberPushKey(`${j.id}:failed`)) void sendExpoPush('Job failed', j.title || 'A run failed on your Mac.', { kind: 'job-failed', ...nav });
     } else if (name === 'approval') {
-      const a = data as { id?: string; status?: string; title?: string } | null;
-      if (a?.id && a.status === 'pending' && rememberPushKey(`appr:${a.id}`)) void sendExpoPush('Needs your attention', a.title || 'An approval is waiting.');
+      const a = data as { id?: string; status?: string; title?: string; projectId?: string | null; jobId?: string | null } | null;
+      if (a?.id && a.status === 'pending' && rememberPushKey(`appr:${a.id}`)) {
+        // Approval has projectId + jobId but no direct sessionId — look up the job in
+        // the mirrored Mac snapshot to recover sessionId so the tap lands on the chat.
+        const job = a.jobId ? (deck?.state?.jobs ?? []).find((x) => x.id === a.jobId) : undefined;
+        void sendExpoPush('Needs your attention', a.title || 'An approval is waiting.', {
+          kind: 'approval',
+          approvalId: a.id,
+          projectId: a.projectId ?? job?.projectId ?? undefined,
+          sessionId: job?.sessionId,
+          jobId: a.jobId ?? undefined,
+        });
+      }
     } else if (name === 'schedule-late') {
-      const s = data as { id?: string; title?: string; firedAt?: number } | null;
-      if (rememberPushKey(`late:${s?.id ?? ''}:${s?.firedAt ?? ''}`)) void sendExpoPush('Scheduled task ran late', s?.title ? `“${s.title}” caught up.` : 'A schedule caught up after a missed time.');
+      const s = data as { id?: string; title?: string; firedAt?: number; projectId?: string; sessionId?: string } | null;
+      if (rememberPushKey(`late:${s?.id ?? ''}:${s?.firedAt ?? ''}`)) void sendExpoPush(
+        'Scheduled task ran late',
+        s?.title ? `“${s.title}” caught up.` : 'A schedule caught up after a missed time.',
+        { kind: 'schedule-late', projectId: s?.projectId, sessionId: s?.sessionId },
+      );
     }
   }
 
@@ -341,6 +428,18 @@ export function buildServer(): FastifyInstance {
   app.get('/api/budget', async () => st()?.budget ?? EMPTY_DASHBOARD.budget);
   app.get('/api/costs', async () => st()?.costs ?? { today: 0, thisMonth: 0, projectedMonth: 0, byDay: [], byProject: [], byEngine: [], includedCodexRuns: 0, claudeRuns: 0 });
   app.get('/api/events', async () => st()?.events ?? []);
+  // ── Delta sync (mobile's primary read path) ────────────────────────
+  // GET /api/sync?since=<ts> — see `buildSyncDelta()` for the exact filter.
+  // Cold-start callers pass `since=0` for the full state. Stale callers whose
+  // `since` predates the oldest tombstone should drop their local store and
+  // re-sync (the Mac caps tombstones at ~1000 ≈ 1 week of churn).
+  app.get('/api/sync', async (_req, reply) => {
+    const sinceQ = (_req.query as { since?: string }).since;
+    const since = Number.isFinite(Number(sinceQ)) ? Math.max(0, Number(sinceQ)) : 0;
+    const s = st();
+    if (!s) return reply.code(503).send({ error: 'Your Mac is offline — open the Maestro desktop app' });
+    return buildSyncDelta(s, since, !!deck?.online);
+  });
   app.get('/api/settings', async () => st()?.settings ?? null);
   app.get('/api/engine-status', async () => st()?.engineStatus ?? { claude: { engine: 'claude', available: false, method: 'none', detail: 'Mac offline', reason: 'Desktop not connected.' }, codex: { engine: 'codex', available: false, method: 'none', detail: 'Mac offline', reason: 'Desktop not connected.' } });
   // ── Media Studio (assets mirror; generation forwards to the Mac's fal key) ──
@@ -502,6 +601,11 @@ export function buildServer(): FastifyInstance {
   });
 
   // ── SSE stream (host events relayed to web clients) ────────────────
+  // ?since=<ts> on connect — relay replays any events from the snapshot's
+  // event log with `ts > since` BEFORE going live. Lets a mobile client that
+  // backgrounded through a burst catch up without polling /api/sync first.
+  // Replay uses `event: replay` (vs the usual live `job`/`approval`/…) so
+  // consumers can optionally treat it as a one-shot catch-up batch.
   app.get('/api/stream', (req, reply) => {
     reply.hijack();
     const res = reply.raw;
@@ -511,7 +615,18 @@ export function buildServer(): FastifyInstance {
       Connection: 'keep-alive',
       'Access-Control-Allow-Origin': '*',
     });
-    res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, hostOnline: !!deck?.online })}\n\n`);
+    res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, hostOnline: !!deck?.online, at: st()?.at ?? Date.now() })}\n\n`);
+    // One-shot replay of missed events. The Mac caps its event log at ~200 so
+    // very stale clients may miss older alerts — they'll catch up on the next
+    // /api/sync?since=<ts> pull (which carries the full delta).
+    const sinceQ = (req.query as { since?: string }).since;
+    const since = Number.isFinite(Number(sinceQ)) ? Math.max(0, Number(sinceQ)) : 0;
+    if (since > 0) {
+      const evs = (st()?.events ?? []).filter((e) => (e.ts ?? 0) > since);
+      for (const e of evs) {
+        try { res.write(`event: replay\ndata: ${JSON.stringify(e)}\n\n`); } catch { /* closed */ }
+      }
+    }
     const deviceId = deviceIdOf(req);
     sseClients.add(res);
     devices.addStream(deviceId, deviceNameOf(req), res);

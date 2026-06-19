@@ -1,13 +1,12 @@
-import React, { useCallback, useState } from 'react';
-import { View, Text, Pressable, ScrollView, ActivityIndicator } from 'react-native';
+import React, { useCallback } from 'react';
+import { View, Text, Pressable, ScrollView, RefreshControl } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { Card } from '../ui';
-import { api, type ChatSession, type Job } from '../api';
-import { useLive } from '../useLive';
-import { cacheGet, cacheSet } from '../storage';
+import { pullSync, useSyncStore } from '../syncStore';
+import { SkeletonList } from '../ui/Skeleton';
 
 function ago(ts: number): string {
   const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
@@ -27,22 +26,17 @@ export function ProjectSessionsScreen() {
   const projectId: string = route.params?.projectId;
   const name: string = route.params?.name ?? 'Project';
 
-  const [sessions, setSessions] = useState<ChatSession[]>(() => cacheGet(`sessions.${projectId}`, []));
-  const [jobs, setJobs] = useState<Job[]>(() => cacheGet(`jobs.${projectId}`, []));
-  const [loading, setLoading] = useState(sessions.length === 0);
+  // Sessions + jobs come from the global SyncStore, filtered for this project.
+  // No per-screen cache key — SSE updates flow in automatically.
+  const sessions = useSyncStore((s) => s.sessions.filter((x) => x.projectId === projectId));
+  const jobs = useSyncStore((s) => s.jobs.filter((x) => x.projectId === projectId));
+  const bootstrapped = useSyncStore((s) => s.bootstrapped);
+  const syncing = useSyncStore((s) => s.syncing);
 
-  const load = useCallback(() => {
-    Promise.all([api.listSessions(projectId), api.listJobs(projectId)])
-      .then(([ss, js]) => {
-        setSessions(ss); setJobs(js);
-        cacheSet(`sessions.${projectId}`, ss); cacheSet(`jobs.${projectId}`, js);
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, [projectId]);
-
-  useFocusEffect(useCallback(() => { load(); }, [load]));
-  useLive(['session', 'job'], load);
+  // Top up the store on focus and on pull-to-refresh — covers the rare case
+  // where SSE dropped a frame and the user just opened the project.
+  useFocusEffect(useCallback(() => { void pullSync(); }, []));
+  const onRefresh = useCallback(() => { void pullSync(); }, []);
 
   // Per-session: last activity + running state, derived from the project's jobs.
   const meta = useCallback(
@@ -65,7 +59,11 @@ export function ProjectSessionsScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
-      <ScrollView contentContainerStyle={{ paddingTop: insets.top + 4, paddingBottom: 96 }} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={{ paddingTop: insets.top + 4, paddingBottom: 96 }}
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={syncing} onRefresh={onRefresh} tintColor={theme.color.inkTertiary} />}
+      >
         {/* header */}
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 16, paddingBottom: 2 }}>
           <Pressable onPress={() => nav.goBack()} hitSlop={8}>
@@ -77,11 +75,8 @@ export function ProjectSessionsScreen() {
           <Text style={{ fontSize: 14, color: theme.color.inkSecondary, marginTop: 3 }}>{active.length} chat{active.length === 1 ? '' : 's'}</Text>
         </View>
 
-        {loading && active.length === 0 ? (
-          <View style={{ alignItems: 'center', paddingVertical: 60, gap: 14 }}>
-            <ActivityIndicator color={theme.color.blue} />
-            <Text style={{ fontSize: 14, color: theme.color.inkTertiary }}>Loading chats…</Text>
-          </View>
+        {!bootstrapped && active.length === 0 ? (
+          <SkeletonList count={4} />
         ) : active.length === 0 ? (
           <View style={{ alignItems: 'center', paddingVertical: 60, paddingHorizontal: 36 }}>
             <View style={{ width: 64, height: 64, borderRadius: 20, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>

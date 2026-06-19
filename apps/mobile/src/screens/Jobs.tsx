@@ -1,12 +1,12 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, Animated } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { Card, Mono } from '../ui';
-import { api, type Job, type Project } from '../api';
-import { useLive } from '../useLive';
+import { type Project } from '../api';
+import { pullSync, useSyncStore } from '../syncStore';
 
 /** Live project descriptor used to render the filter avatars + row subtitles. */
 type LiveProj = { id: string; name: string; color: string };
@@ -86,8 +86,10 @@ export function JobsScreen() {
   const insets = useSafeAreaInsets();
   const nav = useNavigation<any>();
   const [filter, setFilter] = useState<string | 'all'>('all');
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [projects, setProjects] = useState<LiveProj[]>([]);
+
+  // Jobs + projects come from the SyncStore — live SSE keeps them current.
+  const jobs = useSyncStore((s) => s.jobs);
+  const storeProjects = useSyncStore((s) => s.projects);
 
   // color-name -> theme hex; default to blue for unknown names.
   const resolveColor = useCallback(
@@ -98,20 +100,13 @@ export function JobsScreen() {
     [theme],
   );
 
-  const refresh = useCallback(() => {
-    Promise.all([api.listJobs(), api.listProjects()])
-      .then(([js, ps]) => {
-        setJobs(js);
-        setProjects(ps.map((p: Project): LiveProj => ({ id: p.id, name: p.name, color: resolveColor(p.color) })));
-      })
-      .catch(() => {
-        /* fail soft — keep last good data */
-      });
-  }, [resolveColor]);
+  const projects = useMemo<LiveProj[]>(
+    () => storeProjects.map((p: Project) => ({ id: p.id, name: p.name, color: resolveColor(p.color) })),
+    [storeProjects, resolveColor],
+  );
 
-  // SSE drives instant updates; a slow poll is just a backstop if the stream drops.
-  useFocusEffect(useCallback(() => api.poll(refresh, 10000), [refresh]));
-  useLive(['job', 'session'], refresh);
+  // Top up the store on focus so anything missed while another tab was active lands.
+  useFocusEffect(useCallback(() => { void pullSync(); }, []));
 
   const projById = useCallback(
     (projectId: string | null): ProjResolved => {

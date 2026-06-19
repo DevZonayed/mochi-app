@@ -1,13 +1,13 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { View, Text, Pressable, ScrollView } from 'react-native';
+import React, { useCallback, useState } from 'react';
+import { View, Text, Pressable, ScrollView, RefreshControl } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
-import { api, type AppEvent, type AppEventKind } from '../api';
+import { type AppEvent, type AppEventKind } from '../api';
 import { getStr, setStr } from '../storage';
 import { eventAllowed } from '../notifPrefs';
-import { useLive } from '../useLive';
+import { pullSync, useSyncStore } from '../syncStore';
 
 const NOTIF_READ = 'maestro.mobile.notifReadTs';
 
@@ -118,15 +118,17 @@ export function NotificationsScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
   const nav = useNavigation<any>();
-  const [events, setEvents] = useState<AppEvent[]>([]);
+  // Events flow through the unified SyncStore; SSE 'replay' frames + live
+  // events upsert them in real time. Sorted newest-first for the timeline.
+  const allEvents = useSyncStore((s) => s.events);
+  const syncing = useSyncStore((s) => s.syncing);
   const [readTs, setReadTs] = useState<number>(() => Number(getStr(NOTIF_READ)) || 0);
 
-  const reload = useCallback(() => { api.listEvents().then(setEvents).catch(() => {}); }, []);
-  useEffect(() => api.poll(reload, 15000), [reload]); // backstop; SSE drives updates
-  useLive(['job', 'approval', 'asset', 'session', 'briefs', 'comms'], reload);
+  useFocusEffect(useCallback(() => { void pullSync(); }, []));
+  const onRefresh = useCallback(() => { void pullSync(); }, []);
 
   // Honor the Activity-feed category toggles from Settings.
-  const visible = events.filter((e) => eventAllowed(e.kind));
+  const visible = allEvents.filter((e) => eventAllowed(e.kind));
 
   const markAllRead = () => {
     const ts = visible[0]?.ts ?? Date.now();
@@ -136,7 +138,11 @@ export function NotificationsScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
-      <ScrollView contentContainerStyle={{ paddingTop: insets.top + 6, paddingBottom: 24 }} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={{ paddingTop: insets.top + 6, paddingBottom: 24 }}
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={syncing} onRefresh={onRefresh} tintColor={theme.color.inkTertiary} />}
+      >
         {/* back */}
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 16, paddingTop: 2, paddingBottom: 4 }}>
           <Pressable onPress={() => nav.goBack()} hitSlop={8}>

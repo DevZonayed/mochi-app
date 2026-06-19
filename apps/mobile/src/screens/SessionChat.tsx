@@ -1,13 +1,46 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { View, Text, Pressable, ScrollView, TextInput, KeyboardAvoidingView, Platform, ActivityIndicator, Modal, Alert } from 'react-native';
+import { View, Text, Pressable, ScrollView, TextInput, KeyboardAvoidingView, Platform, ActivityIndicator, Modal, Alert, Image } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation, useRoute } from '@react-navigation/native';
+import * as ImagePicker from 'expo-image-picker';
+import * as DocumentPicker from 'expo-document-picker';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Mono } from '../ui';
 import { api, type Job, type TranscriptItem, type Effort, type ModelGroup } from '../api';
-import { useLive } from '../useLive';
 import { cacheGet, cacheSet } from '../storage';
+import { pullSync, useSyncStore } from '../syncStore';
+
+/* One inline composer chip — either an image (vision) or a file (text inlined
+   into the prompt on the Mac, or binary saved as an asset). Bytes ride along as
+   base64; the Mac's `sendChat` ingestor (apps/desktop/electron/localApi.ts:470)
+   slots them into the job and clears them. Capped to keep payload sane. */
+type AttachChip = {
+  id: string;
+  kind: 'image' | 'file';
+  name: string;
+  mime: string;
+  dataB64: string;
+  previewUri?: string; // local URI used by the chip thumbnail before upload
+};
+
+/** Cross-platform "URI → base64" — DocumentPicker doesn't return the bytes, so
+    we fetch the local file URI and stream it through FileReader. Works in both
+    Expo Go and standalone builds without pulling in expo-file-system. */
+async function uriToBase64(uri: string): Promise<string> {
+  const res = await fetch(uri);
+  const blob = await res.blob();
+  return await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = String(reader.result ?? '');
+      const comma = result.indexOf(',');
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error ?? new Error('read failed'));
+    reader.readAsDataURL(blob);
+  });
+}
 
 /* Pick an icon for a tool by its name (best-effort; defaults to a terminal). */
 function toolIcon(name: string): IconName {
@@ -255,37 +288,87 @@ function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (te
   );
 }
 
+/* Compact "tool work" summary pill that the user can tap to expand the hidden
+   tool/text blocks. Mirrors the desktop's WorkBar (ProjectDetail.tsx) so the
+   collapse signal matches: turn is done, a final text/result exists, prior work
+   is non-empty, no pending question or image (those always stay expanded). */
+function WorkBar({ toolCount, expanded, onToggle }: { toolCount: number; expanded: boolean; onToggle: () => void }) {
+  const { theme } = useTheme();
+  return (
+    <Pressable
+      onPress={onToggle}
+      hitSlop={6}
+      style={{ alignSelf: 'flex-start', flexDirection: 'row', alignItems: 'center', gap: 7, height: 28, paddingHorizontal: 12, borderRadius: 14, backgroundColor: theme.color.fillTertiary, borderWidth: 0.5, borderColor: theme.color.separator }}
+    >
+      <Icon name="terminal" size={12} color={theme.color.inkSecondary} />
+      <Text style={{ fontSize: 12, fontWeight: '600', color: theme.color.inkSecondary }}>
+        {toolCount > 0 ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : 'Work'}
+      </Text>
+      <Icon name={expanded ? 'chevronDown' : 'chevronRight'} size={12} color={theme.color.inkTertiary} stroke={2.2} />
+    </Pressable>
+  );
+}
+
 function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: string) => void; answered: boolean }) {
   const { theme } = useTheme();
   const items = job.transcript ?? [];
   const live = job.status === 'running' || job.status === 'pending';
 
+  // Same collapse signal as desktop ProjectDetail (WorkBar): once the turn is
+  // settled and we have a final text/result block, hide everything before it
+  // unless there's an unanswered question or a generated image to keep visible.
+  const hasAsk = items.some((t) => t.kind === 'ask');
+  const hasImage = items.some((t) => t.kind === 'image');
+  let finalIdx = -1;
+  for (let k = items.length - 1; k >= 0; k--) {
+    if (items[k].kind === 'text' || items[k].kind === 'result') { finalIdx = k; break; }
+  }
+  const collapsible = !live && !hasAsk && !hasImage && finalIdx > 0
+    && items.slice(0, finalIdx).some((t) => t.kind === 'tool' || t.kind === 'text');
+  const [expanded, setExpanded] = useState(false);
+
+  const renderItem = (it: TranscriptItem, i: number): React.ReactNode => {
+    if (it.kind === 'tool') return <ToolRow key={i} item={it} />;
+    if (it.kind === 'ask') return <QuestionCard key={i} ask={it.ask || it.text} onAnswer={onAnswer} answered={answered} />;
+    if (it.kind === 'review') {
+      const ok = it.verdict === 'approved';
+      return (
+        <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, borderRadius: 12, padding: 12, backgroundColor: (ok ? theme.color.green : theme.color.orange) + '14', borderWidth: 0.5, borderColor: (ok ? theme.color.green : theme.color.orange) + '40' }}>
+          <Icon name="shield" size={15} color={ok ? theme.color.green : theme.color.orange} />
+          <Text style={{ flex: 1, fontSize: 14, lineHeight: 19, color: theme.color.ink }}>{it.text || (ok ? 'Reviewer approved' : 'Reviewer asked for changes')}{it.resolved ? ' · resolved' : ''}</Text>
+        </View>
+      );
+    }
+    if (it.kind === 'image') {
+      return (
+        <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, borderRadius: 12, padding: 12, backgroundColor: theme.color.fillTertiary }}>
+          <Icon name="image" size={16} color={theme.color.purple} />
+          <Text numberOfLines={1} style={{ flex: 1, fontSize: 14, color: theme.color.inkSecondary }}>{it.alt || it.text || 'Generated image'}</Text>
+        </View>
+      );
+    }
+    if (it.text && it.text.trim()) {
+      return <Text key={i} style={{ fontSize: 16, lineHeight: 24, color: theme.color.ink }}>{it.text.trim()}</Text>;
+    }
+    return null;
+  };
+
   const blocks: React.ReactNode[] = [];
   if (items.length) {
-    items.forEach((it, i) => {
-      if (it.kind === 'tool') {
-        blocks.push(<ToolRow key={i} item={it} />);
-      } else if (it.kind === 'ask') {
-        blocks.push(<QuestionCard key={i} ask={it.ask || it.text} onAnswer={onAnswer} answered={answered} />);
-      } else if (it.kind === 'review') {
-        const ok = it.verdict === 'approved';
-        blocks.push(
-          <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, borderRadius: 12, padding: 12, backgroundColor: (ok ? theme.color.green : theme.color.orange) + '14', borderWidth: 0.5, borderColor: (ok ? theme.color.green : theme.color.orange) + '40' }}>
-            <Icon name="shield" size={15} color={ok ? theme.color.green : theme.color.orange} />
-            <Text style={{ flex: 1, fontSize: 14, lineHeight: 19, color: theme.color.ink }}>{it.text || (ok ? 'Reviewer approved' : 'Reviewer asked for changes')}{it.resolved ? ' · resolved' : ''}</Text>
-          </View>,
-        );
-      } else if (it.kind === 'image') {
-        blocks.push(
-          <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, borderRadius: 12, padding: 12, backgroundColor: theme.color.fillTertiary }}>
-            <Icon name="image" size={16} color={theme.color.purple} />
-            <Text numberOfLines={1} style={{ flex: 1, fontSize: 14, color: theme.color.inkSecondary }}>{it.alt || it.text || 'Generated image'}</Text>
-          </View>,
-        );
-      } else if (it.text && it.text.trim()) {
-        blocks.push(<Text key={i} style={{ fontSize: 16, lineHeight: 24, color: theme.color.ink }}>{it.text.trim()}</Text>);
+    if (collapsible) {
+      const work = items.slice(0, finalIdx);
+      const toolCount = work.filter((t) => t.kind === 'tool').length;
+      blocks.push(<WorkBar key="work-bar" toolCount={toolCount} expanded={expanded} onToggle={() => setExpanded((e) => !e)} />);
+      if (expanded) {
+        work.forEach((it, i) => { const node = renderItem(it, i); if (node) blocks.push(node); });
       }
-    });
+      const finalNode = renderItem(items[finalIdx], finalIdx);
+      if (finalNode) blocks.push(finalNode);
+      // Items after the final answer (rare — usually a trailing review) stay visible.
+      for (let i = finalIdx + 1; i < items.length; i++) { const node = renderItem(items[i], i); if (node) blocks.push(node); }
+    } else {
+      items.forEach((it, i) => { const node = renderItem(it, i); if (node) blocks.push(node); });
+    }
   } else if (job.error) {
     blocks.push(<Text key="err" style={{ fontSize: 15, lineHeight: 22, color: theme.color.red }}>{job.error}</Text>);
   } else if (job.output && job.output.trim()) {
@@ -339,11 +422,21 @@ export function SessionChatScreen() {
   const initialSid: string | undefined = route.params?.sessionId;
   const [sessionId, setSessionId] = useState<string | undefined>(initialSid);
   const [title, setTitle] = useState<string>(route.params?.title ?? 'New chat');
-  // Seed the thread from cache for an instant open; refresh from the relay below.
-  const [turns, setTurns] = useState<Job[]>(() => (initialSid ? cacheGet<Job[]>(`turns.${initialSid}`, []) : []));
+  // Turns are derived live from the unified SyncStore — every SSE `job` event
+  // for this session is already upserted by App.tsx's global subscriber, so we
+  // just filter + sort. The per-session AsyncStorage cache (turns.{sid}) is
+  // gone: the store IS the cache.
+  const turns = useSyncStore((s) =>
+    sessionId
+      ? s.jobs.filter((j) => j.sessionId === sessionId).slice().sort((a, b) => a.createdAt - b.createdAt)
+      : [],
+  );
+  const bootstrapped = useSyncStore((s) => s.bootstrapped);
+
   const [text, setText] = useState('');
+  const [attachments, setAttachments] = useState<AttachChip[]>([]);
+  const [pickingAttachment, setPickingAttachment] = useState(false);
   const [sending, setSending] = useState(false);
-  const [loading, setLoading] = useState(() => !!initialSid && cacheGet<Job[]>(`turns.${initialSid}`, []).length === 0);
   const [schedOpen, setSchedOpen] = useState(false);
   // Per-session effort + model — remembered for the chat, sent with every message.
   const [effort, setEffort] = useState<Effort>(() => (initialSid ? cacheGet<Effort>(`effort.${initialSid}`, 'balanced') : 'balanced'));
@@ -357,53 +450,133 @@ export function SessionChatScreen() {
   // Load the Mac's model catalog (cache-then-network) for the picker.
   useEffect(() => { api.listModels().then((g) => { setModels(g); cacheSet('models', g); }).catch(() => {}); }, []);
 
-  const load = useCallback(() => {
-    if (!sessionId) { setLoading(false); return; }
-    api.listJobs(projectId, sessionId)
-      .then((js) => {
-        const sorted = js.slice().sort((a, b) => a.createdAt - b.createdAt);
-        setTurns(sorted);
-        cacheSet(`turns.${sessionId}`, sorted);
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, [projectId, sessionId]);
+  // Top up the store on (re-)open so a chat that's been idle while another
+  // tab was in front catches up cleanly.
+  useEffect(() => { void pullSync(); }, [sessionId]);
 
-  useEffect(() => { load(); }, [load]);
-
-  // Real-time: any job/session event touching THIS session refreshes the thread.
-  useLive(['job', 'session'], (name, data) => {
-    const d = data as { sessionId?: string; id?: string } | null;
-    if (name === 'job' && sessionId && d?.sessionId === sessionId) load();
-    else if (name === 'session' && sessionId && d?.id === sessionId) load();
-  });
-
+  const loading = !bootstrapped && turns.length === 0 && !!sessionId;
   const liveTurn = turns.some((j) => j.status === 'running' || j.status === 'pending');
 
   // Auto-scroll to the newest content.
   useEffect(() => { const t = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60); return () => clearTimeout(t); }, [turns]);
 
   // Core send — used by the composer AND by answering a question's option.
-  const dispatchChat = useCallback((body: string) => {
+  // `chips` is captured at call time so the optimistic clear of `attachments`
+  // can happen synchronously without losing the bytes for the in-flight send.
+  const dispatchChat = useCallback((body: string, chips: AttachChip[] = []) => {
     setSending(true);
-    return api.sendChat({ projectId, text: body, sessionId, effort, ...(modelKey !== 'auto' ? { modelKey } : {}) })
+    const images = chips.filter((c) => c.kind === 'image').map((c) => ({ name: c.name, mime: c.mime, dataB64: c.dataB64 }));
+    const files = chips.filter((c) => c.kind === 'file').map((c) => ({ name: c.name, mime: c.mime, kind: 'file' as const, dataB64: c.dataB64 }));
+    return api.sendChat({
+      projectId, text: body, sessionId, effort,
+      ...(modelKey !== 'auto' ? { modelKey } : {}),
+      ...(images.length ? { images } : {}),
+      ...(files.length ? { files } : {}),
+    })
       .then((res) => {
         if (!sessionId) {
           setSessionId(res.session.id); setTitle(res.session.title || body.slice(0, 40));
           cacheSet(`effort.${res.session.id}`, effort); cacheSet(`model.${res.session.id}`, modelKey);
         }
-        // Optimistically show the new turn; live events fill in the reply.
-        setTurns((prev) => [...prev, res.job]);
+        // The new turn (and any subsequent live updates) flow through the
+        // SyncStore via SSE; a one-shot pullSync covers the corner case where
+        // the streaming job emits BEFORE we receive the session-creation event.
+        void pullSync();
       })
       .finally(() => setSending(false));
   }, [projectId, sessionId, effort, modelKey]);
 
   const send = () => {
     const body = text.trim();
-    if (!body || sending) return;
+    // An empty body with attachments is valid — vision turns ("look at this") are
+    // a real use case on desktop. Block only the truly-empty case.
+    if ((!body && attachments.length === 0) || sending) return;
+    const chips = attachments;
     setText('');
-    dispatchChat(body).catch(() => setText(body)); // restore on failure
+    setAttachments([]);
+    dispatchChat(body, chips).catch(() => {
+      // Restore both halves on failure so the user can retry.
+      setText(body);
+      setAttachments(chips);
+    });
   };
+
+  // ── Attachment pickers ──────────────────────────────────────────────────
+  const MAX_ATTACHMENTS = 8;             // mirrors the Mac's per-turn image cap
+  const MAX_BYTES = 16 * 1024 * 1024;    // mirrors the Mac's per-image byte cap
+
+  const addChips = (next: AttachChip[]) => {
+    if (!next.length) return;
+    setAttachments((prev) => [...prev, ...next].slice(0, MAX_ATTACHMENTS));
+  };
+
+  const pickImage = async () => {
+    if (pickingAttachment || attachments.length >= MAX_ATTACHMENTS) return;
+    setPickingAttachment(true);
+    try {
+      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!perm.granted) { Alert.alert('Photos permission needed', 'Grant photo library access in Settings to attach images.'); return; }
+      const res = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsMultipleSelection: true,
+        quality: 0.7,
+        base64: true,
+        selectionLimit: MAX_ATTACHMENTS - attachments.length,
+      });
+      if (res.canceled) return;
+      const chips: AttachChip[] = [];
+      for (const a of res.assets) {
+        const dataB64 = a.base64 ?? (a.uri ? await uriToBase64(a.uri).catch(() => '') : '');
+        if (!dataB64) continue;
+        // Rough byte estimate from base64 length (×3/4) — keeps oversize images out.
+        if (dataB64.length * 0.75 > MAX_BYTES) {
+          Alert.alert('Image too large', `“${a.fileName ?? 'image'}” is over 16 MB and was skipped.`);
+          continue;
+        }
+        chips.push({
+          id: `${Date.now()}-${chips.length}`,
+          kind: 'image',
+          name: a.fileName ?? `image-${Date.now()}.${a.mimeType?.split('/')[1] ?? 'jpg'}`,
+          mime: a.mimeType ?? 'image/jpeg',
+          dataB64,
+          previewUri: a.uri,
+        });
+      }
+      addChips(chips);
+    } catch (e) {
+      Alert.alert('Could not attach image', e instanceof Error ? e.message : 'Unknown error.');
+    } finally { setPickingAttachment(false); }
+  };
+
+  const pickFile = async () => {
+    if (pickingAttachment || attachments.length >= MAX_ATTACHMENTS) return;
+    setPickingAttachment(true);
+    try {
+      const res = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true, type: '*/*' });
+      if (res.canceled) return;
+      const chips: AttachChip[] = [];
+      for (const a of res.assets) {
+        if (typeof a.size === 'number' && a.size > MAX_BYTES) {
+          Alert.alert('File too large', `“${a.name}” is over 16 MB and was skipped.`);
+          continue;
+        }
+        const dataB64 = a.uri ? await uriToBase64(a.uri).catch(() => '') : '';
+        if (!dataB64) continue;
+        chips.push({
+          id: `${Date.now()}-${chips.length}`,
+          kind: 'file',
+          name: a.name || 'file',
+          mime: a.mimeType ?? 'application/octet-stream',
+          dataB64,
+        });
+      }
+      addChips(chips);
+    } catch (e) {
+      Alert.alert('Could not attach file', e instanceof Error ? e.message : 'Unknown error.');
+    } finally { setPickingAttachment(false); }
+  };
+
+  const removeChip = (id: string) => setAttachments((prev) => prev.filter((c) => c.id !== id));
 
   // Answer an agent question by sending the chosen option(s) as a turn.
   const answer = (body: string) => { if (!sending && body.trim()) void dispatchChat(body).catch(() => {}); };
@@ -482,16 +655,45 @@ export function SessionChatScreen() {
           <ModelPicker groups={models} value={modelKey} onChange={changeModel} />
           <View style={{ flex: 1 }} />
         </View>
+        {/* attachment chips — appear above the text input once anything's picked */}
+        {attachments.length > 0 ? (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingHorizontal: 12, paddingTop: 10 }}>
+            {attachments.map((c) => (
+              <View
+                key={c.id}
+                style={{ flexDirection: 'row', alignItems: 'center', gap: 8, height: 38, paddingLeft: c.kind === 'image' ? 4 : 10, paddingRight: 8, borderRadius: 19, backgroundColor: theme.color.bgElevated, borderWidth: 0.5, borderColor: theme.color.separator, maxWidth: 220 }}
+              >
+                {c.kind === 'image' && c.previewUri ? (
+                  <Image source={{ uri: c.previewUri }} style={{ width: 30, height: 30, borderRadius: 15 }} />
+                ) : (
+                  <View style={{ width: 24, height: 24, borderRadius: 7, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.fillTertiary }}>
+                    <Icon name={c.kind === 'image' ? 'image' : 'file'} size={13} color={theme.color.inkSecondary} />
+                  </View>
+                )}
+                <Text numberOfLines={1} style={{ flex: 1, fontSize: 13, color: theme.color.ink }}>{c.name}</Text>
+                <Pressable onPress={() => removeChip(c.id)} hitSlop={8} style={{ width: 22, height: 22, borderRadius: 11, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.fillSecondary }}>
+                  <Icon name="x" size={12} color={theme.color.inkSecondary} stroke={2.4} />
+                </Pressable>
+              </View>
+            ))}
+          </ScrollView>
+        ) : null}
         {/* input row */}
-        <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 8, paddingHorizontal: 12, paddingTop: 8 }}>
-          <Pressable onPress={openScheduler} style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.fillSecondary }}>
+        <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 6, paddingHorizontal: 12, paddingTop: 8 }}>
+          <Pressable onPress={openScheduler} hitSlop={6} style={{ width: 38, height: 44, alignItems: 'center', justifyContent: 'center' }}>
             <Icon name="clock" size={19} color={theme.color.inkSecondary} />
+          </Pressable>
+          <Pressable onPress={pickImage} disabled={pickingAttachment || attachments.length >= MAX_ATTACHMENTS} hitSlop={6} style={{ width: 38, height: 44, alignItems: 'center', justifyContent: 'center', opacity: attachments.length >= MAX_ATTACHMENTS ? 0.4 : 1 }}>
+            <Icon name="image" size={19} color={theme.color.inkSecondary} />
+          </Pressable>
+          <Pressable onPress={pickFile} disabled={pickingAttachment || attachments.length >= MAX_ATTACHMENTS} hitSlop={6} style={{ width: 38, height: 44, alignItems: 'center', justifyContent: 'center', opacity: attachments.length >= MAX_ATTACHMENTS ? 0.4 : 1 }}>
+            <Icon name="file" size={19} color={theme.color.inkSecondary} />
           </Pressable>
           <View style={{ flex: 1, minHeight: 44, maxHeight: 130, borderRadius: 22, backgroundColor: theme.color.bgElevated, borderWidth: 0.5, borderColor: theme.color.separator, paddingHorizontal: 16, justifyContent: 'center' }}>
             <TextInput
               value={text}
               onChangeText={setText}
-              placeholder="Message the agent…"
+              placeholder={attachments.length ? 'Add a message (optional)…' : 'Message the agent…'}
               placeholderTextColor={theme.color.inkTertiary}
               multiline
               style={{ fontSize: 16, lineHeight: 21, color: theme.color.ink, paddingVertical: 11 }}
@@ -499,10 +701,10 @@ export function SessionChatScreen() {
           </View>
           <Pressable
             onPress={send}
-            disabled={!text.trim() || sending}
-            style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: text.trim() && !sending ? theme.color.blue : theme.color.fillSecondary }}
+            disabled={(!text.trim() && attachments.length === 0) || sending}
+            style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: (text.trim() || attachments.length > 0) && !sending ? theme.color.blue : theme.color.fillSecondary }}
           >
-            {sending ? <ActivityIndicator size="small" color="#fff" /> : <Icon name="send" size={19} color={text.trim() ? '#fff' : theme.color.inkTertiary} />}
+            {sending ? <ActivityIndicator size="small" color="#fff" /> : <Icon name="send" size={19} color={(text.trim() || attachments.length > 0) ? '#fff' : theme.color.inkTertiary} />}
           </Pressable>
         </View>
       </View>

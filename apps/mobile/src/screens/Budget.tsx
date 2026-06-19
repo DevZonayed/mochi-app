@@ -1,12 +1,13 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { View, Text, Pressable, ScrollView, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import type { Theme } from '@maestro/design-tokens';
 import { Icon } from '../Icon';
-import { api, type CostsData, type Job, type Project } from '../api';
+import { api, type CostsData } from '../api';
 import { Mono } from '../ui';
+import { pullSync, useSyncStore } from '../syncStore';
 
 /** Resolve a live project color NAME ('blue'|'purple'|…) to a theme hex. */
 const PROJECT_COLOR_NAMES = ['blue', 'purple', 'indigo', 'teal', 'orange', 'green', 'red'] as const;
@@ -32,14 +33,16 @@ export function BudgetScreen() {
   const nav = useNavigation<any>();
 
   const [costs, setCosts] = useState<CostsData | null>(null);
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [projects, setProjects] = useState<Record<string, Project>>({});
+  // Jobs + projects come from the SyncStore so we don't double-fetch on every
+  // tab open; only `costs` (a server-computed aggregate) still polls.
+  const jobs = useSyncStore((s) => s.jobs);
+  const storeProjects = useSyncStore((s) => s.projects);
+  const projects = useMemo(() => Object.fromEntries(storeProjects.map((p) => [p.id, p])), [storeProjects]);
 
   useEffect(() => {
     const stop = api.poll(() => {
       api.costs().then(setCosts).catch(() => {});
-      api.listJobs().then(setJobs).catch(() => {});
-      api.listProjects().then(ps => setProjects(Object.fromEntries(ps.map(p => [p.id, p])))).catch(() => {});
+      void pullSync();
     });
     return stop;
   }, []);

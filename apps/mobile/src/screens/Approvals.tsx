@@ -8,7 +8,7 @@ import { Icon, type IconName } from '../Icon';
 import { Card, Mono } from '../ui';
 import { api, type Approval, type ApprovalKind, type Project } from '../api';
 import { biometricGateEnabled, confirmBiometric } from '../biometrics';
-import { useLive } from '../useLive';
+import { pullSync, useSyncStore } from '../syncStore';
 
 type TintKey = 'blue' | 'purple' | 'green' | 'orange' | 'teal' | 'indigo' | 'red';
 type Platform = 'x' | 'linkedin';
@@ -292,39 +292,36 @@ function GateCard({ g, approving, onApprove, onReject }: { g: Gate; approving: b
 export function ApprovalsScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
-  const [gates, setGates] = useState<Gate[]>([]);
+  // Pending approvals + projects come from the unified SyncStore — live SSE
+  // updates upsert/resolve gates in place; pull-to-refresh covers offline naps.
+  const pending = useSyncStore((s) => s.approvals.filter((a) => a.status === 'pending'));
+  const projects = useSyncStore((s) => s.projects);
   const [approvingId, setApprovingId] = useState<string | null>(null);
+  // Local "hidden after a tap" set so the user sees the approval disappear
+  // instantly even before the Mac's resolved event lands.
+  const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
+
+  const gates = useMemo<Gate[]>(() => {
+    const byId: Record<string, Project> = {};
+    for (const p of projects) byId[p.id] = p;
+    return pending.filter((a) => !dismissed.has(a.id)).map((a) => toGate(a, byId));
+  }, [pending, projects, dismissed]);
 
   const sub = useMemo(() => (gates.length ? `${gates.length} waiting · approve from anywhere` : null), [gates.length]);
 
-  const load = useCallback(async () => {
-    try {
-      const [approvals, projects] = await Promise.all([api.listApprovals('pending'), api.listProjects()]);
-      const byId: Record<string, Project> = {};
-      for (const p of projects) byId[p.id] = p;
-      setGates(approvals.map((a) => toGate(a, byId)));
-    } catch {
-      // fail soft — keep whatever's already on screen
-    }
-  }, []);
+  // Refetch on focus so anything that happened while the user was elsewhere lands.
+  useFocusEffect(useCallback(() => { void pullSync(); }, []));
 
-  // Refetch on focus (and on mount) so newly-arrived gates and resolutions show up.
-  useFocusEffect(
-    useCallback(() => {
-      void load();
-    }, [load]),
-  );
-  // Real-time: a new gate or a resolution on the Mac updates the list instantly.
-  useLive(['approval', 'job', 'session'], () => { void load(); });
-
-  // Approve: plays the green-cover animation, hits the API, then refetches.
+  // Approve: plays the green-cover animation, hits the API; the live SSE
+  // approval event will resolve it in the store (and a deferred pullSync nudges
+  // anything that slipped through).
   const finish = (g: Gate) => {
     setApprovingId(g.id);
     void api.approveApproval(g.id).catch(() => {});
     setTimeout(() => {
-      setGates((gs) => gs.filter((x) => x.id !== g.id));
+      setDismissed((s) => new Set(s).add(g.id));
       setApprovingId(null);
-      void load();
+      void pullSync();
     }, 420);
   };
 
@@ -338,13 +335,8 @@ export function ApprovalsScreen() {
   };
 
   const reject = (g: Gate) => {
-    setGates((gs) => gs.filter((x) => x.id !== g.id));
-    void api
-      .denyApproval(g.id)
-      .catch(() => {})
-      .finally(() => {
-        void load();
-      });
+    setDismissed((s) => new Set(s).add(g.id));
+    void api.denyApproval(g.id).catch(() => {}).finally(() => { void pullSync(); });
   };
 
   return (
