@@ -26,6 +26,7 @@ const MediaStudio = React.lazy(() => import('./screens/MediaStudio'));
 const PublishingCenter = React.lazy(() => import('./screens/PublishingCenter'));
 const TrendIntelligence = React.lazy(() => import('./screens/TrendIntelligence'));
 const CommsGateway = React.lazy(() => import('./screens/CommsGateway'));
+const WhatsApp = React.lazy(() => import('./screens/WhatsApp'));
 const BudgetDashboard = React.lazy(() => import('./screens/BudgetDashboard'));
 const Settings = React.lazy(() => import('./screens/Settings'));
 const Feedback = React.lazy(() => import('./screens/Feedback'));
@@ -68,6 +69,7 @@ export function App() {
           <Route path="/publishing" element={<PublishingCenter />} />
           <Route path="/trends" element={<TrendIntelligence />} />
           <Route path="/comms" element={<CommsGateway />} />
+          <Route path="/whatsapp" element={<WhatsApp />} />
           <Route path="/budget" element={<BudgetDashboard />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/feedback" element={<Feedback />} />

@@ -9,7 +9,9 @@ import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
-import { api, type Project as ApiProject, type Job, type ProjectKind, type FolderInspect, IS_LOCAL } from '../lib/api';
+import { api, type Project as ApiProject, type Job, type ProjectKind, type FolderInspect, type ChatSession, IS_LOCAL } from '../lib/api';
+import { SessionStateDot } from './SessionStateDot';
+import { useProjectRollupState } from '../lib/useSessionGitState';
 
 /* Page-specific CSS from Projects.html <style> (the app-shell already provides
    the spin/app-wallpaper/nav-item/ws-header/search-field/tb-icon hooks, but we
@@ -78,6 +80,10 @@ interface Project {
   kind?: ProjectKind;
   path?: string;
   repoUrl?: string;
+  /** Live ids of THIS project's active sessions — feeds the rollup dot. */
+  sessionIds: string[];
+  /** Sessions waiting for archive (their PR has merged). Drives "Archive merged" sweep. */
+  mergedSessionIds: string[];
 }
 
 /* Drag-and-drop reorder wiring, shared by the grid cards and the list rows.
@@ -131,9 +137,10 @@ function templateKey(t: string): string {
    counts and spend are derived from listJobs(id); pending gates from the
    workspace approvals list. Fields the API does not expose (cap, subs, next,
    activity) keep sane static defaults so the render shape stays intact. */
-function toRow(p: ApiProject, jobs: Job[], pendingGates: number): Project {
+function toRow(p: ApiProject, jobs: Job[], pendingGates: number, sessions: ChatSession[]): Project {
   const running = jobs.filter(j => j.status === 'running' || j.status === 'pending').length;
   const spent = jobs.reduce((sum, j) => sum + (j.cost || 0), 0);
+  const live = sessions.filter(s => s.projectId === p.id && !s.archived && !s.archivedAt);
   return {
     id: p.id,
     name: p.name,
@@ -148,6 +155,10 @@ function toRow(p: ApiProject, jobs: Job[], pendingGates: number): Project {
     kind: p.kind,
     path: p.path,
     repoUrl: p.repoUrl,
+    sessionIds: live.map(s => s.id),
+    // The actual "is the PR merged?" check lives in the git-state cache; here
+    // we just feed candidate session ids so the card can ask later.
+    mergedSessionIds: live.map(s => s.id),
   };
 }
 
@@ -181,10 +192,14 @@ interface CardProps {
   onMenu: (id: string) => void;
   onOpen?: (id: string) => void;
   dnd?: Dnd;
+  /** Sweep every `pr-merged` session in this project to archived. Callback fires
+      after the user confirms; returns the swept count for the toast. */
+  onArchiveMerged?: (projectId: string) => void | Promise<void>;
 }
 
-function ProjectCard({ p, onMenu, onOpen, dnd }: CardProps) {
+function ProjectCard({ p, onMenu, onOpen, dnd, onArchiveMerged }: CardProps) {
   const t = TEMPLATES[p.tpl];
+  const rollup = useProjectRollupState(p.id, p.sessionIds);
   return (
     <div className={`proj-card${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
       position: 'relative', background: 'var(--bg-elevated)', borderRadius: 20, overflow: 'hidden',
@@ -195,9 +210,15 @@ function ProjectCard({ p, onMenu, onOpen, dnd }: CardProps) {
       <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 14, flex: 1 }}>
         {/* top row */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span style={{ width: 42, height: 42, borderRadius: 12, flexShrink: 0, display: 'grid', placeItems: 'center',
+          <span style={{ position: 'relative', width: 42, height: 42, borderRadius: 12, flexShrink: 0, display: 'grid', placeItems: 'center',
             background: `color-mix(in srgb, ${t.tint} 15%, transparent)`, color: t.tint }}>
             <Icon name={t.icon} size={22} />
+            {rollup && rollup !== 'no-repo' && (
+              <span style={{ position: 'absolute', right: -2, bottom: -2, width: 14, height: 14, borderRadius: 7,
+                background: 'var(--bg-elevated)', display: 'grid', placeItems: 'center', boxShadow: '0 0 0 1px var(--separator)' }}>
+                <SessionStateDot state={rollup} size={10} />
+              </span>
+            )}
           </span>
           <span style={{ flex: 1, minWidth: 0 }}>
             <span style={{ display: 'block', font: '600 var(--fs-headline)/1.2 var(--font-text)', letterSpacing: '-0.01em', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
@@ -233,6 +254,18 @@ function ProjectCard({ p, onMenu, onOpen, dnd }: CardProps) {
             </span>
           )}
           <span style={{ flex: 1 }} />
+          {/* Show "Archive merged" only when the rollup says the worst state of
+              this project's sessions IS pr-merged (i.e. nothing more urgent is
+              pending) — pure UI gate; the sweep itself re-checks per session. */}
+          {rollup === 'pr-merged' && onArchiveMerged && (
+            <button onClick={e => { e.stopPropagation(); void onArchiveMerged(p.id); }}
+              title="Remove worktrees of every session whose PR has merged"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 24, padding: '0 10px', borderRadius: 'var(--r-pill)',
+                background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)',
+                font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>
+              <Icon name="archive" size={11} /> Archive merged
+            </button>
+          )}
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>
             <Icon name="clock" size={12} /> {p.next === '—' ? p.activity : `Next ${p.next}`}
           </span>
@@ -254,15 +287,22 @@ interface RowProps {
 
 function ProjectRow({ p, onMenu, onOpen, last, dnd }: RowProps) {
   const t = TEMPLATES[p.tpl];
+  const rollup = useProjectRollupState(p.id, p.sessionIds);
   return (
     <div className={`proj-row${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
       display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.4fr 0.8fr 1fr 36px', alignItems: 'center', gap: 14,
       padding: '13px 16px', borderBottom: last ? 'none' : '0.5px solid var(--separator)', cursor: 'pointer',
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
-        <span style={{ width: 32, height: 32, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center',
+        <span style={{ position: 'relative', width: 32, height: 32, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center',
           background: `color-mix(in srgb, ${t.tint} 15%, transparent)`, color: t.tint }}>
           <Icon name={t.icon} size={17} />
+          {rollup && rollup !== 'no-repo' && (
+            <span style={{ position: 'absolute', right: -2, bottom: -2, width: 12, height: 12, borderRadius: 6,
+              background: 'var(--bg-elevated)', display: 'grid', placeItems: 'center', boxShadow: '0 0 0 1px var(--separator)' }}>
+              <SessionStateDot state={rollup} size={8} />
+            </span>
+          )}
         </span>
         <span style={{ minWidth: 0 }}>
           <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
@@ -811,10 +851,11 @@ export default function Projects() {
 
   const load = React.useCallback(async () => {
     try {
-      const [apiProjects, pendingGates, budgetData] = await Promise.all([
+      const [apiProjects, pendingGates, budgetData, allSessions] = await Promise.all([
         api.listProjects(),
         api.listApprovals('pending'),
         api.budget(),
+        api.listSessions().catch(() => [] as ChatSession[]),
       ]);
       const jobsByProject = await Promise.all(
         apiProjects.map(p => api.listJobs(p.id).catch(() => [] as Job[])),
@@ -823,7 +864,7 @@ export default function Projects() {
         if (g.projectId) acc[g.projectId] = (acc[g.projectId] ?? 0) + 1;
         return acc;
       }, {});
-      setProjects(apiProjects.map((p, i) => toRow(p, jobsByProject[i] ?? [], gatesByProject[p.id] ?? 0)));
+      setProjects(apiProjects.map((p, i) => toRow(p, jobsByProject[i] ?? [], gatesByProject[p.id] ?? 0, allSessions)));
       setBudget({ spent: budgetData.spent, cap: budgetData.cap });
     } catch {
       /* fail soft — leave whatever state we have */
@@ -849,6 +890,26 @@ export default function Projects() {
     void api.deleteProject(id).catch(() => { void load(); });
   };
   const open = (id: string) => { navigate(`/project-detail/${id}`); };
+
+  /* Project-card sweep: prune the worktree of every session whose PR has merged.
+     Best-effort — fetches each candidate's git status WITH PR data, then calls
+     archiveSessionWorktree for `pr-merged` only. The card's button shows up only
+     when at least one merged session exists. */
+  const archiveMergedFor = async (projectId: string) => {
+    const proj = projects.find(p => p.id === projectId);
+    if (!proj || proj.mergedSessionIds.length === 0) return;
+    const statuses = await Promise.all(proj.mergedSessionIds.map(sid => api.getSessionGitStatus(sid).catch(() => null)));
+    const targets = statuses.filter((s): s is NonNullable<typeof s> => !!s && s.state === 'pr-merged').map(s => s.sessionId);
+    if (targets.length === 0) {
+      // Nothing actually merged yet — silently no-op (the button is hidden anyway).
+      return;
+    }
+    const ok = window.confirm(`Archive ${targets.length} merged ${targets.length === 1 ? 'session' : 'sessions'} in “${proj.name}”? Their worktrees are removed; chats stay (archived).`);
+    if (!ok) return;
+    // Fire all archives in parallel; the rail will reload on the next load() pass.
+    await Promise.all(targets.map(sid => api.archiveSessionWorktree(sid).catch(() => undefined)));
+    void load();
+  };
 
   // ── Drag-and-drop reorder ─────────────────────────────────────────────────
   // Cards/rows reflow live as you drag (a "last hovered" ref stops oscillation),
@@ -918,7 +979,7 @@ export default function Projects() {
             : projects.length === 0 ? <EmptyProjects onPick={() => setGalleryOpen(true)} />
             : view === 'grid'
               ? <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(316px, 1fr))', gap: 18 }}>
-                  {projects.map(p => <ProjectCard key={p.id} p={p} onMenu={requestDelete} onOpen={open} dnd={dnd} />)}
+                  {projects.map(p => <ProjectCard key={p.id} p={p} onMenu={requestDelete} onOpen={open} dnd={dnd} onArchiveMerged={archiveMergedFor} />)}
                 </div>
               : <ListTable projects={projects} onMenu={requestDelete} onOpen={open} dnd={dnd} />}
         </div>

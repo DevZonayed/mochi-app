@@ -1,11 +1,12 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { View, Text, Pressable, ScrollView, Animated, StyleSheet, Modal, TextInput } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
-import { api, type Schedule, type Project, type ChatSession } from '../api';
+import { api, type Schedule, type ChatSession, type Project } from '../api';
 import { useLive } from '../useLive';
+import { pullSync, useSyncStore } from '../syncStore';
 
 function MSwitch({ value, onValueChange }: { value: boolean; onValueChange: (v: boolean) => void }) {
   const { theme } = useTheme();
@@ -39,6 +40,64 @@ function recurLabel(s: Schedule): string {
     return `every ${h ? `${h}h` : ''}${m ? ` ${m}m` : ''}`.trim() + (s.catchUp ? ' · catch-up' : '');
   }
   return `${s.cadence} · ${s.time || ''}` + (s.catchUp ? ' · catch-up' : '');
+}
+
+function RowM({ active, label, onPress, theme }: { active: boolean; label: string; onPress: () => void; theme: ReturnType<typeof useTheme>['theme'] }) {
+  return (
+    <Pressable onPress={onPress} style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 18, paddingVertical: 13, backgroundColor: active ? theme.color.fillSecondary : 'transparent' }}>
+      <Text numberOfLines={1} style={{ flex: 1, fontSize: 16, fontWeight: active ? '700' : '500', color: active ? theme.color.blue : theme.color.ink }}>{label}</Text>
+      {active && <Icon name="check" size={18} color={theme.color.blue} />}
+    </Pressable>
+  );
+}
+
+/** Searchable dropdown that scales to hundreds of projects/chats: a compact field showing the
+ *  current pick, tapped to open a bottom-sheet with a search box and a filterable list.
+ *  `leadLabel` is a pinned top option for the empty ('') value (e.g. "Workspace");
+ *  `emptyLabel` is the field text when nothing is chosen yet. */
+function SearchSelectM({ options, value, onChange, leadLabel, emptyLabel, placeholder, theme }: {
+  options: { id: string; label: string }[];
+  value: string;
+  onChange: (id: string) => void;
+  leadLabel?: string;
+  emptyLabel?: string;
+  placeholder: string;
+  theme: ReturnType<typeof useTheme>['theme'];
+}) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState('');
+  const query = q.trim().toLowerCase();
+  const rows = query ? options.filter((o) => o.label.toLowerCase().includes(query)) : options;
+  const selected = value ? options.find((o) => o.id === value) : null;
+  const triggerLabel = selected ? selected.label : (leadLabel ?? emptyLabel ?? placeholder);
+  const muted = !selected && !leadLabel;
+  const choose = (id: string) => { onChange(id); setOpen(false); setQ(''); };
+  const field = { backgroundColor: theme.color.bgGrouped, borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, borderColor: theme.color.separator };
+  return (
+    <View style={{ marginBottom: 12 }}>
+      <Pressable onPress={() => setOpen(true)} style={{ ...field, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 12 }}>
+        <Text numberOfLines={1} style={{ flex: 1, fontSize: 15, fontWeight: '600', color: muted ? theme.color.inkTertiary : theme.color.ink }}>{triggerLabel}</Text>
+        <Icon name="chevronDown" size={18} color={theme.color.inkTertiary} />
+      </Pressable>
+      <Modal visible={open} animationType="slide" transparent onRequestClose={() => setOpen(false)}>
+        <Pressable onPress={() => setOpen(false)} style={{ flex: 1, backgroundColor: '#0008', justifyContent: 'flex-end' }}>
+          <Pressable onPress={() => {}} style={{ backgroundColor: theme.color.bg, borderTopLeftRadius: 22, borderTopRightRadius: 22, paddingTop: 14, paddingBottom: 14, maxHeight: '72%' }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 16, marginBottom: 8 }}>
+              <Icon name="search" size={18} color={theme.color.inkTertiary} />
+              <TextInput autoFocus value={q} onChangeText={setQ} placeholder={placeholder} placeholderTextColor={theme.color.inkTertiary}
+                style={{ flex: 1, fontSize: 16, color: theme.color.ink, paddingVertical: 6 }} />
+              <Pressable onPress={() => setOpen(false)} hitSlop={8}><Icon name="x" size={20} color={theme.color.inkSecondary} /></Pressable>
+            </View>
+            <ScrollView keyboardShouldPersistTaps="handled">
+              {leadLabel && !query && <RowM active={!value} label={leadLabel} onPress={() => choose('')} theme={theme} />}
+              {rows.map((o) => <RowM key={o.id} active={value === o.id} label={o.label} onPress={() => choose(o.id)} theme={theme} />)}
+              {rows.length === 0 && <Text style={{ textAlign: 'center', color: theme.color.inkTertiary, paddingVertical: 24, fontSize: 15 }}>No matches</Text>}
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    </View>
+  );
 }
 
 /** Create / edit a recurring schedule from the phone. Daily-at-time or every-N-hours,
@@ -123,29 +182,25 @@ function ScheduleEditor({ open, initial, projects, onClose, onSaved }: { open: b
               style={{ ...fieldBg, paddingHorizontal: 14, paddingVertical: 12, fontSize: 15, color: theme.color.ink, minHeight: 84, textAlignVertical: 'top', marginBottom: 12 }} />
             {/* project picker */}
             <Text style={{ fontSize: 12, fontWeight: '700', textTransform: 'uppercase', color: theme.color.inkTertiary, marginBottom: 6 }}>Project</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
-              <Pressable onPress={() => { setProjectId(''); setSessionId(''); }} style={{ paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10, marginRight: 8, backgroundColor: !projectId ? theme.color.blue : theme.color.fillSecondary }}>
-                <Text style={{ color: !projectId ? '#fff' : theme.color.ink, fontWeight: '600' }}>Workspace</Text>
-              </Pressable>
-              {projects.map((p) => (
-                <Pressable key={p.id} onPress={() => { setProjectId(p.id); setSessionId(''); }} style={{ paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10, marginRight: 8, backgroundColor: projectId === p.id ? theme.color.blue : theme.color.fillSecondary }}>
-                  <Text style={{ color: projectId === p.id ? '#fff' : theme.color.ink, fontWeight: '600' }}>{p.name}</Text>
-                </Pressable>
-              ))}
-            </ScrollView>
+            <SearchSelectM
+              theme={theme}
+              placeholder="Search projects"
+              leadLabel="Workspace"
+              options={projects.map((p) => ({ id: p.id, label: p.name }))}
+              value={projectId}
+              onChange={(id) => { setProjectId(id); setSessionId(''); }}
+            />
             {projectId && sessions.length > 0 && (
               <>
                 <Text style={{ fontSize: 12, fontWeight: '700', textTransform: 'uppercase', color: theme.color.inkTertiary, marginBottom: 6 }}>Run in chat (optional)</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
-                  <Pressable onPress={() => setSessionId('')} style={{ paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10, marginRight: 8, backgroundColor: !sessionId ? theme.color.blue : theme.color.fillSecondary }}>
-                    <Text style={{ color: !sessionId ? '#fff' : theme.color.ink, fontWeight: '600' }}>Any chat</Text>
-                  </Pressable>
-                  {sessions.map((se) => (
-                    <Pressable key={se.id} onPress={() => setSessionId(se.id)} style={{ paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10, marginRight: 8, backgroundColor: sessionId === se.id ? theme.color.blue : theme.color.fillSecondary }}>
-                      <Text numberOfLines={1} style={{ color: sessionId === se.id ? '#fff' : theme.color.ink, fontWeight: '600', maxWidth: 160 }}>{se.title}</Text>
-                    </Pressable>
-                  ))}
-                </ScrollView>
+                <SearchSelectM
+                  theme={theme}
+                  placeholder="Search chats"
+                  leadLabel="Any chat"
+                  options={sessions.map((se) => ({ id: se.id, label: se.title }))}
+                  value={sessionId}
+                  onChange={(id) => setSessionId(id)}
+                />
               </>
             )}
             {/* catch-up */}
@@ -169,15 +224,17 @@ export function QueueScreen() {
   const nav = useNavigation<any>();
 
   const [schedules, setSchedules] = useState<Schedule[]>([]);
-  const [projects, setProjects] = useState<Record<string, Project>>({});
-  const [projectList, setProjectList] = useState<Project[]>([]);
+  // Projects come from the SyncStore (instant on tab open). Schedules still
+  // have their own endpoint — they're low volume + change rarely.
+  const projectList = useSyncStore((s) => s.projects);
+  const projects = useMemo(() => Object.fromEntries(projectList.map((p) => [p.id, p])), [projectList]);
   const [now, setNow] = useState(Date.now());
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<Schedule | null>(null);
 
   const load = useCallback(() => {
     api.listSchedules().then(setSchedules).catch(() => {});
-    api.listProjects().then((ps) => { setProjects(Object.fromEntries(ps.map((p) => [p.id, p]))); setProjectList(ps); }).catch(() => {});
+    void pullSync(); // keeps store projects (used here for chips) fresh
   }, []);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));

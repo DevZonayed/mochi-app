@@ -27,6 +27,10 @@ import {
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
+import { displayCodename } from '../lib/git-types';
+import { GitStatusBar } from './GitStatusBar';
+import { SessionStateDot } from './SessionStateDot';
+import { useSession, useSessionStateOnly } from '../lib/useSessionGitState';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -1558,17 +1562,79 @@ function UserImageThumb({ img }: { img: ChatImage }) {
   );
 }
 
+/* Match an `@<path>` inline attachment marker that points into the project's
+   `.continuum/Attachment/` directory. Works on both forms the bubble can see:
+   the desktop's absolute `@/Users/.../proj/.continuum/Attachment/x.png`, and
+   the relay-scrubbed `@.continuum/Attachment/x.png` the phone receives. */
+const ATTACH_INLINE_RE = /@(\S*\.continuum\/Attachment\/([A-Za-z0-9._-]+))/g;
+/** Basename of a saved attachment path — the lookup key against inputImages /
+    inputFiles, since those carry their `.continuum/Attachment/` filename. */
+const basenameOf = (p: string): string => p.split('/').filter(Boolean).pop() || p;
+/** A small inline attachment chip / image thumbnail rendered AT the position
+    the user dropped the chip in the composer. Image markers expand to a real
+    thumbnail; everything else shows a compact name + size badge.  */
+function InlineAttach({ path, images, files }: { path: string; images?: ChatImage[]; files?: ChatFile[] }) {
+  const base = basenameOf(path);
+  const img = images?.find(im => basenameOf(im.imagePath ?? '') === base || im.name === base);
+  if (img) return <span style={{ display: 'inline-block', verticalAlign: 'middle', margin: '0 2px' }}><UserImageThumb img={img} /></span>;
+  const f = files?.find(fl => (fl.path && basenameOf(fl.path) === base) || fl.name === base);
+  const label = f ? (f.name === 'Pasted text.txt' ? 'Pasted text' : f.name) : base;
+  const sub = f ? `${f.kind === 'text' ? 'text' : (f.mime || 'file')}${f.bytes ? ' · ' + fmtBytes(f.bytes) : ''}` : 'attachment';
+  return (
+    <span title={f?.name ?? path} style={{ display: 'inline-flex', verticalAlign: 'middle', alignItems: 'center', gap: 6, maxWidth: 240, margin: '0 2px', padding: '2px 8px 2px 6px', borderRadius: 9, border: '0.5px solid rgba(255,255,255,0.32)', background: 'rgba(255,255,255,0.14)', color: '#fff', font: '600 12px/1.25 var(--font-text)' }}>
+      <Icon name="file" size={12} />
+      <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+        <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+        <span style={{ font: '500 9px/1.1 var(--font-text)', opacity: 0.72 }}>{sub}</span>
+      </span>
+    </span>
+  );
+}
+
+/** Render the user bubble: text with `@<.continuum/Attachment/…>` markers
+    tokenized into inline chips/thumbnails at the exact position the user
+    dropped them in the composer. Images that aren't referenced inline (legacy
+    jobs before this change persisted markers in the input) fall back to a row
+    above the bubble so nothing disappears. */
 function UserBubble({ text, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
+  // Split the text into [string, attachment, string, attachment, …] tokens.
+  const nodes = React.useMemo(() => {
+    if (!text) return [] as React.ReactNode[];
+    const out: React.ReactNode[] = [];
+    let last = 0; let i = 0;
+    ATTACH_INLINE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ATTACH_INLINE_RE.exec(text)) !== null) {
+      if (m.index > last) out.push(text.slice(last, m.index));
+      out.push(<InlineAttach key={`a${i++}`} path={m[1]} images={images} files={files} />);
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) out.push(text.slice(last));
+    return out;
+  }, [text, images, files]);
+
+  // Anything that DIDN'T appear inline (legacy persisted jobs, or a chip the
+  // user removed before sending while leaving the payload) shows above so the
+  // user still sees what's attached.
+  const referencedBases = React.useMemo(() => {
+    const s = new Set<string>(); if (!text) return s;
+    const r = new RegExp(ATTACH_INLINE_RE.source, 'g'); let mm: RegExpExecArray | null;
+    while ((mm = r.exec(text)) !== null) s.add(mm[2]);
+    return s;
+  }, [text]);
+  const orphanImages = (images ?? []).filter(im => !referencedBases.has(basenameOf(im.imagePath ?? '')) && !referencedBases.has(im.name ?? ''));
+  const orphanFiles = (files ?? []).filter(f => !referencedBases.has(f.path ? basenameOf(f.path) : '') && !referencedBases.has(f.name));
+
   return (
     <div className="chat-msg" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
-      {images && images.length > 0 && (
+      {orphanImages.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: 'min(78%, 640px)' }}>
-          {images.map((im, i) => <UserImageThumb key={`${im.assetId}-${i}`} img={im} />)}
+          {orphanImages.map((im, i) => <UserImageThumb key={`${im.assetId}-${i}`} img={im} />)}
         </div>
       )}
-      {files && files.length > 0 && (
+      {orphanFiles.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: 'min(78%, 640px)' }}>
-          {files.map((f, i) => (
+          {orphanFiles.map((f, i) => (
             <div key={i} title={f.name} style={{ display: 'flex', alignItems: 'center', gap: 8, maxWidth: 240, height: 42, padding: '0 12px 0 9px', borderRadius: 11, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-elevated)' }}>
               <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={14} /></span>
               <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
@@ -1584,7 +1650,7 @@ function UserBubble({ text, images, files }: { text: string; images?: ChatImage[
           background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
           color: '#fff', font: '400 14px/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
           boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
-          {text}
+          {nodes}
         </div>
       )}
     </div>
@@ -2412,6 +2478,74 @@ const fmtBytes = (n?: number): string => (n == null ? '' : n < 1024 ? `${n} B` :
 // name reads nicer as "Pasted text"; everything else uses its filename).
 const attachLabel = (a: Attach): string => (a.kind === 'text' && a.name === 'Pasted text.txt' ? 'Pasted text' : a.name);
 
+/* Tiny live state dot for the session rails — subscribes once via the shared
+   cache so a long rail with 20 chats doesn't open 20 sockets. */
+function SessionPillDot({ sessionId }: { sessionId: string }) {
+  const state = useSessionStateOnly(sessionId);
+  return <SessionStateDot state={state} size={8} reserveSpace />;
+}
+
+/* Chat header bar — sits at the very top of the chat. Conductor-style:
+   • the session's stable codename (lowercase, kebab-safe city) +
+   • the live git/PR state chip with one contextual action button +
+   • the Archive button (or "Restore" pill if the chat is archived) +
+   • a quiet branch label so the operator sees what's actually checked out.
+   Renders nothing for no session / non-repo. */
+function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projectId: string | null }) {
+  const session = useSession(sessionId, projectId);
+  const state = useSessionStateOnly(sessionId);
+  const [busy, setBusy] = React.useState(false);
+  if (!sessionId || !session) return null;
+
+  const code = session.codename;
+  const archived = !!session.archived;
+
+  const archive = async () => {
+    if (busy) return;
+    if (!archived && !window.confirm(`Archive “${session.title}”? You can restore it from the rail.`)) return;
+    setBusy(true);
+    try { await api.archiveSession(sessionId, !archived); } catch { /* best-effort */ } finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{
+      position: 'relative', zIndex: 2,
+      display: 'flex', alignItems: 'center', gap: 10,
+      padding: '10px 16px 8px', borderBottom: '0.5px solid var(--separator)',
+      background: 'color-mix(in srgb, var(--bg-elevated) 92%, transparent)',
+      backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+    }}>
+      {code && (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 'var(--r-pill)',
+          background: 'var(--fill-secondary)', font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', letterSpacing: '0.02em' }}>
+          <SessionStateDot state={state} size={8} reserveSpace />
+          {displayCodename(code)}
+        </span>
+      )}
+      <span style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        font: '600 var(--fs-headline)/1.2 var(--font-text)', color: archived ? 'var(--ink-tertiary)' : 'var(--ink)' }}>
+        {session.title}
+      </span>
+      {archived && (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 8px', borderRadius: 'var(--r-pill)',
+          background: 'color-mix(in srgb, var(--ink-tertiary) 15%, transparent)', color: 'var(--ink-secondary)',
+          font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+          <Icon name="archive" size={11} /> Archived
+        </span>
+      )}
+      <GitStatusBar sessionId={sessionId} variant="header" codename={code} />
+      <button onClick={archive} disabled={busy} title={archived ? 'Restore chat' : 'Archive chat'}
+        style={{ height: 28, padding: '0 11px', borderRadius: 8, border: '0.5px solid var(--separator-strong)',
+          background: 'var(--fill-secondary)', color: 'var(--ink)',
+          font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer',
+          display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        <Icon name={archived ? 'enter' : 'archive'} size={12} />
+        {archived ? 'Restore' : 'Archive'}
+      </button>
+    </div>
+  );
+}
+
 export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, onOpenImage, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
@@ -2650,10 +2784,10 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     const t = raw.trim();
     const list = atts ?? [];
     const imgs = list.filter((a): a is Extract<Attach, { kind: 'image' }> => a.kind === 'image')
-      .map(a => ({ name: a.name, mime: a.mime, dataB64: a.dataUrl.includes(',') ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : a.dataUrl }));
+      .map(a => ({ id: a.id, name: a.name, mime: a.mime, dataB64: a.dataUrl.includes(',') ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : a.dataUrl }));
     const files = list.filter(a => a.kind !== 'image' && a.kind !== 'ref').map(a => a.kind === 'text'
-      ? { name: a.name, kind: 'text' as const, content: a.content }
-      : { name: a.name, kind: 'file' as const, mime: (a as Extract<Attach, { kind: 'file' }>).mime, dataB64: (a as Extract<Attach, { kind: 'file' }>).dataB64 });
+      ? { id: a.id, name: a.name, kind: 'text' as const, content: a.content }
+      : { id: a.id, name: a.name, kind: 'file' as const, mime: (a as Extract<Attach, { kind: 'file' }>).mime, dataB64: (a as Extract<Attach, { kind: 'file' }>).dataB64 });
     // File/folder reference capsules: passed to the local agent as on-disk paths
     // (it reads them with its own tools — no bytes uploaded; folders work too).
     const refs = list.filter((a): a is Extract<Attach, { kind: 'ref' }> => a.kind === 'ref');
@@ -2933,6 +3067,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       {/* faint top atmosphere */}
       <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
         background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
+      {/* Conductor-style chat header: codename + state chip + Archive. The
+          GitStatusBar gates itself for non-repo / null sessions. */}
+      <ChatHeader sessionId={activeId} projectId={projectId} />
       <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
         <div style={{ maxWidth: CHAT_W, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
           {turns.length === 0 && (
@@ -3471,14 +3608,23 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
                         onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
                         style={{ width: '100%', border: '1px solid var(--blue)', borderRadius: 6, padding: '2px 6px', background: 'var(--bg)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1.3 var(--font-text)' }} />
                     ) : (
-                      <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
+                      <span title="Double-click to rename" onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
                         style={{ display: 'flex', alignItems: 'center', gap: 5, font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (active ? 'var(--ink)' : 'var(--ink-secondary)'), whiteSpace: 'nowrap', overflow: 'hidden' }}>
+                        <SessionPillDot sessionId={s.id} />
                         {s.importedFrom && <SourceChip source={s.importedFrom} />}
                         <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.title}</span>
                       </span>
                     )}
-                    <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>{relativeTime(s.updatedAt)}</span>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 6, font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>
+                      {s.codename && <span title="Session codename" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', letterSpacing: '0.02em' }}>{displayCodename(s.codename)}</span>}
+                      {s.codename && <span>·</span>}
+                      {relativeTime(s.updatedAt)}
+                    </span>
                   </span>
+                  <button className="sess-x" title="Rename chat" onClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
+                    style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+                    <Icon name="pencil" size={12} />
+                  </button>
                   <button className="sess-x" title={s.archived ? 'Unarchive' : 'Archive chat'} onClick={e => { e.stopPropagation(); archiveSession(s, !s.archived); }}
                     style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: s.archived ? 'var(--blue)' : 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
                     <Icon name="archive" size={12} />

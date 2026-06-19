@@ -12,6 +12,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { quietDeadline } from './whatsapp-quiet.js';
+import { WaStore, type WaChatMeta, type WaStoredMessage, type WaMessageInput, type WaChatKind } from './wa-store.js';
 import type { RemoteDevice } from './relay.js';
 
 export const id = (): string => randomUUID();
@@ -46,6 +47,9 @@ export interface Project {
   /** Manual display order from drag-and-drop. Lower = earlier. Unset → sorts by createdAt. */
   order?: number;
   createdAt: number;
+  /** Set on create + bumped on every mutation (incl. reorder). Drives the
+      relay's delta-sync filter (/api/sync?since=ts). */
+  updatedAt: number;
 }
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
     final result. The chat renders these as separate blocks with timings. */
@@ -78,22 +82,31 @@ export interface TranscriptItem {
 }
 
 /** An image attached to a user message (pasted, dropped, or picked) — vision
-    input for the agent. Stored as an Asset; the bytes stay on the Mac (imagePath
-    is stripped from the relay snapshot). */
-export interface ChatImage { assetId: string; imagePath: string; mime: string; name?: string; width?: number; height?: number }
+    input for the agent. Saved on disk under `<projectCwd>/.continuum/Attachment/`
+    and registered as an Asset; the absolute path is stripped from the relay
+    snapshot (the phone sees only the basename). The `id` is the composer's chip
+    id and matches the `«attach:id»` placeholder substituted into the prompt text
+    AT the chip position. */
+export interface ChatImage { id?: string; assetId: string; imagePath: string; mime: string; name?: string; width?: number; height?: number }
 
-/** A non-image file attached to a user message. 'text' (pasted text or a code/
-    text file) carries its content inline (the engine inlines it; content is
-    stripped from the relay snapshot). 'file' (any binary, e.g. a PDF) is saved on
-    the Mac and the engine references its path (also stripped from the relay). */
+/** A non-image file attached to a user message. Every kind ('text' for pasted
+    text / code, 'file' for any binary) is saved on disk under
+    `<projectCwd>/.continuum/Attachment/` and referenced inline as `@<absPath>`
+    at the chip position — the agent reads the file with its own tools (so a
+    50k-char paste doesn't re-blast the prompt every turn). The `path` (Mac-
+    local) and `content` (legacy) are stripped from the relay snapshot. */
 export interface ChatFile {
+  /** Composer chip id — matches the `«attach:id»` placeholder before substitution. */
+  id?: string;
   name: string;
   kind: 'text' | 'file';
   mime?: string;
   bytes?: number;
-  /** text only: the file's content, inlined into the prompt. Stripped from the relay. */
+  /** Legacy: text content inlined into the prompt. Stripped from the relay. New
+      writes save the text to disk and leave this undefined; kept on the type for
+      back-compat with old persisted jobs. */
   content?: string;
-  /** file only: Mac-local saved path. Stripped from the relay. */
+  /** Mac-local saved path (under `.continuum/Attachment/`). Stripped from the relay. */
   path?: string;
   /** short display preview (first chars / filename). */
   preview?: string;
@@ -138,6 +151,16 @@ export interface ChatSession {
   baseBranch?: string;
   /** Set when the session's worktree has been pruned/archived. */
   archivedAt?: number;
+  /** Memorable per-session city callsign ("lyon", "porto" …). Assigned once at
+      creation; appears in the branch path (`mochi/<codename>/<slug>`) AND in the
+      UI (rails, chat header) so the operator can refer to the session by name
+      instead of an opaque id. */
+  codename?: string;
+  /** Timestamp the branch was auto-renamed from its initial codename-only form
+      to a task-derived slug. Set once; gates the rename so we don't keep
+      renaming as the title evolves (and to keep the name locked once a PR
+      exists on GitHub). */
+  branchRenamedAt?: number;
   /** Imported from an external store (Claude/Codex/Conductor) — read-only history. */
   importedFrom?: 'claude' | 'codex' | 'conductor';
   /** Source-side conversation id; dedupes re-imports of the same conversation. */
@@ -147,6 +170,17 @@ export interface ChatSession {
 export interface Approval {
   id: string; projectId: string | null; kind: ApprovalKind; title: string; subtitle: string; detail: string;
   status: ApprovalStatus; jobId?: string | null; createdAt: number; resolvedAt: number | null;
+  /** Set on create + bumped on every status change. Drives the relay's
+      delta-sync filter (/api/sync?since=ts). */
+  updatedAt: number;
+}
+
+/** Soft-deletion marker so a delta-sync caller learns about removals. The Mac
+    keeps the last ~1000 across all entity kinds in `data.tombstones`. */
+export interface Tombstone {
+  kind: 'project' | 'session' | 'job' | 'asset' | 'approval';
+  id: string;
+  ts: number;
 }
 export interface Schedule {
   id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean;
@@ -318,10 +352,20 @@ export interface WhatsAppState {
   linkedAt: number | null;
   /** The one-time send gate: until the operator approves, no summary is sent. */
   sendApproved: boolean;
-  /** A summary produced before the operator approved sending — flushed on approval. */
-  pendingSummary?: { text: string; chatName: string; at: number } | null;
+  /** Durable outbox of summaries awaiting delivery — held until sending is approved
+      AND the socket is connected, then flushed (retried). Survives restarts so a
+      power-off mid-window never drops a summary (it's delivered on next availability). */
+  pendingSummaries?: { id: string; text: string; chatName: string; at: number }[];
+  /** Whether the in-app agent may message contacts OTHER than your own number.
+      Off by default — the agent can always message your own number (confirmations,
+      updates), but messaging real contacts requires this opt-in. */
+  agentSendToOthers?: boolean;
+  /** The operator's PERSONAL number (JID) where summaries + agent confirmations are
+      sent. Distinct from `jid` (the linked account — often a separate "app" number).
+      When unset, notifications fall back to the linked account's own "note to self". */
+  notifyJid?: string | null;
 }
-export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null };
+export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [], agentSendToOthers: false, notifyJid: null };
 
 /** One captured WhatsApp message (normalized, text-only — media is noted as a kind). */
 export interface WaMessage { id: string; chatId: string; fromMe: boolean; senderName: string; text: string; ts: number }
@@ -333,8 +377,6 @@ export interface WaChat {
   lastReportedAt: number;
   messages: WaMessage[];
 }
-/** Per-chat capture cap — keeps the JSON store bounded; oldest messages roll off. */
-export const WA_MSG_CAP = 300;
 
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
@@ -433,6 +475,9 @@ interface StoreData {
   briefs: Brief[];
   researchRuns: ResearchRun[];
   events: AppEvent[];
+  /** Soft-deletion markers (last ~1000 across kinds). Lets delta-sync clients
+      learn about removals without diffing the whole list. */
+  tombstones?: Tombstone[];
   chatBindings: ChatBinding[];
   pendingChats: PendingChat[];
   commEvents: CommEvent[];
@@ -519,6 +564,11 @@ export interface DesignComment {
 }
 
 const CATALOG_VERSION = 2;
+/** Delta-sync: how many soft-deletion markers to keep before evicting the
+    oldest. Sized for ~1 week of typical churn on a busy user. A client whose
+    last sync predates the oldest tombstone should treat the next pull as a
+    full re-sync (drop local store, GET /api/sync?since=0). */
+const MAX_TOMBSTONES = 1000;
 const SEED_PROJECT_NAMES = ['Atlas API', 'Q3 Content', 'Market Scan', 'Brand Refresh', 'Infra / CI'];
 const SEED_JOB_TITLE = 'Merge PR #482 — auth refactor';
 
@@ -527,13 +577,31 @@ const ASSET_TINTS = ['#5b8cff', '#9b6bff', '#41c8d4', '#ff9f6b', '#6bd49a', '#ff
 export class Store {
   private file: string;
   private data!: StoreData;
+  /** Full WhatsApp chat + message store (every chat, JSONL-backed). The
+      monolithic `waChats` field is legacy — migrated into this on first load. */
+  readonly wa: WaStore;
 
   constructor() {
     const dir = app.getPath('userData');
     mkdirSync(dir, { recursive: true });
     this.file = join(dir, 'maestro-store.json');
+    this.wa = new WaStore(join(dir, 'whatsapp', 'primary', 'store'));
     this.load();
+    this.migrateInlineWaChats();
     this.seedCatalog();
+  }
+
+  /** One-time lift of any legacy inline `waChats` (captured by older builds into
+      maestro-store.json) into the JSONL-backed WaStore, then clear the inline copy. */
+  private migrateInlineWaChats(): void {
+    const inline = this.data.waChats;
+    if (!inline || Object.keys(inline).length === 0) return;
+    for (const c of Object.values(inline)) {
+      this.wa.upsertChat({ chatId: c.chatId, name: c.name, kind: c.kind, lastMessageAt: c.lastMessageAt, lastReportedAt: c.lastReportedAt });
+      for (const m of c.messages) this.wa.appendMessage({ chatId: c.chatId, fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: 'text' }, { bumpUnread: false });
+    }
+    this.data.waChats = {};
+    this.save();
   }
 
   private load(): void {
@@ -566,12 +634,23 @@ export class Store {
       if (!this.data.briefs) { this.data.briefs = []; dirty = true; }
       if (!this.data.researchRuns) { this.data.researchRuns = []; dirty = true; }
       if (!this.data.events) { this.data.events = []; dirty = true; }
+      if (!this.data.tombstones) { this.data.tombstones = []; dirty = true; }
+      // Backfill `updatedAt` on entities written by an older build (delta-sync
+      // protocol needs it on every row, but it's been added incrementally).
+      for (const p of this.data.projects) if (p.updatedAt === undefined) { p.updatedAt = p.createdAt; dirty = true; }
+      for (const a of this.data.approvals) if (a.updatedAt === undefined) { a.updatedAt = a.resolvedAt ?? a.createdAt; dirty = true; }
       if (!this.data.chatBindings) { this.data.chatBindings = []; dirty = true; }
       if (!this.data.pendingChats) { this.data.pendingChats = []; dirty = true; }
       if (!this.data.commEvents) { this.data.commEvents = []; dirty = true; }
       if (!this.data.feedback) { this.data.feedback = []; dirty = true; }
       if (!this.data.telegram) { this.data.telegram = { offset: 0, botUsername: null, connectedAt: null }; dirty = true; }
-      if (!this.data.whatsapp) { this.data.whatsapp = { ...DEFAULT_WHATSAPP_STATE }; dirty = true; }
+      if (!this.data.whatsapp) { this.data.whatsapp = { ...DEFAULT_WHATSAPP_STATE, pendingSummaries: [] }; dirty = true; }
+      if (this.data.whatsapp && !this.data.whatsapp.pendingSummaries) {
+        const old = (this.data.whatsapp as { pendingSummary?: { text: string; chatName: string; at: number } | null }).pendingSummary;
+        this.data.whatsapp.pendingSummaries = old ? [{ id: id(), text: old.text, chatName: old.chatName, at: old.at }] : [];
+        delete (this.data.whatsapp as { pendingSummary?: unknown }).pendingSummary;
+        dirty = true;
+      }
       if (!this.data.waChats) { this.data.waChats = {}; dirty = true; }
 
       // One-time demo-data purge: only fires on the full seed fingerprint so a
@@ -604,9 +683,10 @@ export class Store {
         workspace: null,
         projects: [], jobs: [], sessions: [], approvals: [], schedules: [], skills: [], templates: [],
         assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
+        tombstones: [],
         chatBindings: [], pendingChats: [], commEvents: [], feedback: [],
         telegram: { offset: 0, botUsername: null, connectedAt: null },
-        whatsapp: { ...DEFAULT_WHATSAPP_STATE }, waChats: {},
+        whatsapp: { ...DEFAULT_WHATSAPP_STATE, pendingSummaries: [] }, waChats: {},
         providerKeys: {},
       };
       this.save();
@@ -799,11 +879,12 @@ export class Store {
   }
   createProject(args: { name: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }): Project {
     const ws = this.data.workspace ?? this.createWorkspace('My Workspace');
+    const t = now();
     const p: Project = {
       id: id(), workspaceId: ws.id, name: this.uniqueProjectName(args.name),
       template: args.template ?? 'claude-code', instructions: args.instructions ?? '', color: args.color ?? 'blue',
       kind: args.kind, path: args.path, repoUrl: args.repoUrl,
-      createdAt: now(),
+      createdAt: t, updatedAt: t,
     };
     this.data.projects.push(p); this.save();
     return p;
@@ -811,30 +892,45 @@ export class Store {
   updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template'>>): Project {
     const cur = this.getProject(projectId);
     if (!cur) throw Object.assign(new Error('project not found'), { statusCode: 404 });
-    Object.assign(cur, patch);
+    Object.assign(cur, patch, { updatedAt: now() });
     this.save();
     return cur;
   }
   /** Persist a manual display order from drag-and-drop. Each id's position in
-      `orderedIds` becomes its `order`; ids not present keep their current order. */
+      `orderedIds` becomes its `order`; ids not present keep their current order.
+      Bumps `updatedAt` on the touched projects so delta-sync clients reorder too. */
   reorderProjects(orderedIds: string[]): Project[] {
+    const t = now();
     orderedIds.forEach((pid, i) => {
       const p = this.data.projects.find(x => x.id === pid);
-      if (p) p.order = i;
+      if (p) { p.order = i; p.updatedAt = t; }
     });
     this.save();
     return this.listProjects();
   }
-  /** Remove a project + its jobs/sessions/schedules. Files on disk are untouched. */
+  /** Remove a project + its jobs/sessions/schedules. Files on disk are untouched.
+      Records tombstones for every removed entity so delta-sync clients learn. */
   deleteProject(projectId: string): void {
     const i = this.data.projects.findIndex(p => p.id === projectId);
     if (i === -1) throw Object.assign(new Error('project not found'), { statusCode: 404 });
     this.data.projects.splice(i, 1);
+    this.recordTombstone('project', projectId);
+    for (const j of this.data.jobs) if (j.projectId === projectId) this.recordTombstone('job', j.id);
+    for (const s of this.data.sessions) if (s.projectId === projectId) this.recordTombstone('session', s.id);
     this.data.jobs = this.data.jobs.filter(j => j.projectId !== projectId);
     this.data.sessions = this.data.sessions.filter(s => s.projectId !== projectId);
     this.data.schedules = this.data.schedules.filter(s => s.projectId !== projectId);
     for (const a of this.data.assets) if (a.projectId === projectId) a.projectId = null;
     this.save();
+  }
+
+  /** Append a soft-deletion marker so the relay can serve it through
+      /api/sync?since=<ts>. Capped to the last MAX_TOMBSTONES entries — older
+      ones drop, so very stale clients should treat that as "full re-sync". */
+  private recordTombstone(kind: Tombstone['kind'], entityId: string): void {
+    const list = this.data.tombstones ?? (this.data.tombstones = []);
+    list.push({ kind, id: entityId, ts: now() });
+    if (list.length > MAX_TOMBSTONES) list.splice(0, list.length - MAX_TOMBSTONES);
   }
 
   // ── Chat sessions ───────────────────────────────────────────────────
@@ -843,13 +939,23 @@ export class Store {
     return (projectId ? all.filter(s => s.projectId === projectId) : all).slice(0, 100);
   }
   getSession(sessionId: string): ChatSession | undefined { return this.data.sessions.find(s => s.id === sessionId); }
-  createSession(projectId: string, title: string): ChatSession {
+  /** Codenames already in use inside `projectId` — used to pick a unique one
+      for a new session. Cheap (a single linear scan over the project's chats). */
+  usedCodenamesIn(projectId: string): Set<string> {
+    const used = new Set<string>();
+    for (const s of this.data.sessions) {
+      if (s.projectId === projectId && s.codename) used.add(s.codename);
+    }
+    return used;
+  }
+  createSession(projectId: string, title: string, codename?: string): ChatSession {
     const t = now();
     const s: ChatSession = { id: id(), projectId, title: (title.trim() || 'New chat').slice(0, 60), createdAt: t, updatedAt: t };
+    if (codename) s.codename = codename;
     this.data.sessions.push(s); this.save();
     return s;
   }
-  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt'>>): ChatSession {
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt' | 'codename' | 'branchRenamedAt'>>): ChatSession {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     Object.assign(s, patch, { updatedAt: now() });
@@ -882,8 +988,11 @@ export class Store {
     const i = this.data.sessions.findIndex(s => s.id === sessionId);
     if (i === -1) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     this.data.sessions.splice(i, 1);
-    // Turns stay in the jobs ledger (costs/audit) but leave the chat.
-    for (const j of this.data.jobs) if (j.sessionId === sessionId) j.sessionId = undefined;
+    this.recordTombstone('session', sessionId);
+    // Turns stay in the jobs ledger (costs/audit) but leave the chat. Bump
+    // each affected job's `updatedAt` so a delta-sync client re-fetches them.
+    const t = now();
+    for (const j of this.data.jobs) if (j.sessionId === sessionId) { j.sessionId = undefined; j.updatedAt = t; }
     this.save();
   }
   /** External-conversation ids already imported into a project (re-scan dedupe). */
@@ -962,6 +1071,7 @@ export class Store {
     const i = this.data.jobs.findIndex(j => j.id === jobId);
     if (i === -1) throw Object.assign(new Error('job not found'), { statusCode: 404 });
     this.data.jobs.splice(i, 1);
+    this.recordTombstone('job', jobId);
     this.save();
   }
   /** Boot sweep: jobs left 'running'/'pending' by a previous app instance can
@@ -987,10 +1097,11 @@ export class Store {
     return status ? all.filter(a => a.status === status) : all.slice(0, 200);
   }
   createApproval(a: { projectId?: string | null; kind?: ApprovalKind; title: string; subtitle?: string; detail?: string; jobId?: string | null }): Approval {
+    const t = now();
     const rec: Approval = {
       id: id(), projectId: a.projectId ?? null, kind: a.kind ?? 'review', title: a.title,
       subtitle: a.subtitle ?? '', detail: a.detail ?? '', status: 'pending', jobId: a.jobId ?? null,
-      createdAt: now(), resolvedAt: null,
+      createdAt: t, resolvedAt: null, updatedAt: t,
     };
     this.data.approvals.push(rec); this.save();
     return rec;
@@ -998,7 +1109,8 @@ export class Store {
   resolveApproval(approvalId: string, status: 'approved' | 'denied'): Approval {
     const cur = this.data.approvals.find(a => a.id === approvalId);
     if (!cur) throw Object.assign(new Error('approval not found'), { statusCode: 404 });
-    cur.status = status; cur.resolvedAt = now();
+    const t = now();
+    cur.status = status; cur.resolvedAt = t; cur.updatedAt = t;
     this.save();
     return cur;
   }
@@ -1129,16 +1241,23 @@ export class Store {
   /** Relay-safe projection of a Job: truncate long output, trim the run log, and
       strip every Mac-local image path (attached inputImages AND transcript image
       items) so the phone never learns a filesystem path. Used by BOTH the snapshot
-      and the live 'job' event / command results, so no channel can leak it. */
+      and the live 'job' event / command results, so no channel can leak it.
+      Also rewrites `@<absPath>` inline-attachment markers inside the user's
+      prompt + every transcript text block to `@.continuum/Attachment/<basename>`
+      so the phone gets the chip's POSITION + name without the operator's home
+      directory. */
   slimJobForRelay(j: Job): Job {
-    const out = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
+    const scrub = (s: string): string => s.replace(/@(\/[^\s]+\/\.continuum\/Attachment\/([A-Za-z0-9._-]+))/g, (_m, _full: string, base: string) => `@.continuum/Attachment/${base}`);
+    const rawOut = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
+    const out = rawOut ? scrub(rawOut) : rawOut;
     const tr = j.transcript;
     const slimItem = (t: TranscriptItem): TranscriptItem => {
       if (t.kind === 'image') { const { imagePath: _omit, ...rest } = t; return rest; }
-      return t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t;
+      const text = scrub(t.text.length > 4000 ? t.text.slice(0, 4000) + '…' : t.text);
+      return text === t.text ? t : { ...t, text };
     };
     const transcript = !tr ? undefined
-      : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image')) ? tr
+      : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image' || t.text.includes('@/'))) ? tr
       : tr.slice(-60).map(slimItem);
     const needsImgStrip = j.inputImages?.some(im => im.imagePath !== undefined);
     const inputImages = needsImgStrip ? j.inputImages!.map(({ imagePath: _omit, ...rest }) => rest as ChatImage) : j.inputImages;
@@ -1146,8 +1265,10 @@ export class Store {
     // phone keeps only name/kind/mime/bytes/preview.
     const needsFileStrip = j.inputFiles?.some(f => f.content !== undefined || f.path !== undefined);
     const inputFiles = needsFileStrip ? j.inputFiles!.map(({ content: _c, path: _p, ...rest }) => rest as ChatFile) : j.inputFiles;
-    if (out === j.output && transcript === tr && inputImages === j.inputImages && inputFiles === j.inputFiles) return j;
-    return { ...j, output: out, transcript, ...(inputImages !== j.inputImages ? { inputImages } : {}), ...(inputFiles !== j.inputFiles ? { inputFiles } : {}) };
+    const inputScrubbed = scrub(j.input);
+    const input = inputScrubbed === j.input ? j.input : inputScrubbed;
+    if (out === j.output && transcript === tr && inputImages === j.inputImages && inputFiles === j.inputFiles && input === j.input) return j;
+    return { ...j, input, output: out, transcript, ...(inputImages !== j.inputImages ? { inputImages } : {}), ...(inputFiles !== j.inputFiles ? { inputFiles } : {}) };
   }
   createAsset(args: Partial<Asset> & { source: Asset['source']; kind: AssetKind; status: AssetStatus }): Asset {
     const t = now();
@@ -1174,6 +1295,7 @@ export class Store {
     const i = this.data.assets.findIndex(a => a.id === assetId);
     if (i === -1) throw Object.assign(new Error('asset not found'), { statusCode: 404 });
     const [removed] = this.data.assets.splice(i, 1);
+    this.recordTombstone('asset', assetId);
     this.save();
     return removed;
   }
@@ -1260,6 +1382,13 @@ export class Store {
   bindChat(args: { chatId: string; name: string; kind: 'dm' | 'group'; provider?: CommsProvider; projectId?: string | null; sessionId?: string | null; permissions?: Partial<ChatPermissions> }): ChatBinding {
     const existing = this.getChatBinding(args.chatId);
     const perms: ChatPermissions = { startJobs: true, receiveReports: true, approveGates: false, ...(args.permissions ?? {}) };
+    // Tracking a WhatsApp chat that already synced history: seed the summary
+    // watermark to its latest message so the first quiet-period summary covers only
+    // what arrives AFTER tracking — not the entire synced backlog.
+    if ((args.provider ?? existing?.provider) === 'whatsapp') {
+      const meta = this.wa.getChat(args.chatId);
+      if (meta) this.wa.markReported(args.chatId, meta.lastMessageAt);
+    }
     if (existing) {
       Object.assign(existing, {
         name: args.name, kind: args.kind, provider: args.provider ?? existing.provider ?? 'telegram',
@@ -1346,39 +1475,73 @@ export class Store {
     this.save();
     return this.whatsappState();
   }
-  /** Append a captured message to its chat's rolling log (cap WA_MSG_CAP), creating
-      the chat record on first sight. Returns the chat. Frequent — debounced save. */
-  recordWaMessage(m: { chatId: string; name?: string; kind?: 'dm' | 'group'; fromMe: boolean; senderName: string; text: string; ts: number }): WaChat {
-    let chat = this.data.waChats[m.chatId];
-    if (!chat) chat = this.data.waChats[m.chatId] = { chatId: m.chatId, name: m.name ?? m.chatId, kind: m.kind ?? 'dm', lastMessageAt: 0, lastReportedAt: 0, messages: [] };
-    if (m.name) chat.name = m.name;
-    if (m.kind) chat.kind = m.kind;
-    chat.messages.push({ id: id(), chatId: m.chatId, fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts });
-    if (chat.messages.length > WA_MSG_CAP) chat.messages.splice(0, chat.messages.length - WA_MSG_CAP);
-    chat.lastMessageAt = Math.max(chat.lastMessageAt, m.ts);
-    this.saveSoon();
-    return chat;
+  /** Durable summary outbox: queue on generation, flush (drop) on successful send. */
+  queueSummary(input: { text: string; chatName: string }): void {
+    const wa = this.data.whatsapp;
+    if (!wa.pendingSummaries) wa.pendingSummaries = [];
+    wa.pendingSummaries.push({ id: id(), text: input.text, chatName: input.chatName, at: now() });
+    if (wa.pendingSummaries.length > 100) wa.pendingSummaries.splice(0, wa.pendingSummaries.length - 100);
+    this.save();
   }
-  /** Read a chat's captured transcript. `sinceReported` returns only messages
-      newer than the last summary watermark — what a quiet period needs to analyze. */
+  listPendingSummaries(): Array<{ id: string; text: string; chatName: string; at: number }> {
+    return [...(this.data.whatsapp.pendingSummaries ?? [])];
+  }
+  dropPendingSummary(summaryId: string): void {
+    const wa = this.data.whatsapp;
+    if (!wa.pendingSummaries) return;
+    wa.pendingSummaries = wa.pendingSummaries.filter(p => p.id !== summaryId);
+    this.save();
+  }
+  /** Capture a message (legacy shim → WaStore). Used by the quiet-timer ingest path
+      and tests; WaStore appends O(1) to the chat's JSONL log. */
+  recordWaMessage(m: { chatId: string; name?: string; kind?: 'dm' | 'group'; fromMe: boolean; senderName: string; text: string; ts: number }): void {
+    if (m.name || m.kind) this.wa.upsertChat({ chatId: m.chatId, ...(m.name ? { name: m.name } : {}), ...(m.kind ? { kind: m.kind } : {}) });
+    this.wa.appendMessage({ chatId: m.chatId, fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: 'text' });
+  }
+  /** Read a chat's transcript. `sinceReported` returns only messages newer than the
+      last summary watermark — what a quiet period needs to analyze. */
   getWaTranscript(chatId: string, opts: { sinceReported?: boolean } = {}): WaMessage[] {
-    const chat = this.data.waChats[chatId];
-    if (!chat) return [];
-    const msgs = opts.sinceReported ? chat.messages.filter(m => m.ts > chat.lastReportedAt) : chat.messages;
-    return msgs.map(m => ({ ...m }));
+    return this.wa.getMessages(chatId, { sinceReported: opts.sinceReported });
   }
   /** Advance a chat's report watermark so the next quiet period only sees newer messages. */
-  markWaReported(chatId: string, ts: number): void {
-    const chat = this.data.waChats[chatId];
-    if (chat) { chat.lastReportedAt = Math.max(chat.lastReportedAt, ts); this.save(); }
-  }
-  /** Tracked-chat summaries (no inlined message bodies — for the snapshot/UI). */
-  listWaChats(): Array<Omit<WaChat, 'messages'> & { count: number }> {
-    return Object.values(this.data.waChats).map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, lastMessageAt: c.lastMessageAt, lastReportedAt: c.lastReportedAt, count: c.messages.length }));
+  markWaReported(chatId: string, ts: number): void { this.wa.markReported(chatId, ts); }
+  /** Captured chats with message counts (back-compat shape for the Comms Bindings tab). */
+  listWaChats(): Array<{ chatId: string; name: string; kind: WaChatKind; lastMessageAt: number; lastReportedAt: number; count: number }> {
+    return this.wa.listChats().map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, lastMessageAt: c.lastMessageAt, lastReportedAt: c.lastReportedAt, count: this.wa.count(c.chatId) }));
   }
   /** Forget a chat's captured log entirely (on untrack/unbind). */
-  forgetWaChat(chatId: string): void {
-    if (this.data.waChats[chatId]) { delete this.data.waChats[chatId]; this.save(); }
+  forgetWaChat(chatId: string): void { this.wa.forget(chatId); }
+
+  // ── WhatsApp full chat store (the WhatsApp screen + agent wa_* tools) ──
+  /** Every captured chat (DMs, groups, channels), pinned-then-newest-first. */
+  waListChats(): WaChatMeta[] { return this.wa.listChats(); }
+  waGetChat(chatId: string): WaChatMeta | undefined { return this.wa.getChat(chatId); }
+  /** A chat's messages for the UI: most-recent `limit`, page older with `before`. */
+  waMessages(chatId: string, opts: { limit?: number; before?: number } = {}): WaStoredMessage[] { return this.wa.getMessages(chatId, opts); }
+  waUpsertChat(meta: { chatId: string } & Partial<WaChatMeta>): WaChatMeta { return this.wa.upsertChat(meta); }
+  waAppendMessage(input: WaMessageInput, opts?: { bumpUnread?: boolean }): WaStoredMessage | null { return this.wa.appendMessage(input, opts); }
+  waUpdateMessage(chatId: string, msgIdOrId: string, patch: Partial<WaStoredMessage>): void { this.wa.updateMessage(chatId, msgIdOrId, patch); }
+  waMarkRead(chatId: string): void { this.wa.markRead(chatId); }
+  waSetUnread(chatId: string, n: number): void { this.wa.setUnread(chatId, n); }
+
+  // ── Per-project WhatsApp chat assignment ────────────────────────────
+  // Backed by whatsapp ChatBindings (single source of truth), so assigning a chat
+  // here also makes it "tracked" (incoming messages route to the project + the
+  // quiet-timer machinery applies) and it shows in the Comms Bindings tab.
+  listProjectWaChats(projectId: string): string[] {
+    return this.data.chatBindings.filter(b => b.provider === 'whatsapp' && b.projectId === projectId).map(b => b.chatId);
+  }
+  addProjectWaChat(projectId: string, chatId: string): string[] {
+    const meta = this.wa.getChat(chatId);
+    this.bindChat({ chatId, name: meta?.name ?? chatId, kind: meta?.kind === 'group' ? 'group' : 'dm', provider: 'whatsapp', projectId });
+    return this.listProjectWaChats(projectId);
+  }
+  removeProjectWaChat(projectId: string, chatId: string): string[] {
+    // Stop routing/summaries but KEEP the captured history (it still shows in the
+    // WhatsApp screen) — only a full unlink wipes message logs.
+    this.cancelWhatsappTimer(chatId);
+    this.unbindChat(chatId);
+    return this.listProjectWaChats(projectId);
   }
 
   // ── Feedback (collected from desktop / web / phone) ─────────────────
@@ -1523,6 +1686,9 @@ export class Store {
       briefs: this.listBriefs(),
       researchRuns: this.listResearchRuns(),
       events: this.listEvents(),
+      // Soft-deletion markers — relays serve these via /api/sync?since=<ts> so
+      // mobile clients learn what to forget without diffing the whole list.
+      tombstones: this.data.tombstones ?? [],
       chatBindings: this.listChatBindings(),
       pendingChats: this.listPendingChats(),
       commEvents: this.listCommEvents(),

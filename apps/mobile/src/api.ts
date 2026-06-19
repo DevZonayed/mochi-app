@@ -15,7 +15,7 @@ export interface DirEntry { name: string; path: string; isDir: boolean; isRepo: 
 export interface DirListing { path: string; parent: string | null; home: string; entries: DirEntry[]; error?: string }
 
 export interface Workspace { id: string; name: string; budgetCap: number; createdAt: number }
-export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; kind?: ProjectKind; path?: string; repoUrl?: string; createdAt: number }
+export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; kind?: ProjectKind; path?: string; repoUrl?: string; order?: number; createdAt: number; updatedAt: number }
 /** One structured block of an agent run (mirrors the desktop, image bytes stripped). */
 export interface TranscriptItem {
   kind: 'text' | 'tool' | 'result' | 'ask' | 'review' | 'image';
@@ -57,7 +57,22 @@ export interface JobDiff {
   reason?: string;
 }
 export interface Approval {
-  id: string; projectId: string | null; kind: ApprovalKind; title: string; subtitle: string; detail: string; status: ApprovalStatus; jobId?: string | null; createdAt: number; resolvedAt: number | null;
+  id: string; projectId: string | null; kind: ApprovalKind; title: string; subtitle: string; detail: string; status: ApprovalStatus; jobId?: string | null; createdAt: number; resolvedAt: number | null; updatedAt: number;
+}
+
+/** Delta-sync envelope (GET /api/sync?since=<ts>). Mirrors the relay's
+    `SyncDelta` shape. Mobile feeds `at` back into the next pull as `since`. */
+export interface SyncDelta {
+  at: number;
+  host: { online: boolean };
+  changed: {
+    projects: Project[]; sessions: ChatSession[]; jobs: Job[];
+    approvals: Approval[]; assets: Asset[]; events: AppEvent[];
+  };
+  deleted: {
+    projects: string[]; sessions: string[]; jobs: string[];
+    approvals: string[]; assets: string[];
+  };
 }
 export type AppEventKind =
   | 'job-done' | 'job-failed' | 'job-cancelled'
@@ -296,12 +311,24 @@ export const api = {
   deleteProject: (id: string) => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' }),
 
   listJobs: (projectId?: string, sessionId?: string) => req<Job[]>('/api/jobs' + qp({ projectId, sessionId })),
+  /** Delta sync — returns ONLY entities that have changed since `since` (a
+      timestamp from a prior `at` in the same shape) + ids that were deleted.
+      `since=0` is the cold-start case and returns the entire current state.
+      Used by the unified `syncStore` instead of the per-collection list calls. */
+  sync: (since: number) => req<SyncDelta>('/api/sync' + qp({ since: since > 0 ? String(since) : undefined })),
 
   /** Chat sessions inside a project (the desktop's project → sessions tree). */
   listSessions: (projectId?: string) => req<ChatSession[]>('/api/sessions' + qp({ projectId })),
   /** Send a chat turn. Omit sessionId to start a new session. The reply streams
-      in via live `job` events; refetch the session's jobs to render it. */
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; effort?: Effort; engine?: EngineId; modelKey?: string }) =>
+      in via live `job` events; refetch the session's jobs to render it.
+      Attachments piggy-back as `images[]` (vision input) and `files[]` (text
+      inlined into the prompt, binary saved on the Mac) — mirrors the desktop
+      composer's payload shape so the same Mac-side ingestor handles both. */
+  sendChat: (input: {
+    projectId: string; text: string; sessionId?: string; effort?: Effort; engine?: EngineId; modelKey?: string;
+    images?: { name?: string; mime: string; dataB64: string }[];
+    files?: { name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[];
+  }) =>
     req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) }),
   createJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
     req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) }),
@@ -384,7 +411,12 @@ export const api = {
 /** Live host events the relay fans out over SSE (the same names the Mac emits). */
 export type LiveEventName =
   | 'job' | 'session' | 'approval' | 'asset' | 'comms' | 'briefs'
-  | 'schedule' | 'schedule-late' | 'git-status' | 'extension' | 'host' | 'hello';
+  | 'schedule' | 'schedule-late' | 'git-status' | 'extension' | 'host' | 'hello'
+  /** One-shot replay frames for events missed while disconnected. The relay
+      emits these on connect when `?since=<ts>` is set; payload mirrors an
+      `AppEvent` from the Mac's event log. Treated like a live event by the
+      sync store: the entity is upserted and `lastSync` bumps to `event.ts`. */
+  | 'replay';
 
 /* ── Connection path ──────────────────────────────────────────────────────
    Which transport the live stream is on RIGHT NOW: 'p2p' (direct WebRTC) once the
@@ -415,8 +447,8 @@ export async function postSignal(signal: unknown): Promise<void> {
     once it's open, host events arrive over P2P and the duplicate SSE app-events are
     suppressed (commands stay on REST). The link is native-free until started, so
     Expo Go / web simply keep using SSE. */
-export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => void): () => void {
-  const NAMES: LiveEventName[] = ['job', 'session', 'approval', 'asset', 'comms', 'briefs', 'schedule', 'schedule-late', 'git-status', 'extension', 'host', 'hello'];
+export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => void, since: number = 0): () => void {
+  const NAMES: LiveEventName[] = ['job', 'session', 'approval', 'asset', 'comms', 'briefs', 'schedule', 'schedule-late', 'git-status', 'extension', 'host', 'hello', 'replay'];
 
   const link = createP2PLink({
     postSignal: (s) => { void postSignal(s); },
@@ -434,7 +466,11 @@ export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => 
   // Only attempt P2P if the Mac enabled it; otherwise stay purely on SSE.
   void api.getSettings().then((s) => { if (s?.p2pEnabled) link.start(); }).catch(() => { /* stay on SSE */ });
 
-  const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME) + '&did=' + encodeURIComponent(getDeviceId()), {
+  // `?since=<ts>` asks the relay to replay any events with `ts > since` from
+  // the snapshot's event log before going live — covers the burst missed
+  // while backgrounded so a foreground transition picks up cleanly.
+  const sinceQuery = since > 0 ? '&since=' + encodeURIComponent(String(since)) : '';
+  const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME) + '&did=' + encodeURIComponent(getDeviceId()) + sinceQuery, {
     headers: pairToken ? { Authorization: `Bearer ${pairToken}` } : undefined,
     // Keep the long-lived stream open; reconnect a few seconds after any drop.
     pollingInterval: 4000,

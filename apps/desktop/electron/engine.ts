@@ -21,11 +21,15 @@ import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { branchSlug, isGitRepo } from './git.js';
+import { pickCityCodename } from './codenames.js';
 import { ensureSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
+import { makeGitCtx, type GitCtx } from './git-ctx.js';
+import type { GitService } from './git-service.js';
+import { waSendAllowed } from './whatsapp.js';
 import type { CronRunner } from './cron.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import type { Providers } from './providers.js';
@@ -87,6 +91,16 @@ const BROWSER_DIRECTIVE =
   `browser_snapshot / browser_read before acting. Accomplish the task on the live page; only fall back to ` +
   `WebSearch if no browser is connected.`;
 
+const WHATSAPP_DIRECTIVE =
+  `\n\n---\n\n[WhatsApp connected] This Mac is linked to the user's WhatsApp. When the user asks anything ` +
+  `about WhatsApp — to read their chats/messages, see who messaged them, or SEND a message (e.g. "message ` +
+  `my number", "send me a confirmation/update", "reply to X", "text the team") — use the ` +
+  `mcp__maestro__wa_list_chats / wa_get_messages / wa_send_message / wa_mark_read tools. Do NOT claim ` +
+  `WhatsApp is unavailable. Messaging the user's OWN number always works (their linked account OR the ` +
+  `personal number they set in Comms — for "message my number"/"send me a confirmation", call wa_send_message ` +
+  `with no chatId/phone and it goes to that personal number); messaging other contacts is blocked unless they ` +
+  `enabled it (the send tool will tell you). Chats assigned to THIS project are marked [project] — prefer them.`;
+
 const DESIGN_DIRECTIVE =
   `\n\n---\n\n[Design mode] You are a senior product designer working in a live design ` +
   `canvas. Build and iteratively refine ONE self-contained artifact at \`design/index.html\` ` +
@@ -130,6 +144,29 @@ const BG_DIRECTIVE =
   `came up, tell the user the URL and how to stop it, then finish your reply — do NOT sit and ` +
   `wait on it. Use the normal shell only for commands that finish quickly (install, build, ` +
   `test, git, file ops).`;
+/* PR lifecycle — appended when the chat has a live worktree + branch on a
+   GitHub repo. This is the Conductor-style recipe: ONE chat owns ONE branch
+   for its whole life; the agent uses the maestro PR/git tools to drive the
+   lifecycle deterministically (never shells out to `gh pr create` directly —
+   the MCP tools handle auth, the active worktree, and emit the right events
+   so the chat header reflects what's happening). */
+const PR_DIRECTIVE =
+  `\n\n---\n\n[Git / PR lifecycle] This chat has its OWN git branch and worktree on a GitHub repo. ` +
+  `When the user asks for any of these, use the MCP tools — never shell out to \`gh pr create\` / ` +
+  `\`git push\` / \`git merge\` via Bash for these specific intents (it bypasses auth, the active ` +
+  `worktree, and the live status events the UI reads):\n\n` +
+  `• "create a PR" / "open a PR" / "ship this" / "let's PR": call git_status first; if dirty, ` +
+  `commit with Bash (\`git add -A && git commit -m "…"\`); then call pr_create (pushes for you).\n` +
+  `• "merge" / "land it" / "ship": call pr_merge — only when git_status reports pr-mergeable.\n` +
+  `• "resolve the conflicts" / "fix the conflicts" / a PR shows pr-conflicts: call ` +
+  `pr_resolve_conflicts. If it returns conflicted files, Read each, Edit out the ` +
+  `<<<<<<</=======/>>>>>>> markers keeping the intended content, Bash-commit, then call ` +
+  `pr_resolve_conflicts again to confirm clean + push.\n` +
+  `• "push" / "send to github" without a PR ask: call git_push.\n` +
+  `• Status questions ("what's the state?" / "is the PR ready?"): call git_status.\n\n` +
+  `Always run git_status BEFORE the action so you know what step the lifecycle is on. ` +
+  `Bash is still the right tool for commits, diffs, and inspections — just not for the ` +
+  `push/PR/merge/resolve actions themselves.`;
 // SP3 — primary↔reviewer loop: how many review→fix→re-review rounds at most.
 const REVIEW_MAX_ROUNDS = 2;
 // Codex already ships a native built-in `image_gen` skill (rides the ChatGPT
@@ -448,6 +485,22 @@ interface BrowserCtx {
   call: (type: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
 }
 
+/* WhatsApp capability for the agent — backed by THIS Mac's Baileys socket + store.
+   The agent can read the user's chats/messages and send (its OWN number freely;
+   other contacts gated behind an opt-in). Off in plan mode / when not linked. */
+interface CommsCtx {
+  ownJid: () => string | null;
+  notifyJid: () => string | null;
+  canSendOthers: () => boolean;
+  projectChatIds: () => string[];
+  listChats: () => Array<{ chatId: string; name: string; kind: string; unreadCount: number; lastMessageAt: number; lastMessageText: string }>;
+  getMessages: (chatId: string, limit: number) => Array<{ fromMe: boolean; senderName: string; text: string; ts: number; kind: string }>;
+  sendText: (chatId: string, text: string) => Promise<boolean>;
+  markRead: (chatId: string) => Promise<void>;
+}
+/** The subset of WhatsAppClient the engine drives for the agent (injected via setComms). */
+export interface WaAgentClient { sendText(chatId: string, text: string): Promise<boolean>; markRead(chatId: string): Promise<void> }
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -459,6 +512,8 @@ async function runClaude(
   browserCtx?: BrowserCtx,
   customMcp?: { servers: Record<string, ClaudeMcpConfig>; allowedTools: string[] },
   scheduleCtx?: ScheduleCtx,
+  gitCtx?: GitCtx,
+  commsCtx?: CommsCtx,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -492,7 +547,7 @@ async function runClaude(
     ].filter(Boolean).join(', ');
     return `- ${s.id} — ${s.name}: ${s.description || '(no description)'}${bits ? ` [${bits}]` : ''}`;
   };
-  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx) && !plan)
+  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || gitCtx || commsCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
@@ -705,6 +760,107 @@ async function runClaude(
                 return txt(rows.map(s => `- ${s.id} — ${s.title}`).join('\n'));
               })),
           ] : []),
+          ...(gitCtx ? [
+            tool('git_status',
+              'Read this chat\'s LIVE git/PR state. Call BEFORE attempting push/pr/merge/resolve to confirm the state matches what you intend — the user may have committed/pushed/merged manually since the last turn. Returns ahead/behind, dirty flag, the open PR (if any), and a one-line "next action" hint. Tells you whether to commit (via Bash), git_push, pr_create, pr_merge, or pr_resolve_conflicts.',
+              {},
+              wrap(async () => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle (no worktree or no GitHub remote).');
+                const s = await gitCtx.status();
+                const lines: string[] = [];
+                lines.push(`state=${s.state}  branch=${s.branch ?? '?'}  base=${s.base ?? '?'}`);
+                lines.push(`ahead=${s.ahead}  behind=${s.behind}  dirty=${s.dirty}  pushed=${s.pushed}`);
+                if (s.pr) lines.push(`PR #${s.pr.number} (${s.pr.state}): ${s.pr.title}  ${s.pr.url}`);
+                lines.push(`\nNext: ${s.nextAction}`);
+                return txt(lines.join('\n'));
+              })),
+            tool('git_push',
+              'Push this chat\'s branch to origin using the user\'s saved GitHub token. Use when git_status says ready-to-push. Auth-aware — the user is never prompted; if no token is connected, it fails and tells you to ask the user to connect GitHub in Settings.',
+              {},
+              wrap(async () => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
+                const r = await gitCtx.push();
+                return txt(r.ok ? 'Pushed. Now call pr_create to open a pull request.' : `Push failed: ${r.reason ?? 'unknown'}`);
+              })),
+            tool('pr_create',
+              'Open (or resurface) a pull request from this chat\'s branch to the base branch. Pushes first if needed — call this directly when the user says "create a PR" / "ship this" / "open a PR". Idempotent: if a PR is already open it returns its url + number without duplicating. Use a brief title (default: the chat title) and a 1–3 line body that explains the change.',
+              { title: z.string().optional().describe('PR title; defaults to the chat title (≤ 80 chars suggested).'),
+                body: z.string().optional().describe('PR description — 1–3 sentences explaining what changed and why.') },
+              wrap(async (a: { title?: string; body?: string }) => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle. Ensure the project is on a GitHub remote and the chat has a worktree.');
+                const r = await gitCtx.createPr({ title: a.title, body: a.body });
+                if (!r.ok) return txt(`Could not open PR: ${r.reason ?? 'unknown'}`);
+                return txt(`PR #${r.number} is open: ${r.url}\nUse git_status to check mergeability, then pr_merge once it\'s clean.`);
+              })),
+            tool('pr_merge',
+              'Merge the open PR for this chat using the repo\'s preferred merge method (auto-picks merge/squash/rebase from the allowed list). Use only when git_status reports pr-mergeable (not when it reports pr-conflicts or pr-blocked).',
+              { method: z.enum(['merge', 'squash', 'rebase']).optional().describe('Override the auto-picked merge method.') },
+              wrap(async (a: { method?: 'merge' | 'squash' | 'rebase' }) => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
+                const r = await gitCtx.mergePr({ method: a.method });
+                return txt(r.ok ? 'Merged. The session\'s work is on the base branch now — you can archive the worktree if you\'re done.' : `Merge failed: ${r.reason ?? 'unknown'}`);
+              })),
+            tool('pr_resolve_conflicts',
+              'Pull the base branch into this chat\'s branch and merge it. If clean, pushes the resulting branch automatically. If it produces conflict markers, returns the conflicted file paths so you can: (1) Read each one, (2) Edit out the <<<<<<</=======/>>>>>>> markers keeping the intended content, (3) commit via Bash (`git add -A && git commit -m "resolve conflicts"`), (4) call this tool again to confirm clean + push. Use when git_status reports pr-conflicts or when the PR is behind.',
+              {},
+              wrap(async () => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
+                const r = await gitCtx.resolveConflicts();
+                if (r.ok && (!r.conflicts || r.conflicts.length === 0)) {
+                  return txt('Conflicts resolved cleanly (or the branch was already up to date) — pushed the merged branch. Call git_status to verify the PR is now mergeable.');
+                }
+                if (r.conflicts && r.conflicts.length > 0) {
+                  const list = r.conflicts.map(f => `  - ${f}`).join('\n');
+                  return txt(`Pulled base; ${r.conflicts.length} file(s) need conflict markers resolved:\n${list}\n\nNext: Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), then\n  Bash: git add -A && git commit -m "resolve merge conflicts"\nFinally call pr_resolve_conflicts again to confirm clean + push.`);
+                }
+                return txt(`pr_resolve_conflicts failed: ${r.reason ?? 'unknown'}`);
+              })),
+            tool('branch_rename',
+              'Rename the session\'s codename-only initial branch (e.g. mochi/lyon/lyon) to its task-derived slug (mochi/lyon/fix-auth-bug). Normally fires automatically after the first turn; use this only if you want to force it (e.g. you steered the chat onto a new task). No-op if the branch is already pushed or a PR exists.',
+              {},
+              wrap(async () => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
+                const r = await gitCtx.renameBranch();
+                if (!r.ok) return txt(`Rename failed: ${r.reason ?? 'unknown'}`);
+                if (r.unchanged) return txt(`Rename skipped (${r.reason ?? 'no-op'}).`);
+                return txt(`Renamed ${r.from} → ${r.to}.`);
+              })),
+          ] : []),
+          ...(commsCtx ? [
+            tool('wa_list_chats',
+              'List the user\'s WhatsApp chats (DMs, groups, channels) on this Mac, most-recent first. Use when the user asks about their WhatsApp — who messaged, unread chats, or to find a chat to read/reply to. Chats assigned to THIS project are marked [project].',
+              { query: z.string().optional().describe('Filter by name / last-message substring.'), limit: z.number().optional().describe('Max chats (default 30).') },
+              wrap(async (a: { query?: string; limit?: number }) => {
+                const assigned = new Set(commsCtx.projectChatIds());
+                let chats = commsCtx.listChats();
+                if (a.query) { const q = a.query.toLowerCase(); chats = chats.filter(c => (c.name + ' ' + c.lastMessageText).toLowerCase().includes(q)); }
+                chats = chats.slice(0, a.limit ?? 30);
+                if (!chats.length) return txt('No WhatsApp chats found yet (they fill in as WhatsApp syncs).');
+                return txt(chats.map(c => `- ${c.chatId} — ${c.name} [${c.kind}]${assigned.has(c.chatId) ? ' [project]' : ''}${c.unreadCount ? ` · ${c.unreadCount} unread` : ''} · last: ${(c.lastMessageText || '').slice(0, 70)}`).join('\n'));
+              })),
+            tool('wa_get_messages',
+              'Read recent messages from a WhatsApp chat. Pass the chatId from wa_list_chats.',
+              { chatId: z.string(), limit: z.number().optional().describe('How many recent messages (default 30).') },
+              wrap(async (a: { chatId: string; limit?: number }) => {
+                const msgs = commsCtx.getMessages(a.chatId, a.limit ?? 30);
+                if (!msgs.length) return txt('No messages captured for that chat yet.');
+                return txt(msgs.map(m => `[${new Date(m.ts).toISOString().slice(11, 16)}] ${m.fromMe ? 'You' : m.senderName}: ${m.kind !== 'text' ? `[${m.kind}] ` : ''}${m.text}`).join('\n'));
+              })),
+            tool('wa_send_message',
+              'Send a WhatsApp message. Give EITHER chatId (from wa_list_chats) OR phone (digits incl. country code, no +). Messaging the user\'s OWN number always works; other contacts require the user to have enabled "agent can message contacts" — if blocked, relay the tool\'s note to the user.',
+              { chatId: z.string().optional(), phone: z.string().optional().describe('Recipient phone in digits, e.g. "15551234567".'), text: z.string().describe('The message to send.') },
+              wrap(async (a: { chatId?: string; phone?: string; text: string }) => {
+                // No chatId/phone → send to the user themselves (their personal notify number, else the linked account).
+                const target = a.chatId || (a.phone ? `${a.phone.replace(/[^0-9]/g, '')}@s.whatsapp.net` : '') || commsCtx.notifyJid() || commsCtx.ownJid() || '';
+                if (!target) return txt('No recipient: pass a chatId (from wa_list_chats) or a phone number, or have the user set their personal number in Comms.');
+                if (!waSendAllowed(target, [commsCtx.ownJid(), commsCtx.notifyJid()], commsCtx.canSendOthers())) return txt('Blocked: messaging contacts other than your own number(s) is OFF by default (a safety gate). The user can turn on "Let the agent message contacts" in Comms. Message NOT sent.');
+                const ok = await commsCtx.sendText(target, a.text);
+                return txt(ok ? `Sent to ${target}.` : `Could not send to ${target} — is WhatsApp still linked?`);
+              })),
+            tool('wa_mark_read', 'Mark a WhatsApp chat as read (clears its unread badge).',
+              { chatId: z.string() },
+              wrap(async (a: { chatId: string }) => { await commsCtx.markRead(a.chatId); return txt(`Marked ${a.chatId} read.`); })),
+          ] : []),
         ],
       })
     : null;
@@ -714,6 +870,8 @@ async function runClaude(
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
     ...(browserCtx ? ['browser_status', 'browser_navigate', 'browser_snapshot', 'browser_read', 'browser_links', 'browser_click', 'browser_type'] : []),
     ...(scheduleCtx ? ['schedule_list', 'schedule_create', 'schedule_update', 'schedule_delete', 'schedule_toggle', 'schedule_run_now', 'projects_list', 'sessions_list'] : []),
+    ...(gitCtx ? ['git_status', 'git_push', 'pr_create', 'pr_merge', 'pr_resolve_conflicts', 'branch_rename'] : []),
+    ...(commsCtx ? ['wa_list_chats', 'wa_get_messages', 'wa_send_message', 'wa_mark_read'] : []),
   ].map(n => `mcp__maestro__${n}`);
   // Merge the operator's custom MCP servers (Settings → MCP servers) alongside the
   // in-process `maestro` server. Each enabled server's tools are auto-allowed via a
@@ -934,7 +1092,7 @@ async function runClaude(
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
 function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
-  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[] },
+  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[]; gitCtx?: GitCtx },
   imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'codex' }));
@@ -950,7 +1108,7 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   // calls unless danger-full-access + approval_policy=never (probe-proven), so a
   // run with any Maestro MCP tools uses that sandbox. Never on reviewer passes.
   const bridge = (!readOnly && ctx?.codexBridge && ctx.projectId) ? ctx.codexBridge : undefined;
-  const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId }) : undefined;
+  const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId, git: ctx?.gitCtx }) : undefined;
   // The operator's custom stdio MCP servers (Settings → MCP servers), as codex
   // `-c mcp_servers.<name>={…}` TOML fragments. Like the maestro bridge, codex's
   // sandbox auto-cancels MCP tool calls unless danger-full-access + approval_policy
@@ -1148,6 +1306,10 @@ export class LocalEngine {
   // schedule_* tools can manage + fire schedules through the same runner.
   private cron?: CronRunner;
   setCron(c: CronRunner) { this.cron = c; }
+  // The WhatsApp client (desktop-owned Baileys socket), injected from main.ts after
+  // it's built — backs the agent's wa_* tools (read the user's chats, send messages).
+  private comms?: WaAgentClient;
+  setComms(c: WaAgentClient) { this.comms = c; }
   /** The browser-extension control channel (ExtensionBridge), injected from main.ts.
       A getter (not the instance) so a late/missing bridge is harmless — browser tools
       simply report "no browser connected" until a Chrome profile pairs + activates. */
@@ -1171,6 +1333,12 @@ export class LocalEngine {
   private codexBridgeFor(): CodexBridge | undefined {
     return this.codexBridge;
   }
+  /** GitService — used post-turn to auto-rename the session's branch + powers
+      the per-session GitCtx that backs the agent's pr_* and git_* tools.
+      Injected from main.ts so the engine ↔ git wiring stays optional (tests
+      don't need a GitService at all). */
+  private gitService?: GitService;
+  setGitService(g: GitService) { this.gitService = g; }
 
   /* ── Background tasks ────────────────────────────────────────────────
      Long-lived processes the agent starts (dev servers, watchers) that must
@@ -1632,7 +1800,15 @@ export class LocalEngine {
       // OWN git worktree dir, so sessions are isolated and can run in parallel.
       // Best-effort — non-repo / failure falls back to the project folder.
       if (session && project?.path && isGitRepo(project.path)) {
-        const branch = session.branch ?? `mochi/${branchSlug(session.title)}-${session.id.slice(0, 4)}`;
+        // Codename = the session's stable city callsign. Almost always assigned
+        // at session creation (sendChat), but backfill here for legacy chats
+        // that pre-date the codename field.
+        const codename = session.codename ?? pickCityCodename(this.store.usedCodenamesIn(project.id));
+        // Branch shape: `mochi/<codename>/<task-slug>`. Until the auto-rename
+        // fires (after the first assistant turn), the slug IS the codename so
+        // the branch reads cleanly even on day-zero.
+        const initialSlug = session.branchRenamedAt ? branchSlug(session.title) : codename;
+        const branch = session.branch ?? `mochi/${codename}/${initialSlug}`;
         const res = ensureSessionWorktree({
           repoDir: project.path,
           worktreeRoot: worktreeRootDir(),
@@ -1646,10 +1822,11 @@ export class LocalEngine {
         });
         if (res.ok) {
           cwd = res.cwd;
-          const patch: Partial<Pick<ChatSession, 'branch' | 'worktreePath' | 'baseBranch'>> = {};
+          const patch: Partial<Pick<ChatSession, 'branch' | 'worktreePath' | 'baseBranch' | 'codename'>> = {};
           if (session.branch !== branch) patch.branch = branch;
           if (session.worktreePath !== res.cwd) patch.worktreePath = res.cwd;
           if (res.base && session.baseBranch !== res.base) patch.baseBranch = res.base;
+          if (!session.codename) patch.codename = codename;
           if (Object.keys(patch).length) { try { this.store.updateSession(session.id, patch); } catch { /* gone */ } }
         }
       }
@@ -1693,19 +1870,28 @@ export class LocalEngine {
       const claudeImages = isClaudeMaster ? resolvedImages.map(r => ({ mime: r.mime, b64: r.b64 })) : [];
       const codexImageFiles = master === 'codex' ? resolvedImages.map(r => r.path) : [];
 
-      // Attached non-image files: inline text content; reference binaries by path.
-      const fileParts: string[] = [];
-      let fileBudget = 400 * 1024; // total inlined-text cap
-      for (const f of cur.inputFiles ?? []) {
-        if (f.kind === 'text' && f.content) {
-          const body = f.content.length > fileBudget ? f.content.slice(0, fileBudget) + '\n…(truncated)' : f.content;
-          fileBudget -= Math.min(f.content.length, fileBudget);
-          fileParts.push(`### Attached file: ${f.name}\n\`\`\`\n${body}\n\`\`\``);
-        } else if (f.kind === 'file' && f.path && existsSync(f.path)) {
-          fileParts.push(`The user attached the file \`${f.name}\` (saved at ${f.path}). Read it with your tools if it's relevant.`);
+      // Attached non-image files: the composer's chip POSITION is preserved as
+      // `@<absPath>` inline in the user's prompt (substituted in localApi from
+      // each chip's `«attach:id»` placeholder), so the agent reads them with its
+      // `Read` tool at the spot the user typed the chip. We only need a small
+      // back-compat path for jobs persisted BEFORE this change, where text was
+      // inlined into `f.content` and binaries had a trailing "saved at $PATH"
+      // hint — surface those as a trailing block so old jobs still resume.
+      const legacy = (cur.inputFiles ?? []).filter(f => (f.kind === 'text' && f.content) || (f.kind === 'file' && f.path && !cur.input.includes(`@${f.path}`)));
+      if (legacy.length) {
+        const fileParts: string[] = [];
+        let fileBudget = 400 * 1024;
+        for (const f of legacy) {
+          if (f.kind === 'text' && f.content) {
+            const body = f.content.length > fileBudget ? f.content.slice(0, fileBudget) + '\n…(truncated)' : f.content;
+            fileBudget -= Math.min(f.content.length, fileBudget);
+            fileParts.push(`### Attached file: ${f.name}\n\`\`\`\n${body}\n\`\`\``);
+          } else if (f.kind === 'file' && f.path && existsSync(f.path)) {
+            fileParts.push(`The user attached the file \`${f.name}\` (saved at ${f.path}). Read it with your tools if it's relevant.`);
+          }
         }
+        if (fileParts.length) prompt += `\n\n---\n\nThe user attached the following file(s):\n\n${fileParts.join('\n\n')}`;
       }
-      if (fileParts.length) prompt += `\n\n---\n\nThe user attached the following file(s):\n\n${fileParts.join('\n\n')}`;
 
       // Project memory (.continuum): on a FRESH turn (no resumed Claude session
       // that already holds it), inject the durable STATE + recent checkpoints as
@@ -1889,16 +2075,43 @@ export class LocalEngine {
       // Schedule capability: let the agent inspect + manage recurring/scheduled
       // tasks and discover projects/sessions to target. Off in plan mode.
       const scheduleCtx: ScheduleCtx | undefined = (this.cron && !opts.plan) ? makeScheduleCtx(this.store, this.cron) : undefined;
+      // PR/git capability: when the chat owns a worktree + branch + GitHub
+      // remote, mount the pr_* and git_* tools AND inject the PR_DIRECTIVE so
+      // the agent knows when to call them. Off in plan mode (the lifecycle is
+      // outward-facing). For one-off jobs (no session) or a non-repo, gitCtx
+      // is null and the tools simply don't surface.
+      const gitCtx: GitCtx | undefined = (session && this.gitService && !opts.plan)
+        ? (makeGitCtx(this.store, this.gitService, session.id) ?? undefined)
+        : undefined;
+      // Both engines now reach the pr_*/git_* tools — Claude via the in-process
+      // maestro MCP, Codex via the stdio bridge. Inject the directive on every
+      // chat turn that owns a live worktree on a GitHub repo.
+      if (isChat && gitCtx?.available()) prompt += PR_DIRECTIVE;
+      // WhatsApp capability: when a number is linked, give the agent read/send tools
+      // backed by THIS Mac's socket + store, scoped to this project's assigned chats.
+      const commsCtx: CommsCtx | undefined = (this.comms && this.store.whatsappState().connected && !opts.plan) ? {
+        ownJid: () => this.store.whatsappState().jid,
+        notifyJid: () => this.store.whatsappState().notifyJid ?? null,
+        canSendOthers: () => !!this.store.whatsappState().agentSendToOthers,
+        projectChatIds: () => this.store.listProjectWaChats(job.projectId ?? ''),
+        listChats: () => this.store.waListChats().map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, unreadCount: c.unreadCount, lastMessageAt: c.lastMessageAt, lastMessageText: c.lastMessageText })),
+        getMessages: (chatId, limit) => this.store.waMessages(chatId, { limit }).map(m => ({ fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: m.kind })),
+        sendText: (chatId, text) => this.comms!.sendText(chatId, text),
+        markRead: (chatId) => this.comms!.markRead(chatId),
+      } : undefined;
       // Browser mode (composer toggle): the maestro MCP tools are deferred, so an
       // explicit directive ensures the agent loads + uses the real-Chrome tools.
       if (opts.browser && browserCtx) prompt += BROWSER_DIRECTIVE;
+      // WhatsApp linked → tell the agent it CAN read/send (the tools are deferred, so
+      // the directive ensures it reaches for them instead of saying it can't).
+      if (commsCtx) prompt += WHATSAPP_DIRECTIVE;
       // Per-engine custom-MCP config: Claude takes stdio + HTTP servers (env/headers
       // resolved by name from the host now); Codex takes stdio TOML fragments only.
       const claudeCustomMcp = buildClaudeCustomMcp(enabledMcpServers, process.env);
       const codexCustomFrags = buildCodexCustomMcp(enabledMcpServers, process.env).fragments;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx)
-        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags }, codexImageFiles);
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx)
+        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
       // operator has to retry by hand. The retry starts the turn fresh; resumeId is
@@ -1962,7 +2175,7 @@ export class LocalEngine {
           };
           let cont: EngineRun;
           try {
-            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp);
+            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx);
           } catch (ce) { if (ce instanceof CancelledError || ac.signal.aborted) throw ce; break; }
           main = {
             text: cont.text || main.text,
@@ -2078,6 +2291,16 @@ export class LocalEngine {
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
       this.emit('job', done);
+      // Auto-rename hook: the first informative turn ripens the title (which is
+      // the user's first prompt). Swap the codename-only branch for one
+      // carrying a task-derived slug. Fires once per session — gated inside.
+      if (isChat && this.gitService) {
+        const fresh = this.store.getSession(session.id);
+        if (fresh && fresh.branch && fresh.codename && !fresh.branchRenamedAt) {
+          // Fire-and-forget; the gitService gates its own no-op cases.
+          void this.gitService.renameSessionBranch(fresh).catch(() => { /* best effort */ });
+        }
+      }
       // AskUserQuestion follow-up: if this chat turn ended on a question the user
       // hasn't answered (the SDK auto-dismisses it headless), arm a countdown that
       // auto-sends the recommended option after ASK_BASE_MS. The question card shows

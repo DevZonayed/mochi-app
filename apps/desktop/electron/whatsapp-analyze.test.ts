@@ -11,11 +11,13 @@ vi.mock('electron', () => ({ app: { getPath: () => hoisted.dir }, powerMonitor: 
 
 import { Store } from './store.js';
 import type { LocalEngine } from './engine.js';
-import { makeWhatsappAnalyzer, approveWhatsappSend } from './whatsapp-analyze.js';
+import { makeWhatsappAnalyzer, approveWhatsappSend, flushSummaries } from './whatsapp-analyze.js';
 
-function sendSpy() {
-  const sent: string[] = [];
-  return { client: { sendToSelf: async (t: string) => { sent.push(t); return true; } }, sent };
+/** A send spy. `failFirst: n` makes the first n sends fail (simulating the socket
+    not being reconnected yet after a wake) before succeeding. */
+function sendSpy(opts: { failFirst?: number } = {}) {
+  const sent: string[] = []; let calls = 0;
+  return { client: { sendToSelf: async (t: string) => { calls++; if (calls <= (opts.failFirst ?? 0)) return false; sent.push(t); return true; } }, sent };
 }
 
 function setup() {
@@ -56,8 +58,25 @@ describe('whatsapp analyzer', () => {
     await analyze(s.armWhatsappTimer({ chatId: 'c1', projectId: null }));
 
     expect(sent).toHaveLength(0);                       // nothing sent silently
-    expect(s.whatsappState().pendingSummary).toBeTruthy();
-    expect(s.whatsappState().pendingSummary!.text).toMatch(/5pm/);
+    expect(s.listPendingSummaries()).toHaveLength(1);   // queued in the durable outbox
+    expect(s.listPendingSummaries()[0].text).toMatch(/5pm/);
+  });
+
+  it('survives a failed send (socket down on wake) and delivers on the next flush', async () => {
+    const { s, engine } = setup();
+    s.setWhatsappState({ sendApproved: true });
+    const { client, sent } = sendSpy({ failFirst: 1 }); // first send fails (not reconnected yet)
+    const analyze = makeWhatsappAnalyzer({ store: s, engine, client, emit: vi.fn(), summarize: fixedSummary });
+
+    await analyze(s.armWhatsappTimer({ chatId: 'c1', projectId: null }));
+    expect(sent).toHaveLength(0);                        // send failed…
+    expect(s.listPendingSummaries()).toHaveLength(1);    // …but it's NOT lost — still queued
+    // watermark still advanced (we won't re-summarize), but the summary text is durable
+    expect(s.getWaTranscript('c1', { sinceReported: true })).toHaveLength(0);
+
+    await flushSummaries({ store: s, client, emit: vi.fn() }); // socket back → retry
+    expect(sent).toHaveLength(1);
+    expect(s.listPendingSummaries()).toHaveLength(0);    // delivered + drained
   });
 
   it('does nothing when there is no new activity since the last report', async () => {
@@ -84,6 +103,6 @@ describe('whatsapp analyzer', () => {
 
     expect(s.whatsappState().sendApproved).toBe(true);
     expect(sent).toHaveLength(1);                       // the held summary went out
-    expect(s.whatsappState().pendingSummary).toBe(null); // cleared
+    expect(s.listPendingSummaries()).toHaveLength(0);   // outbox drained
   });
 });

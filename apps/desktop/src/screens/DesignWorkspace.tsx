@@ -15,6 +15,15 @@ import { Switch } from '../lib/ui';
 import { ImageViewer } from '../lib/CodeView';
 import { api, IS_LOCAL, type Project, type ChatSession, type DesignComment, type InstalledSkill, type RegistrySkillSummary } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
+import { displayCodename } from '../lib/git-types';
+import { SessionStateDot } from './SessionStateDot';
+import { useSessionStateOnly } from '../lib/useSessionGitState';
+
+/** Live state dot for the design session strip. */
+function DSessionStateDot({ sessionId }: { sessionId: string }) {
+  const state = useSessionStateOnly(sessionId);
+  return <SessionStateDot state={state} size={7} reserveSpace />;
+}
 
 const DEVICES = [
   { key: 'desktop', label: 'Desktop', w: 0, icon: 'cpu' as const },
@@ -413,9 +422,13 @@ export default function DesignWorkspace() {
                   );
                   return (
                     <div key={s.id} className="ds-sess" onClick={() => setSessionId(s.id)} onDoubleClick={() => { setRenamingId(s.id); setRenameVal(s.title); }}
-                      title={`${s.title || 'Untitled'} — double-click to rename`} style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, height: 28, padding: '0 6px 0 11px', borderRadius: 'var(--r-pill)', maxWidth: 190, cursor: 'pointer',
+                      title={`${s.title || 'Untitled'}${s.codename ? ` · ${displayCodename(s.codename)}` : ''} — double-click to rename`} style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, height: 28, padding: '0 6px 0 9px', borderRadius: 'var(--r-pill)', maxWidth: 220, cursor: 'pointer',
                         background: on ? 'var(--blue)' : 'var(--surface)', border: on ? 'none' : '0.5px solid var(--separator)', color: on ? '#fff' : 'var(--ink)' }}>
+                      <DSessionStateDot sessionId={s.id} />
                       <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', font: `${on ? 600 : 500} var(--fs-caption)/1 var(--font-text)` }}>{s.title || 'Untitled'}</span>
+                      {s.codename && (
+                        <span style={{ flexShrink: 0, font: '600 9px/1 var(--font-mono)', letterSpacing: '0.04em', color: on ? 'rgba(255,255,255,.75)' : 'var(--ink-tertiary)', textTransform: 'uppercase' }}>{s.codename}</span>
+                      )}
                       <span style={{ flexShrink: 0, font: '500 9px/1 var(--font-mono)', color: on ? 'rgba(255,255,255,.7)' : 'var(--ink-tertiary)' }}>{relTime(s.updatedAt)}</span>
                       <button className="ds-sess-x" onClick={e => { e.stopPropagation(); void removeSession(s.id); }} title="Delete chat"
                         style={{ flexShrink: 0, width: 16, height: 16, borderRadius: 5, display: 'grid', placeItems: 'center', background: 'transparent', border: 'none', color: on ? 'rgba(255,255,255,.85)' : 'var(--ink-tertiary)', cursor: 'pointer' }}><Icon name="x" size={11} /></button>

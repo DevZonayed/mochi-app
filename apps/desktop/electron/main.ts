@@ -274,7 +274,8 @@ app.whenReady().then(() => {
     // Streaming frames (50ms cadence) are local-only: the relay/phone gets the
     // ~1s checkpoint updates instead of a snapshot push per frame. `desktopOnly`
     // events (e.g. auto-update — about THIS Mac's binary) likewise stay local.
-    if (opts?.live || opts?.desktopOnly) return;
+    // `wa-*` events carry WhatsApp chat/message content — Mac-local only, never relayed.
+    if (opts?.live || opts?.desktopOnly || name.startsWith('wa-')) return;
     // Keep every connected browser-extension profile's project+chat list live.
     extensionBridge?.onAppEvent(name);
     if (name === 'settings' && data && typeof data === 'object') {
@@ -366,8 +367,14 @@ app.whenReady().then(() => {
   telegram.resumeOnBoot();
   // WhatsApp: the Mac owns one Baileys socket for the operator's own number.
   const whatsapp = new WhatsAppClient(store, emit);
+  // Give the in-app agent WhatsApp read/send tools backed by this same socket
+  // (fixes "no WhatsApp integration available" — the tools live in the maestro MCP).
+  engine.setComms(whatsapp);
   whatsapp.resumeOnBoot();
   const gitService = new GitService(store, emit, providers);
+  // Hand the gitService to the engine so the post-turn auto-rename hook can
+  // run (otherwise it's a no-op — the engine treats gitService as optional).
+  engine.setGitService(gitService);
   const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge);
   // Local control channel for the native browser extension (one app-owned port).
   extensionBridge = new ExtensionBridge(store, dispatch, (status) => emit('extension', status, { desktopOnly: true }));
