@@ -1570,13 +1570,33 @@ const ATTACH_INLINE_RE = /@(\S*\.continuum\/Attachment\/([A-Za-z0-9._-]+))/g;
 /** Basename of a saved attachment path — the lookup key against inputImages /
     inputFiles, since those carry their `.continuum/Attachment/` filename. */
 const basenameOf = (p: string): string => p.split('/').filter(Boolean).pop() || p;
-/** A small inline attachment chip / image thumbnail rendered AT the position
-    the user dropped the chip in the composer. Image markers expand to a real
-    thumbnail; everything else shows a compact name + size badge.  */
+/** A small inline attachment CAPSULE rendered AT the position the user dropped
+    the chip in the composer. Images render as a small clickable chip (icon +
+    filename) — NOT a thumbnail — so the bubble reads like prose with capsules
+    inline, matching the composer chip. Click on an image chip opens the
+    in-app viewer. Files show the same chip with their kind + size as subtitle. */
 function InlineAttach({ path, images, files }: { path: string; images?: ChatImage[]; files?: ChatFile[] }) {
+  const onOpenImage = React.useContext(ImageOpenContext);
   const base = basenameOf(path);
   const img = images?.find(im => basenameOf(im.imagePath ?? '') === base || im.name === base);
-  if (img) return <span style={{ display: 'inline-block', verticalAlign: 'middle', margin: '0 2px' }}><UserImageThumb img={img} /></span>;
+  if (img) {
+    const clickable = IS_LOCAL && !!img.assetId;
+    const open = () => {
+      if (onOpenImage && img.assetId) onOpenImage(img.assetId, img.name || 'Image', img.imagePath);
+      else if (img.imagePath) void api.revealPath(img.imagePath);
+    };
+    const dims = (img.width && img.height) ? `${img.width}×${img.height}` : 'image';
+    return (
+      <span onClick={clickable ? open : undefined} title={img.name || 'Open image'}
+        style={{ display: 'inline-flex', verticalAlign: 'middle', alignItems: 'center', gap: 6, maxWidth: 240, margin: '0 2px', padding: '2px 8px 2px 6px', borderRadius: 9, border: '0.5px solid rgba(255,255,255,0.32)', background: 'rgba(255,255,255,0.14)', color: '#fff', font: '600 12px/1.25 var(--font-text)', cursor: clickable ? 'pointer' : 'default' }}>
+        <Icon name="image" size={12} />
+        <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+          <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{img.name || base}</span>
+          <span style={{ font: '500 9px/1.1 var(--font-text)', opacity: 0.72 }}>{dims}</span>
+        </span>
+      </span>
+    );
+  }
   const f = files?.find(fl => (fl.path && basenameOf(fl.path) === base) || fl.name === base);
   const label = f ? (f.name === 'Pasted text.txt' ? 'Pasted text' : f.name) : base;
   const sub = f ? `${f.kind === 'text' ? 'text' : (f.mime || 'file')}${f.bytes ? ' · ' + fmtBytes(f.bytes) : ''}` : 'attachment';
