@@ -26,6 +26,7 @@ import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
+import { waSendAllowed } from './whatsapp.js';
 import type { CronRunner } from './cron.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import type { Providers } from './providers.js';
@@ -86,6 +87,16 @@ const BROWSER_DIRECTIVE =
   `under Settings → Browser extension). Then browser_navigate to the relevant site and read it with ` +
   `browser_snapshot / browser_read before acting. Accomplish the task on the live page; only fall back to ` +
   `WebSearch if no browser is connected.`;
+
+const WHATSAPP_DIRECTIVE =
+  `\n\n---\n\n[WhatsApp connected] This Mac is linked to the user's WhatsApp. When the user asks anything ` +
+  `about WhatsApp — to read their chats/messages, see who messaged them, or SEND a message (e.g. "message ` +
+  `my number", "send me a confirmation/update", "reply to X", "text the team") — use the ` +
+  `mcp__maestro__wa_list_chats / wa_get_messages / wa_send_message / wa_mark_read tools. Do NOT claim ` +
+  `WhatsApp is unavailable. Messaging the user's OWN number always works (their linked account OR the ` +
+  `personal number they set in Comms — for "message my number"/"send me a confirmation", call wa_send_message ` +
+  `with no chatId/phone and it goes to that personal number); messaging other contacts is blocked unless they ` +
+  `enabled it (the send tool will tell you). Chats assigned to THIS project are marked [project] — prefer them.`;
 
 const DESIGN_DIRECTIVE =
   `\n\n---\n\n[Design mode] You are a senior product designer working in a live design ` +
@@ -448,6 +459,22 @@ interface BrowserCtx {
   call: (type: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
 }
 
+/* WhatsApp capability for the agent — backed by THIS Mac's Baileys socket + store.
+   The agent can read the user's chats/messages and send (its OWN number freely;
+   other contacts gated behind an opt-in). Off in plan mode / when not linked. */
+interface CommsCtx {
+  ownJid: () => string | null;
+  notifyJid: () => string | null;
+  canSendOthers: () => boolean;
+  projectChatIds: () => string[];
+  listChats: () => Array<{ chatId: string; name: string; kind: string; unreadCount: number; lastMessageAt: number; lastMessageText: string }>;
+  getMessages: (chatId: string, limit: number) => Array<{ fromMe: boolean; senderName: string; text: string; ts: number; kind: string }>;
+  sendText: (chatId: string, text: string) => Promise<boolean>;
+  markRead: (chatId: string) => Promise<void>;
+}
+/** The subset of WhatsAppClient the engine drives for the agent (injected via setComms). */
+export interface WaAgentClient { sendText(chatId: string, text: string): Promise<boolean>; markRead(chatId: string): Promise<void> }
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -459,6 +486,7 @@ async function runClaude(
   browserCtx?: BrowserCtx,
   customMcp?: { servers: Record<string, ClaudeMcpConfig>; allowedTools: string[] },
   scheduleCtx?: ScheduleCtx,
+  commsCtx?: CommsCtx,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -492,7 +520,7 @@ async function runClaude(
     ].filter(Boolean).join(', ');
     return `- ${s.id} — ${s.name}: ${s.description || '(no description)'}${bits ? ` [${bits}]` : ''}`;
   };
-  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx) && !plan)
+  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || commsCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
@@ -705,6 +733,41 @@ async function runClaude(
                 return txt(rows.map(s => `- ${s.id} — ${s.title}`).join('\n'));
               })),
           ] : []),
+          ...(commsCtx ? [
+            tool('wa_list_chats',
+              'List the user\'s WhatsApp chats (DMs, groups, channels) on this Mac, most-recent first. Use when the user asks about their WhatsApp — who messaged, unread chats, or to find a chat to read/reply to. Chats assigned to THIS project are marked [project].',
+              { query: z.string().optional().describe('Filter by name / last-message substring.'), limit: z.number().optional().describe('Max chats (default 30).') },
+              wrap(async (a: { query?: string; limit?: number }) => {
+                const assigned = new Set(commsCtx.projectChatIds());
+                let chats = commsCtx.listChats();
+                if (a.query) { const q = a.query.toLowerCase(); chats = chats.filter(c => (c.name + ' ' + c.lastMessageText).toLowerCase().includes(q)); }
+                chats = chats.slice(0, a.limit ?? 30);
+                if (!chats.length) return txt('No WhatsApp chats found yet (they fill in as WhatsApp syncs).');
+                return txt(chats.map(c => `- ${c.chatId} — ${c.name} [${c.kind}]${assigned.has(c.chatId) ? ' [project]' : ''}${c.unreadCount ? ` · ${c.unreadCount} unread` : ''} · last: ${(c.lastMessageText || '').slice(0, 70)}`).join('\n'));
+              })),
+            tool('wa_get_messages',
+              'Read recent messages from a WhatsApp chat. Pass the chatId from wa_list_chats.',
+              { chatId: z.string(), limit: z.number().optional().describe('How many recent messages (default 30).') },
+              wrap(async (a: { chatId: string; limit?: number }) => {
+                const msgs = commsCtx.getMessages(a.chatId, a.limit ?? 30);
+                if (!msgs.length) return txt('No messages captured for that chat yet.');
+                return txt(msgs.map(m => `[${new Date(m.ts).toISOString().slice(11, 16)}] ${m.fromMe ? 'You' : m.senderName}: ${m.kind !== 'text' ? `[${m.kind}] ` : ''}${m.text}`).join('\n'));
+              })),
+            tool('wa_send_message',
+              'Send a WhatsApp message. Give EITHER chatId (from wa_list_chats) OR phone (digits incl. country code, no +). Messaging the user\'s OWN number always works; other contacts require the user to have enabled "agent can message contacts" — if blocked, relay the tool\'s note to the user.',
+              { chatId: z.string().optional(), phone: z.string().optional().describe('Recipient phone in digits, e.g. "15551234567".'), text: z.string().describe('The message to send.') },
+              wrap(async (a: { chatId?: string; phone?: string; text: string }) => {
+                // No chatId/phone → send to the user themselves (their personal notify number, else the linked account).
+                const target = a.chatId || (a.phone ? `${a.phone.replace(/[^0-9]/g, '')}@s.whatsapp.net` : '') || commsCtx.notifyJid() || commsCtx.ownJid() || '';
+                if (!target) return txt('No recipient: pass a chatId (from wa_list_chats) or a phone number, or have the user set their personal number in Comms.');
+                if (!waSendAllowed(target, [commsCtx.ownJid(), commsCtx.notifyJid()], commsCtx.canSendOthers())) return txt('Blocked: messaging contacts other than your own number(s) is OFF by default (a safety gate). The user can turn on "Let the agent message contacts" in Comms. Message NOT sent.');
+                const ok = await commsCtx.sendText(target, a.text);
+                return txt(ok ? `Sent to ${target}.` : `Could not send to ${target} — is WhatsApp still linked?`);
+              })),
+            tool('wa_mark_read', 'Mark a WhatsApp chat as read (clears its unread badge).',
+              { chatId: z.string() },
+              wrap(async (a: { chatId: string }) => { await commsCtx.markRead(a.chatId); return txt(`Marked ${a.chatId} read.`); })),
+          ] : []),
         ],
       })
     : null;
@@ -714,6 +777,7 @@ async function runClaude(
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
     ...(browserCtx ? ['browser_status', 'browser_navigate', 'browser_snapshot', 'browser_read', 'browser_links', 'browser_click', 'browser_type'] : []),
     ...(scheduleCtx ? ['schedule_list', 'schedule_create', 'schedule_update', 'schedule_delete', 'schedule_toggle', 'schedule_run_now', 'projects_list', 'sessions_list'] : []),
+    ...(commsCtx ? ['wa_list_chats', 'wa_get_messages', 'wa_send_message', 'wa_mark_read'] : []),
   ].map(n => `mcp__maestro__${n}`);
   // Merge the operator's custom MCP servers (Settings → MCP servers) alongside the
   // in-process `maestro` server. Each enabled server's tools are auto-allowed via a
@@ -1148,6 +1212,10 @@ export class LocalEngine {
   // schedule_* tools can manage + fire schedules through the same runner.
   private cron?: CronRunner;
   setCron(c: CronRunner) { this.cron = c; }
+  // The WhatsApp client (desktop-owned Baileys socket), injected from main.ts after
+  // it's built — backs the agent's wa_* tools (read the user's chats, send messages).
+  private comms?: WaAgentClient;
+  setComms(c: WaAgentClient) { this.comms = c; }
   /** The browser-extension control channel (ExtensionBridge), injected from main.ts.
       A getter (not the instance) so a late/missing bridge is harmless — browser tools
       simply report "no browser connected" until a Chrome profile pairs + activates. */
@@ -1889,15 +1957,30 @@ export class LocalEngine {
       // Schedule capability: let the agent inspect + manage recurring/scheduled
       // tasks and discover projects/sessions to target. Off in plan mode.
       const scheduleCtx: ScheduleCtx | undefined = (this.cron && !opts.plan) ? makeScheduleCtx(this.store, this.cron) : undefined;
+      // WhatsApp capability: when a number is linked, give the agent read/send tools
+      // backed by THIS Mac's socket + store, scoped to this project's assigned chats.
+      const commsCtx: CommsCtx | undefined = (this.comms && this.store.whatsappState().connected && !opts.plan) ? {
+        ownJid: () => this.store.whatsappState().jid,
+        notifyJid: () => this.store.whatsappState().notifyJid ?? null,
+        canSendOthers: () => !!this.store.whatsappState().agentSendToOthers,
+        projectChatIds: () => this.store.listProjectWaChats(job.projectId ?? ''),
+        listChats: () => this.store.waListChats().map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, unreadCount: c.unreadCount, lastMessageAt: c.lastMessageAt, lastMessageText: c.lastMessageText })),
+        getMessages: (chatId, limit) => this.store.waMessages(chatId, { limit }).map(m => ({ fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: m.kind })),
+        sendText: (chatId, text) => this.comms!.sendText(chatId, text),
+        markRead: (chatId) => this.comms!.markRead(chatId),
+      } : undefined;
       // Browser mode (composer toggle): the maestro MCP tools are deferred, so an
       // explicit directive ensures the agent loads + uses the real-Chrome tools.
       if (opts.browser && browserCtx) prompt += BROWSER_DIRECTIVE;
+      // WhatsApp linked → tell the agent it CAN read/send (the tools are deferred, so
+      // the directive ensures it reaches for them instead of saying it can't).
+      if (commsCtx) prompt += WHATSAPP_DIRECTIVE;
       // Per-engine custom-MCP config: Claude takes stdio + HTTP servers (env/headers
       // resolved by name from the host now); Codex takes stdio TOML fragments only.
       const claudeCustomMcp = buildClaudeCustomMcp(enabledMcpServers, process.env);
       const codexCustomFrags = buildCodexCustomMcp(enabledMcpServers, process.env).fragments;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx)
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, commsCtx)
         : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the

@@ -5,6 +5,7 @@
    WhatsApp is an honest preview (not wired). */
 
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
 import { api, type CommsStatus, type ChatBinding, type PendingChat, type CommEvent, type Project, type ChatPermissions, type WhatsAppState, type WaChatSummary, type ChatSession, type CommsProvider, ApiError, IS_LOCAL } from '../lib/api';
@@ -38,8 +39,42 @@ function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void 
   );
 }
 
+// ── Your personal "receive on" number (distinct from the linked PA account) ──
+function RecipientField({ wa, onChanged }: { wa: WhatsAppState | null; onChanged: () => void }) {
+  const current = (wa?.notifyJid ?? '').split('@')[0];
+  const [val, setVal] = React.useState(current);
+  const [saved, setSaved] = React.useState(false);
+  React.useEffect(() => { setVal((wa?.notifyJid ?? '').split('@')[0]); }, [wa?.notifyJid]);
+  const digits = val.replace(/[^0-9]/g, '');
+  const linked = (wa?.jid ?? '').split('@')[0].split(':')[0]; // e.g. 8801611682159
+  // A WhatsApp JID needs full international digits (country code, no +, no leading 0).
+  // A leading 0 or a too-short number is almost certainly a local format that will fail.
+  const looksLocal = !!digits && (digits.startsWith('0') || digits.length < 10);
+  // Suggest a fix using the linked account's country code (1–3 digits before the local part).
+  const suggestion = digits.startsWith('0') && linked ? linked.slice(0, Math.max(0, linked.length - (digits.length - 1))) + digits.slice(1) : '';
+  const save = async (override?: string) => { const d = (override ?? val).replace(/[^0-9]/g, ''); setVal(d); await api.setWhatsappRecipient(d); setSaved(true); setTimeout(() => setSaved(false), 1500); onChanged(); };
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 12, borderRadius: 12, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator)', marginBottom: 14 }}>
+      <span style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Your number — where summaries & confirmations go</span>
+      <span style={{ font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-secondary)' }}>The linked account above is your “PA” number{linked ? ` (${linked})` : ''}. Enter the <b style={{ color: 'var(--ink)' }}>personal</b> number you want to receive on — full international format, <b style={{ color: 'var(--ink)' }}>country code, no “+” and no leading 0</b>. Leave blank to use the linked number.</span>
+      <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+        <input value={val} onChange={e => setVal(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') void save(); }} placeholder="e.g. 8801604123482"
+          style={{ flex: 1, height: 38, padding: '0 12px', boxSizing: 'border-box', borderRadius: 10, border: `1px solid ${looksLocal ? 'var(--orange, #d9821b)' : 'var(--separator-strong)'}`, background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-mono)' }} />
+        <button onClick={() => save()} style={{ height: 38, padding: '0 16px', borderRadius: 10, background: digits !== current ? 'var(--green)' : 'var(--fill-secondary)', color: digits !== current ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{saved ? 'Saved ✓' : 'Save'}</button>
+      </div>
+      {digits && !looksLocal && <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Will message: +{digits}</span>}
+      {looksLocal && (
+        <span style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--orange, #d9821b)' }}>
+          That looks like a local number — WhatsApp needs the full international form.{suggestion ? <> Did you mean <button onClick={() => void save(suggestion)} style={{ background: 'none', color: 'var(--blue)', font: 'inherit', textDecoration: 'underline', padding: 0 }}>{suggestion}</button>?</> : ''}
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ── WhatsApp card (link + connection + send gate) ───────────────────────────
 function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tracked: number; onChanged: () => void }) {
+  const navigate = useNavigate();
   const [qr, setQr] = React.useState<string | null>(null);
   const [pairing, setPairing] = React.useState<string | null>(null);
   const [linking, setLinking] = React.useState(false);
@@ -89,15 +124,32 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 12, borderRadius: 12, background: 'color-mix(in srgb, var(--orange, #ff9f0a) 12%, transparent)', border: '0.5px solid color-mix(in srgb, var(--orange, #ff9f0a) 40%, transparent)', marginBottom: 14 }}>
           <Icon name="shield" size={18} style={{ color: 'var(--orange, #ff9f0a)', flexShrink: 0 }} />
           <span style={{ flex: 1, font: '400 var(--fs-footnote)/1.35 var(--font-text)', color: 'var(--ink)' }}>
-            Before Maestro messages summaries to your own number, it needs your OK.{wa.pendingSummary ? ' One summary is waiting.' : ''}
+            Before Maestro messages summaries to your own number, it needs your OK.{wa.pendingSummaries?.length ? ` ${wa.pendingSummaries.length} waiting.` : ''}
           </span>
           {IS_LOCAL && <button onClick={approve} disabled={busy} style={{ height: 34, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', flexShrink: 0 }}>{busy ? '…' : 'Allow'}</button>}
         </div>
       )}
 
+      {/* Where summaries + agent confirmations are delivered (your personal number,
+          not the linked PA account). */}
+      {connected && IS_LOCAL && <RecipientField wa={wa} onChanged={onChanged} />}
+
+      {/* Agent send-gate: the agent can always message your own number; messaging
+          other contacts is off until you allow it here. */}
+      {connected && IS_LOCAL && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 12px', borderRadius: 12, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator)', marginBottom: 14 }}>
+          <span style={{ flex: 1 }}>
+            <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Let the agent message contacts</span>
+            <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>The agent can always message your own number. Turn this on to let it message other people too.</span>
+          </span>
+          <Toggle on={!!wa?.agentSendToOthers} onChange={v => void api.setWhatsappAgentSend(v).then(onChanged)} />
+        </div>
+      )}
+
       {connected ? (
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <div style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Assign chats to a project + session under Bindings. A chat that goes quiet for 15 min gets summarized to you.</div>
+          <div style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Open the WhatsApp space to read and reply to every chat. Assign chats to a project under Bindings; a chat that goes quiet for 15 min is summarized to you.</div>
+          {IS_LOCAL && <button onClick={() => navigate('/whatsapp')} style={{ height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Open WhatsApp</button>}
           {IS_LOCAL && <button onClick={disconnect} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--ink)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Pause</button>}
           {IS_LOCAL && <button onClick={unlink} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Unlink</button>}
         </div>
@@ -122,7 +174,7 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
         <>
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 12, borderRadius: 12, background: 'color-mix(in srgb, var(--red) 9%, transparent)', border: '0.5px solid color-mix(in srgb, var(--red) 30%, transparent)', marginBottom: 14 }}>
             <Icon name="alert" size={16} style={{ color: 'var(--red)', flexShrink: 0, marginTop: 1 }} />
-            <span style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>This links your <b style={{ color: 'var(--ink)' }}>personal</b> number via an unofficial connection. WhatsApp may ban numbers that automate — this is your own informed choice. Maestro only reads tracked chats and messages summaries to you.</span>
+            <span style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>This links your <b style={{ color: 'var(--ink)' }}>personal</b> number via an unofficial connection. WhatsApp may ban numbers that automate — this is your own informed choice. Your chats are read and stored only on this Mac (never sent to the relay).</span>
           </div>
           <button onClick={startLink} disabled={busy} style={{ height: 42, padding: '0 20px', borderRadius: 11, background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{busy ? 'Starting…' : linked ? 'Re-link number' : 'Link your number'}</button>
           {err && <div style={{ marginTop: 10, font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--red)' }}>{err}</div>}
