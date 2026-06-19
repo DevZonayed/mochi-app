@@ -372,6 +372,9 @@ app.whenReady().then(() => {
   engine.setComms(whatsapp);
   whatsapp.resumeOnBoot();
   const gitService = new GitService(store, emit, providers);
+  // Hand the gitService to the engine so the post-turn auto-rename hook can
+  // run (otherwise it's a no-op — the engine treats gitService as optional).
+  engine.setGitService(gitService);
   const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge);
   // Local control channel for the native browser extension (one app-owned port).
   extensionBridge = new ExtensionBridge(store, dispatch, (status) => emit('extension', status, { desktopOnly: true }));

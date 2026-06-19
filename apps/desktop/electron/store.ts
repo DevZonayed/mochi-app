@@ -142,6 +142,16 @@ export interface ChatSession {
   baseBranch?: string;
   /** Set when the session's worktree has been pruned/archived. */
   archivedAt?: number;
+  /** Memorable per-session city callsign ("lyon", "porto" …). Assigned once at
+      creation; appears in the branch path (`mochi/<codename>/<slug>`) AND in the
+      UI (rails, chat header) so the operator can refer to the session by name
+      instead of an opaque id. */
+  codename?: string;
+  /** Timestamp the branch was auto-renamed from its initial codename-only form
+      to a task-derived slug. Set once; gates the rename so we don't keep
+      renaming as the title evolves (and to keep the name locked once a PR
+      exists on GitHub). */
+  branchRenamedAt?: number;
   /** Imported from an external store (Claude/Codex/Conductor) — read-only history. */
   importedFrom?: 'claude' | 'codex' | 'conductor';
   /** Source-side conversation id; dedupes re-imports of the same conversation. */
@@ -920,13 +930,23 @@ export class Store {
     return (projectId ? all.filter(s => s.projectId === projectId) : all).slice(0, 100);
   }
   getSession(sessionId: string): ChatSession | undefined { return this.data.sessions.find(s => s.id === sessionId); }
-  createSession(projectId: string, title: string): ChatSession {
+  /** Codenames already in use inside `projectId` — used to pick a unique one
+      for a new session. Cheap (a single linear scan over the project's chats). */
+  usedCodenamesIn(projectId: string): Set<string> {
+    const used = new Set<string>();
+    for (const s of this.data.sessions) {
+      if (s.projectId === projectId && s.codename) used.add(s.codename);
+    }
+    return used;
+  }
+  createSession(projectId: string, title: string, codename?: string): ChatSession {
     const t = now();
     const s: ChatSession = { id: id(), projectId, title: (title.trim() || 'New chat').slice(0, 60), createdAt: t, updatedAt: t };
+    if (codename) s.codename = codename;
     this.data.sessions.push(s); this.save();
     return s;
   }
-  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt'>>): ChatSession {
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt' | 'codename' | 'branchRenamedAt'>>): ChatSession {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     Object.assign(s, patch, { updatedAt: now() });

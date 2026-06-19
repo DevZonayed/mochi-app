@@ -5,7 +5,7 @@
 import { existsSync } from 'node:fs';
 import type { Store, ChatSession, Project } from './store.js';
 import type { Providers } from './providers.js';
-import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch, fetchOrigin, mergeBaseIntoBranch } from './git.js';
+import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug } from './git.js';
 import { parseGitHubRemote, findOpenPr, getPullStatus, createPull, mergePull, getRepo, pickMergeMethod } from './github.js';
 import { deriveState, type LocalState, type PrStatus, type SessionGitStatus } from './pr-state.js';
 
@@ -140,6 +140,56 @@ export class GitService {
     if (res.ok) pushBranch(dir, session.branch, { token: this.token() });
     await this.fullStatus(session, { withPr: true });
     return res;
+  }
+
+  /** Auto-rename hook: swap the codename-only initial branch for one carrying
+      a task-derived slug (e.g. `mochi/lyon/lyon` → `mochi/lyon/fix-auth-bug`).
+      Fires exactly once per session — gated by `branchRenamedAt`. Refuses
+      after a PR exists on the old name (branch is locked to GitHub) and after
+      the branch has been pushed (avoids dangling remote refs).
+
+      Returns `{ ok:true, unchanged:true }` for no-op cases (already renamed,
+      no branch, no codename, slug == codename, PR exists, branch pushed) so
+      the caller can fire-and-forget without branching on the reason.
+
+      Safe to call multiple times; only the first call where conditions allow
+      will actually run `git branch -m`. */
+  async renameSessionBranch(session: ChatSession): Promise<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }> {
+    if (session.branchRenamedAt) return { ok: true, unchanged: true, reason: 'already renamed' };
+    if (!session.branch || !session.codename || !session.worktreePath) return { ok: true, unchanged: true, reason: 'no worktree branch' };
+    const project = this.store.getProject(session.projectId);
+    if (!project?.path) return { ok: true, unchanged: true, reason: 'no project path' };
+
+    const slug = branchSlug(session.title);
+    // If the slug is still the codename or empty, the title hasn't ripened.
+    if (!slug || slug === session.codename || slug === 'chat') return { ok: true, unchanged: true, reason: 'title not informative yet' };
+
+    const to = `mochi/${session.codename}/${slug}`;
+    if (to === session.branch) {
+      // Already aligned — just mark it renamed so we don't keep evaluating.
+      try { this.store.updateSession(session.id, { branchRenamedAt: Date.now() }); } catch { /* gone */ }
+      return { ok: true, unchanged: true };
+    }
+
+    // Lock once the branch has been pushed or a PR exists — renaming the
+    // remote/PR head is destructive and outside the scope of this hook.
+    const cached = this.cache.get(session.id);
+    if (cached?.local.pushed) {
+      try { this.store.updateSession(session.id, { branchRenamedAt: Date.now() }); } catch { /* gone */ }
+      return { ok: true, unchanged: true, reason: 'branch already pushed' };
+    }
+    if (cached?.pr) {
+      try { this.store.updateSession(session.id, { branchRenamedAt: Date.now() }); } catch { /* gone */ }
+      return { ok: true, unchanged: true, reason: 'PR exists' };
+    }
+
+    const res = renameLocalBranch(session.worktreePath, session.branch, to);
+    if (!res.ok) return { ok: false, from: session.branch, to, reason: res.reason };
+
+    try { this.store.updateSession(session.id, { branch: to, branchRenamedAt: Date.now() }); } catch { /* gone */ }
+    // Re-emit status with the new branch name.
+    try { await this.fullStatus({ ...session, branch: to, branchRenamedAt: Date.now() }, { withPr: false }); } catch { /* best effort */ }
+    return { ok: true, from: session.branch, to, unchanged: res.unchanged };
   }
 
   /** Sessions worth polling for PR state (have a branch + live worktree, not archived). */
