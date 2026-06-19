@@ -21,6 +21,7 @@ import { ghState } from './gh-cli.js';
 import type { GitService } from './git-service.js';
 import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
+import { saveAttachment, substitutePlaceholders } from './attachments.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
 import { scanConversations, parseConversation, type ConvSource } from './conversation-sync.js';
 import { existsSync, mkdirSync, cpSync, readdirSync, statSync } from 'node:fs';
@@ -478,10 +479,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'sendChat': {
         const projectId = String(p.projectId ?? '');
         const text = String(p.text ?? '').trim();
-        const rawImages = Array.isArray(p.images) ? p.images as Array<{ dataB64?: string; mime?: string; name?: string }> : [];
-        const rawFiles = Array.isArray(p.files) ? p.files as Array<{ name?: string; mime?: string; kind?: string; content?: string; dataB64?: string }> : [];
+        const rawImages = Array.isArray(p.images) ? p.images as Array<{ id?: string; dataB64?: string; mime?: string; name?: string }> : [];
+        const rawFiles = Array.isArray(p.files) ? p.files as Array<{ id?: string; name?: string; mime?: string; kind?: string; content?: string; dataB64?: string }> : [];
         if (!projectId || (!text && !rawImages.length && !rawFiles.length)) bad('projectId and a message, image, or file required');
-        if (!store.getProject(projectId)) bad('project not found', 404);
+        const project = store.getProject(projectId);
+        if (!project) bad('project not found', 404);
         let session = p.sessionId ? store.getSession(String(p.sessionId)) : undefined;
         if (p.sessionId && !session) bad('session not found', 404);
         if (!session) {
@@ -491,6 +493,14 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           session = store.createSession(projectId, text, codename);
           emit('session', session);
         }
+        // The project's working root — where `.continuum/Attachment/` lives.
+        // Every composer attachment (image, pasted text, file) is saved there
+        // BEFORE the job is created, then the chip's `«attach:id»` placeholder
+        // in the prompt text is rewritten to `@<absPath>` at the SAME position.
+        // The agent sees an inline file reference exactly where the user typed
+        // it, and can `Read` the file directly with its standard tools.
+        const projectCwd = projectRootOf(project!);
+        const idToPath = new Map<string, string>();
         // Resolve the chosen primary + reviewer. A picker key (modelKey /
         // reviewerKey) is resolved provider-side; legacy engine/model still works.
         const primary = p.modelKey !== undefined
@@ -508,8 +518,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (reviewer !== undefined) sessPatch.reviewer = reviewer;
         if (Object.keys(sessPatch).length) { session = store.updateSession(session.id, sessPatch); emit('session', session); }
 
-        // Ingest pasted/dropped images as Assets (vision input). The bytes stay on
-        // the Mac; the job carries only asset refs. Capped to bound payload + spend.
+        // Ingest pasted/dropped images. Each is saved under
+        // `<projectCwd>/.continuum/Attachment/<safeName>_<idSuffix>.<ext>` and
+        // ALSO registered as an Asset so the existing `assetImage` IPC keeps
+        // serving inline thumbnails to the chat (no second copy on disk — the
+        // Asset's localPath points to the same `.continuum/Attachment/` file).
         const inputImages: ChatImage[] = [];
         const seenAssets = new Set<string>();
         for (const im of rawImages.slice(0, 8)) {
@@ -518,24 +531,36 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           let buf: Buffer;
           try { buf = Buffer.from(b64, 'base64'); } catch { continue; }
           if (!buf.length || buf.length > 16 * 1024 * 1024) continue;
+          const chipId = String(im?.id ?? '') || `img-${seenAssets.size}-${Date.now().toString(36)}`;
           try {
-            const asset = publishing.importAssetBytes(buf, String(im?.name ?? 'pasted.png'), projectId);
+            const saved = saveAttachment(projectCwd, { id: chipId, kind: 'image', name: String(im?.name ?? 'pasted.png'), bytes: buf, mime: String(im?.mime ?? '') });
+            const asset = publishing.importAsset(saved.absPath, projectId);
             if (seenAssets.has(asset.id)) continue; // identical bytes attached twice → one entry
             seenAssets.add(asset.id);
-            inputImages.push({ assetId: asset.id, imagePath: asset.localPath ?? '', mime: String(im?.mime ?? 'image/png'), name: asset.name, width: asset.width, height: asset.height });
+            idToPath.set(chipId, saved.absPath);
+            inputImages.push({ id: chipId, assetId: asset.id, imagePath: saved.absPath, mime: String(im?.mime ?? 'image/png'), name: saved.name, width: asset.width, height: asset.height });
           } catch { /* skip an unreadable image */ }
         }
 
-        // Ingest non-image attachments. Text (pasted text / code files) is inlined
-        // into the prompt; other files are saved on the Mac and referenced by path.
+        // Ingest non-image attachments. EVERY one (text or binary) is saved on
+        // disk under `.continuum/Attachment/`; text pastes are no longer inlined
+        // into the prompt — the agent reads them from the file via its tools,
+        // and the inline `@<absPath>` marker tells it WHERE in the message to
+        // attend to that file. This keeps a 50k-char paste from re-blasting the
+        // prompt every turn.
         const inputFiles: ChatFile[] = [];
         for (const f of rawFiles.slice(0, 12)) {
           const name = String(f?.name ?? 'file').slice(0, 200);
+          const chipId = String(f?.id ?? '') || `f-${inputFiles.length}-${Date.now().toString(36)}`;
           if (f?.kind === 'text') {
             const content = String(f?.content ?? '');
             if (!content.trim()) continue;
-            const capped = content.slice(0, 256 * 1024); // bound the prompt
-            inputFiles.push({ name, kind: 'text', bytes: content.length, content: capped, preview: content.slice(0, 160).replace(/\s+/g, ' ').trim() });
+            const capped = content.slice(0, 1024 * 1024); // file on disk — looser cap than the old in-prompt one
+            try {
+              const saved = saveAttachment(projectCwd, { id: chipId, kind: 'text', name, content: capped });
+              idToPath.set(chipId, saved.absPath);
+              inputFiles.push({ id: chipId, name: saved.name, kind: 'text', bytes: saved.bytes, path: saved.absPath, preview: capped.slice(0, 160).replace(/\s+/g, ' ').trim() });
+            } catch { /* skip an unwritable text */ }
           } else {
             const b64 = String(f?.dataB64 ?? '');
             if (!b64) continue;
@@ -543,13 +568,20 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
             try { buf = Buffer.from(b64, 'base64'); } catch { continue; }
             if (!buf.length || buf.length > 30 * 1024 * 1024) continue;
             try {
-              const savedPath = publishing.saveAttachmentFile(buf, name, projectId);
-              inputFiles.push({ name, kind: 'file', mime: String(f?.mime ?? ''), bytes: buf.length, path: savedPath, preview: name });
+              const saved = saveAttachment(projectCwd, { id: chipId, kind: 'file', name, bytes: buf, mime: String(f?.mime ?? '') });
+              idToPath.set(chipId, saved.absPath);
+              inputFiles.push({ id: chipId, name: saved.name, kind: 'file', mime: String(f?.mime ?? ''), bytes: saved.bytes, path: saved.absPath, preview: saved.name });
             } catch { /* skip an unwritable file */ }
           }
         }
 
-        const job = store.createJob(projectId, text, text.slice(0, 60), p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined);
+        // The composer's chip POSITION is preserved as `«attach:<id>»` in the
+        // prompt text. Rewrite each placeholder to `@<absPath>` AFTER saving, so
+        // the agent sees the inline file reference exactly where the user typed
+        // the chip. Unknown ids drop out — a chip with no payload becomes empty.
+        const finalText = substitutePlaceholders(text, idToPath);
+
+        const job = store.createJob(projectId, finalText, finalText.slice(0, 60), p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined);
         emit('job', job);
         // Fire the run async — the reply streams in over job events.
         void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true, browser: p.browser === true });
