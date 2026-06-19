@@ -14,6 +14,7 @@ import type { WhatsAppClient } from './whatsapp.js';
 import { approveWhatsappSend } from './whatsapp-analyze.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, structuredDiff } from './git.js';
+import { pickCityCodename } from './codenames.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
 import { ghState } from './gh-cli.js';
@@ -412,6 +413,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
         return gitService.resolveSession(s);
       }
+      // Manual one-shot of the auto-rename hook (testing + a future "rename
+      // branch now" button in the chat header).
+      case 'renameSessionBranch': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.renameSessionBranch(s);
+      }
 
       // ── Conversation sync (import Claude/Codex/Conductor history) ──────────
       // DESKTOP-ONLY (reads local agent stores + the Conductor SQLite db). Guarded
@@ -477,7 +485,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         let session = p.sessionId ? store.getSession(String(p.sessionId)) : undefined;
         if (p.sessionId && !session) bad('session not found', 404);
         if (!session) {
-          session = store.createSession(projectId, text);
+          // Pick a memorable city codename so the branch (`mochi/<city>/<slug>`)
+          // and rails surface a stable callsign for the session from the start.
+          const codename = pickCityCodename(store.usedCodenamesIn(projectId));
+          session = store.createSession(projectId, text, codename);
           emit('session', session);
         }
         // Resolve the chosen primary + reviewer. A picker key (modelKey /
