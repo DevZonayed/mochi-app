@@ -8,6 +8,7 @@ import { LiveNotifier } from './src/LiveNotifier';
 import { hydrate } from './src/storage';
 import { reloadPairToken } from './src/api';
 import { registerForPush } from './src/push';
+import { setupPushNav } from './src/pushNav';
 
 export default function App() {
   // Load persisted settings (pair token, theme, prefs) before first render so the
@@ -29,6 +30,10 @@ export default function App() {
     const sub = AppState.addEventListener('change', (s) => { if (s === 'active') void registerForPush(); });
     return () => sub.remove();
   }, []);
+
+  // Tap-to-deep-link for closed/background notifications. Cold-start taps are
+  // queued and flushed once the navigator reports ready (see RootNavigator).
+  React.useEffect(() => setupPushNav(), []);
 
   return (
     <SafeAreaProvider>
