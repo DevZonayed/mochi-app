@@ -2,8 +2,8 @@
    opened while any screen is subscribed and closed when the last one leaves.
    Components call useLive(['job','session'], cb) to react instantly to Mac events. */
 
-import { useEffect, useRef } from 'react';
-import { openLiveStream, type LiveEventName } from './api';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
+import { openLiveStream, getConnPath, subscribeConnPath, type LiveEventName } from './api';
 
 type Listener = (name: LiveEventName, data: unknown) => void;
 
@@ -37,4 +37,9 @@ export function useLive(names: LiveEventName[], cb: Listener): void {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
+}
+
+/** The live stream's current transport: 'p2p' (direct WebRTC) or 'relay'. Re-renders on change. */
+export function useConnPath(): 'p2p' | 'relay' {
+  return useSyncExternalStore(subscribeConnPath, getConnPath, getConnPath);
 }

@@ -324,6 +324,8 @@ export interface AppSettings {
   feedbackRepo?: string;
   /** Device-notification sound preferences. */
   notifications?: NotificationSettings;
+  /** Opt-in: try a direct desktop↔phone WebRTC channel before the relay (default off). */
+  p2pEnabled?: boolean;
 }
 
 export type FeedbackCategory = 'bug' | 'idea' | 'other';

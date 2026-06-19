@@ -390,8 +390,10 @@ export interface AppSettings {
   feedbackRepo?: string;
   /** Device-notification sound preferences. */
   notifications?: NotificationSettings;
+  /** Opt-in: try a direct desktop↔phone WebRTC channel before the relay (default off). */
+  p2pEnabled?: boolean;
 }
-export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], notifications: { ...DEFAULT_NOTIFICATIONS } };
+export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], p2pEnabled: false, notifications: { ...DEFAULT_NOTIFICATIONS } };
 
 export interface BudgetData { cap: number; spent: number; byProject: { projectId: string; name: string; color: string; spent: number }[] }
 export interface CostsData {

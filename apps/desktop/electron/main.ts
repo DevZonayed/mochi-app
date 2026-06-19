@@ -18,6 +18,10 @@ import { createDispatch } from './localApi.js';
 import { GitService } from './git-service.js';
 import { buildModelGroups } from './models.js';
 import { RelayClient } from './relay.js';
+import { DesktopP2PHost } from './p2p.js';
+import { isRemoteBlocked } from './remote-guard.js';
+import { buildIceServers } from '@maestro/realtime';
+import type { Envelope, ConnState } from '@maestro/realtime';
 import { CronRunner } from './cron.js';
 import { runSmoke } from './smoke.js';
 import { Updater } from './updater.js';
@@ -262,6 +266,7 @@ app.whenReady().then(() => {
   let relay: RelayClient | null = null;
   let telegram: TelegramBot | null = null;
   let extensionBridge: ExtensionBridge | null = null;
+  let p2pHost: DesktopP2PHost | null = null;
   const emit = (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => {
     for (const w of BrowserWindow.getAllWindows()) {
       try { w.webContents.send('maestro:event', { name, data }); } catch { /* window closing */ }
@@ -273,7 +278,10 @@ app.whenReady().then(() => {
     if (opts?.live || opts?.desktopOnly || name.startsWith('wa-')) return;
     // Keep every connected browser-extension profile's project+chat list live.
     extensionBridge?.onAppEvent(name);
-    if (name === 'settings' && data && typeof data === 'object') applyLoginItem(!!(data as { openAtLogin?: boolean }).openAtLogin);
+    if (name === 'settings' && data && typeof data === 'object') {
+      applyLoginItem(!!(data as { openAtLogin?: boolean }).openAtLogin);
+      p2pHost?.setEnabled(!!(data as { p2pEnabled?: boolean }).p2pEnabled);
+    }
     // A new pending approval (e.g. reviewer NEEDS WORK) → push to Telegram gates.
     if (name === 'approval' && telegram && (data as Approval)?.status === 'pending') telegram.notifyApproval(data as Approval);
     // A recurring schedule fired late (catch-up after the Mac was asleep) — tell the operator.
@@ -289,6 +297,8 @@ app.whenReady().then(() => {
       : data;
     relay?.event(name, relayData);
     relay?.pushSnapshot();
+    // Direct path: also push the (already slimmed) event to any phone whose P2P channel is open.
+    p2pHost?.broadcastEvent(name, relayData);
   };
 
   // Engine binaries (Codex / Claude / gh) are downloaded on demand into userData
@@ -369,6 +379,34 @@ app.whenReady().then(() => {
   // Give coding turns the browser_* tools that drive the active Chrome profile.
   engine.setExtensionBridge(() => extensionBridge);
 
+  // Shared security boundary for EVERY remote surface (relay AND direct P2P): the
+  // blocked-method guard, feedback provenance, and Job-slimming live here so both
+  // transports answer identically and can't drift. (See remote-guard.ts + p2p.ts.)
+  const handleRemoteCommand = async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+    if (isRemoteBlocked(method)) {
+      throw Object.assign(new Error('not available remotely'), { statusCode: 403 });
+    }
+    // Feedback provenance is set by the TRANSPORT, not the caller: a remote is a
+    // phone or web client and can never assert it came from the desktop.
+    if (method === 'submitFeedback') {
+      params = { ...params, source: (params as { source?: unknown }).source === 'phone' ? 'phone' : 'web' };
+    }
+    const r = await dispatch(method, params);
+    const isJob = (x: unknown): x is Job => !!x && typeof x === 'object' && 'input' in x && 'status' in x && 'phase' in x && 'projectId' in x;
+    if (isJob(r)) return store.slimJobForRelay(r);
+    if (Array.isArray(r)) return r.map((x) => (isJob(x) ? store.slimJobForRelay(x) : x));
+    if (r && typeof r === 'object' && isJob((r as { job?: unknown }).job)) return { ...r, job: store.slimJobForRelay((r as { job: Job }).job) };
+    return r;
+  };
+
+  // Direct P2P host (the renderer runs the actual RTCPeerConnection). Stays off
+  // until the p2pEnabled flag is set; the relay path is unchanged + always the fallback.
+  p2pHost = new DesktopP2PHost({
+    toRenderer: (msg) => { try { win?.webContents.send('maestro:p2p:in', msg); } catch { /* window closing */ } },
+    signalViaRelay: (did, signal) => relay?.signal(did, signal),
+    handleCommand: handleRemoteCommand,
+  });
+
   relay = new RelayClient({
     url: RELAY_URL,
     deckId: store.deck.deckId,
@@ -379,47 +417,37 @@ app.whenReady().then(() => {
     // listJobs…) — slim any Job before it crosses back to the phone so the
     // Mac-local image path never rides the response either. (Desktop IPC at
     // maestro:call calls dispatch directly and keeps the full job for reveal.)
-    onCommand: async (method, params) => {
-      // Desktop-only methods that expose local secrets / personal data must never
-      // answer over the relay, even though dispatch is shared with the local IPC
-      // surface. getPairing returns the raw access token (a local secret); the
-      // *ProjectMemory + snapshotProject methods read/write project files and run
-      // git on the Mac — none may answer over the relay (phone/web are read-mostly
-      // remote controls, not local-execution surfaces).
-      if (method === 'getPairing' || method === 'kickDevice' || method === 'regeneratePairingCode' || method === 'getProjectMemory' || method === 'setProjectMemory' || method === 'snapshotProject' || method === 'archiveSessionWorktree' || method === 'importGithubFromCli' || method === 'getSessionGitStatus' || method === 'refreshSessionGitStatus' || method === 'pushSession' || method === 'createSessionPR' || method === 'mergeSessionPR' || method === 'resolveSession'
-        || method === 'listDesignComments' || method === 'addDesignComment' || method === 'setDesignCommentStatus' || method === 'deleteDesignComment'
-        || method === 'extensionStatus' || method === 'extensionSetActive'
-        || method === 'copyDesignToCode'
-        || method === 'addSkillToProject' || method === 'removeSkillFromProject'
-        || method === 'scanConversations' || method === 'importConversations'
-        // WhatsApp chat content + sending are Mac-local only: a remote must never
-        // read messages or send on the linked personal number over the relay.
-        || method === 'waListChats' || method === 'waGetMessages' || method === 'waChatInfo'
-        || method === 'waSendText' || method === 'waSendMedia' || method === 'waReact'
-        || method === 'waMarkRead' || method === 'waSetTyping' || method === 'waFetchAvatar' || method === 'waDownloadMedia'
-        || method === 'addProjectWaChat' || method === 'removeProjectWaChat' || method === 'listProjectWaChats' || method === 'setWhatsappAgentSend' || method === 'setWhatsappRecipient'
-        // feedbackCreateIssue spends THIS Mac's GitHub token — keep it local-only
-        // (a remote can still submit/list/triage feedback; just not file issues).
-        || method === 'feedbackCreateIssue') {
-        throw Object.assign(new Error('not available remotely'), { statusCode: 403 });
-      }
-      // Feedback provenance is set by the TRANSPORT, not the caller: a remote is
-      // a phone or web client and can never assert it came from the desktop.
-      if (method === 'submitFeedback') {
-        params = { ...params, source: (params as { source?: unknown }).source === 'phone' ? 'phone' : 'web' };
-      }
-      const r = await dispatch(method, params);
-      const isJob = (x: unknown): x is Job => !!x && typeof x === 'object' && 'input' in x && 'status' in x && 'phase' in x && 'projectId' in x;
-      if (isJob(r)) return store.slimJobForRelay(r);
-      if (Array.isArray(r)) return r.map(x => (isJob(x) ? store.slimJobForRelay(x) : x));
-      if (r && typeof r === 'object' && isJob((r as { job?: unknown }).job)) return { ...r, job: store.slimJobForRelay((r as { job: Job }).job) };
-      return r;
-    },
+    // Every remote command (relay OR P2P) funnels through the one shared guard +
+    // provenance + Job-slimming defined above (handleRemoteCommand / remote-guard.ts).
+    onCommand: (method, params) => handleRemoteCommand(method, params),
+    // A remote's WebRTC signaling (offer/answer/ICE) → the renderer-hosted peer.
+    onSignal: (did, signal) => p2pHost?.onSignal(did, signal),
     // The relay reports remote-device presence → mirror it into the store and tell
     // the desktop UI (Devices pane + pairing window). Desktop-only; never relayed.
     onRemote: (devices) => { emit('devices', store.setRemoteDevices(devices), { desktopOnly: true }); },
   });
   relay.start();
+  p2pHost.setEnabled(!!store.getSettings().p2pEnabled);
+  // Renderer-hosted WebRTC peer → main bridge (fire-and-forget; one channel each way).
+  ipcMain.on('maestro:p2p:out', (_e, msg: { kind?: string; did?: string; signal?: unknown; env?: Envelope; state?: ConnState }) => {
+    if (!p2pHost || !msg || typeof msg.did !== 'string') return;
+    if (msg.kind === 'signal-out') p2pHost.fromRendererSignal(msg.did, msg.signal);
+    else if (msg.kind === 'msg-in' && msg.env) p2pHost.fromRendererMessage(msg.did, msg.env);
+    else if (msg.kind === 'state' && msg.state) p2pHost.fromRendererState(msg.did, msg.state);
+    else if (msg.kind === 'closed') p2pHost.removePeer(msg.did);
+  });
+  // ICE config for the renderer peer: time-limited TURN creds from the relay, else public STUN.
+  ipcMain.handle('maestro:p2pIce', async () => {
+    try {
+      const httpBase = RELAY_URL.replace(/^ws/, 'http').replace(/\/ws$/, '');
+      const res = await fetch(`${httpBase}/api/turn-credentials`, { headers: { Authorization: `Bearer ${store.accessToken}` } });
+      if (res.ok) {
+        const t = (await res.json()) as { host: string | null; username: string | null; credential: string | null };
+        if (t.host && t.username && t.credential) return buildIceServers({ host: t.host, username: t.username, credential: t.credential });
+      }
+    } catch { /* fall through to public STUN */ }
+    return buildIceServers();
+  });
 
   const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs), makeWhatsappAnalyzer({ store, engine, client: whatsapp, emit }));
   engine.setCron(cron); // so the agent's schedule_* tools manage + fire through this runner
