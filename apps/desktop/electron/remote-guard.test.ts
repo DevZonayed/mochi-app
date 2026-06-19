@@ -13,6 +13,11 @@ describe('remote-guard', () => {
       'extensionStatus', 'extensionSetActive', 'copyDesignToCode',
       'addSkillToProject', 'removeSkillFromProject', 'scanConversations', 'importConversations',
       'feedbackCreateIssue',
+      // WhatsApp chat content + control are Mac-local — never answer to a remote.
+      'waListChats', 'waGetMessages', 'waChatInfo', 'waSendText', 'waSendMedia', 'waReact',
+      'waMarkRead', 'waSetTyping', 'waFetchAvatar', 'waDownloadMedia',
+      'addProjectWaChat', 'removeProjectWaChat', 'listProjectWaChats',
+      'setWhatsappAgentSend', 'setWhatsappRecipient',
     ];
     for (const m of mustBlock) expect(isRemoteBlocked(m)).toBe(true);
     expect(REMOTE_BLOCKED_METHODS.size).toBe(mustBlock.length);

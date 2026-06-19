@@ -12,20 +12,24 @@ vi.mock('electron', () => ({
 }));
 
 import { Store } from './store.js';
-import { WhatsAppClient, normalizeWaMessage } from './whatsapp.js';
+import { WhatsAppClient, normalizeWaMessage, waSendAllowed } from './whatsapp.js';
 
 /** A minimal stand-in for a baileys socket: records sends, replays ev emissions. */
 function mockSocket(ownId = '15551234567:3@s.whatsapp.net') {
   const handlers: Record<string, Array<(p: unknown) => void>> = {};
-  const sent: Array<{ jid: string; text: string }> = [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sent: Array<{ jid: string; text?: string; content: any }> = [];
+  const reads: unknown[] = [];
   const sock = {
     ev: { on: (e: string, cb: (p: unknown) => void) => { (handlers[e] ||= []).push(cb); } },
     user: { id: ownId },
-    sendMessage: async (jid: string, c: { text: string }) => { sent.push({ jid, text: c.text }); return {}; },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sendMessage: async (jid: string, c: any) => { sent.push({ jid, text: c.text, content: c }); return { key: { id: `srv-${c.text ?? 'm'}`, remoteJid: jid, fromMe: true } }; },
+    readMessages: async (keys: unknown[]) => { reads.push(...keys); },
     end: () => {},
   };
   const fire = (e: string, p: unknown) => { (handlers[e] || []).forEach(cb => cb(p)); };
-  return { sock, sent, fire };
+  return { sock, sent, reads, fire };
 }
 
 function textMsg(chatId: string, text: string, opts: { fromMe?: boolean; pushName?: string; ts?: number } = {}) {
@@ -64,6 +68,58 @@ describe('normalizeWaMessage', () => {
   });
 });
 
+describe('waSendAllowed — agent send gate', () => {
+  it('always allows the linked number OR the configured notify number (device suffix ignored)', () => {
+    expect(waSendAllowed('15551234567@s.whatsapp.net', ['15551234567:3@s.whatsapp.net', null], false)).toBe(true);
+    // the user's personal "notify" number is also always allowed
+    expect(waSendAllowed('999@s.whatsapp.net', ['15551234567@s.whatsapp.net', '999@s.whatsapp.net'], false)).toBe(true);
+  });
+  it('blocks messaging anyone else unless the operator opted in', () => {
+    expect(waSendAllowed('888@s.whatsapp.net', ['15551234567@s.whatsapp.net', null], false)).toBe(false);
+    expect(waSendAllowed('888@s.whatsapp.net', ['15551234567@s.whatsapp.net', null], true)).toBe(true);
+  });
+});
+
+describe('normalizeWaMessage — media descriptors + extra kinds', () => {
+  it('extracts an image media descriptor (thumbnail + download keys)', () => {
+    const m = normalizeWaMessage({
+      key: { remoteJid: 'a@s.whatsapp.net', id: 'i1' },
+      message: { imageMessage: { caption: 'look', mimetype: 'image/jpeg', url: 'https://x', directPath: '/v/x', mediaKey: Buffer.from('key1'), jpegThumbnail: Buffer.from('thumbbytes') } },
+      messageTimestamp: 100, pushName: 'A',
+    })!;
+    expect(m.kind).toBe('image');
+    expect(m.text).toBe('look');
+    expect(m.media?.mediaType).toBe('image');
+    expect(m.media?.mimetype).toBe('image/jpeg');
+    expect(m.media?.thumbBase64).toBe(Buffer.from('thumbbytes').toString('base64'));
+    expect(m.media?.mediaKeyB64).toBe(Buffer.from('key1').toString('base64'));
+    expect(m.media?.directPath).toBe('/v/x');
+  });
+  it('classifies sticker, audio (with duration) and contact', () => {
+    expect(normalizeWaMessage({ key: { remoteJid: 'a@s', id: 's1' }, message: { stickerMessage: { mimetype: 'image/webp', mediaKey: Buffer.from('k'), url: 'u' } }, messageTimestamp: 1 })!.kind).toBe('sticker');
+    const a = normalizeWaMessage({ key: { remoteJid: 'a@s', id: 'au1' }, message: { audioMessage: { mimetype: 'audio/ogg', mediaKey: Buffer.from('k'), url: 'u', seconds: 12, ptt: true } }, messageTimestamp: 1 })!;
+    expect(a.kind).toBe('audio'); expect(a.media?.seconds).toBe(12);
+    const c = normalizeWaMessage({ key: { remoteJid: 'a@s', id: 'c1' }, message: { contactMessage: { displayName: 'Bob' } }, messageTimestamp: 1 })!;
+    expect(c.kind).toBe('contact'); expect(c.text).toBe('Bob');
+  });
+  it('marks unknown/protocol frames as system with empty text + no media', () => {
+    const m = normalizeWaMessage({ key: { remoteJid: 'a@s', id: 'p1' }, message: { protocolMessage: { type: 0 } }, messageTimestamp: 1 })!;
+    expect(m.kind).toBe('system'); expect(m.text).toBe(''); expect(m.media).toBeUndefined();
+  });
+});
+
+describe('WhatsAppClient.ingest — skip blank frames', () => {
+  it('does not store empty system/protocol frames (so they never render as blank bubbles)', () => {
+    const s = new Store();
+    const client = new WhatsAppClient(s, vi.fn());
+    client.ingest({ key: { remoteJid: 'z@s.whatsapp.net', id: 'p1' }, message: { protocolMessage: { type: 0 } }, messageTimestamp: 1 });
+    expect(s.waMessages('z@s.whatsapp.net')).toHaveLength(0);
+    expect(s.waGetChat('z@s.whatsapp.net')).toBeUndefined(); // not even a chat row
+    client.ingest({ key: { remoteJid: 'z@s.whatsapp.net', id: 't1' }, message: { conversation: 'real' }, messageTimestamp: 2, pushName: 'A' });
+    expect(s.waMessages('z@s.whatsapp.net').map(m => m.text)).toEqual(['real']);
+  });
+});
+
 describe('WhatsAppClient.ingest — capture routing', () => {
   it('records a tracked chat and arms its quiet timer', () => {
     const s = new Store();
@@ -93,13 +149,15 @@ describe('WhatsAppClient.ingest — capture routing', () => {
     expect(s.listSchedules().filter(x => x.kind === 'whatsapp-analyze')).toHaveLength(0);
   });
 
-  it('routes an untracked chat to pending (no capture, no timer)', () => {
+  it('captures an untracked chat into the WhatsApp view AND surfaces it as pending (no timer)', () => {
     const s = new Store();
     const client = new WhatsAppClient(s, vi.fn());
 
     client.ingest(textMsg('888@s.whatsapp.net', 'who am i'));
 
-    expect(s.getWaTranscript('888@s.whatsapp.net')).toHaveLength(0);
+    // Now captured so the WhatsApp screen can show it (Mac-local)…
+    expect(s.getWaTranscript('888@s.whatsapp.net').map(m => m.text)).toEqual(['who am i']);
+    // …still surfaced to bind for the quiet-timer, but no timer until bound.
     expect(s.listSchedules().filter(x => x.kind === 'whatsapp-analyze')).toHaveLength(0);
     expect(s.listPendingChats().some(c => c.chatId === '888@s.whatsapp.net')).toBe(true);
   });
@@ -118,6 +176,40 @@ describe('WhatsAppClient.ingest — capture routing', () => {
     expect(timers).toHaveLength(1);               // still one timer, reset in place
     expect(timers[0].fireAt!).toBeGreaterThanOrEqual(firstFire);
     expect(s.getWaTranscript('111@s.whatsapp.net').map(m => m.text)).toEqual(['hi', 'my reply']);
+  });
+});
+
+describe('WhatsAppClient — full chat list + history', () => {
+  it('ingests a history-sync batch into the chat list + message logs', async () => {
+    const s = new Store();
+    const { sock, fire } = mockSocket();
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => sock });
+    await client.connect();
+
+    fire('messaging-history.set', {
+      contacts: [{ id: '111@s.whatsapp.net', name: 'Alice' }],
+      chats: [
+        { id: '111@s.whatsapp.net', conversationTimestamp: 1700000200 },
+        { id: '999-1@g.us', name: 'Team', conversationTimestamp: 1700000300 },
+      ],
+      messages: [textMsg('111@s.whatsapp.net', 'hey', { ts: 1700000100 })],
+    });
+
+    expect(s.waListChats().map(c => c.chatId).sort()).toEqual(['111@s.whatsapp.net', '999-1@g.us']);
+    expect(s.waGetChat('111@s.whatsapp.net')!.name).toBe('Alice');     // resolved from contact
+    expect(s.waGetChat('999-1@g.us')!.kind).toBe('group');             // kind derived from JID
+    expect(s.waMessages('111@s.whatsapp.net').map(m => m.text)).toEqual(['hey']);
+  });
+
+  it('updates a chat name from chats.upsert', async () => {
+    const s = new Store();
+    const { sock, fire } = mockSocket();
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => sock });
+    await client.connect();
+
+    fire('chats.upsert', [{ id: '222@s.whatsapp.net', name: 'Bob' }]);
+
+    expect(s.waGetChat('222@s.whatsapp.net')!.name).toBe('Bob');
   });
 });
 
@@ -154,6 +246,64 @@ describe('WhatsAppClient — connection + send', () => {
     const s = new Store();
     const client = new WhatsAppClient(s, vi.fn());
     expect(await client.sendToSelf('nope')).toBe(false);
+  });
+
+  it('sendToSelf routes to the configured notify number when set (else the linked number)', async () => {
+    const s = new Store();
+    const { sock, sent } = mockSocket('111:2@s.whatsapp.net');
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => sock });
+    await client.connect();
+    s.setWhatsappState({ connected: true, jid: '111@s.whatsapp.net', notifyJid: '99999@s.whatsapp.net' });
+
+    await client.sendToSelf('summary');
+
+    expect(sent.at(-1)!.jid).toBe('99999@s.whatsapp.net'); // the personal number, not the linked PA number
+  });
+
+  it('sendText delivers to a chat and stores the outgoing message locally', async () => {
+    const s = new Store();
+    const { sock, sent, fire } = mockSocket();
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => sock });
+    await client.connect();
+    fire('connection.update', { connection: 'open' });
+
+    const ok = await client.sendText('111@s.whatsapp.net', 'hello there');
+
+    expect(ok).toBe(true);
+    expect(sent.at(-1)).toMatchObject({ jid: '111@s.whatsapp.net', text: 'hello there' });
+    expect(s.waMessages('111@s.whatsapp.net').map(m => m.text)).toContain('hello there');
+    expect(s.waMessages('111@s.whatsapp.net').at(-1)!.fromMe).toBe(true);
+  });
+
+  it('sendText returns false when not connected', async () => {
+    const s = new Store();
+    const client = new WhatsAppClient(s, vi.fn());
+    expect(await client.sendText('111@s.whatsapp.net', 'x')).toBe(false);
+  });
+
+  it('sendReaction emits a react payload to the socket', async () => {
+    const s = new Store();
+    const { sock, sent, fire } = mockSocket();
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => sock });
+    await client.connect();
+    fire('connection.update', { connection: 'open' });
+
+    await client.sendReaction('111@s.whatsapp.net', 'msg-1', '👍');
+
+    expect(sent.at(-1)!.content.react).toMatchObject({ text: '👍' });
+  });
+
+  it('markRead clears the unread badge', async () => {
+    const s = new Store();
+    const { sock, fire } = mockSocket();
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => sock });
+    await client.connect();
+    fire('messages.upsert', { messages: [textMsg('111@s.whatsapp.net', 'ping')] });
+    expect(s.waGetChat('111@s.whatsapp.net')!.unreadCount).toBe(1);
+
+    await client.markRead('111@s.whatsapp.net');
+
+    expect(s.waGetChat('111@s.whatsapp.net')!.unreadCount).toBe(0);
   });
 
   it('captures inbound messages wired through the live socket', async () => {

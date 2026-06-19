@@ -428,8 +428,26 @@ export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; 
 export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; provider?: CommsProvider; projectId: string | null; sessionId?: string | null; permissions: ChatPermissions; boundAt: number }
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
 export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
-export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummary?: { text: string; chatName: string; at: number } | null }
-export interface WaChatSummary { chatId: string; name: string; kind: 'dm' | 'group'; lastMessageAt: number; lastReportedAt: number; count: number }
+export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummaries?: { id: string; text: string; chatName: string; at: number }[]; agentSendToOthers?: boolean; notifyJid?: string | null }
+export type WaChatKind = 'dm' | 'group' | 'channel';
+export interface WaChatSummary { chatId: string; name: string; kind: WaChatKind; lastMessageAt: number; lastReportedAt: number; count: number }
+/** A WhatsApp chat as shown in the WhatsApp workspace (mirrors electron WaChatMeta). */
+export interface WaChat {
+  chatId: string; name: string; kind: WaChatKind; avatarUrl?: string | null;
+  lastMessageAt: number; lastMessageText: string; lastMessageFromMe: boolean;
+  unreadCount: number; pinned?: boolean; muted?: boolean; isContact?: boolean; lastReportedAt: number;
+}
+export interface WaReaction { emoji: string; fromMe: boolean }
+export interface WaMediaRef { kind: string; mimetype?: string; fileName?: string; seconds?: number; sizeBytes?: number; thumbBase64?: string }
+export interface WaMediaData { dataUrl: string; mimetype: string; fileName?: string }
+/** A WhatsApp message in the conversation view (mirrors electron WaStoredMessage). */
+export interface WaMessage {
+  id: string; msgId?: string; chatId: string; fromMe: boolean; senderId?: string;
+  senderName: string; text: string; kind: string; ts: number;
+  quotedText?: string; reactions?: WaReaction[]; media?: WaMediaRef; status?: 'sent' | 'delivered' | 'read';
+}
+/** Live wa-message event payload (Mac-local; never relayed). */
+export interface WaMessageEvent { chatId: string; message: WaMessage; chat?: WaChat }
 export type WhatsAppLink = { method: 'qr'; dataUrl: string } | { method: 'pairing'; code: string };
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
@@ -860,7 +878,7 @@ export const api = {
     call<ChatBinding>('setChatPermissions', { chatId, permissions }, () => req<ChatBinding>('/api/comms/permissions', { method: 'POST', body: JSON.stringify({ chatId, permissions }) })),
 
   // Comms (WhatsApp — desktop owns the Baileys socket; management is desktop-only)
-  whatsappStatus: () => call<WhatsAppState>('whatsappStatus', {}, () => Promise.resolve({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null } as WhatsAppState)),
+  whatsappStatus: () => call<WhatsAppState>('whatsappStatus', {}, () => Promise.resolve({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [] } as WhatsAppState)),
   listWaChats: () => call<WaChatSummary[]>('listWaChats', {}, () => Promise.resolve([] as WaChatSummary[])),
   /** Begin linking the operator's number. QR by default, or a pairing code if a phone is given. */
   whatsappLink: (phone?: string) => call<WhatsAppLink>('whatsappLink', { phone }, () => Promise.reject(new ApiError(403, 'Linking WhatsApp is only available in the desktop app'))),
@@ -870,6 +888,32 @@ export const api = {
   unlinkWhatsApp: () => call<{ ok: boolean }>('unlinkWhatsApp', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
   /** Approve sending summaries to your own number (one-time gate); flushes any held summary. */
   approveWhatsappSend: () => call<WhatsAppState>('approveWhatsappSend', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Allow/disallow the in-app agent messaging contacts other than your own number (off by default). */
+  setWhatsappAgentSend: (on: boolean) => call<WhatsAppState>('setWhatsappAgentSend', { on }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Set the personal number (digits) where summaries + agent confirmations are sent; '' clears it. */
+  setWhatsappRecipient: (number: string) => call<WhatsAppState>('setWhatsappRecipient', { number }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+
+  // WhatsApp workspace — full chat list + messages + control. Desktop-only: these
+  // carry personal message content and send on your number, so the relay blocks them.
+  waListChats: () => call<WaChat[]>('waListChats', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waGetMessages: (chatId: string, opts: { limit?: number; before?: number } = {}) =>
+    call<WaMessage[]>('waGetMessages', { chatId, ...opts }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waChatInfo: (chatId: string) => call<WaChat | null>('waChatInfo', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waSendText: (chatId: string, text: string) => call<{ ok: boolean }>('waSendText', { chatId, text }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waSendMedia: (chatId: string, media: { path?: string; dataB64?: string; kind: string; mimetype?: string; fileName?: string; caption?: string }) =>
+    call<{ ok: boolean }>('waSendMedia', { chatId, ...media }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waReact: (chatId: string, msgId: string, emoji: string) => call<{ ok: boolean }>('waReact', { chatId, msgId, emoji }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waMarkRead: (chatId: string) => call<{ ok: boolean }>('waMarkRead', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waSetTyping: (chatId: string, on: boolean) => call<{ ok: boolean }>('waSetTyping', { chatId, on }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waFetchAvatar: (chatId: string) => call<{ url: string | null }>('waFetchAvatar', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Download a media message's full bytes on demand → a data-URL the UI renders directly. */
+  waDownloadMedia: (chatId: string, msgId: string) => call<WaMediaData | null>('waDownloadMedia', { chatId, msgId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+
+  // Per-project WhatsApp chat assignment (desktop-only). Assigning a chat tracks it
+  // for the project: incoming messages route here and the agent prefers it.
+  listProjectWaChats: (projectId: string) => call<string[]>('listProjectWaChats', { projectId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  addProjectWaChat: (projectId: string, chatId: string) => call<string[]>('addProjectWaChat', { projectId, chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  removeProjectWaChat: (projectId: string, chatId: string) => call<string[]>('removeProjectWaChat', { projectId, chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
 
   /** Native import picker — desktop only; resolves the imported asset or null. */
   importAsset: async (projectId: string | null): Promise<Asset | null> => {
@@ -1146,7 +1190,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as RemoteDevice[]);
@@ -1165,6 +1209,9 @@ export const api = {
         if (name === 'git-status' && handlers.onGitStatus) handlers.onGitStatus(data as SessionGitStatus);
         if (name === 'schedule' && handlers.onSchedule) handlers.onSchedule(data as Schedule);
         if (name === 'github-device' && handlers.onGithubDevice) handlers.onGithubDevice(data as GithubDevice);
+        if (name === 'wa-message' && handlers.onWaMessage) handlers.onWaMessage(data as WaMessageEvent);
+        if (name === 'wa-chats' && handlers.onWaChats) handlers.onWaChats();
+        if (name === 'wa-message-update' && handlers.onWaMessageUpdate) handlers.onWaMessageUpdate(data as { chatId: string });
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
