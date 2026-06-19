@@ -14,10 +14,25 @@ import { ProjectPanel } from '../lib/ProjectPanel';
 import { RightSidebar, type CheckItem } from '../lib/RightSidebar';
 import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
+import { displayCodename } from '../lib/git-types';
+import { SessionStateDot } from './SessionStateDot';
+import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
   return <span aria-label="working" style={{ width: size, height: size, borderRadius: '50%', flexShrink: 0, boxSizing: 'border-box', border: `2px solid color-mix(in srgb, ${color} 24%, transparent)`, borderTopColor: color, animation: 'ws-spin 0.7s linear infinite' }} />;
+}
+
+/** Live per-session state dot for the rail. Subscribes via the shared cache. */
+function SessionStateDotForId({ sessionId }: { sessionId: string }) {
+  const state = useSessionStateOnly(sessionId);
+  return <SessionStateDot state={state} size={7} reserveSpace />;
+}
+
+/** Live worst-state-wins rollup dot for a project's chats. */
+function ProjectRollupDot({ projectId, sessionIds }: { projectId: string; sessionIds: string[] }) {
+  const state = useProjectRollupState(projectId, sessionIds);
+  return <SessionStateDot state={state} size={8} reserveSpace />;
 }
 
 /* Drag-and-drop project reorder — native HTML5 DnD, the same pattern as the
@@ -407,15 +422,21 @@ export default function Workspace() {
         background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
         {runningSessions.has(s.id)
           ? <Loader size={13} color={projColor(p)} />
-          : <Icon name="chat" size={13} style={{ flexShrink: 0, color: open ? projColor(p) : 'var(--ink-tertiary)' }} />}
+          : <Icon name={s.branch ? 'gitMerge' : 'chat'} size={13} style={{ flexShrink: 0, color: open ? projColor(p) : 'var(--ink-tertiary)' }} />}
+        <SessionStateDotForId sessionId={s.id} />
         {renamingId === s.id ? (
           <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
             onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
             style={{ flex: 1, minWidth: 0, border: '1px solid var(--blue)', borderRadius: 6, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1.3 var(--font-text)' }} />
         ) : (
           <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
-            style={{ flex: 1, minWidth: 0, font: `${isActive ? 600 : 500} var(--fs-footnote)/1.35 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (isActive ? 'var(--ink)' : 'var(--ink-secondary)'), whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {s.title}
+            style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'baseline', gap: 6, font: `${isActive ? 600 : 500} var(--fs-footnote)/1.35 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (isActive ? 'var(--ink)' : 'var(--ink-secondary)') }}>
+            <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
+            {s.codename && (
+              <span title={`Session codename · ${displayCodename(s.codename)}`} style={{ flexShrink: 0, font: '600 9px/1 var(--font-mono)', letterSpacing: '0.05em', color: 'var(--ink-tertiary)', textTransform: 'uppercase' }}>
+                {s.codename}
+              </span>
+            )}
           </span>
         )}
         <span className="ws-act" style={{ display: 'inline-flex', gap: 1, flexShrink: 0 }}>
@@ -564,7 +585,10 @@ export default function Workspace() {
                     {projRunning
                       ? <Loader size={14} color={projColor(p)} />
                       : <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p) }} />}
-                    <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
+                    <span style={{ flex: 1, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 6, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)' }}>
+                      <span style={{ minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
+                      <ProjectRollupDot projectId={p.id} sessionIds={chats.map(c => c.id)} />
+                    </span>
                     {chats.length > 0 && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{chats.length}</span>}
                     <button className="ws-newchat" title="Project · settings, jobs, memory" onClick={e => { e.stopPropagation(); setMenuProj(m => m === p.id ? null : p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0, position: 'relative' }}>
                       <Icon name="more" size={15} />

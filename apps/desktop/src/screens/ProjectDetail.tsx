@@ -27,6 +27,10 @@ import {
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
+import { displayCodename } from '../lib/git-types';
+import { GitStatusBar } from './GitStatusBar';
+import { SessionStateDot } from './SessionStateDot';
+import { useSession, useSessionStateOnly } from '../lib/useSessionGitState';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -2412,6 +2416,74 @@ const fmtBytes = (n?: number): string => (n == null ? '' : n < 1024 ? `${n} B` :
 // name reads nicer as "Pasted text"; everything else uses its filename).
 const attachLabel = (a: Attach): string => (a.kind === 'text' && a.name === 'Pasted text.txt' ? 'Pasted text' : a.name);
 
+/* Tiny live state dot for the session rails — subscribes once via the shared
+   cache so a long rail with 20 chats doesn't open 20 sockets. */
+function SessionPillDot({ sessionId }: { sessionId: string }) {
+  const state = useSessionStateOnly(sessionId);
+  return <SessionStateDot state={state} size={8} reserveSpace />;
+}
+
+/* Chat header bar — sits at the very top of the chat. Conductor-style:
+   • the session's stable codename (lowercase, kebab-safe city) +
+   • the live git/PR state chip with one contextual action button +
+   • the Archive button (or "Restore" pill if the chat is archived) +
+   • a quiet branch label so the operator sees what's actually checked out.
+   Renders nothing for no session / non-repo. */
+function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projectId: string | null }) {
+  const session = useSession(sessionId, projectId);
+  const state = useSessionStateOnly(sessionId);
+  const [busy, setBusy] = React.useState(false);
+  if (!sessionId || !session) return null;
+
+  const code = session.codename;
+  const archived = !!session.archived;
+
+  const archive = async () => {
+    if (busy) return;
+    if (!archived && !window.confirm(`Archive “${session.title}”? You can restore it from the rail.`)) return;
+    setBusy(true);
+    try { await api.archiveSession(sessionId, !archived); } catch { /* best-effort */ } finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{
+      position: 'relative', zIndex: 2,
+      display: 'flex', alignItems: 'center', gap: 10,
+      padding: '10px 16px 8px', borderBottom: '0.5px solid var(--separator)',
+      background: 'color-mix(in srgb, var(--bg-elevated) 92%, transparent)',
+      backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+    }}>
+      {code && (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 'var(--r-pill)',
+          background: 'var(--fill-secondary)', font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', letterSpacing: '0.02em' }}>
+          <SessionStateDot state={state} size={8} reserveSpace />
+          {displayCodename(code)}
+        </span>
+      )}
+      <span style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        font: '600 var(--fs-headline)/1.2 var(--font-text)', color: archived ? 'var(--ink-tertiary)' : 'var(--ink)' }}>
+        {session.title}
+      </span>
+      {archived && (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 8px', borderRadius: 'var(--r-pill)',
+          background: 'color-mix(in srgb, var(--ink-tertiary) 15%, transparent)', color: 'var(--ink-secondary)',
+          font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+          <Icon name="archive" size={11} /> Archived
+        </span>
+      )}
+      <GitStatusBar sessionId={sessionId} variant="header" codename={code} />
+      <button onClick={archive} disabled={busy} title={archived ? 'Restore chat' : 'Archive chat'}
+        style={{ height: 28, padding: '0 11px', borderRadius: 8, border: '0.5px solid var(--separator-strong)',
+          background: 'var(--fill-secondary)', color: 'var(--ink)',
+          font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer',
+          display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        <Icon name={archived ? 'enter' : 'archive'} size={12} />
+        {archived ? 'Restore' : 'Archive'}
+      </button>
+    </div>
+  );
+}
+
 export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, onOpenImage, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
@@ -2933,6 +3005,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       {/* faint top atmosphere */}
       <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
         background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
+      {/* Conductor-style chat header: codename + state chip + Archive. The
+          GitStatusBar gates itself for non-repo / null sessions. */}
+      <ChatHeader sessionId={activeId} projectId={projectId} />
       <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
         <div style={{ maxWidth: CHAT_W, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
           {turns.length === 0 && (
@@ -3473,11 +3548,16 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
                     ) : (
                       <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
                         style={{ display: 'flex', alignItems: 'center', gap: 5, font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (active ? 'var(--ink)' : 'var(--ink-secondary)'), whiteSpace: 'nowrap', overflow: 'hidden' }}>
+                        <SessionPillDot sessionId={s.id} />
                         {s.importedFrom && <SourceChip source={s.importedFrom} />}
                         <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.title}</span>
                       </span>
                     )}
-                    <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>{relativeTime(s.updatedAt)}</span>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 6, font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>
+                      {s.codename && <span title="Session codename" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', letterSpacing: '0.02em' }}>{displayCodename(s.codename)}</span>}
+                      {s.codename && <span>·</span>}
+                      {relativeTime(s.updatedAt)}
+                    </span>
                   </span>
                   <button className="sess-x" title={s.archived ? 'Unarchive' : 'Archive chat'} onClick={e => { e.stopPropagation(); archiveSession(s, !s.archived); }}
                     style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: s.archived ? 'var(--blue)' : 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
