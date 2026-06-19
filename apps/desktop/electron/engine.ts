@@ -1693,19 +1693,28 @@ export class LocalEngine {
       const claudeImages = isClaudeMaster ? resolvedImages.map(r => ({ mime: r.mime, b64: r.b64 })) : [];
       const codexImageFiles = master === 'codex' ? resolvedImages.map(r => r.path) : [];
 
-      // Attached non-image files: inline text content; reference binaries by path.
-      const fileParts: string[] = [];
-      let fileBudget = 400 * 1024; // total inlined-text cap
-      for (const f of cur.inputFiles ?? []) {
-        if (f.kind === 'text' && f.content) {
-          const body = f.content.length > fileBudget ? f.content.slice(0, fileBudget) + '\n…(truncated)' : f.content;
-          fileBudget -= Math.min(f.content.length, fileBudget);
-          fileParts.push(`### Attached file: ${f.name}\n\`\`\`\n${body}\n\`\`\``);
-        } else if (f.kind === 'file' && f.path && existsSync(f.path)) {
-          fileParts.push(`The user attached the file \`${f.name}\` (saved at ${f.path}). Read it with your tools if it's relevant.`);
+      // Attached non-image files: the composer's chip POSITION is preserved as
+      // `@<absPath>` inline in the user's prompt (substituted in localApi from
+      // each chip's `«attach:id»` placeholder), so the agent reads them with its
+      // `Read` tool at the spot the user typed the chip. We only need a small
+      // back-compat path for jobs persisted BEFORE this change, where text was
+      // inlined into `f.content` and binaries had a trailing "saved at $PATH"
+      // hint — surface those as a trailing block so old jobs still resume.
+      const legacy = (cur.inputFiles ?? []).filter(f => (f.kind === 'text' && f.content) || (f.kind === 'file' && f.path && !cur.input.includes(`@${f.path}`)));
+      if (legacy.length) {
+        const fileParts: string[] = [];
+        let fileBudget = 400 * 1024;
+        for (const f of legacy) {
+          if (f.kind === 'text' && f.content) {
+            const body = f.content.length > fileBudget ? f.content.slice(0, fileBudget) + '\n…(truncated)' : f.content;
+            fileBudget -= Math.min(f.content.length, fileBudget);
+            fileParts.push(`### Attached file: ${f.name}\n\`\`\`\n${body}\n\`\`\``);
+          } else if (f.kind === 'file' && f.path && existsSync(f.path)) {
+            fileParts.push(`The user attached the file \`${f.name}\` (saved at ${f.path}). Read it with your tools if it's relevant.`);
+          }
         }
+        if (fileParts.length) prompt += `\n\n---\n\nThe user attached the following file(s):\n\n${fileParts.join('\n\n')}`;
       }
-      if (fileParts.length) prompt += `\n\n---\n\nThe user attached the following file(s):\n\n${fileParts.join('\n\n')}`;
 
       // Project memory (.continuum): on a FRESH turn (no resumed Claude session
       // that already holds it), inject the durable STATE + recent checkpoints as
