@@ -21,6 +21,12 @@ export const REMOTE_BLOCKED_METHODS: ReadonlySet<string> = new Set<string>([
   'addSkillToProject', 'removeSkillFromProject', 'scanConversations', 'importConversations',
   // feedbackCreateIssue spends THIS Mac's GitHub token (a remote may submit/list/triage, not file)
   'feedbackCreateIssue',
+  // WhatsApp chat content + sending live on this Mac's Baileys socket — a remote must
+  // never read messages, download media, or send on the linked number over the wire.
+  'waListChats', 'waGetMessages', 'waChatInfo', 'waSendText', 'waSendMedia', 'waReact',
+  'waMarkRead', 'waSetTyping', 'waFetchAvatar', 'waDownloadMedia',
+  'addProjectWaChat', 'removeProjectWaChat', 'listProjectWaChats',
+  'setWhatsappAgentSend', 'setWhatsappRecipient',
 ]);
 
 /** True if `method` must NOT answer to a remote (relay or P2P). */
