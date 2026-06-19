@@ -72,32 +72,44 @@ async function runAnalysis(deps: WaAnalyzeDeps, s: Schedule): Promise<void> {
   const summarize = deps.summarize ?? defaultSummarize(deps);
   const summary = (await summarize({ chatName, transcript: formatTranscript(msgs), projectId: s.projectId, sessionId: s.sessionId })).trim();
 
-  // Advance the watermark regardless: this quiet period has been analyzed once.
-  deps.store.markWaReported(chatId, msgs[msgs.length - 1].ts);
-  if (!summary || /^\(no action needed\)\.?$/i.test(summary)) return;
+  // Quiet period analyzed once → advance the watermark either way (so we never
+  // re-summarize the same window, even if delivery is deferred).
+  if (!summary || /^\(no action needed\)\.?$/i.test(summary)) { deps.store.markWaReported(chatId, msgs[msgs.length - 1].ts); return; }
 
+  // Queue the summary into the DURABLE outbox first (survives a crash/power-off),
+  // THEN advance the watermark, THEN try to deliver. If delivery can't happen now
+  // (not approved, or the socket isn't connected after a wake), it stays queued and
+  // is flushed on the next opportunity — so a power-off mid-window never loses it.
   const body = `🟢 WhatsApp summary — ${chatName}\n\n${summary}`;
-  if (deps.store.whatsappState().sendApproved) {
-    await deps.client.sendToSelf(body);
-  } else {
-    // Hold behind the send gate; surface it so the operator is asked to approve.
-    deps.store.setWhatsappState({ pendingSummary: { text: body, chatName, at: Date.now() } });
-    deps.emit('comms', deps.store.commsStatus());
+  deps.store.queueSummary({ text: body, chatName });
+  deps.store.markWaReported(chatId, msgs[msgs.length - 1].ts);
+  deps.emit('comms', deps.store.commsStatus());
+  await flushSummaries(deps);
+}
+
+/** Deliver queued summaries — only once sending is approved, and only while sends
+    succeed; the first failure (e.g. socket not reconnected yet) stops the drain so
+    the rest stay queued and retry on the next flush (socket 'open' / approval / tick). */
+export async function flushSummaries(deps: { store: Store; client: WaClientLike; emit: (name: string, data: unknown) => void }): Promise<void> {
+  if (!deps.store.whatsappState().sendApproved) return; // held for the one-time gate
+  let delivered = false;
+  for (const p of deps.store.listPendingSummaries()) {
+    if (!(await deps.client.sendToSelf(p.text))) break;  // not connected / failed — keep queued
+    deps.store.dropPendingSummary(p.id);
+    delivered = true;
   }
+  if (delivered) deps.emit('comms', deps.store.commsStatus());
 }
 
-/** Build the CronRunner `analyzeWhatsapp` hook (fire-and-forget per quiet timer). */
-export function makeWhatsappAnalyzer(deps: WaAnalyzeDeps): (s: Schedule) => void {
-  return (s) => { void runAnalysis(deps, s).catch(() => { /* analyzer logs its own failures */ }); };
+/** Build the CronRunner `analyzeWhatsapp` hook. Returns the promise so callers/tests
+    can await it; CronRunner invokes it fire-and-forget (it never rejects). */
+export function makeWhatsappAnalyzer(deps: WaAnalyzeDeps): (s: Schedule) => Promise<void> {
+  return (s) => runAnalysis(deps, s).catch(() => { /* analyzer logs its own failures */ });
 }
 
-/** Approve sending: flip the gate and flush any summary held while it was off. */
+/** Approve sending: flip the gate, then flush everything held in the outbox. */
 export async function approveWhatsappSend(deps: { store: Store; client: WaClientLike; emit: (name: string, data: unknown) => void }): Promise<void> {
-  const held = deps.store.whatsappState().pendingSummary;
   deps.store.setWhatsappState({ sendApproved: true });
-  if (held) {
-    await deps.client.sendToSelf(held.text);
-    deps.store.setWhatsappState({ pendingSummary: null });
-  }
+  await flushSummaries(deps);
   deps.emit('comms', deps.store.commsStatus());
 }

@@ -124,7 +124,7 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 12, borderRadius: 12, background: 'color-mix(in srgb, var(--orange, #ff9f0a) 12%, transparent)', border: '0.5px solid color-mix(in srgb, var(--orange, #ff9f0a) 40%, transparent)', marginBottom: 14 }}>
           <Icon name="shield" size={18} style={{ color: 'var(--orange, #ff9f0a)', flexShrink: 0 }} />
           <span style={{ flex: 1, font: '400 var(--fs-footnote)/1.35 var(--font-text)', color: 'var(--ink)' }}>
-            Before Maestro messages summaries to your own number, it needs your OK.{wa.pendingSummary ? ' One summary is waiting.' : ''}
+            Before Maestro messages summaries to your own number, it needs your OK.{wa.pendingSummaries?.length ? ` ${wa.pendingSummaries.length} waiting.` : ''}
           </span>
           {IS_LOCAL && <button onClick={approve} disabled={busy} style={{ height: 34, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', flexShrink: 0 }}>{busy ? '…' : 'Allow'}</button>}
         </div>

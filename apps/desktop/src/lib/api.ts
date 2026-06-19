@@ -426,7 +426,7 @@ export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; 
 export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; provider?: CommsProvider; projectId: string | null; sessionId?: string | null; permissions: ChatPermissions; boundAt: number }
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
 export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
-export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummary?: { text: string; chatName: string; at: number } | null; agentSendToOthers?: boolean; notifyJid?: string | null }
+export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummaries?: { id: string; text: string; chatName: string; at: number }[]; agentSendToOthers?: boolean; notifyJid?: string | null }
 export type WaChatKind = 'dm' | 'group' | 'channel';
 export interface WaChatSummary { chatId: string; name: string; kind: WaChatKind; lastMessageAt: number; lastReportedAt: number; count: number }
 /** A WhatsApp chat as shown in the WhatsApp workspace (mirrors electron WaChatMeta). */
@@ -876,7 +876,7 @@ export const api = {
     call<ChatBinding>('setChatPermissions', { chatId, permissions }, () => req<ChatBinding>('/api/comms/permissions', { method: 'POST', body: JSON.stringify({ chatId, permissions }) })),
 
   // Comms (WhatsApp — desktop owns the Baileys socket; management is desktop-only)
-  whatsappStatus: () => call<WhatsAppState>('whatsappStatus', {}, () => Promise.resolve({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null } as WhatsAppState)),
+  whatsappStatus: () => call<WhatsAppState>('whatsappStatus', {}, () => Promise.resolve({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [] } as WhatsAppState)),
   listWaChats: () => call<WaChatSummary[]>('listWaChats', {}, () => Promise.resolve([] as WaChatSummary[])),
   /** Begin linking the operator's number. QR by default, or a pairing code if a phone is given. */
   whatsappLink: (phone?: string) => call<WhatsAppLink>('whatsappLink', { phone }, () => Promise.reject(new ApiError(403, 'Linking WhatsApp is only available in the desktop app'))),

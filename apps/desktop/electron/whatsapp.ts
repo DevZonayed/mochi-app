@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import type { Store } from './store.js';
 import type { WaChatKind, WaStoredMessage, WaMediaRef } from './wa-store.js';
+import { flushSummaries } from './whatsapp-analyze.js';
 
 const ACCOUNT = 'primary';
 
@@ -575,6 +576,10 @@ export class WhatsAppClient {
       const prev = this.store.whatsappState();
       this.store.setWhatsappState({ connected: true, jid: ownJidOf(this.sock) ?? prev.jid, name: this.sock?.user?.name ?? prev.name, linkedAt: prev.linkedAt ?? Date.now() });
       this.emit('comms', this.store.commsStatus());
+      // Deliver any summaries queued while we were offline (e.g. a quiet-timer that
+      // fired during a power-off and couldn't reach the socket yet). Retried here on
+      // every (re)connect, so a missed window catches up at the next availability.
+      void flushSummaries({ store: this.store, client: this, emit: this.emit });
       return;
     }
     if (u.connection === 'close') await this.onClose(u);

@@ -319,8 +319,10 @@ export interface WhatsAppState {
   linkedAt: number | null;
   /** The one-time send gate: until the operator approves, no summary is sent. */
   sendApproved: boolean;
-  /** A summary produced before the operator approved sending — flushed on approval. */
-  pendingSummary?: { text: string; chatName: string; at: number } | null;
+  /** Durable outbox of summaries awaiting delivery — held until sending is approved
+      AND the socket is connected, then flushed (retried). Survives restarts so a
+      power-off mid-window never drops a summary (it's delivered on next availability). */
+  pendingSummaries?: { id: string; text: string; chatName: string; at: number }[];
   /** Whether the in-app agent may message contacts OTHER than your own number.
       Off by default — the agent can always message your own number (confirmations,
       updates), but messaging real contacts requires this opt-in. */
@@ -330,7 +332,7 @@ export interface WhatsAppState {
       When unset, notifications fall back to the linked account's own "note to self". */
   notifyJid?: string | null;
 }
-export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null, agentSendToOthers: false, notifyJid: null };
+export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [], agentSendToOthers: false, notifyJid: null };
 
 /** One captured WhatsApp message (normalized, text-only — media is noted as a kind). */
 export interface WaMessage { id: string; chatId: string; fromMe: boolean; senderName: string; text: string; ts: number }
@@ -594,7 +596,13 @@ export class Store {
       if (!this.data.commEvents) { this.data.commEvents = []; dirty = true; }
       if (!this.data.feedback) { this.data.feedback = []; dirty = true; }
       if (!this.data.telegram) { this.data.telegram = { offset: 0, botUsername: null, connectedAt: null }; dirty = true; }
-      if (!this.data.whatsapp) { this.data.whatsapp = { ...DEFAULT_WHATSAPP_STATE }; dirty = true; }
+      if (!this.data.whatsapp) { this.data.whatsapp = { ...DEFAULT_WHATSAPP_STATE, pendingSummaries: [] }; dirty = true; }
+      if (this.data.whatsapp && !this.data.whatsapp.pendingSummaries) {
+        const old = (this.data.whatsapp as { pendingSummary?: { text: string; chatName: string; at: number } | null }).pendingSummary;
+        this.data.whatsapp.pendingSummaries = old ? [{ id: id(), text: old.text, chatName: old.chatName, at: old.at }] : [];
+        delete (this.data.whatsapp as { pendingSummary?: unknown }).pendingSummary;
+        dirty = true;
+      }
       if (!this.data.waChats) { this.data.waChats = {}; dirty = true; }
 
       // One-time demo-data purge: only fires on the full seed fingerprint so a
@@ -629,7 +637,7 @@ export class Store {
         assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
         chatBindings: [], pendingChats: [], commEvents: [], feedback: [],
         telegram: { offset: 0, botUsername: null, connectedAt: null },
-        whatsapp: { ...DEFAULT_WHATSAPP_STATE }, waChats: {},
+        whatsapp: { ...DEFAULT_WHATSAPP_STATE, pendingSummaries: [] }, waChats: {},
         providerKeys: {},
       };
       this.save();
@@ -1375,6 +1383,23 @@ export class Store {
     this.data.whatsapp = { ...this.data.whatsapp, ...patch };
     this.save();
     return this.whatsappState();
+  }
+  /** Durable summary outbox: queue on generation, flush (drop) on successful send. */
+  queueSummary(input: { text: string; chatName: string }): void {
+    const wa = this.data.whatsapp;
+    if (!wa.pendingSummaries) wa.pendingSummaries = [];
+    wa.pendingSummaries.push({ id: id(), text: input.text, chatName: input.chatName, at: now() });
+    if (wa.pendingSummaries.length > 100) wa.pendingSummaries.splice(0, wa.pendingSummaries.length - 100);
+    this.save();
+  }
+  listPendingSummaries(): Array<{ id: string; text: string; chatName: string; at: number }> {
+    return [...(this.data.whatsapp.pendingSummaries ?? [])];
+  }
+  dropPendingSummary(summaryId: string): void {
+    const wa = this.data.whatsapp;
+    if (!wa.pendingSummaries) return;
+    wa.pendingSummaries = wa.pendingSummaries.filter(p => p.id !== summaryId);
+    this.save();
   }
   /** Capture a message (legacy shim → WaStore). Used by the quiet-timer ingest path
       and tests; WaStore appends O(1) to the chat's JSONL log. */
