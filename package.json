@@ -17,7 +17,8 @@
   },
   "pnpm": {
     "overrides": {
-      "node-gyp": "^10.2.0"
+      "node-gyp": "^10.2.0",
+      "event-target-shim": "^6.0.2"
     }
   }
 }
