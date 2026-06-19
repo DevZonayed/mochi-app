@@ -3471,7 +3471,7 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
                         onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
                         style={{ width: '100%', border: '1px solid var(--blue)', borderRadius: 6, padding: '2px 6px', background: 'var(--bg)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1.3 var(--font-text)' }} />
                     ) : (
-                      <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
+                      <span title="Double-click to rename" onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
                         style={{ display: 'flex', alignItems: 'center', gap: 5, font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (active ? 'var(--ink)' : 'var(--ink-secondary)'), whiteSpace: 'nowrap', overflow: 'hidden' }}>
                         {s.importedFrom && <SourceChip source={s.importedFrom} />}
                         <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.title}</span>
@@ -3479,6 +3479,10 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
                     )}
                     <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>{relativeTime(s.updatedAt)}</span>
                   </span>
+                  <button className="sess-x" title="Rename chat" onClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
+                    style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+                    <Icon name="pencil" size={12} />
+                  </button>
                   <button className="sess-x" title={s.archived ? 'Unarchive' : 'Archive chat'} onClick={e => { e.stopPropagation(); archiveSession(s, !s.archived); }}
                     style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: s.archived ? 'var(--blue)' : 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
                     <Icon name="archive" size={12} />
