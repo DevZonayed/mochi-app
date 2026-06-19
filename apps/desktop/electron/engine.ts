@@ -21,11 +21,14 @@ import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { branchSlug, isGitRepo } from './git.js';
+import { pickCityCodename } from './codenames.js';
 import { ensureSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
+import { makeGitCtx, type GitCtx } from './git-ctx.js';
+import type { GitService } from './git-service.js';
 import { waSendAllowed } from './whatsapp.js';
 import type { CronRunner } from './cron.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
@@ -141,6 +144,29 @@ const BG_DIRECTIVE =
   `came up, tell the user the URL and how to stop it, then finish your reply — do NOT sit and ` +
   `wait on it. Use the normal shell only for commands that finish quickly (install, build, ` +
   `test, git, file ops).`;
+/* PR lifecycle — appended when the chat has a live worktree + branch on a
+   GitHub repo. This is the Conductor-style recipe: ONE chat owns ONE branch
+   for its whole life; the agent uses the maestro PR/git tools to drive the
+   lifecycle deterministically (never shells out to `gh pr create` directly —
+   the MCP tools handle auth, the active worktree, and emit the right events
+   so the chat header reflects what's happening). */
+const PR_DIRECTIVE =
+  `\n\n---\n\n[Git / PR lifecycle] This chat has its OWN git branch and worktree on a GitHub repo. ` +
+  `When the user asks for any of these, use the MCP tools — never shell out to \`gh pr create\` / ` +
+  `\`git push\` / \`git merge\` via Bash for these specific intents (it bypasses auth, the active ` +
+  `worktree, and the live status events the UI reads):\n\n` +
+  `• "create a PR" / "open a PR" / "ship this" / "let's PR": call git_status first; if dirty, ` +
+  `commit with Bash (\`git add -A && git commit -m "…"\`); then call pr_create (pushes for you).\n` +
+  `• "merge" / "land it" / "ship": call pr_merge — only when git_status reports pr-mergeable.\n` +
+  `• "resolve the conflicts" / "fix the conflicts" / a PR shows pr-conflicts: call ` +
+  `pr_resolve_conflicts. If it returns conflicted files, Read each, Edit out the ` +
+  `<<<<<<</=======/>>>>>>> markers keeping the intended content, Bash-commit, then call ` +
+  `pr_resolve_conflicts again to confirm clean + push.\n` +
+  `• "push" / "send to github" without a PR ask: call git_push.\n` +
+  `• Status questions ("what's the state?" / "is the PR ready?"): call git_status.\n\n` +
+  `Always run git_status BEFORE the action so you know what step the lifecycle is on. ` +
+  `Bash is still the right tool for commits, diffs, and inspections — just not for the ` +
+  `push/PR/merge/resolve actions themselves.`;
 // SP3 — primary↔reviewer loop: how many review→fix→re-review rounds at most.
 const REVIEW_MAX_ROUNDS = 2;
 // Codex already ships a native built-in `image_gen` skill (rides the ChatGPT
@@ -486,6 +512,7 @@ async function runClaude(
   browserCtx?: BrowserCtx,
   customMcp?: { servers: Record<string, ClaudeMcpConfig>; allowedTools: string[] },
   scheduleCtx?: ScheduleCtx,
+  gitCtx?: GitCtx,
   commsCtx?: CommsCtx,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
@@ -520,7 +547,7 @@ async function runClaude(
     ].filter(Boolean).join(', ');
     return `- ${s.id} — ${s.name}: ${s.description || '(no description)'}${bits ? ` [${bits}]` : ''}`;
   };
-  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || commsCtx) && !plan)
+  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || gitCtx || commsCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
@@ -733,6 +760,72 @@ async function runClaude(
                 return txt(rows.map(s => `- ${s.id} — ${s.title}`).join('\n'));
               })),
           ] : []),
+          ...(gitCtx ? [
+            tool('git_status',
+              'Read this chat\'s LIVE git/PR state. Call BEFORE attempting push/pr/merge/resolve to confirm the state matches what you intend — the user may have committed/pushed/merged manually since the last turn. Returns ahead/behind, dirty flag, the open PR (if any), and a one-line "next action" hint. Tells you whether to commit (via Bash), git_push, pr_create, pr_merge, or pr_resolve_conflicts.',
+              {},
+              wrap(async () => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle (no worktree or no GitHub remote).');
+                const s = await gitCtx.status();
+                const lines: string[] = [];
+                lines.push(`state=${s.state}  branch=${s.branch ?? '?'}  base=${s.base ?? '?'}`);
+                lines.push(`ahead=${s.ahead}  behind=${s.behind}  dirty=${s.dirty}  pushed=${s.pushed}`);
+                if (s.pr) lines.push(`PR #${s.pr.number} (${s.pr.state}): ${s.pr.title}  ${s.pr.url}`);
+                lines.push(`\nNext: ${s.nextAction}`);
+                return txt(lines.join('\n'));
+              })),
+            tool('git_push',
+              'Push this chat\'s branch to origin using the user\'s saved GitHub token. Use when git_status says ready-to-push. Auth-aware — the user is never prompted; if no token is connected, it fails and tells you to ask the user to connect GitHub in Settings.',
+              {},
+              wrap(async () => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
+                const r = await gitCtx.push();
+                return txt(r.ok ? 'Pushed. Now call pr_create to open a pull request.' : `Push failed: ${r.reason ?? 'unknown'}`);
+              })),
+            tool('pr_create',
+              'Open (or resurface) a pull request from this chat\'s branch to the base branch. Pushes first if needed — call this directly when the user says "create a PR" / "ship this" / "open a PR". Idempotent: if a PR is already open it returns its url + number without duplicating. Use a brief title (default: the chat title) and a 1–3 line body that explains the change.',
+              { title: z.string().optional().describe('PR title; defaults to the chat title (≤ 80 chars suggested).'),
+                body: z.string().optional().describe('PR description — 1–3 sentences explaining what changed and why.') },
+              wrap(async (a: { title?: string; body?: string }) => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle. Ensure the project is on a GitHub remote and the chat has a worktree.');
+                const r = await gitCtx.createPr({ title: a.title, body: a.body });
+                if (!r.ok) return txt(`Could not open PR: ${r.reason ?? 'unknown'}`);
+                return txt(`PR #${r.number} is open: ${r.url}\nUse git_status to check mergeability, then pr_merge once it\'s clean.`);
+              })),
+            tool('pr_merge',
+              'Merge the open PR for this chat using the repo\'s preferred merge method (auto-picks merge/squash/rebase from the allowed list). Use only when git_status reports pr-mergeable (not when it reports pr-conflicts or pr-blocked).',
+              { method: z.enum(['merge', 'squash', 'rebase']).optional().describe('Override the auto-picked merge method.') },
+              wrap(async (a: { method?: 'merge' | 'squash' | 'rebase' }) => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
+                const r = await gitCtx.mergePr({ method: a.method });
+                return txt(r.ok ? 'Merged. The session\'s work is on the base branch now — you can archive the worktree if you\'re done.' : `Merge failed: ${r.reason ?? 'unknown'}`);
+              })),
+            tool('pr_resolve_conflicts',
+              'Pull the base branch into this chat\'s branch and merge it. If clean, pushes the resulting branch automatically. If it produces conflict markers, returns the conflicted file paths so you can: (1) Read each one, (2) Edit out the <<<<<<</=======/>>>>>>> markers keeping the intended content, (3) commit via Bash (`git add -A && git commit -m "resolve conflicts"`), (4) call this tool again to confirm clean + push. Use when git_status reports pr-conflicts or when the PR is behind.',
+              {},
+              wrap(async () => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
+                const r = await gitCtx.resolveConflicts();
+                if (r.ok && (!r.conflicts || r.conflicts.length === 0)) {
+                  return txt('Conflicts resolved cleanly (or the branch was already up to date) — pushed the merged branch. Call git_status to verify the PR is now mergeable.');
+                }
+                if (r.conflicts && r.conflicts.length > 0) {
+                  const list = r.conflicts.map(f => `  - ${f}`).join('\n');
+                  return txt(`Pulled base; ${r.conflicts.length} file(s) need conflict markers resolved:\n${list}\n\nNext: Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), then\n  Bash: git add -A && git commit -m "resolve merge conflicts"\nFinally call pr_resolve_conflicts again to confirm clean + push.`);
+                }
+                return txt(`pr_resolve_conflicts failed: ${r.reason ?? 'unknown'}`);
+              })),
+            tool('branch_rename',
+              'Rename the session\'s codename-only initial branch (e.g. mochi/lyon/lyon) to its task-derived slug (mochi/lyon/fix-auth-bug). Normally fires automatically after the first turn; use this only if you want to force it (e.g. you steered the chat onto a new task). No-op if the branch is already pushed or a PR exists.',
+              {},
+              wrap(async () => {
+                if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
+                const r = await gitCtx.renameBranch();
+                if (!r.ok) return txt(`Rename failed: ${r.reason ?? 'unknown'}`);
+                if (r.unchanged) return txt(`Rename skipped (${r.reason ?? 'no-op'}).`);
+                return txt(`Renamed ${r.from} → ${r.to}.`);
+              })),
+          ] : []),
           ...(commsCtx ? [
             tool('wa_list_chats',
               'List the user\'s WhatsApp chats (DMs, groups, channels) on this Mac, most-recent first. Use when the user asks about their WhatsApp — who messaged, unread chats, or to find a chat to read/reply to. Chats assigned to THIS project are marked [project].',
@@ -777,6 +870,7 @@ async function runClaude(
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
     ...(browserCtx ? ['browser_status', 'browser_navigate', 'browser_snapshot', 'browser_read', 'browser_links', 'browser_click', 'browser_type'] : []),
     ...(scheduleCtx ? ['schedule_list', 'schedule_create', 'schedule_update', 'schedule_delete', 'schedule_toggle', 'schedule_run_now', 'projects_list', 'sessions_list'] : []),
+    ...(gitCtx ? ['git_status', 'git_push', 'pr_create', 'pr_merge', 'pr_resolve_conflicts', 'branch_rename'] : []),
     ...(commsCtx ? ['wa_list_chats', 'wa_get_messages', 'wa_send_message', 'wa_mark_read'] : []),
   ].map(n => `mcp__maestro__${n}`);
   // Merge the operator's custom MCP servers (Settings → MCP servers) alongside the
@@ -998,7 +1092,7 @@ async function runClaude(
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
 function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
-  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[] },
+  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[]; gitCtx?: GitCtx },
   imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'codex' }));
@@ -1014,7 +1108,7 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   // calls unless danger-full-access + approval_policy=never (probe-proven), so a
   // run with any Maestro MCP tools uses that sandbox. Never on reviewer passes.
   const bridge = (!readOnly && ctx?.codexBridge && ctx.projectId) ? ctx.codexBridge : undefined;
-  const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId }) : undefined;
+  const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId, git: ctx?.gitCtx }) : undefined;
   // The operator's custom stdio MCP servers (Settings → MCP servers), as codex
   // `-c mcp_servers.<name>={…}` TOML fragments. Like the maestro bridge, codex's
   // sandbox auto-cancels MCP tool calls unless danger-full-access + approval_policy
@@ -1239,6 +1333,12 @@ export class LocalEngine {
   private codexBridgeFor(): CodexBridge | undefined {
     return this.codexBridge;
   }
+  /** GitService — used post-turn to auto-rename the session's branch + powers
+      the per-session GitCtx that backs the agent's pr_* and git_* tools.
+      Injected from main.ts so the engine ↔ git wiring stays optional (tests
+      don't need a GitService at all). */
+  private gitService?: GitService;
+  setGitService(g: GitService) { this.gitService = g; }
 
   /* ── Background tasks ────────────────────────────────────────────────
      Long-lived processes the agent starts (dev servers, watchers) that must
@@ -1700,7 +1800,15 @@ export class LocalEngine {
       // OWN git worktree dir, so sessions are isolated and can run in parallel.
       // Best-effort — non-repo / failure falls back to the project folder.
       if (session && project?.path && isGitRepo(project.path)) {
-        const branch = session.branch ?? `mochi/${branchSlug(session.title)}-${session.id.slice(0, 4)}`;
+        // Codename = the session's stable city callsign. Almost always assigned
+        // at session creation (sendChat), but backfill here for legacy chats
+        // that pre-date the codename field.
+        const codename = session.codename ?? pickCityCodename(this.store.usedCodenamesIn(project.id));
+        // Branch shape: `mochi/<codename>/<task-slug>`. Until the auto-rename
+        // fires (after the first assistant turn), the slug IS the codename so
+        // the branch reads cleanly even on day-zero.
+        const initialSlug = session.branchRenamedAt ? branchSlug(session.title) : codename;
+        const branch = session.branch ?? `mochi/${codename}/${initialSlug}`;
         const res = ensureSessionWorktree({
           repoDir: project.path,
           worktreeRoot: worktreeRootDir(),
@@ -1714,10 +1822,11 @@ export class LocalEngine {
         });
         if (res.ok) {
           cwd = res.cwd;
-          const patch: Partial<Pick<ChatSession, 'branch' | 'worktreePath' | 'baseBranch'>> = {};
+          const patch: Partial<Pick<ChatSession, 'branch' | 'worktreePath' | 'baseBranch' | 'codename'>> = {};
           if (session.branch !== branch) patch.branch = branch;
           if (session.worktreePath !== res.cwd) patch.worktreePath = res.cwd;
           if (res.base && session.baseBranch !== res.base) patch.baseBranch = res.base;
+          if (!session.codename) patch.codename = codename;
           if (Object.keys(patch).length) { try { this.store.updateSession(session.id, patch); } catch { /* gone */ } }
         }
       }
@@ -1957,6 +2066,18 @@ export class LocalEngine {
       // Schedule capability: let the agent inspect + manage recurring/scheduled
       // tasks and discover projects/sessions to target. Off in plan mode.
       const scheduleCtx: ScheduleCtx | undefined = (this.cron && !opts.plan) ? makeScheduleCtx(this.store, this.cron) : undefined;
+      // PR/git capability: when the chat owns a worktree + branch + GitHub
+      // remote, mount the pr_* and git_* tools AND inject the PR_DIRECTIVE so
+      // the agent knows when to call them. Off in plan mode (the lifecycle is
+      // outward-facing). For one-off jobs (no session) or a non-repo, gitCtx
+      // is null and the tools simply don't surface.
+      const gitCtx: GitCtx | undefined = (session && this.gitService && !opts.plan)
+        ? (makeGitCtx(this.store, this.gitService, session.id) ?? undefined)
+        : undefined;
+      // Both engines now reach the pr_*/git_* tools — Claude via the in-process
+      // maestro MCP, Codex via the stdio bridge. Inject the directive on every
+      // chat turn that owns a live worktree on a GitHub repo.
+      if (isChat && gitCtx?.available()) prompt += PR_DIRECTIVE;
       // WhatsApp capability: when a number is linked, give the agent read/send tools
       // backed by THIS Mac's socket + store, scoped to this project's assigned chats.
       const commsCtx: CommsCtx | undefined = (this.comms && this.store.whatsappState().connected && !opts.plan) ? {
@@ -1980,8 +2101,8 @@ export class LocalEngine {
       const claudeCustomMcp = buildClaudeCustomMcp(enabledMcpServers, process.env);
       const codexCustomFrags = buildCodexCustomMcp(enabledMcpServers, process.env).fragments;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, commsCtx)
-        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags }, codexImageFiles);
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx)
+        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
       // operator has to retry by hand. The retry starts the turn fresh; resumeId is
@@ -2045,7 +2166,7 @@ export class LocalEngine {
           };
           let cont: EngineRun;
           try {
-            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp);
+            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx);
           } catch (ce) { if (ce instanceof CancelledError || ac.signal.aborted) throw ce; break; }
           main = {
             text: cont.text || main.text,
@@ -2161,6 +2282,16 @@ export class LocalEngine {
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
       this.emit('job', done);
+      // Auto-rename hook: the first informative turn ripens the title (which is
+      // the user's first prompt). Swap the codename-only branch for one
+      // carrying a task-derived slug. Fires once per session — gated inside.
+      if (isChat && this.gitService) {
+        const fresh = this.store.getSession(session.id);
+        if (fresh && fresh.branch && fresh.codename && !fresh.branchRenamedAt) {
+          // Fire-and-forget; the gitService gates its own no-op cases.
+          void this.gitService.renameSessionBranch(fresh).catch(() => { /* best effort */ });
+        }
+      }
       // AskUserQuestion follow-up: if this chat turn ended on a question the user
       // hasn't answered (the SDK auto-dismisses it headless), arm a countdown that
       // auto-sends the recommended option after ASK_BASE_MS. The question card shows

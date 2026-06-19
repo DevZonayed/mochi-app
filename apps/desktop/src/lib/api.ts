@@ -44,6 +44,19 @@ export interface ChatSession {
   archived?: number;
   primary?: RoleChoice;
   reviewer?: RoleChoice | 'off';
+  /** Isolated git branch for this chat (Conductor-style), once checked out. */
+  branch?: string;
+  /** Absolute path of this session's git worktree. */
+  worktreePath?: string;
+  /** The base branch this session's worktree was forked from. */
+  baseBranch?: string;
+  /** Set when the session's worktree has been pruned/archived. */
+  archivedAt?: number;
+  /** Per-session city callsign ("lyon", "porto" …). Stable; appears in the
+      branch path (`mochi/<codename>/<slug>`) AND in the rail/header. */
+  codename?: string;
+  /** Timestamp the branch was auto-renamed to its task-derived slug. Set once. */
+  branchRenamedAt?: number;
   /** Set when this chat was imported from an external store (read-only history). */
   importedFrom?: ConvSource;
   externalId?: string;
@@ -1146,6 +1159,9 @@ export const api = {
   resolveSession: (sessionId: string) =>
     call<{ ok: boolean; conflicts: string[]; reason?: string }>('resolveSession', { sessionId }, () =>
       req<{ ok: boolean; conflicts: string[]; reason?: string }>(`/api/sessions/${sessionId}/resolve`, { method: 'POST' })),
+  renameSessionBranch: (sessionId: string) =>
+    call<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>('renameSessionBranch', { sessionId }, () =>
+      req<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>(`/api/sessions/${sessionId}/rename-branch`, { method: 'POST' })),
   archiveSessionWorktree: (sessionId: string, deleteBranch?: boolean) =>
     call<{ ok: boolean }>('archiveSessionWorktree', { sessionId, deleteBranch }, () =>
       req<{ ok: boolean }>(`/api/sessions/${sessionId}/archive-worktree`, { method: 'POST', body: JSON.stringify({ deleteBranch }) })),

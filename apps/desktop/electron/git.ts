@@ -374,6 +374,28 @@ export function localRefExists(dir: string, ref: string): boolean {
   return execGit(['-C', dir, 'rev-parse', '--verify', '--quiet', ref]).code === 0;
 }
 
+/** Rename the local branch checked out at `wtDir`. Pure git plumbing — no remote
+    push, no PR concerns. Used by the auto-rename hook: once a session's task is
+    clear, swap the codename-only initial branch (`mochi/<city>/<city>`) for the
+    same path with a meaningful slug (`mochi/<city>/<slug>`). Idempotent — if
+    `to` already matches the current branch, returns ok with `unchanged:true`. */
+export function renameLocalBranch(wtDir: string, from: string, to: string): { ok: boolean; reason?: string; unchanged?: boolean } {
+  if (!from || !to || from === to) return { ok: true, unchanged: true };
+  const git = resolveGit();
+  if (!git || !isGitRepo(wtDir)) return { ok: false, reason: 'not a git repo' };
+  // Confirm the worktree is on `from`; if it's already on `to` (re-entrant call) we're done.
+  const cur = execGit(['-C', wtDir, 'rev-parse', '--abbrev-ref', 'HEAD']);
+  if (!cur.ok) return { ok: false, reason: 'could not read current branch' };
+  if (cur.out === to) return { ok: true, unchanged: true };
+  if (cur.out !== from) return { ok: false, reason: `worktree is on ${cur.out}, expected ${from}` };
+  // Refuse if `to` already exists (another worktree may hold it, or stale local ref).
+  if (execGit(['-C', wtDir, 'rev-parse', '--verify', '--quiet', `refs/heads/${to}`]).code === 0) {
+    return { ok: false, reason: `branch ${to} already exists` };
+  }
+  const r = execGit(['-C', wtDir, 'branch', '-m', from, to]);
+  return r.ok ? { ok: true } : { ok: false, reason: r.out.slice(0, 200) };
+}
+
 /** Merge `base` (preferring origin/<base>) into the current branch in `dir`. A
     clean merge auto-commits; on conflict, returns the conflicted file paths and
     leaves the merge in progress so an agent/operator can resolve them. */

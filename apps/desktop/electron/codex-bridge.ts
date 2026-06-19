@@ -20,7 +20,9 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import type { Store } from './store.js';
 import type { BgTaskRecord } from './engine.js';
+import type { GitCtx } from './git-ctx.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
+import { nextActionFor } from './git-ctx.js';
 
 /** Background-task hooks injected from main.ts — the engine OWNS the processes; the
     bridge just forwards Codex's tool calls to it (Claude reaches the same manager via
@@ -32,9 +34,10 @@ export interface BridgeBg {
   stop(id: string): BgTaskRecord | null;
 }
 
-/** A registered codex run: the project its tools target. */
-interface RunReg { projectId: string | null; skills: boolean; bg: boolean }
-interface RunOptions { skills?: boolean; bg?: boolean }
+/** A registered codex run: the project its tools target + the optional
+    per-session git/PR ctx (only present for chat turns on a GitHub repo). */
+interface RunReg { projectId: string | null; skills: boolean; bg: boolean; git?: GitCtx }
+interface RunOptions { skills?: boolean; bg?: boolean; git?: GitCtx }
 
 /** Handle returned to runCodex: the codex `-c` config to add. */
 export interface CodexRunRegistration {
@@ -48,6 +51,7 @@ const TOOL_NAMES = [
   'search_skills', 'get_skill', 'download_skill', 'add_skill_to_project',
   'list_project_skills', 'remove_project_skill',
   'run_in_background', 'background_output', 'list_background', 'stop_background',
+  'git_status', 'git_push', 'pr_create', 'pr_merge', 'pr_resolve_conflicts', 'branch_rename',
 ] as const;
 
 const txt = (s: string) => ({ content: [{ type: 'text', text: s }] });
@@ -91,7 +95,7 @@ export class CodexBridge {
   /** Register a codex run: returns the `-c mcp_servers` config. */
   register(projectId: string | null, opts: RunOptions = { skills: true, bg: true }): CodexRunRegistration {
     const token = randomBytes(18).toString('hex');
-    const reg: RunReg = { projectId, skills: !!opts.skills, bg: !!opts.bg };
+    const reg: RunReg = { projectId, skills: !!opts.skills, bg: !!opts.bg, git: opts.git };
     this.runs.set(token, reg);
     // Run the shim via Electron's own node (always present; no PATH dependency).
     // The per-run token goes in the MCP server's ENV (not the shim's argv) so it
@@ -228,6 +232,58 @@ export class CodexBridge {
         const r = this.bgHooks.stop(String(a.id ?? ''));
         return txt(r ? `Stopped background task ${a.id ?? ''} (status ${r.status}).` : `No background task ${a.id ?? ''}.`);
       }
+      // Git/PR lifecycle — only enabled when the codex run was registered with a
+      // GitCtx (i.e. this chat owns a worktree + branch on a GitHub repo).
+      case 'git_status': {
+        if (!reg.git) return errRes('git/PR tools are not available — this session has no worktree/branch on a GitHub repo.');
+        if (!reg.git.available()) return txt('No live git/PR lifecycle for this session.');
+        const st = await reg.git.status();
+        const lines: string[] = [];
+        lines.push(`state=${st.state}  branch=${st.branch ?? '?'}  base=${st.base ?? '?'}`);
+        lines.push(`ahead=${st.ahead}  behind=${st.behind}  dirty=${st.dirty}  pushed=${st.pushed}`);
+        if (st.pr) lines.push(`PR #${st.pr.number} (${st.pr.state}): ${st.pr.title}  ${st.pr.url}`);
+        lines.push(`\nNext: ${st.nextAction}`);
+        return txt(lines.join('\n'));
+      }
+      case 'git_push': {
+        if (!reg.git) return errRes('git/PR tools are not available for this run.');
+        const r = await reg.git.push();
+        return txt(r.ok ? 'Pushed. Now call pr_create to open a pull request.' : `Push failed: ${r.reason ?? 'unknown'}`);
+      }
+      case 'pr_create': {
+        if (!reg.git) return errRes('git/PR tools are not available for this run.');
+        const r = await reg.git.createPr({ title: s(a.title), body: s(a.body) });
+        if (!r.ok) return txt(`Could not open PR: ${r.reason ?? 'unknown'}`);
+        return txt(`PR #${r.number} is open: ${r.url}\nUse git_status to check mergeability, then pr_merge once it's clean.`);
+      }
+      case 'pr_merge': {
+        if (!reg.git) return errRes('git/PR tools are not available for this run.');
+        const method = s(a.method);
+        const r = await reg.git.mergePr({ method: method === 'merge' || method === 'squash' || method === 'rebase' ? method : undefined });
+        return txt(r.ok ? "Merged. The session's work is on the base branch now — you can archive the worktree if you're done." : `Merge failed: ${r.reason ?? 'unknown'}`);
+      }
+      case 'pr_resolve_conflicts': {
+        if (!reg.git) return errRes('git/PR tools are not available for this run.');
+        const r = await reg.git.resolveConflicts();
+        if (r.ok && (!r.conflicts || r.conflicts.length === 0)) {
+          return txt('Conflicts resolved cleanly (or the branch was already up to date) — pushed the merged branch. Call git_status to verify the PR is now mergeable.');
+        }
+        if (r.conflicts && r.conflicts.length > 0) {
+          const list = r.conflicts.map(f => `  - ${f}`).join('\n');
+          return txt(`Pulled base; ${r.conflicts.length} file(s) need conflict markers resolved:\n${list}\n\nNext: Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers, then commit (\`git add -A && git commit -m "resolve merge conflicts"\`), then call pr_resolve_conflicts again.`);
+        }
+        return txt(`pr_resolve_conflicts failed: ${r.reason ?? 'unknown'}`);
+      }
+      case 'branch_rename': {
+        if (!reg.git) return errRes('git/PR tools are not available for this run.');
+        const r = await reg.git.renameBranch();
+        if (!r.ok) return txt(`Rename failed: ${r.reason ?? 'unknown'}`);
+        if (r.unchanged) return txt(`Rename skipped (${r.reason ?? 'no-op'}).`);
+        // satisfy the unused-import linter — even when this path doesn't run,
+        // keep nextActionFor exported as a shared helper for both engines.
+        void nextActionFor;
+        return txt(`Renamed ${r.from} → ${r.to}.`);
+      }
       default: return errRes(`unknown tool: ${tool}`);
     }
   }
@@ -249,6 +305,12 @@ const SHIM_TOOLS = JSON.stringify([
   { name: 'background_output', description: 'Read recent stdout+stderr and status of a background task started with run_in_background (e.g. to confirm a server came up and find its URL). Works across turns — background tasks persist.', inputSchema: { type: 'object', properties: { id: { type: 'string' }, tailKB: { type: 'number' } }, required: ['id'] } },
   { name: 'list_background', description: 'List this project\'s background tasks (running first) with id, status and command.', inputSchema: { type: 'object', properties: {} } },
   { name: 'stop_background', description: 'Stop a background task (kills its whole process tree).', inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
+  { name: 'git_status', description: 'Read this chat\'s live git/PR state (branch, ahead/behind, dirty, open PR, next-action hint). Call before push/pr/merge/resolve to confirm the lifecycle position.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'git_push', description: 'Push this chat\'s branch to origin using the user\'s saved GitHub token. Use when git_status says ready-to-push.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'pr_create', description: 'Open (or resurface) a pull request from this chat\'s branch. Pushes first if needed; idempotent.', inputSchema: { type: 'object', properties: { title: { type: 'string' }, body: { type: 'string' } } } },
+  { name: 'pr_merge', description: 'Merge the open PR for this chat using the repo\'s preferred merge method (or override with method=merge|squash|rebase). Only call when git_status reports pr-mergeable.', inputSchema: { type: 'object', properties: { method: { type: 'string' } } } },
+  { name: 'pr_resolve_conflicts', description: 'Pull the base branch in. If clean, pushes; if conflicts, returns the conflicted files so you can Read/Edit them, commit, and call again.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'branch_rename', description: 'Force a one-shot of the auto-rename (codename-only → task-derived slug). No-op if the branch is already pushed or a PR exists.', inputSchema: { type: 'object', properties: {} } },
 ]);
 
 const SHIM_SRC = `'use strict';
