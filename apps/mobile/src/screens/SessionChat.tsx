@@ -431,7 +431,7 @@ export function SessionChatScreen() {
       ? s.jobs.filter((j) => j.sessionId === sessionId).slice().sort((a, b) => a.createdAt - b.createdAt)
       : [],
   );
-  const bootstrapped = useSyncStore((s) => s.bootstrapped);
+  const settled = useSyncStore((s) => s.settled);
 
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<AttachChip[]>([]);
@@ -454,7 +454,7 @@ export function SessionChatScreen() {
   // tab was in front catches up cleanly.
   useEffect(() => { void pullSync(); }, [sessionId]);
 
-  const loading = !bootstrapped && turns.length === 0 && !!sessionId;
+  const loading = !settled && turns.length === 0 && !!sessionId;
   const liveTurn = turns.some((j) => j.status === 'running' || j.status === 'pending');
 
   // Auto-scroll to the newest content.

@@ -7,6 +7,7 @@ import { Icon } from '../Icon';
 import { Card } from '../ui';
 import { pullSync, useSyncStore } from '../syncStore';
 import { SkeletonList } from '../ui/Skeleton';
+import { SyncErrorBanner } from '../SyncErrorBanner';
 
 function ago(ts: number): string {
   const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
@@ -30,7 +31,8 @@ export function ProjectSessionsScreen() {
   // No per-screen cache key — SSE updates flow in automatically.
   const sessions = useSyncStore((s) => s.sessions.filter((x) => x.projectId === projectId));
   const jobs = useSyncStore((s) => s.jobs.filter((x) => x.projectId === projectId));
-  const bootstrapped = useSyncStore((s) => s.bootstrapped);
+  const settled = useSyncStore((s) => s.settled);
+  const syncError = useSyncStore((s) => s.syncError);
   const syncing = useSyncStore((s) => s.syncing);
 
   // Top up the store on focus and on pull-to-refresh — covers the rare case
@@ -75,7 +77,11 @@ export function ProjectSessionsScreen() {
           <Text style={{ fontSize: 14, color: theme.color.inkSecondary, marginTop: 3 }}>{active.length} chat{active.length === 1 ? '' : 's'}</Text>
         </View>
 
-        {!bootstrapped && active.length === 0 ? (
+        {syncError && active.length === 0 ? (
+          <SyncErrorBanner kind={syncError} onRetry={onRefresh} />
+        ) : null}
+
+        {!settled && active.length === 0 ? (
           <SkeletonList count={4} />
         ) : active.length === 0 ? (
           <View style={{ alignItems: 'center', paddingVertical: 60, paddingHorizontal: 36 }}>
