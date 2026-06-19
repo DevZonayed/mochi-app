@@ -44,12 +44,12 @@ describe('Store — captured WhatsApp messages', () => {
     expect(chat.lastMessageAt).toBe(200);
   });
 
-  it('caps a chat log so it cannot grow without bound', () => {
+  it('retains a large history (no longer truncated at the old 300 cap)', () => {
     const s = new Store();
-    for (let i = 0; i < 350; i++) s.recordWaMessage({ chatId: 'c1', fromMe: false, senderName: 'A', text: `m${i}`, ts: i });
-    expect(s.getWaTranscript('c1').length).toBeLessThanOrEqual(300);
-    // The most recent message survives the cap.
-    expect(s.getWaTranscript('c1').at(-1)!.text).toBe('m349');
+    for (let i = 0; i < 400; i++) s.recordWaMessage({ chatId: 'c1', fromMe: false, senderName: 'A', text: `m${i}`, ts: i });
+    const t = s.getWaTranscript('c1');
+    expect(t.length).toBe(400);
+    expect(t.at(-1)!.text).toBe('m399'); // newest preserved, chronological
   });
 
   it('"since last reported" returns only messages after the watermark', () => {
@@ -78,5 +78,22 @@ describe('Store — ChatBinding provider + session', () => {
     const s = new Store();
     const b = s.bindChat({ chatId: '99', name: 'Bob', kind: 'dm' });
     expect(b.provider).toBe('telegram');
+  });
+});
+
+describe('Store — per-project WhatsApp chat assignment (via bindings)', () => {
+  it('assigns, dedupes and removes WhatsApp chats on a project', () => {
+    const s = new Store();
+    const p = s.createProject({ name: 'P' });
+    s.waUpsertChat({ chatId: '111@s.whatsapp.net', name: 'Alice', kind: 'dm' });
+    s.addProjectWaChat(p.id, '111@s.whatsapp.net');
+    s.addProjectWaChat(p.id, '222@s.whatsapp.net');
+    s.addProjectWaChat(p.id, '111@s.whatsapp.net'); // dedupe (bindChat upserts)
+    expect(s.listProjectWaChats(p.id).sort()).toEqual(['111@s.whatsapp.net', '222@s.whatsapp.net']);
+    // assigning makes it a tracked whatsapp binding (shows in Comms Bindings)
+    expect(s.getChatBinding('111@s.whatsapp.net')?.provider).toBe('whatsapp');
+    s.removeProjectWaChat(p.id, '111@s.whatsapp.net');
+    expect(s.listProjectWaChats(p.id)).toEqual(['222@s.whatsapp.net']);
+    expect(s.getChatBinding('111@s.whatsapp.net')).toBeUndefined(); // unbound, but history kept
   });
 });

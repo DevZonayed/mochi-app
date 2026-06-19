@@ -9,6 +9,7 @@ import { Platform } from 'react-native';
 import * as Notifications from 'expo-notifications';
 import * as Haptics from 'expo-haptics';
 import { createAudioPlayer, setAudioModeAsync, type AudioPlayer } from 'expo-audio';
+import type { PushNavData } from './pushNav';
 
 let configured = false;
 let player: AudioPlayer | null = null;
@@ -59,11 +60,13 @@ export function playAlertSound(): void {
   try { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); } catch { /* ignore */ }
 }
 
-/** Post an immediate OS notification (no-op where unsupported). */
-export async function notify(title: string, body: string): Promise<void> {
+/** Post an immediate OS notification (no-op where unsupported). The `data` field
+    mirrors the relay's closed-app push payload so the tap-handler (pushNav.ts)
+    deep-links the same way whether the notification was local or remote. */
+export async function notify(title: string, body: string, data?: PushNavData): Promise<void> {
   try {
     await Notifications.scheduleNotificationAsync({
-      content: { title, body, sound: 'default' },
+      content: { title, body, sound: 'default', ...(data ? { data: data as Record<string, unknown> } : {}) },
       trigger: null,
     });
   } catch {
@@ -71,8 +74,8 @@ export async function notify(title: string, body: string): Promise<void> {
   }
 }
 
-/** The full loud alert: chime + haptics + OS notification. */
-export function fireAlert(title: string, body: string): void {
+/** The full loud alert: chime + haptics + OS notification (with optional nav payload). */
+export function fireAlert(title: string, body: string, data?: PushNavData): void {
   playAlertSound();
-  void notify(title, body);
+  void notify(title, body, data);
 }

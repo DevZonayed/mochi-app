@@ -78,8 +78,16 @@ const EMPTY_DASHBOARD = {
 
 const CMD_TIMEOUT_MS = 10 * 60 * 1000; // jobs run real models on the Mac — be generous
 
+// Mobile + desktop composers ship attachments as base64 JSON to /api/chat. The
+// Mac's ingestor caps each image/file at 16 MB raw → ~22 MB after base64; with
+// up to 8 attachments plus prompt text the worst-case payload is ~180 MB. Fastify
+// defaults to 1 MB and would reject anything bigger before we get a chance to
+// forward, so raise the body limit. Kept slightly above the theoretical max so a
+// legitimate full-cap payload still goes through without us being a bottleneck.
+const RELAY_BODY_LIMIT = 200 * 1024 * 1024;
+
 export function buildServer(): FastifyInstance {
-  const app = Fastify({ logger: true });
+  const app = Fastify({ logger: true, bodyLimit: RELAY_BODY_LIMIT });
   app.register(cors, { origin: true });
 
   // Tolerate empty JSON bodies on bodyless POSTs (approve/deny/toggle).
@@ -180,10 +188,20 @@ export function buildServer(): FastifyInstance {
     if (pushSeen.size > 1000) { const first = pushSeen.values().next().value; if (first) pushSeen.delete(first); }
     return true;
   }
-  async function sendExpoPush(title: string, body: string): Promise<void> {
+  /** Payload mirrored into Expo's `data` field so a notification tap can deep-link
+      the phone to the right session chat (or Approvals when no session applies).
+      Kept small — Expo caps push data at 4KB. */
+  type PushNavData = {
+    kind: 'job-done' | 'job-failed' | 'approval' | 'schedule-late';
+    projectId?: string;
+    sessionId?: string;
+    jobId?: string;
+    approvalId?: string;
+  };
+  async function sendExpoPush(title: string, body: string, data?: PushNavData): Promise<void> {
     const tokens = [...pushTokens.keys()];
     if (!tokens.length) return;
-    const messages = tokens.map((to) => ({ to, title, body, sound: 'default', priority: 'high', channelId: 'alerts' }));
+    const messages = tokens.map((to) => ({ to, title, body, sound: 'default', priority: 'high', channelId: 'alerts', ...(data ? { data } : {}) }));
     try {
       const res = await fetch('https://exp.host/--/api/v2/push/send', {
         method: 'POST',
@@ -200,19 +218,37 @@ export function buildServer(): FastifyInstance {
     } catch { /* push service unreachable — SSE still carries foreground alerts */ }
   }
   // Mirror the alert-worthy events to push, matching the phone's in-app LiveNotifier.
+  // Each push carries a `data` payload (projectId/sessionId/jobId) so the phone can
+  // deep-link the tap to the originating session chat (or Approvals as a fallback).
   function maybePush(name: string, data: unknown): void {
     if (!pushTokens.size) return;
     if (name === 'job') {
-      const j = data as { id?: string; status?: string; title?: string } | null;
+      const j = data as { id?: string; status?: string; title?: string; projectId?: string; sessionId?: string } | null;
       if (!j?.id) return;
-      if (j.status === 'done' && rememberPushKey(`${j.id}:done`)) void sendExpoPush('Conversation complete', j.title || 'A run finished on your Mac.');
-      else if (j.status === 'failed' && rememberPushKey(`${j.id}:failed`)) void sendExpoPush('Job failed', j.title || 'A run failed on your Mac.');
+      const nav = { projectId: j.projectId, sessionId: j.sessionId, jobId: j.id };
+      if (j.status === 'done' && rememberPushKey(`${j.id}:done`)) void sendExpoPush('Conversation complete', j.title || 'A run finished on your Mac.', { kind: 'job-done', ...nav });
+      else if (j.status === 'failed' && rememberPushKey(`${j.id}:failed`)) void sendExpoPush('Job failed', j.title || 'A run failed on your Mac.', { kind: 'job-failed', ...nav });
     } else if (name === 'approval') {
-      const a = data as { id?: string; status?: string; title?: string } | null;
-      if (a?.id && a.status === 'pending' && rememberPushKey(`appr:${a.id}`)) void sendExpoPush('Needs your attention', a.title || 'An approval is waiting.');
+      const a = data as { id?: string; status?: string; title?: string; projectId?: string | null; jobId?: string | null } | null;
+      if (a?.id && a.status === 'pending' && rememberPushKey(`appr:${a.id}`)) {
+        // Approval has projectId + jobId but no direct sessionId — look up the job in
+        // the mirrored Mac snapshot to recover sessionId so the tap lands on the chat.
+        const job = a.jobId ? (deck?.state?.jobs ?? []).find((x) => x.id === a.jobId) : undefined;
+        void sendExpoPush('Needs your attention', a.title || 'An approval is waiting.', {
+          kind: 'approval',
+          approvalId: a.id,
+          projectId: a.projectId ?? job?.projectId ?? undefined,
+          sessionId: job?.sessionId,
+          jobId: a.jobId ?? undefined,
+        });
+      }
     } else if (name === 'schedule-late') {
-      const s = data as { id?: string; title?: string; firedAt?: number } | null;
-      if (rememberPushKey(`late:${s?.id ?? ''}:${s?.firedAt ?? ''}`)) void sendExpoPush('Scheduled task ran late', s?.title ? `“${s.title}” caught up.` : 'A schedule caught up after a missed time.');
+      const s = data as { id?: string; title?: string; firedAt?: number; projectId?: string; sessionId?: string } | null;
+      if (rememberPushKey(`late:${s?.id ?? ''}:${s?.firedAt ?? ''}`)) void sendExpoPush(
+        'Scheduled task ran late',
+        s?.title ? `“${s.title}” caught up.` : 'A schedule caught up after a missed time.',
+        { kind: 'schedule-late', projectId: s?.projectId, sessionId: s?.sessionId },
+      );
     }
   }
 
