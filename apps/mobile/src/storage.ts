@@ -39,6 +39,8 @@ export const DEVICE_ID = 'maestro.mobile.deviceId';
 export const NOTIF_PREFS = 'maestro.mobile.notifPrefs';
 /** Require device biometrics (Face ID / fingerprint) before approving a gate. */
 export const BIOMETRIC_GATE = 'maestro.mobile.biometricGate';
+/** This device's last-registered Expo push token. */
+export const PUSH_TOKEN = 'maestro.mobile.pushToken';
 
 export function getStr(key: string): string {
   return cache.get(key) ?? '';
