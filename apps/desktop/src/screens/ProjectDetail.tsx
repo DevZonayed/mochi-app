@@ -1562,17 +1562,79 @@ function UserImageThumb({ img }: { img: ChatImage }) {
   );
 }
 
+/* Match an `@<path>` inline attachment marker that points into the project's
+   `.continuum/Attachment/` directory. Works on both forms the bubble can see:
+   the desktop's absolute `@/Users/.../proj/.continuum/Attachment/x.png`, and
+   the relay-scrubbed `@.continuum/Attachment/x.png` the phone receives. */
+const ATTACH_INLINE_RE = /@(\S*\.continuum\/Attachment\/([A-Za-z0-9._-]+))/g;
+/** Basename of a saved attachment path — the lookup key against inputImages /
+    inputFiles, since those carry their `.continuum/Attachment/` filename. */
+const basenameOf = (p: string): string => p.split('/').filter(Boolean).pop() || p;
+/** A small inline attachment chip / image thumbnail rendered AT the position
+    the user dropped the chip in the composer. Image markers expand to a real
+    thumbnail; everything else shows a compact name + size badge.  */
+function InlineAttach({ path, images, files }: { path: string; images?: ChatImage[]; files?: ChatFile[] }) {
+  const base = basenameOf(path);
+  const img = images?.find(im => basenameOf(im.imagePath ?? '') === base || im.name === base);
+  if (img) return <span style={{ display: 'inline-block', verticalAlign: 'middle', margin: '0 2px' }}><UserImageThumb img={img} /></span>;
+  const f = files?.find(fl => (fl.path && basenameOf(fl.path) === base) || fl.name === base);
+  const label = f ? (f.name === 'Pasted text.txt' ? 'Pasted text' : f.name) : base;
+  const sub = f ? `${f.kind === 'text' ? 'text' : (f.mime || 'file')}${f.bytes ? ' · ' + fmtBytes(f.bytes) : ''}` : 'attachment';
+  return (
+    <span title={f?.name ?? path} style={{ display: 'inline-flex', verticalAlign: 'middle', alignItems: 'center', gap: 6, maxWidth: 240, margin: '0 2px', padding: '2px 8px 2px 6px', borderRadius: 9, border: '0.5px solid rgba(255,255,255,0.32)', background: 'rgba(255,255,255,0.14)', color: '#fff', font: '600 12px/1.25 var(--font-text)' }}>
+      <Icon name="file" size={12} />
+      <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+        <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+        <span style={{ font: '500 9px/1.1 var(--font-text)', opacity: 0.72 }}>{sub}</span>
+      </span>
+    </span>
+  );
+}
+
+/** Render the user bubble: text with `@<.continuum/Attachment/…>` markers
+    tokenized into inline chips/thumbnails at the exact position the user
+    dropped them in the composer. Images that aren't referenced inline (legacy
+    jobs before this change persisted markers in the input) fall back to a row
+    above the bubble so nothing disappears. */
 function UserBubble({ text, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
+  // Split the text into [string, attachment, string, attachment, …] tokens.
+  const nodes = React.useMemo(() => {
+    if (!text) return [] as React.ReactNode[];
+    const out: React.ReactNode[] = [];
+    let last = 0; let i = 0;
+    ATTACH_INLINE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ATTACH_INLINE_RE.exec(text)) !== null) {
+      if (m.index > last) out.push(text.slice(last, m.index));
+      out.push(<InlineAttach key={`a${i++}`} path={m[1]} images={images} files={files} />);
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) out.push(text.slice(last));
+    return out;
+  }, [text, images, files]);
+
+  // Anything that DIDN'T appear inline (legacy persisted jobs, or a chip the
+  // user removed before sending while leaving the payload) shows above so the
+  // user still sees what's attached.
+  const referencedBases = React.useMemo(() => {
+    const s = new Set<string>(); if (!text) return s;
+    const r = new RegExp(ATTACH_INLINE_RE.source, 'g'); let mm: RegExpExecArray | null;
+    while ((mm = r.exec(text)) !== null) s.add(mm[2]);
+    return s;
+  }, [text]);
+  const orphanImages = (images ?? []).filter(im => !referencedBases.has(basenameOf(im.imagePath ?? '')) && !referencedBases.has(im.name ?? ''));
+  const orphanFiles = (files ?? []).filter(f => !referencedBases.has(f.path ? basenameOf(f.path) : '') && !referencedBases.has(f.name));
+
   return (
     <div className="chat-msg" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
-      {images && images.length > 0 && (
+      {orphanImages.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: 'min(78%, 640px)' }}>
-          {images.map((im, i) => <UserImageThumb key={`${im.assetId}-${i}`} img={im} />)}
+          {orphanImages.map((im, i) => <UserImageThumb key={`${im.assetId}-${i}`} img={im} />)}
         </div>
       )}
-      {files && files.length > 0 && (
+      {orphanFiles.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: 'min(78%, 640px)' }}>
-          {files.map((f, i) => (
+          {orphanFiles.map((f, i) => (
             <div key={i} title={f.name} style={{ display: 'flex', alignItems: 'center', gap: 8, maxWidth: 240, height: 42, padding: '0 12px 0 9px', borderRadius: 11, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-elevated)' }}>
               <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={14} /></span>
               <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
@@ -1588,7 +1650,7 @@ function UserBubble({ text, images, files }: { text: string; images?: ChatImage[
           background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
           color: '#fff', font: '400 14px/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
           boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
-          {text}
+          {nodes}
         </div>
       )}
     </div>
@@ -2722,10 +2784,10 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     const t = raw.trim();
     const list = atts ?? [];
     const imgs = list.filter((a): a is Extract<Attach, { kind: 'image' }> => a.kind === 'image')
-      .map(a => ({ name: a.name, mime: a.mime, dataB64: a.dataUrl.includes(',') ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : a.dataUrl }));
+      .map(a => ({ id: a.id, name: a.name, mime: a.mime, dataB64: a.dataUrl.includes(',') ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : a.dataUrl }));
     const files = list.filter(a => a.kind !== 'image' && a.kind !== 'ref').map(a => a.kind === 'text'
-      ? { name: a.name, kind: 'text' as const, content: a.content }
-      : { name: a.name, kind: 'file' as const, mime: (a as Extract<Attach, { kind: 'file' }>).mime, dataB64: (a as Extract<Attach, { kind: 'file' }>).dataB64 });
+      ? { id: a.id, name: a.name, kind: 'text' as const, content: a.content }
+      : { id: a.id, name: a.name, kind: 'file' as const, mime: (a as Extract<Attach, { kind: 'file' }>).mime, dataB64: (a as Extract<Attach, { kind: 'file' }>).dataB64 });
     // File/folder reference capsules: passed to the local agent as on-disk paths
     // (it reads them with its own tools — no bytes uploaded; folders work too).
     const refs = list.filter((a): a is Extract<Attach, { kind: 'ref' }> => a.kind === 'ref');

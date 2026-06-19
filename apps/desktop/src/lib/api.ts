@@ -939,7 +939,7 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; browser?: boolean; images?: { name?: string; mime: string; dataB64: string }[]; files?: { name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; browser?: boolean; images?: { id?: string; name?: string; mime: string; dataB64: string }[]; files?: { id?: string; name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   renameSession: (id: string, title: string) =>
