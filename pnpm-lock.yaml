@@ -6,6 +6,7 @@ settings:
 
 overrides:
   node-gyp: ^10.2.0
+  event-target-shim: ^6.0.2
 
 importers:
 
@@ -3004,10 +3005,6 @@ packages:
   etag@1.8.1:
     resolution: {integrity: sha512-aIL5Fx7mawVa300al2BnEE4iNvo1qETxLrPI/o05L7z6go7fCw1J6EQmbK4FmJ2AS7kgVF/KEZWufBfdClMcPg==}
     engines: {node: '>= 0.6'}
-
-  event-target-shim@5.0.1:
-    resolution: {integrity: sha512-i/2XbnSz/uxRCU6+NdVJgKWDTM427+MqYbkQzD321DuCQJUqOuJKIA0IM2+W2xtYHdKOmZ4dR6fExsd4SXL+WQ==}
-    engines: {node: '>=6'}
 
   event-target-shim@6.0.2:
     resolution: {integrity: sha512-8q3LsZjRezbFZ2PN+uP+Q7pnHUMmAOziU2vA2OwoFaKIXxlxl38IylhSSgUorWu/rf4er67w0ikBqjBFk/pomA==}
@@ -7860,7 +7857,7 @@ snapshots:
 
   abort-controller@3.0.0:
     dependencies:
-      event-target-shim: 5.0.1
+      event-target-shim: 6.0.2
 
   abstract-logging@2.0.1: {}
 
@@ -9000,8 +8997,6 @@ snapshots:
       '@types/estree': 1.0.9
 
   etag@1.8.1: {}
-
-  event-target-shim@5.0.1: {}
 
   event-target-shim@6.0.2: {}
 
