@@ -484,13 +484,28 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!projectId || (!text && !rawImages.length && !rawFiles.length)) bad('projectId and a message, image, or file required');
         const project = store.getProject(projectId);
         if (!project) bad('project not found', 404);
+        // Clean prose for the rail/header — strip the composer's `«attach:<id>»`
+        // chip placeholders AND any already-substituted `@<.continuum/Attachment/…>`
+        // path markers, so a message that's "[image] device is connected…" shows
+        // as "device is connected…" in the session title, not the chip syntax or
+        // a half-truncated absolute file path.
+        const titleText = text
+          .replace(/«attach:[A-Za-z0-9_-]+»/g, '')
+          .replace(/@\S*\.continuum\/Attachment\/[A-Za-z0-9._-]+/g, '')
+          .replace(/[ \t]+/g, ' ')
+          .replace(/\s*\n\s*/g, ' ')
+          .trim();
         let session = p.sessionId ? store.getSession(String(p.sessionId)) : undefined;
         if (p.sessionId && !session) bad('session not found', 404);
         if (!session) {
           // Pick a memorable city codename so the branch (`mochi/<city>/<slug>`)
           // and rails surface a stable callsign for the session from the start.
           const codename = pickCityCodename(store.usedCodenamesIn(projectId));
-          session = store.createSession(projectId, text, codename);
+          // Fall back to a placeholder so a pure-attachment message ("just this
+          // image please" → empty title after strip) still gets a meaningful rail
+          // entry — the codename pill is the durable callsign anyway.
+          const seedTitle = titleText || (rawImages.length ? 'Image' : rawFiles.length ? 'Attachment' : 'New chat');
+          session = store.createSession(projectId, seedTitle, codename);
           emit('session', session);
         }
         // The project's working root — where `.continuum/Attachment/` lives.
@@ -580,8 +595,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // the agent sees the inline file reference exactly where the user typed
         // the chip. Unknown ids drop out — a chip with no payload becomes empty.
         const finalText = substitutePlaceholders(text, idToPath);
+        // The job's `title` surfaces in telegram pushes, audit history, and the
+        // session rail subtitle — same clean-prose rule as the session title so
+        // none of those leak a `«attach:…»` placeholder or a sliced abs path.
+        const jobTitle = (titleText || (rawImages.length ? 'Image' : rawFiles.length ? 'Attachment' : '')).slice(0, 60);
 
-        const job = store.createJob(projectId, finalText, finalText.slice(0, 60), p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined);
+        const job = store.createJob(projectId, finalText, jobTitle, p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined);
         emit('job', job);
         // Fire the run async — the reply streams in over job events.
         void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true, browser: p.browser === true });
