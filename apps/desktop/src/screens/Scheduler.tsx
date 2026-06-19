@@ -9,6 +9,7 @@
    the shared library, so they are inlined here. */
 
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { Switch } from '../lib/ui';
 import { AppShell } from '../lib/appShell';
@@ -334,6 +335,93 @@ function SheetSection({ n, title, children }: { n: string; title: string; childr
   );
 }
 
+/** A searchable dropdown (combobox) that scales to hundreds of projects or chats: a compact
+ *  select-style trigger showing the current pick, which opens a filterable, scrollable menu.
+ *  The menu is portaled to <body> with fixed positioning so it floats above the modal and is
+ *  never clipped by the sheet's scroll area. `leadLabel` is a pinned top option for the empty
+ *  ('') value (e.g. "Workspace"); `emptyLabel` is the trigger text when nothing is chosen. */
+function SearchSelect({ options, value, onChange, leadLabel, emptyLabel, placeholder }: {
+  options: { id: string; label: string }[];
+  value: string;
+  onChange: (id: string) => void;
+  leadLabel?: string;
+  emptyLabel?: string;
+  placeholder: string;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [q, setQ] = React.useState('');
+  const triggerRef = React.useRef<HTMLButtonElement>(null);
+  const menuRef = React.useRef<HTMLDivElement>(null);
+  const inputRef = React.useRef<HTMLInputElement>(null);
+  const [rect, setRect] = React.useState<DOMRect | null>(null);
+
+  React.useEffect(() => {
+    if (!open) return;
+    const place = () => { if (triggerRef.current) setRect(triggerRef.current.getBoundingClientRect()); };
+    place();
+    inputRef.current?.focus();
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (!triggerRef.current?.contains(t) && !menuRef.current?.contains(t)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown, true);
+    window.addEventListener('resize', place, true);
+    window.addEventListener('scroll', place, true); // keep the menu anchored as the sheet scrolls
+    return () => {
+      document.removeEventListener('mousedown', onDown, true);
+      window.removeEventListener('resize', place, true);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [open]);
+
+  const query = q.trim().toLowerCase();
+  const rows = query ? options.filter(o => o.label.toLowerCase().includes(query)) : options;
+  const selected = value ? options.find(o => o.id === value) : null;
+  const triggerLabel = selected ? selected.label : (leadLabel ?? emptyLabel ?? placeholder);
+  const isMuted = !selected && !leadLabel;
+  const choose = (id: string) => { onChange(id); setOpen(false); setQ(''); };
+
+  return (
+    <>
+      <button ref={triggerRef} type="button" onClick={() => setOpen(o => !o)}
+        style={{ width: '100%', height: 40, display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', cursor: 'pointer', textAlign: 'left',
+          borderRadius: 11, background: 'var(--bg-grouped)',
+          border: open ? '1px solid color-mix(in srgb, var(--blue) 55%, transparent)' : '0.5px solid var(--separator)' }}>
+        <span style={{ flex: 1, font: '600 var(--fs-callout)/1 var(--font-text)', color: isMuted ? 'var(--ink-tertiary)' : 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{triggerLabel}</span>
+        <Icon name="chevronDown" size={16} style={{ color: 'var(--ink-tertiary)', transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 130ms ease' }} />
+      </button>
+      {open && rect && createPortal(
+        <div ref={menuRef} style={{ position: 'fixed', top: rect.bottom + 6, left: rect.left, width: rect.width, zIndex: 200,
+          background: 'var(--bg-elevated)', border: '0.5px solid var(--glass-border)', borderRadius: 12, boxShadow: '0 24px 60px rgba(10,15,40,0.5)', overflow: 'hidden' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '9px 11px', borderBottom: '0.5px solid var(--separator)' }}>
+            <Icon name="search" size={15} style={{ color: 'var(--ink-tertiary)' }} />
+            <input ref={inputRef} value={q} onChange={e => setQ(e.target.value)} placeholder={placeholder}
+              onKeyDown={e => { if (e.key === 'Escape') { e.preventDefault(); setOpen(false); } }}
+              style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
+          </div>
+          <div style={{ maxHeight: 248, overflowY: 'auto', padding: 5 }}>
+            {leadLabel && !query && <SelectRow active={!value} label={leadLabel} onPick={() => choose('')} />}
+            {rows.map(o => <SelectRow key={o.id} active={value === o.id} label={o.label} onPick={() => choose(o.id)} />)}
+            {!rows.length && <div style={{ padding: '16px 10px', textAlign: 'center', font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No matches</div>}
+          </div>
+        </div>, document.body)}
+    </>
+  );
+}
+
+function SelectRow({ active, label, onPick }: { active: boolean; label: string; onPick: () => void }) {
+  const [hover, setHover] = React.useState(false);
+  return (
+    <button type="button" onClick={onPick} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
+      style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 9, height: 36, padding: '0 9px', borderRadius: 8, cursor: 'pointer', textAlign: 'left',
+        background: active ? 'color-mix(in srgb, var(--blue) 14%, transparent)' : hover ? 'var(--fill-secondary)' : 'transparent',
+        color: active ? 'var(--blue)' : 'var(--ink)', font: '500 var(--fs-callout)/1 var(--font-text)' }}>
+      <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+      {active && <Icon name="check" size={15} />}
+    </button>
+  );
+}
+
 export interface ScheduleSaveData { id?: string; title: string; time: string; cadence: string; projectId?: string; sessionId?: string; prompt?: string; everyMinutes?: number; catchUp?: boolean }
 
 interface ScheduleSheetProps {
@@ -443,10 +531,13 @@ function ScheduleSheet({ open, onClose, onSave, onDelete, initial, projects }: S
         <div style={{ padding: 20, overflowY: 'auto' }}>
           {/* 1 project + where it runs */}
           <SheetSection n="1" title="Project & where it runs">
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
-              <button onClick={() => { setProjectId(''); setRunIn('new'); setSessionId(''); }} style={pill(!projectId)}>Workspace</button>
-              {projects.map(p => <button key={p.id} onClick={() => { setProjectId(p.id); setSessionId(''); }} style={pill(projectId === p.id)}>{p.name}</button>)}
-            </div>
+            <SearchSelect
+              placeholder="Search projects…"
+              leadLabel="Workspace"
+              options={projects.map(p => ({ id: p.id, label: p.name }))}
+              value={projectId}
+              onChange={id => { setProjectId(id); setSessionId(''); if (!id) setRunIn('new'); }}
+            />
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, marginTop: 10 }}>
               <button onClick={() => { setRunIn('new'); setSessionId(''); }} style={pill(runIn === 'new')}>A fresh run each time</button>
               <button onClick={() => setRunIn('session')} style={pill(runIn === 'session')}>A specific chat</button>
@@ -457,8 +548,14 @@ function ScheduleSheet({ open, onClose, onSave, onDelete, initial, projects }: S
             {runIn === 'session' && (
               projectId
                 ? (sessions.length
-                    ? <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, marginTop: 10 }}>
-                        {sessions.map(se => <button key={se.id} onClick={() => setSessionId(se.id)} style={pill(sessionId === se.id)}>{se.title}</button>)}
+                    ? <div style={{ marginTop: 10 }}>
+                        <SearchSelect
+                          placeholder="Search chats…"
+                          emptyLabel="Choose a chat…"
+                          options={sessions.map(se => ({ id: se.id, label: se.title }))}
+                          value={sessionId}
+                          onChange={id => setSessionId(id)}
+                        />
                       </div>
                     : <p style={{ margin: '8px 2px 0', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>This project has no chats yet — pick “A fresh run each time”, or open a chat first.</p>)
                 : <p style={{ margin: '8px 2px 0', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>Pick a project above to choose one of its chats.</p>
