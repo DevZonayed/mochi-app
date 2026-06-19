@@ -123,7 +123,8 @@ export type IconName =
   | 'minimize'
   | 'archive'
   | 'trash'
-  | 'pause';
+  | 'pause'
+  | 'pencil';
 
 export interface IconProps {
   name: IconName;
@@ -200,6 +201,7 @@ export function Icon({ name, size = 18, stroke = 1.75, style }: IconProps) {
     minimize: <><path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/></>,
     archive: <><rect x="2.5" y="4" width="19" height="5" rx="1"/><path d="M4.5 9v9a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V9"/><path d="M10 13h4"/></>,
     trash: <><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></>,
+    pencil: <><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5Z"/></>,
   };
   return <svg {...p}>{paths[name]}</svg>;
 }
