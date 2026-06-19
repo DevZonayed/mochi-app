@@ -5,10 +5,10 @@ import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Card, SectionLabel, ProgressBar, Mono } from '../ui';
-import { api, type DashboardData, type Approval, type Job, type ChatSession, type Project } from '../api';
-import { getStr, cacheGet, cacheSet } from '../storage';
+import { api, type DashboardData, type Approval, type Job } from '../api';
+import { getStr } from '../storage';
+import { pullSync, useSyncStore } from '../syncStore';
 import { eventAllowed } from '../notifPrefs';
-import { useLive } from '../useLive';
 import { ConnPill } from '../ConnPill';
 
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -174,10 +174,12 @@ export function HomeScreen() {
   const [live, setLive] = useState<LiveVM[]>([]);
   const [strip, setStrip] = useState({ spend: 0, scheduled: 0, done: 0 });
   const [unread, setUnread] = useState(false);
-  // Recent chats — seeded from cache (shared with Projects) for an instant render.
-  const [sessions, setSessions] = useState<ChatSession[]>(() => cacheGet('sessions', []));
-  const [projects, setProjects] = useState<Project[]>(() => cacheGet('projects', []));
-  const [allJobs, setAllJobs] = useState<Job[]>(() => cacheGet('jobs', []));
+  // Recent chats — read straight from the unified SyncStore. No per-screen
+  // cache, no stale-disk flash on re-mount.
+  const sessions = useSyncStore((s) => s.sessions);
+  const projects = useSyncStore((s) => s.projects);
+  const allJobs = useSyncStore((s) => s.jobs);
+  const storeEvents = useSyncStore((s) => s.events);
   const [now, setNow] = useState(Date.now());
   // A cute line picked once per visit.
   const [quip] = useState(() => MOTIVATIONS[Math.floor(Math.random() * MOTIVATIONS.length)]);
@@ -217,6 +219,9 @@ export function HomeScreen() {
     [colorFor, theme],
   );
 
+  // Sessions/projects/jobs come from the SyncStore — only the dashboard
+  // (server-derived strip + greeting) still uses a one-shot REST call, since
+  // it's a computed view that doesn't fit the delta model cleanly.
   const refetch = useCallback(async () => {
     try {
       const d = await api.dashboard();
@@ -224,23 +229,14 @@ export function HomeScreen() {
     } catch {
       /* fail soft — keep last good state */
     }
-    // Recent chats: sessions + projects + jobs (cache-then-network, shared cache).
-    try {
-      const [ss, ps, js] = await Promise.all([api.listSessions(), api.listProjects(), api.listJobs()]);
-      setSessions(ss); setProjects(ps); setAllJobs(js);
-      cacheSet('sessions', ss); cacheSet('projects', ps); cacheSet('jobs', js);
-    } catch {
-      /* keep cached chats */
-    }
-    // Unread badge: any allowed event newer than the last "mark all read".
-    try {
-      const events = await api.listEvents();
-      const readTs = Number(getStr('maestro.mobile.notifReadTs')) || 0;
-      setUnread(events.some((e) => eventAllowed(e.kind) && e.ts > readTs));
-    } catch {
-      /* leave the badge as-is */
-    }
+    void pullSync(); // refresh the unified store as well
   }, [apply]);
+
+  // Recompute the unread badge from store.events whenever they change.
+  useEffect(() => {
+    const readTs = Number(getStr('maestro.mobile.notifReadTs')) || 0;
+    setUnread(storeEvents.some((e) => eventAllowed(e.kind) && e.ts > readTs));
+  }, [storeEvents]);
 
   // Refetch whenever the screen regains focus (and on first mount).
   useFocusEffect(
@@ -248,8 +244,6 @@ export function HomeScreen() {
       void refetch();
     }, [refetch]),
   );
-  // Real-time: refresh instantly when the Mac reports job/approval/session activity.
-  useLive(['job', 'approval', 'session'], () => { void refetch(); });
 
   const onApprove = useCallback(
     (id: string) => {

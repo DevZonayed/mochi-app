@@ -8,8 +8,8 @@ import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Mono } from '../ui';
 import { api, type Job, type TranscriptItem, type Effort, type ModelGroup } from '../api';
-import { useLive } from '../useLive';
 import { cacheGet, cacheSet } from '../storage';
+import { pullSync, useSyncStore } from '../syncStore';
 
 /* One inline composer chip — either an image (vision) or a file (text inlined
    into the prompt on the Mac, or binary saved as an asset). Bytes ride along as
@@ -422,13 +422,21 @@ export function SessionChatScreen() {
   const initialSid: string | undefined = route.params?.sessionId;
   const [sessionId, setSessionId] = useState<string | undefined>(initialSid);
   const [title, setTitle] = useState<string>(route.params?.title ?? 'New chat');
-  // Seed the thread from cache for an instant open; refresh from the relay below.
-  const [turns, setTurns] = useState<Job[]>(() => (initialSid ? cacheGet<Job[]>(`turns.${initialSid}`, []) : []));
+  // Turns are derived live from the unified SyncStore — every SSE `job` event
+  // for this session is already upserted by App.tsx's global subscriber, so we
+  // just filter + sort. The per-session AsyncStorage cache (turns.{sid}) is
+  // gone: the store IS the cache.
+  const turns = useSyncStore((s) =>
+    sessionId
+      ? s.jobs.filter((j) => j.sessionId === sessionId).slice().sort((a, b) => a.createdAt - b.createdAt)
+      : [],
+  );
+  const bootstrapped = useSyncStore((s) => s.bootstrapped);
+
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<AttachChip[]>([]);
   const [pickingAttachment, setPickingAttachment] = useState(false);
   const [sending, setSending] = useState(false);
-  const [loading, setLoading] = useState(() => !!initialSid && cacheGet<Job[]>(`turns.${initialSid}`, []).length === 0);
   const [schedOpen, setSchedOpen] = useState(false);
   // Per-session effort + model — remembered for the chat, sent with every message.
   const [effort, setEffort] = useState<Effort>(() => (initialSid ? cacheGet<Effort>(`effort.${initialSid}`, 'balanced') : 'balanced'));
@@ -442,27 +450,11 @@ export function SessionChatScreen() {
   // Load the Mac's model catalog (cache-then-network) for the picker.
   useEffect(() => { api.listModels().then((g) => { setModels(g); cacheSet('models', g); }).catch(() => {}); }, []);
 
-  const load = useCallback(() => {
-    if (!sessionId) { setLoading(false); return; }
-    api.listJobs(projectId, sessionId)
-      .then((js) => {
-        const sorted = js.slice().sort((a, b) => a.createdAt - b.createdAt);
-        setTurns(sorted);
-        cacheSet(`turns.${sessionId}`, sorted);
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, [projectId, sessionId]);
+  // Top up the store on (re-)open so a chat that's been idle while another
+  // tab was in front catches up cleanly.
+  useEffect(() => { void pullSync(); }, [sessionId]);
 
-  useEffect(() => { load(); }, [load]);
-
-  // Real-time: any job/session event touching THIS session refreshes the thread.
-  useLive(['job', 'session'], (name, data) => {
-    const d = data as { sessionId?: string; id?: string } | null;
-    if (name === 'job' && sessionId && d?.sessionId === sessionId) load();
-    else if (name === 'session' && sessionId && d?.id === sessionId) load();
-  });
-
+  const loading = !bootstrapped && turns.length === 0 && !!sessionId;
   const liveTurn = turns.some((j) => j.status === 'running' || j.status === 'pending');
 
   // Auto-scroll to the newest content.
@@ -486,8 +478,10 @@ export function SessionChatScreen() {
           setSessionId(res.session.id); setTitle(res.session.title || body.slice(0, 40));
           cacheSet(`effort.${res.session.id}`, effort); cacheSet(`model.${res.session.id}`, modelKey);
         }
-        // Optimistically show the new turn; live events fill in the reply.
-        setTurns((prev) => [...prev, res.job]);
+        // The new turn (and any subsequent live updates) flow through the
+        // SyncStore via SSE; a one-shot pullSync covers the corner case where
+        // the streaming job emits BEFORE we receive the session-creation event.
+        void pullSync();
       })
       .finally(() => setSending(false));
   }, [projectId, sessionId, effort, modelKey]);

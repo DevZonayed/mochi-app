@@ -41,6 +41,9 @@ export const NOTIF_PREFS = 'maestro.mobile.notifPrefs';
 export const BIOMETRIC_GATE = 'maestro.mobile.biometricGate';
 /** This device's last-registered Expo push token. */
 export const PUSH_TOKEN = 'maestro.mobile.pushToken';
+/** Delta-sync watermark — server `at` from the last successful /api/sync pull.
+    Drives the next pull's `?since=` so the relay only returns the delta. */
+export const LAST_SYNC = 'maestro.mobile.lastSync';
 
 export function getStr(key: string): string {
   return cache.get(key) ?? '';
@@ -77,9 +80,46 @@ export function cacheSet(key: string, val: unknown): void {
   setJSON(CACHE_PREFIX + key, val);
 }
 
-/** Wipe all cached data (called on unpair). Keeps non-cache prefs intact. */
+/* ── Session "live" cache ─────────────────────────────────────────────────
+   The persistent cacheGet/cacheSet pair is great for cold-start UX but is the
+   wrong source on re-mount: AsyncStorage can hold the user's projects from a
+   previous Mac state (renamed/deleted/imported) and flash that ghost set
+   between the new mount's first paint and the live `load()` resolving. This
+   in-memory mirror is seeded by `liveSet()` whenever a fresh API response
+   lands, so subsequent screen mounts inside the same session read REAL data
+   instead of the disk's snapshot. Cleared on app cold-start and on unpair. */
+const live = new Map<string, unknown>();
+
+/** Read the most-recently-loaded value for `key` if we have one this session,
+    otherwise fall back to the persisted cache. */
+export function liveGet<T>(key: string, dflt: T): T {
+  if (live.has(key)) return live.get(key) as T;
+  return cacheGet(key, dflt);
+}
+
+/** Persist a fresh API response to both the in-memory session mirror and the
+    on-disk cache. Screens that previously called `cacheSet` should call this
+    instead so re-mounts see the new value instead of the disk snapshot. */
+export function liveSet(key: string, val: unknown): void {
+  live.set(key, val);
+  cacheSet(key, val);
+}
+
+/** Wipe all cached data (called on unpair). Keeps non-cache prefs intact.
+    Also resets the unified SyncStore + delta cursor so a fresh pairing can't
+    inherit the prior account's slice. */
 export async function clearCache(): Promise<void> {
+  live.clear();
   const keys = [...cache.keys()].filter((k) => k.startsWith(CACHE_PREFIX));
   for (const k of keys) cache.delete(k);
   try { await AsyncStorage.multiRemove(keys); } catch { /* ignore */ }
+  // Reset the delta cursor (in-memory + persisted).
+  cache.delete(LAST_SYNC);
+  try { await AsyncStorage.removeItem(LAST_SYNC); } catch { /* ignore */ }
+  // Drop the unified store (project/sessions/jobs/approvals/assets/events).
+  // Done lazily to avoid an import cycle with syncStore → storage.
+  try {
+    const mod = await import('./syncStore');
+    await mod.resetSyncStore();
+  } catch { /* syncStore not loaded yet */ }
 }

@@ -1,13 +1,13 @@
 import React, { useCallback, useState } from 'react';
-import { View, Text, Pressable, ScrollView, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, Pressable, ScrollView, ActivityIndicator, Alert, RefreshControl } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Card } from '../ui';
-import { api, type Project, type Job, type ChatSession } from '../api';
-import { useLive } from '../useLive';
-import { cacheGet, cacheSet } from '../storage';
+import { api, type Project } from '../api';
+import { pullSync, useSyncStore } from '../syncStore';
+import { SkeletonList } from '../ui/Skeleton';
 
 type ColorName = 'blue' | 'purple' | 'indigo' | 'teal' | 'orange' | 'green' | 'red';
 const COLOR_NAMES: ColorName[] = ['blue', 'purple', 'indigo', 'teal', 'orange', 'green', 'red'];
@@ -28,29 +28,24 @@ export function ProjectsScreen() {
   const insets = useSafeAreaInsets();
   const nav = useNavigation<any>();
 
-  // Seed from cache for an instant render; refresh from the relay underneath.
-  const [projects, setProjects] = useState<Project[]>(() => cacheGet('projects', []));
-  const [sessions, setSessions] = useState<ChatSession[]>(() => cacheGet('sessions', []));
-  const [jobs, setJobs] = useState<Job[]>(() => cacheGet('jobs', []));
-  const [loading, setLoading] = useState(projects.length === 0);
-  const [refreshing, setRefreshing] = useState(false);
+  // All data flows through the unified SyncStore — no per-screen cache, no
+  // per-screen refetch. The store is fed by /api/sync (delta-since-last-pull)
+  // and the live SSE/P2P stream. Re-mounts of this screen never re-seed from
+  // stale storage; the store is the source of truth.
+  const projects = useSyncStore((s) => s.projects);
+  const sessions = useSyncStore((s) => s.sessions);
+  const jobs = useSyncStore((s) => s.jobs);
+  const bootstrapped = useSyncStore((s) => s.bootstrapped);
+  const syncing = useSyncStore((s) => s.syncing);
+  const hostOnline = useSyncStore((s) => s.hostOnline);
   const [filter, setFilter] = useState<string>('all'); // 'all' or a kind key
 
   const colorFor = (c: string): string => (COLOR_NAMES.includes(c as ColorName) ? theme.color[c as ColorName] : theme.color.blue);
 
-  const load = useCallback(() => {
-    setRefreshing(true);
-    Promise.all([api.listProjects(), api.listSessions(), api.listJobs()])
-      .then(([ps, ss, js]) => {
-        setProjects(ps); setSessions(ss); setJobs(js);
-        cacheSet('projects', ps); cacheSet('sessions', ss); cacheSet('jobs', js);
-      })
-      .catch(() => {})
-      .finally(() => { setLoading(false); setRefreshing(false); });
-  }, []);
-
-  useFocusEffect(useCallback(() => { load(); }, [load]));
-  useLive(['session', 'job'], load);
+  // Refetch on focus (catches anything missed while another tab was driving),
+  // and pull-to-refresh on the ScrollView.
+  useFocusEffect(useCallback(() => { void pullSync(); }, []));
+  const onRefresh = useCallback(() => { void pullSync(); }, []);
 
   const sessionCount = (pid: string) => sessions.filter((s) => s.projectId === pid && !s.archived).length;
   const runningCount = (pid: string) => jobs.filter((j) => j.projectId === pid && (j.status === 'running' || j.status === 'pending')).length;
@@ -61,7 +56,13 @@ export function ProjectsScreen() {
       'This removes the project and its chats from your Mac. This cannot be undone.',
       [
         { text: 'Cancel', style: 'cancel' },
-        { text: 'Delete', style: 'destructive', onPress: () => { setProjects((cur) => cur.filter((x) => x.id !== p.id)); api.deleteProject(p.id).then(load).catch(() => load()); } },
+        {
+          text: 'Delete', style: 'destructive', onPress: () => {
+            // The Mac will record a tombstone → the next /api/sync (kicked
+            // immediately below) removes the row from the store.
+            api.deleteProject(p.id).finally(() => { void pullSync(); });
+          },
+        },
       ],
     );
   };
@@ -104,25 +105,33 @@ export function ProjectsScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
-      <ScrollView contentContainerStyle={{ paddingTop: insets.top + 6, paddingBottom: 24 }} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={{ paddingTop: insets.top + 6, paddingBottom: 24 }}
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={syncing} onRefresh={onRefresh} tintColor={theme.color.inkTertiary} />}
+      >
         <View style={{ paddingHorizontal: 20, paddingBottom: 12, flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' }}>
           <View style={{ flex: 1 }}>
             <Text style={{ fontSize: 34, fontWeight: '700', letterSpacing: -0.7, color: theme.color.ink }}>Projects</Text>
             <Text style={{ fontSize: 14, color: theme.color.inkSecondary, marginTop: 3 }}>Your codespace, grouped by type.</Text>
           </View>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14 }}>
-            {refreshing && projects.length > 0 ? <ActivityIndicator size="small" color={theme.color.inkTertiary} /> : null}
+            {syncing && projects.length > 0 ? <ActivityIndicator size="small" color={theme.color.inkTertiary} /> : null}
             <Pressable onPress={() => nav.navigate('CreateProject')} hitSlop={8} style={{ width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.blue }}>
               <Icon name="plus" size={20} color="#fff" stroke={2.4} />
             </Pressable>
           </View>
         </View>
 
-        {loading && projects.length === 0 ? (
-          <View style={{ alignItems: 'center', paddingVertical: 80, gap: 14 }}>
-            <ActivityIndicator color={theme.color.blue} />
-            <Text style={{ fontSize: 14, color: theme.color.inkTertiary }}>Loading your projects…</Text>
+        {bootstrapped && !hostOnline ? (
+          <View style={{ marginHorizontal: 16, marginBottom: 12, padding: 12, borderRadius: 12, backgroundColor: theme.color.orange + '14', borderWidth: 0.5, borderColor: theme.color.orange + '40', flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            <Icon name="x" size={14} color={theme.color.orange} stroke={2.4} />
+            <Text style={{ flex: 1, fontSize: 13, color: theme.color.ink }}>Your Mac is offline — showing the last known state.</Text>
           </View>
+        ) : null}
+
+        {!bootstrapped && projects.length === 0 ? (
+          <SkeletonList count={5} />
         ) : projects.length === 0 ? (
           <View style={{ alignItems: 'center', paddingVertical: 70, paddingHorizontal: 36 }}>
             <View style={{ width: 64, height: 64, borderRadius: 20, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>

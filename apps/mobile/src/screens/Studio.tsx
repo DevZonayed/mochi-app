@@ -1,11 +1,11 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, Animated, Easing, StyleSheet, Image } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Card, Mono } from '../ui';
 import { api, type Asset } from '../api';
-import { useLive } from '../useLive';
+import { pullSync, useSyncStore } from '../syncStore';
 
 type TabKey = 'drafts' | 'rendering' | 'published';
 const TABS: [TabKey, string][] = [
@@ -76,11 +76,14 @@ export function StudioScreen() {
   const insets = useSafeAreaInsets();
   const [tab, setTab] = useState<TabKey>('drafts');
   const [trackW, setTrackW] = useState(0);
-  const [assets, setAssets] = useState<Asset[]>([]);
+  // Assets come from the SyncStore — live SSE 'asset' events upsert into it.
+  const assets = useSyncStore((s) => s.assets);
 
-  const reload = useCallback(() => { api.listAssets().then(setAssets).catch(() => {}); }, []);
-  useEffect(() => api.poll(reload, 12000), [reload]); // backstop; SSE drives updates
-  useLive(['asset'], reload);
+  // A slow poll kicks the SyncStore as a backstop when SSE is unreliable.
+  useEffect(() => api.poll(() => { void pullSync(); }, 12000), []);
+
+  // Approving / cancelling triggers a quick pullSync to flush the new status.
+  const refreshAsset = () => { void pullSync(); };
 
   const ti = TABS.findIndex((t) => t[0] === tab);
   const slide = useRef(new Animated.Value(ti)).current;
@@ -135,7 +138,7 @@ export function StudioScreen() {
             <View style={{ flexDirection: 'row', gap: 10, paddingHorizontal: 16, paddingBottom: 24 }}>
               {[colA, colB].map((col, ci) => (
                 <View key={ci} style={{ flex: 1 }}>
-                  {col.map((a) => <DraftCard key={a.id} a={a} width={colWidth > 0 ? colWidth : 0} onApprove={() => { void api.approveAsset(a.id).then(() => api.listAssets().then(setAssets)).catch(() => {}); }} />)}
+                  {col.map((a) => <DraftCard key={a.id} a={a} width={colWidth > 0 ? colWidth : 0} onApprove={() => { void api.approveAsset(a.id).then(() => Promise.resolve(refreshAsset())).catch(() => {}); }} />)}
                 </View>
               ))}
             </View>
@@ -154,7 +157,7 @@ export function StudioScreen() {
                     <Text numberOfLines={1} style={{ fontSize: 15, fontWeight: '600', color: theme.color.ink }}>{a.prompt || a.kind}</Text>
                     <Text style={{ fontSize: 13, color: theme.color.inkTertiary, marginTop: 4 }}>{a.model} · <Mono style={{ fontSize: 13 }}>${a.cost.toFixed(3)}</Mono></Text>
                   </View>
-                  <Pressable onPress={() => { void api.cancelAsset(a.id).then(() => api.listAssets().then(setAssets)).catch(() => {}); }} hitSlop={8}>
+                  <Pressable onPress={() => { void api.cancelAsset(a.id).then(() => Promise.resolve(refreshAsset())).catch(() => {}); }} hitSlop={8}>
                     <Text style={{ fontSize: 14, fontWeight: '600', color: theme.color.red }}>Cancel</Text>
                   </Pressable>
                 </Card>
