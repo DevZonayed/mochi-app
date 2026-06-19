@@ -78,22 +78,31 @@ export interface TranscriptItem {
 }
 
 /** An image attached to a user message (pasted, dropped, or picked) — vision
-    input for the agent. Stored as an Asset; the bytes stay on the Mac (imagePath
-    is stripped from the relay snapshot). */
-export interface ChatImage { assetId: string; imagePath: string; mime: string; name?: string; width?: number; height?: number }
+    input for the agent. Saved on disk under `<projectCwd>/.continuum/Attachment/`
+    and registered as an Asset; the absolute path is stripped from the relay
+    snapshot (the phone sees only the basename). The `id` is the composer's chip
+    id and matches the `«attach:id»` placeholder substituted into the prompt text
+    AT the chip position. */
+export interface ChatImage { id?: string; assetId: string; imagePath: string; mime: string; name?: string; width?: number; height?: number }
 
-/** A non-image file attached to a user message. 'text' (pasted text or a code/
-    text file) carries its content inline (the engine inlines it; content is
-    stripped from the relay snapshot). 'file' (any binary, e.g. a PDF) is saved on
-    the Mac and the engine references its path (also stripped from the relay). */
+/** A non-image file attached to a user message. Every kind ('text' for pasted
+    text / code, 'file' for any binary) is saved on disk under
+    `<projectCwd>/.continuum/Attachment/` and referenced inline as `@<absPath>`
+    at the chip position — the agent reads the file with its own tools (so a
+    50k-char paste doesn't re-blast the prompt every turn). The `path` (Mac-
+    local) and `content` (legacy) are stripped from the relay snapshot. */
 export interface ChatFile {
+  /** Composer chip id — matches the `«attach:id»` placeholder before substitution. */
+  id?: string;
   name: string;
   kind: 'text' | 'file';
   mime?: string;
   bytes?: number;
-  /** text only: the file's content, inlined into the prompt. Stripped from the relay. */
+  /** Legacy: text content inlined into the prompt. Stripped from the relay. New
+      writes save the text to disk and leave this undefined; kept on the type for
+      back-compat with old persisted jobs. */
   content?: string;
-  /** file only: Mac-local saved path. Stripped from the relay. */
+  /** Mac-local saved path (under `.continuum/Attachment/`). Stripped from the relay. */
   path?: string;
   /** short display preview (first chars / filename). */
   preview?: string;
@@ -1129,16 +1138,23 @@ export class Store {
   /** Relay-safe projection of a Job: truncate long output, trim the run log, and
       strip every Mac-local image path (attached inputImages AND transcript image
       items) so the phone never learns a filesystem path. Used by BOTH the snapshot
-      and the live 'job' event / command results, so no channel can leak it. */
+      and the live 'job' event / command results, so no channel can leak it.
+      Also rewrites `@<absPath>` inline-attachment markers inside the user's
+      prompt + every transcript text block to `@.continuum/Attachment/<basename>`
+      so the phone gets the chip's POSITION + name without the operator's home
+      directory. */
   slimJobForRelay(j: Job): Job {
-    const out = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
+    const scrub = (s: string): string => s.replace(/@(\/[^\s]+\/\.continuum\/Attachment\/([A-Za-z0-9._-]+))/g, (_m, _full: string, base: string) => `@.continuum/Attachment/${base}`);
+    const rawOut = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
+    const out = rawOut ? scrub(rawOut) : rawOut;
     const tr = j.transcript;
     const slimItem = (t: TranscriptItem): TranscriptItem => {
       if (t.kind === 'image') { const { imagePath: _omit, ...rest } = t; return rest; }
-      return t.text.length > 4000 ? { ...t, text: t.text.slice(0, 4000) + '…' } : t;
+      const text = scrub(t.text.length > 4000 ? t.text.slice(0, 4000) + '…' : t.text);
+      return text === t.text ? t : { ...t, text };
     };
     const transcript = !tr ? undefined
-      : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image')) ? tr
+      : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image' || t.text.includes('@/'))) ? tr
       : tr.slice(-60).map(slimItem);
     const needsImgStrip = j.inputImages?.some(im => im.imagePath !== undefined);
     const inputImages = needsImgStrip ? j.inputImages!.map(({ imagePath: _omit, ...rest }) => rest as ChatImage) : j.inputImages;
@@ -1146,8 +1162,10 @@ export class Store {
     // phone keeps only name/kind/mime/bytes/preview.
     const needsFileStrip = j.inputFiles?.some(f => f.content !== undefined || f.path !== undefined);
     const inputFiles = needsFileStrip ? j.inputFiles!.map(({ content: _c, path: _p, ...rest }) => rest as ChatFile) : j.inputFiles;
-    if (out === j.output && transcript === tr && inputImages === j.inputImages && inputFiles === j.inputFiles) return j;
-    return { ...j, output: out, transcript, ...(inputImages !== j.inputImages ? { inputImages } : {}), ...(inputFiles !== j.inputFiles ? { inputFiles } : {}) };
+    const inputScrubbed = scrub(j.input);
+    const input = inputScrubbed === j.input ? j.input : inputScrubbed;
+    if (out === j.output && transcript === tr && inputImages === j.inputImages && inputFiles === j.inputFiles && input === j.input) return j;
+    return { ...j, input, output: out, transcript, ...(inputImages !== j.inputImages ? { inputImages } : {}), ...(inputFiles !== j.inputFiles ? { inputFiles } : {}) };
   }
   createAsset(args: Partial<Asset> & { source: Asset['source']; kind: AssetKind; status: AssetStatus }): Asset {
     const t = now();

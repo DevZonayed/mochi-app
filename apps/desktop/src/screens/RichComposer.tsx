@@ -17,8 +17,11 @@ export type ComposerChip =
   | { kind: 'mention'; id: string; label: string; icon: IconName }
   | { kind: 'file'; name: string; path: string; isDir: boolean }
   // An inline capsule for a composer attachment (pasted image, pasted text, picked
-  // file). Carries the parent's attachment `id`; the bytes/content ride along in the
-  // send payload, so the chip serializes to "" (no on-disk path to inline).
+  // file). Carries the parent's attachment `id`; the bytes/content ride along in
+  // the send payload. Serializes to `«attach:<id>»` so the chip's POSITION is
+  // preserved in the prompt text — the backend then substitutes each placeholder
+  // for `@<absPath>` after saving the bytes under `.continuum/Attachment/`, so
+  // the agent sees an inline file reference exactly where the user dropped it.
   | { kind: 'attach'; id: string; name: string; label?: string };
 
 export interface RichComposerHandle {
@@ -96,7 +99,7 @@ export const RichComposer = React.forwardRef<RichComposerHandle, Props>(function
     span.setAttribute('style', `display:inline-flex;align-items:center;gap:4px;vertical-align:baseline;margin:0 1px;padding:1px 3px 1px 7px;border-radius:6px;font:600 12px/1.45 var(--font-text);background:color-mix(in srgb, ${accent} 14%, transparent);border:1px solid color-mix(in srgb, ${accent} 38%, transparent);color:${accent};user-select:none;white-space:nowrap;max-width:240px;`);
     let icon: string, label: string;
     if (chip.kind === 'mention') { icon = SVG[chip.icon] ?? ''; label = chip.label; span.dataset.id = chip.id; span.dataset.text = ''; }
-    else if (chip.kind === 'attach') { icon = fileIconHtml(chip.name, 15); label = chip.label ?? chip.name; span.dataset.attachId = chip.id; span.dataset.text = ''; }
+    else if (chip.kind === 'attach') { icon = fileIconHtml(chip.name, 15); label = chip.label ?? chip.name; span.dataset.attachId = chip.id; span.dataset.text = `«attach:${chip.id}»`; }
     else { icon = chip.isDir ? SVG.folder : fileIconHtml(chip.name, 15); label = chip.name; span.dataset.name = chip.name; span.dataset.path = chip.path; span.dataset.dir = chip.isDir ? '1' : '0'; span.dataset.text = '`' + chip.path + '`'; }
     span.innerHTML = `${icon}<span style="overflow:hidden;text-overflow:ellipsis;">${esc(label)}</span><button type="button" tabindex="-1" data-rm="1" aria-label="Remove" style="display:inline-flex;align-items:center;border:none;background:transparent;color:inherit;cursor:pointer;padding:0 1px;opacity:.6;">${SVG.x}</button>`;
     return span;
