@@ -111,6 +111,8 @@ Durable identity lives in Postgres. Ephemeral/large state does **not** (see Redi
     subscribed remotes deliver to them.
   - `result:cmd:<cmdId>` — a host's reply to a command; the instance holding the requesting
     remote awaits it and resolves the open request.
+  - `signal:device:<deviceId>` — WebRTC signaling (offer/answer/ICE) targeted at one
+    device; the instance holding that device's WS delivers it.
 - **Rate limiting** — per-account/IP login + command throttles.
 
 ## Server (Fastify, stateless, N instances)
@@ -159,6 +161,35 @@ makes "100 other desktops never conflict" true by construction.
 **Scale.** Instances are stateless; all cross-instance state is in Redis (presence, pub/sub,
 snapshot) and Postgres (identity). A device's WS lives on exactly one instance; everything
 else routes by deviceId through Redis.
+
+## WebRTC (P2P) — must work end to end
+
+The phone and its **active host** can open a direct **WebRTC DataChannel** for low-latency
+host→remote events; the server stays the **signaling channel** and the **relay fallback**.
+This keeps working under the account model — signaling is just another account-scoped,
+device-targeted routed message.
+
+- **Signaling routing.** Offer/answer/ICE flow remote ↔ active host through the server,
+  device-targeted: a remote sends a signal aimed at its active `hostDeviceId`; the host
+  sends signals aimed at the originating `remoteDeviceId`. The server **asserts both devices
+  belong to the caller's account**, then routes via `signal:device:<targetId>` (Redis pub/sub)
+  to whichever instance holds the target's WS. No signal ever crosses an account boundary.
+- **ICE / TURN.** `GET /api/turn-credentials` becomes **session-authed** and returns STUN +
+  time-limited TURN credentials (coturn) so NAT traversal works on restrictive networks; with
+  no TURN configured, clients fall back to public STUN.
+- **Lifecycle.** A remote attempts P2P **after** it selects an active host. On success,
+  host→remote events arrive over the DataChannel and the duplicate relay events are
+  suppressed; **commands stay on the authed REST/relay path** (unchanged). If P2P fails or ICE
+  can't connect, it transparently **falls back to the relay** — the server path always works.
+- **Host switching.** Switching the active host (or logout / host going offline) **tears down**
+  the current peer connection and renegotiates with the new host. Exactly one active P2P link
+  per remote at a time.
+- **Isolation.** Because signaling is account-scoped and device-targeted, a remote can only
+  negotiate a peer with a host **in its own account** — P2P inherits the same isolation as
+  everything else.
+- **Reuse.** This generalizes the existing desktop↔mobile WebRTC path (`p2p/peer.ts`,
+  `p2p/link.ts`, `p2p/transport.ts`, the `/api/signal` + signal-over-SSE plumbing); only the
+  addressing changes from pairing-token/`did` to session + `hostDeviceId`/`remoteDeviceId`.
 
 ## Desktop (host) changes
 
@@ -213,7 +244,8 @@ else routes by deviceId through Redis.
 | `db.ts` | Postgres pool + migrations | Postgres |
 | `redis.ts` | Redis client + presence/pubsub/snapshot helpers | Redis |
 | `devices.ts` | Device registry: upsert, list-by-account, presence, rename/remove | db, redis |
-| `routing.ts` | Cross-instance command/event bridge (Redis pub/sub + pending map) | redis |
+| `routing.ts` | Cross-instance command/event/**signal** bridge (Redis pub/sub + pending map) | redis |
+| `webrtc.ts` | Session-authed TURN/STUN creds + signaling fan-out helpers | auth, routing |
 | `wsHost.ts` | Host WS endpoint (register, snapshot/event ingest) | auth, devices, redis |
 | `wsRemote.ts` | Remote WS/SSE endpoint (subscribe to active host, fan-out) | auth, redis |
 | routes | Account-scoped REST (`/api/devices`, `/api/sync`, command forwards) | auth, devices, routing |
@@ -227,9 +259,10 @@ does).
 - **Server (Vitest):** sign-up/in/out + session validation; device upsert + list scoped by
   account; presence online/offline (TTL); command routing + result correlation; **cross-account
   isolation** (account A cannot see or target account B's host → 404); command timeout →
-  fast error (no hang). Use a disposable Postgres (testcontainers or a temp DB) and Redis
-  (real or `ioredis-mock`). Cross-instance routing tested with two in-process server instances
-  sharing one Redis.
+  fast error (no hang); **WebRTC signaling** routes remote↔active-host and a cross-account
+  signal is rejected; TURN-creds endpoint is session-gated. Use a disposable Postgres
+  (testcontainers or a temp DB) and Redis (real or `ioredis-mock`). Cross-instance routing
+  (commands + events + signals) tested with two in-process server instances sharing one Redis.
 - **Desktop / mobile:** typecheck; pure-function unit tests for the device-switcher selection
   and active-host scoping; auth-client wiring smoke test.
 
@@ -243,3 +276,6 @@ does).
 5. A dead/half-open host never hangs a command — bounded timeout, fast error.
 6. Server runs as ≥2 stateless instances behind the proxy with no behavior change (Redis
    coordinates).
+7. **WebRTC works:** the phone and its active host establish a direct DataChannel
+   (low-latency events), fall back to the relay when P2P can't connect, and tear
+   down/renegotiate on host switch — all account-scoped (no cross-account signaling).
