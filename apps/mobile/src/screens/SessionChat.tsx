@@ -546,8 +546,39 @@ export function SessionChatScreen() {
   const loading = !settled && turns.length === 0 && !!sessionId;
   const liveTurn = turns.some((j) => j.status === 'running' || j.status === 'pending');
 
-  // Auto-scroll to the newest content.
-  useEffect(() => { const t = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60); return () => clearTimeout(t); }, [turns]);
+  /* User-intent scroll tracking. The previous implementation snapped back to
+     the bottom every time `turns` updated — which fires constantly during a
+     stream, so swiping up to read older content immediately got yanked back
+     down. Now: track whether the user is near the bottom (within
+     NEAR_BOTTOM_PX of the last frame) and ONLY auto-scroll when they are.
+     When new content arrives off-bottom, surface a tappable "↓ New messages"
+     pill that jumps to the bottom AND re-enables auto-follow. */
+  const NEAR_BOTTOM_PX = 80;
+  const atBottomRef = useRef(true);
+  const [pendingNew, setPendingNew] = useState(false);
+  const jumpToBottom = useCallback(() => {
+    scrollRef.current?.scrollToEnd({ animated: true });
+    atBottomRef.current = true;
+    setPendingNew(false);
+  }, []);
+  const onScroll = useCallback((e: import('react-native').NativeSyntheticEvent<import('react-native').NativeScrollEvent>) => {
+    const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
+    const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
+    const now = distanceFromBottom <= NEAR_BOTTOM_PX;
+    if (now !== atBottomRef.current) atBottomRef.current = now;
+    if (now && pendingNew) setPendingNew(false);
+  }, [pendingNew]);
+  // Auto-scroll to the newest content — ONLY when the user is already near the
+  // bottom. Otherwise leave their position alone and flag pendingNew so the
+  // floating "↓ New messages" pill renders.
+  useEffect(() => {
+    if (atBottomRef.current) {
+      const t = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60);
+      return () => clearTimeout(t);
+    }
+    setPendingNew(true);
+    return undefined;
+  }, [turns]);
 
   // Core send — used by the composer AND by answering a question's option.
   // `chips` is captured at call time so the optimistic clear of `attachments`
@@ -720,20 +751,56 @@ export function SessionChatScreen() {
       {loading ? (
         <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}><ActivityIndicator color={theme.color.blue} /></View>
       ) : (
-        <ScrollView ref={scrollRef} contentContainerStyle={{ padding: 16, paddingBottom: 24 }} showsVerticalScrollIndicator={false}>
-          {turns.length === 0 ? (
-            <View style={{ alignItems: 'center', paddingVertical: 70, paddingHorizontal: 30, gap: 12 }}>
-              <View style={{ width: 60, height: 60, borderRadius: 18, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}>
-                <Icon name="chat" size={28} color={theme.color.inkTertiary} />
+        <View style={{ flex: 1 }}>
+          <ScrollView
+            ref={scrollRef}
+            contentContainerStyle={{ padding: 16, paddingBottom: 24 }}
+            showsVerticalScrollIndicator={false}
+            onScroll={onScroll}
+            scrollEventThrottle={16}
+          >
+            {turns.length === 0 ? (
+              <View style={{ alignItems: 'center', paddingVertical: 70, paddingHorizontal: 30, gap: 12 }}>
+                <View style={{ width: 60, height: 60, borderRadius: 18, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}>
+                  <Icon name="chat" size={28} color={theme.color.inkTertiary} />
+                </View>
+                <Text style={{ fontSize: 15, lineHeight: 21, color: theme.color.inkSecondary, textAlign: 'center' }}>
+                  Send a message to start. It runs on your Mac in this project, and the reply streams back here live.
+                </Text>
               </View>
-              <Text style={{ fontSize: 15, lineHeight: 21, color: theme.color.inkSecondary, textAlign: 'center' }}>
-                Send a message to start. It runs on your Mac in this project, and the reply streams back here live.
-              </Text>
-            </View>
-          ) : (
-            turns.map((j, i) => <Turn key={j.id} job={j} onAnswer={answer} answered={i < turns.length - 1} />)
-          )}
-        </ScrollView>
+            ) : (
+              turns.map((j, i) => <Turn key={j.id} job={j} onAnswer={answer} answered={i < turns.length - 1} />)
+            )}
+          </ScrollView>
+          {pendingNew ? (
+            <Pressable
+              onPress={jumpToBottom}
+              accessibilityRole="button"
+              accessibilityLabel="Jump to latest message"
+              style={({ pressed }) => ({
+                position: 'absolute',
+                bottom: 16,
+                alignSelf: 'center',
+                flexDirection: 'row',
+                alignItems: 'center',
+                gap: 6,
+                paddingHorizontal: 14,
+                paddingVertical: 8,
+                borderRadius: 999,
+                backgroundColor: theme.color.blue,
+                shadowColor: '#000',
+                shadowOpacity: 0.18,
+                shadowRadius: 8,
+                shadowOffset: { width: 0, height: 4 },
+                elevation: 4,
+                opacity: pressed ? 0.85 : 1,
+              })}
+            >
+              <Icon name="chevronDown" size={15} color="#fff" stroke={2.6} />
+              <Text style={{ fontSize: 13, fontWeight: '600', color: '#fff' }}>New messages</Text>
+            </Pressable>
+          ) : null}
+        </View>
       )}
 
       {/* composer */}
