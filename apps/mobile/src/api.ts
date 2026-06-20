@@ -225,28 +225,61 @@ function recordOutbox(desc: string, state: OutboxState, why?: string): void {
    Direct /api/* calls that are NOT host commands: device listing, the per-host
    snapshot sync, TURN credentials, WebRTC signaling, and the auth probe. Sends
    the account session as Bearer + this phone's device id. */
+
+/** Hard ceiling for any account/cmd request. Without this, a stalled fetch
+ *  (captive portal, dead connection that never resets, CDN hang) holds the
+ *  pullSync inflight promise forever — every subsequent pullSync() reuses it,
+ *  `settled` stays false, and screens like ProjectSessions render their skeleton
+ *  infinitely with no way for the user to recover except killing the app.
+ *  20s is "patient on slow cellular, prompt when truly dead." */
+const ACCOUNT_REQ_TIMEOUT_MS = 20_000;
+
 async function accountReq<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getSessionToken();
   const hasBody = init?.body != null;
-  const res = await fetch(API_BASE + path, {
-    ...init,
-    headers: {
-      ...(hasBody ? { 'content-type': 'application/json' } : {}),
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-      'x-maestro-device': DEVICE_NAME,
-      'x-maestro-device-id': getDeviceId(),
-      ...(init?.headers ?? {}),
-    },
-  });
-  if (!res.ok) {
-    let detail = res.statusText;
-    try { const b = (await res.json()) as { error?: string; message?: string }; detail = b?.error || b?.message || detail; }
-    catch { /* non-JSON */ }
-    if (res.status === 401 && authRedirectEnabled) handleUnauthorized();
-    throw new ApiError(res.status, detail);
+  // Per-request timeout via AbortController. Combine with any caller-supplied
+  // signal so cancellation from the call site still works.
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ACCOUNT_REQ_TIMEOUT_MS);
+  const callerSignal = init?.signal;
+  if (callerSignal) {
+    if (callerSignal.aborted) ac.abort();
+    else callerSignal.addEventListener('abort', () => ac.abort(), { once: true });
   }
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
+  try {
+    const res = await fetch(API_BASE + path, {
+      ...init,
+      signal: ac.signal,
+      headers: {
+        ...(hasBody ? { 'content-type': 'application/json' } : {}),
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        'x-maestro-device': DEVICE_NAME,
+        'x-maestro-device-id': getDeviceId(),
+        ...(init?.headers ?? {}),
+      },
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { const b = (await res.json()) as { error?: string; message?: string }; detail = b?.error || b?.message || detail; }
+      catch { /* non-JSON */ }
+      if (res.status === 401 && authRedirectEnabled) handleUnauthorized();
+      throw new ApiError(res.status, detail);
+    }
+    if (res.status === 204) return undefined as T;
+    return (await res.json()) as T;
+  } catch (e) {
+    // Normalize an aborted fetch (our timeout OR caller cancellation) into a
+    // status=0 ApiError so classifySyncError treats it as `network` — the
+    // SyncErrorBanner shows "Couldn't reach the server" with a Retry CTA
+    // instead of leaving the user stuck on the skeleton.
+    if (e instanceof Error && (e.name === 'AbortError' || e.name === 'TimeoutError')) {
+      const reason = callerSignal?.aborted ? 'Request cancelled' : 'Request timed out';
+      throw new ApiError(0, reason);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** No active host selected yet — surfaced like a 503 so screens fall through to
