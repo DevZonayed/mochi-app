@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mochi.app/schemas/project-settings.schema.json",
+  "title": "Mochi project worktree-isolation settings",
+  "description": "Per-project settings that control how Mochi isolates parallel sessions. Each session runs in its own git worktree on its own branch (~/Maestro/worktrees/<projectId>/<sessionId>). These fields are stored on the Project record and editable via the updateProject RPC. The committed, teammate-shared counterpart to `copyGlobs` is a `.worktreeinclude` file at the repo root, which takes precedence when present.",
+  "type": "object",
+  "properties": {
+    "defaultBaseBranch": {
+      "type": "string",
+      "description": "Branch new session worktrees are created from (e.g. 'main', 'origin/master'). When unset, Mochi auto-detects it from origin/HEAD.",
+      "examples": ["main", "origin/master"]
+    },
+    "setupScript": {
+      "type": "string",
+      "description": "Shell command run once (login shell, in the worktree) right after a new session worktree is created — install deps, generate files, init per-workspace resources. Receives the MOCHI_* env (see x-mochi-env).",
+      "examples": ["pnpm install", "pnpm install && pnpm db:setup"]
+    },
+    "copyGlobs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Gitignored files copied into each new session worktree so an isolated session can actually run (env files, local config, certs). Glob's last path segment may contain '*'. A committed `.worktreeinclude` at the repo root overrides this. Defaults to ['.env*'] when neither is set.",
+      "examples": [[".env*", "config/*.local.json", "certs/*.pem"]]
+    },
+    "runMode": {
+      "type": "string",
+      "enum": ["concurrent", "nonconcurrent"],
+      "default": "concurrent",
+      "description": "Whether sessions of this project may run their dev server / background tasks at the same time. 'concurrent' → every session gets its own isolated MOCHI_PORT block and may run in parallel. 'nonconcurrent' → the project depends on one fixed port / local DB / Docker stack, so only one session may have a live background run at a time; a second is refused with a clear message until the first stops."
+    }
+  },
+  "additionalProperties": true,
+  "x-mochi-env": {
+    "description": "Environment variables injected into each session's background processes and setup script — the per-session isolation contract, analogous to Conductor's CONDUCTOR_* set.",
+    "MOCHI_PORT": "First port of this session's isolated 10-port block (e.g. 41000). Use $MOCHI_PORT in `npm run dev` so parallel sessions don't collide.",
+    "MOCHI_PORT_RANGE": "The session's full block, e.g. '41000-41009'. Companion services can use $MOCHI_PORT+1 … +9.",
+    "MOCHI_WORKSPACE_PATH": "Absolute path to this session's worktree.",
+    "MOCHI_PROJECT_ID": "Project id.",
+    "MOCHI_SESSION_ID": "Session id.",
+    "MOCHI_DEFAULT_BRANCH": "The project's default/base branch.",
+    "MOCHI_IS_LOCAL": "'1' on the user's Mac, '0' in a cloud workspace."
+  }
+}

@@ -1,0 +1,13 @@
+# .worktreeinclude — committed, teammate-shared list of gitignored files that
+# Mochi copies into every new session worktree, so an isolated session can run.
+#
+# Rename this file to `.worktreeinclude` (drop `.example`) and commit it. When
+# present it OVERRIDES the per-machine `copyGlobs` project setting. If absent,
+# Mochi falls back to that setting, and finally to the default `.env*`.
+#
+# Format: one glob per line. The last path segment may contain `*`.
+# Blank lines and `#` comments are ignored.
+
+.env*
+config/*.local.json
+certs/*.pem

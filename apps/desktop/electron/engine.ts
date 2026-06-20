@@ -23,6 +23,8 @@ import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { branchSlug, isGitRepo } from './git.js';
 import { pickCityCodename } from './codenames.js';
 import { ensureSessionWorktree, worktreeRootDir } from './session-worktree.js';
+import { allocatePortBase, sessionPortEnv } from './session-ports.js';
+import { normalizeRunMode, canStartBackgroundRun } from './run-mode.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
@@ -623,6 +625,10 @@ async function runClaude(
                 cwd: z.string().optional().describe('Working directory (absolute, or relative to the project). Defaults to the project root.') },
               wrap(async (a: { command: string; cwd?: string }) => {
                 const r = bgCtx.start(a.command, a.cwd);
+                if (r.status === 'failed') {
+                  const o = bgCtx.output(r.id);
+                  return txt(o?.output || `Could not start background task ${r.id}.`);
+                }
                 return txt(`Started background task ${r.id} (pid ${r.pid ?? '?'}) in ${r.cwd}: \`${a.command}\`. It keeps running after this turn. Use background_output("${r.id}") in a moment to read its logs / confirm it started, and stop_background("${r.id}") to stop it.`);
               })),
             tool('background_output',
@@ -1352,7 +1358,32 @@ export class LocalEngine {
      app-exit survival. */
   private bg = new Map<string, { rec: BgTaskRecord; child: ChildProcess | null; buf: string }>();
 
+  /** Stable port-block base per session (lives for the app's lifetime so a session
+      keeps its MOCHI_PORT across restarts of its dev server). */
+  private sessionPortBase = new Map<string, number>();
+
   private emitBg(rec: BgTaskRecord) { try { this.emit('bg', rec); } catch { /* window gone */ } }
+
+  /** This session's isolated port block (allocated once, probed clear of other live
+      sessions). Null for session-less tasks. */
+  portBaseFor(projectId: string | null, sessionId: string | null): number | null {
+    if (!sessionId) return null;
+    const existing = this.sessionPortBase.get(sessionId);
+    if (existing != null) return existing;
+    const base = allocatePortBase(projectId ?? '', sessionId, new Set(this.sessionPortBase.values()));
+    this.sessionPortBase.set(sessionId, base);
+    return base;
+  }
+
+  /** The MOCHI_* env a session's processes / setup script receive, or {} if no session. */
+  private sessionEnvFor(projectId: string | null, sessionId: string | null, cwd: string): Record<string, string> {
+    const portBase = this.portBaseFor(projectId, sessionId);
+    if (portBase == null) return {};
+    return sessionPortEnv({
+      portBase, workspacePath: cwd, projectId, sessionId,
+      defaultBranch: (projectId ? this.store.getProject(projectId)?.defaultBaseBranch : null) ?? null,
+    });
+  }
 
   /** Start a command as a tracked background process. Returns its record immediately. */
   bgStart(opts: { projectId: string | null; sessionId?: string | null; command: string; cwd: string }): BgTaskRecord {
@@ -1362,6 +1393,23 @@ export class LocalEngine {
       command: opts.command, cwd: opts.cwd, status: 'running',
       pid: null, exitCode: null, startedAt: Date.now(), endedAt: null, bytes: 0,
     };
+    // Run-mode guard: a 'nonconcurrent' project (one shared port/DB/Docker stack)
+    // allows only ONE session's background run at a time. Refuse cleanly instead of
+    // letting a second session collide on the shared resource.
+    const mode = normalizeRunMode(opts.projectId ? this.store.getProject(opts.projectId)?.runMode : undefined);
+    if (mode === 'nonconcurrent') {
+      const activeOther = [...this.bg.values()]
+        .filter(h => h.rec.status === 'running' && h.rec.projectId === opts.projectId && h.rec.sessionId)
+        .map(h => h.rec.sessionId as string);
+      const decision = canStartBackgroundRun({ mode, sessionId: opts.sessionId ?? null, activeSessionIds: activeOther });
+      if (!decision.allowed) {
+        rec.status = 'failed'; rec.endedAt = Date.now();
+        const msg = `Blocked: this project's run mode is "nonconcurrent" — another session (${decision.blockedBy}) already has a background process running. Stop it first, or switch the project to "concurrent" in project settings.`;
+        this.bg.set(id, { rec, child: null, buf: msg });
+        this.emitBg(rec);
+        return rec;
+      }
+    }
     let child: ChildProcess;
     try {
       // Run through the LOGIN shell (`/bin/zsh -lc`, the app's standard for shell ops in
@@ -1369,7 +1417,10 @@ export class LocalEngine {
       // GUI-launched Mac app otherwise has a minimal PATH and `npm run dev` would not be
       // found. detached:true → own process group so stop_background kills the WHOLE tree
       // (the dev server's children too), not just the shell.
-      child = spawn('/bin/zsh', ['-lc', opts.command], { cwd: opts.cwd, detached: true, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+      // Inject this session's isolated MOCHI_PORT block so two sessions' dev servers
+      // don't fight over the same port (the project can read $MOCHI_PORT in `npm run dev`).
+      const sessionEnv = this.sessionEnvFor(opts.projectId, opts.sessionId ?? null, opts.cwd);
+      child = spawn('/bin/zsh', ['-lc', opts.command], { cwd: opts.cwd, detached: true, env: { ...process.env, ...sessionEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (e) {
       rec.status = 'failed'; rec.endedAt = Date.now();
       this.bg.set(id, { rec, child: null, buf: e instanceof Error ? e.message : String(e) });
@@ -1818,6 +1869,7 @@ export class LocalEngine {
           base: session.baseBranch,
           copyGlobs: project.copyGlobs,
           setupScript: project.setupScript,
+          env: this.sessionEnvFor(project.id, session.id, path.join(worktreeRootDir(), project.id, session.id)),
           fetch: true,
         });
         if (res.ok) {
