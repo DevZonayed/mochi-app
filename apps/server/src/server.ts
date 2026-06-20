@@ -201,21 +201,26 @@ export function buildServer(config: RelayConfig = {}): FastifyInstance {
 
   /** Find the deck that owns this access token (= the phone's pairing code).
       When more than one deck shares the token — e.g. the Mac reinstalled under a
-      new deckId but kept its pairing code, leaving a stale offline deck behind —
-      a LIVE deck always wins. Without this, the first-inserted (older, now dead)
-      deck shadowed the live one: the phone routed to a socketless deck while the
-      real Mac's events fanned out to nobody (the split-brain we hit in prod).
-      Falls back to a stale deck only when no live one matches, so the phone can
-      still read the last snapshot while the Mac is briefly away. */
+      new deckId but kept its pairing code, leaving a stale deck behind — pick the
+      one most likely to be the LIVE Mac: a connected socket beats a disconnected
+      one, and among equally-connected decks the freshest (most-recently-active)
+      wins. The freshness tie-break is what defeats a "ghost" deck — a half-open
+      socket the relay still thinks is connected (online:true) — which would
+      otherwise shadow the live Mac and make every forwarded command HANG waiting
+      for a reply that never comes (phone send button spins forever). The live
+      Mac pings/pushes every ~20s so its lastSeen stays fresh; the ghost goes
+      stale. Falls back to the freshest disconnected deck so the phone can still
+      read the last snapshot while the Mac is briefly away. */
   function deckByAccessToken(token: string): Deck | null {
     if (!token) return null;
-    let stale: Deck | null = null;
+    const rank = (d: Deck): number => (d.online && d.ws ? 1 : 0);
+    let best: Deck | null = null;
     for (const d of decks.values()) {
       if (d.accessToken !== token) continue;
-      if (d.online && d.ws) return d;
-      stale ??= d;
+      if (best === null) { best = d; continue; }
+      if (rank(d) > rank(best) || (rank(d) === rank(best) && d.lastSeen > best.lastSeen)) best = d;
     }
-    return stale;
+    return best;
   }
 
   // ── Remote-device presence + per-device control (per deck) ─────────
