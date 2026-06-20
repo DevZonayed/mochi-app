@@ -7,6 +7,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Mono } from '../ui';
+import { Markdown } from '../Markdown';
 import { api, type Job, type TranscriptItem, type Effort, type ModelGroup } from '../api';
 import { cacheGet, cacheSet } from '../storage';
 import { pullSync, useSyncStore } from '../syncStore';
@@ -167,7 +168,7 @@ function ThinkingRow({ item }: { item: TranscriptItem }) {
       </Pressable>
       {open && (
         <View style={{ marginTop: 6, marginLeft: 8, paddingLeft: 12, borderLeftWidth: 1.5, borderLeftColor: theme.color.purple + '3d' }}>
-          <Text style={{ fontSize: 13, lineHeight: 21, color: theme.color.inkSecondary }}>{text}</Text>
+          <Markdown text={text} color={theme.color.inkSecondary} size={13} />
         </View>
       )}
     </View>
@@ -420,7 +421,7 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
       );
     }
     if (it.text && it.text.trim()) {
-      return <Text key={i} style={{ fontSize: 16, lineHeight: 24, color: theme.color.ink }}>{it.text.trim()}</Text>;
+      return <Markdown key={i} text={it.text.trim()} />;
     }
     return null;
   };
@@ -458,7 +459,7 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
   } else if (job.error) {
     blocks.push(<Text key="err" style={{ fontSize: 15, lineHeight: 22, color: theme.color.red }}>{job.error}</Text>);
   } else if (job.output && job.output.trim()) {
-    blocks.push(<Text key="out" style={{ fontSize: 16, lineHeight: 24, color: theme.color.ink }}>{job.output.trim()}</Text>);
+    blocks.push(<Markdown key="out" text={job.output.trim()} />);
   } else if (live) {
     blocks.push(
       <View key="working" style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
