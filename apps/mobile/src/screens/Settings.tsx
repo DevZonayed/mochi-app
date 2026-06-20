@@ -7,7 +7,8 @@ import { useTheme } from '../theme';
 import type { ThemeMode } from '@maestro/design-tokens';
 import { Icon } from '../Icon';
 import { Group, Row } from '../ui';
-import { api, getPairToken, setPairToken, API_BASE, type Workspace, type Effort as ApiEffort, type EngineId } from '../api';
+import { api, API_BASE, type Device, type Workspace, type Effort as ApiEffort, type EngineId } from '../api';
+import { signOut, getActiveHost } from '../auth';
 import { setFlag, ONBOARDED, getFlag, BIOMETRIC_GATE, clearCache } from '../storage';
 import { unregisterPush } from '../push';
 import { NOTIF_CATEGORIES, getNotifPrefs, setNotifPref } from '../notifPrefs';
@@ -279,22 +280,28 @@ export function SettingsScreen() {
   const [bioAvail, setBioAvail] = useState(true);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [conn, setConn] = useState<'idle' | 'testing' | 'ok' | 'fail'>('idle');
+  const [activeMac, setActiveMac] = useState<Device | null>(null);
   const [outbox, setOutbox] = useState(api.outbox().length);
   const [fbOpen, setFbOpen] = useState(false);
 
   const testConnection = () => {
     setConn('testing');
-    api.verifyPairing().then((r) => setConn(r === 'invalid' || r === 'unreachable' ? 'fail' : 'ok')).catch(() => setConn('fail'));
+    api.verifySession().then((r) => setConn(r === 'invalid' || r === 'unreachable' ? 'fail' : 'ok')).catch(() => setConn('fail'));
   };
 
   React.useEffect(() => { void biometricAvailable().then(setBioAvail); }, []);
   React.useEffect(() => api.onOutbox(() => setOutbox(api.outbox().length)), []);
 
-  // Live workspace + persisted defaults whenever the screen regains focus.
+  // Live workspace + active Mac + persisted defaults whenever the screen regains focus.
   useFocusEffect(
     React.useCallback(() => {
       let alive = true;
       api.listWorkspaces().then((wss) => { if (alive) setWorkspace(wss[0] ?? null); }).catch(() => { if (alive) setWorkspace(null); });
+      api.listDevices().then((list) => {
+        if (!alive) return;
+        const host = getActiveHost();
+        setActiveMac(list.find((d) => d.id === host) ?? null);
+      }).catch(() => { if (alive) setActiveMac(null); });
       api.getSettings().then((s) => {
         if (!alive || !s) return;
         setEff(fromApiEffort(s.defaultEffort));
@@ -336,13 +343,15 @@ export function SettingsScreen() {
               <Icon name="smartphone" size={24} color={theme.color.inkSecondary} />
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={{ fontSize: 17, fontWeight: '600', color: theme.color.ink }}>{workspace?.name ?? 'Your Mac'}</Text>
+              <Text style={{ fontSize: 17, fontWeight: '600', color: theme.color.ink }}>{activeMac?.name ?? workspace?.name ?? 'No Mac selected'}</Text>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 5 }}>
                 {conn === 'fail'
                   ? <><View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: theme.color.red }} /><Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.red }}>Can't reach your Mac</Text></>
                   : conn === 'testing'
                     ? <Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkSecondary }}>Testing…</Text>
-                    : <><View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: theme.color.green }} /><Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.green }}>{conn === 'ok' ? 'Reachable via relay' : 'Paired via relay'}</Text></>}
+                    : !getActiveHost()
+                      ? <Text style={{ fontSize: 13, fontWeight: '500', color: theme.color.inkSecondary }}>Pick a Mac to control</Text>
+                      : <><View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: activeMac && !activeMac.online ? theme.color.inkTertiary : theme.color.green }} /><Text style={{ fontSize: 13, fontWeight: '500', color: activeMac && !activeMac.online ? theme.color.inkTertiary : theme.color.green }}>{activeMac && !activeMac.online ? 'Offline' : conn === 'ok' ? 'Connected' : 'Connected'}</Text></>}
               </View>
             </View>
           </View>
@@ -353,20 +362,16 @@ export function SettingsScreen() {
           </View>
         </View>
 
-        {/* Pairing */}
+        {/* Active Mac (device switcher) */}
         <View style={{ marginBottom: 22 }}>
-          <Group header="Pairing" footer="The code from your Mac (Maestro → Settings → Devices). Without it, this phone can't reach your Mac.">
-            <Row last>
-              <View style={rowLabel}><Text style={labelText}>Code</Text></View>
-              <TextInput
-                defaultValue={getPairToken()}
-                onChangeText={(t: string) => setPairToken(t)}
-                autoCapitalize="characters"
-                autoCorrect={false}
-                placeholder="XXXX-XXXX-XXXX"
-                placeholderTextColor={theme.color.inkTertiary}
-                style={{ flex: 1, textAlign: 'right', fontSize: 15, fontWeight: '600', letterSpacing: 1, color: theme.color.ink, paddingVertical: 6 }}
-              />
+          <Group header="Mac" footer="The Mac this phone controls. Every action runs on the selected one.">
+            <Row last onPress={() => nav.navigate('Devices')}>
+              <View style={{ width: 30, height: 30, borderRadius: 8, backgroundColor: theme.color.blue + '24', alignItems: 'center', justifyContent: 'center' }}>
+                <Icon name="command" size={16} color={theme.color.blue} />
+              </View>
+              <View style={rowLabel}><Text style={labelText}>Active Mac</Text></View>
+              <Text style={{ fontSize: 14, fontWeight: '500', color: theme.color.inkTertiary }}>{activeMac?.name ?? (getActiveHost() ? 'Selected' : 'None')}</Text>
+              <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
             </Row>
           </Group>
         </View>
@@ -452,17 +457,17 @@ export function SettingsScreen() {
           </Group>
         </View>
 
-        {/* This device */}
+        {/* Account */}
         <View style={{ marginBottom: 22 }}>
-          <Group header="This device" footer="Unpairing clears the code on this phone; pair again from your Mac's code to reconnect.">
+          <Group header="Account" footer="Signing out clears this phone's session and cached data. Sign back in any time.">
             <Row last onPress={() => {
-              void unregisterPush(); // drop this phone's push token from the relay (before the token clears)
-              setPairToken('');
+              void unregisterPush(); // drop this phone's push token from the server (before the session clears)
+              void signOut(); // end the session server-side + clear token + active host
               setFlag(ONBOARDED, false);
-              void clearCache(); // logout wipes cached projects/chats
-              nav.reset({ index: 0, routes: [{ name: 'Onboarding' }] });
+              void clearCache(); // wipe cached projects/chats/host slices
+              nav.reset({ index: 0, routes: [{ name: 'Login' }] });
             }}>
-              <View style={rowLabel}><Text style={{ fontSize: 16, color: theme.color.red }}>Unpair from Mac</Text></View>
+              <View style={rowLabel}><Text style={{ fontSize: 16, color: theme.color.red }}>Sign out</Text></View>
               <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
             </Row>
           </Group>
@@ -489,7 +494,7 @@ export function SettingsScreen() {
               <Text style={{ fontSize: 14, fontWeight: '500', fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>{appVersion}</Text>
             </Row>
             <Row last>
-              <View style={rowLabel}><Text style={labelText}>Relay</Text></View>
+              <View style={rowLabel}><Text style={labelText}>Server</Text></View>
               <Text style={{ fontSize: 13, fontWeight: '500', fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>{relayHost}</Text>
             </Row>
           </Group>
