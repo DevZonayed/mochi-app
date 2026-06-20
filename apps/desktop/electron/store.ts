@@ -42,8 +42,14 @@ export interface Project {
   defaultBaseBranch?: string;
   /** Shell script run once in each new session worktree (e.g. install deps). */
   setupScript?: string;
-  /** Gitignored files copied into each new session worktree. Default ['.env*']. */
+  /** Gitignored files copied into each new session worktree. Default ['.env*'].
+      A committed `.worktreeinclude` file at the repo root overrides this. */
   copyGlobs?: string[];
+  /** Whether sessions of this project may run their dev server / background tasks
+      at the same time. 'concurrent' (default) → each session gets its own isolated
+      MOCHI_PORT block; 'nonconcurrent' → only one session may run at a time
+      (project depends on one fixed port / DB / Docker stack). */
+  runMode?: 'concurrent' | 'nonconcurrent';
   /** Manual display order from drag-and-drop. Lower = earlier. Unset → sorts by createdAt. */
   order?: number;
   createdAt: number;
@@ -889,7 +895,7 @@ export class Store {
     this.data.projects.push(p); this.save();
     return p;
   }
-  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template'>>): Project {
+  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode'>>): Project {
     const cur = this.getProject(projectId);
     if (!cur) throw Object.assign(new Error('project not found'), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });

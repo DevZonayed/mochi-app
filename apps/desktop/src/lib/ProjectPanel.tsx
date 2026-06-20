@@ -213,10 +213,13 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+const settingsInput: React.CSSProperties = { width: '100%', border: '1px solid var(--hairline)', borderRadius: 8, padding: '6px 10px', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none' };
+
 function SettingsBody({ project, patch }: { project: Project; patch: (p: Partial<Project>) => void }) {
+  const globsText = (project.copyGlobs ?? []).join(', ');
   return (
     <div style={{ maxWidth: 560, display: 'flex', flexDirection: 'column', gap: 12 }}>
-      <Field label="Name"><input defaultValue={project.name} key={project.id} onBlur={e => { const v = e.target.value.trim(); if (v && v !== project.name) patch({ name: v }); }} style={{ width: '100%', border: '1px solid var(--hairline)', borderRadius: 8, padding: '6px 10px', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none' }} /></Field>
+      <Field label="Name"><input defaultValue={project.name} key={project.id} onBlur={e => { const v = e.target.value.trim(); if (v && v !== project.name) patch({ name: v }); }} style={settingsInput} /></Field>
       <Field label="Type"><span style={{ textTransform: 'capitalize' }}>{project.kind ?? 'general'}</span></Field>
       {project.path && <Field label="Folder">
         <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
@@ -225,6 +228,36 @@ function SettingsBody({ project, patch }: { project: Project; patch: (p: Partial
         </span>
       </Field>}
       {project.repoUrl && <Field label="Repository"><code style={{ font: '400 var(--fs-caption)/1.4 var(--font-mono)', color: 'var(--ink-secondary)' }}>{project.repoUrl}</code></Field>}
+
+      {project.path && <>
+        <div style={{ marginTop: 6, paddingTop: 14, borderTop: '0.5px solid var(--separator)', display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <div style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Worktree isolation</div>
+          <div style={{ font: '400 var(--fs-caption)/1.45 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+            Each session runs in its own git worktree. These control how a new worktree is set up and whether sessions can run their dev server in parallel.
+          </div>
+        </div>
+        <Field label="Default branch">
+          <input defaultValue={project.defaultBaseBranch ?? ''} key={project.id + ':base'} placeholder="auto-detect (origin/HEAD)"
+            onBlur={e => { const v = e.target.value.trim(); if (v !== (project.defaultBaseBranch ?? '')) patch({ defaultBaseBranch: v }); }} style={settingsInput} />
+        </Field>
+        <Field label="Run mode">
+          <select value={project.runMode ?? 'concurrent'} onChange={e => patch({ runMode: e.target.value === 'nonconcurrent' ? 'nonconcurrent' : 'concurrent' })} style={{ ...settingsInput, cursor: 'pointer' }}>
+            <option value="concurrent">Concurrent — sessions run in parallel (own MOCHI_PORT each)</option>
+            <option value="nonconcurrent">One at a time — shared port / DB / Docker stack</option>
+          </select>
+        </Field>
+        <Field label="Files to copy">
+          <input defaultValue={globsText} key={project.id + ':globs'} placeholder=".env*, config/*.local.json"
+            onBlur={e => { const next = e.target.value.split(/[,\n]/).map(s => s.trim()).filter(Boolean); if (next.join(',') !== (project.copyGlobs ?? []).join(',')) patch({ copyGlobs: next }); }} style={settingsInput} />
+        </Field>
+        <div style={{ marginTop: -6, marginLeft: 104, font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+          Gitignored files copied into each new worktree. A committed <code style={{ font: '400 var(--fs-caption)/1 var(--font-mono)' }}>.worktreeinclude</code> at the repo root overrides this. Default <code style={{ font: '400 var(--fs-caption)/1 var(--font-mono)' }}>.env*</code>.
+        </div>
+        <Field label="Setup script">
+          <input defaultValue={project.setupScript ?? ''} key={project.id + ':setup'} placeholder="pnpm install"
+            onBlur={e => { const v = e.target.value.trim(); if (v !== (project.setupScript ?? '')) patch({ setupScript: v }); }} style={settingsInput} />
+        </Field>
+      </>}
     </div>
   );
 }

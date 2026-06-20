@@ -246,10 +246,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'updateProject': {
         const patch: Record<string, unknown> = {};
-        for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl'] as const) {
+        for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl', 'defaultBaseBranch', 'setupScript'] as const) {
           if (typeof p[k] === 'string') patch[k] = p[k];
         }
         if (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') patch.kind = p.kind;
+        // Worktree isolation settings.
+        if (Array.isArray(p.copyGlobs)) patch.copyGlobs = (p.copyGlobs as unknown[]).filter((g): g is string => typeof g === 'string');
+        if (p.runMode === 'concurrent' || p.runMode === 'nonconcurrent') patch.runMode = p.runMode;
         if (Object.keys(patch).length === 0) bad('no valid project fields');
         const proj = store.updateProject(String(p.id ?? ''), patch);
         emit('project', proj);
