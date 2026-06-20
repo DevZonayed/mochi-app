@@ -82,6 +82,10 @@ interface Deck {
   ws: WebSocket | null;
   online: boolean;
   lastSeen: number;
+  /** When the host WS went away (ws closed). null while online. Drives eviction
+      of decks that stay dead past the grace window so a stale deck can never
+      shadow a live one that shares the same pairing token. */
+  offlineSince: number | null;
   state: Snapshot | null;
   pending: Map<string, Pending>;
   /** Per-tenant device list (presence + revocation). */
@@ -155,7 +159,20 @@ export function buildSyncDelta(snap: Snapshot, since: number, hostOnline: boolea
 // legitimate full-cap payload still goes through without us being a bottleneck.
 const RELAY_BODY_LIMIT = 200 * 1024 * 1024;
 
-export function buildServer(): FastifyInstance {
+/** Relay tunables. Both default to production-safe values; tests inject tiny
+    windows to exercise eviction without waiting. */
+export interface RelayConfig {
+  /** A deck offline (host WS gone) longer than this is evicted from the map. */
+  deckEvictionMs?: number;
+  /** How often the eviction sweep runs. */
+  deckSweepMs?: number;
+}
+
+export function buildServer(config: RelayConfig = {}): FastifyInstance {
+  // The Mac's relay client reconnects with backoff capped at 30s, so the grace
+  // window is generous — a routine reconnect must never lose the snapshot.
+  const DECK_EVICTION_MS = config.deckEvictionMs ?? 5 * 60 * 1000;
+  const DECK_SWEEP_MS = config.deckSweepMs ?? 30 * 1000;
   const app = Fastify({ logger: true, bodyLimit: RELAY_BODY_LIMIT });
   app.register(cors, { origin: true });
 
@@ -182,11 +199,23 @@ export function buildServer(): FastifyInstance {
     return true;
   }
 
-  /** Find the deck that owns this access token (= the phone's pairing code). */
+  /** Find the deck that owns this access token (= the phone's pairing code).
+      When more than one deck shares the token — e.g. the Mac reinstalled under a
+      new deckId but kept its pairing code, leaving a stale offline deck behind —
+      a LIVE deck always wins. Without this, the first-inserted (older, now dead)
+      deck shadowed the live one: the phone routed to a socketless deck while the
+      real Mac's events fanned out to nobody (the split-brain we hit in prod).
+      Falls back to a stale deck only when no live one matches, so the phone can
+      still read the last snapshot while the Mac is briefly away. */
   function deckByAccessToken(token: string): Deck | null {
     if (!token) return null;
-    for (const d of decks.values()) if (d.accessToken === token) return d;
-    return null;
+    let stale: Deck | null = null;
+    for (const d of decks.values()) {
+      if (d.accessToken !== token) continue;
+      if (d.online && d.ws) return d;
+      stale ??= d;
+    }
+    return stale;
   }
 
   // ── Remote-device presence + per-device control (per deck) ─────────
@@ -396,6 +425,7 @@ export function buildServer(): FastifyInstance {
               ws,
               online: true,
               lastSeen: Date.now(),
+              offlineSince: null,
               state: null, // never inherit another deck's snapshot — was the cross-tenant leak
               pending: new Map(),
               devices: new DeviceRegistry(),
@@ -414,6 +444,7 @@ export function buildServer(): FastifyInstance {
             existing.ws = ws;
             existing.online = true;
             existing.lastSeen = Date.now();
+            existing.offlineSince = null; // back online → no longer a candidate for eviction
             if (m.accessToken && m.accessToken !== existing.accessToken) {
               existing.accessToken = m.accessToken;
               existing.devices.reset(); // pairing code rotated → every remote must re-pair
@@ -465,6 +496,7 @@ export function buildServer(): FastifyInstance {
         if (myDeck && myDeck.ws === ws) {
           myDeck.online = false;
           myDeck.ws = null;
+          myDeck.offlineSince = Date.now(); // start the eviction clock
           for (const [, p] of myDeck.pending) { clearTimeout(p.timer); p.reject(Object.assign(new Error('Mac disconnected'), { statusCode: 503 })); }
           myDeck.pending.clear();
           sseSend(myDeck, 'host', { online: false });
@@ -479,6 +511,23 @@ export function buildServer(): FastifyInstance {
     }
   }, 25000);
   app.addHook('onClose', async () => clearInterval(keepalive));
+
+  // Evict decks that stay dead past the grace window. A long-offline deck is an
+  // orphan — the Mac reinstalled under a new deckId, or quit for good — and must
+  // not linger: it would shadow a live deck on a shared token and grow the map
+  // without bound. Ending its SSE streams forces any phone still pinned to it to
+  // reconnect, where the auth hook re-routes it onto the live deck.
+  const sweep = setInterval(() => {
+    const now = Date.now();
+    for (const [id, deck] of decks) {
+      if (deck.online || deck.ws) continue;
+      if (deck.offlineSince === null || now - deck.offlineSince <= DECK_EVICTION_MS) continue;
+      for (const res of deck.sseClients) { try { res.end(); } catch { /* already closed */ } }
+      deck.sseClients.clear();
+      decks.delete(id);
+    }
+  }, DECK_SWEEP_MS);
+  app.addHook('onClose', async () => clearInterval(sweep));
 
   // ── Health / meta ──────────────────────────────────────────────────
   app.get('/health', async () => {

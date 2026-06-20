@@ -28,6 +28,7 @@ import {
   type SyncDelta, type LiveEventName,
 } from './api';
 import { getJSON, getStr, setStr, LAST_SYNC } from './storage';
+import { classifySyncError, type SyncErrorKind } from './syncErrors';
 
 /* ── State shape ───────────────────────────────────────────────────────── */
 
@@ -42,16 +43,24 @@ export interface SyncState {
   lastSync: number;
   /** Mac connectivity, learned from the most recent sync or SSE `host` event. */
   hostOnline: boolean;
-  /** True once we've completed at least one sync this session — flips screens
-      out of skeleton state without falsely showing "empty" on cold start. */
+  /** True once we've completed at least one SUCCESSFUL sync this session. Drives
+      the "showing last known state" affordance and the empty-vs-data decision. */
   bootstrapped: boolean;
+  /** True once at least one sync ATTEMPT has settled (success OR failure). This
+      is what flips screens out of the skeleton — a failed first attempt must not
+      leave them spinning forever; they fall through to a reconnect/empty state. */
+  settled: boolean;
+  /** Set when the last sync attempt failed; null after any success. Lets screens
+      show a precise, actionable message (re-pair / Mac offline / retry) instead
+      of an endless spinner when the phone is on a stale or disconnected deck. */
+  syncError: SyncErrorKind | null;
   /** True while a `pullSync()` is in flight (drives the small header spinner). */
   syncing: boolean;
 }
 
 const EMPTY_STATE: SyncState = {
   projects: [], sessions: [], jobs: [], approvals: [], assets: [], events: [],
-  lastSync: 0, hostOnline: false, bootstrapped: false, syncing: false,
+  lastSync: 0, hostOnline: false, bootstrapped: false, settled: false, syncError: null, syncing: false,
 };
 
 /* ── Persistence ───────────────────────────────────────────────────────── */
@@ -78,6 +87,8 @@ function loadFromStorage(): SyncState {
     lastSync: persisted.lastSync ?? ls,
     hostOnline: false,
     bootstrapped: false,
+    settled: false,
+    syncError: null,
     syncing: false,
   };
 }
@@ -155,10 +166,14 @@ export function pullSync(): Promise<void> {
       const delta: SyncDelta = await api.sync(state.lastSync);
       applyDelta(delta);
     } catch (e) {
-      // Network / 503 (Mac offline) — keep current state, drop syncing flag.
-      // Screens still render from the persisted snapshot; the user sees a
-      // "Mac offline" banner if the relay reported that on a previous pull.
+      // Network / 503 (Mac offline) / 401 (token rejected) — keep current state
+      // (screens still render from the persisted snapshot) but RECORD the failure
+      // and mark the attempt settled, so a failed first sync flips screens out of
+      // the skeleton into an actionable reconnect/offline state instead of an
+      // endless spinner. A 401 separately bounces to re-pair (see api.req).
       console.warn('[sync] pull failed:', e instanceof Error ? e.message : e);
+      state = { ...state, settled: true, syncError: classifySyncError(e) };
+      notify();
     } finally {
       state = { ...state, syncing: false };
       notify();
@@ -191,6 +206,8 @@ function applyDelta(delta: SyncDelta): void {
     lastSync: delta.at,
     hostOnline: delta.host.online,
     bootstrapped: true,
+    settled: true,
+    syncError: null, // a successful pull clears any prior failure
   };
   persist();
   notify();
