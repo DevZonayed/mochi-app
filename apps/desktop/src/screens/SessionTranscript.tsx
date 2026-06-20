@@ -13,7 +13,8 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { GitStatusBar } from './GitStatusBar';
 import { Icon, type IconName } from '../lib/icons';
 import { EffortDial, CountUp } from '../lib/ui';
-import { FileChip, IS_WRITE_TOOL } from '../lib/fileChip';
+import { FileChip } from '../lib/fileChip';
+import { toolDisplay, isSkillTool, prettySkillName } from '../lib/toolDisplay';
 import { AppShell } from '../lib/appShell';
 import { api, type Job, type Effort, type TranscriptItem } from '../lib/api';
 
@@ -96,15 +97,22 @@ function GoalBlock({ goal }: { goal: string }) {
 
 /* Tool glyph/tint by name — mirrors the chat's ToolNode so the transcript reads
    the same in both places. */
-function toolMeta(name: string): { icon: IconName; tint: string } {
-  const n = name.toLowerCase();
-  if (/bash|shell|command|exec|terminal/.test(n)) return { icon: 'terminal', tint: 'var(--blue)' };
-  if (/read|write|edit|glob|grep|notebook|file|patch|ls/.test(n)) return { icon: 'folder', tint: 'var(--teal)' };
-  if (/web|search|fetch|browser/.test(n)) return { icon: 'telescope', tint: 'var(--indigo)' };
-  if (/skill|task|agent|subagent/.test(n)) return { icon: 'spark', tint: 'var(--purple)' };
-  return { icon: 'command', tint: 'var(--ink-secondary)' };
-}
 const fmtToolDur = (ms?: number): string => (ms == null ? '' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`);
+
+// The agent's extended thinking — calm dimmed prose under a small purple header.
+function ThinkingStep({ item }: { item: TranscriptItem }) {
+  const text = item.text.trim();
+  if (!text) return null;
+  return (
+    <div style={{ maxWidth: 720 }}>
+      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, marginBottom: 6 }}>
+        <span style={{ width: 18, height: 18, borderRadius: 6, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)' }}><Icon name="spark" size={11} /></span>
+        <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--purple)' }}>Thinking</span>
+      </div>
+      <div style={{ marginLeft: 8, paddingLeft: 13, borderLeft: '1.5px solid color-mix(in srgb, var(--purple) 24%, var(--separator))', font: '400 var(--fs-footnote)/1.66 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{text}</div>
+    </div>
+  );
+}
 
 /* Lightweight prose: split out ``` fenced code blocks; render the rest as
    line-break-preserving paragraphs. Good enough for agent text + JSON output
@@ -123,27 +131,44 @@ function renderText(text: string, keyBase: string): React.ReactNode[] {
   return out;
 }
 
-// One real tool step from the job's transcript.
+// One real tool step — a FLAT row (no card), short verb + filename chip / detail.
 function ToolStep({ item }: { item: TranscriptItem }) {
   const running = item.toolStatus === 'running';
   const error = item.toolStatus === 'error';
-  const { icon, tint } = toolMeta(item.name ?? '');
-  const accent = error ? 'var(--red)' : tint;
-  const isWrite = IS_WRITE_TOOL(item.name ?? '') && !!item.text;
+  const isSkill = isSkillTool(item.name);
+  const d = toolDisplay(item.name ?? '');
+  const short = isSkill ? 'Skill' : d.short;
+  const glyph = isSkill ? 'var(--purple)' : error ? 'var(--red)' : d.tint;
+  const showFile = !!d.file && !!item.text && !isSkill;
+  const hasCmd = !!item.cmd && !showFile && !isSkill;
+  const detail = isSkill ? prettySkillName(item.text) : item.text;
+  const detailFont = !isSkill && !!d.mono && !hasCmd ? 'var(--font-mono)' : 'var(--font-text)';
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 9, maxWidth: 720, padding: '7px 11px 7px 8px', borderRadius: 11,
-      background: error ? 'color-mix(in srgb, var(--red) 8%, var(--bg-elevated))' : `color-mix(in srgb, ${tint} 9%, var(--bg-elevated))`,
-      border: `0.5px solid color-mix(in srgb, ${accent} 30%, var(--separator))` }}>
-      <span style={{ width: 22, height: 22, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${accent} 18%, transparent)`, color: accent }}><Icon name={icon} size={13} /></span>
-      <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{item.name}</span>
-      {isWrite
-        ? <FileChip path={item.text} preview={item.preview} />
-        : item.text && <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text}</span>}
-      <span style={{ flexShrink: 0, marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-        {running ? <span className="breathe" style={{ width: 8, height: 8, borderRadius: 4, background: tint }} />
+    <div style={{ display: 'flex', alignItems: hasCmd ? 'flex-start' : 'center', gap: 9, maxWidth: 720, padding: '4px 7px', borderRadius: 8 }}>
+      <span style={{ width: 16, flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'grid', placeItems: 'center', color: glyph }}><Icon name={isSkill ? 'spark' : d.icon} size={15} /></span>
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+          <span style={{ font: '600 var(--fs-footnote)/1.4 var(--font-text)', color: error ? 'var(--red)' : 'var(--ink)', flexShrink: 0 }}>{short}</span>
+          {showFile
+            ? <FileChip path={item.text} preview={item.preview} />
+            : detail && <span style={{ flex: 1, minWidth: 0, font: `400 var(--fs-footnote)/1.4 ${detailFont}`, color: isSkill ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail}</span>}
+        </div>
+        {hasCmd && <code style={{ alignSelf: 'flex-start', maxWidth: '100%', boxSizing: 'border-box', font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', background: 'var(--fill-tertiary)', borderRadius: 5, padding: '1px 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.cmd}</code>}
+      </div>
+      <span style={{ flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        {running ? <span className="breathe" style={{ width: 8, height: 8, borderRadius: 4, background: isSkill ? 'var(--purple)' : d.tint }} />
           : error ? <Icon name="x" size={12} stroke={2.6} style={{ color: 'var(--red)' }} />
-          : <><span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{fmtToolDur(item.durMs)}</span><Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)' }} /></>}
+          : <>{item.durMs != null && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{fmtToolDur(item.durMs)}</span>}<Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)' }} /></>}
       </span>
+    </div>
+  );
+}
+
+// A run of consecutive tool steps — a calm flat list (no card framing).
+function ToolGroupCard({ items }: { items: TranscriptItem[] }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+      {items.map((it, i) => <ToolStep key={i} item={it} />)}
     </div>
   );
 }
@@ -168,11 +193,17 @@ function transcriptBlocks(job: Job | null, live: boolean): React.ReactNode[] {
   if (job?.input) blocks.push(<GoalBlock key="goal" goal={job.input} />);
   const items = job?.transcript ?? [];
   if (items.length) {
-    items.forEach((it, i) => {
-      if (it.kind === 'tool') blocks.push(<ToolStep key={`it${i}`} item={it} />);
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it.kind === 'tool') {
+        const run: TranscriptItem[] = [];
+        while (i < items.length && items[i].kind === 'tool') { run.push(items[i]); i++; }
+        i--; // the for-loop will advance past the last tool
+        blocks.push(<ToolGroupCard key={`g${i}`} items={run} />);
+      } else if (it.kind === 'thinking') blocks.push(<ThinkingStep key={`it${i}`} item={it} />);
       else if (it.kind === 'ask') blocks.push(<AskStep key={`it${i}`} text={it.ask || it.text} />);
       else if (it.text && it.text.trim()) blocks.push(<React.Fragment key={`it${i}`}>{renderText(it.text, `it${i}`)}</React.Fragment>);
-    });
+    }
   } else if (job) {
     const body = (job.error ?? job.output ?? '').trim();
     if (body) blocks.push(<React.Fragment key="out">{renderText(body, 'out')}</React.Fragment>);

@@ -43,12 +43,6 @@ async function uriToBase64(uri: string): Promise<string> {
 }
 
 /* Pick an icon for a tool by its name (best-effort; defaults to a terminal). */
-function toolIcon(name: string): IconName {
-  const n = name.toLowerCase();
-  if (n.includes('search') || n.includes('grep') || n.includes('glob') || n.includes('web') || n.includes('fetch')) return 'search';
-  if (n.includes('read') || n.includes('write') || n.includes('edit') || n.includes('file')) return 'file';
-  return 'terminal';
-}
 
 /* ── Per-session effort dial (FAST → BALANCED → DEEP → MAX) ──────────────── */
 const EFFORT_ORDER: Effort[] = ['fast', 'balanced', 'deep', 'max'];
@@ -151,21 +145,95 @@ function ModelPicker({ groups, value, onChange }: { groups: ModelGroup[]; value:
   );
 }
 
+const isSkillTool = (name?: string): boolean => (name ?? '').toLowerCase() === 'skill';
+const prettySkillName = (raw: string): string => { const tail = (raw.split(':').pop() ?? raw).replace(/[-_]/g, ' ').trim(); return tail ? tail.replace(/\b\w/g, (c) => c.toUpperCase()) : raw; };
+
+// Extended thinking → calm dimmed prose under a purple header, tap to expand/collapse.
+function ThinkingRow({ item }: { item: TranscriptItem }) {
+  const { theme } = useTheme();
+  const [open, setOpen] = useState(false);
+  const text = (item.text || '').trim();
+  if (!text) return null;
+  const preview = text.replace(/\s+/g, ' ').slice(0, 80);
+  return (
+    <View>
+      <Pressable onPress={() => setOpen((o) => !o)} style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
+        <View style={{ width: 18, height: 18, borderRadius: 6, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.purple + '24' }}>
+          <Icon name="spark" size={11} color={theme.color.purple} />
+        </View>
+        <Text style={{ fontSize: 11, fontWeight: '600', letterSpacing: 0.6, textTransform: 'uppercase', color: theme.color.purple }}>Thinking</Text>
+        <Icon name={open ? 'chevronDown' : 'chevronRight'} size={13} color={theme.color.inkTertiary} />
+        {!open && <Text numberOfLines={1} style={{ flex: 1, fontSize: 11, color: theme.color.inkTertiary }}>{preview}…</Text>}
+      </Pressable>
+      {open && (
+        <View style={{ marginTop: 6, marginLeft: 8, paddingLeft: 12, borderLeftWidth: 1.5, borderLeftColor: theme.color.purple + '3d' }}>
+          <Text style={{ fontSize: 13, lineHeight: 21, color: theme.color.inkSecondary }}>{text}</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+// Short friendly identity for a tool — verb + glyph (+ file flag), mirrors desktop toolDisplay.
+function toolDisplay(name: string): { short: string; icon: IconName; tint: 'blue' | 'teal' | 'indigo' | 'purple' | 'ink'; file?: boolean; mono?: boolean } {
+  const raw = (name || '').replace(/^mcp__[^_]+__/, '');
+  const n = raw.toLowerCase();
+  if (/multiedit|multi_edit|^edit|apply_patch|str_replace/.test(n)) return { short: 'Edit', icon: 'file', tint: 'teal', file: true };
+  if (/^write|create_file|^notebook/.test(n)) return { short: 'Write', icon: 'file', tint: 'teal', file: true };
+  if (/^read|^view|^cat|open_file/.test(n)) return { short: 'Read', icon: 'file', tint: 'teal', file: true };
+  if (/grep|^search$|ripgrep/.test(n)) return { short: 'Search', icon: 'search', tint: 'teal' };
+  if (/glob|^ls$|list_dir|list_files|^find/.test(n)) return { short: 'Find', icon: 'search', tint: 'teal' };
+  if (/websearch|web_search/.test(n)) return { short: 'Web search', icon: 'telescope', tint: 'indigo' };
+  if (/webfetch|web_fetch|^fetch|^http|browser|navigate/.test(n)) return { short: 'Fetch', icon: 'telescope', tint: 'indigo' };
+  if (/image|photo|picture|generate_image/.test(n)) return { short: 'Image', icon: 'image', tint: 'purple' };
+  if (/todo/.test(n)) return { short: 'Plan', icon: 'checkCircle', tint: 'blue' };
+  if (/task|subagent|^agent|dispatch/.test(n)) return { short: 'Agent', icon: 'spark', tint: 'purple' };
+  if (/bash|shell|^run|exec|terminal|command/.test(n)) return { short: 'Run', icon: 'terminal', tint: 'blue', mono: true };
+  const pretty = raw.replace(/[_-]+/g, ' ').trim();
+  return { short: pretty ? pretty.charAt(0).toUpperCase() + pretty.slice(1) : 'Tool', icon: 'command', tint: 'ink' };
+}
+const baseName = (p: string): string => (p.split(/[?#]/)[0].split(/[\\/]/).filter(Boolean).pop() || p).trim();
+
 function ToolRow({ item }: { item: TranscriptItem }) {
   const { theme } = useTheme();
   const running = item.toolStatus === 'running';
   const error = item.toolStatus === 'error';
-  const tint = error ? theme.color.red : running ? theme.color.purple : theme.color.inkSecondary;
+  const isSkill = isSkillTool(item.name);
+  const d = toolDisplay(item.name ?? '');
+  const short = isSkill ? 'Skill' : d.short;
+  const glyph = isSkill ? theme.color.purple : error ? theme.color.red : d.tint === 'ink' ? theme.color.inkSecondary : theme.color[d.tint];
+  const showFile = !!d.file && !!item.text && !isSkill;
+  const hasCmd = !!item.cmd && !showFile && !isSkill;
+  const detail = isSkill ? prettySkillName(item.text) : (showFile ? baseName(item.text) : item.text);
+  const detailMono = showFile || (!isSkill && !!d.mono && !hasCmd); // file basename or a raw shell command → mono
+  const trailing = running ? <ActivityIndicator size="small" color={theme.color.purple} />
+    : error ? <Icon name="x" size={13} color={theme.color.red} stroke={2.6} />
+      : <Icon name="check" size={13} color={theme.color.green} stroke={2.6} />;
   return (
-    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 9, paddingVertical: 8, paddingHorizontal: 11, borderRadius: 10, backgroundColor: theme.color.fillTertiary, borderWidth: 0.5, borderColor: theme.color.separator }}>
-      <View style={{ width: 22, height: 22, borderRadius: 7, alignItems: 'center', justifyContent: 'center', backgroundColor: tint + '24' }}>
-        <Icon name={toolIcon(item.name ?? '')} size={13} color={tint} />
+    <View style={{ flexDirection: 'row', alignItems: hasCmd ? 'flex-start' : 'center', gap: 9, paddingVertical: 5, paddingHorizontal: 7 }}>
+      <View style={{ width: 18, alignItems: 'center', justifyContent: 'center', marginTop: hasCmd ? 1 : 0 }}>
+        <Icon name={isSkill ? 'spark' : d.icon} size={15} color={glyph} />
       </View>
-      <Text style={{ fontSize: 13, fontWeight: '600', color: theme.color.ink }}>{item.name || 'tool'}</Text>
-      {item.text ? <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, fontFamily: theme.fontFamily.mono, color: theme.color.inkSecondary }}>{item.text}</Text> : <View style={{ flex: 1 }} />}
-      {running ? <ActivityIndicator size="small" color={theme.color.purple} />
-        : error ? <Icon name="x" size={13} color={theme.color.red} stroke={2.6} />
-          : <Icon name="check" size={13} color={theme.color.green} stroke={2.6} />}
+      <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
+          <Text style={{ fontSize: 13, fontWeight: '600', color: error ? theme.color.red : theme.color.ink }}>{short}</Text>
+          {detail ? <Text numberOfLines={1} style={{ flex: 1, fontSize: 13, fontFamily: detailMono ? theme.fontFamily.mono : undefined, color: isSkill ? theme.color.ink : theme.color.inkSecondary }}>{detail}</Text> : null}
+        </View>
+        {hasCmd ? <Text numberOfLines={1} style={{ alignSelf: 'flex-start', maxWidth: '100%', fontSize: 11, fontFamily: theme.fontFamily.mono, color: theme.color.inkSecondary, backgroundColor: theme.color.fillTertiary, borderRadius: 5, paddingHorizontal: 6, paddingVertical: 1, overflow: 'hidden' }}>{item.cmd}</Text> : null}
+      </View>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: hasCmd ? 2 : 0 }}>
+        {item.durMs != null && !running && !error ? <Text style={{ fontSize: 11, fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>{item.durMs < 1000 ? `${item.durMs}ms` : `${(item.durMs / 1000).toFixed(1)}s`}</Text> : null}
+        {trailing}
+      </View>
+    </View>
+  );
+}
+
+// A run of consecutive tool steps — a calm flat list (no card framing).
+function ToolGroupCard({ items }: { items: TranscriptItem[] }) {
+  return (
+    <View style={{ gap: 1 }}>
+      {items.map((it, i) => <ToolRow key={i} item={it} />)}
     </View>
   );
 }
@@ -292,17 +360,20 @@ function QuestionCard({ ask, onAnswer, answered }: { ask?: string; onAnswer: (te
    tool/text blocks. Mirrors the desktop's WorkBar (ProjectDetail.tsx) so the
    collapse signal matches: turn is done, a final text/result exists, prior work
    is non-empty, no pending question or image (those always stay expanded). */
-function WorkBar({ toolCount, expanded, onToggle }: { toolCount: number; expanded: boolean; onToggle: () => void }) {
+function WorkBar({ toolCount, thought, expanded, onToggle }: { toolCount: number; thought?: boolean; expanded: boolean; onToggle: () => void }) {
   const { theme } = useTheme();
+  const parts: string[] = [];
+  if (thought) parts.push('Thought');
+  if (toolCount > 0) parts.push(`${toolCount} tool${toolCount === 1 ? '' : 's'}`);
   return (
     <Pressable
       onPress={onToggle}
       hitSlop={6}
       style={{ alignSelf: 'flex-start', flexDirection: 'row', alignItems: 'center', gap: 7, height: 28, paddingHorizontal: 12, borderRadius: 14, backgroundColor: theme.color.fillTertiary, borderWidth: 0.5, borderColor: theme.color.separator }}
     >
-      <Icon name="terminal" size={12} color={theme.color.inkSecondary} />
+      <Icon name={toolCount === 0 && thought ? 'spark' : 'terminal'} size={12} color={toolCount === 0 && thought ? theme.color.purple : theme.color.inkSecondary} />
       <Text style={{ fontSize: 12, fontWeight: '600', color: theme.color.inkSecondary }}>
-        {toolCount > 0 ? `${toolCount} tool${toolCount === 1 ? '' : 's'}` : 'Work'}
+        {parts.length ? parts.join(' · ') : 'Work'}
       </Text>
       <Icon name={expanded ? 'chevronDown' : 'chevronRight'} size={12} color={theme.color.inkTertiary} stroke={2.2} />
     </Pressable>
@@ -324,11 +395,12 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
     if (items[k].kind === 'text' || items[k].kind === 'result') { finalIdx = k; break; }
   }
   const collapsible = !live && !hasAsk && !hasImage && finalIdx > 0
-    && items.slice(0, finalIdx).some((t) => t.kind === 'tool' || t.kind === 'text');
+    && items.slice(0, finalIdx).some((t) => t.kind === 'tool' || t.kind === 'text' || t.kind === 'thinking');
   const [expanded, setExpanded] = useState(false);
 
   const renderItem = (it: TranscriptItem, i: number): React.ReactNode => {
     if (it.kind === 'tool') return <ToolRow key={i} item={it} />;
+    if (it.kind === 'thinking') return <ThinkingRow key={i} item={it} />;
     if (it.kind === 'ask') return <QuestionCard key={i} ask={it.ask || it.text} onAnswer={onAnswer} answered={answered} />;
     if (it.kind === 'review') {
       const ok = it.verdict === 'approved';
@@ -353,21 +425,35 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
     return null;
   };
 
+  // Render a list, gathering consecutive tool steps into one flat ToolGroupCard.
+  const pushRun = (target: React.ReactNode[], list: TranscriptItem[], base: number) => {
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].kind === 'tool') {
+        const run: TranscriptItem[] = [];
+        while (i < list.length && list[i].kind === 'tool') { run.push(list[i]); i++; }
+        i--;
+        target.push(<ToolGroupCard key={`g${base}-${i}`} items={run} />);
+      } else {
+        const node = renderItem(list[i], base + i);
+        if (node) target.push(node);
+      }
+    }
+  };
+
   const blocks: React.ReactNode[] = [];
   if (items.length) {
     if (collapsible) {
       const work = items.slice(0, finalIdx);
       const toolCount = work.filter((t) => t.kind === 'tool').length;
-      blocks.push(<WorkBar key="work-bar" toolCount={toolCount} expanded={expanded} onToggle={() => setExpanded((e) => !e)} />);
-      if (expanded) {
-        work.forEach((it, i) => { const node = renderItem(it, i); if (node) blocks.push(node); });
-      }
+      const thought = work.some((t) => t.kind === 'thinking');
+      blocks.push(<WorkBar key="work-bar" toolCount={toolCount} thought={thought} expanded={expanded} onToggle={() => setExpanded((e) => !e)} />);
+      if (expanded) pushRun(blocks, work, 0);
       const finalNode = renderItem(items[finalIdx], finalIdx);
       if (finalNode) blocks.push(finalNode);
       // Items after the final answer (rare — usually a trailing review) stay visible.
       for (let i = finalIdx + 1; i < items.length; i++) { const node = renderItem(items[i], i); if (node) blocks.push(node); }
     } else {
-      items.forEach((it, i) => { const node = renderItem(it, i); if (node) blocks.push(node); });
+      pushRun(blocks, items, 0);
     }
   } else if (job.error) {
     blocks.push(<Text key="err" style={{ fontSize: 15, lineHeight: 22, color: theme.color.red }}>{job.error}</Text>);

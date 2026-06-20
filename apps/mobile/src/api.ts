@@ -21,9 +21,11 @@ export interface Workspace { id: string; name: string; budgetCap: number; create
 export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; kind?: ProjectKind; path?: string; repoUrl?: string; order?: number; createdAt: number; updatedAt: number }
 /** One structured block of an agent run (mirrors the desktop, image bytes stripped). */
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result' | 'ask' | 'review' | 'image';
+  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image';
   text: string;
   name?: string;
+  /** tool: secondary de-emphasized detail (e.g. raw shell command behind a Bash description). */
+  cmd?: string;
   toolStatus?: 'running' | 'done' | 'error';
   verdict?: 'approved' | 'needs-work';
   resolved?: boolean;
