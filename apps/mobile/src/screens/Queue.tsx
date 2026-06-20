@@ -303,12 +303,65 @@ export function QueueScreen() {
         </View>
 
         {queued.length === 0 && recurring.length === 0 ? (
-          <View style={{ alignItems: 'center', paddingVertical: 70, paddingHorizontal: 36 }}>
-            <View style={{ width: 64, height: 64, borderRadius: 20, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
-              <Icon name="clock" size={30} color={theme.color.inkTertiary} />
+          // First-run onboarding: surface the two example use-cases up front so
+          // a new user understands what a "Queue" is for without reading the
+          // ScheduleEditor first. Tapping any chip opens the editor.
+          <View style={{ paddingHorizontal: 20, paddingTop: 14 }}>
+            <View style={{ alignItems: 'center', paddingVertical: 28 }}>
+              <View style={{ width: 76, height: 76, borderRadius: 22, backgroundColor: theme.color.blue + '18', alignItems: 'center', justifyContent: 'center', marginBottom: 18 }}>
+                <Icon name="clock" size={34} color={theme.color.blue} />
+              </View>
+              <Text style={{ fontSize: 19, fontWeight: '700', color: theme.color.ink, marginBottom: 8 }}>Nothing queued yet</Text>
+              <Text style={{ fontSize: 14, lineHeight: 20, color: theme.color.inkSecondary, textAlign: 'center', marginBottom: 22, paddingHorizontal: 12 }}>
+                Schedules are recurring jobs your Mac runs on its own — daily checks, hourly
+                summaries, anything you'd otherwise type by hand.
+              </Text>
+              <Pressable
+                onPress={openNew}
+                accessibilityRole="button"
+                accessibilityLabel="Create your first schedule"
+                style={({ pressed }) => ({
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: 8,
+                  height: 48,
+                  paddingHorizontal: 22,
+                  borderRadius: 999,
+                  backgroundColor: theme.color.blue,
+                  opacity: pressed ? 0.85 : 1,
+                })}
+              >
+                <Icon name="plus" size={18} color="#fff" stroke={2.6} />
+                <Text style={{ fontSize: 16, fontWeight: '600', color: '#fff' }}>Create your first schedule</Text>
+              </Pressable>
             </View>
-            <Text style={{ fontSize: 16, fontWeight: '600', color: theme.color.ink, marginBottom: 6 }}>Nothing queued</Text>
-            <Text style={{ fontSize: 14, lineHeight: 20, color: theme.color.inkSecondary, textAlign: 'center' }}>Tap + to create a recurring schedule, or schedule a one-off from a chat (the clock button). It appears here with a live countdown.</Text>
+
+            <Text style={{ fontSize: 12, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkTertiary, marginBottom: 8 }}>Examples</Text>
+            <View style={{ gap: 10, paddingBottom: 20 }}>
+              {[
+                { icon: 'clock' as const, title: 'Daily 9am brief', sub: 'Every morning at 09:00 · summarize what changed overnight' },
+                { icon: 'send' as const, title: 'Hourly WhatsApp digest', sub: 'Every 1h · catch unread chats, ping me if urgent' },
+                { icon: 'spark' as const, title: 'Friday review', sub: 'Daily at 17:00 · what shipped this week' },
+              ].map((ex) => (
+                <Pressable
+                  key={ex.title}
+                  onPress={openNew}
+                  style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14, borderRadius: 14, backgroundColor: theme.color.bgElevated, borderWidth: StyleSheet.hairlineWidth, borderColor: theme.color.separator }}
+                >
+                  <View style={{ width: 36, height: 36, borderRadius: 10, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.blue + '1c' }}>
+                    <Icon name={ex.icon} size={17} color={theme.color.blue} />
+                  </View>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text numberOfLines={1} style={{ fontSize: 15, fontWeight: '600', color: theme.color.ink }}>{ex.title}</Text>
+                    <Text numberOfLines={1} style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 3 }}>{ex.sub}</Text>
+                  </View>
+                  <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
+                </Pressable>
+              ))}
+            </View>
+            <Text style={{ fontSize: 12, color: theme.color.inkTertiary, textAlign: 'center', paddingTop: 4 }}>
+              Or tap the clock button inside any chat to schedule a one-off message.
+            </Text>
           </View>
         ) : (
           <>

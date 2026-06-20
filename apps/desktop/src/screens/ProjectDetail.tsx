@@ -3012,12 +3012,32 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     if (streaming) void sendNow(t, imgs).then(ok => { if (!ok) restoreAtts(imgs); });
     else void sendRaw(t, imgs).then(ok => { if (!ok) { composerRef.current?.setText(t); restoreAtts(imgs); } });
   }, [text, attachments, projectId, streaming, sendText, sendNow, sendRaw, restoreAtts]);
+  // ⌘↩ "run next" — previously this cancelled the in-flight turn and started a
+  // new run with this prompt (the user-reported bug: their typed-mid-stream
+  // context killed the agent's working answer). NEW SEMANTICS: while streaming,
+  // ⌘↩ pushes the message to the FRONT of the queue so it runs the moment the
+  // current turn finishes — no cancel, no lost work. The explicit interrupt
+  // path (the queue-row "Send now — interrupt and steer" button + the red
+  // stop button) is still available for the rare case someone actually wants
+  // to kill the run. When idle, ⌘↩ just sends immediately (no queue to skip).
   const sendComposedNow = React.useCallback(() => {
     const t = text.trim(); const imgs = attachments;
     if ((!t && !imgs.length) || !projectId) return;
+    composerRef.current?.clear();
     setAttachments([]);
+    if (streaming) {
+      // Images can't ride the queue payload, so a steer with attached images
+      // still uses the explicit interrupt path. Text-only is the common case
+      // and what the bug report covered.
+      if (imgs.length) {
+        void sendNow(t, imgs).then(ok => { if (!ok) restoreAtts(imgs); });
+      } else {
+        mutateQueue(q => [t, ...q]);
+      }
+      return;
+    }
     void sendNow(t, imgs.length ? imgs : undefined).then(ok => { if (!ok) restoreAtts(imgs); });
-  }, [text, attachments, projectId, sendNow, restoreAtts]);
+  }, [text, attachments, projectId, streaming, sendNow, mutateQueue, restoreAtts]);
 
   const removeFromQueue = (i: number) => mutateQueue(q => q.filter((_, j) => j !== i));
   // Reorder = reprioritize: the drainer always fires queue[0] next.
@@ -3257,7 +3277,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               <RichComposer
                 ref={composerRef}
                 disabled={!projectId}
-                placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ send now)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
+                placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
                 onTextChange={setText}
                 onChips={info => {
                   setComposerBrowser(info.hasBrowser);
@@ -3293,7 +3313,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               {streaming ? (
                 <>
                   {canSend && (
-                    <button onClick={sendComposed} className="send-fab" title={attachments.length ? 'Send now — interrupts the current run' : 'Queue (Enter) — runs when the agent finishes · ⌘Enter to send now'} style={{
+                    <button onClick={sendComposed} className="send-fab" title={attachments.length ? 'Send now — interrupts the current run' : 'Queue (Enter) — runs when the agent finishes · ⌘Enter — runs NEXT (jumps to the front of the queue, current turn keeps going)'} style={{
                       width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
                       background: 'var(--blue)', color: '#fff', boxShadow: '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)', cursor: 'pointer' }}>
                       <Icon name={attachments.length ? 'arrowRight' : 'plus'} size={18} stroke={2.6} style={attachments.length ? { transform: 'rotate(-90deg)' } : undefined} />
