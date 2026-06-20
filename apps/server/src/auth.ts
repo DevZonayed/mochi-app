@@ -13,6 +13,12 @@ export const auth = betterAuth({
   secret: process.env.BETTER_AUTH_SECRET || 'dev-insecure-secret-change-me',
   baseURL: process.env.BETTER_AUTH_URL || 'http://localhost:8787',
   trustedOrigins: ['*'],
+  // Native clients (Electron renderer, React Native) send a `null` / no Origin,
+  // which Better Auth's origin check rejects with "Missing or null Origin" in
+  // production (the check is auto-skipped in test env, which hid this). Our auth is
+  // BEARER-TOKEN based (not cookies), so CSRF — a cookie/browser attack — doesn't
+  // apply; disabling the CSRF/origin check is the correct posture for token auth.
+  advanced: { disableCSRFCheck: true },
   plugins: [bearer()],
 });
 
