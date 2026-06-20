@@ -13,7 +13,7 @@ export interface TurnCreds { host: string | null; username: string | null; crede
     All-null when TURN isn't configured → clients use public STUN. */
 export function turnCredentials(now: number = Date.now()): TurnCreds {
   const host = process.env.TURN_HOST || null;
-  const secret = process.env.TURN_SECRET || null;
+  const secret = process.env.TURN_STATIC_SECRET || process.env.TURN_SECRET || null;
   if (!host || !secret) return { host: null, username: null, credential: null, ttl: 0 };
   const ttl = 3600;
   const username = String(Math.floor(now / 1000) + ttl);
