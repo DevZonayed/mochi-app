@@ -3,6 +3,8 @@ import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { UpdateBanner } from './lib/UpdateBanner';
 import { NotificationCenter } from './lib/notify';
 import { RemotePairGate } from './lib/RemotePairGate';
+import { IS_LOCAL } from './lib/api';
+import { hasSession, onAuthChange, primeSession } from './lib/auth';
 
 /* Real application entry. First run → Onboarding (creates the workspace, sets
    the budget); afterwards the app opens straight in the Workspace. There is no
@@ -30,7 +32,7 @@ const WhatsApp = React.lazy(() => import('./screens/WhatsApp'));
 const BudgetDashboard = React.lazy(() => import('./screens/BudgetDashboard'));
 const Settings = React.lazy(() => import('./screens/Settings'));
 const Feedback = React.lazy(() => import('./screens/Feedback'));
-const DevicePairing = React.lazy(() => import('./screens/DevicePairing'));
+const Login = React.lazy(() => import('./screens/Login'));
 const AuditHistory = React.lazy(() => import('./screens/AuditHistory'));
 
 /** Where the app should land: first-run setup, or straight into the cockpit —
@@ -44,9 +46,34 @@ function entryPath(): string {
   }
 }
 
+/* Account gate (desktop only). The Maestro desktop now requires an account
+   session: until the operator signs in, show the Login screen; the host
+   connection to the server only starts once a session token exists (pushed to
+   main from the auth lib). The web build (!IS_LOCAL) keeps its own token-based
+   RemotePairGate path and skips this entirely. */
+function AccountGate({ children }: { children: React.ReactNode }) {
+  const [authed, setAuthed] = React.useState(() => hasSession());
+  React.useEffect(() => {
+    if (!IS_LOCAL) return;
+    // Push any stored session to main on launch so the host reconnects without
+    // forcing a re-login, then track login/logout to re-render the gate.
+    primeSession();
+    return onAuthChange(() => setAuthed(hasSession()));
+  }, []);
+  if (IS_LOCAL && !authed) {
+    return (
+      <React.Suspense fallback={null}>
+        <Login />
+      </React.Suspense>
+    );
+  }
+  return <>{children}</>;
+}
+
 export function App() {
   return (
     <HashRouter>
+      <AccountGate>
       <RemotePairGate>
       <React.Suspense fallback={null}>
         <Routes>
@@ -73,7 +100,6 @@ export function App() {
           <Route path="/budget" element={<BudgetDashboard />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/feedback" element={<Feedback />} />
-          <Route path="/device-pairing" element={<DevicePairing />} />
           <Route path="/audit" element={<AuditHistory />} />
           <Route path="*" element={<Navigate to={entryPath()} replace />} />
         </Routes>
@@ -81,6 +107,7 @@ export function App() {
       <UpdateBanner />
       <NotificationCenter />
       </RemotePairGate>
+      </AccountGate>
     </HashRouter>
   );
 }
