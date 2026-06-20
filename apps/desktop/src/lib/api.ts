@@ -515,6 +515,7 @@ interface Bridge {
   importAsset?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   assetImage?: (assetId: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   readFile?: (projectId: string, p: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  writeFile?: (projectId: string, p: string, text: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   listDir?: (projectId: string, p?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   listProjectFiles?: (projectId: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   runCommand?: (projectId: string, command: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
@@ -854,6 +855,16 @@ export const api = {
     const r = await bridge.readFile(projectId, p);
     if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'read failed');
     return r.data as { path: string; text: string; bytes: number; truncated: boolean };
+  },
+  /** Overwrite an existing text file with new content — desktop only, confined
+      to the project folder. Backs in-app file edits made from a chat link.
+      Returns null on web/phone (no bridge); throws on the desktop only when
+      the main-side validation rejects the write. */
+  writeFile: async (projectId: string, p: string, text: string): Promise<{ path: string; bytes: number; mtime: number } | null> => {
+    if (!bridge?.writeFile) return null;
+    const r = await bridge.writeFile(projectId, p, text);
+    if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'write failed');
+    return r.data as { path: string; bytes: number; mtime: number };
   },
   /** List a directory inside the project — desktop only; null in the browser. */
   listDir: async (projectId: string, p?: string): Promise<{ path: string; entries: DirEntry[] } | null> => {
