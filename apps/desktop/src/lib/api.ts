@@ -30,6 +30,17 @@ export interface Project {
   kind?: ProjectKind;
   path?: string;
   repoUrl?: string;
+  /** Worktree base branch override (else auto-detected from origin/HEAD). */
+  defaultBaseBranch?: string;
+  /** Shell script run once in each new session worktree (e.g. install deps). */
+  setupScript?: string;
+  /** Gitignored files copied into each new session worktree. Default ['.env*'].
+      A committed `.worktreeinclude` at the repo root overrides this. */
+  copyGlobs?: string[];
+  /** Whether sessions of this project may run their dev server / background tasks
+      at the same time. 'concurrent' (default) → each session gets its own isolated
+      MOCHI_PORT block; 'nonconcurrent' → one session at a time (shared port/DB/stack). */
+  runMode?: 'concurrent' | 'nonconcurrent';
   /** Manual display order from drag-and-drop. Lower = earlier. */
   order?: number;
   createdAt: number;
@@ -741,7 +752,7 @@ export const api = {
   createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }) =>
     call<Project>('createProject', { ...input }, () =>
       req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) })),
-  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template'>>) =>
+  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode'>>) =>
     call<Project>('updateProject', { id, ...patch }, () =>
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   reorderProjects: (ids: string[]) =>

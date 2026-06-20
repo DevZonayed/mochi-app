@@ -6,9 +6,10 @@ import { SessionStateDot } from './SessionStateDot';
 import { useSessionGitState } from '../lib/useSessionGitState';
 
 /* Per-session PR/git status chip + the single contextual action (Conductor-style).
-   Subscribes to live git-status events via the shared cache; outward actions
-   confirm first. Renders nothing for non-repo sessions or one-off jobs
-   (no sessionId).
+   Subscribes to live git-status events via the shared cache. Every outward action
+   confirms first, shows a persistent success/failure message (not a fleeting
+   icon), and PR/merge actions are gated on a connected GitHub account. Renders
+   nothing for non-repo sessions or one-off jobs (no sessionId).
 
    Two variants:
    • `inline` (default) — the small chip used in the transcript header
@@ -25,15 +26,22 @@ const btnHeader: React.CSSProperties = {
   font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer',
 };
 
+type RunOpts = { confirm?: string; okText?: string };
+type Runner = (fn: () => Promise<{ ok: boolean; reason?: string }>, opts?: RunOpts) => void;
 interface Action { label: string; go: () => void; tone?: 'primary' | 'danger' }
 
-function actionFor(st: SessionGitStatus, run: (fn: () => Promise<{ ok: boolean; reason?: string }>, confirmMsg?: string) => void): Action | null {
+/** PR/merge actions require a connected GitHub account with repo scope. */
+function actionNeedsGitHub(state: SessionGitState): boolean {
+  return state === 'ready-for-pr' || state === 'pr-mergeable';
+}
+
+function actionFor(st: SessionGitStatus, run: Runner): Action | null {
   switch (st.state) {
-    case 'ready-to-push': return { label: 'Push', go: () => run(() => api.pushSession(st.sessionId)) };
-    case 'ready-for-pr':  return { label: 'Create PR', tone: 'primary', go: () => run(() => api.createSessionPR(st.sessionId), 'Push the branch and open a pull request on GitHub?') };
-    case 'pr-mergeable':  return { label: 'Merge', tone: 'primary', go: () => run(() => api.mergeSessionPR(st.sessionId), 'Merge this pull request on GitHub?') };
-    case 'pr-conflicts':  return { label: 'Resolve', tone: 'danger', go: () => run(() => api.resolveSession(st.sessionId).then(r => ({ ok: r.ok, reason: r.conflicts?.length ? `Conflicts: ${r.conflicts.join(', ')}` : r.reason }))) };
-    case 'pr-merged':     return { label: 'Archive', go: () => run(() => api.archiveSessionWorktree(st.sessionId), 'Remove this session’s worktree?') };
+    case 'ready-to-push': return { label: 'Push', go: () => run(() => api.pushSession(st.sessionId), { confirm: 'Push this branch to the remote?', okText: 'Pushed' }) };
+    case 'ready-for-pr':  return { label: 'Create PR', tone: 'primary', go: () => run(() => api.createSessionPR(st.sessionId), { confirm: 'Push the branch and open a pull request on GitHub?', okText: 'PR opened' }) };
+    case 'pr-mergeable':  return { label: 'Merge', tone: 'primary', go: () => run(() => api.mergeSessionPR(st.sessionId), { confirm: 'Merge this pull request on GitHub?', okText: 'Merged' }) };
+    case 'pr-conflicts':  return { label: 'Resolve', tone: 'danger', go: () => run(() => api.resolveSession(st.sessionId).then(r => ({ ok: r.ok, reason: r.conflicts?.length ? `Conflicts remain: ${r.conflicts.join(', ')}` : r.reason })), { confirm: 'Merge the base branch in to resolve conflicts? This updates your worktree.', okText: 'Resolved' }) };
+    case 'pr-merged':     return { label: 'Archive', go: () => run(() => api.archiveSessionWorktree(st.sessionId), { confirm: 'Remove this session’s worktree?', okText: 'Archived' }) };
     default: return null;
   }
 }
@@ -50,7 +58,8 @@ export interface GitStatusBarProps {
 export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitStatusBarProps) {
   const st = useSessionGitState(sessionId);
   const [busy, setBusy] = React.useState(false);
-  const [err, setErr] = React.useState('');
+  const [msg, setMsg] = React.useState<{ kind: 'err' | 'ok'; text: string } | null>(null);
+  const [gh, setGh] = React.useState<{ connected: boolean; hasRepoScope: boolean } | null>(null);
 
   // The cache only auto-fetches without PR (cheap). The header variant wants
   // a one-time WITH-PR refresh on first mount per session so the action label
@@ -62,20 +71,36 @@ export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitSta
     api.refreshSessionGitStatus(sessionId).catch(() => {});
   }, [sessionId]);
 
+  // Precondition: when the available action targets GitHub, verify the account is
+  // connected (with repo scope) so we can warn BEFORE the user clicks and the
+  // server rejects it.
+  const needsGitHub = st ? actionNeedsGitHub(st.state) : false;
+  React.useEffect(() => {
+    if (!needsGitHub) { setGh(null); return; }
+    let on = true;
+    api.githubStatus().then(s => { if (on) setGh({ connected: s.connected, hasRepoScope: s.hasRepoScope }); }).catch(() => { if (on) setGh(null); });
+    return () => { on = false; };
+  }, [needsGitHub]);
+
   if (!sessionId || !st || st.state === 'no-repo') return null;
 
-  const run = async (fn: () => Promise<{ ok: boolean; reason?: string }>, confirmMsg?: string) => {
-    if (confirmMsg && !window.confirm(confirmMsg)) return;
-    setBusy(true); setErr('');
+  const ghBlocked = needsGitHub && gh != null && (!gh.connected || !gh.hasRepoScope);
+
+  const run: Runner = async (fn, opts = {}) => {
+    if (opts.confirm && !window.confirm(opts.confirm)) return;
+    setBusy(true); setMsg(null);
     try {
       const r = await fn();
-      if (!r.ok && r.reason) setErr(r.reason);
+      if (!r.ok) setMsg({ kind: 'err', text: r.reason || 'Action failed.' });
+      else if (opts.okText) setMsg({ kind: 'ok', text: opts.okText });
     } catch (e) {
-      setErr(e instanceof Error ? e.message : 'failed');
+      setMsg({ kind: 'err', text: e instanceof Error ? e.message : 'Action failed.' });
     } finally {
       setBusy(false);
     }
-    try { await api.refreshSessionGitStatus(sessionId); } catch { /* keep last */ }
+    // Don't silently swallow a refresh failure — surface it if nothing else did.
+    try { await api.refreshSessionGitStatus(sessionId); }
+    catch { setMsg(m => m ?? { kind: 'err', text: 'Couldn’t refresh git status — it may be stale.' }); }
   };
 
   const action = actionFor(st, run);
@@ -84,10 +109,20 @@ export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitSta
   const code = codename || codenameFromBranch(st.branch);
   const label = SESSION_STATE_LABELS[st.state as SessionGitState];
 
+  // Persistent feedback: a result message (sticks until the next action) or, when
+  // a GitHub-bound action can't proceed, a standing "Connect GitHub" warning.
+  const feedback = msg
+    ? <span title={msg.text} style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: msg.kind === 'err' ? 'var(--red)' : 'var(--green, #34c759)', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{msg.kind === 'err' ? '⚠ ' : '✓ '}{msg.text}</span>
+    : ghBlocked
+      ? <span title="Sign in to GitHub under Settings → GitHub (needs repo scope)." style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--orange, #ff9500)' }}>⚠ Connect GitHub</span>
+      : null;
+
+  const actionDisabled = busy || ghBlocked;
+
   if (variant === 'header') {
     const actionBtn = action
-      ? <button disabled={busy} onClick={action.go} style={{
-          ...btnHeader,
+      ? <button disabled={actionDisabled} onClick={action.go} title={ghBlocked ? 'Connect GitHub first' : undefined} style={{
+          ...btnHeader, ...(actionDisabled ? { opacity: 0.5, cursor: 'not-allowed' } : {}),
           ...(action.tone === 'danger' ? { color: 'var(--red)', borderColor: 'color-mix(in srgb, var(--red) 45%, transparent)', background: 'color-mix(in srgb, var(--red) 13%, transparent)' } : {}),
         }}>{busy ? '…' : action.label}</button>
       : null;
@@ -111,7 +146,7 @@ export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitSta
           </button>
         )}
         {actionBtn}
-        {err && <span title={err} style={{ color: 'var(--red)' }}>⚠</span>}
+        {feedback}
       </div>
     );
   }
@@ -128,8 +163,8 @@ export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitSta
       {st.local.behind > 0 && <span title="commits behind base">↓{st.local.behind}</span>}
       {checkSummary && <span>· {checkSummary}</span>}
       {st.pr && <button onClick={() => window.open(st.pr!.url, '_blank')} style={btnInline}>PR #{st.pr.number}</button>}
-      {action && <button disabled={busy} onClick={action.go} style={{ ...btnInline, color: action.tone === 'danger' ? 'var(--red)' : 'var(--blue)' }}>{busy ? '…' : action.label}</button>}
-      {err && <span style={{ color: 'var(--red)' }} title={err}>⚠</span>}
+      {action && <button disabled={actionDisabled} onClick={action.go} title={ghBlocked ? 'Connect GitHub first' : undefined} style={{ ...btnInline, color: action.tone === 'danger' ? 'var(--red)' : 'var(--blue)', ...(actionDisabled ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}>{busy ? '…' : action.label}</button>}
+      {feedback}
     </div>
   );
 }
