@@ -4,6 +4,15 @@ import { closeDb } from './db.js';
 
 const HAS_DB = !!process.env.TEST_DATABASE_URL;
 
+describe('auth config', () => {
+  it('disables the CSRF/origin check so native clients (null Origin) can sign in', () => {
+    // Electron/RN send a null/no Origin; the origin check is auto-skipped in test
+    // env, so this asserts the prod-relevant config explicitly. Bearer-token auth
+    // is not CSRF-exposed.
+    expect(auth.options.advanced?.disableCSRFCheck).toBe(true);
+  });
+});
+
 describe.skipIf(!HAS_DB)('auth (email/password + bearer session)', () => {
   beforeAll(async () => { await migrateAuth(); });
   afterAll(async () => { await closeDb(); });
