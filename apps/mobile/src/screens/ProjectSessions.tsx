@@ -1,4 +1,4 @@
-import React, { useCallback } from 'react';
+import React, { useCallback, useMemo } from 'react';
 import { View, Text, Pressable, ScrollView, RefreshControl } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
@@ -29,8 +29,14 @@ export function ProjectSessionsScreen() {
 
   // Sessions + jobs come from the global SyncStore, filtered for this project.
   // No per-screen cache key — SSE updates flow in automatically.
-  const sessions = useSyncStore((s) => s.sessions.filter((x) => x.projectId === projectId));
-  const jobs = useSyncStore((s) => s.jobs.filter((x) => x.projectId === projectId));
+  // Select the STABLE store arrays, then derive per-project slices with useMemo.
+  // Filtering inside the selector returned a fresh array on every getSnapshot,
+  // which useSyncExternalStore reads as "changed" every render → infinite loop
+  // ("Maximum update depth exceeded") the moment this screen mounts.
+  const allSessions = useSyncStore((s) => s.sessions);
+  const allJobs = useSyncStore((s) => s.jobs);
+  const sessions = useMemo(() => allSessions.filter((x) => x.projectId === projectId), [allSessions, projectId]);
+  const jobs = useMemo(() => allJobs.filter((x) => x.projectId === projectId), [allJobs, projectId]);
   const settled = useSyncStore((s) => s.settled);
   const syncError = useSyncStore((s) => s.syncError);
   const syncing = useSyncStore((s) => s.syncing);

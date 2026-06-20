@@ -294,7 +294,11 @@ export function ApprovalsScreen() {
   const insets = useSafeAreaInsets();
   // Pending approvals + projects come from the unified SyncStore — live SSE
   // updates upsert/resolve gates in place; pull-to-refresh covers offline naps.
-  const pending = useSyncStore((s) => s.approvals.filter((a) => a.status === 'pending'));
+  // Select the stable array; derive the pending slice in useMemo. A `.filter()`
+  // inside the selector returns a new array each getSnapshot → useSyncExternalStore
+  // infinite-loops ("Maximum update depth exceeded").
+  const allApprovals = useSyncStore((s) => s.approvals);
+  const pending = useMemo(() => allApprovals.filter((a) => a.status === 'pending'), [allApprovals]);
   const projects = useSyncStore((s) => s.projects);
   const [approvingId, setApprovingId] = useState<string | null>(null);
   // Local "hidden after a tap" set so the user sees the approval disappear

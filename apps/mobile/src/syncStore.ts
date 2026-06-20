@@ -20,7 +20,7 @@
    calls await the same promise). SSE events that arrive during a pull are
    merged after — they only bump entities we already have or are about to. */
 
-import { useSyncExternalStore } from 'react';
+import { useSyncExternalStoreWithSelector } from 'use-sync-external-store/shim/with-selector';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   api,
@@ -120,9 +120,17 @@ function subscribe(cb: () => void): () => void { listeners.add(cb); return () =>
 function getSnapshot(): SyncState { return state; }
 
 /** Subscribe to a slice of the sync store. Re-renders the calling component
-    only when the selector's return value changes by `Object.is`. */
+    only when the selector's return value changes by `Object.is`.
+
+    Uses `useSyncExternalStoreWithSelector` (not the bare `useSyncExternalStore`)
+    so the selection is MEMOIZED per snapshot: the selector only re-runs when the
+    underlying `state` reference actually changes. This makes derived selectors —
+    `(s) => s.jobs.filter(...).sort(...)` — safe. With the bare hook those return
+    a fresh array on every call, which React reads as "store changed" on every
+    render → "The result of getSnapshot should be cached" → "Maximum update depth
+    exceeded". Memoizing here removes that whole class of bug for every screen. */
 export function useSyncStore<T>(selector: (s: SyncState) => T): T {
-  return useSyncExternalStore(subscribe, () => selector(state), () => selector(state));
+  return useSyncExternalStoreWithSelector(subscribe, getSnapshot, getSnapshot, selector);
 }
 
 /** Read the current state outside of a React component (for one-shot uses
