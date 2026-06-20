@@ -4,15 +4,17 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useTheme } from './theme';
 import { Icon, type IconName } from './Icon';
-import { getFlag, ONBOARDED } from './storage';
 import { api } from './api';
+import { isAuthed } from './auth';
 import { useLive } from './useLive';
 import { navRef } from './navRef';
+import { flushPendingNav } from './pushNav';
 
 import { HomeScreen } from './screens/Home';
 import { ApprovalsScreen } from './screens/Approvals';
 import { SettingsScreen } from './screens/Settings';
-import { OnboardingScreen } from './screens/Onboarding';
+import { LoginScreen, RegisterScreen } from './screens/Auth';
+import { DevicesScreen } from './screens/Devices';
 import { JobTimelineScreen } from './screens/JobTimeline';
 import { DiffReviewScreen } from './screens/DiffReview';
 import { NewJobScreen } from './screens/NewJob';
@@ -27,7 +29,9 @@ import { CreateProjectScreen } from './screens/CreateProject';
 
 export type RootStackParamList = {
   Tabs: undefined;
-  Onboarding: undefined;
+  Login: undefined;
+  Register: undefined;
+  Devices: { firstRun?: boolean } | undefined;
   JobTimeline: { id?: string; jobId?: string } | undefined;
   DiffReview: { jobId?: string } | undefined;
   NewJob: { projectId?: string } | undefined;
@@ -90,10 +94,12 @@ export function RootNavigator() {
     },
   };
   return (
-    <NavigationContainer theme={navTheme} ref={navRef}>
-      <Stack.Navigator screenOptions={{ headerShown: false }} initialRouteName={getFlag(ONBOARDED) ? 'Tabs' : 'Onboarding'}>
+    <NavigationContainer theme={navTheme} ref={navRef} onReady={flushPendingNav}>
+      <Stack.Navigator screenOptions={{ headerShown: false }} initialRouteName={isAuthed() ? 'Tabs' : 'Login'}>
         <Stack.Screen name="Tabs" component={Tabs} />
-        <Stack.Screen name="Onboarding" component={OnboardingScreen} />
+        <Stack.Screen name="Login" component={LoginScreen} />
+        <Stack.Screen name="Register" component={RegisterScreen} />
+        <Stack.Screen name="Devices" component={DevicesScreen} />
         <Stack.Screen name="JobTimeline" component={JobTimelineScreen} />
         <Stack.Screen name="DiffReview" component={DiffReviewScreen} />
         <Stack.Screen name="NewJob" component={NewJobScreen} options={{ presentation: 'modal' }} />

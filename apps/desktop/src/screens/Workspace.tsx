@@ -14,10 +14,25 @@ import { ProjectPanel } from '../lib/ProjectPanel';
 import { RightSidebar, type CheckItem } from '../lib/RightSidebar';
 import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
+import { displayCodename } from '../lib/git-types';
+import { SessionStateDot } from './SessionStateDot';
+import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
   return <span aria-label="working" style={{ width: size, height: size, borderRadius: '50%', flexShrink: 0, boxSizing: 'border-box', border: `2px solid color-mix(in srgb, ${color} 24%, transparent)`, borderTopColor: color, animation: 'ws-spin 0.7s linear infinite' }} />;
+}
+
+/** Live per-session state dot for the rail. Subscribes via the shared cache. */
+function SessionStateDotForId({ sessionId }: { sessionId: string }) {
+  const state = useSessionStateOnly(sessionId);
+  return <SessionStateDot state={state} size={7} reserveSpace />;
+}
+
+/** Live worst-state-wins rollup dot for a project's chats. */
+function ProjectRollupDot({ projectId, sessionIds }: { projectId: string; sessionIds: string[] }) {
+  const state = useProjectRollupState(projectId, sessionIds);
+  return <SessionStateDot state={state} size={8} reserveSpace />;
 }
 
 /* Drag-and-drop project reorder — native HTML5 DnD, the same pattern as the
@@ -407,18 +422,27 @@ export default function Workspace() {
         background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
         {runningSessions.has(s.id)
           ? <Loader size={13} color={projColor(p)} />
-          : <Icon name="chat" size={13} style={{ flexShrink: 0, color: open ? projColor(p) : 'var(--ink-tertiary)' }} />}
+          : <Icon name={s.branch ? 'gitMerge' : 'chat'} size={13} style={{ flexShrink: 0, color: open ? projColor(p) : 'var(--ink-tertiary)' }} />}
+        <SessionStateDotForId sessionId={s.id} />
         {renamingId === s.id ? (
           <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
             onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
             style={{ flex: 1, minWidth: 0, border: '1px solid var(--blue)', borderRadius: 6, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1.3 var(--font-text)' }} />
         ) : (
-          <span onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
-            style={{ flex: 1, minWidth: 0, font: `${isActive ? 600 : 500} var(--fs-footnote)/1.35 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (isActive ? 'var(--ink)' : 'var(--ink-secondary)'), whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {s.title}
+          <span title="Double-click to rename" onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
+            style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'baseline', gap: 6, font: `${isActive ? 600 : 500} var(--fs-footnote)/1.35 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (isActive ? 'var(--ink)' : 'var(--ink-secondary)') }}>
+            <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
+            {s.codename && (
+              <span title={`Session codename · ${displayCodename(s.codename)}`} style={{ flexShrink: 0, font: '600 9px/1 var(--font-mono)', letterSpacing: '0.05em', color: 'var(--ink-tertiary)', textTransform: 'uppercase' }}>
+                {s.codename}
+              </span>
+            )}
           </span>
         )}
         <span className="ws-act" style={{ display: 'inline-flex', gap: 1, flexShrink: 0 }}>
+          <button title="Rename chat" onClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}>
+            <Icon name="pencil" size={12} />
+          </button>
           {s.archived ? (
             <button title="Unarchive" onClick={e => { e.stopPropagation(); archiveSession(s, false); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)' }}>
               <Icon name="archive" size={12} />
@@ -564,7 +588,10 @@ export default function Workspace() {
                     {projRunning
                       ? <Loader size={14} color={projColor(p)} />
                       : <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p) }} />}
-                    <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
+                    <span style={{ flex: 1, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 6, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)' }}>
+                      <span style={{ minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
+                      <ProjectRollupDot projectId={p.id} sessionIds={chats.map(c => c.id)} />
+                    </span>
                     {chats.length > 0 && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{chats.length}</span>}
                     <button className="ws-newchat" title="Project · settings, jobs, memory" onClick={e => { e.stopPropagation(); setMenuProj(m => m === p.id ? null : p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0, position: 'relative' }}>
                       <Icon name="more" size={15} />
@@ -642,6 +669,10 @@ export default function Workspace() {
               {tabs.map(t => {
                 const on = t.key === activeKey;
                 const p = projById[t.projectId];
+                // A chat tab is session-backed → its title can be renamed inline
+                // (mirrors the rail's double-click → input → commit flow).
+                const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
+                const editing = chatTab && renamingId === t.sessionId;
                 return (
                   <div key={t.key} data-tabkey={t.key} className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)}
                     style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
@@ -654,7 +685,15 @@ export default function Workspace() {
                       : t.kind === 'project'
                       ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
                       : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />}
-                    <span style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
+                    {editing && t.sessionId ? (
+                      <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
+                        onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}
+                        style={{ minWidth: 0, maxWidth: 150, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
+                    ) : (
+                      <span title={chatTab ? 'Double-click to rename' : undefined}
+                        onDoubleClick={chatTab ? (e => { e.stopPropagation(); setRenamingId(t.sessionId!); setRenameVal(t.title); }) : undefined}
+                        style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
+                    )}
                     <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
                       <Icon name="x" size={11} stroke={2.6} />
                     </button>
@@ -675,12 +714,18 @@ export default function Workspace() {
                       {tabs.map(t => {
                         const on = t.key === activeKey;
                         const p = projById[t.projectId];
+                        const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
                         return (
                           <div key={t.key} className="ws-ovf-item" onClick={() => { setActiveKey(t.key); setOvfOpen(false); }}
                             style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 9px', borderRadius: 8, cursor: 'pointer', background: on ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
                             <Icon name={t.kind === 'file' ? 'file' : t.kind === 'image' ? 'image' : 'chat'} size={13} style={{ flexShrink: 0, color: t.kind && t.kind !== 'chat' ? 'var(--ink-secondary)' : projColor(p) }} />
                             <span style={{ flex: 1, minWidth: 0, font: `${on ? 600 : 500} var(--fs-footnote)/1.25 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
                             {p && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', flexShrink: 0, maxWidth: 70, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>}
+                            {chatTab && t.sessionId && (
+                              <button title="Rename chat" onClick={e => { e.stopPropagation(); setOvfOpen(false); setActiveKey(t.key); setRenamingId(t.sessionId!); setRenameVal(t.title); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+                                <Icon name="pencil" size={11} stroke={2.4} />
+                              </button>
+                            )}
                             <button title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
                               <Icon name="x" size={11} stroke={2.4} />
                             </button>

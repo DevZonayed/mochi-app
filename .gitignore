@@ -2,6 +2,13 @@
 node_modules/
 .pnpm-store/
 
+# This is a pnpm workspace — pnpm-lock.yaml is the only lockfile. A stray
+# package-lock.json / yarn.lock makes EAS Build (and CI) pick npm/yarn and run
+# `npm ci` against an empty lockfile, so `expo` + plugins never install and the
+# build dies in "Read app config". Never commit/upload these.
+package-lock.json
+yarn.lock
+
 # builds / generated
 dist/
 dist-electron/
@@ -25,6 +32,12 @@ release/
 *.db-journal
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# operator-local skills installed via add_skill_to_project
+.claude/
 
 # env / secrets
 .env

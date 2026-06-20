@@ -4,11 +4,11 @@
    workspace instead of buried in a separate screen. */
 
 import React from 'react';
-import { api, type Project, type Job, type ProjectMemory, type InstalledSkill, type RegistrySkillSummary } from './api';
+import { api, type Project, type Job, type ProjectMemory, type InstalledSkill, type RegistrySkillSummary, type WaChat, ApiError } from './api';
 import { Icon, type IconName } from './icons';
 import { Switch } from './ui';
 
-type Section = 'settings' | 'instructions' | 'jobs' | 'memory' | 'skills';
+type Section = 'settings' | 'instructions' | 'jobs' | 'memory' | 'skills' | 'whatsapp';
 
 function relTime(ms: number): string {
   const s = Math.max(0, (Date.now() - ms) / 1000);
@@ -35,6 +35,7 @@ export function ProjectPanel({ projectId, section = 'settings' }: { projectId: s
     { key: 'instructions', label: 'Instructions', icon: 'bookmark' },
     { key: 'memory', label: 'Memory', icon: 'spark' },
     { key: 'skills', label: 'Skills', icon: 'spark' },
+    { key: 'whatsapp', label: 'WhatsApp', icon: 'whatsapp' },
     { key: 'jobs', label: 'Jobs', icon: 'jobs' },
   ];
 
@@ -64,6 +65,7 @@ export function ProjectPanel({ projectId, section = 'settings' }: { projectId: s
         {tab === 'instructions' && project && <InstructionsBody project={project} patch={patch} />}
         {tab === 'memory' && <MemoryBody projectId={projectId} />}
         {tab === 'skills' && <SkillsBody projectId={projectId} />}
+        {tab === 'whatsapp' && <WhatsAppBody projectId={projectId} />}
         {tab === 'jobs' && <JobsBody projectId={projectId} />}
       </div>
     </div>
@@ -211,10 +213,13 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+const settingsInput: React.CSSProperties = { width: '100%', border: '1px solid var(--hairline)', borderRadius: 8, padding: '6px 10px', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none' };
+
 function SettingsBody({ project, patch }: { project: Project; patch: (p: Partial<Project>) => void }) {
+  const globsText = (project.copyGlobs ?? []).join(', ');
   return (
     <div style={{ maxWidth: 560, display: 'flex', flexDirection: 'column', gap: 12 }}>
-      <Field label="Name"><input defaultValue={project.name} key={project.id} onBlur={e => { const v = e.target.value.trim(); if (v && v !== project.name) patch({ name: v }); }} style={{ width: '100%', border: '1px solid var(--hairline)', borderRadius: 8, padding: '6px 10px', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none' }} /></Field>
+      <Field label="Name"><input defaultValue={project.name} key={project.id} onBlur={e => { const v = e.target.value.trim(); if (v && v !== project.name) patch({ name: v }); }} style={settingsInput} /></Field>
       <Field label="Type"><span style={{ textTransform: 'capitalize' }}>{project.kind ?? 'general'}</span></Field>
       {project.path && <Field label="Folder">
         <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
@@ -223,6 +228,36 @@ function SettingsBody({ project, patch }: { project: Project; patch: (p: Partial
         </span>
       </Field>}
       {project.repoUrl && <Field label="Repository"><code style={{ font: '400 var(--fs-caption)/1.4 var(--font-mono)', color: 'var(--ink-secondary)' }}>{project.repoUrl}</code></Field>}
+
+      {project.path && <>
+        <div style={{ marginTop: 6, paddingTop: 14, borderTop: '0.5px solid var(--separator)', display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <div style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Worktree isolation</div>
+          <div style={{ font: '400 var(--fs-caption)/1.45 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+            Each session runs in its own git worktree. These control how a new worktree is set up and whether sessions can run their dev server in parallel.
+          </div>
+        </div>
+        <Field label="Default branch">
+          <input defaultValue={project.defaultBaseBranch ?? ''} key={project.id + ':base'} placeholder="auto-detect (origin/HEAD)"
+            onBlur={e => { const v = e.target.value.trim(); if (v !== (project.defaultBaseBranch ?? '')) patch({ defaultBaseBranch: v }); }} style={settingsInput} />
+        </Field>
+        <Field label="Run mode">
+          <select value={project.runMode ?? 'concurrent'} onChange={e => patch({ runMode: e.target.value === 'nonconcurrent' ? 'nonconcurrent' : 'concurrent' })} style={{ ...settingsInput, cursor: 'pointer' }}>
+            <option value="concurrent">Concurrent — sessions run in parallel (own MOCHI_PORT each)</option>
+            <option value="nonconcurrent">One at a time — shared port / DB / Docker stack</option>
+          </select>
+        </Field>
+        <Field label="Files to copy">
+          <input defaultValue={globsText} key={project.id + ':globs'} placeholder=".env*, config/*.local.json"
+            onBlur={e => { const next = e.target.value.split(/[,\n]/).map(s => s.trim()).filter(Boolean); if (next.join(',') !== (project.copyGlobs ?? []).join(',')) patch({ copyGlobs: next }); }} style={settingsInput} />
+        </Field>
+        <div style={{ marginTop: -6, marginLeft: 104, font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+          Gitignored files copied into each new worktree. A committed <code style={{ font: '400 var(--fs-caption)/1 var(--font-mono)' }}>.worktreeinclude</code> at the repo root overrides this. Default <code style={{ font: '400 var(--fs-caption)/1 var(--font-mono)' }}>.env*</code>.
+        </div>
+        <Field label="Setup script">
+          <input defaultValue={project.setupScript ?? ''} key={project.id + ':setup'} placeholder="pnpm install"
+            onBlur={e => { const v = e.target.value.trim(); if (v !== (project.setupScript ?? '')) patch({ setupScript: v }); }} style={settingsInput} />
+        </Field>
+      </>}
     </div>
   );
 }
@@ -277,6 +312,70 @@ function MemoryBody({ projectId }: { projectId: string }) {
             ))}
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+function WhatsAppBody({ projectId }: { projectId: string }) {
+  const [assigned, setAssigned] = React.useState<string[] | null>(null);
+  const [chats, setChats] = React.useState<WaChat[]>([]);
+  const [blocked, setBlocked] = React.useState(false);
+  const [picking, setPicking] = React.useState(false);
+  const [q, setQ] = React.useState('');
+
+  const reload = React.useCallback(() => {
+    api.listProjectWaChats(projectId).then(setAssigned).catch((e: unknown) => { if (e instanceof ApiError && e.status === 403) setBlocked(true); setAssigned([]); });
+    api.waListChats().then(setChats).catch(() => {});
+  }, [projectId]);
+  React.useEffect(reload, [reload]);
+
+  const nameOf = (id: string) => chats.find(c => c.chatId === id)?.name ?? id;
+  const add = (id: string) => { void api.addProjectWaChat(projectId, id).then(setAssigned).catch(() => {}); setPicking(false); setQ(''); };
+  const remove = (id: string) => { void api.removeProjectWaChat(projectId, id).then(setAssigned).catch(() => {}); };
+
+  if (blocked) return <div style={{ color: 'var(--ink-tertiary)', font: '400 var(--fs-footnote)/1.5 var(--font-text)' }}>Link your WhatsApp number in <b style={{ color: 'var(--ink)' }}>Comms</b> to assign chats to this project.</div>;
+  if (!assigned) return <div style={{ color: 'var(--ink-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-text)' }}>Loading…</div>;
+
+  const candidates = chats.filter(c => !assigned.includes(c.chatId) && (!q.trim() || (c.name + ' ' + c.lastMessageText).toLowerCase().includes(q.trim().toLowerCase())));
+
+  return (
+    <div style={{ maxWidth: 560, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <p style={{ margin: 0, font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+        Chats assigned here are tracked for this project: incoming messages route to it, a chat that goes quiet is summarized to you, and the agent prefers these chats. Read & reply to any chat in the <b style={{ color: 'var(--ink)' }}>WhatsApp</b> space.
+      </p>
+
+      {assigned.length === 0 ? (
+        <div style={{ padding: 20, textAlign: 'center', borderRadius: 12, border: '0.5px dashed var(--separator-strong)', font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>No WhatsApp chats assigned yet.</div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {assigned.map(id => (
+            <div key={id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderRadius: 12, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)' }}>
+              <span style={{ width: 30, height: 30, borderRadius: '50%', display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--green) 16%, transparent)', color: 'var(--green)' }}><Icon name="whatsapp" size={16} /></span>
+              <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{nameOf(id)}</span>
+              <button onClick={() => remove(id)} style={{ height: 30, padding: '0 12px', borderRadius: 8, background: 'transparent', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Remove</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {picking ? (
+        <div style={{ borderRadius: 12, border: '0.5px solid var(--separator)', background: 'var(--bg-elevated)', overflow: 'hidden' }}>
+          <input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder="Search chats to add"
+            style={{ width: '100%', height: 40, padding: '0 14px', boxSizing: 'border-box', border: 'none', borderBottom: '0.5px solid var(--separator)', background: 'transparent', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)' }} />
+          <div style={{ maxHeight: 240, overflow: 'auto' }}>
+            {candidates.length === 0 ? <div style={{ padding: 14, font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{chats.length ? 'No more chats to add.' : 'No chats synced yet.'}</div>
+              : candidates.slice(0, 50).map(c => (
+                <button key={c.chatId} onClick={() => add(c.chatId)} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '9px 14px', textAlign: 'left', borderBottom: '0.5px solid color-mix(in srgb, var(--separator) 50%, transparent)' }}>
+                  <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{c.name} <span style={{ color: 'var(--ink-tertiary)' }}>· {c.kind}</span></span>
+                  <Icon name="plus" size={15} style={{ color: 'var(--green)' }} />
+                </button>
+              ))}
+          </div>
+          <button onClick={() => { setPicking(false); setQ(''); }} style={{ width: '100%', height: 36, background: 'transparent', color: 'var(--ink-secondary)', font: '500 var(--fs-caption)/1 var(--font-text)', borderTop: '0.5px solid var(--separator)' }}>Cancel</button>
+        </div>
+      ) : (
+        <button onClick={() => setPicking(true)} style={{ alignSelf: 'flex-start', display: 'flex', alignItems: 'center', gap: 7, height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}><Icon name="plus" size={16} /> Assign a chat</button>
       )}
     </div>
   );

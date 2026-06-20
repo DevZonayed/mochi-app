@@ -30,6 +30,17 @@ export interface Project {
   kind?: ProjectKind;
   path?: string;
   repoUrl?: string;
+  /** Worktree base branch override (else auto-detected from origin/HEAD). */
+  defaultBaseBranch?: string;
+  /** Shell script run once in each new session worktree (e.g. install deps). */
+  setupScript?: string;
+  /** Gitignored files copied into each new session worktree. Default ['.env*'].
+      A committed `.worktreeinclude` at the repo root overrides this. */
+  copyGlobs?: string[];
+  /** Whether sessions of this project may run their dev server / background tasks
+      at the same time. 'concurrent' (default) → each session gets its own isolated
+      MOCHI_PORT block; 'nonconcurrent' → one session at a time (shared port/DB/stack). */
+  runMode?: 'concurrent' | 'nonconcurrent';
   /** Manual display order from drag-and-drop. Lower = earlier. */
   order?: number;
   createdAt: number;
@@ -44,6 +55,19 @@ export interface ChatSession {
   archived?: number;
   primary?: RoleChoice;
   reviewer?: RoleChoice | 'off';
+  /** Isolated git branch for this chat (Conductor-style), once checked out. */
+  branch?: string;
+  /** Absolute path of this session's git worktree. */
+  worktreePath?: string;
+  /** The base branch this session's worktree was forked from. */
+  baseBranch?: string;
+  /** Set when the session's worktree has been pruned/archived. */
+  archivedAt?: number;
+  /** Per-session city callsign ("lyon", "porto" …). Stable; appears in the
+      branch path (`mochi/<codename>/<slug>`) AND in the rail/header. */
+  codename?: string;
+  /** Timestamp the branch was auto-renamed to its task-derived slug. Set once. */
+  branchRenamedAt?: number;
   /** Set when this chat was imported from an external store (read-only history). */
   importedFrom?: ConvSource;
   externalId?: string;
@@ -69,9 +93,11 @@ export interface ConversationScan {
   conversations: ScannedConversation[];
 }
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result' | 'ask' | 'review' | 'image';
+  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image';
   text: string;
   name?: string;
+  /** tool: secondary de-emphasized detail (e.g. raw shell command behind a Bash description). */
+  cmd?: string;
   toolStatus?: 'running' | 'done' | 'error';
   verdict?: 'approved' | 'needs-work';
   /** review only: the primary fixed the flagged findings → show as resolved. */
@@ -276,18 +302,22 @@ export interface ModelGroup {
 }
 /** One connected/recent remote device, reported by the relay's device registry. */
 export interface RemoteDevice { id: string; name: string | null; live: boolean; lastSeen: number }
+/** A device registered to the account, from GET /api/devices (account server). */
+export interface AccountDevice {
+  id: string;
+  role: 'host' | 'remote';
+  name: string | null;
+  platform: string | null;
+  deckId: string | null;
+  online: boolean;
+  lastSeen: number | null;
+}
 /** Whether the `gh` CLI is available (system or our managed download). */
 export interface GhState { installed: boolean; source: 'system' | 'managed' | 'none'; version: string | null; path: string | null; supported: boolean }
 /** Live frames during a GitHub OAuth sign-in: downloading gh, then the one-time code. */
 export type GithubDevice =
   | { stage: 'downloading-cli'; pct: number }
   | { stage: 'code'; userCode: string; verificationUri: string };
-export interface PairingInfo {
-  token: string;
-  relayUrl: string;
-  /** Live remote devices (phone/web), reported by the relay. */
-  devices?: RemoteDevice[];
-}
 export type AppEventKind =
   | 'job-done' | 'job-failed' | 'job-cancelled'
   | 'approval-created' | 'approval-resolved'
@@ -428,8 +458,26 @@ export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; 
 export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; provider?: CommsProvider; projectId: string | null; sessionId?: string | null; permissions: ChatPermissions; boundAt: number }
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
 export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
-export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummary?: { text: string; chatName: string; at: number } | null }
-export interface WaChatSummary { chatId: string; name: string; kind: 'dm' | 'group'; lastMessageAt: number; lastReportedAt: number; count: number }
+export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummaries?: { id: string; text: string; chatName: string; at: number }[]; agentSendToOthers?: boolean; notifyJid?: string | null }
+export type WaChatKind = 'dm' | 'group' | 'channel';
+export interface WaChatSummary { chatId: string; name: string; kind: WaChatKind; lastMessageAt: number; lastReportedAt: number; count: number }
+/** A WhatsApp chat as shown in the WhatsApp workspace (mirrors electron WaChatMeta). */
+export interface WaChat {
+  chatId: string; name: string; kind: WaChatKind; avatarUrl?: string | null;
+  lastMessageAt: number; lastMessageText: string; lastMessageFromMe: boolean;
+  unreadCount: number; pinned?: boolean; muted?: boolean; isContact?: boolean; lastReportedAt: number;
+}
+export interface WaReaction { emoji: string; fromMe: boolean }
+export interface WaMediaRef { kind: string; mimetype?: string; fileName?: string; seconds?: number; sizeBytes?: number; thumbBase64?: string }
+export interface WaMediaData { dataUrl: string; mimetype: string; fileName?: string }
+/** A WhatsApp message in the conversation view (mirrors electron WaStoredMessage). */
+export interface WaMessage {
+  id: string; msgId?: string; chatId: string; fromMe: boolean; senderId?: string;
+  senderName: string; text: string; kind: string; ts: number;
+  quotedText?: string; reactions?: WaReaction[]; media?: WaMediaRef; status?: 'sent' | 'delivered' | 'read';
+}
+/** Live wa-message event payload (Mac-local; never relayed). */
+export interface WaMessageEvent { chatId: string; message: WaMessage; chat?: WaChat }
 export type WhatsAppLink = { method: 'qr'; dataUrl: string } | { method: 'pairing'; code: string };
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
@@ -610,6 +658,38 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** The account session token the renderer persisted at login (Better Auth).
+    Read directly from localStorage to avoid a circular import with auth.ts. */
+const SESSION_KEY = 'maestro.session';
+function accountToken(): string {
+  if (typeof window === 'undefined') return '';
+  try { return localStorage.getItem(SESSION_KEY) ?? ''; } catch { return ''; }
+}
+
+/** Raw request against the account server, authed by the session token
+    (Authorization: Bearer …). Used for account-scoped endpoints (devices) that
+    are NOT part of the relay's mirrored dispatch. */
+async function reqAccount<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = accountToken();
+  const hasBody = init?.body != null;
+  const res = await fetch(API_BASE + path, {
+    ...init,
+    headers: {
+      ...(hasBody ? { 'content-type': 'application/json' } : {}),
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers ?? {}),
+    },
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { const body = (await res.json()) as { error?: string; message?: string }; if (body?.error || body?.message) detail = body.error ?? body.message ?? detail; }
+    catch { /* non-JSON error body */ }
+    throw new ApiError(res.status, detail);
+  }
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
 async function reqRegistryAdmin<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getRegistryAdminToken();
   const hasBody = init?.body != null;
@@ -711,7 +791,7 @@ export const api = {
   createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }) =>
     call<Project>('createProject', { ...input }, () =>
       req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) })),
-  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template'>>) =>
+  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode'>>) =>
     call<Project>('updateProject', { id, ...patch }, () =>
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   reorderProjects: (ids: string[]) =>
@@ -871,7 +951,7 @@ export const api = {
     call<ChatBinding>('setChatPermissions', { chatId, permissions }, () => req<ChatBinding>('/api/comms/permissions', { method: 'POST', body: JSON.stringify({ chatId, permissions }) })),
 
   // Comms (WhatsApp — desktop owns the Baileys socket; management is desktop-only)
-  whatsappStatus: () => call<WhatsAppState>('whatsappStatus', {}, () => Promise.resolve({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummary: null } as WhatsAppState)),
+  whatsappStatus: () => call<WhatsAppState>('whatsappStatus', {}, () => Promise.resolve({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [] } as WhatsAppState)),
   listWaChats: () => call<WaChatSummary[]>('listWaChats', {}, () => Promise.resolve([] as WaChatSummary[])),
   /** Begin linking the operator's number. QR by default, or a pairing code if a phone is given. */
   whatsappLink: (phone?: string) => call<WhatsAppLink>('whatsappLink', { phone }, () => Promise.reject(new ApiError(403, 'Linking WhatsApp is only available in the desktop app'))),
@@ -881,6 +961,32 @@ export const api = {
   unlinkWhatsApp: () => call<{ ok: boolean }>('unlinkWhatsApp', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
   /** Approve sending summaries to your own number (one-time gate); flushes any held summary. */
   approveWhatsappSend: () => call<WhatsAppState>('approveWhatsappSend', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Allow/disallow the in-app agent messaging contacts other than your own number (off by default). */
+  setWhatsappAgentSend: (on: boolean) => call<WhatsAppState>('setWhatsappAgentSend', { on }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Set the personal number (digits) where summaries + agent confirmations are sent; '' clears it. */
+  setWhatsappRecipient: (number: string) => call<WhatsAppState>('setWhatsappRecipient', { number }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+
+  // WhatsApp workspace — full chat list + messages + control. Desktop-only: these
+  // carry personal message content and send on your number, so the relay blocks them.
+  waListChats: () => call<WaChat[]>('waListChats', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waGetMessages: (chatId: string, opts: { limit?: number; before?: number } = {}) =>
+    call<WaMessage[]>('waGetMessages', { chatId, ...opts }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waChatInfo: (chatId: string) => call<WaChat | null>('waChatInfo', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waSendText: (chatId: string, text: string) => call<{ ok: boolean }>('waSendText', { chatId, text }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waSendMedia: (chatId: string, media: { path?: string; dataB64?: string; kind: string; mimetype?: string; fileName?: string; caption?: string }) =>
+    call<{ ok: boolean }>('waSendMedia', { chatId, ...media }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waReact: (chatId: string, msgId: string, emoji: string) => call<{ ok: boolean }>('waReact', { chatId, msgId, emoji }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waMarkRead: (chatId: string) => call<{ ok: boolean }>('waMarkRead', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waSetTyping: (chatId: string, on: boolean) => call<{ ok: boolean }>('waSetTyping', { chatId, on }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  waFetchAvatar: (chatId: string) => call<{ url: string | null }>('waFetchAvatar', { chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  /** Download a media message's full bytes on demand → a data-URL the UI renders directly. */
+  waDownloadMedia: (chatId: string, msgId: string) => call<WaMediaData | null>('waDownloadMedia', { chatId, msgId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+
+  // Per-project WhatsApp chat assignment (desktop-only). Assigning a chat tracks it
+  // for the project: incoming messages route here and the agent prefers it.
+  listProjectWaChats: (projectId: string) => call<string[]>('listProjectWaChats', { projectId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  addProjectWaChat: (projectId: string, chatId: string) => call<string[]>('addProjectWaChat', { projectId, chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
+  removeProjectWaChat: (projectId: string, chatId: string) => call<string[]>('removeProjectWaChat', { projectId, chatId }, () => Promise.reject(new ApiError(403, 'desktop only'))),
 
   /** Native import picker — desktop only; resolves the imported asset or null. */
   importAsset: async (projectId: string | null): Promise<Asset | null> => {
@@ -893,7 +999,7 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; browser?: boolean; images?: { name?: string; mime: string; dataB64: string }[]; files?: { name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; browser?: boolean; images?: { id?: string; name?: string; mime: string; dataB64: string }[]; files?: { id?: string; name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   renameSession: (id: string, title: string) =>
@@ -1113,6 +1219,9 @@ export const api = {
   resolveSession: (sessionId: string) =>
     call<{ ok: boolean; conflicts: string[]; reason?: string }>('resolveSession', { sessionId }, () =>
       req<{ ok: boolean; conflicts: string[]; reason?: string }>(`/api/sessions/${sessionId}/resolve`, { method: 'POST' })),
+  renameSessionBranch: (sessionId: string) =>
+    call<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>('renameSessionBranch', { sessionId }, () =>
+      req<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>(`/api/sessions/${sessionId}/rename-branch`, { method: 'POST' })),
   archiveSessionWorktree: (sessionId: string, deleteBranch?: boolean) =>
     call<{ ok: boolean }>('archiveSessionWorktree', { sessionId, deleteBranch }, () =>
       req<{ ok: boolean }>(`/api/sessions/${sessionId}/archive-worktree`, { method: 'POST', body: JSON.stringify({ deleteBranch }) })),
@@ -1133,15 +1242,10 @@ export const api = {
     call<Roles>('setRoles', { ...patch }, () =>
       req<Roles>('/api/roles', { method: 'POST', body: JSON.stringify(patch) })),
 
-  // Pairing + device management (desktop-only)
-  getPairing: () =>
-    call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
-  /** Disconnect one remote device — closes its live streams and forces it to re-pair. */
-  kickDevice: (deviceId: string) =>
-    call<{ ok: boolean }>('kickDevice', { deviceId }, () => Promise.reject(new ApiError(403, 'Only the Mac can disconnect devices'))),
-  /** Regenerate the pairing code — unpairs every device. Returns the new code. */
-  regeneratePairingCode: () =>
-    call<{ token: string }>('regeneratePairingCode', {}, () => Promise.reject(new ApiError(403, 'Only the Mac can regenerate the code'))),
+  /** Account devices (host + remotes) for the signed-in account, with live
+      online status. Raw fetch against the account server, authed by the session
+      token the renderer stored at login. Replaces the old pairing-code flow. */
+  listDevices: () => reqAccount<AccountDevice[]>('/api/devices'),
 
   /** Auto-update — desktop only; `undefined` in web/phone remotes (updates are
       about this Mac's own binary, so they're never exposed over the relay). */
@@ -1157,7 +1261,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as RemoteDevice[]);
@@ -1176,6 +1280,9 @@ export const api = {
         if (name === 'git-status' && handlers.onGitStatus) handlers.onGitStatus(data as SessionGitStatus);
         if (name === 'schedule' && handlers.onSchedule) handlers.onSchedule(data as Schedule);
         if (name === 'github-device' && handlers.onGithubDevice) handlers.onGithubDevice(data as GithubDevice);
+        if (name === 'wa-message' && handlers.onWaMessage) handlers.onWaMessage(data as WaMessageEvent);
+        if (name === 'wa-chats' && handlers.onWaChats) handlers.onWaChats();
+        if (name === 'wa-message-update' && handlers.onWaMessageUpdate) handlers.onWaMessageUpdate(data as { chatId: string });
       });
     }
     if (typeof EventSource === 'undefined') return () => {};

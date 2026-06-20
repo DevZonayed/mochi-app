@@ -1,0 +1,46 @@
+# EAS uses .easignore (when present) in place of .gitignore to decide what to
+# upload for a build. Mirror .gitignore, then add EAS-only exclusions.
+
+# dependencies
+node_modules/
+.pnpm-store/
+
+# builds / generated
+dist/
+dist-electron/
+build/
+web-build/
+release/
+.turbo/
+*.tsbuildinfo
+
+# expo / metro
+.expo/
+.expo-shared/
+
+# databases (runtime)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# tooling / local state
+.context/
+.continuum/
+.playwright-cli/
+.DS_Store
+*.log
+coverage/
+
+# --- EAS-only: the mobile build does NOT need the other workspace apps.
+# Excluding them keeps EAS from installing apps/server's native deps
+# (better-sqlite3), which fail to compile on the EAS image (Python 3.12 has no
+# distutils for the old node-gyp). pnpm --frozen-lockfile tolerates the extra
+# lockfile importers, so the install still succeeds. Verified locally.
+apps/server/
+apps/desktop/

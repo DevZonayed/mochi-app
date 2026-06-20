@@ -1,8 +1,9 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, protocol, Notification } from 'electron';
 import path from 'node:path';
+import os from 'node:os';
 import { existsSync, realpathSync, mkdirSync, promises as fsp } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { Store, newPairingToken } from './store.js';
+import { Store } from './store.js';
 import { LocalEngine } from './engine.js';
 import { MediaEngine } from './media.js';
 import { ResearchEngine } from './research.js';
@@ -17,7 +18,7 @@ import type { Approval, Job } from './store.js';
 import { createDispatch } from './localApi.js';
 import { GitService } from './git-service.js';
 import { buildModelGroups } from './models.js';
-import { RelayClient } from './relay.js';
+import { HostClient } from './hostClient.js';
 import { DesktopP2PHost } from './p2p.js';
 import { isRemoteBlocked } from './remote-guard.js';
 import { buildIceServers } from '@maestro/realtime';
@@ -29,7 +30,12 @@ import { setEnginesRoot } from './engines.js';
 
 const RENDERER_DIST = path.join(__dirname, '../dist');
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
-const RELAY_URL = process.env['MAESTRO_RELAY_URL'] || 'wss://api.nexalance.cloud/ws';
+// Account server base (HTTPS). The HostClient derives wss://…/ws/host from this,
+// and the /api/* REST routes (turn-credentials, …) hang off the same origin.
+const SERVER_URL = (process.env['MAESTRO_SERVER_URL'] || 'https://api.nexalance.cloud').replace(/\/$/, '');
+// Legacy var name kept for the value passed into createDispatch (used only to
+// build a web-remote URL hint in a couple of dispatch responses).
+const RELAY_URL = SERVER_URL;
 
 // The preload is emitted as either preload.mjs or preload.js depending on the
 // build; load whichever actually exists. If this resolves wrong, window.maestro
@@ -193,8 +199,8 @@ function createWindow() {
   }
 }
 
-/* ── Maestro core boots WITH the app: local store + local engine + relay ──
-   Everything lives and executes on this Mac. The relay connection exists only
+/* ── Maestro core boots WITH the app: local store + local engine + host ──
+   Everything lives and executes on this Mac. The host connection exists only
    so the phone/web remotes can mirror state and send commands here. */
 
 app.whenReady().then(() => {
@@ -263,7 +269,11 @@ app.whenReady().then(() => {
   const applyLoginItem = (openAtLogin: boolean) => { try { app.setLoginItemSettings({ openAtLogin }); } catch { /* unsupported */ } };
   applyLoginItem(store.getSettings().openAtLogin);
 
-  let relay: RelayClient | null = null;
+  // The host connection to the account server. Created lazily once the renderer
+  // delivers the logged-in account's session token (see the maestro:session IPC
+  // below). Before login it's null and nothing is mirrored to the server.
+  let host: HostClient | null = null;
+  let sessionToken = '';
   let telegram: TelegramBot | null = null;
   let extensionBridge: ExtensionBridge | null = null;
   let p2pHost: DesktopP2PHost | null = null;
@@ -274,7 +284,8 @@ app.whenReady().then(() => {
     // Streaming frames (50ms cadence) are local-only: the relay/phone gets the
     // ~1s checkpoint updates instead of a snapshot push per frame. `desktopOnly`
     // events (e.g. auto-update — about THIS Mac's binary) likewise stay local.
-    if (opts?.live || opts?.desktopOnly) return;
+    // `wa-*` events carry WhatsApp chat/message content — Mac-local only, never relayed.
+    if (opts?.live || opts?.desktopOnly || name.startsWith('wa-')) return;
     // Keep every connected browser-extension profile's project+chat list live.
     extensionBridge?.onAppEvent(name);
     if (name === 'settings' && data && typeof data === 'object') {
@@ -294,8 +305,8 @@ app.whenReady().then(() => {
     const relayData = name === 'asset' && data && typeof data === 'object' ? store.slimAssetForRelay(data as import('./store.js').Asset)
       : name === 'job' && data && typeof data === 'object' ? store.slimJobForRelay(data as Job)
       : data;
-    relay?.event(name, relayData);
-    relay?.pushSnapshot();
+    host?.event(name, relayData);
+    host?.pushSnapshot();
     // Direct path: also push the (already slimmed) event to any phone whose P2P channel is open.
     p2pHost?.broadcastEvent(name, relayData);
   };
@@ -366,8 +377,14 @@ app.whenReady().then(() => {
   telegram.resumeOnBoot();
   // WhatsApp: the Mac owns one Baileys socket for the operator's own number.
   const whatsapp = new WhatsAppClient(store, emit);
+  // Give the in-app agent WhatsApp read/send tools backed by this same socket
+  // (fixes "no WhatsApp integration available" — the tools live in the maestro MCP).
+  engine.setComms(whatsapp);
   whatsapp.resumeOnBoot();
   const gitService = new GitService(store, emit, providers);
+  // Hand the gitService to the engine so the post-turn auto-rename hook can
+  // run (otherwise it's a no-op — the engine treats gitService as optional).
+  engine.setGitService(gitService);
   const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge);
   // Local control channel for the native browser extension (one app-owned port).
   extensionBridge = new ExtensionBridge(store, dispatch, (status) => emit('extension', status, { desktopOnly: true }));
@@ -399,30 +416,55 @@ app.whenReady().then(() => {
   // until the p2pEnabled flag is set; the relay path is unchanged + always the fallback.
   p2pHost = new DesktopP2PHost({
     toRenderer: (msg) => { try { win?.webContents.send('maestro:p2p:in', msg); } catch { /* window closing */ } },
-    signalViaRelay: (did, signal) => relay?.signal(did, signal),
+    signalViaRelay: (did, signal) => host?.signal(did, signal),
     handleCommand: handleRemoteCommand,
   });
 
-  relay = new RelayClient({
-    url: RELAY_URL,
-    deckId: store.deck.deckId,
-    deckSecret: store.deck.deckSecret,
-    accessToken: store.accessToken,
-    getSnapshot: () => ({ ...store.snapshot(providers.list()), engineStatus: engine.statuses(), mediaRates: media.rates(), models: buildModelGroups(engine.statuses()) }),
-    // Relay command results can be Job-shaped (sendChat → {session,job}, getJob,
-    // listJobs…) — slim any Job before it crosses back to the phone so the
-    // Mac-local image path never rides the response either. (Desktop IPC at
-    // maestro:call calls dispatch directly and keeps the full job for reveal.)
-    // Every remote command (relay OR P2P) funnels through the one shared guard +
-    // provenance + Job-slimming defined above (handleRemoteCommand / remote-guard.ts).
-    onCommand: (method, params) => handleRemoteCommand(method, params),
-    // A remote's WebRTC signaling (offer/answer/ICE) → the renderer-hosted peer.
-    onSignal: (did, signal) => p2pHost?.onSignal(did, signal),
-    // The relay reports remote-device presence → mirror it into the store and tell
-    // the desktop UI (Devices pane + pairing window). Desktop-only; never relayed.
-    onRemote: (devices) => { emit('devices', store.setRemoteDevices(devices), { desktopOnly: true }); },
+  // The host connection's snapshot/command/signal handlers are IDENTICAL to the
+  // old relay's — only the transport + auth changed (account session token vs.
+  // pairing code). Built once and reused whenever a HostClient is (re)created.
+  const getSnapshot = () => ({ ...store.snapshot(providers.list()), engineStatus: engine.statuses(), mediaRates: media.rates(), models: buildModelGroups(engine.statuses()) });
+
+  /** (Re)connect to the account server as this Mac's host, with the given
+      account session token. Tears down any prior connection first so a re-login
+      with a different account doesn't leave a stale host registered. */
+  const startHost = (token: string): void => {
+    sessionToken = token;
+    if (host) { host.updateSession(token); return; }
+    host = new HostClient({
+      url: SERVER_URL,
+      sessionToken: token,
+      // Stable per-Mac device id (reused from the legacy deck identity so an
+      // upgrade keeps the same host id the server already knows).
+      deviceId: store.deck.deckId,
+      name: os.hostname(),
+      deckId: store.deck.deckId,
+      getSnapshot,
+      // Host command results can be Job-shaped (sendChat → {session,job}, getJob,
+      // listJobs…) — slim any Job before it crosses back to a remote so the
+      // Mac-local image path never rides the response either. (Desktop IPC at
+      // maestro:call calls dispatch directly and keeps the full job for reveal.)
+      // Every remote command (host WS OR P2P) funnels through the one shared guard +
+      // provenance + Job-slimming defined above (handleRemoteCommand / remote-guard.ts).
+      onCommand: (method, params) => handleRemoteCommand(method, params),
+      // A remote's WebRTC signaling (offer/answer/ICE) → the renderer-hosted peer.
+      onSignal: (did, signal) => p2pHost?.onSignal(did, signal),
+    });
+    host.start();
+  };
+
+  // The renderer owns the account session (it logs in over raw fetch + persists
+  // the token in localStorage). It pushes the token here on launch + on every
+  // (re-)login, and pushes null on sign-out. The host connection lives and dies
+  // with that token — before the operator logs in nothing is mirrored upstream.
+  ipcMain.on('maestro:session', (_e, token: unknown) => {
+    const t = typeof token === 'string' ? token.trim() : '';
+    if (t) { startHost(t); return; }
+    // Sign-out: drop the token + close the host connection (no auto-reconnect).
+    sessionToken = '';
+    if (host) { host.stop(); host = null; }
   });
-  relay.start();
+
   p2pHost.setEnabled(!!store.getSettings().p2pEnabled);
   // Renderer-hosted WebRTC peer → main bridge (fire-and-forget; one channel each way).
   ipcMain.on('maestro:p2p:out', (_e, msg: { kind?: string; did?: string; signal?: unknown; env?: Envelope; state?: ConnState }) => {
@@ -432,11 +474,12 @@ app.whenReady().then(() => {
     else if (msg.kind === 'state' && msg.state) p2pHost.fromRendererState(msg.did, msg.state);
     else if (msg.kind === 'closed') p2pHost.removePeer(msg.did);
   });
-  // ICE config for the renderer peer: time-limited TURN creds from the relay, else public STUN.
+  // ICE config for the renderer peer: time-limited TURN creds from the server
+  // (authed by the account session token), else public STUN.
   ipcMain.handle('maestro:p2pIce', async () => {
     try {
-      const httpBase = RELAY_URL.replace(/^ws/, 'http').replace(/\/ws$/, '');
-      const res = await fetch(`${httpBase}/api/turn-credentials`, { headers: { Authorization: `Bearer ${store.accessToken}` } });
+      if (!sessionToken) return buildIceServers();
+      const res = await fetch(`${SERVER_URL}/api/turn-credentials`, { headers: { Authorization: `Bearer ${sessionToken}` } });
       if (res.ok) {
         const t = (await res.json()) as { host: string | null; username: string | null; credential: string | null };
         if (t.host && t.username && t.credential) return buildIceServers({ host: t.host, username: t.username, credential: t.credential });
@@ -453,26 +496,10 @@ app.whenReady().then(() => {
   // Auto-update (electron-updater → GitHub Releases). Desktop-only: its events
   // never cross the relay. Polling starts after the window exists (see below).
   const updater = new Updater(emit);
-  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); relay?.stop(); telegram?.stop(); whatsapp.disconnect(); codexBridge.stop(); extensionBridge?.stop(); updater.stop(); engine.bgStopAll(); });
+  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); host?.stop(); telegram?.stop(); whatsapp.disconnect(); codexBridge.stop(); extensionBridge?.stop(); updater.stop(); engine.bgStopAll(); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {
-      // Device management + update.* control THIS Mac (its relay client / binary)
-      // and are handled locally — never via the shared dispatch (which the relay
-      // also calls), so a remote can't disconnect devices or rotate the code.
-      if (method === 'kickDevice') {
-        const deviceId = String((params as { deviceId?: unknown })?.deviceId ?? '').trim();
-        if (!deviceId) throw Object.assign(new Error('deviceId required'), { statusCode: 400 });
-        relay?.kick(deviceId);
-        return { ok: true, data: { ok: true } };
-      }
-      if (method === 'regeneratePairingCode') {
-        const token = newPairingToken();
-        store.setAccessToken(token);
-        relay?.updateToken(token);
-        emit('devices', store.setRemoteDevices([]), { desktopOnly: true });
-        return { ok: true, data: { token } };
-      }
       // update.* controls this Mac's binary → handled locally, never via the
       // shared dispatch (which the relay also calls).
       // Local IPC = the desktop app: stamp feedback provenance authoritatively.
