@@ -39,6 +39,13 @@ export const DEVICE_ID = 'maestro.mobile.deviceId';
 export const NOTIF_PREFS = 'maestro.mobile.notifPrefs';
 /** Require device biometrics (Face ID / fingerprint) before approving a gate. */
 export const BIOMETRIC_GATE = 'maestro.mobile.biometricGate';
+/** Opt-in: route live events over WebSocket instead of SSE. Lower latency for
+    token-stream output during a chat; SSE keeps working in fallback mode. */
+export const USE_WS_STREAM = 'maestro.mobile.useWsStream';
+/** Last server `seq` we processed on the live stream. Sent as `?since=<seq>`
+    on every reconnect so the relay can replay events we missed while offline
+    (network blink, app suspended, etc.). See apps/server/src/eventBuffer.ts. */
+export const LAST_SEQ = 'maestro.mobile.lastSeq';
 
 export function getStr(key: string): string {
   return cache.get(key) ?? '';

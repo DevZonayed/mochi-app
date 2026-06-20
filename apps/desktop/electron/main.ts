@@ -26,6 +26,10 @@ import { CronRunner } from './cron.js';
 import { runSmoke } from './smoke.js';
 import { Updater } from './updater.js';
 import { setEnginesRoot } from './engines.js';
+import { SyncWorker } from './sync-worker.js';
+import { chatSessionToSync, jobToSyncMessages } from './sync-mappers.js';
+import { onMemoryWrite } from './continuum.js';
+import type { ChatSession } from './store.js';
 
 const RENDERER_DIST = path.join(__dirname, '../dist');
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
@@ -267,6 +271,9 @@ app.whenReady().then(() => {
   let telegram: TelegramBot | null = null;
   let extensionBridge: ExtensionBridge | null = null;
   let p2pHost: DesktopP2PHost | null = null;
+  // Phase 2 mirror worker — constructed after RelayClient so it can read the
+  // base URL + access token from the same source of truth.
+  let syncWorker: SyncWorker | null = null;
   const emit = (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => {
     for (const w of BrowserWindow.getAllWindows()) {
       try { w.webContents.send('maestro:event', { name, data }); } catch { /* window closing */ }
@@ -298,6 +305,20 @@ app.whenReady().then(() => {
     relay?.pushSnapshot();
     // Direct path: also push the (already slimmed) event to any phone whose P2P channel is open.
     p2pHost?.broadcastEvent(name, relayData);
+    // Phase 2 mirror — push chat session + message deltas to the relay's
+    // /api/mirror/* so the phone shows yesterday's chats while the Mac is
+    // asleep. The worker batches + retries internally; this is fire-and-
+    // forget. Mac stays the source of truth either way.
+    if (syncWorker) {
+      if (name === 'session' && data && typeof data === 'object') {
+        try { syncWorker.syncChat(chatSessionToSync(data as ChatSession)); } catch { /* never break emit() */ }
+      } else if (name === 'job' && data && typeof data === 'object') {
+        try {
+          const msgs = jobToSyncMessages(data as Job);
+          if (msgs.length) syncWorker.syncMessages(msgs[0].chatId, msgs);
+        } catch { /* never break emit() */ }
+      }
+    }
   };
 
   // Engine binaries (Codex / Claude / gh) are downloaded on demand into userData
@@ -424,6 +445,35 @@ app.whenReady().then(() => {
   });
   relay.start();
   p2pHost.setEnabled(!!store.getSettings().p2pEnabled);
+
+  // ── Phase 2 mirror: SyncWorker + .continuum subscription ──────────
+  // Reads RELAY_URL/accessToken fresh on every push so a code rotation
+  // doesn't break the worker. Posts to the same relay we already use for
+  // commands — see apps/server/src/server.ts /api/mirror/* + mirrorStore.ts.
+  const mirrorHttpBase = () => RELAY_URL.replace(/^ws/, 'http').replace(/\/ws$/, '');
+  syncWorker = new SyncWorker({
+    httpBase: mirrorHttpBase,
+    accessToken: () => store.accessToken,
+    log: (msg, ...extras) => { try { console.log(msg, ...extras); } catch { /* fine */ } },
+  });
+  // STATE.md + chain-link writes happen deep inside engine.ts / localApi.ts —
+  // subscribing here keeps that code path untouched.
+  const projectRootOf = (p: { path?: string }) => p.path || '';
+  const unsubMemory = onMemoryWrite((e) => {
+    const proj = store.listProjects().find((p) => projectRootOf(p) === e.projectRoot);
+    if (!proj) return; // a write to a folder that isn't a known Maestro project (rare; never crash)
+    syncWorker?.syncMemory({
+      projectId: proj.id,
+      kind: e.kind,
+      content: e.content,
+      commitSha: e.commitSha ?? null,
+      tags: e.tags ?? [],
+    });
+  });
+  app.on('will-quit', () => {
+    try { unsubMemory(); } catch { /* fine */ }
+    try { syncWorker?.stop(); } catch { /* fine */ }
+  });
   // Renderer-hosted WebRTC peer → main bridge (fire-and-forget; one channel each way).
   ipcMain.on('maestro:p2p:out', (_e, msg: { kind?: string; did?: string; signal?: unknown; env?: Envelope; state?: ConnState }) => {
     if (!p2pHost || !msg || typeof msg.did !== 'string') return;

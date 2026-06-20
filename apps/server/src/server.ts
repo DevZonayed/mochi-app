@@ -19,6 +19,15 @@ import type { WebSocket } from 'ws';
 import { registerRegistry } from './registry.js';
 import { DeviceRegistry } from './devices.js';
 import { turnConfigFromEnv } from './turn.js';
+import { createPushTokenStore, type PushTokenStore } from './pushTokens.js';
+import { EventBuffer, type BufferedEvent } from './eventBuffer.js';
+import {
+  createMirrorStore,
+  type MirrorStore,
+  type UpsertChat,
+  type UpsertMessage,
+  type UpsertMemory,
+} from './mirrorStore.js';
 
 interface Snapshot {
   workspace?: unknown;
@@ -78,7 +87,17 @@ const EMPTY_DASHBOARD = {
 
 const CMD_TIMEOUT_MS = 10 * 60 * 1000; // jobs run real models on the Mac — be generous
 
-export function buildServer(): FastifyInstance {
+export interface BuildServerOptions {
+  /** Inject the push-token store (tests pass ':memory:' via createPushTokenStore). */
+  pushTokenStore?: PushTokenStore;
+  /** Inject the chat+memory mirror store (tests pass an InMemoryMirrorStore).
+      When omitted, the relay picks Postgres if MAESTRO_PG_URL is set, otherwise
+      a process-local in-memory store. The Mac stays the source of truth either
+      way — the mirror is read-through cache only. */
+  mirrorStore?: MirrorStore;
+}
+
+export function buildServer(opts: BuildServerOptions = {}): FastifyInstance {
   const app = Fastify({ logger: true });
   app.register(cors, { origin: true });
 
@@ -148,14 +167,100 @@ export function buildServer(): FastifyInstance {
     notifyRemote();
   });
 
-  // ── SSE fan-out to web clients ─────────────────────────────────────
+  // ── SSE + WS fan-out to web clients ────────────────────────────────
+  // Two transports for the same event stream:
+  //   - SSE (`/api/stream`) — long-lived HTTP, what web clients use today
+  //   - WS  (`/api/stream-ws`) — full-duplex, lower latency, used by the mobile
+  //     app to stream token-by-token chat output without the SSE reconnect tax.
+  // sseSend() now fans out to BOTH so adding the WS endpoint didn't require
+  // touching every call site.
   const sseClients = new Set<ServerResponse>();
+  const wsStreamClients = new Set<WebSocket>();
+  /* Event replay buffer — see eventBuffer.ts. Every broadcast event is
+     stamped with a monotonic `seq` and remembered for the last N events
+     (default 2000, ≈ several minutes of normal traffic). A reconnecting
+     client sends `?since=<lastSeq>` and we replay the gap, so the phone
+     never returns to a stale screen after a network blink or going from
+     subway to wifi. Some events the user opted to ignore (heavy assets,
+     mid-stream snapshots) we don't buffer — they're either replayed by
+     the Mac's snapshot push or are too verbose to be worth catching up. */
+  const eventBuffer = new EventBuffer(2000);
+  /** Event names worth buffering for replay. Listed exhaustively so a
+   *  reconnecting client (mobile after AppState resume, web-desktop after
+   *  a page reload or network blink) doesn't miss anything material.
+   *
+   *  Excluded by design:
+   *   - high-volume mid-stream frames the next snapshot push covers (state,
+   *     dashboard)
+   *   - one-shot lifecycle frames where catch-up is meaningless (clone
+   *     progress completes or aborts; github-device finishes the OAuth dance
+   *     within ~minutes of starting and a new request would issue a fresh
+   *     code anyway)
+   *
+   *  We intentionally include `bg` / `project` / `publishDraft` / `feedback`
+   *  even though they originated as desktop-renderer concerns — the relay
+   *  fans them all out and a web-desktop client legitimately depends on
+   *  them. Mobile ignores names it doesn't recognise. */
+  const REPLAYABLE = new Set([
+    'job', 'session', 'approval', 'asset', 'comms', 'briefs',
+    'schedule', 'schedule-late', 'git-status', 'extension', 'host',
+    // Newly added for desktop-web reconnect alignment:
+    'project', 'bg', 'publishDraft', 'feedback',
+  ]);
   function sseSend(event: string, data: unknown) {
-    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    // Record before broadcast: if the broadcast fails for a single client,
+    // the buffer is still accurate for everyone else's reconnect.
+    const seq = REPLAYABLE.has(event) ? eventBuffer.push(event, data) : 0;
+    const ssePayload = seq
+      ? `id: ${seq}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+      : `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of sseClients) {
-      try { res.write(payload); } catch { sseClients.delete(res); }
+      try { res.write(ssePayload); } catch { sseClients.delete(res); }
+    }
+    // WS clients get the same event shape as a single JSON frame. Mobile parses
+    // `{ event, data, seq }` whether it arrived via SSE or WS, so the consumer
+    // code stays identical. `seq` is omitted for non-replayable events.
+    if (wsStreamClients.size) {
+      const wsPayload = JSON.stringify(seq ? { event, data, seq } : { event, data });
+      for (const sock of wsStreamClients) {
+        try { sock.send(wsPayload); } catch { wsStreamClients.delete(sock); }
+      }
     }
   }
+  /** Replay events newer than `since` to a single SSE response stream. Used
+   *  by /api/stream when the client passes `?since=<seq>`. */
+  function replaySse(res: ServerResponse, since: number): void {
+    const r = eventBuffer.since(since);
+    if (r.bufferOverflow) {
+      // Client missed too much — tell them to do a full snapshot refetch.
+      // SSE comment-style frame so the consumer can match by `event: buffer-overflow`.
+      res.write(`event: buffer-overflow\ndata: ${JSON.stringify({ latestSeq: r.latestSeq, since })}\n\n`);
+      return;
+    }
+    for (const ev of r.events) {
+      res.write(`id: ${ev.seq}\nevent: ${ev.name}\ndata: ${JSON.stringify(ev.data)}\n\n`);
+    }
+  }
+  /** Same for a single WS client. */
+  function replayWs(sock: WebSocket, since: number): void {
+    const r = eventBuffer.since(since);
+    if (r.bufferOverflow) {
+      try { sock.send(JSON.stringify({ event: 'buffer-overflow', data: { latestSeq: r.latestSeq, since } })); } catch { /* closed */ }
+      return;
+    }
+    for (const ev of r.events) {
+      try { sock.send(JSON.stringify({ event: ev.name, data: ev.data, seq: ev.seq })); } catch { /* closed */ }
+    }
+  }
+  /** Parse the `since` query into a non-negative integer; junk → 0 (= no replay). */
+  function parseSince(q: unknown): number {
+    if (typeof q !== 'string') return 0;
+    const n = Number.parseInt(q, 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+  /** Suppress the unused-symbol warning for the BufferedEvent re-export when
+   *  the import isn't directly consumed by sseSend (it's used in replay). */
+  void (null as unknown as BufferedEvent | null);
   // Device-targeted SSE (WebRTC signaling to ONE remote, not a broadcast).
   function sseSendTo(did: string | null | undefined, event: string, data: unknown) {
     if (!did) return;
@@ -169,11 +274,25 @@ export function buildServer(): FastifyInstance {
   // SSE only reaches a running app; a closed phone misses every event. The phone
   // registers its Expo push token here, and we mirror the Mac's job/approval/
   // schedule events to Expo's push service so a closed app still gets a real OS
-  // notification. This is pure transport (the same events SSE already carries) —
-  // the Mac stays the brain. In-memory by design (the relay owns no DB): the phone
-  // re-registers on every launch/foreground, so a redeploy self-heals.
-  const pushTokens = new Map<string, number>(); // expoToken → lastSeen ms
-  const pushSeen = new Set<string>();           // dedupe keys (bounded)
+  // notification. Tokens persist via better-sqlite3 (see pushTokens.ts) so a
+  // Dokploy redeploy doesn't wipe the device list and a closed phone keeps
+  // receiving alerts without needing to be opened first. Mac still owns the
+  // domain events themselves — this is pure transport.
+  const pushTokens = opts.pushTokenStore ?? createPushTokenStore();
+  app.addHook('onClose', async () => pushTokens.close());
+
+  // ── Chat + project-memory mirror ───────────────────────────────────
+  // The desktop pushes deltas to /api/mirror/*; mobile reads from /api/mirror/*
+  // when the Mac is asleep. The store is created lazily so a missing
+  // MAESTRO_PG_URL doesn't block boot — `createMirrorStore` falls back to
+  // in-memory in that case (see mirrorStore.ts comments).
+  let mirror: MirrorStore | null = opts.mirrorStore ?? null;
+  const mirrorReady: Promise<MirrorStore> = mirror
+    ? Promise.resolve(mirror)
+    : createMirrorStore().then((s) => { mirror = s; return s; });
+  app.addHook('onClose', async () => { if (mirror) await mirror.close(); });
+
+  const pushSeen = new Set<string>(); // dedupe keys (bounded, in-memory is fine — keys are derived)
   function rememberPushKey(k: string): boolean {
     if (pushSeen.has(k)) return false;
     pushSeen.add(k);
@@ -181,7 +300,7 @@ export function buildServer(): FastifyInstance {
     return true;
   }
   async function sendExpoPush(title: string, body: string): Promise<void> {
-    const tokens = [...pushTokens.keys()];
+    const tokens = pushTokens.list();
     if (!tokens.length) return;
     const messages = tokens.map((to) => ({ to, title, body, sound: 'default', priority: 'high', channelId: 'alerts' }));
     try {
@@ -193,15 +312,17 @@ export function buildServer(): FastifyInstance {
       // Expo returns per-message receipts; prune any token it reports as gone.
       const json = (await res.json().catch(() => null)) as { data?: { status?: string; details?: { error?: string } }[] } | null;
       if (Array.isArray(json?.data)) {
+        const dead: string[] = [];
         json!.data!.forEach((r, i) => {
-          if (r?.status === 'error' && r.details?.error === 'DeviceNotRegistered') pushTokens.delete(tokens[i]);
+          if (r?.status === 'error' && r.details?.error === 'DeviceNotRegistered') dead.push(tokens[i]);
         });
+        if (dead.length) pushTokens.prune(dead);
       }
     } catch { /* push service unreachable — SSE still carries foreground alerts */ }
   }
   // Mirror the alert-worthy events to push, matching the phone's in-app LiveNotifier.
   function maybePush(name: string, data: unknown): void {
-    if (!pushTokens.size) return;
+    if (!pushTokens.size()) return;
     if (name === 'job') {
       const j = data as { id?: string; status?: string; title?: string } | null;
       if (!j?.id) return;
@@ -266,6 +387,7 @@ export function buildServer(): FastifyInstance {
           if (!deck || deck.deckId !== m.deckId) {
             deck = { deckId: m.deckId, secret: m.secret ?? '', accessToken: m.accessToken ?? '', ws, online: true, lastSeen: Date.now(), state: deck?.state ?? null, pending: new Map() };
             devices.reset(); // fresh deck → forget any prior devices/revocations
+            eventBuffer.reset(); // and the replay buffer — old seqs are meaningless under a new deck
           } else {
             deck.ws = ws; deck.online = true; deck.lastSeen = Date.now();
             if (m.accessToken && m.accessToken !== deck.accessToken) {
@@ -322,6 +444,61 @@ export function buildServer(): FastifyInstance {
     try { deck?.ws?.send(JSON.stringify({ type: 'ping' })); } catch { /* closed */ }
   }, 25000);
   app.addHook('onClose', async () => clearInterval(keepalive));
+
+  // ── /api/stream-ws — WebSocket transport for the event stream ──────
+  // Same shape as `/api/stream` (SSE), just a full-duplex socket so we can
+  // stream token-by-token chat output without the SSE reconnect tax on mobile.
+  // Auth: rides the `/api/*` onRequest hook above, so the same pairing-token
+  // bearer/?token= check applies — no separate auth surface.
+  app.register(async (scope) => {
+    scope.get('/api/stream-ws', { websocket: true }, (conn: unknown, req) => {
+      const sock = ((conn as { socket?: WebSocket }).socket ?? conn) as WebSocket;
+      wsStreamClients.add(sock);
+      const deviceId = deviceIdOf(req);
+      const deviceName = deviceNameOf(req);
+      // Track presence the same way SSE does so the desktop Devices pane sees
+      // a WS-connected phone as "live", not just "last seen".
+      // (devices.touch already happened in onRequest; we don't have a "live
+      // stream" marker for WS yet — that's a future cleanup if needed.)
+      devices.touch(deviceId, deviceName);
+      notifyRemote(true);
+
+      // Mirror SSE's first frame so the client knows it's ready to consume.
+      // `latestSeq` lets a fresh client start tracking from the right point.
+      try { sock.send(JSON.stringify({ event: 'hello', data: { ok: true, hostOnline: !!deck?.online, latestSeq: eventBuffer.latestSeq } })); } catch { /* closed */ }
+      // Catch up missed events if the client passed `?since=<seq>`. Same
+      // semantics as the SSE replay — see replayWs() above.
+      const since = parseSince((req.query as { since?: unknown }).since);
+      if (since > 0) replayWs(sock, since);
+
+      // Heartbeat — keeps Dokploy/intermediate proxies from idle-closing us at
+      // ~30s. The browser's WebSocket layer answers pings automatically; mobile
+      // libraries (react-native ws) do too.
+      const heartbeat = setInterval(() => {
+        try { sock.send('{"event":"ping","data":{}}'); } catch { /* closed */ }
+      }, 25000);
+
+      sock.on('message', (buf: Buffer | string) => {
+        // Best-effort echo for client-side liveness probes. We don't currently
+        // accept any commands over the stream socket — POSTs still go through
+        // the REST surface for predictable error handling.
+        try {
+          const m = JSON.parse(String(buf)) as { type?: string };
+          if (m.type === 'ping') sock.send('{"event":"pong","data":{}}');
+        } catch { /* ignore garbage */ }
+      });
+
+      sock.on('close', () => {
+        clearInterval(heartbeat);
+        wsStreamClients.delete(sock);
+        notifyRemote(true);
+      });
+      sock.on('error', () => {
+        clearInterval(heartbeat);
+        wsStreamClients.delete(sock);
+      });
+    });
+  });
 
   const st = (): Snapshot | null => deck?.state ?? null;
 
@@ -490,15 +667,30 @@ export function buildServer(): FastifyInstance {
   app.get('/api/turn-credentials', async () => turnConfigFromEnv());
 
   // ── Push registration (phone registers its Expo token for closed-app alerts) ──
+  // Tokens persist (see pushTokens.ts) — a redeploy no longer wipes the device list.
+  // We also stash the calling device id/name so the desktop can correlate "which
+  // phone is registered for push" against the Devices pane.
   app.post('/api/push/register', async (req) => {
     const { token } = (req.body ?? {}) as { token?: string };
-    if (typeof token === 'string' && token.trim()) pushTokens.set(token.trim(), Date.now());
-    return { ok: true, devices: pushTokens.size };
+    if (typeof token === 'string' && token.trim()) {
+      pushTokens.upsert(token, { deviceId: deviceIdOf(req), deviceName: deviceNameOf(req) });
+    }
+    return { ok: true, devices: pushTokens.size() };
   });
   app.post('/api/push/unregister', async (req) => {
     const { token } = (req.body ?? {}) as { token?: string };
-    if (typeof token === 'string') pushTokens.delete(token.trim());
-    return { ok: true, devices: pushTokens.size };
+    if (typeof token === 'string') pushTokens.remove(token);
+    return { ok: true, devices: pushTokens.size() };
+  });
+  // Mobile Settings → "Push status" pings this on focus to confirm the relay has
+  // the phone's token (i.e. closed-app alerts will actually fire). Returns just
+  // a boolean for the current token + the total registered device count, never
+  // the raw list (don't leak other devices' tokens).
+  app.post('/api/push/status', async (req) => {
+    const { token } = (req.body ?? {}) as { token?: string };
+    const t = typeof token === 'string' ? token.trim() : '';
+    const registered = t ? pushTokens.list().includes(t) : false;
+    return { ok: true, registered, devices: pushTokens.size() };
   });
 
   // ── SSE stream (host events relayed to web clients) ────────────────
@@ -511,11 +703,22 @@ export function buildServer(): FastifyInstance {
       Connection: 'keep-alive',
       'Access-Control-Allow-Origin': '*',
     });
-    res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, hostOnline: !!deck?.online })}\n\n`);
+    // The hello frame carries `latestSeq` so a client connecting fresh (no
+    // prior `since`) immediately knows what seq to start tracking from.
+    res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, hostOnline: !!deck?.online, latestSeq: eventBuffer.latestSeq })}\n\n`);
     const deviceId = deviceIdOf(req);
+    // Order matters: add to live set FIRST so events that fire mid-replay
+    // are still delivered (sseSend is sync — there's no actual race window
+    // in Node's single-threaded event loop, but this also gives us correct
+    // ordering for tests). Replay happens immediately after.
     sseClients.add(res);
     devices.addStream(deviceId, deviceNameOf(req), res);
     notifyRemote(true); // a live remote stream opened
+    // Catch up missed events. `?since=<seq>` from the client (defaults to 0 →
+    // no replay). On buffer-overflow we send a `buffer-overflow` frame the
+    // mobile uses as a "do a full refetch" signal.
+    const since = parseSince((req.query as { since?: unknown }).since);
+    if (since > 0) replaySse(res, since);
     const ping = setInterval(() => {
       try { res.write(': ping\n\n'); } catch { /* closed */ }
     }, 25000);
@@ -525,6 +728,84 @@ export function buildServer(): FastifyInstance {
       devices.removeStream(deviceId, res);
       notifyRemote(true); // stream closed → presence drops
     });
+  });
+
+  // ── Chat + memory mirror endpoints (Phase 2) ───────────────────────
+  // Reads: mobile/web hit these when the Mac is asleep so the phone still
+  // shows yesterday's chats and the project's current STATE.md.
+  // Writes: the desktop SyncWorker (apps/desktop/electron/syncWorker.ts)
+  // pushes deltas here as the agent writes new messages and checkpoints to
+  // disk. Auth: same pairing-token gate as every other /api/* route — there's
+  // no separate write surface today (single-tenant per Mac). When Better Auth
+  // lands (per maestro-account-multitenant memory), POSTs will be gated to
+  // the host's token specifically.
+  app.get('/api/mirror/chats', async (req, reply) => {
+    const m = await mirrorReady;
+    const { projectId, accountId } = req.query as { projectId?: string; accountId?: string };
+    const acc = accountId || 'self';
+    // `projectId=` unset → ALL chats; `projectId=null` → workspace-level
+    // chats; `projectId=<id>` → chats in that project.
+    const proj = projectId === undefined ? undefined : projectId === 'null' ? null : projectId;
+    try { return await m.listChats(acc, proj); }
+    catch (e) { return reply.code(500).send({ error: e instanceof Error ? e.message : 'mirror read failed' }); }
+  });
+
+  app.get('/api/mirror/chats/:id', async (req, reply) => {
+    const m = await mirrorReady;
+    const id = (req.params as { id: string }).id;
+    const chat = await m.getChat(id);
+    return chat ?? reply.code(404).send({ error: 'chat not found in mirror' });
+  });
+
+  app.get('/api/mirror/chats/:id/messages', async (req, reply) => {
+    const m = await mirrorReady;
+    const id = (req.params as { id: string }).id;
+    const { limit, before } = req.query as { limit?: string; before?: string };
+    try {
+      return await m.listMessages(id, {
+        limit: limit ? Number(limit) : undefined,
+        beforeCreatedAt: before ? Number(before) : undefined,
+      });
+    } catch (e) { return reply.code(500).send({ error: e instanceof Error ? e.message : 'mirror read failed' }); }
+  });
+
+  app.get('/api/mirror/memories', async (req, reply) => {
+    const m = await mirrorReady;
+    const { projectId, accountId } = req.query as { projectId?: string; accountId?: string };
+    if (!projectId) return reply.code(400).send({ error: 'projectId is required' });
+    try { return await m.listMemories(accountId || 'self', projectId); }
+    catch (e) { return reply.code(500).send({ error: e instanceof Error ? e.message : 'mirror read failed' }); }
+  });
+
+  app.post('/api/mirror/chat', async (req, reply) => {
+    const m = await mirrorReady;
+    const body = (req.body ?? {}) as UpsertChat;
+    if (!body.id) return reply.code(400).send({ error: 'id is required' });
+    try { return await m.upsertChat(body); }
+    catch (e) { return reply.code(500).send({ error: e instanceof Error ? e.message : 'mirror write failed' }); }
+  });
+
+  app.post('/api/mirror/chats/:id/messages', async (req, reply) => {
+    const m = await mirrorReady;
+    const id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as { messages?: UpsertMessage[] };
+    const msgs = Array.isArray(body.messages) ? body.messages : [];
+    if (!msgs.length) return reply.code(400).send({ error: 'messages[] is required' });
+    // Force chatId on every row (the URL is the truth, not the body) so a
+    // misconfigured client can't insert messages under the wrong chat.
+    const stamped = msgs.map((mm) => ({ ...mm, chatId: id }));
+    try {
+      const written = await m.upsertMessages(stamped);
+      return { ok: true, written };
+    } catch (e) { return reply.code(500).send({ error: e instanceof Error ? e.message : 'mirror write failed' }); }
+  });
+
+  app.post('/api/mirror/memory', async (req, reply) => {
+    const m = await mirrorReady;
+    const body = (req.body ?? {}) as UpsertMemory;
+    if (!body.projectId || !body.kind) return reply.code(400).send({ error: 'projectId + kind are required' });
+    try { return await m.upsertMemory(body); }
+    catch (e) { return reply.code(500).send({ error: e instanceof Error ? e.message : 'mirror write failed' }); }
   });
 
   // Skill registry (read-only reference content, public, /registry/* — see registry.ts).

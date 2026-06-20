@@ -1168,8 +1168,52 @@ export const api = {
       });
     }
     if (typeof EventSource === 'undefined') return () => {};
-    const sseQs = qp({ token: remoteToken || undefined, did: ensureDeviceId() || undefined, device: deviceLabel() });
+    /* Replay alignment (Phase 5 — see apps/server/src/eventBuffer.ts).
+       The web-desktop client is a peer of mobile when it comes to the relay's
+       event stream — both connect via /api/stream and want catch-up on
+       reconnect. Track the latest seq in localStorage and pass it as
+       `?since=<seq>`; the relay replays events with seq > since (in order)
+       before transitioning to live. On `buffer-overflow` (we were offline
+       longer than the relay's retention window) reset the cursor — there's
+       no per-screen "force refetch" hook here yet, but the next full page
+       load will fetch initial state anyway. */
+    const LAST_SEQ_KEY = 'maestro.web.lastSeq';
+    const readLastSeq = (): number => {
+      try {
+        const v = Number.parseInt(localStorage.getItem(LAST_SEQ_KEY) || '0', 10);
+        return Number.isFinite(v) && v > 0 ? v : 0;
+      } catch { return 0; }
+    };
+    const writeLastSeq = (n: number): void => {
+      if (!Number.isFinite(n) || n <= 0) return;
+      try { localStorage.setItem(LAST_SEQ_KEY, String(n)); } catch { /* no storage — fine */ }
+    };
+    const since = readLastSeq();
+    const sseQs = qp({
+      token: remoteToken || undefined,
+      did: ensureDeviceId() || undefined,
+      device: deviceLabel(),
+      since: since > 0 ? String(since) : undefined,
+    });
     const es = new EventSource(API_BASE + '/api/stream' + (sseQs ? `?${sseQs}` : ''));
+    /* Advance the seq cursor on every event the relay tagged with `id:`.
+       EventSource exposes that as `lastEventId` on the MessageEvent — same
+       wire format mobile uses. EventSource does NOT dispatch typed (named)
+       frames to the generic 'message' listener, so we hook each known name. */
+    const stampSeqHandler = (e: MessageEvent) => {
+      const n = Number.parseInt((e as MessageEvent & { lastEventId?: string }).lastEventId || '0', 10);
+      if (Number.isFinite(n) && n > readLastSeq()) writeLastSeq(n);
+    };
+    for (const name of ['job','session','approval','asset','comms','briefs','schedule','schedule-late','git-status','extension','host','project','bg','publishDraft','feedback']) {
+      es.addEventListener(name, stampSeqHandler);
+    }
+    /* Buffer-overflow → reset cursor so the next reconnect doesn't ask for
+       an unreachable window. Web-desktop also doesn't have a screen-level
+       refetch hook today, but page navigation / Tab focus naturally
+       refetches via the snapshot endpoints. */
+    es.addEventListener('buffer-overflow', () => {
+      try { localStorage.removeItem(LAST_SEQ_KEY); } catch { /* no storage — fine */ }
+    });
     if (handlers.onBg) es.addEventListener('bg', (e: MessageEvent) => { try { handlers.onBg!(JSON.parse(e.data) as BgTask); } catch { /* ignore */ } });
     if (handlers.onJob) es.addEventListener('job', (e: MessageEvent) => { try { handlers.onJob!(JSON.parse(e.data) as Job); } catch { /* ignore */ } });
     if (handlers.onApproval) es.addEventListener('approval', (e: MessageEvent) => { try { handlers.onApproval!(JSON.parse(e.data) as Approval); } catch { /* ignore */ } });

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, Text, Pressable, ScrollView, Animated, StyleSheet, Modal, TextInput, Alert, type ViewStyle } from 'react-native';
+import { View, Text, Pressable, ScrollView, Animated, StyleSheet, Modal, TextInput, Alert, Linking, Platform, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import Constants from 'expo-constants';
@@ -8,8 +8,8 @@ import type { ThemeMode } from '@maestro/design-tokens';
 import { Icon } from '../Icon';
 import { Group, Row } from '../ui';
 import { api, getPairToken, setPairToken, API_BASE, type Workspace, type Effort as ApiEffort, type EngineId } from '../api';
-import { setFlag, ONBOARDED, getFlag, BIOMETRIC_GATE, clearCache } from '../storage';
-import { unregisterPush } from '../push';
+import { setFlag, ONBOARDED, getFlag, BIOMETRIC_GATE, USE_WS_STREAM, clearCache } from '../storage';
+import { unregisterPush, getPushState, subscribePush, registerForPush, refreshPushStatus, type PushState } from '../push';
 import { NOTIF_CATEGORIES, getNotifPrefs, setNotifPref } from '../notifPrefs';
 import { biometricAvailable, confirmBiometric } from '../biometrics';
 
@@ -267,6 +267,35 @@ function FeedbackSheet({ visible, onClose }: { visible: boolean; onClose: () => 
 const relayHost = API_BASE.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
 const appVersion = Constants.expoConfig?.version ?? '—';
 
+/* Live PushState hook — re-renders Settings whenever registerForPush/
+   refreshPushStatus updates the cached state. */
+function usePushState(): PushState {
+  const [s, setS] = useState<PushState>(getPushState());
+  React.useEffect(() => subscribePush(setS), []);
+  return s;
+}
+
+/* Human-readable summary for the Settings row — answers "is closed-app push
+   actually going to work?" in one line. */
+function pushSummary(s: PushState): { label: string; tint: 'green' | 'red' | 'orange' | 'inkSecondary'; hint: string } {
+  if (!s.projectId) {
+    return { label: 'Not configured', tint: 'red', hint: 'Build the app with EAS to enable closed-app pushes.' };
+  }
+  if (s.permission === 'denied') {
+    return { label: 'Permission denied', tint: 'red', hint: 'Allow notifications in iOS/Android Settings to receive closed-app alerts.' };
+  }
+  if (s.permission === 'undetermined' || s.permission === 'unknown') {
+    return { label: 'Not asked yet', tint: 'orange', hint: 'Tap Re-register to ask for permission and register this phone.' };
+  }
+  if (!s.token) {
+    return { label: 'No token', tint: 'orange', hint: s.lastError || 'Tap Re-register to mint a push token.' };
+  }
+  if (!s.registered) {
+    return { label: 'Not on relay', tint: 'orange', hint: s.lastError || 'Token minted but relay didn’t confirm. Tap Re-register.' };
+  }
+  return { label: 'Enabled', tint: 'green', hint: 'This phone will receive alerts even when the app is closed.' };
+}
+
 export function SettingsScreen() {
   const { theme, override, setOverride } = useTheme();
   const insets = useSafeAreaInsets();
@@ -276,11 +305,17 @@ export function SettingsScreen() {
   const [engine, setEngine] = useState<EngineChoice>('auto');
   const [notifs, setNotifs] = useState(getNotifPrefs());
   const [bioGate, setBioGate] = useState(getFlag(BIOMETRIC_GATE));
+  // USE_WS_STREAM: opt-in to the WebSocket transport for live events. Off by
+  // default — SSE still works everywhere; WS is a perf upgrade for chats.
+  const [wsStream, setWsStream] = useState(getFlag(USE_WS_STREAM));
   const [bioAvail, setBioAvail] = useState(true);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [conn, setConn] = useState<'idle' | 'testing' | 'ok' | 'fail'>('idle');
   const [outbox, setOutbox] = useState(api.outbox().length);
   const [fbOpen, setFbOpen] = useState(false);
+  const push = usePushState();
+  const pushInfo = pushSummary(push);
+  const [pushBusy, setPushBusy] = useState(false);
 
   const testConnection = () => {
     setConn('testing');
@@ -301,9 +336,41 @@ export function SettingsScreen() {
         setEngine(s.defaultEngine);
       }).catch(() => {});
       setOutbox(api.outbox().length);
+      // Probe the relay for "does it still have my token?" — surfaces a
+      // post-redeploy "Not on relay" without the user needing to re-open the app.
+      void refreshPushStatus();
       return () => { alive = false; };
     }, []),
   );
+
+  /* Re-register: re-run the perm prompt + mint a fresh Expo token + register
+     with the relay. Idempotent. If perms are denied, deep-link to OS settings. */
+  const reRegisterPush = React.useCallback(async () => {
+    if (pushBusy) return;
+    setPushBusy(true);
+    try {
+      await registerForPush();
+      await refreshPushStatus();
+      const s = getPushState();
+      if (s.permission === 'denied') {
+        Alert.alert(
+          'Notifications are off',
+          'Allow notifications in your phone’s Settings to receive alerts while the app is closed.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => { void Linking.openSettings(); } },
+          ],
+        );
+      } else if (!s.projectId) {
+        Alert.alert(
+          'EAS build required',
+          'Closed-app push needs a dev or production EAS build (Expo Go can’t deliver remote pushes). Once you install an EAS build on this phone, this row will turn green.',
+        );
+      }
+    } finally {
+      setPushBusy(false);
+    }
+  }, [pushBusy]);
 
   const changeEffort = (e: Effort) => { setEff(e); void api.setSettings({ defaultEffort: toApiEffort(e) }).catch(() => {}); };
   const changeEngine = (id: EngineChoice) => { setEngine(id); void api.setSettings({ defaultEngine: id }).catch(() => {}); };
@@ -394,6 +461,63 @@ export function SettingsScreen() {
                 <MSwitch value={notifs[c.key]} onValueChange={(v) => setNotifs(setNotifPref(c.key, v))} />
               </Row>
             ))}
+          </Group>
+        </View>
+
+        {/* Push notifications — closed-app alerts via the relay → Expo */}
+        <View style={{ marginBottom: 22 }}>
+          <Group
+            header="Push notifications"
+            footer={pushInfo.hint}
+          >
+            <Row>
+              <View style={rowLabel}><Text style={labelText}>Status</Text></View>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: theme.color[pushInfo.tint] }} />
+                <Text style={{ fontSize: 14, fontWeight: '600', color: theme.color[pushInfo.tint] }}>{pushInfo.label}</Text>
+              </View>
+            </Row>
+            <Row>
+              <View style={rowLabel}><Text style={labelText}>EAS project</Text></View>
+              <Text style={{ fontSize: 13, fontWeight: '500', fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>
+                {push.projectId ? push.projectId.slice(0, 8) + '…' : 'missing'}
+              </Text>
+            </Row>
+            <Row>
+              <View style={rowLabel}><Text style={labelText}>Permission</Text></View>
+              <Text style={{ fontSize: 14, fontWeight: '500', color: theme.color.inkSecondary }}>
+                {push.permission === 'granted' ? 'Granted' : push.permission === 'denied' ? 'Denied' : push.permission === 'undetermined' ? 'Not asked' : '—'}
+              </Text>
+            </Row>
+            <Row last onPress={reRegisterPush}>
+              <View style={{ width: 30, height: 30, borderRadius: 8, backgroundColor: theme.color.blue + '24', alignItems: 'center', justifyContent: 'center' }}>
+                <Icon name="bell" size={16} color={theme.color.blue} />
+              </View>
+              <View style={rowLabel}>
+                <Text style={{ fontSize: 16, color: theme.color.blue }}>
+                  {pushBusy ? 'Registering…' : push.permission === 'denied' ? 'Open OS settings' : 'Re-register this phone'}
+                </Text>
+              </View>
+              <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
+            </Row>
+          </Group>
+        </View>
+
+        {/* Connection — transport for the live event stream */}
+        <View style={{ marginBottom: 22 }}>
+          <Group
+            header="Connection"
+            footer="WebSocket lowers latency for streaming chat output. SSE (off) is the safe default and works everywhere; turn this on if chats feel laggy."
+          >
+            <Row last>
+              <View style={rowLabel}>
+                <Text style={labelText}>Use WebSocket stream</Text>
+                <Text style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 2 }}>
+                  {wsStream ? 'WS' : 'SSE'} · takes effect on next screen open
+                </Text>
+              </View>
+              <MSwitch value={wsStream} onValueChange={(v) => { setWsStream(v); setFlag(USE_WS_STREAM, v); }} />
+            </Row>
           </Group>
         </View>
 
