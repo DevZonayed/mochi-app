@@ -300,18 +300,22 @@ export interface ModelGroup {
 }
 /** One connected/recent remote device, reported by the relay's device registry. */
 export interface RemoteDevice { id: string; name: string | null; live: boolean; lastSeen: number }
+/** A device registered to the account, from GET /api/devices (account server). */
+export interface AccountDevice {
+  id: string;
+  role: 'host' | 'remote';
+  name: string | null;
+  platform: string | null;
+  deckId: string | null;
+  online: boolean;
+  lastSeen: number | null;
+}
 /** Whether the `gh` CLI is available (system or our managed download). */
 export interface GhState { installed: boolean; source: 'system' | 'managed' | 'none'; version: string | null; path: string | null; supported: boolean }
 /** Live frames during a GitHub OAuth sign-in: downloading gh, then the one-time code. */
 export type GithubDevice =
   | { stage: 'downloading-cli'; pct: number }
   | { stage: 'code'; userCode: string; verificationUri: string };
-export interface PairingInfo {
-  token: string;
-  relayUrl: string;
-  /** Live remote devices (phone/web), reported by the relay. */
-  devices?: RemoteDevice[];
-}
 export type AppEventKind =
   | 'job-done' | 'job-failed' | 'job-cancelled'
   | 'approval-created' | 'approval-resolved'
@@ -645,6 +649,38 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     // A 401 on an /api/* call from a browser remote means our token/device was
     // rejected (kicked, or the code was regenerated) → drop it + show the re-pair gate.
     if (res.status === 401 && !IS_LOCAL && path.startsWith('/api/')) handleUnauthorized(detail);
+    throw new ApiError(res.status, detail);
+  }
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
+/** The account session token the renderer persisted at login (Better Auth).
+    Read directly from localStorage to avoid a circular import with auth.ts. */
+const SESSION_KEY = 'maestro.session';
+function accountToken(): string {
+  if (typeof window === 'undefined') return '';
+  try { return localStorage.getItem(SESSION_KEY) ?? ''; } catch { return ''; }
+}
+
+/** Raw request against the account server, authed by the session token
+    (Authorization: Bearer …). Used for account-scoped endpoints (devices) that
+    are NOT part of the relay's mirrored dispatch. */
+async function reqAccount<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = accountToken();
+  const hasBody = init?.body != null;
+  const res = await fetch(API_BASE + path, {
+    ...init,
+    headers: {
+      ...(hasBody ? { 'content-type': 'application/json' } : {}),
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers ?? {}),
+    },
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { const body = (await res.json()) as { error?: string; message?: string }; if (body?.error || body?.message) detail = body.error ?? body.message ?? detail; }
+    catch { /* non-JSON error body */ }
     throw new ApiError(res.status, detail);
   }
   if (res.status === 204) return undefined as T;
@@ -1193,15 +1229,10 @@ export const api = {
     call<Roles>('setRoles', { ...patch }, () =>
       req<Roles>('/api/roles', { method: 'POST', body: JSON.stringify(patch) })),
 
-  // Pairing + device management (desktop-only)
-  getPairing: () =>
-    call<PairingInfo>('getPairing', {}, () => Promise.reject(new ApiError(404, 'Pairing info is only available in the desktop app'))),
-  /** Disconnect one remote device — closes its live streams and forces it to re-pair. */
-  kickDevice: (deviceId: string) =>
-    call<{ ok: boolean }>('kickDevice', { deviceId }, () => Promise.reject(new ApiError(403, 'Only the Mac can disconnect devices'))),
-  /** Regenerate the pairing code — unpairs every device. Returns the new code. */
-  regeneratePairingCode: () =>
-    call<{ token: string }>('regeneratePairingCode', {}, () => Promise.reject(new ApiError(403, 'Only the Mac can regenerate the code'))),
+  /** Account devices (host + remotes) for the signed-in account, with live
+      online status. Raw fetch against the account server, authed by the session
+      token the renderer stored at login. Replaces the old pairing-code flow. */
+  listDevices: () => reqAccount<AccountDevice[]>('/api/devices'),
 
   /** Auto-update — desktop only; `undefined` in web/phone remotes (updates are
       about this Mac's own binary, so they're never exposed over the relay). */

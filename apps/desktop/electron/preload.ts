@@ -43,6 +43,11 @@ contextBridge.exposeInMainWorld('maestro', {
     ipcRenderer.on('maestro:cmd-output', l);
     return () => ipcRenderer.removeListener('maestro:cmd-output', l);
   },
+  // Account session bridge: the renderer owns the Better Auth session token (it
+  // logs in over raw fetch + persists it in localStorage), and pushes it to the
+  // main process here so the host WebSocket can authenticate. Fire-and-forget;
+  // pass null on sign-out to tear the host connection down.
+  setSession: (token: string | null): void => { ipcRenderer.send('maestro:session', token); },
   // Direct P2P (WebRTC): the renderer hosts the RTCPeerConnection, main stays the brain.
   // renderer→main is fire-and-forget on :out; main→renderer pushes on :in.
   sendP2P: (msg: unknown): void => ipcRenderer.send('maestro:p2p:out', msg),

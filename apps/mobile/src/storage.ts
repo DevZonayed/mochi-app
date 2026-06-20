@@ -32,8 +32,15 @@ export function setFlag(key: string, val: boolean): void {
 }
 
 export const ONBOARDED = 'maestro.mobile.onboarded';
+/** Legacy pairing-code token (kept only so old installs can be migrated/cleared). */
 export const PAIR_TOKEN = 'maestro.mobile.token';
-/** Stable per-install device id (minted on pair) so the Mac can list + disconnect THIS device. */
+/** Account session token (Better Auth) — sent as `Authorization: Bearer` on /api/*
+    and `?token=` on the /ws/remote stream. Replaces the pairing code. */
+export const SESSION_TOKEN = 'maestro.mobile.sessionToken';
+/** The currently-selected host (Mac) this phone is controlling — its device id.
+    All sync/commands/live-stream are scoped to this host. */
+export const ACTIVE_HOST = 'maestro.mobile.activeHost';
+/** Stable per-install device id (minted once) so the account can list + manage THIS device. */
 export const DEVICE_ID = 'maestro.mobile.deviceId';
 /** Which AppEvent kinds surface in the Activity feed (per-category toggles). */
 export const NOTIF_PREFS = 'maestro.mobile.notifPrefs';
@@ -116,6 +123,9 @@ export async function clearCache(): Promise<void> {
   // Reset the delta cursor (in-memory + persisted).
   cache.delete(LAST_SYNC);
   try { await AsyncStorage.removeItem(LAST_SYNC); } catch { /* ignore */ }
+  // Forget the active host so a fresh sign-in re-picks from the new account's hosts.
+  cache.delete(ACTIVE_HOST);
+  try { await AsyncStorage.removeItem(ACTIVE_HOST); } catch { /* ignore */ }
   // Drop the unified store (project/sessions/jobs/approvals/assets/events).
   // Done lazily to avoid an import cycle with syncStore → storage.
   try {

@@ -1,7 +1,10 @@
-/* Maestro mobile — live API client for the deployed maestro-server.
+/* Maestro mobile — API client for the account server (api.nexalance.cloud).
 
-   React Native has fetch but no EventSource, so live updates use polling
-   (api.poll) instead of SSE. Same shape/contract as the desktop client. */
+   The phone signs in to an ACCOUNT (see auth.ts) and controls one of the account's
+   HOSTS (Macs) at a time — the "active host". All reads/commands go through
+   POST /api/cmd {hostId, method, params}; the per-host snapshot comes from
+   GET /api/sync?host=; live updates ride the /ws/remote WebSocket (RN's global
+   WebSocket — no SSE). Same data shapes/contract as the desktop client. */
 
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
@@ -134,48 +137,29 @@ export interface DashboardData {
   budget: BudgetData;
 }
 
-export const API_BASE = 'https://api.nexalance.cloud';
-
-import EventSource from 'react-native-sse';
-import { Platform } from 'react-native';
-
-/** A human label for this device, sent so the Mac can show "iPhone connected". */
-export const DEVICE_NAME = Platform.OS === 'ios' ? 'iPhone' : Platform.OS === 'android' ? 'Android phone' : 'Web remote';
-import { getStr, setStr, PAIR_TOKEN, DEVICE_ID } from './storage';
-import { gotoRepair } from './navRef';
 import { buildIceServers } from '@maestro/realtime';
 import { createP2PLink } from './p2p/link';
 import type { Signal } from './p2p/transport';
+import {
+  API_BASE, DEVICE_NAME, DEVICE_PLATFORM,
+  getSessionToken, getDeviceId, getActiveHost, setSessionToken, setActiveHost,
+} from './auth';
+import { gotoRepair } from './navRef';
 
-/* Pairing token — the relay refuses /api/* without the code shown in the
-   Maestro desktop app (Settings → Devices). Stored locally on this phone. */
-let pairToken = getStr(PAIR_TOKEN);
-export function getPairToken(): string { return pairToken; }
-export function setPairToken(token: string): void {
-  pairToken = token.trim();
-  setStr(PAIR_TOKEN, pairToken);
-  freshDeviceId(); // (re-)pair → new identity so a prior kick (old id revoked) doesn't carry over
-}
-/** Re-read the token from storage after async hydration (see storage.hydrate). */
-export function reloadPairToken(): void { pairToken = getStr(PAIR_TOKEN); }
+export { API_BASE, DEVICE_NAME, getDeviceId };
 
-/* Per-device identity — a stable id lets the Mac list + disconnect THIS phone. */
-function mintDeviceId(): string {
-  return `dev-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
-}
-export function getDeviceId(): string {
-  let id = getStr(DEVICE_ID);
-  if (!id) { id = mintDeviceId(); setStr(DEVICE_ID, id); }
-  return id;
-}
-function freshDeviceId(): void { setStr(DEVICE_ID, mintDeviceId()); }
+/* ── Device (host) listing — account-scoped ────────────────────────────────
+   The account server tracks every device on the account. Hosts (Macs that can
+   run jobs) are role==='host'; the phone picks one as its "active host". */
+export interface Device { id: string; role: 'host' | 'remote'; name: string; platform: string; deckId?: string; online: boolean; lastSeen?: number }
 
-/* Re-pair gate: when the relay rejects our token (this device was kicked, or the
-   code was regenerated), drop the token and bounce to Onboarding so the user can
-   reconnect — instead of failing silently. Suppressed around verifyPairing's probe. */
+/* Auth gate: when the server rejects our session (token expired / signed out
+   elsewhere), drop the token and bounce to Login so the user can sign back in —
+   instead of failing silently. Suppressed where a caller handles 401 itself. */
 let authRedirectEnabled = true;
 function handleUnauthorized(): void {
-  setPairToken(''); // clears token + mints a fresh device id for the next pair
+  setSessionToken(''); // clears the session; the active host is left for re-pick after re-login
+  setActiveHost('');
   gotoRepair();
 }
 
@@ -200,31 +184,33 @@ const OUTBOX_CAP = 50;
 
 function notifyOutbox(): void { for (const cb of outboxSubs) { try { cb(); } catch { /* ignore */ } } }
 
-/** Human label for a mutating request, derived from method + path. */
-function describeMutation(method: string, path: string): string | null {
-  const p = path.split('?')[0];
-  const table: [RegExp, string][] = [
-    [/^\/api\/jobs\/run$/, 'Start job'],
-    [/^\/api\/jobs\/[^/]+\/run$/, 'Run job'],
-    [/^\/api\/jobs\/[^/]+\/cancel$/, 'Cancel job'],
-    [/^\/api\/jobs\/[^/]+\/delete$/, 'Delete job'],
-    [/^\/api\/jobs$/, 'Create job'],
-    [/^\/api\/approvals\/[^/]+\/approve$/, 'Approve gate'],
-    [/^\/api\/approvals\/[^/]+\/deny$/, 'Deny gate'],
-    [/^\/api\/assets\/[^/]+\/approve$/, 'Approve asset'],
-    [/^\/api\/assets\/[^/]+\/cancel$/, 'Cancel asset'],
-    [/^\/api\/assets\/generate$/, 'Generate asset'],
-    [/^\/api\/projects$/, 'Create project'],
-    [/^\/api\/projects\/[^/]+\/delete$/, 'Delete project'],
-    [/^\/api\/workspaces$/, 'Create workspace'],
-    [/^\/api\/schedules\/[^/]+\/toggle$/, 'Toggle schedule'],
-    [/^\/api\/schedules\/[^/]+\/delete$/, 'Cancel scheduled'],
-    [/^\/api\/schedules$/, 'Queue message'],
-    [/^\/api\/skills\/[^/]+\/toggle$/, 'Toggle skill'],
-    [/^\/api\/feedback$/, 'Send feedback'],
-  ];
-  for (const [re, label] of table) if (re.test(p)) return label;
-  return null;
+/** Human label for a mutating command, keyed by host RPC method name. Read-only
+    methods return null (no outbox entry). */
+function describeMutation(method: string): string | null {
+  const table: Record<string, string> = {
+    createAndRunJob: 'Start job',
+    runJob: 'Run job',
+    cancelJob: 'Cancel job',
+    deleteJob: 'Delete job',
+    createJob: 'Create job',
+    sendChat: 'Send message',
+    approveApproval: 'Approve gate',
+    denyApproval: 'Deny gate',
+    approveAsset: 'Approve asset',
+    cancelAsset: 'Cancel asset',
+    generateAsset: 'Generate asset',
+    createProject: 'Create project',
+    deleteProject: 'Delete project',
+    createWorkspace: 'Create workspace',
+    toggleSchedule: 'Toggle schedule',
+    deleteSchedule: 'Cancel scheduled',
+    createSchedule: 'Queue message',
+    updateSchedule: 'Update schedule',
+    toggleSkill: 'Toggle skill',
+    submitFeedback: 'Send feedback',
+    setSettings: 'Update settings',
+  };
+  return table[method] ?? null;
 }
 
 function recordOutbox(desc: string, state: OutboxState, why?: string): void {
@@ -233,45 +219,65 @@ function recordOutbox(desc: string, state: OutboxState, why?: string): void {
   notifyOutbox();
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  // Only send a JSON content-type when there's actually a body — otherwise
-  // Fastify rejects the empty body (FST_ERR_CTP_EMPTY_JSON_BODY) on bodyless POSTs.
+/* ── Account-level transport ───────────────────────────────────────────────
+   Direct /api/* calls that are NOT host commands: device listing, the per-host
+   snapshot sync, TURN credentials, WebRTC signaling, and the auth probe. Sends
+   the account session as Bearer + this phone's device id. */
+async function accountReq<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getSessionToken();
   const hasBody = init?.body != null;
-  const method = (init?.method ?? 'GET').toUpperCase();
-  const intent = method === 'GET' ? null : describeMutation(method, path);
+  const res = await fetch(API_BASE + path, {
+    ...init,
+    headers: {
+      ...(hasBody ? { 'content-type': 'application/json' } : {}),
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      'x-maestro-device': DEVICE_NAME,
+      'x-maestro-device-id': getDeviceId(),
+      ...(init?.headers ?? {}),
+    },
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { const b = (await res.json()) as { error?: string; message?: string }; detail = b?.error || b?.message || detail; }
+    catch { /* non-JSON */ }
+    if (res.status === 401 && authRedirectEnabled) handleUnauthorized();
+    throw new ApiError(res.status, detail);
+  }
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
+/** No active host selected yet — surfaced like a 503 so screens fall through to
+    their "pick a Mac / offline" state instead of hanging. */
+export class NoHostError extends ApiError {
+  constructor() { super(503, 'No Mac selected — choose one to control.'); }
+}
+
+/* ── Host command transport ────────────────────────────────────────────────
+   EVERY command/mutation AND read goes through POST /api/cmd {hostId, method,
+   params}; the server forwards it to the active host (the Mac) and returns its
+   reply. 404 = cross-account, 503 = host offline, 504 = host timed out — the
+   same status contract the screens already handle (was the relay's 503/etc). */
+async function cmd<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+  const intent = describeMutation(method);
+  const hostId = getActiveHost();
+  if (!hostId) {
+    if (intent) recordOutbox(intent, 'conflict', 'No Mac selected');
+    throw new NoHostError();
+  }
   try {
-    const res = await fetch(API_BASE + path, {
-      ...init,
-      headers: {
-        ...(hasBody ? { 'content-type': 'application/json' } : {}),
-        ...(pairToken ? { authorization: `Bearer ${pairToken}` } : {}),
-        'x-maestro-device': DEVICE_NAME,
-        'x-maestro-device-id': getDeviceId(),
-        ...(init?.headers ?? {}),
-      },
+    const result = await accountReq<T>('/api/cmd', {
+      method: 'POST',
+      body: JSON.stringify({ hostId, method, params }),
     });
-    if (!res.ok) {
-      let detail = res.statusText;
-      try {
-        const body = (await res.json()) as { error?: string };
-        if (body?.error) detail = body.error;
-      } catch {
-        /* non-JSON error body */
-      }
-      // Our token/device was rejected (kicked, or the code was regenerated) → drop
-      // it and bounce to the enter-code screen so the user can reconnect.
-      if (res.status === 401 && authRedirectEnabled) handleUnauthorized();
-      throw new ApiError(res.status, detail);
-    }
     if (intent) recordOutbox(intent, 'applied');
-    if (res.status === 204) return undefined as T;
-    return (await res.json()) as T;
+    return result;
   } catch (e) {
     // 503 = the Mac is offline, so nothing ran (a "conflict" with reality);
     // any other failure means the Mac refused or the request errored.
     if (intent) {
       const status = e instanceof ApiError ? e.status : 0;
-      recordOutbox(intent, status === 503 ? 'conflict' : 'rejected', e instanceof Error ? e.message : 'request failed');
+      recordOutbox(intent, status === 503 || status === 504 ? 'conflict' : 'rejected', e instanceof Error ? e.message : 'request failed');
     }
     throw e;
   }
@@ -285,40 +291,105 @@ const qp = (params: Record<string, string | undefined>): string => {
   return q ? `?${q}` : '';
 };
 
+/* ── Snapshot → SyncDelta adapter ──────────────────────────────────────────
+   The account server mirrors each host's FULL state (apps/desktop store.snapshot)
+   in Redis and serves it via /api/sync?host=. The unified mobile store still
+   speaks `SyncDelta`, so we adapt: every collection becomes a full upsert and the
+   host's `tombstones` become the `deleted` ids. Since it's a full snapshot, the
+   store's upsert-by-id reconciles cleanly on every pull. */
+interface Tombstone { kind: 'project' | 'session' | 'job' | 'asset' | 'approval'; id: string; ts: number }
+export interface SnapshotShape {
+  projects?: Project[]; sessions?: ChatSession[]; jobs?: Job[];
+  approvals?: Approval[]; assets?: Asset[]; events?: AppEvent[];
+  tombstones?: Tombstone[]; at?: number;
+}
+export function snapshotToDelta(_host: string, snap: SnapshotShape | null): SyncDelta {
+  const s = snap ?? {};
+  const tomb = s.tombstones ?? [];
+  const idsOf = (kind: Tombstone['kind']) => tomb.filter((t) => t.kind === kind).map((t) => t.id);
+  return {
+    at: s.at ?? Date.now(),
+    host: { online: snap != null }, // a present snapshot ⇒ the host has mirrored state
+    changed: {
+      projects: s.projects ?? [], sessions: s.sessions ?? [], jobs: s.jobs ?? [],
+      approvals: s.approvals ?? [], assets: s.assets ?? [], events: s.events ?? [],
+    },
+    deleted: {
+      projects: idsOf('project'), sessions: idsOf('session'), jobs: idsOf('job'),
+      approvals: idsOf('approval'), assets: idsOf('asset'),
+    },
+  };
+}
+
 export const api = {
   base: API_BASE,
-  health: () => req<{ ok: boolean; name: string; version: string; engine: string }>('/health'),
+  health: () => accountReq<{ ok: boolean; name: string; mode: string }>('/health'),
 
-  dashboard: (workspaceId?: string) => req<DashboardData>('/api/dashboard' + qp({ workspaceId })),
-  budget: (workspaceId?: string) => req<BudgetData>('/api/budget' + qp({ workspaceId })),
-  costs: () => req<CostsData>('/api/costs'),
-  listEvents: () => req<AppEvent[]>('/api/events'),
-  engineStatus: () => req<EngineStatuses>('/api/engine-status'),
+  /* ── Account-level (not host-scoped) ─────────────────────────────────── */
 
-  listAssets: (projectId?: string) => req<Asset[]>('/api/assets' + qp({ projectId })),
-  approveAsset: (id: string) => req<Asset>(`/api/assets/${encodeURIComponent(id)}/approve`, { method: 'POST' }),
-  cancelAsset: (id: string) => req<Asset>(`/api/assets/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+  /** Every device on the account. Hosts (Macs) are role==='host'. */
+  listDevices: () => accountReq<Device[]>('/api/devices'),
+  turnCredentials: () => accountReq<{ host: string | null; username: string | null; credential: string | null; ttl: number }>('/api/turn-credentials'),
 
-  listWorkspaces: () => req<Workspace[]>('/api/workspaces'),
-  createWorkspace: (name: string, budgetCap?: number) => req<Workspace>('/api/workspaces', { method: 'POST', body: JSON.stringify({ name, budgetCap }) }),
+  /** A read-only auth/connectivity probe (mirrors the old verifyPairing).
+     'ok' = signed in + hosts reachable · 'invalid' = session rejected (401) ·
+     'mac-offline' = signed in but the active host is offline/none ·
+     'unreachable' = network/server down. */
+  verifySession: async (): Promise<'ok' | 'invalid' | 'mac-offline' | 'unreachable'> => {
+    authRedirectEnabled = false; // this probe handles 401 itself (don't bounce to Login)
+    try {
+      const devices = await accountReq<Device[]>('/api/devices');
+      const host = getActiveHost();
+      const active = host ? devices.find((d) => d.id === host) : devices.find((d) => d.role === 'host' && d.online);
+      return active?.online ? 'ok' : 'mac-offline';
+    } catch (e) {
+      if (e instanceof ApiError) return e.status === 401 ? 'invalid' : 'unreachable';
+      return 'unreachable';
+    } finally {
+      authRedirectEnabled = true;
+    }
+  },
 
-  listProjects: (workspaceId?: string) => req<Project[]>('/api/projects' + qp({ workspaceId })),
+  /* ── Host snapshot sync ──────────────────────────────────────────────── */
+
+  /** Pull the active host's full mirrored snapshot and adapt it to the store's
+      `SyncDelta` shape (full upsert, tombstones honored). The account server's
+      /api/sync returns {host, snapshot}; there is no incremental delta, so
+      `since` is ignored (kept for call-site compatibility). */
+  sync: async (_since: number): Promise<SyncDelta> => {
+    const hostId = getActiveHost();
+    if (!hostId) throw new NoHostError();
+    const { host, snapshot } = await accountReq<{ host: string; snapshot: SnapshotShape | null }>('/api/sync' + qp({ host: hostId }));
+    return snapshotToDelta(host, snapshot);
+  },
+
+  /* ── Host commands (routed via /api/cmd to the active Mac) ───────────── */
+
+  dashboard: () => cmd<DashboardData>('dashboard'),
+  budget: () => cmd<BudgetData>('budget'),
+  costs: () => cmd<CostsData>('costs'),
+  listEvents: () => cmd<AppEvent[]>('listEvents'),
+  engineStatus: () => cmd<EngineStatuses>('engineStatus'),
+
+  listAssets: (projectId?: string) => cmd<Asset[]>('listAssets', { projectId }),
+  approveAsset: (id: string) => cmd<Asset>('approveAsset', { id }),
+  cancelAsset: (id: string) => cmd<Asset>('cancelAsset', { id }),
+
+  listWorkspaces: () => cmd<Workspace[]>('listWorkspaces'),
+  createWorkspace: (name: string, budgetCap?: number) => cmd<Workspace>('createWorkspace', { name, budgetCap }),
+
+  listProjects: () => cmd<Project[]>('listProjects'),
   createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; path?: string; kind?: ProjectKind }) =>
-    req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) }),
+    cmd<Project>('createProject', input),
   /** Browse a folder on the Mac (read-only) for the new-project location picker. */
-  browseDir: (path?: string) => req<DirListing>('/api/browse' + qp({ path })),
-  getProject: (id: string) => req<Project>(`/api/projects/${encodeURIComponent(id)}`),
-  deleteProject: (id: string) => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' }),
+  browseDir: (path?: string) => cmd<DirListing>('browseDir', { path }),
+  getProject: (id: string) => cmd<Project>('getProject', { id }),
+  deleteProject: (id: string) => cmd<{ ok: boolean }>('deleteProject', { id }),
 
-  listJobs: (projectId?: string, sessionId?: string) => req<Job[]>('/api/jobs' + qp({ projectId, sessionId })),
-  /** Delta sync — returns ONLY entities that have changed since `since` (a
-      timestamp from a prior `at` in the same shape) + ids that were deleted.
-      `since=0` is the cold-start case and returns the entire current state.
-      Used by the unified `syncStore` instead of the per-collection list calls. */
-  sync: (since: number) => req<SyncDelta>('/api/sync' + qp({ since: since > 0 ? String(since) : undefined })),
+  listJobs: (projectId?: string, sessionId?: string) => cmd<Job[]>('listJobs', { projectId, sessionId }),
 
   /** Chat sessions inside a project (the desktop's project → sessions tree). */
-  listSessions: (projectId?: string) => req<ChatSession[]>('/api/sessions' + qp({ projectId })),
+  listSessions: (projectId?: string) => cmd<ChatSession[]>('listSessions', { projectId }),
   /** Send a chat turn. Omit sessionId to start a new session. The reply streams
       in via live `job` events; refetch the session's jobs to render it.
       Attachments piggy-back as `images[]` (vision input) and `files[]` (text
@@ -329,67 +400,50 @@ export const api = {
     images?: { name?: string; mime: string; dataB64: string }[];
     files?: { name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[];
   }) =>
-    req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) }),
+    cmd<{ session: ChatSession; job: Job }>('sendChat', input),
   createJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
-    req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) }),
-  getJob: (id: string) => req<Job>(`/api/jobs/${encodeURIComponent(id)}`),
-  runJob: (id: string, effort?: Effort) => req<Job>(`/api/jobs/${encodeURIComponent(id)}/run`, { method: 'POST', body: JSON.stringify(effort ? { effort } : {}) }),
+    cmd<Job>('createJob', input),
+  getJob: (id: string) => cmd<Job>('getJob', { id }),
+  runJob: (id: string, effort?: Effort) => cmd<Job>('runJob', { id, effort }),
   createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort; engine?: EngineId }) =>
-    req<Job>('/api/jobs/run', { method: 'POST', body: JSON.stringify(input) }),
-  cancelJob: (id: string) => req<Job>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+    cmd<Job>('createAndRunJob', input),
+  cancelJob: (id: string) => cmd<Job>('cancelJob', { id }),
   /** Real git diff of a job's work (committed + uncommitted), computed on the Mac. */
-  getJobDiff: (id: string) => req<JobDiff>(`/api/jobs/${encodeURIComponent(id)}/diff`),
+  getJobDiff: (id: string) => cmd<JobDiff>('getJobDiff', { id }),
 
-  listApprovals: (status?: ApprovalStatus) => req<Approval[]>('/api/approvals' + qp({ status })),
-  approveApproval: (id: string) => req<Approval>(`/api/approvals/${encodeURIComponent(id)}/approve`, { method: 'POST' }),
-  denyApproval: (id: string) => req<Approval>(`/api/approvals/${encodeURIComponent(id)}/deny`, { method: 'POST' }),
+  listApprovals: (status?: ApprovalStatus) => cmd<Approval[]>('listApprovals', { status }),
+  approveApproval: (id: string) => cmd<Approval>('approveApproval', { id }),
+  denyApproval: (id: string) => cmd<Approval>('denyApproval', { id }),
 
-  listSchedules: () => req<Schedule[]>('/api/schedules'),
-  toggleSchedule: (id: string, enabled: boolean) => req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) }),
+  listSchedules: () => cmd<Schedule[]>('listSchedules'),
+  toggleSchedule: (id: string, enabled: boolean) => cmd<{ ok: boolean }>('toggleSchedule', { id, enabled }),
   /** Create a schedule. With fireAt+sessionId+prompt it's a one-shot queued message;
       with everyMinutes or time+cadence it's a recurring schedule. */
   createSchedule: (input: { title: string; projectId?: string | null; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; everyMinutes?: number; catchUp?: boolean }) =>
-    req<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(input) }),
+    cmd<Schedule>('createSchedule', input),
   updateSchedule: (id: string, patch: { title?: string; prompt?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; enabled?: boolean; sessionId?: string; projectId?: string }) =>
-    req<Schedule>(`/api/schedules/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
-  deleteSchedule: (id: string) => req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/delete`, { method: 'POST' }),
+    cmd<Schedule>('updateSchedule', { ...patch, id }),
+  deleteSchedule: (id: string) => cmd<{ ok: boolean }>('deleteSchedule', { id }),
 
-  listSkills: () => req<Skill[]>('/api/skills'),
-  toggleSkill: (id: string) => req<Skill>(`/api/skills/${encodeURIComponent(id)}/toggle`, { method: 'POST' }),
+  listSkills: () => cmd<Skill[]>('listSkills'),
+  toggleSkill: (id: string) => cmd<Skill>('toggleSkill', { id }),
 
-  listTemplates: () => req<Template[]>('/api/templates'),
+  listTemplates: () => cmd<Template[]>('listTemplates'),
   /** Grouped, pickable models with per-provider runnable state (from the Mac). */
-  listModels: () => req<ModelGroup[]>('/api/models'),
+  listModels: () => cmd<ModelGroup[]>('listModels'),
 
   /** Operator defaults, stored on the Mac (effort/engine the new-job composer inherits). */
-  getSettings: () => req<AppSettings | null>('/api/settings'),
-  setSettings: (patch: Partial<AppSettings>) => req<AppSettings>('/api/settings', { method: 'POST', body: JSON.stringify(patch) }),
-  turnCredentials: () => req<{ host: string | null; username: string | null; credential: string | null; ttl: number }>('/api/turn-credentials'),
+  getSettings: () => cmd<AppSettings | null>('getSettings'),
+  setSettings: (patch: Partial<AppSettings>) => cmd<AppSettings>('setSettings', patch),
 
   /** Send feedback from this phone — stored on the Mac (source: 'phone'). */
   submitFeedback: (input: { category: 'bug' | 'idea' | 'other'; message: string }) =>
-    req<{ id: string }>('/api/feedback', { method: 'POST', body: JSON.stringify({ ...input, source: 'phone' }) }),
+    cmd<{ id: string }>('submitFeedback', { ...input, source: 'phone' }),
 
-  /** Register this phone's Expo push token so the relay can alert a CLOSED app. */
-  registerPush: (token: string) => req<{ ok: boolean; devices: number }>('/api/push/register', { method: 'POST', body: JSON.stringify({ token }) }),
-  /** Drop this phone's push token (called on unpair). */
-  unregisterPush: (token: string) => req<{ ok: boolean; devices: number }>('/api/push/unregister', { method: 'POST', body: JSON.stringify({ token }) }),
-
-  /** Verify the current pair token against the relay (a read-only auth probe).
-     'ok' = token works · 'invalid' = wrong code (401) · 'mac-offline' = no Mac
-     reachable to validate against (503) · 'unreachable' = network/relay down. */
-  verifyPairing: async (): Promise<'ok' | 'invalid' | 'mac-offline' | 'unreachable'> => {
-    authRedirectEnabled = false; // this probe handles 401 itself (don't bounce to Onboarding)
-    try {
-      await req('/api/engine-status');
-      return 'ok';
-    } catch (e) {
-      if (e instanceof ApiError) return e.status === 401 ? 'invalid' : e.status === 503 ? 'mac-offline' : 'invalid';
-      return 'unreachable';
-    } finally {
-      authRedirectEnabled = true;
-    }
-  },
+  /** Register this phone's Expo push token so the server can alert a CLOSED app. */
+  registerPush: (token: string) => accountReq<{ ok: boolean; devices: number }>('/api/push/register', { method: 'POST', body: JSON.stringify({ token }) }),
+  /** Drop this phone's push token (called on sign-out). */
+  unregisterPush: (token: string) => accountReq<{ ok: boolean; devices: number }>('/api/push/unregister', { method: 'POST', body: JSON.stringify({ token }) }),
 
   /** The phone's outbox — intents dispatched this session, newest first. */
   outbox: (): OutboxEntry[] => outboxLog.slice(),
@@ -408,19 +462,20 @@ export const api = {
   },
 };
 
-/** Live host events the relay fans out over SSE (the same names the Mac emits). */
+/** Live host events the server fans out over the /ws/remote stream (the same
+    names the Mac emits). Plus the synthetic `hello` frame that carries the active
+    host's full snapshot on connect. */
 export type LiveEventName =
   | 'job' | 'session' | 'approval' | 'asset' | 'comms' | 'briefs'
   | 'schedule' | 'schedule-late' | 'git-status' | 'extension' | 'host' | 'hello'
-  /** One-shot replay frames for events missed while disconnected. The relay
-      emits these on connect when `?since=<ts>` is set; payload mirrors an
-      `AppEvent` from the Mac's event log. Treated like a live event by the
-      sync store: the entity is upserted and `lastSync` bumps to `event.ts`. */
+  /** Reserved for missed-event replay frames (not emitted by the account server
+      today, but the store still treats them as AppEvents if they ever arrive). */
   | 'replay';
 
 /* ── Connection path ──────────────────────────────────────────────────────
    Which transport the live stream is on RIGHT NOW: 'p2p' (direct WebRTC) once the
-   channel is open, else 'relay'. Subscribable so a UI pill can reflect it. */
+   channel is open, else 'relay' (the /ws/remote WebSocket). Subscribable so a UI
+   pill can reflect it. */
 let connPath: 'p2p' | 'relay' = 'relay';
 const connSubs = new Set<() => void>();
 export function getConnPath(): 'p2p' | 'relay' { return connPath; }
@@ -431,24 +486,51 @@ function setConnPath(p: 'p2p' | 'relay'): void {
   for (const cb of connSubs) { try { cb(); } catch { /* ignore */ } }
 }
 
-/** Send WebRTC signaling to the Mac. The relay tags it with this device's id and
-    hands it to the host; the Mac's replies come back as SSE `signal` frames. Not a
-    tracked mutation (no outbox noise). */
-export async function postSignal(signal: unknown): Promise<void> {
-  await req('/api/signal', { method: 'POST', body: JSON.stringify({ signal }) });
+/** Send a WebRTC signal to a device on the account (default: the active host).
+    POST /api/signal {toDeviceId, signal}; the server routes it and the peer's
+    replies come back as `{type:'signal', fromDeviceId, signal}` on /ws/remote.
+    Not a tracked mutation (no outbox noise). */
+export async function postSignal(signal: unknown, toDeviceId?: string): Promise<void> {
+  const to = toDeviceId || getActiveHost();
+  if (!to) return; // no host to signal yet
+  await accountReq('/api/signal', { method: 'POST', body: JSON.stringify({ toDeviceId: to, signal }) });
 }
 
-/** Open the relay's SSE stream (real-time, no polling) and invoke `onEvent(name,
-    data)` for each host event. Returns a disposer. react-native-sse is an XHR-based
-    EventSource that works in Expo Go (RN has no native EventSource) and reconnects
-    automatically. The pairing token rides as a Bearer header.
+/** Build the /ws/remote URL for the active host, carrying the account session
+    (?token=), this device's id (?did=), and the target host (?host=). */
+function remoteWsUrl(hostId: string): string {
+  const base = API_BASE.replace(/^http/, 'ws').replace(/\/$/, '');
+  const q = qp({
+    token: getSessionToken(),
+    did: getDeviceId(),
+    host: hostId,
+    name: DEVICE_NAME,
+    platform: DEVICE_PLATFORM,
+  });
+  return `${base}/ws/remote${q}`;
+}
 
-    When the Mac's `p2pEnabled` flag is on, a direct WebRTC channel is attempted;
-    once it's open, host events arrive over P2P and the duplicate SSE app-events are
-    suppressed (commands stay on REST). The link is native-free until started, so
-    Expo Go / web simply keep using SSE. */
-export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => void, since: number = 0): () => void {
-  const NAMES: LiveEventName[] = ['job', 'session', 'approval', 'asset', 'comms', 'briefs', 'schedule', 'schedule-late', 'git-status', 'extension', 'host', 'hello', 'replay'];
+/** Open the account server's /ws/remote stream for the ACTIVE host and invoke
+    `onEvent(name, data)` for each host event. Returns a disposer. Uses the global
+    `WebSocket` (RN provides it natively — no EventSource/SSE). Auto-reconnects with
+    backoff while open; re-reads the active host on each (re)connect so a host switch
+    that flips this stream down reconnects to the new host.
+
+    Frames:
+    - {type:'hello', hostId, snapshot}        → onEvent('hello', snapshot) (full state)
+    - {type:'event', name, data}              → onEvent(name, data)
+    - {type:'signal', fromDeviceId, signal}   → feed the P2P answerer
+
+    When the Mac's `p2pEnabled` flag is on a direct WebRTC channel is attempted;
+    once open, host events arrive over P2P and the duplicate WS app-events are
+    suppressed (commands stay on REST). P2P is native-only, so Expo Go / web simply
+    keep using the WebSocket. The `since` arg is accepted for call-site
+    compatibility but unused (the hello snapshot is a full catch-up). */
+export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => void, _since: number = 0): () => void {
+  let ws: WebSocket | null = null;
+  let stopped = false;
+  let retryMs = 1000;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   const link = createP2PLink({
     postSignal: (s) => { void postSignal(s); },
@@ -463,42 +545,55 @@ export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => 
     onEvent: (name, data) => onEvent(name as LiveEventName, data),
     onActiveChange: (active) => setConnPath(active ? 'p2p' : 'relay'),
   });
-  // Only attempt P2P if the Mac enabled it; otherwise stay purely on SSE.
-  void api.getSettings().then((s) => { if (s?.p2pEnabled) link.start(); }).catch(() => { /* stay on SSE */ });
+  // Only attempt P2P if the Mac enabled it; otherwise stay purely on the WebSocket.
+  void api.getSettings().then((s) => { if (s?.p2pEnabled) link.start(); }).catch(() => { /* stay on WS */ });
 
-  // `?since=<ts>` asks the relay to replay any events with `ts > since` from
-  // the snapshot's event log before going live — covers the burst missed
-  // while backgrounded so a foreground transition picks up cleanly.
-  const sinceQuery = since > 0 ? '&since=' + encodeURIComponent(String(since)) : '';
-  const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME) + '&did=' + encodeURIComponent(getDeviceId()) + sinceQuery, {
-    headers: pairToken ? { Authorization: `Bearer ${pairToken}` } : undefined,
-    // Keep the long-lived stream open; reconnect a few seconds after any drop.
-    pollingInterval: 4000,
-  });
-
-  // Signaling rides the SSE stream as a `signal` frame → feed the answerer.
-  const sigFn = (e: { type: string; data?: string | null }) => {
-    try { link.onRemoteSignal((e.data ? JSON.parse(e.data) : {}) as Signal); } catch { /* non-JSON */ }
+  const scheduleReconnect = (): void => {
+    if (stopped) return;
+    retryTimer = setTimeout(connect, retryMs);
+    retryMs = Math.min(retryMs * 2, 30000);
   };
-  es.addEventListener('signal' as 'message', sigFn as (e: unknown) => void);
 
-  const handlers = NAMES.map((name) => {
-    const fn = (e: { type: string; data?: string | null }) => {
-      let data: unknown = null;
-      try { data = e.data ? JSON.parse(e.data) : null; } catch { /* non-JSON frame */ }
-      if (!link.isActive()) onEvent(name, data); // P2P up → events arrive over the channel instead
+  function connect(): void {
+    if (stopped) return;
+    const hostId = getActiveHost();
+    if (!hostId) { scheduleReconnect(); return; } // no host picked yet — try again soon
+    let sock: WebSocket;
+    try {
+      sock = new WebSocket(remoteWsUrl(hostId));
+    } catch {
+      scheduleReconnect();
+      return;
+    }
+    ws = sock;
+    sock.onopen = () => { retryMs = 1000; };
+    sock.onmessage = (e: { data: unknown }) => {
+      let m: { type?: string; name?: string; data?: unknown; snapshot?: unknown; fromDeviceId?: string; signal?: unknown };
+      try { m = JSON.parse(String(e.data)) as typeof m; } catch { return; }
+      if (m.type === 'signal') {
+        try { link.onRemoteSignal((m.signal ?? {}) as Signal); } catch { /* non-signal */ }
+        return;
+      }
+      if (m.type === 'hello') {
+        onEvent('hello', m.snapshot ?? null); // full snapshot → store does a full reconcile
+        return;
+      }
+      if (m.type === 'event' && m.name) {
+        if (!link.isActive()) onEvent(m.name as LiveEventName, m.data ?? null); // P2P up → events arrive over the channel
+      }
     };
-    // react-native-sse dispatches `event: <name>` frames to listeners by name.
-    es.addEventListener(name as 'message', fn as (e: unknown) => void);
-    return { name, fn };
-  });
+    sock.onerror = () => { /* 'close' follows */ };
+    sock.onclose = () => { ws = null; scheduleReconnect(); };
+  }
+
+  connect();
+
   return () => {
+    stopped = true;
+    if (retryTimer) clearTimeout(retryTimer);
     link.stop();
     setConnPath('relay');
-    try {
-      es.removeEventListener('signal' as 'message', sigFn as (e: unknown) => void);
-      for (const h of handlers) es.removeEventListener(h.name as 'message', h.fn as (e: unknown) => void);
-      es.close();
-    } catch { /* already closed */ }
+    try { ws?.close(); } catch { /* already closed */ }
+    ws = null;
   };
 }

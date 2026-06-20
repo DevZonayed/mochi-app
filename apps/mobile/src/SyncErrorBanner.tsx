@@ -1,11 +1,12 @@
 /* Actionable banner shown when the last sync failed, so the phone never sits on
-   an endless spinner when it's on a stale or disconnected deck. Driven by the
-   sync store's `syncError`:
+   an endless spinner when the session or the active host is unavailable. Driven by
+   the sync store's `syncError`:
 
-   - unauthorized → the relay rejected our pairing token (kicked / code rotated /
-     our deck was evicted). Offer RE-PAIR (drops to the enter-code screen).
-   - offline      → relay reachable but no live Mac for our token. Offer RETRY.
-   - network      → couldn't reach the relay at all. Offer RETRY. */
+   - unauthorized → the server rejected our session (expired / signed out
+     elsewhere). Offer SIGN IN (drops to the Login screen).
+   - offline      → server reachable but the active Mac is offline (or none is
+     selected yet). Offer RETRY.
+   - network      → couldn't reach the server at all. Offer RETRY. */
 
 import React from 'react';
 import { View, Text, Pressable } from 'react-native';
@@ -15,9 +16,9 @@ import { gotoRepair } from './navRef';
 import type { SyncErrorKind } from './syncErrors';
 
 const COPY: Record<SyncErrorKind, { msg: string; cta: string; repair: boolean }> = {
-  unauthorized: { msg: 'This device was disconnected. Re-pair with the code in the Mac’s Settings → Devices.', cta: 'Re-pair', repair: true },
+  unauthorized: { msg: 'Your session expired. Sign in again to reconnect.', cta: 'Sign in', repair: true },
   offline: { msg: 'Your Mac looks offline — open the Maestro desktop app, then retry.', cta: 'Retry', repair: false },
-  network: { msg: 'Can’t reach the relay. Check your connection, then retry.', cta: 'Retry', repair: false },
+  network: { msg: 'Can’t reach the server. Check your connection, then retry.', cta: 'Retry', repair: false },
 };
 
 export function SyncErrorBanner({ kind, onRetry }: { kind: SyncErrorKind; onRetry: () => void }) {
