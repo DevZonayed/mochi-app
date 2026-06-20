@@ -10,6 +10,29 @@ import path from 'node:path';
 const STATE_CAP = 16_000;
 const LINK_CAP = 8_000;
 
+/* ── Memory-write listeners ────────────────────────────────────────────
+   The SyncWorker subscribes here so a STATE.md write or a chain checkpoint
+   gets mirrored to the relay's `/api/mirror/memory` endpoint and is visible
+   on the phone the moment it lands. Listeners must NEVER throw — they're
+   side-effects on a hot write path and the agent's run shouldn't fail
+   because the network blinked. */
+export interface MemoryWriteEvent {
+  projectRoot: string;
+  kind: 'state' | 'checkpoint';
+  content: string;
+  commitSha?: string | null;
+  tags?: string[];
+}
+type MemoryListener = (e: MemoryWriteEvent) => void;
+const memoryListeners = new Set<MemoryListener>();
+export function onMemoryWrite(l: MemoryListener): () => void {
+  memoryListeners.add(l);
+  return () => { memoryListeners.delete(l); };
+}
+function fireMemoryWrite(e: MemoryWriteEvent): void {
+  for (const l of memoryListeners) { try { l(e); } catch { /* listeners must not break writes */ } }
+}
+
 function dir(projectRoot: string): string { return path.join(projectRoot, '.continuum'); }
 function linksDir(projectRoot: string): string { return path.join(dir(projectRoot), 'chain', 'links'); }
 function linkIds(projectRoot: string): number[] {
@@ -40,7 +63,11 @@ export function readContinuumContext(projectRoot: string, k = 4): string {
 
 /** Replace STATE.md — the agent's durable understanding of the project. */
 export function writeProjectState(projectRoot: string, state: string): void {
-  try { mkdirSync(dir(projectRoot), { recursive: true }); writeFileSync(path.join(dir(projectRoot), 'STATE.md'), (state ?? '').slice(0, STATE_CAP), 'utf8'); } catch { /* best effort */ }
+  const content = (state ?? '').slice(0, STATE_CAP);
+  try { mkdirSync(dir(projectRoot), { recursive: true }); writeFileSync(path.join(dir(projectRoot), 'STATE.md'), content, 'utf8'); } catch { /* best effort */ }
+  // Fire AFTER the disk write — Mac stays source of truth; the mirror is a
+  // best-effort cache. If the disk write threw, we never tell the relay.
+  fireMemoryWrite({ projectRoot, kind: 'state', content });
 }
 export function readProjectState(projectRoot: string): string {
   try { const f = path.join(dir(projectRoot), 'STATE.md'); return existsSync(f) ? readFileSync(f, 'utf8') : ''; } catch { return ''; }
@@ -53,11 +80,15 @@ export function appendCheckpoint(projectRoot: string, input: { summary: string; 
   const id = (linkIds(projectRoot).pop() ?? 0) + 1;
   const linkDir = path.join(ld, String(id).padStart(4, '0'));
   mkdirSync(linkDir, { recursive: true });
-  writeFileSync(path.join(linkDir, 'summary.md'), (input.summary ?? '').slice(0, LINK_CAP), 'utf8');
+  const content = (input.summary ?? '').slice(0, LINK_CAP);
+  writeFileSync(path.join(linkDir, 'summary.md'), content, 'utf8');
   try {
     appendFileSync(path.join(dir(projectRoot), 'chain', 'index.jsonl'),
       JSON.stringify({ id, ts: new Date(atMs).toISOString(), tags: input.tags ?? [], commit: input.commit ?? null }) + '\n');
   } catch { /* index is advisory */ }
+  // Mirror this checkpoint to the relay — keyed by commit sha so each link
+  // is its own row.
+  fireMemoryWrite({ projectRoot, kind: 'checkpoint', content, commitSha: input.commit ?? null, tags: input.tags ?? [] });
   return { id };
 }
 

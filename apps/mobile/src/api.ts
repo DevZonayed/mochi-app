@@ -79,6 +79,40 @@ export type EngineStatuses = Record<EngineId, EngineStatus>;
 export interface ModelDescriptor { key: string; id: string; label: string; provider: string; family?: string; badge?: 'NEW'; tierNote?: string; external?: boolean }
 export interface ModelGroup { provider: string; label: string; runnable: boolean; reason: string; models: ModelDescriptor[] }
 
+/* ── Server-side mirror ────────────────────────────────────────────────
+   Phase 2: cloud cache of chats + memories the desktop pushes to the relay
+   (apps/server/src/mirrorStore.ts). Mobile reads from here when the Mac is
+   asleep. Shape mirrors the server's ChatRecord / MessageRecord / MemoryRecord. */
+export interface MirrorChat {
+  id: string;
+  accountId: string;
+  projectId: string | null;
+  title: string;
+  archived: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+export interface MirrorMessage {
+  id: string;
+  chatId: string;
+  accountId: string;
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  content: string;
+  metadata: Record<string, unknown> | null;
+  createdAt: number;
+}
+export interface MirrorMemory {
+  id: string;
+  accountId: string;
+  projectId: string;
+  kind: 'state' | 'checkpoint';
+  content: string;
+  tags: string[];
+  commitSha: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
 /** Operator defaults stored on the Mac (mirrors the desktop AppSettings). */
 export interface AppSettings {
   defaultEffort: Effort;
@@ -126,7 +160,7 @@ import { Platform } from 'react-native';
 
 /** A human label for this device, sent so the Mac can show "iPhone connected". */
 export const DEVICE_NAME = Platform.OS === 'ios' ? 'iPhone' : Platform.OS === 'android' ? 'Android phone' : 'Web remote';
-import { getStr, setStr, PAIR_TOKEN, DEVICE_ID } from './storage';
+import { getStr, setStr, getFlag, PAIR_TOKEN, DEVICE_ID, USE_WS_STREAM, LAST_SEQ } from './storage';
 import { gotoRepair } from './navRef';
 import { buildIceServers } from '@maestro/realtime';
 import { createP2PLink } from './p2p/link';
@@ -347,6 +381,31 @@ export const api = {
   registerPush: (token: string) => req<{ ok: boolean; devices: number }>('/api/push/register', { method: 'POST', body: JSON.stringify({ token }) }),
   /** Drop this phone's push token (called on unpair). */
   unregisterPush: (token: string) => req<{ ok: boolean; devices: number }>('/api/push/unregister', { method: 'POST', body: JSON.stringify({ token }) }),
+  /** Ask the relay whether it has THIS phone's token in its persistent store
+      (i.e. closed-app pushes will actually fire). The relay never returns the
+      raw list — just yes/no for the supplied token + the total device count. */
+  pushStatus: (token: string) => req<{ ok: boolean; registered: boolean; devices: number }>('/api/push/status', { method: 'POST', body: JSON.stringify({ token }) }),
+
+  /* ── Mirror reads (Phase 2: server-cached chat + memory) ───────────────
+     Used when the Mac is asleep/offline. The desktop SyncWorker keeps the
+     server's mirror up-to-date; mobile reads from it here so the phone is
+     never empty just because the Mac is closed. */
+  mirrorListChats: (projectId?: string) =>
+    req<MirrorChat[]>(
+      '/api/mirror/chats' + (projectId !== undefined ? `?projectId=${encodeURIComponent(projectId)}` : ''),
+    ),
+  mirrorGetChat: (id: string) => req<MirrorChat>('/api/mirror/chats/' + encodeURIComponent(id)),
+  mirrorListMessages: (chatId: string, opts: { limit?: number; before?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit));
+    if (opts.before !== undefined) q.set('before', String(opts.before));
+    const qs = q.toString();
+    return req<{ messages: MirrorMessage[]; hasMore: boolean }>(
+      '/api/mirror/chats/' + encodeURIComponent(chatId) + '/messages' + (qs ? '?' + qs : ''),
+    );
+  },
+  mirrorListMemories: (projectId: string) =>
+    req<MirrorMemory[]>('/api/mirror/memories?projectId=' + encodeURIComponent(projectId)),
 
   /** Verify the current pair token against the relay (a read-only auth probe).
      'ok' = token works · 'invalid' = wrong code (401) · 'mac-offline' = no Mac
@@ -381,10 +440,34 @@ export const api = {
   },
 };
 
-/** Live host events the relay fans out over SSE (the same names the Mac emits). */
+/** Live host events the relay fans out over SSE (the same names the Mac emits).
+ *  Plus synthetic local events:
+ *  - `resume`: fires when the OS brings the app back to foreground after a
+ *    background suspend (which freezes JS + can kill the stream). useLive
+ *    delivers this UNFILTERED — every subscriber gets it so screens re-fetch
+ *    in one shot. Drives the "I came back to a stale screen" fix.
+ *  - `buffer-overflow`: relay signals we were offline longer than its event
+ *    buffer can replay. Treated as a forced full refetch (same path as
+ *    resume — useLive bypasses the names filter). */
 export type LiveEventName =
   | 'job' | 'session' | 'approval' | 'asset' | 'comms' | 'briefs'
-  | 'schedule' | 'schedule-late' | 'git-status' | 'extension' | 'host' | 'hello';
+  | 'schedule' | 'schedule-late' | 'git-status' | 'extension' | 'host' | 'hello'
+  | 'resume' | 'buffer-overflow';
+
+/* ── Server event sequence tracking ──────────────────────────────────────
+   Every replayable event the relay sends carries a monotonic `seq`. We
+   remember the latest one we processed so a reconnect can pass
+   `?since=<lastSeq>` and the relay replays only what we missed. This is
+   what makes "phone lost internet for 30s then opens" feel seamless. */
+let lastSeq = Number.parseInt(getStr(LAST_SEQ) || '0', 10) || 0;
+export function getLastSeq(): number { return lastSeq; }
+export function setLastSeq(n: number): void {
+  if (!Number.isFinite(n) || n <= lastSeq) return;
+  lastSeq = n;
+  // Persist async — no need to block the event loop.
+  void setStr(LAST_SEQ, String(n));
+}
+export function resetLastSeq(): void { lastSeq = 0; void setStr(LAST_SEQ, '0'); }
 
 /* ── Connection path ──────────────────────────────────────────────────────
    Which transport the live stream is on RIGHT NOW: 'p2p' (direct WebRTC) once the
@@ -416,6 +499,10 @@ export async function postSignal(signal: unknown): Promise<void> {
     suppressed (commands stay on REST). The link is native-free until started, so
     Expo Go / web simply keep using SSE. */
 export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => void): () => void {
+  // Opt-in to the WS transport via the user's USE_WS_STREAM flag (Settings →
+  // Connection). Same surface — same disposer contract — so call sites don't
+  // care which transport is underneath.
+  if (getFlag(USE_WS_STREAM)) return openLiveStreamWs(onEvent);
   const NAMES: LiveEventName[] = ['job', 'session', 'approval', 'asset', 'comms', 'briefs', 'schedule', 'schedule-late', 'git-status', 'extension', 'host', 'hello'];
 
   const link = createP2PLink({
@@ -434,7 +521,11 @@ export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => 
   // Only attempt P2P if the Mac enabled it; otherwise stay purely on SSE.
   void api.getSettings().then((s) => { if (s?.p2pEnabled) link.start(); }).catch(() => { /* stay on SSE */ });
 
-  const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME) + '&did=' + encodeURIComponent(getDeviceId()), {
+  // Pass `?since=lastSeq` so the relay replays any events we missed since
+  // the last live frame (network blink, backgrounding, etc.). Default 0 ⇒
+  // no replay, fresh start. Persists in AsyncStorage via getLastSeq/setLastSeq.
+  const since = getLastSeq();
+  const es = new EventSource(API_BASE + '/api/stream?device=' + encodeURIComponent(DEVICE_NAME) + '&did=' + encodeURIComponent(getDeviceId()) + (since > 0 ? '&since=' + since : ''), {
     headers: pairToken ? { Authorization: `Bearer ${pairToken}` } : undefined,
     // Keep the long-lived stream open; reconnect a few seconds after any drop.
     pollingInterval: 4000,
@@ -446,10 +537,26 @@ export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => 
   };
   es.addEventListener('signal' as 'message', sigFn as (e: unknown) => void);
 
+  // Server-overflow signal: relay's event buffer didn't have enough history
+  // to replay — surface as a synthetic frame so useLive treats it as a
+  // forced refetch.
+  const overflowFn = (e: { type: string; data?: string | null }) => {
+    let data: unknown = null;
+    try { data = e.data ? JSON.parse(e.data) : null; } catch { /* fine */ }
+    onEvent('buffer-overflow', data);
+  };
+  es.addEventListener('buffer-overflow' as 'message', overflowFn as (e: unknown) => void);
+
   const handlers = NAMES.map((name) => {
-    const fn = (e: { type: string; data?: string | null }) => {
+    const fn = (e: { type: string; data?: string | null; lastEventId?: string }) => {
       let data: unknown = null;
       try { data = e.data ? JSON.parse(e.data) : null; } catch { /* non-JSON frame */ }
+      // SSE `id:` lines arrive on the event as lastEventId. Stamp our seq
+      // tracker so the next reconnect can pass `?since=<seq>`.
+      if (e.lastEventId) {
+        const n = Number.parseInt(e.lastEventId, 10);
+        if (Number.isFinite(n) && n > 0) setLastSeq(n);
+      }
       if (!link.isActive()) onEvent(name, data); // P2P up → events arrive over the channel instead
     };
     // react-native-sse dispatches `event: <name>` frames to listeners by name.
@@ -461,8 +568,113 @@ export function openLiveStream(onEvent: (name: LiveEventName, data: unknown) => 
     setConnPath('relay');
     try {
       es.removeEventListener('signal' as 'message', sigFn as (e: unknown) => void);
+      es.removeEventListener('buffer-overflow' as 'message', overflowFn as (e: unknown) => void);
       for (const h of handlers) es.removeEventListener(h.name as 'message', h.fn as (e: unknown) => void);
       es.close();
     } catch { /* already closed */ }
+  };
+}
+
+/** WebSocket transport for the live event stream.
+ *
+ *  Wire format mirrors SSE: the server pushes `{ event, data }` JSON frames.
+ *  Reconnects with exponential backoff (capped at 30s) the moment a socket
+ *  drops, so a brief network blip doesn't cost the user the live stream.
+ *
+ *  Why both transports? SSE works in every browser + Expo Go without native
+ *  modules; WS gives lower latency (no XHR polling, full-duplex) for the
+ *  token-by-token streaming case that the chat composer benefits from most.
+ *  Users opt in via Settings → Connection (USE_WS_STREAM flag), and the rest
+ *  of the app stays oblivious — the disposer contract is identical. */
+export function openLiveStreamWs(onEvent: (name: LiveEventName, data: unknown) => void): () => void {
+  // Same event name list as SSE. The server emits these as one of:
+  //   { "event": "<name>", "data": <payload> }
+  // …plus heartbeat pings we silently swallow.
+  const KNOWN: ReadonlySet<LiveEventName> = new Set<LiveEventName>([
+    'job', 'session', 'approval', 'asset', 'comms', 'briefs',
+    'schedule', 'schedule-late', 'git-status', 'extension', 'host', 'hello',
+    'buffer-overflow',
+  ]);
+  /** Build the URL fresh on every connect — `since` MUST reflect the latest
+   *  seq we've processed (it advances during the lifetime of this stream
+   *  and across reconnects). */
+  const buildUrl = (): string => {
+    const since = getLastSeq();
+    return API_BASE.replace(/^http/, 'ws')
+      + '/api/stream-ws'
+      + '?device=' + encodeURIComponent(DEVICE_NAME)
+      + '&did=' + encodeURIComponent(getDeviceId())
+      // RN WebSocket can't set headers, so the pairing token rides as a query
+      // arg (the relay's `/api/*` onRequest hook accepts both forms).
+      + (pairToken ? '&token=' + encodeURIComponent(pairToken) : '')
+      + (since > 0 ? '&since=' + since : '');
+  };
+
+  let closed = false;
+  let sock: WebSocket | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let backoffMs = 1000; // doubles per failed attempt, capped at 30s
+  /* Stale-frame watchdog. The server sends a heartbeat every 25s. If we
+     haven't seen ANY frame in STALE_MS we assume the connection is dead
+     (carrier NAT drop, captive portal, etc.) — force close, which triggers
+     the reconnect path with the latest `since`. This catches "phone lost
+     internet mid-session" without needing NetInfo as a dependency. */
+  const STALE_MS = 60_000;
+  const CHECK_MS = 10_000;
+  let staleTimer: ReturnType<typeof setInterval> | null = null;
+  let lastFrameAt = 0;
+
+  const connect = () => {
+    if (closed) return;
+    sock = new WebSocket(buildUrl());
+    sock.onopen = () => {
+      backoffMs = 1000; // reset on successful connect
+      lastFrameAt = Date.now();
+      setConnPath('relay'); // WS still goes through the relay; P2P is its own path
+    };
+    sock.onmessage = (ev) => {
+      lastFrameAt = Date.now();
+      let frame: { event?: string; data?: unknown; seq?: number } | null = null;
+      try { frame = JSON.parse(String(ev.data)); } catch { /* ignore garbage */ }
+      if (!frame || typeof frame.event !== 'string') return;
+      // Heartbeats — silently dropped, never bubble to consumers.
+      if (frame.event === 'ping' || frame.event === 'pong') return;
+      // Track seq so the next reconnect can replay anything we missed.
+      if (typeof frame.seq === 'number' && frame.seq > 0) setLastSeq(frame.seq);
+      // `hello` from the server carries `latestSeq` so a fresh client knows
+      // where to start (especially before any seq'd events arrive).
+      if (frame.event === 'hello' && frame.data && typeof frame.data === 'object') {
+        const h = frame.data as { latestSeq?: number };
+        if (typeof h.latestSeq === 'number' && h.latestSeq > 0) setLastSeq(h.latestSeq);
+      }
+      if (KNOWN.has(frame.event as LiveEventName)) {
+        onEvent(frame.event as LiveEventName, frame.data ?? null);
+      }
+    };
+    sock.onerror = () => { /* `onclose` fires right after — let it handle reconnect */ };
+    sock.onclose = () => {
+      sock = null;
+      if (closed) return;
+      // Exponential backoff with a 30s cap. Mirrors react-native-sse's polling
+      // cadence so the perceived recovery time is the same.
+      reconnectTimer = setTimeout(connect, backoffMs);
+      backoffMs = Math.min(backoffMs * 2, 30_000);
+    };
+  };
+  connect();
+  // Periodic check for a dead connection (no frames for STALE_MS). If we
+  // detect one, force-close — the onclose path takes over from there.
+  staleTimer = setInterval(() => {
+    if (!sock || sock.readyState !== 1 /* OPEN */) return;
+    if (lastFrameAt && Date.now() - lastFrameAt > STALE_MS) {
+      try { sock.close(); } catch { /* fine */ }
+    }
+  }, CHECK_MS);
+
+  return () => {
+    closed = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (staleTimer) clearInterval(staleTimer);
+    try { sock?.close(); } catch { /* already closed */ }
   };
 }

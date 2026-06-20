@@ -5,8 +5,8 @@ import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/nativ
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { Card } from '../ui';
-import { api, type ChatSession, type Job } from '../api';
-import { useLive } from '../useLive';
+import { api, type ChatSession, type Job, type MirrorChat } from '../api';
+import { useLive, useHostOnline } from '../useLive';
 import { cacheGet, cacheSet } from '../storage';
 
 function ago(ts: number): string {
@@ -30,18 +30,47 @@ export function ProjectSessionsScreen() {
   const [sessions, setSessions] = useState<ChatSession[]>(() => cacheGet(`sessions.${projectId}`, []));
   const [jobs, setJobs] = useState<Job[]>(() => cacheGet(`jobs.${projectId}`, []));
   const [loading, setLoading] = useState(sessions.length === 0);
+  // Phase 2: when the Mac is asleep, fall back to the server-mirrored chats.
+  // Reads only — no offline writes. `usingMirror` drives the banner below so
+  // the user knows what they're looking at.
+  const [usingMirror, setUsingMirror] = useState(false);
+  const hostOnline = useHostOnline();
 
   const load = useCallback(() => {
     Promise.all([api.listSessions(projectId), api.listJobs(projectId)])
       .then(([ss, js]) => {
-        setSessions(ss); setJobs(js);
+        setSessions(ss); setJobs(js); setUsingMirror(false);
         cacheSet(`sessions.${projectId}`, ss); cacheSet(`jobs.${projectId}`, js);
       })
-      .catch(() => {})
+      .catch(() => { /* errors handled by the mirror fallback below */ })
       .finally(() => setLoading(false));
   }, [projectId]);
 
-  useFocusEffect(useCallback(() => { load(); }, [load]));
+  // Mirror fallback — when the Mac just went offline (or the live API just
+  // 503'd), pull the server-cached chat list so the screen isn't empty. The
+  // mirror has the chat metadata the desktop SyncWorker pushed; jobs aren't
+  // mirrored yet (P2.5 followup) so the "running" badge will be empty in
+  // mirror mode — acceptable, since the Mac can't be running anything.
+  const loadMirror = useCallback(() => {
+    api.mirrorListChats(projectId)
+      .then((rows: MirrorChat[]) => {
+        const mapped: ChatSession[] = rows.map((r) => ({
+          id: r.id, projectId: r.projectId ?? projectId, title: r.title,
+          createdAt: r.createdAt, updatedAt: r.updatedAt,
+          archived: r.archived ? r.updatedAt : undefined,
+        }));
+        setSessions(mapped); setUsingMirror(true);
+        // Don't overwrite the cache — the live list, when the Mac wakes,
+        // is still the source of truth.
+      })
+      .catch(() => { /* network down too; cache from disk stays on screen */ })
+      .finally(() => setLoading(false));
+  }, [projectId]);
+
+  useFocusEffect(useCallback(() => {
+    if (hostOnline === false) loadMirror();
+    else load();
+  }, [hostOnline, load, loadMirror]));
   useLive(['session', 'job'], load);
 
   // Per-session: last activity + running state, derived from the project's jobs.
@@ -76,6 +105,19 @@ export function ProjectSessionsScreen() {
           <Text numberOfLines={1} style={{ fontSize: 30, fontWeight: '700', letterSpacing: -0.6, color: theme.color.ink }}>{name}</Text>
           <Text style={{ fontSize: 14, color: theme.color.inkSecondary, marginTop: 3 }}>{active.length} chat{active.length === 1 ? '' : 's'}</Text>
         </View>
+
+        {/* Mirror-fallback banner — only when the Mac is offline AND we're
+            actually reading from the server cache. Tells the user why the
+            "running" badge is missing + that the list might be slightly stale. */}
+        {usingMirror ? (
+          <View style={{ marginHorizontal: 16, marginBottom: 12, padding: 12, borderRadius: 12, backgroundColor: theme.color.orange + '18', flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <Icon name="moon" size={16} color={theme.color.orange} />
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontSize: 13, fontWeight: '600', color: theme.color.orange }}>Mac is asleep — showing cached chats</Text>
+              <Text style={{ fontSize: 12, color: theme.color.inkSecondary, marginTop: 2 }}>Wake your Mac to start a new run or see live status.</Text>
+            </View>
+          </View>
+        ) : null}
 
         {loading && active.length === 0 ? (
           <View style={{ alignItems: 'center', paddingVertical: 60, gap: 14 }}>

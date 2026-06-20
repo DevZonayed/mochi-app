@@ -124,12 +124,39 @@ export function ProjectsScreen() {
             <Text style={{ fontSize: 14, color: theme.color.inkTertiary }}>Loading your projects…</Text>
           </View>
         ) : projects.length === 0 ? (
-          <View style={{ alignItems: 'center', paddingVertical: 70, paddingHorizontal: 36 }}>
-            <View style={{ width: 64, height: 64, borderRadius: 20, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
-              <Icon name="folder" size={30} color={theme.color.inkTertiary} />
+          // First-run empty state. The "+" button up in the header navigates to
+          // CreateProject too, but a new user won't read that — they need an
+          // obvious CTA card here so the screen never feels broken.
+          <View style={{ alignItems: 'center', paddingVertical: 56, paddingHorizontal: 28 }}>
+            <View style={{ width: 76, height: 76, borderRadius: 22, backgroundColor: theme.color.blue + '18', alignItems: 'center', justifyContent: 'center', marginBottom: 18 }}>
+              <Icon name="folder" size={34} color={theme.color.blue} />
             </View>
-            <Text style={{ fontSize: 16, fontWeight: '600', color: theme.color.ink, marginBottom: 6 }}>No projects yet</Text>
-            <Text style={{ fontSize: 14, lineHeight: 20, color: theme.color.inkSecondary, textAlign: 'center' }}>Create a project on your Mac and it appears here, with all its chat sessions.</Text>
+            <Text style={{ fontSize: 19, fontWeight: '700', color: theme.color.ink, marginBottom: 8 }}>No projects yet</Text>
+            <Text style={{ fontSize: 14, lineHeight: 20, color: theme.color.inkSecondary, textAlign: 'center', marginBottom: 22 }}>
+              Point Maestro at a folder on your Mac (a repo, a docs site, anything) and every
+              chat, every job, every file change groups under it here.
+            </Text>
+            <Pressable
+              onPress={() => nav.navigate('CreateProject')}
+              accessibilityRole="button"
+              accessibilityLabel="Create your first project"
+              style={({ pressed }) => ({
+                flexDirection: 'row',
+                alignItems: 'center',
+                gap: 8,
+                height: 48,
+                paddingHorizontal: 22,
+                borderRadius: theme.radius.pill,
+                backgroundColor: theme.color.blue,
+                opacity: pressed ? 0.85 : 1,
+              })}
+            >
+              <Icon name="plus" size={18} color="#fff" stroke={2.6} />
+              <Text style={{ fontSize: 16, fontWeight: '600', color: '#fff' }}>Create your first project</Text>
+            </Pressable>
+            <Text style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 14, textAlign: 'center' }}>
+              Or create one from your Mac and it'll appear here in seconds.
+            </Text>
           </View>
         ) : (
           <>

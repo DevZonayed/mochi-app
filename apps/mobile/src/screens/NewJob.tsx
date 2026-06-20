@@ -6,7 +6,7 @@ import { useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Card, Mono } from '../ui';
-import { api, type Effort as ApiEffort } from '../api';
+import { api, type Effort as ApiEffort, type EngineStatuses, type ModelGroup } from '../api';
 
 type Effort = 'FAST' | 'BALANCED' | 'DEEP' | 'MAX';
 type ModelId = 'auto' | 'claude' | 'codex';
@@ -38,11 +38,57 @@ const AUTOS: Record<AutoKey, [string, string]> = {
   unatt: ['Unattended', 'Runs end-to-end inside allowlists and caps.'],
 };
 
-const MODELS: { id: ModelId; name: string; sub: string; cost: number }[] = [
-  { id: 'auto', name: 'Auto', sub: 'Use routing default', cost: 0 },
-  { id: 'claude', name: 'Claude Code', sub: 'Your Claude login', cost: 0 },
-  { id: 'codex', name: 'Codex', sub: 'Your ChatGPT login', cost: 0 },
+/** Static engine catalog. Status (available + count) is filled in from the
+    live `/api/engine-status` + `/api/models` calls — the `cost: 0` placeholders
+    were vestigial dummy data that didn't reflect reality. */
+const ENGINES: { id: ModelId; name: string; sub: string }[] = [
+  { id: 'auto', name: 'Auto', sub: 'Use routing default' },
+  { id: 'claude', name: 'Claude Code', sub: 'Your Claude login' },
+  { id: 'codex', name: 'Codex', sub: 'Your ChatGPT login' },
 ];
+
+/** Per-engine live status surfaced in the picker — derived from /api/engine-status
+    (available + reason) and /api/models (variant count). */
+interface EngineMeta { available: boolean; reason: string; modelCount: number }
+type EngineMetaMap = Record<ModelId, EngineMeta>;
+
+/** Hook: fetch live engine status + model counts once, with a cheap inline
+    derivation. Fails soft (returns empty map) so the picker still renders. */
+function useEngineMeta(): EngineMetaMap {
+  const [meta, setMeta] = useState<EngineMetaMap>({
+    auto:   { available: true,  reason: '', modelCount: 0 },
+    claude: { available: false, reason: 'Checking…', modelCount: 0 },
+    codex:  { available: false, reason: 'Checking…', modelCount: 0 },
+  });
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      api.engineStatus().catch(() => null),
+      api.listModels().catch(() => [] as ModelGroup[]),
+    ]).then(([st, groups]) => {
+      if (!alive) return;
+      const e = (st ?? {}) as EngineStatuses;
+      // Count runnable models per provider (claude / codex). Provider names
+      // come from the desktop catalog — we match case-insensitively to be safe.
+      const countFor = (engine: ModelId): number => {
+        if (engine === 'auto') return 0;
+        const ms = groups.flatMap((g) => g.provider?.toLowerCase().includes(engine) ? g.models : []);
+        return ms.length;
+      };
+      setMeta({
+        auto: {
+          available: !!(e.claude?.available || e.codex?.available),
+          reason: e.claude?.available || e.codex?.available ? '' : 'No engine ready on your Mac',
+          modelCount: groups.reduce((n, g) => n + (g.models?.length ?? 0), 0),
+        },
+        claude: { available: !!e.claude?.available, reason: e.claude?.reason ?? '', modelCount: countFor('claude') },
+        codex:  { available: !!e.codex?.available,  reason: e.codex?.reason ?? '',  modelCount: countFor('codex') },
+      });
+    });
+    return () => { alive = false; };
+  }, []);
+  return meta;
+}
 
 function useEffortMeta() {
   const { theme } = useTheme();
@@ -150,34 +196,36 @@ function EffortDial({ value, onChange }: { value: Effort; onChange: (v: Effort) 
   );
 }
 
-function CostDots({ n }: { n: number }) {
+/** Compact live status badge: green dot + "N models" or red dot + reason.
+    Replaces the old dummy CostDots, which surfaced fake "cost: 0" numbers. */
+function EngineStatusBadge({ meta }: { meta: EngineMeta | undefined }) {
   const { theme } = useTheme();
-  if (!n) {
-    return <Text style={{ fontSize: 11, fontWeight: '600', color: theme.color.green }}>auto</Text>;
+  if (!meta) return null;
+  if (meta.available) {
+    return (
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+        <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: theme.color.green }} />
+        <Text style={{ fontSize: 11, fontWeight: '600', color: theme.color.inkSecondary }}>
+          {meta.modelCount > 0 ? `${meta.modelCount} model${meta.modelCount === 1 ? '' : 's'}` : 'ready'}
+        </Text>
+      </View>
+    );
   }
   return (
-    <View style={{ flexDirection: 'row', gap: 2 }}>
-      {[1, 2, 3].map((d) => (
-        <View
-          key={d}
-          style={{
-            width: 5,
-            height: 5,
-            borderRadius: 3,
-            backgroundColor: d <= n ? theme.color.orange : theme.color.inkTertiary,
-            opacity: d <= n ? 1 : 0.3,
-          }}
-        />
-      ))}
+    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, maxWidth: 110 }}>
+      <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: theme.color.red }} />
+      <Text numberOfLines={1} style={{ fontSize: 11, fontWeight: '600', color: theme.color.inkTertiary }}>{meta.reason || 'unavailable'}</Text>
     </View>
   );
 }
 
-/** Model switcher — pill that expands an inline pick list (provider glyph + tier + cost dots). */
-function ModelSwitcher({ value, onChange }: { value: ModelId; onChange: (v: ModelId) => void }) {
+/** Engine switcher — live-status pill that expands an inline pick list.
+    Shows real /api/engine-status + /api/models data instead of dummy cost dots. */
+function ModelSwitcher({ value, onChange, meta }: { value: ModelId; onChange: (v: ModelId) => void; meta: EngineMetaMap }) {
   const { theme } = useTheme();
   const [open, setOpen] = useState(false);
-  const cur = MODELS.find((m) => m.id === value) ?? MODELS[0];
+  const cur = ENGINES.find((m) => m.id === value) ?? ENGINES[0];
+  const curMeta = meta[cur.id];
   return (
     <View>
       <Pressable
@@ -195,12 +243,16 @@ function ModelSwitcher({ value, onChange }: { value: ModelId; onChange: (v: Mode
       >
         <Icon name="spark" size={17} color={cur.id === 'auto' ? theme.color.inkSecondary : theme.color.ink} />
         <Text style={{ fontSize: 13, fontWeight: '600', color: theme.color.ink }}>{cur.name}</Text>
+        {/* Live status next to the selected engine name — green if the Mac can
+            actually run it, red + reason if not. */}
+        <EngineStatusBadge meta={curMeta} />
         <Icon name="chevronDown" size={13} color={theme.color.inkTertiary} />
       </Pressable>
       {open ? (
-        <Card style={{ marginTop: 6, width: 248, borderRadius: 12, padding: 4 } as any}>
-          {MODELS.map((m) => {
+        <Card style={{ marginTop: 6, width: 264, borderRadius: 12, padding: 4 } as any}>
+          {ENGINES.map((m) => {
             const on = m.id === value;
+            const mMeta = meta[m.id];
             return (
               <Pressable
                 key={m.id}
@@ -216,6 +268,9 @@ function ModelSwitcher({ value, onChange }: { value: ModelId; onChange: (v: Mode
                   paddingHorizontal: 10,
                   borderRadius: 8,
                   backgroundColor: on ? theme.color.blue + '1A' : 'transparent',
+                  // Subtle dim when the engine isn't available — still tappable
+                  // (the Mac might come online before the job runs).
+                  opacity: mMeta && !mMeta.available && m.id !== 'auto' ? 0.6 : 1,
                 }}
               >
                 <View
@@ -234,7 +289,7 @@ function ModelSwitcher({ value, onChange }: { value: ModelId; onChange: (v: Mode
                   <Text style={{ fontSize: 15, fontWeight: '600', color: theme.color.ink }}>{m.name}</Text>
                   <Text style={{ fontSize: 11, color: theme.color.inkTertiary, marginTop: 2 }}>{m.sub}</Text>
                 </View>
-                {on ? <Icon name="check" size={16} color={theme.color.blue} stroke={2.6} /> : <CostDots n={m.cost} />}
+                {on ? <Icon name="check" size={16} color={theme.color.blue} stroke={2.6} /> : <EngineStatusBadge meta={mMeta} />}
               </Pressable>
             );
           })}
@@ -280,6 +335,8 @@ export function NewJobScreen() {
   const [model, setModel] = useState<ModelId>('auto');
   const [auto, setAuto] = useState<AutoKey>('plan');
   const [running, setRunning] = useState(false);
+  /** Live engine status + model counts — see useEngineMeta() above. */
+  const engineMeta = useEngineMeta();
 
   useEffect(() => {
     let alive = true;
@@ -439,7 +496,7 @@ export function NewJobScreen() {
         {/* model */}
         <View style={{ marginBottom: 16 }}>
           <FieldLabel>Model</FieldLabel>
-          <ModelSwitcher value={model} onChange={setModel} />
+          <ModelSwitcher value={model} onChange={setModel} meta={engineMeta} />
         </View>
 
         {/* autonomy */}
