@@ -33,7 +33,7 @@ describe.skipIf(!HAS_DB)('webrtc signaling (account-scoped)', () => {
 
 describe('turn credentials', () => {
   it('returns nulls when TURN is unconfigured', () => {
-    delete process.env.TURN_HOST; delete process.env.TURN_SECRET;
+    delete process.env.TURN_HOST; delete process.env.TURN_SECRET; delete process.env.TURN_STATIC_SECRET;
     expect(turnCredentials()).toEqual({ host: null, username: null, credential: null, ttl: 0 });
   });
   it('returns time-limited creds when configured', () => {
