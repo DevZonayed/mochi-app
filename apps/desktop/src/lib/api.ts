@@ -82,9 +82,11 @@ export interface ConversationScan {
   conversations: ScannedConversation[];
 }
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result' | 'ask' | 'review' | 'image';
+  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image';
   text: string;
   name?: string;
+  /** tool: secondary de-emphasized detail (e.g. raw shell command behind a Bash description). */
+  cmd?: string;
   toolStatus?: 'running' | 'done' | 'error';
   verdict?: 'approved' | 'needs-work';
   /** review only: the primary fixed the flagged findings → show as resolved. */

@@ -54,11 +54,15 @@ export interface Project {
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
     final result. The chat renders these as separate blocks with timings. */
 export interface TranscriptItem {
-  kind: 'text' | 'tool' | 'result' | 'ask' | 'review' | 'image';
-  /** text/result: the content. tool: short detail (command, file, query…). ask: prompt. review: the findings. image: a short caption (the prompt). */
+  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image';
+  /** text/result: the content. thinking: the model's reasoning prose. tool: the HUMAN label (Bash description, relative file path, search pattern…). ask: prompt. review: the findings. image: a short caption (the prompt). */
   text: string;
   /** tool: tool name. review: the reviewer engine's label. */
   name?: string;
+  /** tool: a secondary, de-emphasized detail shown under the human label — e.g. the
+      raw shell command behind a Bash 'description'. Absent when there's nothing extra
+      to show (the label already IS the detail). */
+  cmd?: string;
   toolStatus?: 'running' | 'done' | 'error';
   /** review only: the reviewer's verdict. */
   verdict?: 'approved' | 'needs-work';

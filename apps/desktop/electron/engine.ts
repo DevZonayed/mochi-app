@@ -19,6 +19,7 @@ import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice, ChatSess
 import type { PublishingEngine } from './publishing.js';
 import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
+import { toolLabel, relPath } from './tool-label.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { branchSlug, isGitRepo } from './git.js';
 import { pickCityCodename } from './codenames.js';
@@ -337,16 +338,8 @@ function priceFor(model: string): Price {
   return MODEL_PRICE.sonnet; // sensible mid default (also covers 'claude'/sonnet ids)
 }
 
-/** Human-sized summary of a tool invocation's input for the chat chip. */
-function toolDetail(input: unknown): string {
-  if (!input || typeof input !== 'object') return '';
-  const i = input as Record<string, unknown>;
-  for (const k of ['command', 'file_path', 'path', 'pattern', 'query', 'url', 'skill', 'description', 'prompt', 'name']) {
-    if (typeof i[k] === 'string' && i[k]) return (i[k] as string).slice(0, 110);
-  }
-  const first = Object.values(i).find(v => typeof v === 'string' && v);
-  return typeof first === 'string' ? first.slice(0, 110) : '';
-}
+// toolLabel / relPath: human-readable tool labels (Bash description, relative paths,
+// search patterns) — pure + unit-tested in ./tool-label.ts.
 
 const PREVIEW_CAP = 8000;
 /** For file-writing tools, a capped snapshot of the content written, so the
@@ -933,6 +926,11 @@ async function runClaude(
      the complete assistant message then replaces it (authoritative text). */
   const items: TranscriptItem[] = [];
   let openText: TranscriptItem | null = null;
+  // The agent's extended-thinking block, streamed in via `thinking_delta` and
+  // reconciled against the authoritative `thinking` block on the assistant message.
+  // Kept separate from openText: a turn streams thinking FIRST, then text/tools, and
+  // both must survive so the final message can replace each with its canonical copy.
+  let openThinking: TranscriptItem | null = null;
   const toolById = new Map<string, TranscriptItem>();
 
   let resultText = '';
@@ -970,8 +968,8 @@ async function runClaude(
         errors?: string[];
         session_id?: string;
         parent_tool_use_id?: string | null;
-        message?: { content?: { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; is_error?: boolean }[]; model?: string };
-        event?: { type?: string; delta?: { type?: string; text?: string }; usage?: { output_tokens?: number } };
+        message?: { content?: { type: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; is_error?: boolean }[]; model?: string };
+        event?: { type?: string; delta?: { type?: string; text?: string; thinking?: string }; usage?: { output_tokens?: number } };
         usage?: { input_tokens?: number; output_tokens?: number };
         total_cost_usd?: number; result?: unknown;
       };
@@ -979,7 +977,14 @@ async function runClaude(
       // Subagent traffic surfaces through its parent Task chip — don't interleave it.
       if (m.parent_tool_use_id) continue;
 
-      if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
+      if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'thinking_delta') {
+        // Extended thinking (default-on/adaptive for Opus 4.6+). Stream it into an
+        // open thinking block so the chat shows the model's reasoning live, the way
+        // the Claude Code UI does — instead of discarding it (the old behaviour).
+        if (!openThinking) { openThinking = { kind: 'thinking', text: '', ts: Date.now() }; items.push(openThinking); }
+        openThinking.text += m.event.delta.thinking ?? '';
+        progress();
+      } else if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
         if (!openText) { openText = { kind: 'text', text: '', ts: Date.now() }; items.push(openText); }
         openText.text += m.event.delta.text ?? '';
         progress();
@@ -994,16 +999,23 @@ async function runClaude(
       } else if (m.type === 'assistant' && m.message?.content) {
         model = m.message.model ?? model;
         for (const b of m.message.content) {
-          if (b.type === 'text' && typeof b.text === 'string') {
+          if (b.type === 'thinking' && typeof b.thinking === 'string') {
+            // Replace the streamed-in reasoning with the message's authoritative copy.
+            if (openThinking) { openThinking.text = b.thinking; openThinking = null; }
+            else if (b.thinking.trim()) items.push({ kind: 'thinking', text: b.thinking, ts: Date.now() });
+          } else if (b.type === 'text' && typeof b.text === 'string') {
+            openThinking = null; // text closes any open thinking block
             if (openText) { openText.text = b.text; openText = null; }
             else if (b.text.trim()) items.push({ kind: 'text', text: b.text, ts: Date.now() });
           } else if (b.type === 'tool_use' && b.name === 'AskUserQuestion') {
             // Surface the agent's question as an interactive card, not a tool chip.
-            openText = null;
+            openText = null; openThinking = null;
             items.push({ kind: 'ask', name: 'AskUserQuestion', text: '', ask: safeJson(b.input), ts: Date.now() });
           } else if (b.type === 'tool_use') {
-            openText = null;
-            const t: TranscriptItem = { kind: 'tool', name: b.name ?? 'tool', text: toolDetail(b.input), toolStatus: 'running', ts: Date.now() };
+            openText = null; openThinking = null;
+            const label = toolLabel(b.name ?? '', b.input, cwd);
+            const t: TranscriptItem = { kind: 'tool', name: b.name ?? 'tool', text: label.text, toolStatus: 'running', ts: Date.now() };
+            if (label.cmd) t.cmd = label.cmd;
             const preview = toolPreview(b.name ?? '', b.input);
             if (preview !== undefined) t.preview = preview;
             items.push(t);
@@ -1184,9 +1196,14 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
             existing.toolStatus = item.status === 'failed' ? 'error' : 'done';
             existing.durMs = Date.now() - existing.ts;
           } else if (!existing) {
+            // Codex carries no human 'description' — show its file path relativized
+            // (so it reads like the project tree, not an absolute dump) and otherwise
+            // the raw command. A path-bearing event is a file edit: give it a canonical
+            // 'edit' name so the UI's toolDisplay() routes it to the teal Edit identity +
+            // filename chip (its raw type "file_change"/"patch_apply" wouldn't match).
             const chip: TranscriptItem = {
-              kind: 'tool', name: item.type.replace(/_/g, ' '),
-              text: (item.command ?? item.path ?? '').slice(0, 110),
+              kind: 'tool', name: item.path ? 'edit' : item.type.replace(/_/g, ' '),
+              text: (item.path ? relPath(item.path, cwd) : (item.command ?? '')).slice(0, 140),
               toolStatus: started ? 'running' : 'done', ts: Date.now(),
             };
             if (!started) chip.durMs = 0;
