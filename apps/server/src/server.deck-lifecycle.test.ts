@@ -108,6 +108,32 @@ describe('deck lifecycle — prefer-online routing', () => {
 
     live.close();
   });
+
+  it('routes to the FRESHEST deck when a half-open "ghost" shares the token (both online)', async () => {
+    // The exact prod failure: an old session's socket stays half-open on the relay
+    // (online:true, but it never replies) and shares the live Mac's pairing token.
+    // First-online routing sent forwarded commands to the ghost → they hung forever
+    // (phone send button spins). The token must resolve to the FRESHEST deck — the
+    // live Mac keeps pushing/pinging, the ghost goes stale.
+    const ghost = openHost(port, { deckId: 'deck-ghost', secret: 's1', accessToken: 'CODE' });
+    await ghost.ready;
+    ghost.pushState({ projects: [{ id: 'p-ghost', name: 'ghost' }] });
+    await waitForProjects(port, 'CODE', (ps) => ps.some((p) => p.name === 'ghost'));
+
+    await new Promise((r) => setTimeout(r, 40)); // ensure the live Mac is strictly fresher
+
+    // Live Mac connects later, same token, still pushing — BOTH sockets are open
+    // ("online"), but the live one has the fresher lastSeen.
+    const live = openHost(port, { deckId: 'deck-live', secret: 's2', accessToken: 'CODE' });
+    await live.ready;
+    live.pushState({ projects: [{ id: 'p-live', name: 'live' }] });
+
+    const seen = await waitForProjects(port, 'CODE', (ps) => ps.some((p) => p.name === 'live'));
+    expect(seen.map((p) => p.name)).toEqual(['live']);
+
+    ghost.close();
+    live.close();
+  });
 });
 
 describe('deck lifecycle — eviction of long-offline decks', () => {

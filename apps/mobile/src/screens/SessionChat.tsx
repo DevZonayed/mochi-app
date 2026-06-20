@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, TextInput, KeyboardAvoidingView, Platform, ActivityIndicator, Modal, Alert, Image } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation, useRoute } from '@react-navigation/native';
@@ -426,10 +426,12 @@ export function SessionChatScreen() {
   // for this session is already upserted by App.tsx's global subscriber, so we
   // just filter + sort. The per-session AsyncStorage cache (turns.{sid}) is
   // gone: the store IS the cache.
-  const turns = useSyncStore((s) =>
-    sessionId
-      ? s.jobs.filter((j) => j.sessionId === sessionId).slice().sort((a, b) => a.createdAt - b.createdAt)
-      : [],
+  const allJobs = useSyncStore((s) => s.jobs);
+  const turns = useMemo(
+    () => (sessionId
+      ? allJobs.filter((j) => j.sessionId === sessionId).slice().sort((a, b) => a.createdAt - b.createdAt)
+      : []),
+    [allJobs, sessionId],
   );
   const settled = useSyncStore((s) => s.settled);
 
