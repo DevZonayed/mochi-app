@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { ghRequest, getViewer, parseGitHubRemote, getRepo, findOpenPr, getPullStatus, createPull, mergePull, pickMergeMethod } from './github.js';
+import { ghRequest, getViewer, parseGitHubRemote, getRepo, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, pickMergeMethod } from './github.js';
 
 /** A fake fetch that routes by URL substring (for multi-call functions). */
 function routeFetch(routes: Array<{ match: string; status: number; body?: unknown; headers?: Record<string, string> }>): typeof fetch {
@@ -72,6 +72,38 @@ describe('findOpenPr', () => {
   test('returns null when none', async () => {
     const f = routeFetch([{ match: '/pulls?', status: 200, body: [] }]);
     expect(await findOpenPr('t', 'o', 'r', 'feat', f)).toBeNull();
+  });
+});
+
+describe('findRecentPr', () => {
+  // After a squash-merge, the PR is "closed" + "merged" → state=open filter
+  // returns nothing. findRecentPr uses state=all so the merged PR still
+  // surfaces, which is what drives the `pr-merged` state in the UI instead
+  // of the bug-y `ready-for-pr` fallback (see prState in git-service.ts).
+  test('returns the most recently updated PR regardless of state', async () => {
+    const f = routeFetch([{ match: '/pulls?', status: 200, body: [{ number: 45, html_url: 'u', title: 't', head: { sha: 'sha-after-squash' } }] }]);
+    const got = await findRecentPr('t', 'o', 'r', 'feat', f);
+    expect(got).toMatchObject({ number: 45, headSha: 'sha-after-squash' });
+  });
+  test('queries state=all + sort=updated DESC + per_page=1', async () => {
+    // Verifying the exact GitHub query — important because getting any of
+    // these wrong produces silent wrong behaviour (e.g. sort=created would
+    // miss a merge of an older PR).
+    const seen: string[] = [];
+    const f = (async (url: string) => {
+      seen.push(String(url));
+      return { status: 200, ok: true, headers: { get: () => null }, json: async () => [] };
+    }) as unknown as typeof fetch;
+    await findRecentPr('t', 'o', 'r', 'feat', f);
+    expect(seen[0]).toContain('state=all');
+    expect(seen[0]).toContain('sort=updated');
+    expect(seen[0]).toContain('direction=desc');
+    expect(seen[0]).toContain('per_page=1');
+    expect(seen[0]).toContain('head=o:feat'); // owner:branch separator is a literal `:`
+  });
+  test('returns null when the branch has never had a PR', async () => {
+    const f = routeFetch([{ match: '/pulls?', status: 200, body: [] }]);
+    expect(await findRecentPr('t', 'o', 'r', 'feat', f)).toBeNull();
   });
 });
 
