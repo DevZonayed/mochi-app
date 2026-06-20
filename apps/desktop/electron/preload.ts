@@ -33,6 +33,10 @@ contextBridge.exposeInMainWorld('maestro', {
   // project's own folder on the main side; intentionally NOT in the relay
   // dispatch, so the phone/web remotes can never read local files.
   readFile: (projectId: string, p: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:readFile', projectId, p),
+  // Persist edits made in the in-app FileViewer tab. Confined to the project
+  // folder on the main side; intentionally NOT in the relay dispatch, so the
+  // phone/web remotes can never mutate local files.
+  writeFile: (projectId: string, p: string, text: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:writeFile', projectId, p, text),
   listDir: (projectId: string, p?: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:listDir', projectId, p ?? ''),
   listProjectFiles: (projectId: string): Promise<MaestroCallResult> => ipcRenderer.invoke('maestro:listProjectFiles', projectId),
   // Run / Terminal — run a shell command in the project folder, stream output.

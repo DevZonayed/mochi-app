@@ -27,6 +27,7 @@ import {
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
+import { OpenPathContext, pathIsInside, type OpenPathFn } from '../lib/openPath';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -1042,13 +1043,25 @@ function CodeCard({ code, lang, keyId }: { code: string; lang?: string; keyId: s
 }
 
 /* Path detection — absolute mac paths, ~ paths, and dotted relative files.
-   Returned paths are clickable → reveal in Finder. */
+   Returned paths are clickable. When the chat is inside a host that can open
+   files as tabs (Workspace), the click opens an in-app FileViewer tab so the
+   markdown can be previewed / edited / copied. Otherwise it reveals in Finder. */
 const PATH_RE = /(~\/[^\s`'"()<>]+|\/(?:Users|private|tmp|var|opt|usr|home|Applications|System|Library)\/[^\s`'"()<>]+|\b[\w.-]+\/[\w./-]+\.[A-Za-z0-9]{1,6})/g;
 const looksLikePath = (s: string): boolean => { PATH_RE.lastIndex = 0; const m = PATH_RE.exec(s.trim()); return !!m && m[0] === s.trim(); };
 
 function PathLink({ path, mono = true }: { path: string; mono?: boolean }) {
+  const openInTab = React.useContext(OpenPathContext);
+  const action = openInTab ? 'Open in editor' : 'Reveal in Finder';
+  const onClick = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // ⌘/Ctrl-click always falls back to Finder, even when an opener is present —
+    // matches the "reveal" reflex from VS Code / Cursor.
+    if (openInTab && !(e.metaKey || e.ctrlKey)) { openInTab(path); return; }
+    void api.revealPath(path);
+  };
   return (
-    <button onClick={() => { void api.revealPath(path); }} title="Reveal in Finder" style={{
+    <button onClick={onClick} title={action} style={{
       display: 'inline', padding: '0 2px', margin: '0 -2px', borderRadius: 4, background: 'transparent', cursor: 'pointer',
       color: 'var(--blue)', font: mono ? '500 0.92em var(--font-mono)' : 'inherit', textDecorationLine: 'underline',
       textDecorationColor: 'color-mix(in srgb, var(--blue) 68%, transparent)', textUnderlineOffset: 2, wordBreak: 'break-all' }}>
@@ -2412,7 +2425,7 @@ const fmtBytes = (n?: number): string => (n == null ? '' : n < 1024 ? `${n} B` :
 // name reads nicer as "Pasted text"; everything else uses its filename).
 const attachLabel = (a: Attach): string => (a.kind === 'text' && a.name === 'Pasted text.txt' ? 'Pasted text' : a.name);
 
-export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, onOpenImage, flush, autoFocus }: {
+export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, onOpenImage, onOpenFile, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
   sessionId: string | null;
@@ -2422,6 +2435,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   onTurns?: (jobs: Job[]) => void;
   /** Open a generated/attached image in an in-app viewer tab (Workspace only). */
   onOpenImage?: (assetId: string, name: string, imagePath?: string) => void;
+  /** Open a file referenced in the transcript as an in-app FileViewer tab
+      (Workspace only). The path may be absolute or relative to the project. */
+  onOpenFile?: (filePath: string) => void;
   flush?: boolean;
   autoFocus?: boolean;
 }) {
@@ -2432,6 +2448,23 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const onOpenImageRef = React.useRef(onOpenImage);
   onOpenImageRef.current = onOpenImage;
   const openImageStable = React.useMemo(() => (a: string, n: string, p?: string) => onOpenImageRef.current?.(a, n, p), []);
+  // Same pattern for opening a chat-referenced file path in an in-app tab.
+  // The smart wrapper falls back to reveal-in-Finder when there's no host
+  // tab system (standalone ProjectDetail) or when the path lives outside
+  // this project's folder (FileViewer is path-confined to the project).
+  const onOpenFileRef = React.useRef(onOpenFile);
+  onOpenFileRef.current = onOpenFile;
+  const projectPathRef = React.useRef(project?.path);
+  projectPathRef.current = project?.path;
+  const openPathStable = React.useMemo<OpenPathFn | null>(() => (p: string) => {
+    const handler = onOpenFileRef.current;
+    const root = projectPathRef.current;
+    if (handler && (!p.startsWith('/') || (root && pathIsInside(p, root)))) {
+      handler(p);
+    } else {
+      void api.revealPath(p);
+    }
+  }, []);
   const [activeId, setActiveId] = React.useState<string | null>(sessionId);
   const [text, setText] = React.useState('');
   // Primary (coding) + reviewer model. Remembered across the app via localStorage;
@@ -2958,17 +2991,19 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               </div>
             </div>
           )}
-          <ImageOpenContext.Provider value={openImageStable}>
-            {turns.map((t, i) => (
-              <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
-                <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />
-                <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText}
-                  onAnswer={i === turns.length - 1 ? answerLiveQuestion : sendText}
-                  pendingAsk={i === turns.length - 1 ? pendingAsk : null}
-                  onExtendAsk={extendLiveQuestion} onCancelAsk={cancelLiveQuestion} />
-              </div>
-            ))}
-          </ImageOpenContext.Provider>
+          <OpenPathContext.Provider value={openPathStable}>
+            <ImageOpenContext.Provider value={openImageStable}>
+              {turns.map((t, i) => (
+                <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
+                  <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />
+                  <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText}
+                    onAnswer={i === turns.length - 1 ? answerLiveQuestion : sendText}
+                    pendingAsk={i === turns.length - 1 ? pendingAsk : null}
+                    onExtendAsk={extendLiveQuestion} onCancelAsk={cancelLiveQuestion} />
+                </div>
+              ))}
+            </ImageOpenContext.Provider>
+          </OpenPathContext.Provider>
         </div>
       </div>
 
