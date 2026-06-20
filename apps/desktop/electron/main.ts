@@ -599,6 +599,25 @@ app.whenReady().then(() => {
     } catch (e) { return { ok: false, error: (e as Error)?.message ?? 'read failed' }; }
   });
 
+  // Write a file's text — DESKTOP-ONLY, confined to the project folder, and
+  // ONLY overwrites an existing regular text file (no creating new files, no
+  // overwriting binaries). Backs the in-app "edit + save" on the FileViewer
+  // tab opened from a chat path link. Never added to the relay dispatch, so
+  // remotes can't mutate local files.
+  ipcMain.handle('maestro:writeFile', async (_e, projectId: string, rel: string, text: string) => {
+    try {
+      if (typeof text !== 'string') return { ok: false, error: 'text must be a string' };
+      if (text.length > 4 * 1024 * 1024) return { ok: false, error: 'file too large to save here (4 MB cap)' };
+      if (text.includes('\u0000')) return { ok: false, error: 'refused to write NUL byte (binary)' };
+      const real = resolveInsideRoot(projectRoot(projectId), rel);
+      const st = await fsp.stat(real);
+      if (!st.isFile()) return { ok: false, error: 'not a file' };
+      await fsp.writeFile(real, text, 'utf8');
+      const next = await fsp.stat(real);
+      return { ok: true, data: { path: real, bytes: next.size, mtime: next.mtimeMs } };
+    } catch (e) { return { ok: false, error: (e as Error)?.message ?? 'write failed' }; }
+  });
+
   // List a directory's immediate entries — DESKTOP-ONLY, confined to the project.
   ipcMain.handle('maestro:listDir', async (_e, projectId: string, rel: string) => {
     try {
