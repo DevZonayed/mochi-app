@@ -23,11 +23,12 @@
 import { useSyncExternalStoreWithSelector } from 'use-sync-external-store/shim/with-selector';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
-  api,
+  api, snapshotToDelta,
   type Project, type ChatSession, type Job, type Approval, type Asset, type AppEvent,
-  type SyncDelta, type LiveEventName,
+  type SyncDelta, type LiveEventName, type SnapshotShape,
 } from './api';
 import { getJSON, getStr, setStr, LAST_SYNC } from './storage';
+import { getActiveHost } from './auth';
 import { classifySyncError, type SyncErrorKind } from './syncErrors';
 
 /* ── State shape ───────────────────────────────────────────────────────── */
@@ -63,9 +64,12 @@ const EMPTY_STATE: SyncState = {
   lastSync: 0, hostOnline: false, bootstrapped: false, settled: false, syncError: null, syncing: false,
 };
 
-/* ── Persistence ───────────────────────────────────────────────────────── */
+/* ── Persistence (keyed by active host) ─────────────────────────────────────
+   Each host (Mac) gets its OWN persisted slice so switching the active host
+   shows that Mac's data cleanly, with no bleed-through from the previous one. */
 
-const STORAGE_KEY = 'maestro.mobile.syncStore.v1';
+const STORAGE_PREFIX = 'maestro.mobile.syncStore.v2.';
+function storageKey(): string { return STORAGE_PREFIX + (getActiveHost() || 'none'); }
 
 interface PersistShape {
   projects: Project[]; sessions: ChatSession[]; jobs: Job[];
@@ -74,7 +78,7 @@ interface PersistShape {
 }
 
 function loadFromStorage(): SyncState {
-  const persisted = getJSON<PersistShape | null>(STORAGE_KEY, null);
+  const persisted = getJSON<PersistShape | null>(storageKey(), null);
   const ls = Number(getStr(LAST_SYNC)) || 0;
   if (!persisted) return { ...EMPTY_STATE, lastSync: ls };
   return {
@@ -103,7 +107,7 @@ function persist(): void {
       approvals: state.approvals, assets: state.assets, events: state.events,
       lastSync: state.lastSync,
     };
-    void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot)).catch(() => { /* storage full / unmount — try next time */ });
+    void AsyncStorage.setItem(storageKey(), JSON.stringify(snapshot)).catch(() => { /* storage full / unmount — try next time */ });
     if (state.lastSync) setStr(LAST_SYNC, String(state.lastSync));
   }, 500);
 }
@@ -226,6 +230,14 @@ function applyDelta(delta: SyncDelta): void {
 /** Drop an SSE/P2P event into the store. Recognises the same event names the
     Mac emits + the relay's one-shot `replay` frames. */
 export function applyLiveEvent(name: LiveEventName, data: unknown): void {
+  // The /ws/remote `hello` frame carries the active host's FULL snapshot — apply
+  // it as a delta (full upsert + tombstones) so a fresh connect catches up
+  // immediately, and mark the host online (it just spoke to us). Mirrors pullSync.
+  if (name === 'hello') {
+    applyDelta(snapshotToDelta('', (data as SnapshotShape | null) ?? null));
+    if (!state.hostOnline) { state = { ...state, hostOnline: true }; notify(); }
+    return;
+  }
   if (data === null || typeof data !== 'object') return;
   let touched = false;
   if (name === 'job') {
@@ -277,14 +289,28 @@ function schedulePullSoon(): void {
   pullSoonTimer = setTimeout(() => { pullSoonTimer = null; void pullSync(); }, 800);
 }
 
-/* ── Reset (called on unpair / clearCache) ─────────────────────────────── */
+/* ── Host switch ───────────────────────────────────────────────────────────
+   When the user picks a different Mac, swap the in-memory state to that host's
+   persisted slice (instant render of its last-known data) and kick a fresh pull.
+   Call AFTER setActiveHost() so storageKey() resolves to the new host. */
+export function reloadForActiveHost(): void {
+  if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+  state = loadFromStorage(); // reads the new host's slice (or EMPTY_STATE if none)
+  notify();
+  void pullSync();
+}
 
-/** Wipe the store + cursor. Call from `clearCache()` on logout/unpair so a
-    new pairing can't inherit the old account's data. */
+/* ── Reset (called on sign-out / clearCache) ───────────────────────────── */
+
+/** Wipe the store + cursor. Call from `clearCache()` on sign-out so a new
+    account/host can't inherit the old data. Clears ALL host slices. */
 export async function resetSyncStore(): Promise<void> {
   state = { ...EMPTY_STATE };
   if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
-  try { await AsyncStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+  try {
+    const keys = (await AsyncStorage.getAllKeys()).filter((k) => k.startsWith(STORAGE_PREFIX));
+    if (keys.length) await AsyncStorage.multiRemove(keys);
+  } catch { /* ignore */ }
   setStr(LAST_SYNC, '');
   notify();
 }

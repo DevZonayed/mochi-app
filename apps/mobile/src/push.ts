@@ -14,7 +14,8 @@
 
 import Constants from 'expo-constants';
 import * as Notifications from 'expo-notifications';
-import { api, getPairToken } from './api';
+import { api } from './api';
+import { isAuthed } from './auth';
 import { getStr, setStr } from './storage';
 
 const PUSH_TOKEN = 'maestro.mobile.pushToken';
@@ -30,7 +31,7 @@ function projectId(): string | undefined {
     safe to call on every launch and on foreground. Never throws. */
 export async function registerForPush(): Promise<void> {
   try {
-    if (!getPairToken()) return; // not paired yet — nothing to register against
+    if (!isAuthed()) return; // not signed in yet — nothing to register against
     const pid = projectId();
     if (!pid) {
       console.warn('[push] no EAS projectId — set extra.eas.projectId and use a dev/prod build to enable closed-app notifications');
