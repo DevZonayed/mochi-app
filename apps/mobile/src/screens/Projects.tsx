@@ -8,6 +8,7 @@ import { Card } from '../ui';
 import { api, type Project } from '../api';
 import { pullSync, useSyncStore } from '../syncStore';
 import { SkeletonList } from '../ui/Skeleton';
+import { SyncErrorBanner } from '../SyncErrorBanner';
 
 type ColorName = 'blue' | 'purple' | 'indigo' | 'teal' | 'orange' | 'green' | 'red';
 const COLOR_NAMES: ColorName[] = ['blue', 'purple', 'indigo', 'teal', 'orange', 'green', 'red'];
@@ -36,6 +37,8 @@ export function ProjectsScreen() {
   const sessions = useSyncStore((s) => s.sessions);
   const jobs = useSyncStore((s) => s.jobs);
   const bootstrapped = useSyncStore((s) => s.bootstrapped);
+  const settled = useSyncStore((s) => s.settled);
+  const syncError = useSyncStore((s) => s.syncError);
   const syncing = useSyncStore((s) => s.syncing);
   const hostOnline = useSyncStore((s) => s.hostOnline);
   const [filter, setFilter] = useState<string>('all'); // 'all' or a kind key
@@ -123,14 +126,16 @@ export function ProjectsScreen() {
           </View>
         </View>
 
-        {bootstrapped && !hostOnline ? (
+        {syncError ? (
+          <SyncErrorBanner kind={syncError} onRetry={onRefresh} />
+        ) : bootstrapped && !hostOnline ? (
           <View style={{ marginHorizontal: 16, marginBottom: 12, padding: 12, borderRadius: 12, backgroundColor: theme.color.orange + '14', borderWidth: 0.5, borderColor: theme.color.orange + '40', flexDirection: 'row', alignItems: 'center', gap: 8 }}>
             <Icon name="x" size={14} color={theme.color.orange} stroke={2.4} />
             <Text style={{ flex: 1, fontSize: 13, color: theme.color.ink }}>Your Mac is offline — showing the last known state.</Text>
           </View>
         ) : null}
 
-        {!bootstrapped && projects.length === 0 ? (
+        {!settled && projects.length === 0 ? (
           <SkeletonList count={5} />
         ) : projects.length === 0 ? (
           <View style={{ alignItems: 'center', paddingVertical: 70, paddingHorizontal: 36 }}>
