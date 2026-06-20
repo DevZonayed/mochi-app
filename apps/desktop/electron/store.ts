@@ -1048,6 +1048,61 @@ export class Store {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (s) { s.enabled = enabled; this.save(); }
   }
+  /** Idempotent "schedule a continue at reset" for a single session.
+   *
+   *  Why this exists: when the user has queued messages while Claude is rate-
+   *  limited, each queued message hits the limit and used to spawn its own
+   *  duplicate `auto-continue` row (see image_5zcze.png — 4 identical entries
+   *  all firing at the same time). At reset they'd all collide and re-send the
+   *  same continue prompt 4×.
+   *
+   *  This helper coalesces all of them into a single pending row per session:
+   *  - If a pending auto-continue (enabled + fireAt in the future) already
+   *    exists for `sessionId`, we update its `fireAt` (the latest reset
+   *    timestamp wins — sometimes Claude bumps it forward) and return it.
+   *  - Otherwise we create one and return it.
+   *  Returns `{ schedule, created }` so the caller knows whether to emit a
+   *  'schedule' event (created) vs nothing (already existed).
+   */
+  upsertAutoContinueForSession(opts: {
+    sessionId: string;
+    fireAt: number;
+    projectId?: string | null;
+    title?: string;
+    prompt: string;
+    effort?: Effort;
+  }): { schedule: Schedule; created: boolean } {
+    const now = Date.now();
+    const existing = this.data.schedules.find((s) =>
+      s.kind === 'auto-continue' &&
+      s.sessionId === opts.sessionId &&
+      s.enabled !== false &&
+      typeof s.fireAt === 'number' && s.fireAt > now,
+    );
+    if (existing) {
+      // The user might have queued a message AFTER an earlier hit set the
+      // schedule; if the new reset is LATER (Claude said "actually wait
+      // longer"), bump it. If it's earlier, keep the existing later time so
+      // we don't fire prematurely and immediately hit the limit again.
+      const fireAt = Math.max(existing.fireAt ?? 0, opts.fireAt);
+      if (fireAt !== existing.fireAt) {
+        existing.fireAt = fireAt;
+        existing.nextRun = fireAt;
+        this.save();
+      }
+      return { schedule: existing, created: false };
+    }
+    const schedule = this.createSchedule({
+      projectId: opts.projectId ?? null,
+      sessionId: opts.sessionId,
+      title: opts.title ?? 'Continue when Claude limit resets',
+      prompt: opts.prompt,
+      fireAt: opts.fireAt,
+      kind: 'auto-continue',
+      effort: opts.effort,
+    });
+    return { schedule, created: true };
+  }
   markScheduleRun(scheduleId: string, ts: number, nextRun: number | null, opts?: { dueAt?: number; late?: boolean }): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (s) {

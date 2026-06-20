@@ -350,6 +350,32 @@ export function SessionChatScreen() {
   const [modelKey, setModelKey] = useState<string>(() => (initialSid ? cacheGet<string>(`model.${initialSid}`, 'auto') : 'auto'));
   const [models, setModels] = useState<ModelGroup[]>(() => cacheGet('models', []));
   const scrollRef = useRef<ScrollView>(null);
+  /* User-intent scroll tracking. The previous implementation snapped back to
+     the bottom every time `turns` updated — which fires constantly during a
+     stream, so swiping up to read older content immediately got yanked back
+     down. Now: track whether the user is near the bottom (within NEAR_BOTTOM_PX
+     of the last frame) and ONLY auto-scroll when they are.
+
+     - `atBottomRef` is a ref (not state) because we read it inside the
+       scroll-trigger effect without wanting that effect to re-run when it
+       flips. The pill render uses `pendingNew` state so it re-renders.
+     - When the user pulls up, a "↓ new messages" pill appears; tapping it
+       jumps to the bottom and re-enables auto-scroll. */
+  const NEAR_BOTTOM_PX = 80;
+  const atBottomRef = useRef(true);
+  const [pendingNew, setPendingNew] = useState(false);
+  const jumpToBottom = useCallback(() => {
+    scrollRef.current?.scrollToEnd({ animated: true });
+    atBottomRef.current = true;
+    setPendingNew(false);
+  }, []);
+  const onScroll = useCallback((e: import('react-native').NativeSyntheticEvent<import('react-native').NativeScrollEvent>) => {
+    const { layoutMeasurement, contentOffset, contentSize } = e.nativeEvent;
+    const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
+    const now = distanceFromBottom <= NEAR_BOTTOM_PX;
+    if (now !== atBottomRef.current) atBottomRef.current = now;
+    if (now && pendingNew) setPendingNew(false);
+  }, [pendingNew]);
 
   const changeEffort = (e: Effort) => { setEffort(e); if (sessionId) cacheSet(`effort.${sessionId}`, e); };
   const changeModel = (key: string) => { setModelKey(key); if (sessionId) cacheSet(`model.${sessionId}`, key); };
@@ -380,8 +406,20 @@ export function SessionChatScreen() {
 
   const liveTurn = turns.some((j) => j.status === 'running' || j.status === 'pending');
 
-  // Auto-scroll to the newest content.
-  useEffect(() => { const t = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60); return () => clearTimeout(t); }, [turns]);
+  // Auto-scroll to the newest content — ONLY when the user is already near the
+  // bottom. If they've intentionally pulled up to read older messages, leave
+  // their position alone and surface a "↓ new messages" pill instead so they
+  // can opt back in when they're ready. (Previously this snapped them down on
+  // every render — the "won't let me read" bug.)
+  useEffect(() => {
+    if (atBottomRef.current) {
+      const t = setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 60);
+      return () => clearTimeout(t);
+    }
+    // Off-bottom + new turn content arrived → flag the pill.
+    setPendingNew(true);
+    return undefined;
+  }, [turns]);
 
   // Core send — used by the composer AND by answering a question's option.
   const dispatchChat = useCallback((body: string) => {
@@ -458,20 +496,61 @@ export function SessionChatScreen() {
       {loading ? (
         <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}><ActivityIndicator color={theme.color.blue} /></View>
       ) : (
-        <ScrollView ref={scrollRef} contentContainerStyle={{ padding: 16, paddingBottom: 24 }} showsVerticalScrollIndicator={false}>
-          {turns.length === 0 ? (
-            <View style={{ alignItems: 'center', paddingVertical: 70, paddingHorizontal: 30, gap: 12 }}>
-              <View style={{ width: 60, height: 60, borderRadius: 18, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}>
-                <Icon name="chat" size={28} color={theme.color.inkTertiary} />
+        <View style={{ flex: 1 }}>
+          <ScrollView
+            ref={scrollRef}
+            contentContainerStyle={{ padding: 16, paddingBottom: 24 }}
+            showsVerticalScrollIndicator={false}
+            onScroll={onScroll}
+            // 16ms ≈ 60Hz — frequent enough to catch the swipe instantly,
+            // cheap enough to never block the render thread.
+            scrollEventThrottle={16}
+          >
+            {turns.length === 0 ? (
+              <View style={{ alignItems: 'center', paddingVertical: 70, paddingHorizontal: 30, gap: 12 }}>
+                <View style={{ width: 60, height: 60, borderRadius: 18, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}>
+                  <Icon name="chat" size={28} color={theme.color.inkTertiary} />
+                </View>
+                <Text style={{ fontSize: 15, lineHeight: 21, color: theme.color.inkSecondary, textAlign: 'center' }}>
+                  Send a message to start. It runs on your Mac in this project, and the reply streams back here live.
+                </Text>
               </View>
-              <Text style={{ fontSize: 15, lineHeight: 21, color: theme.color.inkSecondary, textAlign: 'center' }}>
-                Send a message to start. It runs on your Mac in this project, and the reply streams back here live.
-              </Text>
-            </View>
-          ) : (
-            turns.map((j, i) => <Turn key={j.id} job={j} onAnswer={answer} answered={i < turns.length - 1} />)
-          )}
-        </ScrollView>
+            ) : (
+              turns.map((j, i) => <Turn key={j.id} job={j} onAnswer={answer} answered={i < turns.length - 1} />)
+            )}
+          </ScrollView>
+          {/* "↓ new messages" pill — only when the user has pulled away from
+              the bottom AND a new turn arrived underneath them. Tapping it
+              jumps to the bottom AND re-enables auto-scroll going forward. */}
+          {pendingNew ? (
+            <Pressable
+              onPress={jumpToBottom}
+              accessibilityRole="button"
+              accessibilityLabel="Jump to latest message"
+              style={({ pressed }) => ({
+                position: 'absolute',
+                bottom: 16,
+                alignSelf: 'center',
+                flexDirection: 'row',
+                alignItems: 'center',
+                gap: 6,
+                paddingHorizontal: 14,
+                paddingVertical: 8,
+                borderRadius: theme.radius.pill,
+                backgroundColor: theme.color.blue,
+                shadowColor: '#000',
+                shadowOpacity: 0.18,
+                shadowRadius: 8,
+                shadowOffset: { width: 0, height: 4 },
+                elevation: 4,
+                opacity: pressed ? 0.85 : 1,
+              })}
+            >
+              <Icon name="chevronDown" size={15} color="#fff" stroke={2.6} />
+              <Text style={{ fontSize: 13, fontWeight: '600', color: '#fff' }}>New messages</Text>
+            </Pressable>
+          ) : null}
+        </View>
       )}
 
       {/* composer */}

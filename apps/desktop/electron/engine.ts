@@ -1924,16 +1924,24 @@ export class LocalEngine {
         const reset = main.limitResetsAt;
         if (reset != null && reset > Date.now()) {
           const fireAt = reset + LIMIT_RESET_BUFFER_MS;
+          let created = true;
           try {
-            const sched = this.store.createSchedule({
+            // Dedupe: a queued message + the original run both hit the limit
+            // ⇒ used to create 4 duplicate "Continues at reset" rows that all
+            // fired together. upsertAutoContinueForSession keeps a SINGLE
+            // pending row per session and bumps its fireAt forward if needed.
+            const res = this.store.upsertAutoContinueForSession({
               projectId: job.projectId, sessionId: session.id,
               title: 'Continue when Claude limit resets', prompt: CONTINUE_PROMPT,
-              fireAt, kind: 'auto-continue', effort,
+              fireAt, effort,
             });
-            this.emit('schedule', sched);
+            created = res.created;
+            this.emit('schedule', res.schedule);
           } catch { /* non-fatal — still show the note below */ }
           const when = new Date(fireAt).toLocaleString();
-          const note = `⏸ Claude usage limit reached. I’ve scheduled a continue for ${when} — this chat will pick up automatically when the limit resets. (Cancel it any time from the scheduled-messages strip.)`;
+          const note = created
+            ? `⏸ Claude usage limit reached. I’ve scheduled a continue for ${when} — this chat will pick up automatically when the limit resets. (Cancel it any time from the scheduled-messages strip.)`
+            : `⏸ Claude usage limit still reached. The existing continue at ${when} will pick this up — no new schedule needed.`;
           main = { ...main, text: main.text ? `${main.text}\n\n${note}` : note, transcript: [...main.transcript, { kind: 'text', text: note, ts: Date.now() }] };
         } else {
           const note = '⏸ Claude usage limit reached, and no reset time was reported. Send “continue” later and I’ll pick up exactly where this left off.';
