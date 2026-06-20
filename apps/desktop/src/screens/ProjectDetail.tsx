@@ -11,6 +11,7 @@ import { Icon, type IconName } from '../lib/icons';
 import { RichComposer, type RichComposerHandle, type ComposerChip } from './RichComposer';
 import { FileTypeIcon } from '../lib/fileIcons';
 import { FileChip, IS_WRITE_TOOL } from '../lib/fileChip';
+import { toolDisplay, isSkillTool, prettySkillName } from '../lib/toolDisplay';
 import {
   GroupedList,
   Row,
@@ -85,8 +86,8 @@ const PAGE_CSS = `
 
   /* tool node — refined card, lifts on hover, pops on mount */
   @keyframes nodePop { from { opacity:0; transform: translateY(4px) scale(.985); } to { opacity:1; transform:none; } }
-  .tool-node { animation: nodePop 240ms cubic-bezier(.32,.72,0,1) both; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease, box-shadow 160ms ease; }
-  .tool-node:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(15,20,50,.08); }
+  .tool-node { animation: nodePop 240ms cubic-bezier(.32,.72,0,1) both; transition: background 140ms ease; }
+  .tool-node:hover { background: var(--fill-tertiary); }
 
   /* "thinking" shimmer text before the first token */
   @keyframes thinkSweep { to { background-position: -200% 0; } }
@@ -1223,22 +1224,7 @@ function renderChatBody(text: string, keyBase = 'b'): React.ReactNode[] {
   return out;
 }
 
-/* Tool/skill metadata — which glyph + accent tint a tool family reads as. */
-const TOOL_META = (name: string): { icon: IconName; tint: string } => {
-  const n = name.toLowerCase();
-  // Image tools (e.g. mcp__maestro__generate_image) — tint them like media instead
-  // of the flat neutral default, which reads as a murky black chip in dark mode.
-  if (/image|photo|picture/.test(n)) return { icon: 'image', tint: 'var(--purple)' };
-  if (/bash|shell|command|exec|terminal/.test(n)) return { icon: 'terminal', tint: 'var(--blue)' };
-  if (/read|write|edit|glob|grep|notebook|file|patch|ls/.test(n)) return { icon: 'folder', tint: 'var(--teal)' };
-  if (/web|search|fetch|browser/.test(n)) return { icon: 'telescope', tint: 'var(--indigo)' };
-  if (/skill|task|agent|subagent/.test(n)) return { icon: 'spark', tint: 'var(--purple)' };
-  return { icon: 'command', tint: 'var(--ink-secondary)' };
-};
 const fmtToolDur = (ms?: number): string => (ms == null ? '' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`);
-/** Clean a tool name for display — drop the mcp__<server>__ prefix and underscores
-    so e.g. "mcp__maestro__generate_image" shows as "generate image". */
-const prettyToolName = (name: string): string => name.replace(/^mcp__[^_]+__/, '').replace(/_/g, ' ').trim() || name;
 
 /** A human verb for the tool the agent is running right now. */
 const TOOL_VERB = (name: string): string => {
@@ -1268,6 +1254,7 @@ function liveActivity(job: Job, transcript: TranscriptItem[]): string {
       }
       return 'Thinking…'; // tool finished — the model is deciding the next step
     }
+    if (last.kind === 'thinking') return 'Thinking…';
     if (last.kind === 'image') return 'Saving image…';
     if (last.kind === 'ask') return 'Waiting for your answer…';
     if ((last.kind === 'text' || last.kind === 'result') && last.text.trim()) return 'Responding…';
@@ -1275,45 +1262,96 @@ function liveActivity(job: Job, transcript: TranscriptItem[]): string {
   return 'Thinking…';
 }
 
-/** One step in the agent's tool sequence — a crisp, tinted, monospace card. */
-function ToolNode({ item, connect }: { item: TranscriptItem; connect: boolean }) {
-  const running = item.toolStatus === 'running';
-  const error = item.toolStatus === 'error';
-  const { icon, tint } = TOOL_META(item.name ?? '');
-  const accent = error ? 'var(--red)' : tint;
-  const isWrite = IS_WRITE_TOOL(item.name ?? '') && !!item.text;
+/** The agent's extended-thinking, rendered as calm dimmed prose (the model's inner
+    voice) under a small purple "Thinking" header. Live = auto-expanded + streaming
+    caret; settled = collapsed to a one-line preview you can open. This is the block
+    Maestro used to throw away — the whole reason the transcript felt mechanical. */
+function ThinkingNode({ item, live }: { item: TranscriptItem; live?: boolean }) {
+  // `open` is DERIVED from `live` (expanded while this is the block streaming,
+  // collapsed the moment the model moves on) — so a long reasoning block doesn't
+  // sit open above the tools and answer for the rest of a live turn. A manual
+  // toggle records an override that wins, so we never snap shut a node the user
+  // deliberately opened (or force open one they closed).
+  const [override, setOverride] = React.useState<boolean | null>(null);
+  const text = item.text.trim();
+  if (!text) return null; // an empty thinking block shouldn't leave a dangling header
+  const open = override ?? !!live;
+  const preview = text.replace(/\s+/g, ' ').slice(0, 96);
   return (
-    <div style={{ position: 'relative' }}>
-      {connect && <span style={{ position: 'absolute', left: 17, top: -7, width: 1.5, height: 7, background: 'var(--separator-strong)' }} />}
-      <div className="tool-node" style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '7px 11px 7px 8px', borderRadius: 11,
-        background: error ? 'color-mix(in srgb, var(--red) 8%, var(--bg-elevated))' : `color-mix(in srgb, ${tint} 9%, var(--bg-elevated))`,
-        border: `0.5px solid color-mix(in srgb, ${accent} 30%, var(--separator))` }}>
-        <span style={{ width: 22, height: 22, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center',
-          background: `color-mix(in srgb, ${accent} 18%, transparent)`, color: accent }}>
-          <Icon name={icon} size={13} />
+    <div style={{ margin: '9px 0' }}>
+      <button onClick={() => setOverride(!open)} title={open ? 'Hide reasoning' : 'Show reasoning'}
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: 0, background: 'none', border: 'none', cursor: 'pointer', maxWidth: '100%' }}>
+        <span style={{ width: 18, height: 18, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center',
+          background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)' }}>
+          <Icon name="spark" size={11} />
         </span>
-        <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{prettyToolName(item.name ?? '')}</span>
-        {isWrite
-          ? <FileChip path={item.text} preview={item.preview} />
-          : item.text && <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text}</span>}
-        <span style={{ flexShrink: 0, marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-          {running ? <Spinner size={11} color={tint} />
-            : error ? <Icon name="x" size={12} stroke={2.6} style={{ color: 'var(--red)' }} />
-            : <>
-                <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{fmtToolDur(item.durMs)}</span>
-                <Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)' }} />
-              </>}
+        <span className={live ? 'breathe' : undefined} style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--purple)', flexShrink: 0 }}>
+          Thinking{live ? '…' : ''}
         </span>
-      </div>
+        <Icon name="chevronRight" size={12} style={{ flexShrink: 0, color: 'var(--ink-tertiary)', transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+        {!open && preview && (
+          <span style={{ minWidth: 0, font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{preview}…</span>
+        )}
+      </button>
+      {open && (
+        <div style={{ marginTop: 6, marginLeft: 8, paddingLeft: 13, borderLeft: '1.5px solid color-mix(in srgb, var(--purple) 24%, var(--separator))',
+          font: '400 13px/1.66 var(--font-text)', color: 'var(--ink-secondary)' }}>
+          {renderProse(text, 'think')}
+          {live && <span className="chat-caret" style={{ background: 'var(--purple)' }} />}
+        </div>
+      )}
     </div>
   );
 }
 
-/** A run of consecutive tool steps, threaded into one sequence. */
+/** One step in the agent's tool sequence — a FLAT row (no card), the same calm,
+    document-like framing as the Thinking block. Reads "[icon] Read SessionChat.tsx":
+    a short tool verb + a filename chip (basename) for file tools, the description for
+    Bash (raw command as an inline code chip), a pattern for search. */
+function ToolNode({ item }: { item: TranscriptItem }) {
+  const running = item.toolStatus === 'running';
+  const error = item.toolStatus === 'error';
+  const isSkill = isSkillTool(item.name);
+  const d = toolDisplay(item.name ?? '');
+  const short = isSkill ? 'Skill' : d.short;
+  const glyph = isSkill ? 'var(--purple)' : error ? 'var(--red)' : d.tint;
+  const showFile = !!d.file && !!item.text && !isSkill; // file tools → basename chip, not a path
+  const hasCmd = !!item.cmd && !showFile && !isSkill;
+  const detail = isSkill ? prettySkillName(item.text) : item.text;
+  // A shell tool whose detail IS the raw command (no separate cmd chip) → mono font.
+  const detailFont = !isSkill && !!d.mono && !hasCmd ? 'var(--font-mono)' : 'var(--font-text)';
+  return (
+    <div className="tool-node" style={{ display: 'flex', alignItems: hasCmd ? 'flex-start' : 'center', gap: 9, padding: '4px 7px', borderRadius: 8 }}>
+      <span style={{ width: 16, flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'grid', placeItems: 'center', color: glyph }}>
+        <Icon name={isSkill ? 'spark' : d.icon} size={15} />
+      </span>
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+          <span style={{ font: '600 var(--fs-footnote)/1.4 var(--font-text)', color: error ? 'var(--red)' : 'var(--ink)', flexShrink: 0 }}>{short}</span>
+          {showFile
+            ? <FileChip path={item.text} preview={item.preview} />
+            : detail && <span style={{ flex: 1, minWidth: 0, font: `400 var(--fs-footnote)/1.4 ${detailFont}`, color: isSkill ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail}</span>}
+        </div>
+        {hasCmd && <code style={{ alignSelf: 'flex-start', maxWidth: '100%', boxSizing: 'border-box', font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', background: 'var(--fill-tertiary)', borderRadius: 5, padding: '1px 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.cmd}</code>}
+      </div>
+      <span style={{ flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        {running ? <Spinner size={11} color={isSkill ? 'var(--purple)' : d.tint} />
+          : error ? <Icon name="x" size={12} stroke={2.6} style={{ color: 'var(--red)' }} />
+          : <>
+              {item.durMs != null && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{fmtToolDur(item.durMs)}</span>}
+              <Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)' }} />
+            </>}
+      </span>
+    </div>
+  );
+}
+
+/** A run of consecutive tool steps — a calm flat list (no card framing), so the tools
+    read in the same document-like register as the surrounding text and the Thinking. */
 function ToolGroup({ items }: { items: TranscriptItem[] }) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 7, margin: '10px 0' }}>
-      {items.map((it, i) => <ToolNode key={i} item={it} connect={i > 0} />)}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 1, margin: '8px 0' }}>
+      {items.map((it, i) => <ToolNode key={i} item={it} />)}
     </div>
   );
 }
@@ -1509,7 +1547,10 @@ function QuestionCard({ ask, onAnswer, answered, pending, onExtend, onCancel }: 
 }
 
 /* ── Collapsible "work" summary shown once a turn is done ──────────────── */
-function WorkBar({ toolCount, elapsed, expanded, onToggle, children }: { toolCount: number; elapsed: string; expanded: boolean; onToggle: () => void; children: React.ReactNode }) {
+function WorkBar({ toolCount, thought, elapsed, expanded, onToggle, children }: { toolCount: number; thought?: boolean; elapsed: string; expanded: boolean; onToggle: () => void; children: React.ReactNode }) {
+  const parts = [`Worked ${elapsed}`];
+  if (thought) parts.push('thought');
+  if (toolCount > 0) parts.push(`${toolCount} ${toolCount === 1 ? 'tool' : 'tools'}`);
   return (
     <div style={{ margin: '2px 0 4px' }}>
       <button onClick={onToggle} className="work-bar" title={expanded ? 'Hide the steps' : 'Show the steps'} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 26, padding: '0 11px 0 8px', borderRadius: 'var(--r-pill)',
@@ -1517,7 +1558,7 @@ function WorkBar({ toolCount, elapsed, expanded, onToggle, children }: { toolCou
         font: '600 var(--fs-caption)/1 var(--font-text)' }}>
         <Icon name="chevronRight" size={13} style={{ transform: expanded ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)', color: 'var(--ink-tertiary)' }} />
         <Icon name="check" size={12} stroke={2.6} style={{ color: 'var(--green)' }} />
-        Worked {elapsed}{toolCount > 0 ? ` · ${toolCount} ${toolCount === 1 ? 'tool' : 'tools'}` : ''}
+        {parts.join(' · ')}
       </button>
       {expanded && <div style={{ marginTop: 8, paddingLeft: 11, borderLeft: '1.5px solid var(--separator)', opacity: 0.7 }}>{children}</div>}
     </div>
@@ -1864,6 +1905,9 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
       const run: TranscriptItem[] = [];
       while (i < items.length && items[i].kind === 'tool') { run.push(items[i]); i++; }
       blocks.push(<ToolGroup key={`${keyPrefix}g${i}`} items={run} />);
+    } else if (it.kind === 'thinking') {
+      blocks.push(<ThinkingNode key={`${keyPrefix}think${i}`} item={it} live={opts.caretAt === i} />);
+      i++;
     } else if (it.kind === 'ask') {
       blocks.push(<QuestionCard key={`${keyPrefix}q${i}`} ask={it.ask} onAnswer={opts.onAnswer ?? (() => {})} answered={!!opts.answered} pending={opts.pendingAsk ?? null} onExtend={opts.onExtendAsk} onCancel={opts.onCancelAsk} />);
       i++;
@@ -1917,7 +1961,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   const hasImage = transcript.some(t => t.kind === 'image');
   let finalIdx = -1;
   for (let k = transcript.length - 1; k >= 0; k--) { if (transcript[k].kind === 'text' || transcript[k].kind === 'result') { finalIdx = k; break; } }
-  const collapsible = !live && !hasAsk && !hasImage && finalIdx > 0 && transcript.slice(0, finalIdx).some(t => t.kind === 'tool' || t.kind === 'text');
+  const collapsible = !live && !hasAsk && !hasImage && finalIdx > 0 && transcript.slice(0, finalIdx).some(t => t.kind === 'tool' || t.kind === 'text' || t.kind === 'thinking');
   const [expanded, setExpanded] = React.useState(false);
 
   const toolCount = transcript.filter(t => t.kind === 'tool').length;
@@ -1929,9 +1973,10 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
     if (collapsible) {
       const work = transcript.slice(0, finalIdx);
       const workTools = work.filter(t => t.kind === 'tool').length;
+      const workThought = work.some(t => t.kind === 'thinking');
       body = (
         <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
-          <WorkBar toolCount={workTools} elapsed={elapsed} expanded={expanded} onToggle={() => setExpanded(e => !e)}>
+          <WorkBar toolCount={workTools} thought={workThought} elapsed={elapsed} expanded={expanded} onToggle={() => setExpanded(e => !e)}>
             <div style={{ font: '400 13px/1.55 var(--font-text)' }}>{renderTranscript(work, 'w', { answered: true, jobId: job.id })}</div>
           </WorkBar>
           <div style={{ marginTop: 6 }}>{renderChatBody(transcript[finalIdx].text, 'fa')}</div>
