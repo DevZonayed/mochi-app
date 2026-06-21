@@ -608,10 +608,23 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // A real user-initiated turn lands → the keep-going auto-continue
         // streak for this session resets (image_0ss8f.png: a real reply means
         // the agent isn't stuck spinning anymore, so the next stall starts
-        // fresh from attempt 1 instead of carrying yesterday's count).
+        // fresh from attempt 1 instead of carrying yesterday's count). AND
+        // any PENDING keep-going schedule is disabled, so the queued
+        // auto-continue doesn't fire on top of this fresh reply (image_su2cf.png:
+        // a "Continue please" landed and the keep-going schedule STILL fired
+        // 5 minutes later — the counter reset alone wasn't enough).
         // Auto-continue and retry-run jobs go through engine.run directly via
         // the cron, NOT sendChat, so this only fires on genuine user messages.
-        try { store.resetKeepGoingCounter(session.id); } catch { /* best-effort */ }
+        try {
+          store.resetKeepGoingCounter(session.id);
+          const disabled = store.cancelKeepGoingForSession(session.id);
+          // Emit the now-disabled rows so any live schedule-queue UI prunes
+          // them immediately (same shape the cron uses when it fires + disables).
+          for (const id of disabled) {
+            const sch = store.listSchedules().find(x => x.id === id);
+            if (sch) emit('schedule', sch);
+          }
+        } catch { /* best-effort */ }
         // Fire the run async — the reply streams in over job events.
         void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true, browser: p.browser === true });
         return { session, job };

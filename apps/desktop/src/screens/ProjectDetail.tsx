@@ -1669,21 +1669,28 @@ function InlineAttach({ path, images, files }: { path: string; images?: ChatImag
     tokenized into inline chips/thumbnails at the exact position the user
     dropped them in the composer. Images that aren't referenced inline (legacy
     jobs before this change persisted markers in the input) fall back to a row
-    above the bubble so nothing disappears. */
+    above the bubble so nothing disappears.
+    Each string segment between chips is run through `renderInline` so
+    `**bold**` and `` `code` `` render properly — the user reported that
+    auto-continue prompts (and their own typed messages) were showing literal
+    `**` stars in the bubble (image_kpijo.png / image_6f4zy.png). */
 function UserBubble({ text, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
-  // Split the text into [string, attachment, string, attachment, …] tokens.
+  // Split the text into [string, attachment, string, attachment, …] tokens,
+  // then run each plain-text segment through the inline-markdown renderer
+  // (same one the agent bubble uses, so the formatting is symmetric).
   const nodes = React.useMemo(() => {
     if (!text) return [] as React.ReactNode[];
     const out: React.ReactNode[] = [];
     let last = 0; let i = 0;
     ATTACH_INLINE_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
+    const pushString = (s: string) => { if (s) out.push(...renderInline(s, `ub${i++}`)); };
     while ((m = ATTACH_INLINE_RE.exec(text)) !== null) {
-      if (m.index > last) out.push(text.slice(last, m.index));
+      if (m.index > last) pushString(text.slice(last, m.index));
       out.push(<InlineAttach key={`a${i++}`} path={m[1]} images={images} files={files} />);
       last = m.index + m[0].length;
     }
-    if (last < text.length) out.push(text.slice(last));
+    if (last < text.length) pushString(text.slice(last));
     return out;
   }, [text, images, files]);
 

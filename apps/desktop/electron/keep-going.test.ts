@@ -89,6 +89,30 @@ describe('extractNextItems', () => {
     expect(extractNextItems('')).toEqual([]);
     expect(extractNextItems(undefined)).toEqual([]);
   });
+
+  // image_kpijo.png / image_6f4zy.png: the items used to land in the
+  // organized prompt with their literal **stars**, which the user-side chat
+  // bubble doesn't render — they showed as raw `**` to the operator.
+  it('strips inline **bold** / __bold__ from bulleted items so the auto-continue prompt reads clean in the user bubble', () => {
+    const body = `Suggested next wave\n- **Sprint 10b — CSFLE on phone/email** (envelope-encrypt PII via mongoose plugin; placeholder KMS until real KMS lands)\n- **Sprint 3b PDF renderer follow-up** — wire the rendered URL into \`paper_render_ready\` notifications\n- __Sprint 9c__ image-render mode for question detail (anti-OCR; serve text as watermarked SVG)`;
+    const items = extractNextItems(body);
+    expect(items.length).toBeGreaterThanOrEqual(3);
+    for (const it of items) {
+      expect(it).not.toMatch(/\*\*/);
+      expect(it).not.toMatch(/__/);
+    }
+    // The semantic content survives — both the head and the trailing detail.
+    expect(items.some(i => i.includes('Sprint 10b — CSFLE on phone/email') && i.includes('mongoose plugin'))).toBe(true);
+    expect(items.some(i => i.includes('Sprint 3b PDF renderer follow-up') && i.includes('paper_render_ready'))).toBe(true);
+    expect(items.some(i => i.includes('Sprint 9c'))).toBe(true);
+  });
+
+  it('preserves backticked inline code (the user-side bubble renders code OK)', () => {
+    const body = `- Run \`pnpm import:questions\` on prod\n- Set \`BILLING_ENABLED=true\``;
+    const items = extractNextItems(body);
+    expect(items.some(i => i.includes('`pnpm import:questions`'))).toBe(true);
+    expect(items.some(i => i.includes('`BILLING_ENABLED=true`'))).toBe(true);
+  });
 });
 
 describe('organizedContinuePrompt', () => {
