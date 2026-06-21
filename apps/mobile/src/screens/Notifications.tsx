@@ -7,7 +7,7 @@ import { Icon, type IconName } from '../Icon';
 import { type AppEvent, type AppEventKind } from '../api';
 import { getStr, setStr } from '../storage';
 import { eventAllowed } from '../notifPrefs';
-import { pullSync, useSyncStore } from '../syncStore';
+import { pullSync, pullSyncIfStale, useSyncStore } from '../syncStore';
 
 const NOTIF_READ = 'maestro.mobile.notifReadTs';
 
@@ -124,7 +124,9 @@ export function NotificationsScreen() {
   const syncing = useSyncStore((s) => s.syncing);
   const [readTs, setReadTs] = useState<number>(() => Number(getStr(NOTIF_READ)) || 0);
 
-  useFocusEffect(useCallback(() => { void pullSync(); }, []));
+  // Skip the refetch if the cache is already fresh — the live WS already drips
+  // new events in, so re-pulling on every tab focus only flashed the spinner.
+  useFocusEffect(useCallback(() => { void pullSyncIfStale(); }, []));
   const onRefresh = useCallback(() => { void pullSync(); }, []);
 
   // Honor the Activity-feed category toggles from Settings.

@@ -6,7 +6,7 @@ import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { Card, Mono } from '../ui';
 import { type Project } from '../api';
-import { pullSync, useSyncStore } from '../syncStore';
+import { pullSyncIfStale, useSyncStore } from '../syncStore';
 
 /** Live project descriptor used to render the filter avatars + row subtitles. */
 type LiveProj = { id: string; name: string; color: string };
@@ -105,8 +105,9 @@ export function JobsScreen() {
     [storeProjects, resolveColor],
   );
 
-  // Top up the store on focus so anything missed while another tab was active lands.
-  useFocusEffect(useCallback(() => { void pullSync(); }, []));
+  // Top up the store on focus so anything missed while another tab was active lands —
+  // but only if the cache is genuinely stale. The live WS keeps it fresh otherwise.
+  useFocusEffect(useCallback(() => { void pullSyncIfStale(); }, []));
 
   const projById = useCallback(
     (projectId: string | null): ProjResolved => {

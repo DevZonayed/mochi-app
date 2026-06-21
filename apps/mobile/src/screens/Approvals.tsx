@@ -8,7 +8,7 @@ import { Icon, type IconName } from '../Icon';
 import { Card, Mono } from '../ui';
 import { api, type Approval, type ApprovalKind, type Project } from '../api';
 import { biometricGateEnabled, confirmBiometric } from '../biometrics';
-import { pullSync, useSyncStore } from '../syncStore';
+import { pullSync, pullSyncIfStale, useSyncStore } from '../syncStore';
 
 type TintKey = 'blue' | 'purple' | 'green' | 'orange' | 'teal' | 'indigo' | 'red';
 type Platform = 'x' | 'linkedin';
@@ -313,8 +313,9 @@ export function ApprovalsScreen() {
 
   const sub = useMemo(() => (gates.length ? `${gates.length} waiting · approve from anywhere` : null), [gates.length]);
 
-  // Refetch on focus so anything that happened while the user was elsewhere lands.
-  useFocusEffect(useCallback(() => { void pullSync(); }, []));
+  // Refetch on focus so anything that happened while the user was elsewhere lands —
+  // but only when the cache is genuinely stale (the live WS already keeps it fresh).
+  useFocusEffect(useCallback(() => { void pullSyncIfStale(); }, []));
 
   // Approve: plays the green-cover animation, hits the API; the live SSE
   // approval event will resolve it in the store (and a deferred pullSync nudges
