@@ -28,11 +28,21 @@ export interface RelayOptions {
   onSignal?: (did: string, signal: unknown) => void;
 }
 
+/** Match HostClient: minimum gap between snapshot pushes. The emit() path in
+    main.ts calls pushSnapshot on every non-live event, so a streaming chat
+    triggers one push per second. The snapshot is ~70 MB of JSON for a heavy
+    user and was being built EVEN WHEN THE WS WASN'T CONNECTED — the sustained
+    ArrayBuffer allocation rate (the JSON.stringify -> ws.send path is
+    Buffer-backed) exhausted V8's ArrayBuffer pool. */
+const SNAPSHOT_THROTTLE_MS = 5000;
+
 export class RelayClient {
   private ws: WebSocket | null = null;
   private stopped = false;
   private retryMs = 1000;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
+  private lastSnapshotAt = 0;
+  private snapshotTrailer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private opts: RelayOptions) {}
 
@@ -44,6 +54,7 @@ export class RelayClient {
   stop(): void {
     this.stopped = true;
     if (this.heartbeat) clearInterval(this.heartbeat);
+    if (this.snapshotTrailer) { clearTimeout(this.snapshotTrailer); this.snapshotTrailer = null; }
     try { this.ws?.close(); } catch { /* closing */ }
   }
 
@@ -90,8 +101,26 @@ export class RelayClient {
     }
   }
 
+  /** Throttled snapshot push. Same shape as HostClient.pushSnapshot: callers
+      fire it on every event, so collapse a burst into one push per window AND
+      short-circuit when the WS isn't OPEN so we don't pay the JSON cost when
+      nothing is listening. */
   pushSnapshot(): void {
-    this.send({ type: 'state', state: this.opts.getSnapshot() });
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    const wait = SNAPSHOT_THROTTLE_MS - (now - this.lastSnapshotAt);
+    if (wait <= 0) {
+      if (this.snapshotTrailer) { clearTimeout(this.snapshotTrailer); this.snapshotTrailer = null; }
+      this.lastSnapshotAt = now;
+      this.send({ type: 'state', state: this.opts.getSnapshot() });
+      return;
+    }
+    if (this.snapshotTrailer) return;
+    this.snapshotTrailer = setTimeout(() => {
+      this.snapshotTrailer = null;
+      this.lastSnapshotAt = Date.now();
+      if (this.ws?.readyState === WebSocket.OPEN) this.send({ type: 'state', state: this.opts.getSnapshot() });
+    }, wait);
   }
 
   event(name: string, data: unknown): void {

@@ -27,11 +27,23 @@ export interface HostClientOptions {
   onSignal?: (fromDeviceId: string, signal: unknown) => void;
 }
 
+/** Minimum gap between snapshot pushes. emit() calls pushSnapshot on every
+    non-live event for live remotes (jobs, sessions, etc.); during a streaming
+    chat that fires roughly once per second. The snapshot itself serializes
+    ~70 MB of JSON for a heavy user, and that cost is paid even when the WS is
+    closed (the call site doesn't know). Sustained ~70 MB/s allocation exhausts
+    V8's ArrayBuffer pool in tens of minutes (the 0.1.19 39-min OOM). Throttling
+    here means the per-event call collapses into at most one push per window;
+    the 20s heartbeat + per-event WS event frames already deliver every delta. */
+const SNAPSHOT_THROTTLE_MS = 5000;
+
 export class HostClient {
   private ws: WebSocket | null = null;
   private stopped = false;
   private retryMs = 1000;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
+  private lastSnapshotAt = 0;
+  private snapshotTrailer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private opts: HostClientOptions) {}
 
@@ -45,6 +57,7 @@ export class HostClient {
   stop(): void {
     this.stopped = true;
     if (this.heartbeat) clearInterval(this.heartbeat);
+    if (this.snapshotTrailer) { clearTimeout(this.snapshotTrailer); this.snapshotTrailer = null; }
     try { this.ws?.close(); } catch { /* closing */ }
   }
 
@@ -101,7 +114,28 @@ export class HostClient {
     }
   }
 
-  pushSnapshot(): void { this.send({ type: 'state', state: this.opts.getSnapshot() }); }
+  /** Throttled snapshot push. The full-store snapshot is expensive to build (it
+      serializes top-N jobs with their slim transcripts) — call sites in main.ts
+      fire this on every event, so we MUST collapse a burst into at most one push
+      per SNAPSHOT_THROTTLE_MS. Also: if the WS isn't OPEN we don't even build the
+      snapshot — the old code paid the JSON cost even when nobody was listening. */
+  pushSnapshot(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    const wait = SNAPSHOT_THROTTLE_MS - (now - this.lastSnapshotAt);
+    if (wait <= 0) {
+      if (this.snapshotTrailer) { clearTimeout(this.snapshotTrailer); this.snapshotTrailer = null; }
+      this.lastSnapshotAt = now;
+      this.send({ type: 'state', state: this.opts.getSnapshot() });
+      return;
+    }
+    if (this.snapshotTrailer) return; // a trailer is already pending — let it fire
+    this.snapshotTrailer = setTimeout(() => {
+      this.snapshotTrailer = null;
+      this.lastSnapshotAt = Date.now();
+      if (this.ws?.readyState === WebSocket.OPEN) this.send({ type: 'state', state: this.opts.getSnapshot() });
+    }, wait);
+  }
   event(name: string, data: unknown): void { this.send({ type: 'event', eventName: name, data }); }
   /** Send a WebRTC signal to one remote device (the server routes by device id). */
   signal(toDeviceId: string, payload: unknown): void { this.send({ type: 'signal', toDeviceId, signal: payload }); }

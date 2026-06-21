@@ -1797,7 +1797,12 @@ export class Store {
       workspace: this.data.workspace,
       workspaces: this.data.workspace ? [this.data.workspace] : [],
       projects: this.listProjects(),
-      jobs: this.listJobs().map(slimJob),
+      // Phone/web shows a recent-job rail, not the full history — keep the
+      // snapshot small (listJobs() default cap is 200; each slimmed job is
+      // still up to ~360 KB, so 200 → 60 cuts the serialized snapshot ~3x).
+      // Phone-side delta sync (/api/sync?since=ts) backfills the older ones
+      // when actually requested.
+      jobs: this.listJobs().slice(0, 60).map(slimJob),
       sessions: this.listSessions(),
       approvals: this.listApprovals(),
       schedules: this.listSchedules(),
