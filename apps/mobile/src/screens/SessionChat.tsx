@@ -7,7 +7,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Mono } from '../ui';
-import { Markdown } from '../Markdown';
+import { Markdown, StreamingMarkdown } from '../Markdown';
 import { api, type Job, type TranscriptItem, type Effort, type ModelGroup } from '../api';
 import { cacheGet, cacheSet } from '../storage';
 import { pullSync, useSyncStore } from '../syncStore';
@@ -150,25 +150,31 @@ const isSkillTool = (name?: string): boolean => (name ?? '').toLowerCase() === '
 const prettySkillName = (raw: string): string => { const tail = (raw.split(':').pop() ?? raw).replace(/[-_]/g, ' ').trim(); return tail ? tail.replace(/\b\w/g, (c) => c.toUpperCase()) : raw; };
 
 // Extended thinking → calm dimmed prose under a purple header, tap to expand/collapse.
-function ThinkingRow({ item }: { item: TranscriptItem }) {
+// While the block is currently STREAMING, default to expanded + reveal text through
+// the typewriter so the user can watch the model reason in real time (matches the
+// desktop's `ThinkingNode` behavior).
+function ThinkingRow({ item, live }: { item: TranscriptItem; live?: boolean }) {
   const { theme } = useTheme();
-  const [open, setOpen] = useState(false);
+  const [override, setOverride] = useState<boolean | null>(null);
   const text = (item.text || '').trim();
   if (!text) return null;
+  const open = override ?? !!live;
   const preview = text.replace(/\s+/g, ' ').slice(0, 80);
   return (
     <View>
-      <Pressable onPress={() => setOpen((o) => !o)} style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
+      <Pressable onPress={() => setOverride(!open)} style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
         <View style={{ width: 18, height: 18, borderRadius: 6, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.purple + '24' }}>
           <Icon name="spark" size={11} color={theme.color.purple} />
         </View>
-        <Text style={{ fontSize: 11, fontWeight: '600', letterSpacing: 0.6, textTransform: 'uppercase', color: theme.color.purple }}>Thinking</Text>
+        <Text style={{ fontSize: 11, fontWeight: '600', letterSpacing: 0.6, textTransform: 'uppercase', color: theme.color.purple }}>Thinking{live ? '…' : ''}</Text>
         <Icon name={open ? 'chevronDown' : 'chevronRight'} size={13} color={theme.color.inkTertiary} />
         {!open && <Text numberOfLines={1} style={{ flex: 1, fontSize: 11, color: theme.color.inkTertiary }}>{preview}…</Text>}
       </Pressable>
       {open && (
         <View style={{ marginTop: 6, marginLeft: 8, paddingLeft: 12, borderLeftWidth: 1.5, borderLeftColor: theme.color.purple + '3d' }}>
-          <Markdown text={text} color={theme.color.inkSecondary} size={13} />
+          {live
+            ? <StreamingMarkdown text={text} live color={theme.color.inkSecondary} size={13} />
+            : <Markdown text={text} color={theme.color.inkSecondary} size={13} />}
         </View>
       )}
     </View>
@@ -399,9 +405,15 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
     && items.slice(0, finalIdx).some((t) => t.kind === 'tool' || t.kind === 'text' || t.kind === 'thinking');
   const [expanded, setExpanded] = useState(false);
 
+  // The LAST transcript item is the one currently growing — when the job is
+  // live, render it through `StreamingMarkdown` so streamed chunks reveal at a
+  // smooth, adaptive cadence (mirrors desktop's `StreamingBody`) instead of
+  // jolting into view in half-second bursts.
+  const lastIdx = items.length - 1;
+
   const renderItem = (it: TranscriptItem, i: number): React.ReactNode => {
     if (it.kind === 'tool') return <ToolRow key={i} item={it} />;
-    if (it.kind === 'thinking') return <ThinkingRow key={i} item={it} />;
+    if (it.kind === 'thinking') return <ThinkingRow key={i} item={it} live={live && i === lastIdx} />;
     if (it.kind === 'ask') return <QuestionCard key={i} ask={it.ask || it.text} onAnswer={onAnswer} answered={answered} />;
     if (it.kind === 'review') {
       const ok = it.verdict === 'approved';
@@ -421,6 +433,10 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
       );
     }
     if (it.text && it.text.trim()) {
+      // Live, growing text block → typewriter. Settled blocks render directly.
+      if (live && i === lastIdx) {
+        return <StreamingMarkdown key={i} text={it.text} live size={16} />;
+      }
       return <Markdown key={i} text={it.text.trim()} />;
     }
     return null;
@@ -459,7 +475,11 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
   } else if (job.error) {
     blocks.push(<Text key="err" style={{ fontSize: 15, lineHeight: 22, color: theme.color.red }}>{job.error}</Text>);
   } else if (job.output && job.output.trim()) {
-    blocks.push(<Markdown key="out" text={job.output.trim()} />);
+    blocks.push(
+      live
+        ? <StreamingMarkdown key="out" text={job.output} live />
+        : <Markdown key="out" text={job.output.trim()} />,
+    );
   } else if (live) {
     blocks.push(
       <View key="working" style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
