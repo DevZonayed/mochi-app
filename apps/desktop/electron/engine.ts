@@ -315,6 +315,12 @@ export interface BgTaskRecord {
   bytes: number;
 }
 const BG_BUFFER_CAP = 256 * 1024; // keep only the last 256 KB of a bg task's output
+/** Max completed bg-task records retained in the Map. Older entries are evicted
+    so a long-running app session doesn't leak hundreds of MB of buffers. */
+const BG_COMPLETED_RETAIN = 25;
+/** Grace period after a task completes before it becomes eligible for eviction —
+    lets a follow-up tail/log read complete after the process exits. */
+const BG_COMPLETED_GRACE_MS = 60_000;
 
 interface RunHooks {
   /** Live progress: prose-so-far + the structured transcript + running usage. Throttled by the caller. */
@@ -1148,7 +1154,12 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   return new Promise<EngineRun>((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env });
     hooks.onChild?.(child);
-    let stdout = '';
+    // Codex runs can stream HUNDREDS of MB of JSON events over 30 minutes; we
+    // MUST NOT accumulate the full stdout into a Node string (V8 OOM trap). We
+    // only need a line-by-line parse — `buf` is a tiny rolling head until the
+    // next newline. `stderr` is tail-bounded for diagnostics on a non-zero exit.
+    // Tokens are counted incrementally in `consumeLine` (no re-parse needed).
+    const STDERR_TAIL = 4 * 1024; // 4 KB diagnostic tail
     let stderr = '';
     let buf = '';
     let liveTokens = 0; // accumulated from turn.completed events; codex is $0 (subscription)
@@ -1221,26 +1232,23 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
       } catch { /* non-JSON line */ }
     };
     child.stdout.on('data', (d: Buffer) => {
-      stdout += String(d);
       buf += String(d);
       let nl: number;
       while ((nl = buf.indexOf('\n')) >= 0) { consumeLine(buf.slice(0, nl)); buf = buf.slice(nl + 1); }
+      // Defensive: a misbehaving codex that never emits a newline could grow `buf`
+      // unbounded. Cap at 1MB — well above any realistic single JSON event line.
+      if (buf.length > 1 << 20) buf = buf.slice(-(1 << 20));
     });
-    child.stderr.on('data', (d: Buffer) => { stderr += String(d); });
+    child.stderr.on('data', (d: Buffer) => { stderr = (stderr + String(d)).slice(-STDERR_TAIL); });
     child.on('error', (e) => { clearTimeout(killer); codexReg?.release(); reject(Object.assign(new Error(`Codex failed to start: ${e.message}`), { statusCode: 500 })); });
     child.on('close', (code, sig) => {
       clearTimeout(killer);
       codexReg?.release(); // invalidate the run's MCP token (codex has exited)
       if (hooks.signal?.aborted) { reject(new CancelledError()); return; }
-      let tokens = 0;
-      for (const line of stdout.split('\n')) {
-        const t = line.trim();
-        if (!t) continue;
-        try {
-          const ev = JSON.parse(t) as { type?: string; usage?: { input_tokens?: number; output_tokens?: number } };
-          if (ev.type === 'turn.completed' && ev.usage) tokens += (ev.usage.input_tokens ?? 0) + (ev.usage.output_tokens ?? 0);
-        } catch { /* non-JSON line */ }
-      }
+      // Drain any final partial line so a token-bearing event isn't dropped.
+      if (buf.trim()) { consumeLine(buf); buf = ''; }
+      // Tokens were tallied incrementally in consumeLine — no second-pass parse.
+      const tokens = liveTokens;
       let text = '';
       try { text = readFileSync(outFile, 'utf8').trim(); } catch { /* no file */ }
       try { rmSync(outFile, { force: true }); } catch { /* best effort */ }
@@ -1402,8 +1410,25 @@ export class LocalEngine {
     });
   }
 
+  /** Drop completed records beyond BG_COMPLETED_RETAIN (oldest endedAt first),
+      keeping all still-running and any task within the post-completion grace
+      window. Called on every bgStart so the Map stays bounded under steady use. */
+  private evictCompletedBg(): void {
+    const now = Date.now();
+    const completed: { id: string; endedAt: number }[] = [];
+    for (const [id, h] of this.bg) {
+      if (h.rec.status !== 'running' && h.rec.endedAt != null && now - h.rec.endedAt > BG_COMPLETED_GRACE_MS) {
+        completed.push({ id, endedAt: h.rec.endedAt });
+      }
+    }
+    if (completed.length <= BG_COMPLETED_RETAIN) return;
+    completed.sort((a, b) => a.endedAt - b.endedAt); // oldest first
+    for (const { id } of completed.slice(0, completed.length - BG_COMPLETED_RETAIN)) this.bg.delete(id);
+  }
+
   /** Start a command as a tracked background process. Returns its record immediately. */
   bgStart(opts: { projectId: string | null; sessionId?: string | null; command: string; cwd: string }): BgTaskRecord {
+    this.evictCompletedBg();
     const id = `bg_${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`;
     const rec: BgTaskRecord = {
       id, projectId: opts.projectId, sessionId: opts.sessionId ?? null,
