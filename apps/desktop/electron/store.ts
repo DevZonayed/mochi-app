@@ -602,6 +602,18 @@ const CATALOG_VERSION = 2;
     last sync predates the oldest tombstone should treat the next pull as a
     full re-sync (drop local store, GET /api/sync?since=0). */
 const MAX_TOMBSTONES = 1000;
+/** Job retention is two-tiered.
+    - `JOB_TRANSCRIPT_RETAIN` jobs keep their full transcript in memory (and on
+      disk). Beyond that, finished jobs have their `transcript` field stripped
+      — the job, its tokens/cost/title still exist for stats and the chat list,
+      but the heavy structured-events payload is dropped. Re-opening an old chat
+      shows the persisted `output` text instead of the per-step replay.
+    - Beyond `JOB_HARD_RETAIN` total jobs, the oldest finished ones are deleted
+      outright (a tombstone is recorded so the relay learns).
+    Sized so a heavy operator (~50 jobs/day) keeps a week of full transcripts
+    and roughly a month of metadata. Adjust if real-world churn proves different. */
+const JOB_TRANSCRIPT_RETAIN = 350;
+const JOB_HARD_RETAIN = 1500;
 const SEED_PROJECT_NAMES = ['Atlas API', 'Q3 Content', 'Market Scan', 'Brand Refresh', 'Infra / CI'];
 const SEED_JOB_TITLE = 'Merge PR #482 — auth refactor';
 
@@ -709,6 +721,13 @@ export class Store {
         dirty = true;
       }
       if (dirty) this.save();
+      // Existing stores from old builds may carry thousands of jobs with full
+      // transcripts (the leak we just fixed). Run the retention sweep once at
+      // boot so a long-lived install starts paying back memory immediately,
+      // instead of waiting for the next createJob to trigger the first sweep.
+      const beforeLen = this.data.jobs.length;
+      this.pruneOldJobs();
+      if (this.data.jobs.length !== beforeLen) this.save();
     } catch {
       this.data = {
         deckId: id(), deckSecret: id(), accessToken: newPairingToken(), extensionToken: newPairingToken(),
@@ -1080,8 +1099,49 @@ export class Store {
       ...(inputFiles && inputFiles.length ? { inputFiles } : {}),
       createdAt: t, updatedAt: t,
     };
-    this.data.jobs.push(j); this.save();
+    this.data.jobs.push(j);
+    this.pruneOldJobs();
+    this.save();
     return j;
+  }
+
+  /** Two-tier job retention sweep — the jobs ledger never trimmed itself, so a
+      multi-week-running app would accumulate every job's structured transcript
+      in V8 memory and on disk indefinitely. Called on createJob (so the prune
+      runs at the natural cadence of new work) and during loadStore boot. */
+  private pruneOldJobs(): void {
+    const jobs = this.data.jobs;
+    if (jobs.length <= JOB_TRANSCRIPT_RETAIN) return;
+    // Sort by createdAt newest-first; the first N keep transcripts, then any
+    // FINISHED job loses its transcript, and beyond JOB_HARD_RETAIN the oldest
+    // finished ones are deleted. Running/pending jobs are never pruned.
+    const byAge = [...jobs].sort((a, b) => b.createdAt - a.createdAt);
+    let stripped = 0;
+    let deleted = 0;
+    for (let i = JOB_TRANSCRIPT_RETAIN; i < byAge.length; i++) {
+      const j = byAge[i];
+      if (j.status === 'running' || j.status === 'pending') continue;
+      if (j.transcript !== undefined && j.transcript.length > 0) {
+        // Strip transcript but keep an empty array sentinel so older UI code
+        // that expects an array doesn't surprise-crash.
+        j.transcript = [];
+        stripped++;
+      }
+    }
+    if (byAge.length > JOB_HARD_RETAIN) {
+      // Take the oldest finished jobs above the cap and remove them outright.
+      const tail = byAge.slice(JOB_HARD_RETAIN).filter(j => j.status !== 'running' && j.status !== 'pending');
+      const dropIds = new Set(tail.map(j => j.id));
+      if (dropIds.size > 0) {
+        this.data.jobs = jobs.filter(j => !dropIds.has(j.id));
+        for (const id of dropIds) this.recordTombstone('job', id);
+        deleted = dropIds.size;
+      }
+    }
+    if (stripped > 0 || deleted > 0) {
+      // Best-effort diagnostic — silent on success so a normal createJob is quiet.
+      try { console.log(`[store] job prune: stripped=${stripped} deleted=${deleted} total=${this.data.jobs.length}`); } catch { /* */ }
+    }
   }
   updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript'>>): Job {
     const cur = this.getJob(jobId);
