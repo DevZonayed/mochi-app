@@ -2113,11 +2113,13 @@ function BgTasksPanel({ tasks, onStop }: { tasks: BgTask[]; onStop: (id: string)
         <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 300, overflowY: 'auto' }}>
           {shown.map(t => (
             <div key={t.id} style={{ borderBottom: '0.5px solid var(--separator)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 12px' }}>
+              {/* minWidth:0 on the row + overflow:hidden on the middle button ensure the long command
+                  text truncates with an ellipsis instead of pushing the Stop button off the right edge. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 12px', minWidth: 0 }}>
                 <span className={t.status === 'running' ? 'breathe' : undefined} style={{ width: 7, height: 7, borderRadius: 4, background: dot(t.status), flexShrink: 0 }} />
-                <button onClick={() => setOpen(o => o === t.id ? null : t.id)} title="Show logs" style={{ flex: 1, minWidth: 0, textAlign: 'left', background: 'transparent', cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 2 }}>
-                  <span style={{ font: '600 var(--fs-caption)/1.2 var(--font-mono, ui-monospace)', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.command}</span>
-                  <span style={{ font: '500 11px/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{t.status}{t.pid != null ? ` · pid ${t.pid}` : ''}{t.exitCode != null ? ` · exit ${t.exitCode}` : ''}</span>
+                <button onClick={() => setOpen(o => o === t.id ? null : t.id)} title="Show logs" style={{ flex: '1 1 0', minWidth: 0, width: 0, overflow: 'hidden', textAlign: 'left', background: 'transparent', cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ display: 'block', width: '100%', font: '600 var(--fs-caption)/1.2 var(--font-mono, ui-monospace)', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.command}</span>
+                  <span style={{ display: 'block', width: '100%', font: '500 11px/1 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.status}{t.pid != null ? ` · pid ${t.pid}` : ''}{t.exitCode != null ? ` · exit ${t.exitCode}` : ''}</span>
                 </button>
                 {t.status === 'running' && (
                   <button onClick={() => onStop(t.id)} title="Stop this task" style={{ height: 26, padding: '0 11px', borderRadius: 7, border: '0.5px solid var(--separator)', background: 'var(--fill-secondary)', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer', flexShrink: 0 }}>Stop</button>
