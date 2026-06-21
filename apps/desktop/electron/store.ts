@@ -1383,6 +1383,25 @@ export class Store {
   keepGoingCountFor(sessionId: string): number {
     return this.data.keepGoingCounters?.[sessionId] ?? 0;
   }
+  /** Disable every PENDING keep-going schedule for a session — called when the
+      user sends a real message into the session, so the queued auto-continue
+      doesn't fire on top of the user's reply (image_su2cf.png: the user typed
+      "Continue please", got a turn, and the keep-going schedule STILL fired
+      ~5 min later because resetting the counter alone didn't disable the row).
+      Returns the disabled schedule ids so the caller can emit 'schedule'
+      events for the UI/queue. */
+  cancelKeepGoingForSession(sessionId: string): string[] {
+    const out: string[] = [];
+    for (const s of this.data.schedules) {
+      if (s.kind === 'keep-going' && s.sessionId === sessionId && s.enabled) {
+        s.enabled = false;
+        s.nextRun = null;
+        out.push(s.id);
+      }
+    }
+    if (out.length) this.save();
+    return out;
+  }
   /** Idempotent "retry this failed run on exponential backoff" — one PENDING
    *  retry schedule per session (or per one-off jobId). On every arming the
    *  counter bumps; on every job SUCCESS for the same key the counter resets,
