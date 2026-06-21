@@ -605,6 +605,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
         const job = store.createJob(projectId, finalText, jobTitle, p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined);
         emit('job', job);
+        // A real user-initiated turn lands → the keep-going auto-continue
+        // streak for this session resets (image_0ss8f.png: a real reply means
+        // the agent isn't stuck spinning anymore, so the next stall starts
+        // fresh from attempt 1 instead of carrying yesterday's count).
+        // Auto-continue and retry-run jobs go through engine.run directly via
+        // the cron, NOT sendChat, so this only fires on genuine user messages.
+        try { store.resetKeepGoingCounter(session.id); } catch { /* best-effort */ }
         // Fire the run async — the reply streams in over job events.
         void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true, browser: p.browser === true });
         return { session, job };
