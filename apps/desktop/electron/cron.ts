@@ -161,9 +161,23 @@ export class CronRunner {
     // chat, on that chat's model. For a scheduled message the composer intent
     // (effort, browser, plan, goal) was captured so it runs exactly as if sent
     // by hand; a plain wait-&-check carries none of those and falls back.
+    // Same dispatch path covers two auto-recovery kinds (kept here on purpose
+    // so they reuse the live engine + chat-history + UI plumbing):
+    //   - 'keep-going' fires the organized auto-continue prompt that came from
+    //     the model's own outlined next-steps (image_0ss8f.png scenario).
+    //   - 'retry-run'  fires a fresh attempt of a failed (transient) job after
+    //     the backoff window (image_ni4jn.png scenario).
     const session = s.sessionId ? this.store.getSession(s.sessionId) : undefined;
     const input = s.prompt && s.prompt.trim() ? s.prompt : s.title;
-    const job = this.store.createJob(project.id, input, `Scheduled: ${s.title}`, s.effort ?? 'balanced', session?.id);
+    // Title prefix so the operator can tell at a glance how the run started.
+    // 'message' (user-scheduled) and the default fallback both read "Scheduled:".
+    const titlePrefix =
+      s.kind === 'keep-going' ? 'Auto-continue: ' :
+      s.kind === 'retry-run' ? `Auto-retry (${s.retryAttempt ?? '?'}/10): ` :
+      s.kind === 'auto-continue' ? 'Continue (limit reset): ' :
+      s.kind === 'auto-answer' ? 'Auto-answer: ' :
+      'Scheduled: ';
+    const job = this.store.createJob(project.id, input, `${titlePrefix}${s.title}`, s.effort ?? 'balanced', session?.id);
     this.emit('job', job);
     const runOpts = {
       ...(session?.primary ? { engine: session.primary.engine, model: session.primary.model, reviewer: session.reviewer } : {}),
