@@ -167,6 +167,12 @@ function removeIds<T extends IdEntity>(list: T[], ids: string[]): T[] {
 
 let inflightPull: Promise<void> | null = null;
 
+/** Belt-and-suspenders ceiling above the per-fetch timeout in api.ts. Even if
+ *  api.sync somehow never settles (a JS-layer bug, a custom in-process await
+ *  that races a never-resolving promise), this guarantees `settled` flips
+ *  true within PULL_SYNC_CEILING_MS so screens recover. */
+const PULL_SYNC_CEILING_MS = 25_000;
+
 /** Pull the delta since the last sync and merge it into the store. Re-entrant:
     calls during an in-flight pull share the same promise. */
 export function pullSync(): Promise<void> {
@@ -175,14 +181,23 @@ export function pullSync(): Promise<void> {
   notify();
   inflightPull = (async () => {
     try {
-      const delta: SyncDelta = await api.sync(state.lastSync);
+      // Race the real fetch against a hard ceiling. If api.sync wins, great.
+      // If the ceiling wins, the store still settles (screens stop showing
+      // the infinite skeleton) AND the network error banner appears.
+      const delta: SyncDelta = await Promise.race([
+        api.sync(state.lastSync),
+        new Promise<SyncDelta>((_, reject) =>
+          setTimeout(() => reject(new Error('Sync ceiling exceeded — server didn\'t respond')), PULL_SYNC_CEILING_MS),
+        ),
+      ]);
       applyDelta(delta);
     } catch (e) {
-      // Network / 503 (Mac offline) / 401 (token rejected) — keep current state
-      // (screens still render from the persisted snapshot) but RECORD the failure
-      // and mark the attempt settled, so a failed first sync flips screens out of
-      // the skeleton into an actionable reconnect/offline state instead of an
-      // endless spinner. A 401 separately bounces to re-pair (see api.req).
+      // Network / 503 (Mac offline) / 401 (token rejected) / timeout — keep
+      // current state (screens still render from the persisted snapshot) but
+      // RECORD the failure and mark the attempt settled, so a failed first
+      // sync flips screens out of the skeleton into an actionable
+      // reconnect/offline state instead of an endless spinner. A 401
+      // separately bounces to re-pair (see api.req).
       console.warn('[sync] pull failed:', e instanceof Error ? e.message : e);
       state = { ...state, settled: true, syncError: classifySyncError(e) };
       notify();
