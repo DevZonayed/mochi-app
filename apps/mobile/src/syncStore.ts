@@ -195,6 +195,21 @@ export function pullSync(): Promise<void> {
   return inflightPull;
 }
 
+/** Pull only when our cached snapshot is older than `maxAgeMs` AND we're not
+    already pulling. Wired into screen focus effects so flipping back to a tab
+    we visited 200 ms ago doesn't re-trigger /api/sync (the live WS already kept
+    the store fresh) — that's what caused the constant "loading" spinner flash
+    on Projects / ProjectSessions. The first call (cold-start, `bootstrapped`
+    false) always goes through. Returns the same promise as `pullSync` when it
+    actually fires, else a resolved no-op. */
+export function pullSyncIfStale(maxAgeMs = 8000): Promise<void> {
+  if (inflightPull) return inflightPull;
+  // Cold start, host switch, or never-synced — always pull.
+  if (!state.bootstrapped || !state.lastSync) return pullSync();
+  if (Date.now() - state.lastSync < maxAgeMs) return Promise.resolve();
+  return pullSync();
+}
+
 /** Apply a delta envelope (REST or — in the future — a stitched SSE batch). */
 function applyDelta(delta: SyncDelta): void {
   const c = delta.changed;

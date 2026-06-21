@@ -5,7 +5,8 @@ import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/nativ
 import { useTheme } from '../theme';
 import { Icon } from '../Icon';
 import { Card } from '../ui';
-import { pullSync, useSyncStore } from '../syncStore';
+import { pullSync, pullSyncIfStale, useSyncStore } from '../syncStore';
+import type { Job, ChatSession } from '../api';
 import { SkeletonList } from '../ui/Skeleton';
 import { SyncErrorBanner } from '../SyncErrorBanner';
 
@@ -41,29 +42,63 @@ export function ProjectSessionsScreen() {
   const syncError = useSyncStore((s) => s.syncError);
   const syncing = useSyncStore((s) => s.syncing);
 
-  // Top up the store on focus and on pull-to-refresh — covers the rare case
-  // where SSE dropped a frame and the user just opened the project.
-  useFocusEffect(useCallback(() => { void pullSync(); }, []));
+  // Top up the store on focus — but skip if the cache is already fresh. The
+  // live WS keeps the store warm, so re-pulling on every navigation back to
+  // this screen just flashed the RefreshControl spinner without delivering
+  // new data ("they are loading so much" in the operator's words).
+  useFocusEffect(useCallback(() => { void pullSyncIfStale(); }, []));
   const onRefresh = useCallback(() => { void pullSync(); }, []);
 
-  // Per-session: last activity + running state, derived from the project's jobs.
+  // Pre-bucket the project's jobs by sessionId ONCE per `jobs` change, so the
+  // per-row render is O(1) lookup instead of a fresh filter+sort scan for every
+  // session. Visible on long session lists (8+ chats), where the old map made
+  // the inside-project screen feel "stuck" on first paint.
+  const jobsBySession = useMemo(() => {
+    const m = new Map<string, Job[]>();
+    for (const j of jobs) {
+      if (!j.sessionId) continue;
+      const arr = m.get(j.sessionId);
+      if (arr) arr.push(j); else m.set(j.sessionId, [j]);
+    }
+    // Sort each bucket by recency once.
+    for (const arr of m.values()) arr.sort((a, b) => b.updatedAt - a.updatedAt);
+    return m;
+  }, [jobs]);
+
+  // Per-session: last activity + running state. Falls back to the session's
+  // own updatedAt when no job is in the snapshot for this session (the Mac
+  // caps the mirrored job list at the 200 most-recent — see
+  // apps/desktop/electron/store.ts → listJobs slice(0,200) — so a session's
+  // turn can briefly be the freshest signal we have). "Running" also accepts a
+  // very recent session.updatedAt (< 60 s) as a positive, which keeps the
+  // breathing dot lit during the gap between a sendChat returning and the
+  // first 'job' frame landing.
+  const FRESH_RUNNING_MS = 60_000;
   const meta = useCallback(
-    (sid: string): { last: number; running: boolean; snippet: string } => {
-      const sj = jobs.filter((j) => j.sessionId === sid).sort((a, b) => b.updatedAt - a.updatedAt);
-      const top = sj[0];
+    (s: ChatSession): { last: number; running: boolean; snippet: string } => {
+      const sj = jobsBySession.get(s.id);
+      const top = sj?.[0];
+      const lastJob = top?.updatedAt ?? 0;
+      const last = Math.max(lastJob, s.updatedAt);
+      const jobRunning = sj?.some((j) => j.status === 'running' || j.status === 'pending') ?? false;
+      const sessionWarm = (Date.now() - s.updatedAt) < FRESH_RUNNING_MS;
+      // Only treat a "warm" session as running if there's also at least one
+      // job for it on file (so a brand-new empty chat doesn't render a spinner).
+      const running = jobRunning || (sessionWarm && (sj?.length ?? 0) > 0);
       return {
-        last: top?.updatedAt ?? 0,
-        running: sj.some((j) => j.status === 'running' || j.status === 'pending'),
+        last,
+        running,
         snippet: top ? (top.output?.trim() || top.input || '') : '',
       };
     },
-    [jobs],
+    [jobsBySession],
   );
 
-  const active = sessions
+  const active = useMemo(() => sessions
     .filter((s) => !s.archived)
-    .map((s) => ({ s, ...meta(s.id) }))
-    .sort((a, b) => (b.s.pinned ? 1 : 0) - (a.s.pinned ? 1 : 0) || b.last - a.last || b.s.updatedAt - a.s.updatedAt);
+    .map((s) => ({ s, ...meta(s) }))
+    .sort((a, b) => (b.s.pinned ? 1 : 0) - (a.s.pinned ? 1 : 0) || b.last - a.last || b.s.updatedAt - a.s.updatedAt),
+    [sessions, meta]);
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.color.bg }}>
