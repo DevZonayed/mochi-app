@@ -114,6 +114,63 @@ describe('Store.upsertKeepGoingForSession', () => {
   });
 });
 
+describe('Store.cancelKeepGoingForSession', () => {
+  let s: Store;
+  let projectId: string;
+  let sessionId: string;
+  beforeEach(() => {
+    rmSync(hoisted.dir, { recursive: true, force: true });
+    s = new Store();
+    const p = s.createProject({ name: 'Proj' });
+    const sess = s.createSession(p.id, 'Chat');
+    projectId = p.id; sessionId = sess.id;
+  });
+
+  // image_su2cf.png: the user typed "Continue please" while a keep-going
+  // schedule was pending; the schedule STILL fired 5 min later because the
+  // engine only reset the counter and never disabled the row.
+  it('disables every pending keep-going row for the session (and returns their ids)', () => {
+    const r = s.upsertKeepGoingForSession({ sessionId, projectId, prompt: KEEP_GOING_PROMPT, fireAt: future(5 * 60_000), maxPerSession: 20 });
+    expect(r.schedule!.enabled).toBe(true);
+    const ids = s.cancelKeepGoingForSession(sessionId);
+    expect(ids).toEqual([r.schedule!.id]);
+    const sched = s.listSchedules().find(x => x.id === r.schedule!.id)!;
+    expect(sched.enabled).toBe(false);
+    expect(sched.nextRun).toBeNull();
+  });
+
+  it('does NOT touch another session\'s keep-going row', () => {
+    const second = s.createSession(projectId, 'Chat 2');
+    const a = s.upsertKeepGoingForSession({ sessionId, projectId, prompt: KEEP_GOING_PROMPT, fireAt: future(5 * 60_000), maxPerSession: 20 });
+    const b = s.upsertKeepGoingForSession({ sessionId: second.id, projectId, prompt: KEEP_GOING_PROMPT, fireAt: future(5 * 60_000), maxPerSession: 20 });
+    s.cancelKeepGoingForSession(sessionId);
+    expect(s.listSchedules().find(x => x.id === a.schedule!.id)!.enabled).toBe(false);
+    expect(s.listSchedules().find(x => x.id === b.schedule!.id)!.enabled).toBe(true);
+  });
+
+  it('does NOT touch other schedule kinds (auto-answer, retry-run, message) for the same session', () => {
+    const kg = s.upsertKeepGoingForSession({ sessionId, projectId, prompt: KEEP_GOING_PROMPT, fireAt: future(5 * 60_000), maxPerSession: 20 });
+    const msg = s.createSchedule({ projectId, sessionId, kind: 'message', title: 'queued', prompt: 'hi', fireAt: future(60_000) });
+    const retry = s.upsertRetryRunForKey({ key: `session:${sessionId}`, sessionId, projectId, sourceJobId: 'jX', title: 'retry', prompt: 'p', fireAt: future(60_000), attempt: 1 });
+    s.cancelKeepGoingForSession(sessionId);
+    expect(s.listSchedules().find(x => x.id === kg.schedule!.id)!.enabled).toBe(false);
+    expect(s.listSchedules().find(x => x.id === msg.id)!.enabled).toBe(true);
+    expect(s.listSchedules().find(x => x.id === retry.schedule.id)!.enabled).toBe(true);
+  });
+
+  it('is a no-op when nothing is pending', () => {
+    expect(s.cancelKeepGoingForSession(sessionId)).toEqual([]);
+  });
+
+  it('does NOT re-enable an already-disabled row (idempotent)', () => {
+    const r = s.upsertKeepGoingForSession({ sessionId, projectId, prompt: KEEP_GOING_PROMPT, fireAt: future(5 * 60_000), maxPerSession: 20 });
+    s.cancelKeepGoingForSession(sessionId);
+    const ids = s.cancelKeepGoingForSession(sessionId);
+    expect(ids).toEqual([]);
+    expect(s.listSchedules().find(x => x.id === r.schedule!.id)!.enabled).toBe(false);
+  });
+});
+
 describe('Store retry counter', () => {
   let s: Store;
   beforeEach(() => {
