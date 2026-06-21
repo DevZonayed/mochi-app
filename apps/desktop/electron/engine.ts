@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, readdirSync, statSync, lst
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
-import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice, ChatSession } from './store.js';
+import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice, ChatSession, Schedule } from './store.js';
 import type { PublishingEngine } from './publishing.js';
 import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
@@ -42,6 +42,14 @@ import {
 } from './engines.js';
 import { resetFromRateLimitInfo, isUsageLimitMessage, parseUsageLimitReset, type RateLimitInfo } from './limit-reset.js';
 import { parseAsk, timeoutAnswer, ASK_BASE_MS } from './ask-question.js';
+import {
+  detectKeepGoing, organizedContinuePrompt,
+  KEEP_GOING_BASE_MS, KEEP_GOING_MAX_PER_SESSION, KEEP_GOING_CAP_NOTE,
+} from './keep-going.js';
+import {
+  isRetryWorthy, retryDelayMs, retryKeyFor, retryScheduleTitle, retryNote, retryGiveUpNote,
+  RETRY_MAX_ATTEMPTS,
+} from './retry-backoff.js';
 import { resolveGh, downloadGh } from './gh-cli.js';
 import { ghTokenFrom, githubConnectionStatus, type GithubConnection } from './github-auth.js';
 import { shell } from 'electron';
@@ -1758,15 +1766,15 @@ export class LocalEngine {
   /** Arm an auto-answer countdown for an unanswered AskUserQuestion at the tail of a
       finished chat turn. No-op unless the model genuinely ended ON the question (it
       asked and didn't act afterwards) and nothing is already armed for this session. */
-  private armAskFollowup(sessionId: string, projectId: string, items: TranscriptItem[], effort: Effort): void {
+  private armAskFollowup(sessionId: string, projectId: string, items: TranscriptItem[], effort: Effort): boolean {
     let askIdx = -1;
     for (let i = items.length - 1; i >= 0; i--) { if (items[i].kind === 'ask') { askIdx = i; break; } }
-    if (askIdx === -1) return;
+    if (askIdx === -1) return false;
     // If the model used a tool AFTER asking, it proceeded on its own — don't auto-answer.
-    for (let i = askIdx + 1; i < items.length; i++) { if (items[i].kind === 'tool') return; }
+    for (let i = askIdx + 1; i < items.length; i++) { if (items[i].kind === 'tool') return false; }
     const questions = parseAsk(items[askIdx].ask);
-    if (!questions.length) return;
-    if (this.store.listSchedules().some(s => s.kind === 'auto-answer' && s.sessionId === sessionId && s.enabled)) return;
+    if (!questions.length) return false;
+    if (this.store.listSchedules().some(s => s.kind === 'auto-answer' && s.sessionId === sessionId && s.enabled)) return true;
     const armedAt = Date.now();
     const sched = this.store.createSchedule({
       projectId, sessionId, kind: 'auto-answer',
@@ -1774,6 +1782,143 @@ export class LocalEngine {
       fireAt: armedAt + ASK_BASE_MS, armedAt, extends: 0, effort,
     });
     this.emit('schedule', sched);
+    return true;
+  }
+
+  /** Arm a "want me to keep going?" follow-up: when the model's last text
+      offers to continue and nothing else is pending, schedule an organized
+      auto-continue for KEEP_GOING_BASE_MS later. Per-session cap +
+      idempotent upsert keep a stuck agent from spinning forever AND keep a
+      burst of re-emits from spawning duplicate schedules.
+      Returns the schedule (or null when capped / nothing to arm). */
+  private armKeepGoingFollowup(opts: {
+    sessionId: string;
+    projectId: string;
+    items: TranscriptItem[];
+    effort: Effort;
+    goalMode: boolean;
+    originalGoal?: string;
+    sourceJobId: string;
+    outputText: string;
+  }): void {
+    // Last text the model emitted (the offer to continue lives there, NOT in
+    // a tool chip or thinking block). Tail-only search keeps a single match in
+    // the middle of a long body from triggering when the body ends on a real
+    // deliverable.
+    let lastText = '';
+    for (let i = opts.items.length - 1; i >= 0; i--) {
+      const it = opts.items[i];
+      if (it.kind === 'text' || it.kind === 'result') { lastText = it.text; break; }
+    }
+    if (!lastText && opts.outputText) lastText = opts.outputText;
+    if (!lastText) return;
+    if (!detectKeepGoing(lastText)) return;
+    // Don't auto-continue ON TOP OF other pending actions for the session
+    // (an auto-answer, an auto-continue at limit-reset, a queued message,
+    // or a pending retry-run). Those have priority — once they fire, the
+    // next turn re-evaluates from the new tail.
+    const blockingKinds = new Set(['auto-answer', 'auto-continue', 'retry-run', 'message']);
+    const hasBlocking = this.store.listSchedules().some(s =>
+      s.sessionId === opts.sessionId && s.enabled && blockingKinds.has(s.kind ?? ''),
+    );
+    if (hasBlocking) return;
+    const fireAt = Date.now() + KEEP_GOING_BASE_MS;
+    const prompt = organizedContinuePrompt({
+      lastText,
+      goalMode: opts.goalMode,
+      originalGoal: opts.originalGoal,
+      attempt: this.store.keepGoingCountFor(opts.sessionId) + 1,
+      maxAttempts: KEEP_GOING_MAX_PER_SESSION,
+    });
+    const res = this.store.upsertKeepGoingForSession({
+      sessionId: opts.sessionId,
+      projectId: opts.projectId,
+      title: 'Auto-continue (want me to keep going?)',
+      prompt,
+      fireAt,
+      effort: opts.effort,
+      sourceJobId: opts.sourceJobId,
+      maxPerSession: KEEP_GOING_MAX_PER_SESSION,
+    });
+    if (res.capped) {
+      // Surface a graceful pause note onto the source job so the operator
+      // can see auto-continue stopped on its own (not silently).
+      try {
+        const j = this.store.getJob(opts.sourceJobId);
+        if (j) {
+          const note = KEEP_GOING_CAP_NOTE;
+          const merged: TranscriptItem[] = [...(j.transcript ?? []), { kind: 'text', text: note, ts: Date.now() }];
+          const patched = this.store.updateJob(opts.sourceJobId, {
+            output: j.output ? `${j.output}\n\n${note}` : note,
+            transcript: merged.slice(-400),
+          });
+          this.emit('job', patched);
+        }
+      } catch { /* best-effort */ }
+      return;
+    }
+    if (res.schedule) this.emit('schedule', res.schedule);
+  }
+
+  /** Boot-sweep helper: settleOrphanedRuns() at startup marks any jobs left
+      'running'/'pending' as failed with "Interrupted — Maestro was restarted
+      while this job was running." (image_ni4jn.png). Arm exponential retries
+      for THOSE so the operator doesn't have to tap Retry by hand: the same
+      backoff schedule kicks in (1m, 2m, …, 10m) on the next CronRunner tick.
+      Returns an array of armed schedules so main.ts can log it. */
+  armRetriesForOrphanedJobs(orphans: Job[]): { jobId: string; schedule: Schedule; attempt: number }[] {
+    const out: { jobId: string; schedule: Schedule; attempt: number }[] = [];
+    for (const j of orphans) {
+      if (!isRetryWorthy(j.error)) continue;
+      try {
+        const armed = this.armRetryRun({ job: j, projectId: j.projectId, error: j.error ?? '' });
+        if (armed) {
+          out.push({ jobId: j.id, schedule: armed.schedule, attempt: armed.attempt });
+          // Tag the orphan with the retry note so the UI shows the user that auto-recovery is in motion.
+          try {
+            const note = retryNote(armed.attempt, armed.schedule.fireAt ?? Date.now());
+            const merged = this.store.updateJob(j.id, { error: `${j.error ?? 'Interrupted'}\n\n${note}` });
+            this.emit('job', merged);
+          } catch { /* non-fatal */ }
+          this.emit('schedule', armed.schedule);
+        }
+      } catch { /* best-effort per orphan */ }
+    }
+    return out;
+  }
+
+  /** After a transient failure that's already past the engine's inline retry
+      budget, queue an exponential retry (1 min, 2 min, 3 min, … up to
+      RETRY_MAX_ATTEMPTS=10). Per-key counter ticks forward; a later SUCCESS
+      for the same key resets it, so a single later failure starts from 1 min
+      (exactly the user's "if one is going well then reset" requirement).
+      Returns the scheduled retry or null when the cap was hit. */
+  private armRetryRun(opts: {
+    job: Job;
+    projectId: string;
+    error: string;
+  }): { schedule: Schedule; attempt: number } | null {
+    const key = retryKeyFor({ sessionId: opts.job.sessionId, jobId: opts.job.id });
+    const attempt = this.store.recordRetryAttempt(key, RETRY_MAX_ATTEMPTS);
+    if (attempt == null) return null;
+    const delay = retryDelayMs(attempt);
+    const fireAt = Date.now() + delay;
+    const res = this.store.upsertRetryRunForKey({
+      key,
+      sessionId: opts.job.sessionId,
+      projectId: opts.projectId,
+      sourceJobId: opts.job.id,
+      title: retryScheduleTitle(attempt),
+      // Re-fire the original user input — the engine resolves chat history
+      // from the session (resumeId for Claude, stitched history for Codex),
+      // so the model picks up exactly where the failed run left off.
+      prompt: opts.job.input,
+      fireAt,
+      attempt,
+      effort: opts.job.effort,
+      goal: opts.job.goal,
+    });
+    return { schedule: res.schedule, attempt };
   }
 
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
@@ -2382,8 +2527,38 @@ export class LocalEngine {
       // hasn't answered (the SDK auto-dismisses it headless), arm a countdown that
       // auto-sends the recommended option after ASK_BASE_MS. The question card shows
       // the countdown + an extend button; answering/extending reschedules or cancels.
+      // If THAT wasn't applicable, but the model's tail says "want me to keep going?"
+      // (image_0ss8f.png), arm the keep-going auto-continue countdown instead — same
+      // wait shape, organized prompt built from the model's own outlined next items.
       if (isChat && !opts.plan && !ac.signal.aborted) {
-        try { this.armAskFollowup(session.id, job.projectId, allItems, effort); } catch { /* best-effort */ }
+        try {
+          const armedAsk = this.armAskFollowup(session.id, job.projectId, allItems, effort);
+          if (!armedAsk) {
+            this.armKeepGoingFollowup({
+              sessionId: session.id,
+              projectId: job.projectId,
+              items: allItems,
+              effort,
+              goalMode,
+              originalGoal: goalMode ? cur.input : undefined,
+              sourceJobId: jobId,
+              outputText: output,
+            });
+          }
+        } catch { /* best-effort */ }
+      }
+      // A SUCCESSFUL chat turn means whatever was wrong has cleared — reset the
+      // exponential retry streak for this session so a future single failure
+      // restarts the 1m → 10m series from scratch (the user's "if one is going
+      // well then reset" requirement). Also: any real activity from the user
+      // is signalled by a fresh turn arriving (handled at message-send time),
+      // but a successful auto-continue STILL completing means we made progress,
+      // so the keep-going streak only resets when the user types something —
+      // not on every keep-going firing — to keep the cap meaningful.
+      if (isChat) {
+        try { this.store.resetRetryCounter(retryKeyFor({ sessionId: session.id, jobId })); } catch { /* best-effort */ }
+      } else {
+        try { this.store.resetRetryCounter(retryKeyFor({ sessionId: undefined, jobId })); } catch { /* best-effort */ }
       }
       // Continuum: append a terse checkpoint link for turns that changed files (or
       // any design turn) so the chain reflects real deltas, not chatter.
@@ -2428,9 +2603,29 @@ export class LocalEngine {
       const errMsg = isTransientFailure(e)
         ? `The engine kept hitting a transient error and stopped after ${ENGINE_MAX_RETRIES} retries — usually a brief network or service blip. Tap Retry.\n\n${raw}`.trim()
         : raw;
+      // Async exponential auto-retry (image_ni4jn.png scenario): when the
+      // failure is transient-shaped — restart marker, network blip, overload,
+      // 429, 5xx — schedule a fresh attempt on 1m → 2m → 3m … 10m backoff
+      // instead of leaving the operator to tap Retry. The streak resets to 1
+      // once any later run for the same session/job succeeds.
+      let retryNoteText: string | null = null;
+      if (isRetryWorthy(errMsg) && !ac.signal.aborted) {
+        try {
+          const cur = this.store.getJob(jobId);
+          if (cur) {
+            const armed = this.armRetryRun({ job: cur, projectId: cur.projectId, error: errMsg });
+            if (armed) {
+              retryNoteText = retryNote(armed.attempt, armed.schedule.fireAt ?? Date.now());
+              this.emit('schedule', armed.schedule);
+            } else {
+              retryNoteText = retryGiveUpNote();
+            }
+          }
+        } catch { /* best-effort — failure still surfaces below */ }
+      }
       const failed = this.store.updateJob(jobId, {
         status: 'failed', phase: 'Failed', stage: '',
-        error: errMsg,
+        error: retryNoteText ? `${errMsg}\n\n${retryNoteText}` : errMsg,
       });
       this.emit('job', failed);
       this.store.pushEvent({ kind: 'job-failed', title: `Failed: ${failed.title}`, subtitle: failed.error ?? undefined, projectId: failed.projectId, jobId });

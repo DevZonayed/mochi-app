@@ -205,7 +205,11 @@ function createWindow() {
 
 app.whenReady().then(() => {
   const store = new Store();
-  store.settleOrphanedRuns(); // jobs from a previous app instance can't finish — settle them honestly
+  // jobs from a previous app instance can't finish — settle them honestly,
+  // then queue exponential auto-retries for the transient-shaped ones
+  // (image_ni4jn.png: "Interrupted — Maestro was restarted") once the engine
+  // exists. The orphans collected here are passed back below.
+  const orphanedRuns = store.settleOrphanedRuns();
   const providers = new Providers(store);
 
   /* Serve a design project's folder for the live preview iframe:
@@ -322,6 +326,13 @@ app.whenReady().then(() => {
   }
 
   const engine = new LocalEngine(store, emit, providers);
+  // Boot-sweep auto-retry: orphaned jobs from a previous app instance get the
+  // same exponential 1m → 10m backoff as in-flight failures — the operator
+  // doesn't have to tap Retry by hand. Non-retry-worthy orphans (auth/cli
+  // missing) are left as-is.
+  if (orphanedRuns.length) {
+    try { engine.armRetriesForOrphanedJobs(orphanedRuns); } catch { /* best-effort */ }
+  }
   const media = new MediaEngine(store, emit, () => providers.getLocalKey('fal'));
   media.resumeOnBoot();
   const research = new ResearchEngine(store, engine, emit);

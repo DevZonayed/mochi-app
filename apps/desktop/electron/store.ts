@@ -203,15 +203,27 @@ export interface Schedule {
       is blocked by the usage limit — it fires "continue" into the chat at reset.
       'auto-answer' fires the recommended option into the chat when an unanswered
       AskUserQuestion times out (the countdown the user sees on the question card).
+      'keep-going' fires an organized "continue" message into the chat when the
+      model ended a turn on "want me to keep going?" and the user didn't reply
+      within the wait window (image_0ss8f.png scenario).
+      'retry-run' fires a fresh attempt of a failed (transient) job after the
+      exponential backoff window (image_ni4jn.png scenario — "Interrupted —
+      Maestro was restarted", overload, 429, 5xx).
       'whatsapp-analyze' is the per-chat quiet timer: it fires once a tracked
       WhatsApp chat has sat silent for 15 min, summarizing it back to the operator. */
-  kind?: 'message' | 'auto-continue' | 'auto-answer' | 'whatsapp-analyze'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean;
+  kind?: 'message' | 'auto-continue' | 'auto-answer' | 'keep-going' | 'retry-run' | 'whatsapp-analyze'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean;
   /** whatsapp-analyze only: the WhatsApp chat (JID) whose silence this timer watches. */
   chatId?: string;
   /** auto-answer only: when it was armed (base for the escalating-extend math),
       how many times the user extended, and whether it's been paused past the cap
       (paused = no auto-answer; the question waits indefinitely for a manual reply). */
   armedAt?: number; extends?: number; paused?: boolean;
+  /** retry-run only: 1-indexed attempt number this scheduled retry represents
+      (1..RETRY_MAX_ATTEMPTS). Surfaced in the schedule title + chat note. */
+  retryAttempt?: number;
+  /** retry-run / keep-going: original jobId this schedule was spawned from, so
+      the UI can correlate the auto-recovery back to the failed run. */
+  sourceJobId?: string;
   /** Interval cadence: fire every N minutes from `anchorAt` (defaults to createdAt).
       When set (>0) the schedule is interval-mode and ignores time/cadence. */
   everyMinutes?: number; anchorAt?: number;
@@ -511,6 +523,17 @@ interface StoreData {
       are merged into every agent run — Claude's `mcpServers`, Codex's
       `-c mcp_servers.<name>=…`. Mac-local; secrets referenced by env-var name. */
   mcpServers?: CustomMcpServer[];
+  /** Auto-retry streak counter per chat session (or per one-off jobId), keyed
+      by `session:<id>` / `job:<id>`. Bumped each time a retry schedule is armed
+      and reset to 0 on a successful run for the same key, so the linear 1m → 10m
+      backoff resumes from 1 minute after a single recovery (image_ni4jn.png).
+      Mac-local; resets if the store is missing this map (older snapshots). */
+  retryCounters?: Record<string, number>;
+  /** Per-session running count of consecutive auto-continues issued by the
+      keep-going follow-up (image_0ss8f.png). Reset on the next genuine user
+      message. Capped by KEEP_GOING_MAX_PER_SESSION to keep a stuck agent from
+      burning through tokens. Mac-local. */
+  keepGoingCounters?: Record<string, number>;
 }
 
 /** A literal key/value pair — an env var or an HTTP header. */
@@ -1127,7 +1150,7 @@ export class Store {
 
   // ── Schedules ───────────────────────────────────────────────────────
   listSchedules(): Schedule[] { return [...this.data.schedules].sort((a, b) => a.time.localeCompare(b.time)); }
-  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue' | 'auto-answer' | 'whatsapp-analyze'; chatId?: string; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean; armedAt?: number; extends?: number; everyMinutes?: number; anchorAt?: number; catchUp?: boolean; catchUpWindowMs?: number }): Schedule {
+  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue' | 'auto-answer' | 'keep-going' | 'retry-run' | 'whatsapp-analyze'; chatId?: string; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean; armedAt?: number; extends?: number; everyMinutes?: number; anchorAt?: number; catchUp?: boolean; catchUpWindowMs?: number; retryAttempt?: number; sourceJobId?: string }): Schedule {
     const at = s.fireAt ? new Date(s.fireAt) : null;
     const time = s.time ?? (at ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}` : '');
     const rec: Schedule = {
@@ -1149,6 +1172,8 @@ export class Store {
       ...(s.anchorAt ? { anchorAt: s.anchorAt } : {}),
       ...(s.catchUp ? { catchUp: true } : {}),
       ...(s.catchUpWindowMs ? { catchUpWindowMs: s.catchUpWindowMs } : {}),
+      ...(s.retryAttempt ? { retryAttempt: s.retryAttempt } : {}),
+      ...(s.sourceJobId ? { sourceJobId: s.sourceJobId } : {}),
     };
     this.data.schedules.push(rec); this.save();
     return rec;
@@ -1216,6 +1241,167 @@ export class Store {
       fireAt: opts.fireAt,
       kind: 'auto-continue',
       effort: opts.effort,
+    });
+    return { schedule, created: true };
+  }
+  /** Idempotent "auto-continue on 'want me to keep going?'" — one PENDING
+   *  schedule per session, regardless of how many times the engine re-arms it
+   *  inside the wait window. Same coalescing shape as upsertAutoContinueForSession
+   *  (image_5zcze.png style guard against duplicate rows) but driven by the
+   *  end-of-turn pattern-match instead of a rate-limit event.
+   *
+   *  Per-session safety cap: the helper checks the keep-going streak counter
+   *  and returns `{ capped: true }` once it would push past the limit, so the
+   *  caller can post a graceful pause note instead of armed silence.
+   *
+   *  `bumpCounter` defaults to true (the normal arming path). The cron runner
+   *  passes false when re-arming after a fire, so the count tracks consecutive
+   *  auto-continues, not the total schedules created.
+   */
+  upsertKeepGoingForSession(opts: {
+    sessionId: string;
+    projectId?: string | null;
+    title?: string;
+    prompt: string;
+    fireAt: number;
+    effort?: Effort;
+    sourceJobId?: string;
+    maxPerSession: number;
+    bumpCounter?: boolean;
+  }): { schedule: Schedule | null; created: boolean; capped: boolean; attempt: number } {
+    const counters = (this.data.keepGoingCounters ??= {});
+    const current = counters[opts.sessionId] ?? 0;
+    const nextAttempt = current + 1;
+    if (nextAttempt > opts.maxPerSession) {
+      return { schedule: null, created: false, capped: true, attempt: current };
+    }
+    const now = Date.now();
+    const existing = this.data.schedules.find((s) =>
+      s.kind === 'keep-going' &&
+      s.sessionId === opts.sessionId &&
+      s.enabled !== false &&
+      typeof s.fireAt === 'number' && s.fireAt > now,
+    );
+    if (existing) {
+      // Already armed for this session — extend forward only (never pull a
+      // later deadline backward) and refresh the prompt to the latest
+      // organized form, in case the model's last text changed.
+      const fireAt = Math.max(existing.fireAt ?? 0, opts.fireAt);
+      const patch: Partial<Schedule> = {};
+      if (fireAt !== existing.fireAt) { existing.fireAt = fireAt; existing.nextRun = fireAt; patch.fireAt = fireAt; }
+      if (opts.prompt && opts.prompt !== existing.prompt) { existing.prompt = opts.prompt; patch.prompt = opts.prompt; }
+      if (Object.keys(patch).length) this.save();
+      return { schedule: existing, created: false, capped: false, attempt: current };
+    }
+    if (opts.bumpCounter !== false) {
+      counters[opts.sessionId] = nextAttempt;
+    }
+    const schedule = this.createSchedule({
+      projectId: opts.projectId ?? null,
+      sessionId: opts.sessionId,
+      title: opts.title ?? 'Auto-continue (want me to keep going?)',
+      prompt: opts.prompt,
+      fireAt: opts.fireAt,
+      kind: 'keep-going',
+      effort: opts.effort,
+      sourceJobId: opts.sourceJobId,
+    });
+    return { schedule, created: true, capped: false, attempt: opts.bumpCounter !== false ? nextAttempt : current };
+  }
+  /** Reset the per-session keep-going streak counter (called whenever the
+      user sends a genuine message into the session — that's the "things are
+      moving" signal, so the next stall starts fresh from attempt 1). */
+  resetKeepGoingCounter(sessionId: string): void {
+    if (!this.data.keepGoingCounters) return;
+    if (this.data.keepGoingCounters[sessionId] != null) {
+      delete this.data.keepGoingCounters[sessionId];
+      this.save();
+    }
+  }
+  /** Current consecutive-auto-continue count for a session (used by the UI
+      to show "Auto-continue 3/20" on the schedule chip). */
+  keepGoingCountFor(sessionId: string): number {
+    return this.data.keepGoingCounters?.[sessionId] ?? 0;
+  }
+  /** Idempotent "retry this failed run on exponential backoff" — one PENDING
+   *  retry schedule per session (or per one-off jobId). On every arming the
+   *  counter bumps; on every job SUCCESS for the same key the counter resets,
+   *  so the linear 1m → 10m series restarts after a single recovery, exactly
+   *  as the user requested.
+   *
+   *  Returns the new attempt number (1..N) so the caller writes the right
+   *  note ("Auto-retry 3/10 in 3 min …"), or `null` when past the cap (the
+   *  caller surfaces a give-up note instead).
+   */
+  recordRetryAttempt(key: string, max: number): number | null {
+    const counters = (this.data.retryCounters ??= {});
+    const next = (counters[key] ?? 0) + 1;
+    if (next > max) return null;
+    counters[key] = next;
+    this.save();
+    return next;
+  }
+  /** Clear the retry streak for a key (called on a successful run for the same
+      session/job, so the next single failure starts again from 1 minute). */
+  resetRetryCounter(key: string): void {
+    if (!this.data.retryCounters) return;
+    if (this.data.retryCounters[key] != null) {
+      delete this.data.retryCounters[key];
+      this.save();
+    }
+  }
+  /** Current attempt count for a key — used by tests + the UI. */
+  retryCountFor(key: string): number {
+    return this.data.retryCounters?.[key] ?? 0;
+  }
+  /** Idempotent "schedule a retry-run after the backoff window" — coalesces
+      so a burst of re-emit events for the same failure can't spawn duplicates.
+      Caller computes `attempt` via recordRetryAttempt first. */
+  upsertRetryRunForKey(opts: {
+    key: string;
+    sessionId?: string;
+    projectId?: string | null;
+    sourceJobId: string;
+    title: string;
+    prompt: string;
+    fireAt: number;
+    attempt: number;
+    effort?: Effort;
+    browser?: boolean;
+    plan?: boolean;
+    goal?: boolean;
+  }): { schedule: Schedule; created: boolean } {
+    const now = Date.now();
+    // Coalesce per (key) — same session OR same source job, whichever the
+    // caller indexed under. We match on sourceJobId because that's the
+    // stable identifier across attempts.
+    const existing = this.data.schedules.find((s) =>
+      s.kind === 'retry-run' &&
+      s.enabled !== false &&
+      typeof s.fireAt === 'number' && s.fireAt > now &&
+      (s.sourceJobId === opts.sourceJobId || (opts.sessionId ? s.sessionId === opts.sessionId : false)),
+    );
+    if (existing) {
+      const fireAt = Math.max(existing.fireAt ?? 0, opts.fireAt);
+      const patch: Partial<Schedule> = {};
+      if (fireAt !== existing.fireAt) { existing.fireAt = fireAt; existing.nextRun = fireAt; patch.fireAt = fireAt; }
+      if (opts.attempt && existing.retryAttempt !== opts.attempt) { existing.retryAttempt = opts.attempt; patch.retryAttempt = opts.attempt; }
+      if (Object.keys(patch).length) this.save();
+      return { schedule: existing, created: false };
+    }
+    const schedule = this.createSchedule({
+      projectId: opts.projectId ?? null,
+      sessionId: opts.sessionId,
+      title: opts.title,
+      prompt: opts.prompt,
+      fireAt: opts.fireAt,
+      kind: 'retry-run',
+      effort: opts.effort,
+      browser: opts.browser,
+      plan: opts.plan,
+      goal: opts.goal,
+      retryAttempt: opts.attempt,
+      sourceJobId: opts.sourceJobId,
     });
     return { schedule, created: true };
   }
