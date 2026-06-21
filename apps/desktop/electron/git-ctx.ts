@@ -128,7 +128,7 @@ export function nextActionFor(state: SessionGitStatus['state']): string {
     case 'pr-mergeable':  return 'PR is open and clean. Call pr_merge to land it.';
     case 'pr-conflicts':  return 'PR has conflicts. Call pr_resolve_conflicts — it will pull base in; if it returns conflicted files, read each, resolve the <<<<<<< markers, commit, and call again.';
     case 'pr-blocked':    return 'PR is open but blocked (checks pending or behind). Wait for checks; pull base via pr_resolve_conflicts if behind.';
-    case 'pr-merged':     return 'PR has been merged — the lifecycle for this session is done. Use mcp__maestro__archiveSessionWorktree if you want to prune the worktree.';
+    case 'pr-merged':     return 'PR is merged — work is on base. Branch may still show "ahead" commits with different SHAs (squash-merge case): they\'re obsolete. Reset to base (Bash: git fetch origin <base>:<base> && git reset --hard origin/<base>) or archive the worktree.';
     case 'pr-closed':     return 'PR was closed without merging. The branch still exists locally; consider a new PR or abandoning the chat.';
   }
 }

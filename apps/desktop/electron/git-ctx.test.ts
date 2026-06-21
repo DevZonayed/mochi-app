@@ -132,4 +132,14 @@ describe('nextActionFor', () => {
   test('pr-conflicts hint mentions pr_resolve_conflicts', () => {
     expect(nextActionFor('pr-conflicts')).toMatch(/pr_resolve_conflicts/);
   });
+  test('pr-merged hint explains the squash-merge cleanup path', () => {
+    // The bug we fixed: after squash-merge the branch shows "ahead" with
+    // different SHAs and the user wonders what to do. The hint must
+    // mention BOTH the reset path and the archive path so the agent (and
+    // a human reading the message) has actionable next steps.
+    const hint = nextActionFor('pr-merged');
+    expect(hint).toMatch(/reset/i);
+    expect(hint).toMatch(/archive/i);
+    expect(hint).toMatch(/squash/i); // mentions the underlying mechanism
+  });
 });

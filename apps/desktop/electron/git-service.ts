@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import type { Store, ChatSession, Project } from './store.js';
 import type { Providers } from './providers.js';
 import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug } from './git.js';
-import { parseGitHubRemote, findOpenPr, getPullStatus, createPull, mergePull, getRepo, pickMergeMethod } from './github.js';
+import { parseGitHubRemote, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, getRepo, pickMergeMethod } from './github.js';
 import { deriveState, type LocalState, type PrStatus, type SessionGitStatus } from './pr-state.js';
 
 type Emit = (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => void;
@@ -36,7 +36,16 @@ export class GitService {
     return { isRepo: true, ahead, behind, dirty: isDirty(dir), pushed };
   }
 
-  /** Live PR facts from GitHub (null when no token / non-GitHub / no open PR). */
+  /** Live PR facts from GitHub.
+   *
+   *  Returns the OPEN PR for this branch when one exists. If no open PR exists,
+   *  falls back to the MOST RECENT PR (open / merged / closed) so a finished
+   *  lifecycle (`pr-merged`, `pr-closed`) still surfaces in the UI instead of
+   *  collapsing to `ready-for-pr`. This fixes the "PR was squash-merged but the
+   *  UI still says Create PR / shows 50 ahead" bug.
+   *
+   *  Returns null only when there's no token, no remote, or the branch has
+   *  literally never had a PR. */
   async prState(session: ChatSession, project: Project): Promise<PrStatus | null> {
     const token = this.token();
     if (!token || !project.path || !session.branch) return null;
@@ -44,8 +53,12 @@ export class GitService {
     if (!gh) return null;
     try {
       const open = await findOpenPr(token, gh.owner, gh.repo, session.branch);
-      if (!open) return null;
-      return await getPullStatus(token, gh.owner, gh.repo, open.number);
+      if (open) return await getPullStatus(token, gh.owner, gh.repo, open.number);
+      // No open PR → fall back to the most recent one (regardless of state) so
+      // merged/closed PRs still report their state instead of returning null.
+      const recent = await findRecentPr(token, gh.owner, gh.repo, session.branch);
+      if (!recent) return null;
+      return await getPullStatus(token, gh.owner, gh.repo, recent.number);
     } catch {
       return this.cache.get(session.id)?.pr ?? null; // keep last known on transient error
     }
