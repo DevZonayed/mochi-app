@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { View, Text, Pressable, ScrollView, ActivityIndicator, Alert, RefreshControl } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
@@ -6,7 +6,7 @@ import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Card } from '../ui';
 import { api, type Project } from '../api';
-import { pullSync, useSyncStore } from '../syncStore';
+import { pullSync, pullSyncIfStale, useSyncStore } from '../syncStore';
 import { SkeletonList } from '../ui/Skeleton';
 import { SyncErrorBanner } from '../SyncErrorBanner';
 
@@ -45,13 +45,87 @@ export function ProjectsScreen() {
 
   const colorFor = (c: string): string => (COLOR_NAMES.includes(c as ColorName) ? theme.color[c as ColorName] : theme.color.blue);
 
-  // Refetch on focus (catches anything missed while another tab was driving),
-  // and pull-to-refresh on the ScrollView.
-  useFocusEffect(useCallback(() => { void pullSync(); }, []));
+  // Refetch on focus — but only if the cache is genuinely stale. The live WS
+  // already keeps the store fresh, so re-pulling every time the user lands on
+  // this tab just made the header spinner flash without ever changing the data.
+  useFocusEffect(useCallback(() => { void pullSyncIfStale(); }, []));
   const onRefresh = useCallback(() => { void pullSync(); }, []);
 
-  const sessionCount = (pid: string) => sessions.filter((s) => s.projectId === pid && !s.archived).length;
-  const runningCount = (pid: string) => jobs.filter((j) => j.projectId === pid && (j.status === 'running' || j.status === 'pending')).length;
+  // Precompute per-project active-session + running counts ONCE per render
+  // instead of N×(sessions+jobs) passes during the list map. With many projects
+  // (and a 200-job snapshot from the Mac) the per-row filters were the visible
+  // "loading" jank on a project list of 20+ rows.
+  const sessionCountByProject = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const s of sessions) {
+      if (s.archived) continue;
+      m.set(s.projectId, (m.get(s.projectId) ?? 0) + 1);
+    }
+    return m;
+  }, [sessions]);
+
+  // "Running" badge sources, merged for parity with how the desktop reads live
+  // activity. The Mac mirrors only the most-recent 200 jobs in the snapshot
+  // (apps/desktop/electron/store.ts → listJobs slice(0,200)), so a project's
+  // older-but-still-running turn can fall out of the snapshot. We backstop that
+  // by ALSO treating any session updated in the last 90 s as live — the
+  // session row itself gets touched on every turn even when its job doesn't
+  // ride along.
+  const runningByProject = useMemo(() => {
+    const FRESH_MS = 90_000;
+    const sessionsRunningByProject = new Map<string, Set<string>>();
+    const liveJobSessionsByProject = new Map<string, Set<string>>();
+    const orphanRunningCount = new Map<string, number>();
+    const cutoff = Date.now() - FRESH_MS;
+    for (const j of jobs) {
+      if (j.status !== 'running' && j.status !== 'pending') continue;
+      if (j.sessionId) {
+        const set = liveJobSessionsByProject.get(j.projectId) ?? new Set<string>();
+        set.add(j.sessionId);
+        liveJobSessionsByProject.set(j.projectId, set);
+      } else {
+        orphanRunningCount.set(j.projectId, (orphanRunningCount.get(j.projectId) ?? 0) + 1);
+      }
+    }
+    for (const s of sessions) {
+      if (s.archived) continue;
+      if (s.updatedAt >= cutoff) {
+        const set = sessionsRunningByProject.get(s.projectId) ?? new Set<string>();
+        set.add(s.id);
+        sessionsRunningByProject.set(s.projectId, set);
+      }
+    }
+    // Union of (sessions with a running job) ∪ (sessions touched in last 90s)
+    // + non-session orphan jobs. That's the broadest, parity-with-desktop count.
+    const out = new Map<string, number>();
+    const allKeys = new Set<string>([
+      ...liveJobSessionsByProject.keys(),
+      ...sessionsRunningByProject.keys(),
+      ...orphanRunningCount.keys(),
+    ]);
+    for (const pid of allKeys) {
+      const union = new Set<string>();
+      liveJobSessionsByProject.get(pid)?.forEach((sid) => union.add(sid));
+      sessionsRunningByProject.get(pid)?.forEach((sid) => union.add(sid));
+      out.set(pid, union.size + (orphanRunningCount.get(pid) ?? 0));
+    }
+    return out;
+  }, [jobs, sessions]);
+
+  const sessionCount = (pid: string) => sessionCountByProject.get(pid) ?? 0;
+  const runningCount = (pid: string) => runningByProject.get(pid) ?? 0;
+
+  // Debounced syncing flag — flips on only after the sync has been running for
+  // 350 ms so the header spinner doesn't pop in for a sub-200 ms snapshot fetch
+  // (which is what happens on most focus refreshes). The RefreshControl in the
+  // ScrollView still mirrors the raw flag — pull-to-refresh needs the immediate
+  // feedback so the gesture feels live.
+  const [slowSyncing, setSlowSyncing] = useState(false);
+  useEffect(() => {
+    if (!syncing) { setSlowSyncing(false); return; }
+    const t = setTimeout(() => setSlowSyncing(true), 350);
+    return () => clearTimeout(t);
+  }, [syncing]);
 
   const confirmDelete = (p: Project) => {
     Alert.alert(
@@ -119,7 +193,7 @@ export function ProjectsScreen() {
             <Text style={{ fontSize: 14, color: theme.color.inkSecondary, marginTop: 3 }}>Your codespace, grouped by type.</Text>
           </View>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14 }}>
-            {syncing && projects.length > 0 ? <ActivityIndicator size="small" color={theme.color.inkTertiary} /> : null}
+            {slowSyncing && projects.length > 0 ? <ActivityIndicator size="small" color={theme.color.inkTertiary} /> : null}
             <Pressable onPress={() => nav.navigate('CreateProject')} hitSlop={8} style={{ width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.blue }}>
               <Icon name="plus" size={20} color="#fff" stroke={2.4} />
             </Pressable>
