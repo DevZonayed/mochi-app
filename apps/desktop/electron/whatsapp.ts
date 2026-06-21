@@ -241,6 +241,12 @@ const NO_RECONNECT = new Set([401, 440, 500]);
 const MAX_RECONNECTS = 5;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
+// In-memory contact cache cap (Map insertion order = LRU when re-set). A typical
+// WhatsApp account has ~500-2000 contacts; an active operator with chats inside
+// many groups can rack up tens of thousands of *participants* over a session,
+// each handled by ingestContact. Cap so the Map never holds more than this many
+// distinct JIDs in RAM — chat metadata persists to disk via the WaStore.
+const CONTACTS_CACHE_MAX = 5000;
 
 export class WhatsAppClient {
   private sock: WaSocket | null = null;
@@ -254,8 +260,22 @@ export class WhatsAppClient {
   constructor(private store: Store, private emit: (name: string, data: unknown) => void, private deps: WaDeps = {}) {
     try {
       powerMonitor.on('resume', () => { if (this.wantConnected && !this.sock) void this.connect().catch(() => {}); });
-      powerMonitor.on('suspend', () => { try { this.sock?.end?.(); } catch { /* */ } this.sock = null; });
+      powerMonitor.on('suspend', () => { this.releaseSocket(); });
     } catch { /* powerMonitor absent (tests) */ }
+  }
+
+  /** End the current socket and drop all of its event listeners so the closure
+      tree (each one captures `this`) can be GC'd, instead of being pinned by
+      Baileys' internal references until its next cleanup pass. Used on
+      suspend / disconnect / unlink so a long-lived app session can't accumulate
+      dead-socket retention across many sleep/wake or network drop cycles. */
+  private releaseSocket(): void {
+    try {
+      const ev = this.sock?.ev as unknown as { removeAllListeners?: () => void } | undefined;
+      ev?.removeAllListeners?.();
+    } catch { /* mock sockets may not be EventEmitters */ }
+    try { this.sock?.end?.(); } catch { /* already dead */ }
+    this.sock = null;
   }
 
   status() { return this.store.whatsappState(); }
@@ -332,6 +352,15 @@ export class WhatsAppClient {
     if (!c?.id) return;
     const name = c.name || c.notify || c.verifiedName;
     if (!name) return;
+    // Re-insert touches LRU position (Maps preserve insertion order). When the
+    // cache is full, evict the oldest entry instead of growing indefinitely
+    // — group-heavy operators can otherwise see this Map balloon to tens of
+    // thousands of JIDs over a long session.
+    if (this.contacts.has(c.id)) this.contacts.delete(c.id);
+    else if (this.contacts.size >= CONTACTS_CACHE_MAX) {
+      const oldest = this.contacts.keys().next().value;
+      if (oldest !== undefined) this.contacts.delete(oldest);
+    }
     this.contacts.set(c.id, name);
     if (this.store.waGetChat(c.id)) this.store.waUpsertChat({ chatId: c.id, name });
   }
@@ -548,8 +577,7 @@ export class WhatsAppClient {
   /** Stop the socket but keep auth (a transient disconnect). */
   disconnect(): void {
     this.wantConnected = false;
-    try { this.sock?.end?.(); } catch { /* */ }
-    this.sock = null;
+    this.releaseSocket();
     this.lastQr = null;
     this.store.setWhatsappState({ connected: false });
     this.emit('comms', this.store.commsStatus());
@@ -596,7 +624,13 @@ export class WhatsAppClient {
   }
 
   private async onClose(u: { lastDisconnect?: { error?: { output?: { statusCode?: number } } } }): Promise<void> {
-    this.sock = null;
+    // Eagerly drop every listener bound to the OLD socket's EventEmitter so the
+    // closure tree (each callback captures `this`) can be GC'd immediately,
+    // rather than waiting on whatever internal references Baileys still holds.
+    // Belt-and-suspenders: each `connect()` attaches a fresh set on a fresh
+    // socket, so a long-lived app with intermittent network would otherwise pin
+    // chains of dead-socket closure trees across reconnect cycles.
+    this.releaseSocket();
     const code = u.lastDisconnect?.error?.output?.statusCode ?? null;
     if (code === 401) { await this.unlink(); return; }                  // logged out → forget
     this.store.setWhatsappState({ connected: false });
@@ -619,10 +653,30 @@ export class WhatsAppClient {
     };
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const { version } = await fetchLatestBaileysVersion();
-    // Sync history so the WhatsApp screen can show existing chats + messages (not
-    // just ones that arrive after linking). WhatsApp streams it in batches via
-    // messaging-history.set; WaStore caps each chat so it stays bounded.
-    const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, syncFullHistory: true, shouldSyncHistoryMessage: () => true, markOnlineOnConnect: false });
+    // History sync: previously `syncFullHistory: true` + `shouldSyncHistoryMessage: () => true`
+    // streamed the operator's ENTIRE account history through a single
+    // `messaging-history.set` event (often hundreds of MB held in V8 during the
+    // batch). Real WhatsApp Web only loads recent threads; we do the same now —
+    // capture new messages as they arrive (always), and cap historical back-fill
+    // to ~30 days so an unread/archived chat doesn't drag its full lifetime in.
+    // The WaStore captures whatever Baileys hands us, so a smaller window is
+    // strictly a memory win — not a UX regression. Conductor follows the same
+    // strategy and that's why its memory stays flat.
+    const HISTORY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+    const cutoffSec = Math.floor((Date.now() - HISTORY_WINDOW_MS) / 1000);
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: false,
+      syncFullHistory: false,
+      // Per-message gate Baileys calls during a history batch — only keep the
+      // last 30 days. Robust to both raw seconds and Long timestamps.
+      shouldSyncHistoryMessage: (msg: { messageTimestamp?: unknown }) => {
+        const t = toEpochSeconds(msg?.messageTimestamp as Raw['messageTimestamp']);
+        return t === 0 || t >= cutoffSec;
+      },
+      markOnlineOnConnect: false,
+    });
     sock.ev.on('creds.update', saveCreds);
     return sock;
   }
