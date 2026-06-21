@@ -186,7 +186,7 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
         <button onClick={onToggleCollapse} title="Show files panel" className="ws-newbtn" style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-secondary)' }}>
           <Icon name="sidebar" size={16} />
         </button>
-        {changed.length > 0 && <div title={`${changed.length} changed`} style={{ marginTop: 2, width: 18, height: 18, borderRadius: 9, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--green) 16%, transparent)', color: 'var(--green)', font: '700 9px/1 var(--font-mono)' }}>{changed.length}</div>}
+        {changed.length > 0 && <div title={`${changed.length} edited by this chat (chat-history, not git diff)`} style={{ marginTop: 2, width: 18, height: 18, borderRadius: 9, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--green) 16%, transparent)', color: 'var(--green)', font: '700 9px/1 var(--font-mono)' }}>{changed.length}</div>}
       </div>
     );
   }
@@ -203,7 +203,11 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
         {/* Tabs scroll sideways when the panel is too narrow, rather than wrapping
             the labels to a second line (which broke the fixed-height header). */}
         <div className="ws-tabs" style={{ display: 'flex', alignItems: 'center', gap: 2, minWidth: 0, flexShrink: 1, overflowX: 'auto' }}>
-          {([['files', 'All files', 0], ['changes', 'Changes', changed.length], ['checks', 'Checks', checks.length]] as [TopTab, string, number][]).map(([k, label, n]) => (
+          {/* "Edited" instead of "Changes" — the list is files the chat
+              transcript wrote to (chat-history truth), NOT files currently
+              different from base. "Changes" misled users into thinking it was
+              a git diff; "Edited" makes the meaning honest. */}
+          {([['files', 'All files', 0], ['changes', 'Edited', changed.length], ['checks', 'Checks', checks.length]] as [TopTab, string, number][]).map(([k, label, n]) => (
             <button key={k} onClick={() => setTab(k)} style={{ height: 28, padding: '0 9px', borderRadius: 7, cursor: 'pointer', flexShrink: 0, whiteSpace: 'nowrap', display: 'inline-flex', alignItems: 'center', gap: 5,
               font: `${tab === k ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: tab === k ? 'var(--ink)' : 'var(--ink-tertiary)', background: tab === k ? 'var(--fill-secondary)' : 'transparent' }}>
               {label}{n > 0 && <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: k === 'checks' && failing ? 'var(--orange)' : 'var(--ink-tertiary)' }}>{n}</span>}

@@ -114,6 +114,17 @@ export async function findOpenPr(token: string, owner: string, repo: string, hea
   return pr ? { number: pr.number, url: pr.html_url, title: pr.title, headSha: pr.head.sha } : null;
 }
 
+/** The MOST RECENT PR for `headBranch`, regardless of state (open / closed / merged).
+ *  Used by `prState()` as a fallback when no open PR exists, so the UI can still
+ *  show `pr-merged` (or `pr-closed`) and the right next-action hint after the PR
+ *  has been squash-merged. GitHub's REST `state=all` + sort=updated DESC gives us
+ *  that ordering — we take the first result. */
+export async function findRecentPr(token: string, owner: string, repo: string, headBranch: string, fetchImpl?: FetchImpl): Promise<OpenPr | null> {
+  const r = await ghRequest<Array<{ number: number; html_url: string; title: string; head: { sha: string } }>>({ token, path: `/repos/${owner}/${repo}/pulls?state=all&head=${owner}:${encodeURIComponent(headBranch)}&sort=updated&direction=desc&per_page=1`, fetchImpl });
+  const pr = r.data?.[0];
+  return pr ? { number: pr.number, url: pr.html_url, title: pr.title, headSha: pr.head.sha } : null;
+}
+
 function normalizeMergeableState(s: string): PrStatus['mergeableState'] {
   const known = ['clean', 'dirty', 'blocked', 'behind', 'unstable', 'draft', 'unknown'];
   return (known.includes(s) ? s : 'unknown') as PrStatus['mergeableState'];
