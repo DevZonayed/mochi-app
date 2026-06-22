@@ -43,6 +43,18 @@ files:
   - '!node_modules/@anthropic-ai/claude-agent-sdk-*/**'
   - '!node_modules/.pnpm/@anthropic-ai+claude-agent-sdk-*/**'
 
+# Ship the Chrome extension alongside the app so EVERY user has it (not just
+# this dev box). At runtime electron/extension-locator.ts resolves the folder
+# to <app-resources>/extension/ in packaged builds and apps/desktop/extension/
+# in `pnpm dev`. Settings → "Reveal extension folder" opens it for Load Unpacked.
+extraResources:
+  - from: extension
+    to: extension
+    filter:
+      - '**/*'
+      - '!**/.DS_Store'
+      - '!**/node_modules/**'
+
 publish:
   provider: github
   owner: DevZonayed

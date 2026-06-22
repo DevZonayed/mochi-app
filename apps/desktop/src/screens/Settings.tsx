@@ -669,9 +669,14 @@ function SecurityPane({ onExportAudit }: { onExportAudit: () => void }) {
 function ExtensionPane() {
   const [status, setStatus] = React.useState<ExtensionStatus | null>(null);
   const [copied, setCopied] = React.useState(false);
+  const [extPath, setExtPath] = React.useState<{ path: string | null; source: string; manifestPresent: boolean } | null>(null);
+  const [revealed, setRevealed] = React.useState(false);
   const refetch = React.useCallback(() => { if (IS_LOCAL) void api.extensionStatus().then(setStatus).catch(() => {}); }, []);
   React.useEffect(() => {
     refetch();
+    // The bundled-extension location is static (read once on mount). The dispatch
+    // is cheap (no IO beyond an existsSync) so polling adds nothing.
+    if (IS_LOCAL) void api.extensionPath().then(setExtPath).catch(() => {});
     const t = setInterval(refetch, 2000); // live profile/active updates while the pane is open
     return () => clearInterval(t);
   }, [refetch]);
@@ -679,8 +684,23 @@ function ExtensionPane() {
     if (!status?.token) return;
     void navigator.clipboard?.writeText(status.token).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1600); });
   };
+  const reveal = () => {
+    // The dispatch opens the folder; we flash a confirmation back so the user
+    // knows the click landed even if their attention is on Chrome already.
+    void api.extensionRevealFolder()
+      .then(() => { setRevealed(true); setTimeout(() => setRevealed(false), 2000); })
+      .catch(() => {});
+  };
   const makeActive = (clientId: string) => { void api.extensionSetActive(clientId).then(setStatus).catch(() => {}); };
   const peers = status?.peers ?? [];
+  /* Three states the install card has to render cleanly:
+       - found ('packaged'/'dev'/'env-override' + manifest present) → the green
+         path: show the absolute path + a "Reveal folder" button.
+       - 'not-found' → the build doesn't ship an extension at this path
+         (regression in electron-builder filter, or a hand-built dev tree).
+       - found but manifest missing → folder exists but Chrome would reject it.
+     The footer tells the user EXACTLY what to do in the chrome://extensions UI. */
+  const extFound = !!extPath?.path && extPath.manifestPresent;
   return (
     <div>
       <PaneHead sub="The native Chrome extension talks to this Mac over one local port. Pair it once with the token below — then send or steer messages and drop comments on any chat, from any tab.">Browser extension</PaneHead>
@@ -692,6 +712,40 @@ function ExtensionPane() {
               <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{status?.running ? 'Control channel ready' : 'Offline'}</span>
               <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{peers.length ? `${peers.length} Chrome profile${peers.length === 1 ? '' : 's'} connected` : 'No Chrome profile connected yet'}</span>
             </span>
+          </Row>
+        </GroupedList>
+
+        <GroupedList
+          header="Install in Chrome"
+          footer={extFound
+            ? 'In Chrome: open chrome://extensions → enable Developer mode → click "Load unpacked" → pick the folder revealed above. The bundled extension is read-only — restart the app to pick up any updates.'
+            : extPath?.path
+              ? 'The folder exists but is missing manifest.json — the installer didn’t copy the extension correctly. Reinstall the app, or set MAESTRO_EXTENSION_DIR to point at a known-good copy.'
+              : 'No bundled extension was shipped with this build. Set MAESTRO_EXTENSION_DIR=/path/to/extension to point at a local copy, or reinstall the app.'}
+        >
+          <Row last>
+            <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: extFound ? 'color-mix(in srgb, var(--purple, var(--blue)) 14%, transparent)' : 'var(--fill-tertiary)', color: extFound ? 'var(--purple, var(--blue))' : 'var(--ink-tertiary)' }}><Icon name="folder" size={17} /></span>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>
+                {extFound ? 'Mochi extension is bundled' : 'Extension folder not found'}
+              </span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.35 var(--font-mono)', color: 'var(--ink-secondary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={extPath?.path ?? ''}>
+                {extPath?.path ?? '(no path)'}
+              </span>
+              {extPath?.source && extPath.source !== 'not-found' && (
+                <span style={{ display: 'inline-block', marginTop: 4, padding: '1px 7px', borderRadius: 'var(--r-pill)', background: 'var(--fill-tertiary)', color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-text)' }}>
+                  source: {extPath.source}
+                </span>
+              )}
+            </span>
+            <button
+              onClick={reveal}
+              disabled={!extFound}
+              className="ghost-btn"
+              style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: revealed ? 'rgba(52,199,89,0.14)' : 'var(--fill-secondary)', color: revealed ? 'var(--green)' : extFound ? 'var(--ink)' : 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: extFound ? 1 : 0.5, cursor: extFound ? 'pointer' : 'not-allowed' }}
+            >
+              {revealed ? 'Opened ✓' : 'Reveal folder'}
+            </button>
           </Row>
         </GroupedList>
 
