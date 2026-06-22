@@ -1,5 +1,8 @@
 import { describe, test, expect } from 'vitest';
-import { githubConnectionStatus } from './github-auth.js';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { githubConnectionStatus, ghLoggedIn } from './github-auth.js';
 
 function fakeFetch(spec: { status: number; body?: unknown; headers?: Record<string, string> }): typeof fetch {
   return (async () => ({
@@ -29,5 +32,31 @@ describe('githubConnectionStatus', () => {
   test('401 → disconnected', async () => {
     const f = fakeFetch({ status: 401, body: { message: 'Bad credentials' } });
     expect(await githubConnectionStatus('t', f)).toMatchObject({ connected: false });
+  });
+});
+
+describe('ghLoggedIn', () => {
+  test('missing hosts.yml → false', () => {
+    expect(ghLoggedIn('/this/path/does/not/exist/hosts.yml')).toBe(false);
+  });
+  test('hosts.yml without a github.com block → false', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-auth-test-'));
+    const p = join(dir, 'hosts.yml');
+    try {
+      writeFileSync(p, '# empty\n');
+      expect(ghLoggedIn(p)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test('hosts.yml with github.com block → true', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-auth-test-'));
+    const p = join(dir, 'hosts.yml');
+    try {
+      writeFileSync(p, 'github.com:\n  user: octo\n  oauth_token: gho_xxx\n');
+      expect(ghLoggedIn(p)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

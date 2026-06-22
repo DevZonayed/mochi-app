@@ -622,22 +622,30 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // A real user-initiated turn lands → the keep-going auto-continue
         // streak for this session resets (image_0ss8f.png: a real reply means
         // the agent isn't stuck spinning anymore, so the next stall starts
-        // fresh from attempt 1 instead of carrying yesterday's count).
+        // fresh from attempt 1 instead of carrying yesterday's count). AND
+        // any PENDING keep-going schedule is disabled, so the queued
+        // auto-continue doesn't fire on top of this fresh reply (image_su2cf.png:
+        // a "Continue please" landed and the keep-going schedule STILL fired
+        // 5 minutes later — the counter reset alone wasn't enough).
         // Auto-continue and retry-run jobs go through engine.run directly via
         // the cron, NOT sendChat, so this only fires on genuine user messages.
-        try { store.resetKeepGoingCounter(session.id); } catch { /* best-effort */ }
-        // CANCEL every pending autopilot followup for this session — fixes
-        // the "fires again unnecessarily" bug the operator hit in chat: a
-        // [Auto-continue]: countdown that was armed BEFORE the user typed
-        // must not fire AFTER the user replied. Previously only the counter
-        // was reset; the schedule row stayed live and fired anyway. Now we
-        // disable both 'keep-going' and 'auto-answer' rows here so the user's
-        // real message is the authoritative signal.
         try {
+          store.resetKeepGoingCounter(session.id);
+          // CANCEL every pending autopilot followup for this session — fixes
+          // the "fires again unnecessarily" bug (image_su2cf.png): a
+          // [Auto-continue]: countdown that was armed BEFORE the user typed
+          // must not fire AFTER the user replied. Resetting the counter alone
+          // wasn't enough; the schedule row stayed live and fired ~5 min later.
+          // Now we disable BOTH 'keep-going' and 'auto-answer' rows so the
+          // user's real message is the authoritative signal. (Broader than the
+          // earlier cancelKeepGoingForSession — covers the AskUserQuestion
+          // auto-answer too, since both share the same followup lifecycle.)
           const cancelled = store.cancelPendingFollowups(session.id);
+          // Emit the now-disabled rows so any live schedule-queue UI prunes
+          // them immediately (same shape the cron uses when it fires + disables).
           for (const id of cancelled) {
-            const s = store.listSchedules().find((x) => x.id === id);
-            if (s) emit('schedule', s);
+            const sch = store.listSchedules().find((x) => x.id === id);
+            if (sch) emit('schedule', sch);
           }
         } catch { /* best-effort */ }
         // Fire the run async — the reply streams in over job events.

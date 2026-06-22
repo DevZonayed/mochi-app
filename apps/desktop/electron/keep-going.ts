@@ -81,14 +81,34 @@ export function detectKeepGoing(text: string | undefined | null): string | null 
 
 /* ── Organizing the continue prompt ──────────────────────────────────── */
 
+/** Strip inline markdown emphasis (bold/italic) from an extracted item so the
+    auto-continue prompt — which renders into the USER-SIDE chat bubble (no
+    markdown parser there) — doesn't show literal `**Sprint 10b**` stars to
+    the operator. The agent still understands the plain text fine. Backticks
+    are preserved (inline code reads OK as ``code`` in plain text). */
+function stripEmphasis(s: string): string {
+  return s
+    // **bold** / __bold__
+    .replace(/\*\*([^*\n]+?)\*\*/g, '$1')
+    .replace(/__([^_\n]+?)__/g, '$1')
+    // *italic* / _italic_ — only when bracketed with whitespace on both
+    // outer sides so we don't eat "5*3" or "snake_case".
+    .replace(/(^|[\s(])\*([^*\n]+?)\*(?=[\s).,;:!?]|$)/g, '$1$2')
+    .replace(/(^|[\s(])_([^_\n]+?)_(?=[\s).,;:!?]|$)/g, '$1$2')
+    .trim();
+}
+
 /** Extract the model's own outlined next items from its last text so we can
     echo them back as bullets. Captures numbered lists, dashed bullets, and
     bold-headed alternatives ("**Sprint 4b — paywall** , Sprint 8 …"). Dedups
-    and caps at 8 to keep the resumed prompt tight. */
+    and caps at 8 to keep the resumed prompt tight. Markdown emphasis is
+    stripped (see stripEmphasis) so the resulting prompt reads cleanly in the
+    USER-side chat bubble, which has no markdown renderer. */
 export function extractNextItems(text: string | undefined | null): string[] {
   if (!text) return [];
   const out: string[] = [];
-  const push = (s: string) => {
+  const push = (raw: string) => {
+    const s = stripEmphasis(raw);
     const t = s.replace(/\s+/g, ' ').trim();
     if (!t || t.length < 3 || t.length > 240) return;
     if (out.includes(t)) return;

@@ -1413,6 +1413,9 @@ export class Store {
       // ran is a no-op anyway, but skipping it keeps the audit clean.
       if (typeof s.fireAt === 'number' && s.fireAt <= now && s.lastRun) continue;
       s.enabled = false;
+      // Clear nextRun so the schedule-queue UI shows "—" for the next-run
+      // column on a cancelled row, not a stale future timestamp.
+      s.nextRun = null;
       ids.push(s.id);
     }
     if (ids.length) this.save();
@@ -1423,6 +1426,10 @@ export class Store {
   keepGoingCountFor(sessionId: string): number {
     return this.data.keepGoingCounters?.[sessionId] ?? 0;
   }
+  // cancelKeepGoingForSession was removed in the autopilot redesign — its
+  // narrower scope (keep-going only) is subsumed by cancelPendingFollowups
+  // above, which also handles 'auto-answer' (the AskUserQuestion countdown
+  // shares the same followup lifecycle and should cancel on a real reply too).
   /** Idempotent "retry this failed run on exponential backoff" — one PENDING
    *  retry schedule per session (or per one-off jobId). On every arming the
    *  counter bumps; on every job SUCCESS for the same key the counter resets,
