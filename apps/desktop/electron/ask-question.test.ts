@@ -66,11 +66,15 @@ describe('answer formatting', () => {
 });
 
 describe('escalating extend + cap', () => {
+  // After the 2026 autopilot redesign ASK_BASE_MS dropped 5min → 1min (the
+  // operator wanted snappier countdowns now that it's opt-in per-chat).
+  // The escalating step (+5, +10, +15) is unchanged, only the BASE shifts —
+  // so deadlines below are written in terms of ASK_BASE_MS, not literal 10m/20m.
   it('offset grows base, +5, +10, +15 …', () => {
-    expect(offsetForExtends(0)).toBe(ASK_BASE_MS);                 // 5m
-    expect(offsetForExtends(1)).toBe(ASK_BASE_MS + 5 * 60_000);    // 10m
-    expect(offsetForExtends(2)).toBe(ASK_BASE_MS + 15 * 60_000);   // 20m
-    expect(offsetForExtends(3)).toBe(ASK_BASE_MS + 30 * 60_000);   // 35m (over cap)
+    expect(offsetForExtends(0)).toBe(ASK_BASE_MS);                 // base (1m)
+    expect(offsetForExtends(1)).toBe(ASK_BASE_MS + 5 * 60_000);    // base + 5m
+    expect(offsetForExtends(2)).toBe(ASK_BASE_MS + 15 * 60_000);   // base + 15m
+    expect(offsetForExtends(3)).toBe(ASK_BASE_MS + 30 * 60_000);   // base + 30m (over 30-min cap)
   });
   it('first extend adds 5 min', () => {
     const armed = 1_000_000;
@@ -78,7 +82,7 @@ describe('escalating extend + cap', () => {
     expect(e.capped).toBe(false);
     expect(e.extends).toBe(1);
     expect(e.addedMs).toBe(5 * 60_000);
-    expect(e.deadline).toBe(armed + 10 * 60_000);
+    expect(e.deadline).toBe(armed + ASK_BASE_MS + 5 * 60_000);
   });
   it('second extend adds 10 min (15 min of extension total)', () => {
     const armed = 1_000_000;
@@ -86,10 +90,10 @@ describe('escalating extend + cap', () => {
     expect(e.capped).toBe(false);
     expect(e.extends).toBe(2);
     expect(e.addedMs).toBe(10 * 60_000);
-    expect(e.deadline).toBe(armed + 20 * 60_000);
+    expect(e.deadline).toBe(armed + ASK_BASE_MS + 15 * 60_000);
   });
   it('the extend that would exceed 30 min total caps → graceful pause', () => {
-    const e = nextExtend(1_000_000, 2); // next would be 35m total > 30m cap
+    const e = nextExtend(1_000_000, 2); // next would push past the 30-min cap
     expect(e.capped).toBe(true);
     expect(offsetForExtends(3)).toBeGreaterThan(ASK_CAP_MS);
   });
