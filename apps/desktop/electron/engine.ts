@@ -40,6 +40,7 @@ import {
   enginesRoot, managedBinary, systemBinary, bundledBinary, downloadEngine, engineState,
   type EngineState, type DownloadProgress,
 } from './engines.js';
+import { codexSpawnEnv } from './node-shim.js';
 import { resetFromRateLimitInfo, isUsageLimitMessage, parseUsageLimitReset, type RateLimitInfo } from './limit-reset.js';
 import { parseAsk, timeoutAnswer, ASK_BASE_MS } from './ask-question.js';
 import {
@@ -1131,9 +1132,15 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   // API-key auth: when there is no ChatGPT subscription login, pass the stored
   // OpenAI key to `codex exec` via OPENAI_API_KEY (the provider's env_key). When a
   // subscription login exists, leave the env alone so Codex uses that.
-  const env = (!codexLoggedIn() && ctx?.openaiKey)
-    ? { ...process.env, OPENAI_API_KEY: ctx.openaiKey }
-    : process.env;
+  //
+  // PATH fix-up: Codex sub-tools (its MCP shims, hook scripts, custom MCP servers)
+  // routinely shebang `#!/usr/bin/env node`. On a Finder-launched .app the inherited
+  // PATH is bare and lacks `node`, so they fail with exit 127. codexSpawnEnv()
+  // prepends a `node` shim (Electron-as-node via ELECTRON_RUN_AS_NODE=1, same trick
+  // codex-bridge.ts already uses) plus the user's real login-shell PATH — so npm,
+  // git, gh, asdf, fnm, pyenv binaries all keep resolving too. See node-shim.ts.
+  const env = codexSpawnEnv(enginesRoot(),
+    (!codexLoggedIn() && ctx?.openaiKey) ? { OPENAI_API_KEY: ctx.openaiKey } : undefined);
   const outFile = path.join(tmpdir(), `maestro-codex-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
   // Native MCP for codex: one stdio bridge forwards the Skill-Broker and
   // background-task tools back into Maestro. Codex's sandbox auto-cancels MCP tool
@@ -1618,7 +1625,9 @@ export class LocalEngine {
     try { this.codexLoginChild?.kill('SIGTERM'); } catch { /* gone */ }
     return new Promise((resolve, reject) => {
       let out = '';
-      const child = spawn(bin, ['login'], { stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
+      // Same PATH fix-up as `codex exec` — login may also shell out to node-based
+      // helpers (the device-flow page server, browser launch shims). See node-shim.ts.
+      const child = spawn(bin, ['login'], { stdio: ['ignore', 'pipe', 'pipe'], env: codexSpawnEnv(enginesRoot()) });
       this.codexLoginChild = child;
       const timer = setTimeout(() => {
         try { child.kill('SIGTERM'); } catch { /* gone */ }

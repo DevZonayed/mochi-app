@@ -90,9 +90,11 @@ const PAGE_CSS = `
   .tool-node { animation: nodePop 240ms cubic-bezier(.32,.72,0,1) both; transition: background 140ms ease; }
   .tool-node:hover { background: var(--fill-tertiary); }
 
-  /* "thinking" shimmer text before the first token */
+  /* "thinking" shimmer text before the first token —
+     low stop bumped from --ink-secondary (60% opacity) to ~78% so the dimmest
+     part of the sweep stays clearly readable on dark AND light backgrounds. */
   @keyframes thinkSweep { to { background-position: -200% 0; } }
-  .think-shimmer { background: linear-gradient(100deg, var(--ink-secondary) 32%, var(--ink) 50%, var(--ink-secondary) 68%);
+  .think-shimmer { background: linear-gradient(100deg, color-mix(in srgb, var(--ink) 78%, transparent) 32%, var(--ink) 50%, color-mix(in srgb, var(--ink) 78%, transparent) 68%);
     background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
     animation: thinkSweep 1.5s linear infinite; }
 
@@ -3431,7 +3433,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               {schedNote && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)', display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}><Icon name="check" size={12} /> {schedNote}</span>}
               <span style={{ flex: 1, minWidth: 6 }} />
               {streaming
-                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>
+                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap' }}>
                     <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn ? liveActivity(lastTurn, lastTurn.transcript ?? []) : 'Working…'}
                   </span>
                 : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{planMode ? 'Plan · ⏎' : goalMode ? 'Goal · ⏎' : queue.length ? `${queue.length} queued` : '⏎ to send'}</span>}

@@ -27,6 +27,7 @@ import { CronRunner } from './cron.js';
 import { runSmoke } from './smoke.js';
 import { Updater } from './updater.js';
 import { setEnginesRoot } from './engines.js';
+import { bootstrapNodePath } from './node-shim.js';
 
 const RENDERER_DIST = path.join(__dirname, '../dist');
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
@@ -323,6 +324,13 @@ app.whenReady().then(() => {
     const raw = process.env.MAESTRO_ENGINES_DIR;
     const enginesDir = raw ? (raw.startsWith('~/') || raw === '~' ? path.join(app.getPath('home'), raw.slice(1)) : path.resolve(raw)) : path.join(app.getPath('userData'), 'engines');
     setEnginesRoot(enginesDir);
+    // Fix `node` on PATH for engine sub-spawns (Codex MCP shims, Agent SDK's
+    // internal claude binary spawn, etc.). A Finder-launched .app inherits a
+    // bare PATH on macOS, so anything with `#!/usr/bin/env node` exits 127
+    // ("Codex exited 127: env: node: No such file or directory" — bug
+    // image_br9a4.png). bootstrapNodePath prepends a `node` shim (Electron via
+    // ELECTRON_RUN_AS_NODE=1) + the user's real login-shell PATH. See node-shim.ts.
+    bootstrapNodePath(enginesDir);
   }
 
   const engine = new LocalEngine(store, emit, providers);
