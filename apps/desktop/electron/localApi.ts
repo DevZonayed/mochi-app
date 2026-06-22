@@ -27,7 +27,8 @@ import { scanConversations, parseConversation, type ConvSource } from './convers
 import { existsSync, mkdirSync, cpSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
-import { app } from 'electron';
+import { app, shell } from 'electron';
+import { locateExtension } from './extension-locator.js';
 
 type Params = Record<string, unknown>;
 
@@ -202,6 +203,34 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const b = getExtensionBridge?.();
         if (!b) bad('extension channel unavailable', 503);
         return b!.setActiveFromApp(String(p.clientId ?? ''));
+      }
+      // Where does the bundled Chrome extension live on this machine? Powers the
+      // Settings → "Browser extension" panel: shows the path + the "Reveal folder
+      // (for Load Unpacked)" button when no profile is paired yet.
+      case 'extensionPath': {
+        // app.isPackaged + process.resourcesPath are both Electron-only — they're
+        // undefined under vitest. extension-locator handles both safely.
+        const loc = locateExtension({
+          resourcesPath: app?.isPackaged ? process.resourcesPath : undefined,
+          callerDir: __dirname,
+        });
+        return loc;
+      }
+      // Open the bundled extension folder in Finder/Explorer so the user can drag
+      // it into chrome://extensions → Load Unpacked. Returns the path that was
+      // revealed (or null if the extension wasn't shipped with this build).
+      case 'extensionRevealFolder': {
+        const loc = locateExtension({
+          resourcesPath: app?.isPackaged ? process.resourcesPath : undefined,
+          callerDir: __dirname,
+        });
+        if (!loc.path) bad('extension folder not shipped with this build', 404);
+        if (!loc.manifestPresent) bad(`extension manifest missing at ${loc.path}`, 500);
+        // openPath opens a folder in the OS file manager. (showItemInFolder would
+        // also work but on macOS it selects the folder in its parent — we want the
+        // folder itself opened so the user can grab it for Load Unpacked.)
+        try { void shell.openPath(loc.path!); } catch { /* user can still type the path */ }
+        return { path: loc.path, source: loc.source };
       }
       // Hand off a design to code: COPY the design's folder (design/index.html +
       // assets + .continuum memory) into a NEW coding project so the design lives

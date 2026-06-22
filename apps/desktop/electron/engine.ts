@@ -28,6 +28,7 @@ import { allocatePortBase, sessionPortEnv } from './session-ports.js';
 import { normalizeRunMode, canStartBackgroundRun } from './run-mode.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
+import { ensureBrowserSkill } from './browser-skill.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
 import { makeGitCtx, type GitCtx } from './git-ctx.js';
@@ -94,13 +95,29 @@ const ASK_DIRECTIVE =
 // live-previewable HTML artifact — the OpenDesign "agent-native design" model, but
 // on Maestro's own engines + image-gen. Prepended to every turn of a design project.
 const BROWSER_DIRECTIVE =
-  `\n\n---\n\n[Browser mode ON] The user turned on BROWSER for this message: drive their REAL connected Chrome ` +
-  `via the mcp__maestro__browser_navigate / browser_snapshot / browser_read / browser_links / browser_click / ` +
-  `browser_type tools — do NOT use WebSearch/WebFetch. First call mcp__maestro__browser_status to confirm a ` +
-  `profile is connected; if none, tell the user to open the Mochi extension and pair it (the app shows the token ` +
-  `under Settings → Browser extension). Then browser_navigate to the relevant site and read it with ` +
-  `browser_snapshot / browser_read before acting. Accomplish the task on the live page; only fall back to ` +
-  `WebSearch if no browser is connected.`;
+  `\n\n---\n\n[Browser mode ON] The user turned on BROWSER for this message — drive their REAL ` +
+  `connected Chrome (their logged-in profiles, cookies, sessions) via the mcp__maestro__browser_* tools. ` +
+  `Do NOT use WebSearch/WebFetch.\n\n` +
+  `**First call: \`mcp__maestro__browser_status\`.** If no profile is connected, tell the user to open the ` +
+  `Mochi Chrome extension and pair it (the app shows the token under Settings → Browser extension), then stop ` +
+  `— do not loop.\n\n` +
+  `**The reading ladder (cheap → expensive)** — climb in order, NEVER start with snapshot on a heavy SPA:\n` +
+  `  1. \`browser_read\` — visible text. Read like a human.\n` +
+  `  2. \`browser_links\` — navigation choices.\n` +
+  `  3. \`browser_find_by_role_name\` — locate a SPECIFIC button/input by accessibility role+name (the ` +
+  `selector rescue when CSS fishing fails on heavy DOM like Gemini/ChatGPT/Linear/Figma).\n` +
+  `  4. \`browser_snapshot\` — accessibility tree (24KB cap). Only when you need refs for many elements.\n` +
+  `  5. \`browser_evaluate\` — arbitrary JS in the page. The escape hatch when nothing else exposes what you need.\n\n` +
+  `**Power tools:** \`browser_screenshot\` (viewport / fullPage / elementRef → PNG dataUrl), ` +
+  `\`browser_grab_image\` (save an <img> the page generated via canvas → base64 PNG, no download button needed), ` +
+  `\`browser_download_url\` (Chrome download to user's Downloads folder), \`browser_console_messages\` + ` +
+  `\`browser_network_requests\` (debug what broke), \`browser_emulate_viewport\` (test mobile/iPad), ` +
+  `\`browser_upload_file\` (drive file inputs), \`browser_wait_for_selector\` (instead of fixed sleeps).\n\n` +
+  `**Connection-loss recovery:** browser_* tools auto-retry once when the extension drops briefly (it ` +
+  `reconnects with exponential backoff up to ~15s). If you still get "browser profile disconnected" or ` +
+  `"No browser connected" AFTER the retry, tell the user one line and stop. Do not loop.\n\n` +
+  `Read \`.claude/skills/browser/SKILL.md\` (auto-installed in this project) for the full tool reference + ` +
+  `recipes (image-grab, heavy-DOM rescue, debugging, mobile emulation).`;
 
 const WHATSAPP_DIRECTIVE =
   `\n\n---\n\n[WhatsApp connected] This Mac is linked to the user's WhatsApp. When the user asks anything ` +
@@ -664,9 +681,32 @@ async function runClaude(
                 return txt(r ? `Stopped background task ${a.id} (status ${r.status}).` : `No background task ${a.id}.`);
               })),
           ] : []),
-          ...(browserCtx ? [
+          ...(browserCtx ? (() => {
+            /* Retry wrapper for the extension RPC. The extension auto-reconnects with
+               exponential backoff up to 15s, so a brief drop (Wi-Fi blip, Chrome
+               restart, profile takeover) shouldn't fail the tool. We retry ONCE
+               after a 3.5s wait when the bridge reports "disconnected" / "not
+               connected"; longer outages surface to the agent so it can tell the
+               user. Non-connection errors (selector miss, bad URL, timeout) are
+               NEVER retried — they're real and need the agent's attention. */
+            const isDisconnect = (e: unknown) =>
+              /no browser connected|browser profile disconnected|not connected to the app/i.test(
+                e instanceof Error ? e.message : String(e),
+              );
+            const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+            const browserCall = async (type: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown> => {
+              try { return await browserCtx.call(type, params, timeoutMs); }
+              catch (e) {
+                if (!isDisconnect(e)) throw e;
+                await sleep(3500);
+                if (browserCtx.connected()) return await browserCtx.call(type, params, timeoutMs);
+                throw e;
+              }
+            };
+            const json = (v: unknown, max = 16000) => txt(JSON.stringify(v, null, 2).slice(0, max));
+            return [
             tool('browser_status',
-              'Check whether the user\'s real Chrome browser is connected (via the Mochi extension) and which profile is active. Use before the other browser_* tools if unsure a browser is available.',
+              'Check whether the user\'s real Chrome browser is connected (via the Mochi extension) and which profile is active. Use BEFORE other browser_* tools when in doubt, and AFTER a tool reports a disconnect to confirm.',
               {},
               wrap(async () => {
                 if (!browserCtx.connected()) return txt('No browser connected. Ask the user to open the Mochi Chrome extension and pair/activate a profile (the app shows the token under Settings → Browser extension).');
@@ -674,43 +714,265 @@ async function runClaude(
                 try { const t = await browserCtx.call('tab_url') as { url?: string }; if (t?.url) where = ` Current tab: ${t.url}`; } catch { /* no tab yet */ }
                 return txt(`Browser connected — active profile "${browserCtx.profile() ?? 'Chrome'}".${where}`);
               })),
+
+            // ── Navigation ──
             tool('browser_navigate',
-              'Open a URL in the USER\'S OWN real Chrome (their logged-in session) via the Mochi extension. Use this WHENEVER the user says "my browser", "go to my browser", "open …", "browse …", "check this site", or asks you to act on a real website (shop, search, log-in-walled page, fill a form). This is NOT WebFetch/WebSearch — it drives their actual visible browser with a live cursor. After navigating, call browser_snapshot or browser_read to see the page.',
+              'Open a URL in the USER\'S OWN real Chrome (their logged-in session) via the Mochi extension. Use WHENEVER the user says "my browser", "go to …", "open …", "browse …", or asks to act on a real website (shop, search, log-in-walled page, fill a form). NOT WebFetch/WebSearch — drives their actual visible browser with a live cursor. After navigating, call browser_read (cheapest) or browser_snapshot (for refs) to see the page.',
               { url: z.string().describe('The URL to open, including scheme, e.g. https://www.daraz.com.bd.') },
               wrap(async (a: { url: string }) => {
-                try { const r = await browserCtx.call('navigate', { url: a.url }, 45000) as { url?: string }; return txt(`Opened ${r?.url ?? a.url} in the user's browser. Use browser_snapshot or browser_read to see the page.`); }
+                try { const r = await browserCall('navigate', { url: a.url }, 45000) as { url?: string }; return txt(`Opened ${r?.url ?? a.url}. Use browser_read or browser_snapshot to see the page.`); }
                 catch (e) {
                   if (/no active session|session_start first/i.test(String((e as Error).message ?? e))) {
-                    await browserCtx.call('session_start', { url: a.url, title: 'Maestro Agent', color: 'blue' }, 45000);
-                    return txt(`Opened a new browser tab at ${a.url}. Use browser_snapshot or browser_read to see the page.`);
+                    await browserCall('session_start', { url: a.url, title: 'Maestro Agent', color: 'blue' }, 45000);
+                    return txt(`Opened a new browser tab at ${a.url}. Use browser_read or browser_snapshot to see the page.`);
                   }
                   throw e;
                 }
               })),
-            tool('browser_snapshot',
-              'Read the current page in the user\'s browser as an accessibility tree (roles, names, and CSS refs you can click). Use after browser_navigate to understand the page and find elements for browser_click.',
+            tool('browser_open_tab',
+              'Open an ADDITIONAL tab in the active browser session (the main tab stays). Use for multi-tab workflows: compare two product pages, open a sub-task, keep a reference open.',
+              { url: z.string().describe('URL to open.'), makePrimary: z.boolean().optional().describe('Make this the default tab for subsequent browser_* calls (default true).') },
+              wrap(async (a: { url: string; makePrimary?: boolean }) => json(await browserCall('open_tab', { url: a.url, makePrimary: a.makePrimary ?? true, active: true }, 45000)))),
+            tool('browser_list_tabs',
+              'List every tab in the active session (id, url, title, primary flag). Use before browser_close_tab or to switch focus.',
               {},
-              wrap(async () => txt(JSON.stringify(await browserCtx.call('snapshot'), null, 2).slice(0, 24000)))),
+              wrap(async () => json(await browserCall('list_tabs')))),
+            tool('browser_close_tab',
+              'Close a non-primary tab in the active session. Cannot close the primary tab — use browser_session_end for that.',
+              { tabId: z.number().describe('Tab id from browser_list_tabs.') },
+              wrap(async (a: { tabId: number }) => json(await browserCall('close_tab', { tabId: a.tabId })))),
+            tool('browser_tab_url',
+              'Get the current URL + title of the active tab (or a specific tab). Useful to confirm a navigation actually landed where you expected.',
+              { tabId: z.number().optional() },
+              wrap(async (a: { tabId?: number }) => json(await browserCall('tab_url', a.tabId != null ? { tabId: a.tabId } : {})))),
+            tool('browser_go_back',
+              'Press the browser Back button on the active tab.',
+              {},
+              wrap(async () => json(await browserCall('go_back')))),
+            tool('browser_go_forward',
+              'Press the browser Forward button on the active tab.',
+              {},
+              wrap(async () => json(await browserCall('go_forward')))),
+
+            // ── Read ──
             tool('browser_read',
-              'Extract the visible TEXT of the current page in the user\'s browser (optionally focused by a query). Use this to actually read content — search results, product listings, article text — after navigating.',
+              'Extract the visible TEXT of the current page (optionally focused by a query). **The CHEAPEST read tool — try this FIRST.** Use to actually read content: search results, product listings, article text, chat messages.',
               { query: z.string().optional().describe('Optional keyword/substring to focus the extraction.'), limit: z.number().optional().describe('Max blocks (default 80).') },
               wrap(async (a: { query?: string; limit?: number }) => {
-                const r = await browserCtx.call('text', { query: a.query, limit: a.limit ?? 80 }) as { text?: string };
+                const r = await browserCall('text', { query: a.query, limit: a.limit ?? 80 }) as { text?: string };
                 return txt((typeof r?.text === 'string' ? r.text : JSON.stringify(r)).slice(0, 16000));
               })),
             tool('browser_links',
-              'List links on the current page in the user\'s browser (text + href), optionally filtered. Use to find where to navigate next (a product page, a category, a result).',
+              'List links on the current page (text + href), optionally filtered. Use to find where to navigate next (a product page, a category, a result).',
               { query: z.string().optional().describe('Optional keyword to filter links.') },
-              wrap(async (a: { query?: string }) => txt(JSON.stringify(await browserCtx.call('links', { query: a.query, limit: 50 })).slice(0, 12000)))),
+              wrap(async (a: { query?: string }) => txt(JSON.stringify(await browserCall('links', { query: a.query, limit: 50 })).slice(0, 12000)))),
+            tool('browser_snapshot',
+              'Read the page as an accessibility tree (roles, names, CSS refs you can click). **24KB cap.** Heavier than browser_read — climb the reading ladder: read → links → find_by_role_name → snapshot. NEVER start with this on a heavy SPA (Gemini, Gmail, Figma) — you\'ll hit the cap and still be blind.',
+              {},
+              wrap(async () => json(await browserCall('snapshot'), 24000))),
+            tool('browser_find_by_role_name',
+              'Find ONE element by accessibility role + name (e.g. role:"button" name:"Submit"). **The selector rescue when CSS fishing fails on heavy SPA DOM (Gemini, ChatGPT, Linear, Figma).** Returns a stable CSS ref you can pass to browser_click / browser_type.',
+              { role: z.string().describe('ARIA role like "button", "textbox", "link", "tab", "menuitem".'), name: z.string().optional().describe('Accessible name (aria-label / text content). Case-insensitive substring by default.'), exact: z.boolean().optional().describe('Require exact-case full-match of name.'), tabId: z.number().optional() },
+              wrap(async (a: { role: string; name?: string; exact?: boolean; tabId?: number }) => json(await browserCall('find_by_role_name', { role: a.role, name: a.name, exact: !!a.exact, tabId: a.tabId })))),
+            tool('browser_match_count',
+              'Count how many elements match a CSS selector (with 5 sample previews). Diagnostic — call when a click "failed" to learn whether the selector hit 0, 1, or N matches.',
+              { ref: z.string().describe('CSS selector to count.'), tabId: z.number().optional() },
+              wrap(async (a: { ref: string; tabId?: number }) => json(await browserCall('match_count', { ref: a.ref, tabId: a.tabId })))),
+            tool('browser_screenshot',
+              'Capture a PNG screenshot of the active tab (viewport by default; full page or a single element supported). Returns a data: URL — pass it through to the user or extract bytes with browser_evaluate.',
+              { fullPage: z.boolean().optional().describe('Capture the WHOLE scrolled page, not just the viewport.'), elementRef: z.string().optional().describe('CSS selector — capture just that element\'s bounding box.'), format: z.enum(['png', 'jpeg']).optional() },
+              wrap(async (a: { fullPage?: boolean; elementRef?: string; format?: 'png' | 'jpeg' }) => {
+                const r = await browserCall('screenshot', { fullPage: !!a.fullPage, elementRef: a.elementRef, format: a.format ?? 'png' }, 45000) as { mode?: string; dataUrl?: string; width?: number; height?: number };
+                if (!r?.dataUrl) return json(r);
+                const len = r.dataUrl.length;
+                // Don't dump the whole base64 into the model's context — keep it lean.
+                return txt(`Screenshot captured (mode=${r.mode ?? 'viewport'}${r.width ? `, ${r.width}×${r.height}` : ''}, ${(len / 1024).toFixed(1)} KB dataUrl). dataUrl[0..80]: ${r.dataUrl.slice(0, 80)}…`);
+              })),
+            tool('browser_console_messages',
+              'Read captured browser console output (log/info/warn/error) for the active tab. The extension attaches CDP on session start and buffers up to 400 messages. Use to debug page errors.',
+              { level: z.enum(['log', 'info', 'warn', 'error', 'debug']).optional(), since: z.number().optional().describe('Unix-ms — only messages newer than this.'), limit: z.number().optional().describe('Max messages (default 100, cap 500).'), clear: z.boolean().optional().describe('Empty the buffer after reading.'), tabId: z.number().optional() },
+              wrap(async (a: { level?: string; since?: number; limit?: number; clear?: boolean; tabId?: number }) => json(await browserCall('console_messages', a)))),
+            tool('browser_network_requests',
+              'Read captured browser network traffic (HTTP requests + responses) for the active tab. Filter by URL substring, method, status range, or failedOnly. Use to debug API calls, find a download URL, check what loaded.',
+              { urlContains: z.string().optional(), method: z.string().optional(), statusGte: z.number().optional(), statusLt: z.number().optional(), failedOnly: z.boolean().optional(), includeRequestHeaders: z.boolean().optional(), includeResponseHeaders: z.boolean().optional(), limit: z.number().optional(), tabId: z.number().optional() },
+              wrap(async (a: Record<string, unknown>) => json(await browserCall('network_requests', a)))),
+
+            // ── Interact ──
             tool('browser_click',
-              'Click an element in the user\'s browser by CSS selector (get selectors from browser_snapshot). Use to press buttons, open a result, add to cart, etc. The page may navigate — follow up with browser_snapshot/browser_read.',
-              { ref: z.string().describe('A CSS selector for the element, e.g. "button.add-to-cart" or "a[href*=\'product\']".') },
-              wrap(async (a: { ref: string }) => { const r = await browserCtx.call('click', { ref: a.ref }, 45000) as { url?: string }; return txt(`Clicked ${a.ref}.${r?.url ? ` Now at ${r.url}.` : ''} Use browser_snapshot/browser_read to see the result.`); })),
+              'Click an element by CSS selector. Use to press buttons, open a result, add to cart. The page may navigate — follow up with browser_read / browser_snapshot.',
+              { ref: z.string().describe('CSS selector, e.g. "button.add-to-cart" or "a[href*=\'product\']".') },
+              wrap(async (a: { ref: string }) => { const r = await browserCall('click', { ref: a.ref }, 45000) as { url?: string }; return txt(`Clicked ${a.ref}.${r?.url ? ` Now at ${r.url}.` : ''}`); })),
+            tool('browser_click_at',
+              'Click at viewport coordinates (CSS pixels). Use AFTER browser_resolve_box or for overlays/canvases without a stable selector. Supports right/middle click and double/triple click.',
+              { x: z.number(), y: z.number(), button: z.enum(['left', 'right', 'middle']).optional(), clickCount: z.number().optional().describe('1 single, 2 double, 3 triple.'), tabId: z.number().optional() },
+              wrap(async (a: { x: number; y: number; button?: string; clickCount?: number; tabId?: number }) => json(await browserCall('click_at', a, 30000)))),
             tool('browser_type',
-              'Type text into an input/textarea in the user\'s browser (e.g. a search box). Optionally submit (press Enter) — handy for running a search.',
-              { ref: z.string().describe('CSS selector for the input.'), text: z.string().describe('The text to type.'), submit: z.boolean().optional().describe('Press Enter after typing (e.g. to run a search).') },
-              wrap(async (a: { ref: string; text: string; submit?: boolean }) => { await browserCtx.call('type', { ref: a.ref, text: a.text, submit: !!a.submit }); return txt(`Typed into ${a.ref}${a.submit ? ' and submitted' : ''}. Use browser_snapshot/browser_read to see the result.`); })),
-          ] : []),
+              'Type text into an input/textarea (e.g. a search box). Optionally submit (press Enter).',
+              { ref: z.string().describe('CSS selector for the input.'), text: z.string().describe('The text to type.'), submit: z.boolean().optional().describe('Press Enter after typing (e.g. to run a search).'), clear: z.boolean().optional().describe('Clear existing value first (default true).') },
+              wrap(async (a: { ref: string; text: string; submit?: boolean; clear?: boolean }) => { await browserCall('type', { ref: a.ref, text: a.text, submit: !!a.submit, clear: a.clear !== false }); return txt(`Typed into ${a.ref}${a.submit ? ' and submitted' : ''}.`); })),
+            tool('browser_press_key',
+              'Press a single key on the active tab. Use for Enter, Tab, Escape, ArrowDown, etc. when no text typing is needed.',
+              { key: z.string().describe('Key name, e.g. "Enter", "Tab", "Escape", "ArrowDown".') },
+              wrap(async (a: { key: string }) => json(await browserCall('press_key', { key: a.key })))),
+            tool('browser_scroll',
+              'Scroll the page. Pass deltaX/deltaY to scrollBy (relative), or x/y to scrollTo (absolute).',
+              { deltaX: z.number().optional(), deltaY: z.number().optional(), x: z.number().optional(), y: z.number().optional(), tabId: z.number().optional() },
+              wrap(async (a: { deltaX?: number; deltaY?: number; x?: number; y?: number; tabId?: number }) => json(await browserCall('scroll', a)))),
+            tool('browser_upload_file',
+              'Drive a file input (<input type="file">) in the page. Use when the user asks you to upload a file, attach an image, share a document. The file must already exist on disk; pass its absolute path.',
+              { filePaths: z.array(z.string()).describe('Absolute paths of files to upload.'), target: z.string().describe('CSS selector for the file input.'), strategies: z.array(z.enum(['direct', 'native-file-chooser', 'drag-drop'])).optional().describe('Strategy chain — defaults to ["direct"].') },
+              wrap(async (a: { filePaths: string[]; target: string; strategies?: string[] }) => json(await browserCall('upload_file', a, 60000)))),
+
+            // ── Wait ──
+            tool('browser_wait',
+              'Sleep for N milliseconds (0..60000). Use SPARINGLY — prefer browser_wait_for_selector. Suited for "let an animation finish" pauses, not for "wait until content appears".',
+              { ms: z.number() },
+              wrap(async (a: { ms: number }) => json(await browserCall('wait', { ms: a.ms })))),
+            tool('browser_wait_for_selector',
+              'Poll until a CSS selector exists (and optionally is visible). The right way to wait for content to appear (search results, generated image, modal). Replaces fixed sleeps.',
+              { ref: z.string().describe('CSS selector to wait for.'), timeoutMs: z.number().optional().describe('Max wait (default 30000, cap 180000).'), visible: z.boolean().optional().describe('Also require visible bounding box (default true).') },
+              wrap(async (a: { ref: string; timeoutMs?: number; visible?: boolean }) => {
+                const timeoutMs = Math.max(100, Math.min(180000, a.timeoutMs ?? 30000));
+                const visible = a.visible !== false;
+                const expr = `new Promise((resolve) => { const t0 = Date.now(); const tick = () => { const el = document.querySelector(${JSON.stringify(a.ref)}); if (el) { if (!${visible}) return resolve({ found: true, waitedMs: Date.now() - t0 }); const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return resolve({ found: true, waitedMs: Date.now() - t0 }); } if (Date.now() - t0 >= ${timeoutMs}) return resolve({ found: false, waitedMs: Date.now() - t0 }); setTimeout(tick, 150); }; tick(); })`;
+                const r = await browserCall('evaluate', { expression: expr, awaitPromise: true, timeoutMs: timeoutMs + 5000 }, timeoutMs + 10000) as { ok?: boolean; value?: { found?: boolean; waitedMs?: number }; error?: string };
+                if (!r?.ok) throw new Error(r?.error || 'wait_for_selector failed');
+                if (!r.value?.found) throw new Error(`selector "${a.ref}" did not appear in ${timeoutMs}ms`);
+                return txt(`Found "${a.ref}" after ${r.value.waitedMs}ms.`);
+              })),
+
+            // ── Power tools ──
+            tool('browser_evaluate',
+              'Run arbitrary JavaScript in the active tab (CDP Runtime.evaluate). Returns the serializable result as {ok, value}. The escape hatch when nothing else exposes what you need — extract data, trigger a hidden action, read computed styles, drive an unusual UI.',
+              { expression: z.string().describe('JavaScript source. Top-level await NOT supported — return a Promise and use awaitPromise.'), awaitPromise: z.boolean().optional().describe('Await the resolved Promise (default true).'), timeoutMs: z.number().optional().describe('Eval timeout (default 5000, cap 60000).') },
+              wrap(async (a: { expression: string; awaitPromise?: boolean; timeoutMs?: number }) => json(await browserCall('evaluate', { expression: a.expression, awaitPromise: a.awaitPromise !== false, returnByValue: true, timeoutMs: a.timeoutMs ?? 5000 }, (a.timeoutMs ?? 5000) + 10000)))),
+            tool('browser_grab_image',
+              'Find an <img> element on the page, draw it onto a canvas, and return its bytes as a base64 PNG dataUrl. The right way to "save the image the website just generated" (Gemini, ChatGPT, Midjourney, etc.) when there is no download button. Returns {dataUrl, width, height, src}. Tip: write the bytes to disk with Bash + base64 -D.',
+              { ref: z.string().optional().describe('CSS selector for the <img>. If omitted, picks the largest visible <img>.'), minSize: z.number().optional().describe('Minimum side length (px) to consider — default 200, to skip icons.') },
+              wrap(async (a: { ref?: string; minSize?: number }) => {
+                const minSize = a.minSize ?? 200;
+                const sel = a.ref ? JSON.stringify(a.ref) : 'null';
+                const expr = `(async () => {
+                  const refSel = ${sel};
+                  let img;
+                  if (refSel) img = document.querySelector(refSel);
+                  else {
+                    const imgs = Array.from(document.querySelectorAll('img'))
+                      .filter(i => i.complete && i.naturalWidth >= ${minSize} && i.naturalHeight >= ${minSize});
+                    img = imgs.sort((a,b) => (b.naturalWidth*b.naturalHeight) - (a.naturalWidth*a.naturalHeight))[0];
+                  }
+                  if (!img) return { found: false };
+                  // Draw to canvas. If the src is cross-origin without CORS, this throws —
+                  // fall back to fetch() + blob().
+                  try {
+                    const c = document.createElement('canvas');
+                    c.width = img.naturalWidth; c.height = img.naturalHeight;
+                    c.getContext('2d').drawImage(img, 0, 0);
+                    return { found: true, dataUrl: c.toDataURL('image/png'), width: img.naturalWidth, height: img.naturalHeight, src: img.src.slice(0, 200) };
+                  } catch (canvasErr) {
+                    try {
+                      const res = await fetch(img.src);
+                      const blob = await res.blob();
+                      const dataUrl = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
+                      return { found: true, dataUrl, width: img.naturalWidth, height: img.naturalHeight, src: img.src.slice(0, 200), via: 'fetch' };
+                    } catch (fetchErr) {
+                      return { found: false, error: 'tainted canvas + fetch failed: ' + String(fetchErr) };
+                    }
+                  }
+                })()`;
+                const r = await browserCall('evaluate', { expression: expr, awaitPromise: true, timeoutMs: 20000 }, 30000) as { ok?: boolean; value?: { found?: boolean; dataUrl?: string; width?: number; height?: number; src?: string; via?: string; error?: string }; error?: string };
+                if (!r?.ok) throw new Error(r?.error || 'grab_image failed');
+                const v = r.value;
+                if (!v?.found) throw new Error(v?.error || `no <img> matched (ref=${a.ref ?? 'auto'}, minSize=${minSize})`);
+                if (!v.dataUrl) throw new Error('image found but no dataUrl');
+                return txt(`Grabbed image ${v.width}×${v.height} from ${v.src} (${(v.dataUrl.length / 1024).toFixed(1)} KB${v.via ? `, via ${v.via}` : ''}).\ndataUrl: ${v.dataUrl}`);
+              })),
+            tool('browser_download_url',
+              'Tell Chrome to download a URL (chrome.downloads API). Use AFTER you have the file URL (e.g. found via browser_evaluate or browser_network_requests). Saves to the user\'s Downloads folder.',
+              { url: z.string().describe('Absolute URL of the file to download.'), filename: z.string().optional().describe('Suggested filename. May include a subpath relative to Downloads/.'), conflictAction: z.enum(['uniquify', 'overwrite', 'prompt']).optional() },
+              wrap(async (a: { url: string; filename?: string; conflictAction?: string }) => json(await browserCall('download_url', a, 60000)))),
+
+            // ── Layout ──
+            tool('browser_window_resize',
+              'Move/resize the Chrome window (or change its state to minimized/maximized/fullscreen). Useful for layout tests and recording sessions.',
+              { width: z.number().optional(), height: z.number().optional(), left: z.number().optional(), top: z.number().optional(), state: z.enum(['normal', 'minimized', 'maximized', 'fullscreen']).optional() },
+              wrap(async (a: Record<string, unknown>) => json(await browserCall('window_resize', a)))),
+            tool('browser_emulate_viewport',
+              'Apply device emulation (viewport size + DPR + mobile flag + UA). Use to TEST how a site renders on mobile/tablet. Presets: iphone-15-pro, iphone-se, pixel-7, ipad, desktop-hd, desktop-fhd, desktop-2k.',
+              { preset: z.string().optional(), width: z.number().optional(), height: z.number().optional(), mobile: z.boolean().optional(), userAgent: z.string().optional(), deviceScaleFactor: z.number().optional() },
+              wrap(async (a: Record<string, unknown>) => json(await browserCall('emulate_viewport', a)))),
+            tool('browser_clear_emulation',
+              'Drop device emulation — back to a normal desktop viewport. Call after browser_emulate_viewport when you\'re done testing.',
+              {},
+              wrap(async () => json(await browserCall('clear_emulation')))),
+
+            // ── Cookies + storage + master CDP ──
+            tool('browser_cookies_get',
+              'Read cookies. Pass `url` to scope to a site (preferred), or `domain` to read across all paths. With `name`, returns just that cookie. Useful for "is the user still logged in?", debugging auth, scripting an OTP flow.',
+              { url: z.string().optional().describe('Origin to query, e.g. "https://example.com". Required when `name` is given.'), name: z.string().optional(), domain: z.string().optional() },
+              wrap(async (a: { url?: string; name?: string; domain?: string }) => json(await browserCall('cookies_get', a)))),
+            tool('browser_cookies_set',
+              'Set a cookie on a URL. Use to script logged-in fixtures, drop a session cookie, override a flag. The browser enforces normal cookie rules (secure, sameSite, domain scope).',
+              { url: z.string().describe('Origin the cookie belongs to.'), name: z.string(), value: z.string(), domain: z.string().optional(), path: z.string().optional(), secure: z.boolean().optional(), httpOnly: z.boolean().optional(), sameSite: z.enum(['no_restriction', 'lax', 'strict', 'unspecified']).optional(), expirationDate: z.number().optional().describe('Unix seconds (NOT ms). Omit for a session cookie.') },
+              wrap(async (a: Record<string, unknown>) => json(await browserCall('cookies_set', a)))),
+            tool('browser_cookies_clear',
+              'Remove cookies. Without `name`: clears every cookie matching `url` (or `domain`). Use to fully sign a user out before a test, or reset a paywall.',
+              { url: z.string().optional(), name: z.string().optional(), domain: z.string().optional() },
+              wrap(async (a: { url?: string; name?: string; domain?: string }) => json(await browserCall('cookies_clear', a)))),
+            tool('browser_hover',
+              'Move the cursor over an element (fires real mouseenter/mouseover events via CDP). The right way to open a hover-menu, reveal a tooltip, or trigger CSS :hover. Synthetic events from browser_evaluate often fail for these.',
+              { ref: z.string().describe('CSS selector for the element to hover.'), tabId: z.number().optional() },
+              wrap(async (a: { ref: string; tabId?: number }) => json(await browserCall('hover', a)))),
+            tool('browser_drag',
+              'Drag from one element to another (Trello card, Figma object, slider handle, file-drop zone). Implemented as a real CDP mouse press + move-along-path + release sequence so HTML5 drag listeners fire correctly.',
+              { fromRef: z.string().describe('CSS selector for the element to drag.'), toRef: z.string().describe('CSS selector for the drop target.'), steps: z.number().optional().describe('Intermediate move events (2..40, default 12) — more = smoother path.'), tabId: z.number().optional() },
+              wrap(async (a: { fromRef: string; toRef: string; steps?: number; tabId?: number }) => json(await browserCall('drag', a, 30000)))),
+            tool('browser_cdp',
+              '**The master key.** Run ANY Chrome DevTools Protocol method on the active tab — Page.printToPDF, Emulation.setGeolocationOverride, Network.setRequestInterception, Accessibility.getFullAXTree, Network.setBlockedURLs, Emulation.setCPUThrottlingRate, Storage.clearDataForOrigin, etc. Reach for this when nothing else exposes what you need. Method names use the standard "Domain.method" form. See https://chromedevtools.github.io/devtools-protocol/',
+              { method: z.string().describe('CDP method, e.g. "Page.printToPDF", "Emulation.setGeolocationOverride", "Network.getCookies".'), params: z.record(z.unknown()).optional().describe('Method-specific params object.'), tabId: z.number().optional() },
+              wrap(async (a: { method: string; params?: Record<string, unknown>; tabId?: number }) => {
+                const r = await browserCall('cdp', { method: a.method, params: a.params ?? {}, tabId: a.tabId }, 60000) as { result?: { data?: string } };
+                // Trim base64 blobs (PDF, screenshot via CDP) so the agent's context doesn't fill up.
+                if (typeof r?.result?.data === 'string' && r.result.data.length > 1024) {
+                  return txt(`CDP ${a.method} → result.data is ${(r.result.data.length / 1024).toFixed(1)} KB base64. dataLen=${r.result.data.length}, dataHead=${r.result.data.slice(0, 80)}…\nOther keys: ${Object.keys(r.result).filter(k => k !== 'data').join(', ') || '(none)'}`);
+                }
+                return json(r, 16000);
+              })),
+            tool('browser_pdf',
+              'Save the active tab as a PDF (Page.printToPDF). Returns the file path written under the user\'s Downloads folder. Configure paper size, margins, headers/footers via the standard CDP params.',
+              { filename: z.string().optional().describe('Saved name (default tab title + ".pdf"). Will be uniquified.'), landscape: z.boolean().optional(), printBackground: z.boolean().optional(), paperWidth: z.number().optional().describe('Inches.'), paperHeight: z.number().optional().describe('Inches.'), scale: z.number().optional().describe('0.1..2'), tabId: z.number().optional() },
+              wrap(async (a: { filename?: string; landscape?: boolean; printBackground?: boolean; paperWidth?: number; paperHeight?: number; scale?: number; tabId?: number }) => {
+                const cdpRes = await browserCall('cdp', {
+                  method: 'Page.printToPDF',
+                  params: {
+                    landscape: !!a.landscape,
+                    printBackground: a.printBackground !== false,
+                    paperWidth: a.paperWidth ?? 8.5,
+                    paperHeight: a.paperHeight ?? 11,
+                    scale: a.scale ?? 1,
+                    transferMode: 'ReturnAsBase64',
+                  },
+                  tabId: a.tabId,
+                }, 60000) as { result?: { data?: string } };
+                const data = cdpRes?.result?.data;
+                if (!data) throw new Error('Page.printToPDF returned no data');
+                // Hand the bytes off to chrome.downloads via a data: URL — keeps the
+                // download in the user's normal Downloads folder + history.
+                const filename = a.filename ?? `page-${Date.now()}.pdf`;
+                const dl = await browserCall('download_url', { url: `data:application/pdf;base64,${data}`, filename, conflictAction: 'uniquify' }, 60000) as { filename?: string; id?: number };
+                return txt(`PDF saved to ${dl.filename ?? `~/Downloads/${filename}`} (download id ${dl.id ?? '?'}, ${(data.length * 0.75 / 1024).toFixed(1)} KB).`);
+              })),
+
+            // ── Lifecycle (almost always implicit via browser_navigate) ──
+            tool('browser_session_start',
+              'Explicitly start a browser session (open a tab in a Mochi-managed tab group). Almost never needed — browser_navigate creates one on demand.',
+              { url: z.string().optional(), title: z.string().optional(), color: z.string().optional(), newWindow: z.boolean().optional() },
+              wrap(async (a: Record<string, unknown>) => json(await browserCall('session_start', a, 45000)))),
+            tool('browser_session_end',
+              'Close the active browser session. Pass closeTabs:true to also close the tabs (default leaves them open, just removes the group).',
+              { closeTabs: z.boolean().optional() },
+              wrap(async (a: { closeTabs?: boolean }) => json(await browserCall('session_end', { closeTabs: !!a.closeTabs })))),
+          ];})() : []),
           ...(scheduleCtx ? [
             tool('schedule_list',
               'List recurring/scheduled tasks. Use to see what is already scheduled before creating or editing. Optionally filter by project.',
@@ -881,7 +1143,21 @@ async function runClaude(
     ...(imageGen ? ['generate_image'] : []),
     ...(skillsCtx ? ['search_skills', 'get_skill', 'download_skill', 'add_skill_to_project', 'list_project_skills', 'remove_project_skill'] : []),
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
-    ...(browserCtx ? ['browser_status', 'browser_navigate', 'browser_snapshot', 'browser_read', 'browser_links', 'browser_click', 'browser_type'] : []),
+    ...(browserCtx ? [
+      'browser_status', 'browser_navigate', 'browser_open_tab', 'browser_list_tabs', 'browser_close_tab',
+      'browser_tab_url', 'browser_go_back', 'browser_go_forward',
+      'browser_read', 'browser_links', 'browser_snapshot',
+      'browser_find_by_role_name', 'browser_match_count',
+      'browser_screenshot', 'browser_console_messages', 'browser_network_requests',
+      'browser_click', 'browser_click_at', 'browser_type', 'browser_press_key', 'browser_scroll', 'browser_upload_file',
+      'browser_hover', 'browser_drag',
+      'browser_wait', 'browser_wait_for_selector',
+      'browser_evaluate', 'browser_grab_image', 'browser_download_url',
+      'browser_cookies_get', 'browser_cookies_set', 'browser_cookies_clear',
+      'browser_cdp', 'browser_pdf',
+      'browser_window_resize', 'browser_emulate_viewport', 'browser_clear_emulation',
+      'browser_session_start', 'browser_session_end',
+    ] : []),
     ...(scheduleCtx ? ['schedule_list', 'schedule_create', 'schedule_update', 'schedule_delete', 'schedule_toggle', 'schedule_run_now', 'projects_list', 'sessions_list'] : []),
     ...(gitCtx ? ['git_status', 'git_push', 'pr_create', 'pr_merge', 'pr_resolve_conflicts', 'branch_rename'] : []),
     ...(commsCtx ? ['wa_list_chats', 'wa_get_messages', 'wa_send_message', 'wa_mark_read'] : []),
@@ -2311,6 +2587,13 @@ export class LocalEngine {
         profile: () => bridge.activeProfile(),
         call: (type, params, timeoutMs) => bridge.request(type, params ?? {}, timeoutMs),
       } : undefined;
+      /* Auto-install the bundled `browser` SKILL.md so the agent reads the full
+         tool reference + recipes BEFORE its first browser_* call. Idempotent — it
+         won't clobber an operator-edited copy. Gated on browser mode being ON for
+         this turn AND a bridge existing (browserCtx truthy implies both). */
+      if (opts.browser && browserCtx) {
+        try { ensureBrowserSkill(cwd); } catch { /* best-effort; missing doc never fails a run */ }
+      }
       // Schedule capability: let the agent inspect + manage recurring/scheduled
       // tasks and discover projects/sessions to target. Off in plan mode.
       const scheduleCtx: ScheduleCtx | undefined = (this.cron && !opts.plan) ? makeScheduleCtx(this.store, this.cron) : undefined;
