@@ -970,6 +970,17 @@ async function runClaude(
                 if (!r?.ok) throw new Error(r?.error || 'storage_set failed');
                 return json(r.value);
               })),
+            tool('browser_storage_clear',
+              'Empty an entire storage area for the active tab\'s origin (everything in localStorage or sessionStorage). Symmetric with browser_cookies_clear — use to fully reset SPA state before re-testing a flow.',
+              { area: z.enum(['local', 'session']) },
+              wrap(async (a: { area: 'local' | 'session' }) => {
+                const store = a.area === 'session' ? 'sessionStorage' : 'localStorage';
+                // Capture the count before clearing so the agent sees what it actually wiped.
+                const expr = `(() => { try { const n = ${store}.length; ${store}.clear(); return { area: ${JSON.stringify(a.area)}, cleared: n }; } catch (e) { return { error: String(e) }; } })()`;
+                const r = await browserCall('evaluate', { expression: expr, awaitPromise: false, timeoutMs: 5000 }) as { ok?: boolean; value?: unknown; error?: string };
+                if (!r?.ok) throw new Error(r?.error || 'storage_clear failed');
+                return json(r.value);
+              })),
             tool('browser_save_image',
               'Save a base64 image (data: URL OR raw base64) to disk under the project. Pair with browser_grab_image / browser_screenshot to one-shot extract → save without falling back to Bash + base64 -D.',
               { dataUrl: z.string().describe('Either a "data:image/png;base64,...." URL or a raw base64 string.'), filename: z.string().describe('Output filename (path is relative to the project root unless absolute). Subdirectories are created.') },
@@ -1207,7 +1218,7 @@ async function runClaude(
       'browser_evaluate', 'browser_grab_image', 'browser_download_url',
       'browser_cookies_get', 'browser_cookies_set', 'browser_cookies_clear',
       'browser_cdp', 'browser_pdf', 'browser_save_image',
-      'browser_resolve_box', 'browser_assert', 'browser_storage_get', 'browser_storage_set',
+      'browser_resolve_box', 'browser_assert', 'browser_storage_get', 'browser_storage_set', 'browser_storage_clear',
       'browser_window_resize', 'browser_emulate_viewport', 'browser_clear_emulation',
       'browser_session_start', 'browser_session_end',
     ] : []),
