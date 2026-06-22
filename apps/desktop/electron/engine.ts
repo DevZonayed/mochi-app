@@ -20,6 +20,7 @@ import type { PublishingEngine } from './publishing.js';
 import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
 import { toolLabel, relPath } from './tool-label.js';
+import { thinkingConfigFor } from './thinking-config.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { branchSlug, isGitRepo } from './git.js';
 import { pickCityCodename } from './codenames.js';
@@ -58,6 +59,7 @@ import { shell } from 'electron';
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
 // coding agent needs real headroom — 4 turns dies mid-`ls`.
 const EFFORT_TURNS: Record<string, number> = { fast: 8, balanced: 24, deep: 48, max: 96 };
+
 // Goal mode: pursue the goal autonomously over a long horizon — far more turns.
 const GOAL_MAX_TURNS = 240;
 // When a normal (non-goal) run exhausts its per-run turn budget MID-TASK, we resume
@@ -934,6 +936,11 @@ async function runClaude(
       // non-bypass mode. In plan mode imageServer is null so the tool is absent.
       ...(Object.keys(mergedMcpServers).length ? { mcpServers: mergedMcpServers, allowedTools: mergedAllowed } : {}),
       ...(modelOverride ? { model: modelOverride } : {}),
+      // Force extended thinking ON for all models, not just Opus 4.6+ adaptive.
+      // Without this Sonnet/Haiku stay silent and the transcript's purple
+      // "Thinking" block never appears, even though the capture path (#42) is
+      // wired end-to-end. See `thinkingConfigFor` above.
+      thinking: thinkingConfigFor(modelOverride, effort),
       ...(resume ? { resume } : {}),
       ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
       ...(apiKey ? { env: { ...process.env, ANTHROPIC_API_KEY: apiKey } as NodeJS.ProcessEnv } : {}),
