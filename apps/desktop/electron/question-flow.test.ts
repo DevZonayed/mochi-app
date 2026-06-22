@@ -57,11 +57,14 @@ describe('question flow — answer/extend via real dispatch', () => {
 
     const e1 = await dispatch('extendQuestion', { sessionId: session.id }) as { extends: number; fireAt: number };
     expect(e1.extends).toBe(1);
-    expect(e1.fireAt - armedAt).toBe(10 * 60_000);   // base 5 + 5
+    // Base shifted 5min → 1min in the 2026 autopilot redesign; +5min step
+    // unchanged. So 1st extend = base(1) + 5 = 6 min from armedAt.
+    expect(e1.fireAt - armedAt).toBe(6 * 60_000);
 
     const e2 = await dispatch('extendQuestion', { sessionId: session.id }) as { extends: number; fireAt: number };
     expect(e2.extends).toBe(2);
-    expect(e2.fireAt - armedAt).toBe(20 * 60_000);   // + 10
+    // 2nd extend = base(1) + 5 + 10 = 16 min
+    expect(e2.fireAt - armedAt).toBe(16 * 60_000);
 
     const e3 = await dispatch('extendQuestion', { sessionId: session.id }) as { paused?: boolean };
     expect(e3.paused).toBe(true);                    // + 15 would be 35m > 30m cap → graceful pause

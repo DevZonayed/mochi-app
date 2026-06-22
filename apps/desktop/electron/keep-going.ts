@@ -31,8 +31,11 @@
 export const KEEP_GOING_PREFIX = '[Auto-continue]:';
 
 /** Default wait before auto-continuing, matching the AskUserQuestion follow-up
-    cadence so the operator has a single mental model for "the timer". */
-export const KEEP_GOING_BASE_MS = 5 * 60_000; // 5 minutes
+    cadence so the operator has a single mental model for "the timer".
+    Tightened from 5 → 1 minute alongside the autopilot opt-in: now that the
+    feature only runs when the user explicitly enabled it for THIS chat, a
+    long wait window is wasted — the operator wanted snappy continuation. */
+export const KEEP_GOING_BASE_MS = 60_000; // 1 minute
 /** Safety cap on consecutive auto-continues per session, so a stuck agent
     can't burn the user's tokens forever. Past this we post a graceful pause
     note and wait for a real reply. Generous because the per-run turn budget

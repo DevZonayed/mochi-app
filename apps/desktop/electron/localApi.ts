@@ -366,6 +366,20 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('session', s);
         return s;
       }
+      // Per-chat autopilot + reviewer toggles. Independent on/off booleans
+      // wired to the composer's two new toggle buttons. Both default OFF —
+      // operator opts in explicitly per chat (was always-on for legacy chats
+      // which produced too-eager auto-continues and silent reviewer skips).
+      case 'setSessionAutopilot': {
+        const s = store.updateSession(String(p.id ?? ''), { autoPilot: p.enabled === true });
+        emit('session', s);
+        return s;
+      }
+      case 'setSessionReviewer': {
+        const s = store.updateSession(String(p.id ?? ''), { reviewerEnabled: p.enabled === true });
+        emit('session', s);
+        return s;
+      }
       // Worktree archive (Conductor PR lifecycle): prune this session's git worktree.
       case 'archiveSessionWorktree': {
         const s = store.getSession(String(p.sessionId ?? p.id ?? ''));
@@ -617,11 +631,20 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // the cron, NOT sendChat, so this only fires on genuine user messages.
         try {
           store.resetKeepGoingCounter(session.id);
-          const disabled = store.cancelKeepGoingForSession(session.id);
+          // CANCEL every pending autopilot followup for this session — fixes
+          // the "fires again unnecessarily" bug (image_su2cf.png): a
+          // [Auto-continue]: countdown that was armed BEFORE the user typed
+          // must not fire AFTER the user replied. Resetting the counter alone
+          // wasn't enough; the schedule row stayed live and fired ~5 min later.
+          // Now we disable BOTH 'keep-going' and 'auto-answer' rows so the
+          // user's real message is the authoritative signal. (Broader than the
+          // earlier cancelKeepGoingForSession — covers the AskUserQuestion
+          // auto-answer too, since both share the same followup lifecycle.)
+          const cancelled = store.cancelPendingFollowups(session.id);
           // Emit the now-disabled rows so any live schedule-queue UI prunes
           // them immediately (same shape the cron uses when it fires + disables).
-          for (const id of disabled) {
-            const sch = store.listSchedules().find(x => x.id === id);
+          for (const id of cancelled) {
+            const sch = store.listSchedules().find((x) => x.id === id);
             if (sch) emit('schedule', sch);
           }
         } catch { /* best-effort */ }

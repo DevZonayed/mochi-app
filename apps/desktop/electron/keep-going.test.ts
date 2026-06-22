@@ -142,8 +142,10 @@ describe('organizedContinuePrompt', () => {
 });
 
 describe('keep-going constants', () => {
-  it('defaults match the design (5-min base + 20-cap)', () => {
-    expect(KEEP_GOING_BASE_MS).toBe(5 * 60_000);
+  it('defaults match the design (1-min base + 20-cap)', () => {
+    // Tightened from 5min → 1min when autopilot became opt-in (the user
+    // explicitly enables it per-chat now, so a long wait window is wasted).
+    expect(KEEP_GOING_BASE_MS).toBe(60_000);
     expect(KEEP_GOING_MAX_PER_SESSION).toBe(20);
     expect(KEEP_GOING_CAP_NOTE).toMatch(/Auto-continue paused after 20/);
   });

@@ -2674,6 +2674,34 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     }
   }, []);
   const [activeId, setActiveId] = React.useState<string | null>(sessionId);
+  // Active ChatSession (autopilot / reviewer-enabled toggles read off this).
+  // useSession live-syncs via the 'session' event emitter, so a setSessionAutopilot
+  // call from another window updates the button state here too.
+  const activeSession = useSession(activeId, projectId);
+  const autoPilotOn = activeSession?.autoPilot === true;
+  const reviewerToggleOn = activeSession?.reviewerEnabled === true;
+  // Local optimistic state so the button flips instantly when clicked, even
+  // before the api.setSession* round-trip lands. Reconciles with the session
+  // hook on the next emit.
+  const [autoPilotLocal, setAutoPilotLocal] = React.useState<boolean | null>(null);
+  const [reviewerLocal, setReviewerLocal] = React.useState<boolean | null>(null);
+  React.useEffect(() => { setAutoPilotLocal(null); setReviewerLocal(null); }, [activeId]);
+  const autoPilotEffective = autoPilotLocal ?? autoPilotOn;
+  const reviewerEffective = reviewerLocal ?? reviewerToggleOn;
+  const toggleAutoPilot = React.useCallback(async () => {
+    if (!activeId) return;
+    const next = !autoPilotEffective;
+    setAutoPilotLocal(next);
+    try { await api.setSessionAutopilot(activeId, next); }
+    catch { setAutoPilotLocal(!next); /* revert on failure */ }
+  }, [activeId, autoPilotEffective]);
+  const toggleReviewer = React.useCallback(async () => {
+    if (!activeId) return;
+    const next = !reviewerEffective;
+    setReviewerLocal(next);
+    try { await api.setSessionReviewer(activeId, next); }
+    catch { setReviewerLocal(!next); /* revert on failure */ }
+  }, [activeId, reviewerEffective]);
   const [text, setText] = React.useState('');
   // Primary (coding) + reviewer model. Remembered across the app via localStorage;
   // seeded from the workspace role defaults when the user hasn't chosen yet.
@@ -3403,6 +3431,33 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   border: goalMode ? '1px solid color-mix(in srgb, var(--purple) 45%, transparent)' : '1px solid transparent',
                   color: goalMode ? 'var(--purple)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                 <Icon name="target" size={14} /> {primaryProvider === 'codex' ? 'Pursue goal' : 'Goal'}
+              </button>
+              {/* Autopilot — per-chat opt-in. ON = engine runs a Sonnet judgment after
+                  every turn and arms a 1-min [Auto-continue] followup when the agent
+                  ended on a continuation cue. A genuine user reply cancels any pending
+                  followup. The pending countdown is visible + cancellable in the
+                  Scheduler. Off by default. */}
+              <button onClick={toggleAutoPilot} disabled={!activeId}
+                title={!activeId ? 'Send a message to enable autopilot for this chat' : autoPilotEffective ? 'Autopilot ON for this chat — auto-continues in 1 min when the agent offers to keep going. Click to disable.' : 'Autopilot OFF — turn on to auto-continue this chat when the agent ends on "want me to keep going?"'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9,
+                  cursor: activeId ? 'pointer' : 'default', opacity: activeId ? 1 : 0.5,
+                  background: autoPilotEffective ? 'color-mix(in srgb, var(--green) 14%, transparent)' : 'var(--fill-secondary)',
+                  border: autoPilotEffective ? '1px solid color-mix(in srgb, var(--green) 45%, transparent)' : '1px solid transparent',
+                  color: autoPilotEffective ? 'var(--green)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                <Icon name="bolt" size={14} /> Autopilot
+              </button>
+              {/* Reviewer — per-chat opt-in. ON = the reviewer engine runs after
+                  EVERY assistant turn (not only on file-writing turns, which was
+                  the silent-skip bug). The reviewer-model popover next to this
+                  picks WHICH engine reviews. Off by default. */}
+              <button onClick={toggleReviewer} disabled={!activeId}
+                title={!activeId ? 'Send a message to enable reviewer for this chat' : reviewerEffective ? 'Reviewer ON for this chat — every turn gets reviewed. Click to disable.' : 'Reviewer OFF — turn on to review every assistant turn (picks the engine via the sliders popover).'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9,
+                  cursor: activeId ? 'pointer' : 'default', opacity: activeId ? 1 : 0.5,
+                  background: reviewerEffective ? 'color-mix(in srgb, var(--orange) 14%, transparent)' : 'var(--fill-secondary)',
+                  border: reviewerEffective ? '1px solid color-mix(in srgb, var(--orange) 45%, transparent)' : '1px solid transparent',
+                  color: reviewerEffective ? 'var(--orange)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                <Icon name="checkCircle" size={14} /> Review
               </button>
               <span style={{ width: 1, height: 18, background: 'var(--separator)', margin: '0 1px' }} />
               {/* schedule THIS message — pick a date/time; it fires into the chat then */}

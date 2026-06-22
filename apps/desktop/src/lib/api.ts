@@ -71,6 +71,15 @@ export interface ChatSession {
   /** Set when this chat was imported from an external store (read-only history). */
   importedFrom?: ConvSource;
   externalId?: string;
+  /** OPT-IN per-chat: autopilot ON for THIS chat. When true, after every
+      assistant turn the engine runs a Sonnet judgment; if it returns
+      'continue' it schedules a 1-min [Auto-continue] followup (visible +
+      cancellable in the Scheduler). Off by default. */
+  autoPilot?: boolean;
+  /** OPT-IN per-chat: run the reviewer engine on every turn (independent of
+      whether files changed). The `reviewer` field above still picks the
+      engine/model. Off by default. */
+  reviewerEnabled?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -189,10 +198,14 @@ export interface Schedule {
   fireAt?: number;
   sessionId?: string;
   prompt?: string;
-  /** A user-scheduled chat message, an auto-continue queued when a Claude run is
-      blocked by the usage limit, or an auto-answer countdown for an unanswered
-      AskUserQuestion (fires the recommended option into the chat on timeout). */
-  kind?: 'message' | 'auto-continue' | 'auto-answer';
+  /** Schedule kind:
+      - 'message' : a user-authored chat message to fire at a future time
+      - 'auto-continue' : the usage-limit-reset auto-resume
+      - 'auto-answer' : AskUserQuestion timeout (1-min countdown)
+      - 'keep-going' : autopilot's "the agent offered to continue" 1-min countdown
+      - 'retry-run' : a failed run's retry on exponential backoff
+      - 'whatsapp-analyze' : per-chat WhatsApp quiet timer */
+  kind?: 'message' | 'auto-continue' | 'auto-answer' | 'keep-going' | 'retry-run' | 'whatsapp-analyze';
   effort?: Effort;
   browser?: boolean;
   plan?: boolean;
@@ -1011,6 +1024,18 @@ export const api = {
     call<ChatSession>('pinSession', { id, pinned }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/pin`, { method: 'POST', body: JSON.stringify({ pinned }) })),
   archiveSession: (id: string, archived: boolean) =>
     call<ChatSession>('archiveSession', { id, archived }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify({ archived }) })),
+  /** Toggle autopilot for a chat. When ON, after every assistant turn the
+      engine runs a Sonnet judgment + arms a 1-min [Auto-continue] followup
+      if the agent ended on a continuation cue. A genuine user message
+      cancels any pending followup. Off by default. */
+  setSessionAutopilot: (id: string, enabled: boolean) =>
+    call<ChatSession>('setSessionAutopilot', { id, enabled }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/autopilot`, { method: 'POST', body: JSON.stringify({ enabled }) })),
+  /** Toggle the reviewer engine for a chat. When ON, every assistant turn
+      runs the reviewer (independent of whether files changed). The
+      `reviewer` field on the session picks which engine/model reviews.
+      Off by default. */
+  setSessionReviewer: (id: string, enabled: boolean) =>
+    call<ChatSession>('setSessionReviewer', { id, enabled }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/reviewer-enabled`, { method: 'POST', body: JSON.stringify({ enabled }) })),
   deleteProject: (id: string) =>
     call<{ ok: boolean }>('deleteProject', { id }, () => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 
