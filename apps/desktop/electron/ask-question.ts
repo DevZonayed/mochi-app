@@ -15,8 +15,11 @@
 /** The exact prefix the model treats as a direct answer to its question. */
 export const ANSWER_PREFIX = '[User answered AskUserQuestion]:';
 
-/** Base wait before auto-answering, and the hard cap on total wait. Tunable. */
-export const ASK_BASE_MS = 5 * 60_000;   // 5 minutes
+/** Base wait before auto-answering, and the hard cap on total wait. Tunable.
+    Tightened to 1 minute alongside the autopilot opt-in (matches KEEP_GOING_BASE_MS
+    so the operator only has one "the timer" mental model). The cap stays at
+    30 min so a genuinely long-form answer the user is composing isn't auto-resolved. */
+export const ASK_BASE_MS = 60_000;       // 1 minute
 export const ASK_CAP_MS = 30 * 60_000;   // 30 minutes total, then graceful pause
 const ASK_STEP_MS = 5 * 60_000;          // extend increment unit (+5, +10, +15 …)
 

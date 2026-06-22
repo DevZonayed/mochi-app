@@ -43,9 +43,10 @@ import {
 import { resetFromRateLimitInfo, isUsageLimitMessage, parseUsageLimitReset, type RateLimitInfo } from './limit-reset.js';
 import { parseAsk, timeoutAnswer, ASK_BASE_MS } from './ask-question.js';
 import {
-  detectKeepGoing, organizedContinuePrompt,
+  detectKeepGoing, extractNextItems, organizedContinuePrompt,
   KEEP_GOING_BASE_MS, KEEP_GOING_MAX_PER_SESSION, KEEP_GOING_CAP_NOTE,
 } from './keep-going.js';
+import { judgeFollowup, type JudgeResult } from './followup-judge.js';
 import {
   isRetryWorthy, retryDelayMs, retryKeyFor, retryScheduleTitle, retryNote, retryGiveUpNote,
   RETRY_MAX_ATTEMPTS,
@@ -1790,8 +1791,15 @@ export class LocalEngine {
 
   /** Arm an auto-answer countdown for an unanswered AskUserQuestion at the tail of a
       finished chat turn. No-op unless the model genuinely ended ON the question (it
-      asked and didn't act afterwards) and nothing is already armed for this session. */
+      asked and didn't act afterwards), the session has AUTOPILOT enabled (opt-in
+      per-chat — was always-on before; the operator wanted explicit control), and
+      nothing is already armed for this session. */
   private armAskFollowup(sessionId: string, projectId: string, items: TranscriptItem[], effort: Effort): boolean {
+    // Per-chat opt-in: autopilot must be ON for this session, or the auto-answer
+    // is just user-hostile (the operator typed a question to be ANSWERED, not
+    // auto-resolved). The toggle lives on the composer; default is OFF.
+    const session = this.store.getSession(sessionId);
+    if (!session?.autoPilot) return false;
     let askIdx = -1;
     for (let i = items.length - 1; i >= 0; i--) { if (items[i].kind === 'ask') { askIdx = i; break; } }
     if (askIdx === -1) return false;
@@ -1815,8 +1823,20 @@ export class LocalEngine {
       auto-continue for KEEP_GOING_BASE_MS later. Per-session cap +
       idempotent upsert keep a stuck agent from spinning forever AND keep a
       burst of re-emits from spawning duplicate schedules.
+
+      DESIGN (post-redesign):
+      1. Gated on session.autoPilot — off by default; the operator opts in
+         per-chat via the composer toggle. Was always-on; that produced too
+         many false positives.
+      2. Sonnet judge (followup-judge.ts) reads the agent's actual last
+         text + a little context and returns one of {continue, wait-for-user,
+         paused, done}. Only 'continue' arms a schedule.
+      3. Regex (detectKeepGoing) is the FALLBACK when no Anthropic API key
+         exists or the judge call fails — autopilot still works offline,
+         just less smart.
+
       Returns the schedule (or null when capped / nothing to arm). */
-  private armKeepGoingFollowup(opts: {
+  private async armKeepGoingFollowup(opts: {
     sessionId: string;
     projectId: string;
     items: TranscriptItem[];
@@ -1825,11 +1845,14 @@ export class LocalEngine {
     originalGoal?: string;
     sourceJobId: string;
     outputText: string;
-  }): void {
+  }): Promise<void> {
+    // Per-chat opt-in. Off by default; the composer's autopilot button toggles
+    // this. Skipping when off prevents auto-continue noise in chats where the
+    // operator just wants a single answer per turn.
+    const session = this.store.getSession(opts.sessionId);
+    if (!session?.autoPilot) return;
     // Last text the model emitted (the offer to continue lives there, NOT in
-    // a tool chip or thinking block). Tail-only search keeps a single match in
-    // the middle of a long body from triggering when the body ends on a real
-    // deliverable.
+    // a tool chip or thinking block).
     let lastText = '';
     for (let i = opts.items.length - 1; i >= 0; i--) {
       const it = opts.items[i];
@@ -1837,7 +1860,6 @@ export class LocalEngine {
     }
     if (!lastText && opts.outputText) lastText = opts.outputText;
     if (!lastText) return;
-    if (!detectKeepGoing(lastText)) return;
     // Don't auto-continue ON TOP OF other pending actions for the session
     // (an auto-answer, an auto-continue at limit-reset, a queued message,
     // or a pending retry-run). Those have priority — once they fire, the
@@ -1847,18 +1869,76 @@ export class LocalEngine {
       s.sessionId === opts.sessionId && s.enabled && blockingKinds.has(s.kind ?? ''),
     );
     if (hasBlocking) return;
+
+    // Sonnet judgment — gated by API key. If we get a clean verdict, trust it;
+    // if not (no key, network blip, malformed JSON), fall back to the regex.
+    const apiKey = this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined;
+    let judged: JudgeResult | null = null;
+    if (apiKey) {
+      // Gather a tiny bit of context — last 3 turns from THIS session — so the
+      // judge can distinguish "asked Y in the body, agent already answered it"
+      // from "asked Y, awaiting user". Cheap to gather; bounded in size.
+      const ctx: { role: 'user' | 'assistant'; text: string }[] = [];
+      try {
+        const jobs = this.store.listJobs(opts.projectId, opts.sessionId)
+          .filter((j) => j.id !== opts.sourceJobId)
+          .slice(-3);
+        for (const j of jobs) {
+          ctx.push({ role: 'user', text: j.input ?? '' });
+          if (j.output) ctx.push({ role: 'assistant', text: j.output });
+        }
+      } catch { /* best-effort */ }
+      judged = await judgeFollowup({
+        apiKey,
+        lastAssistantText: lastText,
+        contextTurns: ctx,
+        goalMode: opts.goalMode,
+        originalGoal: opts.originalGoal,
+      });
+    }
+    // If the judge spoke, trust it. Else fall back to the regex detector that
+    // shipped before — autopilot still works without API access (and the
+    // operator can disable the chat-level toggle if it misfires).
+    let verdict: 'continue' | 'wait-for-user' | 'paused' | 'done';
+    let reason = '';
+    let items: string[] | undefined;
+    if (judged) {
+      verdict = judged.verdict;
+      reason = judged.reason;
+      items = judged.items;
+    } else {
+      verdict = detectKeepGoing(lastText) ? 'continue' : 'done';
+      reason = 'regex fallback (no API key or judge unavailable)';
+    }
+    if (verdict !== 'continue') return;
+
     const fireAt = Date.now() + KEEP_GOING_BASE_MS;
-    const prompt = organizedContinuePrompt({
-      lastText,
-      goalMode: opts.goalMode,
-      originalGoal: opts.originalGoal,
-      attempt: this.store.keepGoingCountFor(opts.sessionId) + 1,
-      maxAttempts: KEEP_GOING_MAX_PER_SESSION,
-    });
+    // If the judge gave us items, prefer them (it saw full context); else
+    // re-extract from the last text. Either way the operator sees the
+    // agent's own next moves echoed back in the [Auto-continue]: prompt.
+    const promptItems = items && items.length ? items : extractNextItems(lastText);
+    // organizedContinuePrompt already builds the standard envelope; if the
+    // judge surfaced richer items, splice them in via the lastText overload.
+    const prompt = promptItems.length
+      ? organizedContinuePrompt({
+          lastText: `${lastText}\n\n${promptItems.map((i) => `- ${i}`).join('\n')}`,
+          goalMode: opts.goalMode,
+          originalGoal: opts.originalGoal,
+          attempt: this.store.keepGoingCountFor(opts.sessionId) + 1,
+          maxAttempts: KEEP_GOING_MAX_PER_SESSION,
+        })
+      : organizedContinuePrompt({
+          lastText,
+          goalMode: opts.goalMode,
+          originalGoal: opts.originalGoal,
+          attempt: this.store.keepGoingCountFor(opts.sessionId) + 1,
+          maxAttempts: KEEP_GOING_MAX_PER_SESSION,
+        });
+    const titleSuffix = reason ? ` — ${reason.slice(0, 60)}` : '';
     const res = this.store.upsertKeepGoingForSession({
       sessionId: opts.sessionId,
       projectId: opts.projectId,
-      title: 'Auto-continue (want me to keep going?)',
+      title: `Auto-continue${titleSuffix}`,
       prompt,
       fireAt,
       effort: opts.effort,
@@ -2474,15 +2554,28 @@ export class LocalEngine {
       /* SP3 — primary↔reviewer loop. A reviewer engine (e.g. Codex) checks the
          primary's (e.g. Opus) changes for security/weak code/bugs; if it flags
          problems AND the turn actually changed files, the primary fixes them and
-         the reviewer re-verifies — up to REVIEW_MAX_ROUNDS. Now runs for chat too. */
+         the reviewer re-verifies — up to REVIEW_MAX_ROUNDS. Now runs for chat too.
+
+         Gating (post-redesign):
+         - reviewer model picked (!= 'off') — picks WHICH engine reviews
+         - PER-CHAT TOGGLE session.reviewerEnabled — picks WHETHER to review
+           this chat at all. Default OFF so the operator opts in explicitly.
+         - Drops the silent "only review when files changed" condition — the
+           operator complained the reviewer wasn't firing on chat turns
+           because of this hidden gate. Now: if the toggle is on, it ALWAYS
+           reviews. */
       const reviewerChoice: RoleChoice | 'off' = opts.reviewer ?? roles.reviewer;
       const reviewer: EngineId | 'off' = reviewerChoice === 'off' ? 'off' : reviewerChoice.engine;
       const reviewerModel = reviewerChoice === 'off' ? undefined : reviewerChoice.model;
       const wroteFiles = allItems.some(it => it.kind === 'tool' && IS_WRITE_TOOL_RE.test(it.name ?? ''));
       const reviewerKey = () => (this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined);
       let reviewVerdict: 'approved' | 'needs-work' | null = null;
+      // Per-chat toggle: opt-in. For NON-chat jobs (one-off runs from the
+      // research/publishing pipeline) the existing behavior stays — those
+      // aren't chats so there's no per-session toggle.
+      const reviewerOn = !isChat || (session != null && session.reviewerEnabled === true);
 
-      if (reviewer !== 'off' && this.available(reviewer) && (wroteFiles || !isChat) && !main.hitLimit && !ac.signal.aborted) {
+      if (reviewer !== 'off' && this.available(reviewer) && reviewerOn && !main.hitLimit && !ac.signal.aborted) {
         for (let round = 0; round < REVIEW_MAX_ROUNDS; round++) {
           cur = this.store.updateJob(jobId, { progress: 88, stage: `reviewer (${ENGINE_LABEL[reviewer]}) checking…` });
           this.emit('job', cur);
@@ -2559,7 +2652,11 @@ export class LocalEngine {
         try {
           const armedAsk = this.armAskFollowup(session.id, job.projectId, allItems, effort);
           if (!armedAsk) {
-            this.armKeepGoingFollowup({
+            // Awaited so the Sonnet judge has time to land BEFORE we declare
+            // the turn fully done. Cheap (~1s) and the engine has already
+            // emitted the final 'job' update, so the user sees the answer
+            // immediately — only the schedule arming waits on the judge.
+            await this.armKeepGoingFollowup({
               sessionId: session.id,
               projectId: job.projectId,
               items: allItems,

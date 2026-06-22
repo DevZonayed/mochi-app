@@ -175,6 +175,20 @@ export interface ChatSession {
   importedFrom?: 'claude' | 'codex' | 'conductor';
   /** Source-side conversation id; dedupes re-imports of the same conversation. */
   externalId?: string;
+  /** OPT-IN per-chat: enable the autopilot mechanism for THIS chat. When true,
+      the engine runs a Sonnet judgment after every turn — if the agent ended
+      on a continuation cue (or didn't get the human input it asked for), it
+      schedules a 1-minute followup ('keep-going' or 'auto-answer') that fires
+      "[Auto-continue]: …" / "[User answered AskUserQuestion]: …" into the session.
+      Default OFF — a genuine user message ALWAYS cancels the pending followup.
+      The toggle button lives in the composer header. */
+  autoPilot?: boolean;
+  /** OPT-IN per-chat: run the reviewer engine on EVERY turn (independent of
+      whether files changed). This is the master switch for the per-turn
+      review pass; the `reviewer` field above still picks WHICH engine/model
+      reviews. Default OFF — the silent "only review when files changed"
+      heuristic was confusing operators. The toggle lives next to autopilot. */
+  reviewerEnabled?: boolean;
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
@@ -1007,7 +1021,7 @@ export class Store {
     this.data.sessions.push(s); this.save();
     return s;
   }
-  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt' | 'codename' | 'branchRenamedAt'>>): ChatSession {
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt' | 'codename' | 'branchRenamedAt' | 'autoPilot' | 'reviewerEnabled'>>): ChatSession {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     Object.assign(s, patch, { updatedAt: now() });
@@ -1378,6 +1392,32 @@ export class Store {
       this.save();
     }
   }
+  /** Cancel every pending autopilot followup ('keep-going' or 'auto-answer')
+      for a session — called from sendChat the instant a genuine user message
+      lands. The bug this fixes (image_autopilot.png in spirit): the engine
+      armed a 5-min "[Auto-continue]:" countdown when the agent ended on
+      "ready when you are", then the user typed a real reply, but the
+      countdown ALSO fired afterwards because resetKeepGoingCounter only
+      zeroed the streak counter and left the schedule armed. Now we disable
+      every live followup row so a real reply is the authoritative signal.
+      Returns the IDs of the schedules that were disabled so the caller can
+      emit `schedule` events for the UI. */
+  cancelPendingFollowups(sessionId: string): string[] {
+    const now = Date.now();
+    const ids: string[] = [];
+    for (const s of this.data.schedules) {
+      if (s.sessionId !== sessionId) continue;
+      if (s.kind !== 'keep-going' && s.kind !== 'auto-answer') continue;
+      if (s.enabled === false) continue;
+      // Only cancel rows that haven't fired yet — a one-shot that already
+      // ran is a no-op anyway, but skipping it keeps the audit clean.
+      if (typeof s.fireAt === 'number' && s.fireAt <= now && s.lastRun) continue;
+      s.enabled = false;
+      ids.push(s.id);
+    }
+    if (ids.length) this.save();
+    return ids;
+  }
   /** Current consecutive-auto-continue count for a session (used by the UI
       to show "Auto-continue 3/20" on the schedule chip). */
   keepGoingCountFor(sessionId: string): number {
@@ -1468,6 +1508,14 @@ export class Store {
   setScheduleEnabled(scheduleId: string, enabled: boolean): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (s) { s.enabled = enabled; this.save(); }
+  }
+  /** Snapshot of the chat session associated with a pending followup row
+      (so the Scheduler UI can show the chat title alongside a 'keep-going' /
+      'auto-answer' row). Returns undefined when no session is linked. */
+  getSessionForSchedule(scheduleId: string): ChatSession | undefined {
+    const s = this.data.schedules.find(x => x.id === scheduleId);
+    if (!s?.sessionId) return undefined;
+    return this.getSession(s.sessionId);
   }
   markScheduleRun(scheduleId: string, ts: number, nextRun: number | null, opts?: { dueAt?: number; late?: boolean }): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);

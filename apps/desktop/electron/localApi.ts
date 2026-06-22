@@ -366,6 +366,20 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('session', s);
         return s;
       }
+      // Per-chat autopilot + reviewer toggles. Independent on/off booleans
+      // wired to the composer's two new toggle buttons. Both default OFF —
+      // operator opts in explicitly per chat (was always-on for legacy chats
+      // which produced too-eager auto-continues and silent reviewer skips).
+      case 'setSessionAutopilot': {
+        const s = store.updateSession(String(p.id ?? ''), { autoPilot: p.enabled === true });
+        emit('session', s);
+        return s;
+      }
+      case 'setSessionReviewer': {
+        const s = store.updateSession(String(p.id ?? ''), { reviewerEnabled: p.enabled === true });
+        emit('session', s);
+        return s;
+      }
       // Worktree archive (Conductor PR lifecycle): prune this session's git worktree.
       case 'archiveSessionWorktree': {
         const s = store.getSession(String(p.sessionId ?? p.id ?? ''));
@@ -612,6 +626,20 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // Auto-continue and retry-run jobs go through engine.run directly via
         // the cron, NOT sendChat, so this only fires on genuine user messages.
         try { store.resetKeepGoingCounter(session.id); } catch { /* best-effort */ }
+        // CANCEL every pending autopilot followup for this session — fixes
+        // the "fires again unnecessarily" bug the operator hit in chat: a
+        // [Auto-continue]: countdown that was armed BEFORE the user typed
+        // must not fire AFTER the user replied. Previously only the counter
+        // was reset; the schedule row stayed live and fired anyway. Now we
+        // disable both 'keep-going' and 'auto-answer' rows here so the user's
+        // real message is the authoritative signal.
+        try {
+          const cancelled = store.cancelPendingFollowups(session.id);
+          for (const id of cancelled) {
+            const s = store.listSchedules().find((x) => x.id === id);
+            if (s) emit('schedule', s);
+          }
+        } catch { /* best-effort */ }
         // Fire the run async — the reply streams in over job events.
         void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true, browser: p.browser === true });
         return { session, job };
