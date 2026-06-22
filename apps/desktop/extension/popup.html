@@ -1,0 +1,297 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        --bg: #ffffff;
+        --bg-subtle: rgba(0,0,0,0.04);
+        --border: rgba(0,0,0,0.08);
+        --border-strong: rgba(0,0,0,0.14);
+        --text: #0a0a0a;
+        --text-muted: #6e6e76;
+        --text-soft: #8e8e94;
+        --primary: #2563eb;
+        --primary-fg: #ffffff;
+        --primary-hover: #1d4fd1;
+        --success: #16a34a;
+        --warning: #f59e0b;
+        --danger: #dc2626;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1c1c1f;
+          --bg-subtle: rgba(255,255,255,0.05);
+          --border: rgba(255,255,255,0.10);
+          --border-strong: rgba(255,255,255,0.18);
+          --text: #f5f5f7;
+          --text-muted: #a1a1a6;
+          --text-soft: #6e6e76;
+          --primary: #3b82f6;
+          --primary-hover: #4d8ffb;
+          --success: #22c55e;
+          --warning: #fbbf24;
+          --danger: #f87171;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        width: 320px;
+        margin: 0;
+        padding: 0;
+        color: var(--text);
+        background: var(--bg);
+        font-size: 13px;
+      }
+
+      .header {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 14px 16px 12px;
+        border-bottom: 1px solid var(--border);
+      }
+      .brand {
+        display: flex; align-items: baseline; gap: 7px;
+      }
+      .brand .name { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+      .brand .sub  { font-size: 11px; color: var(--text-muted); font-weight: 500; }
+      .conn {
+        display: inline-flex; align-items: center; gap: 6px;
+        font-size: 11.5px; color: var(--text-muted);
+      }
+      .conn .dot {
+        display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+        background: var(--text-soft);
+      }
+      .conn .dot.ok      { background: var(--success); box-shadow: 0 0 6px rgba(22,163,74,0.5); }
+      .conn .dot.standby { background: var(--warning); box-shadow: 0 0 6px rgba(245,158,11,0.5); }
+      .conn .dot.bad     { background: var(--danger);  box-shadow: 0 0 6px rgba(220,38,38,0.4); }
+
+      .section {
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--border);
+      }
+      .section:last-child { border-bottom: none; }
+
+      .section-title {
+        font-size: 10.5px; font-weight: 600;
+        color: var(--text-muted);
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        margin: 0 0 8px 0;
+      }
+
+      .kv {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 5px 0;
+        font-size: 12.5px;
+      }
+      .kv .k { color: var(--text-muted); }
+      .kv .v { color: var(--text); font-weight: 500; }
+
+      /* iOS switch */
+      .switch { position: relative; display: inline-block; width: 30px; height: 18px; flex-shrink: 0; }
+      .switch input { opacity: 0; width: 0; height: 0; }
+      .switch .track {
+        position: absolute; cursor: pointer; inset: 0;
+        background: rgba(0,0,0,0.18);
+        border-radius: 18px;
+        transition: background 200ms cubic-bezier(0.16, 1, 0.3, 1);
+      }
+      .switch .thumb {
+        position: absolute;
+        top: 2px; left: 2px;
+        width: 14px; height: 14px; border-radius: 50%;
+        background: #ffffff;
+        box-shadow: 0 1px 1px rgba(0,0,0,0.06), 0 2px 4px rgba(0,0,0,0.15);
+        transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1);
+      }
+      .switch input:checked + .track { background: var(--success); }
+      .switch input:checked + .track .thumb { transform: translateX(12px); }
+      @media (prefers-color-scheme: dark) { .switch .track { background: rgba(255,255,255,0.18); } }
+
+      .num-input {
+        font-family: inherit; font-size: 12.5px; color: var(--text);
+        background: var(--bg);
+        border: 1px solid var(--border-strong);
+        border-radius: 6px;
+        padding: 3px 6px;
+        width: 60px;
+        text-align: right;
+      }
+      .num-input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(37,99,235,0.20); }
+
+      /* buttons */
+      .btn-row { display: flex; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+      .btn-row .btn { flex: 1; }
+      button.btn {
+        appearance: none;
+        font-family: inherit; font-size: 12.5px; font-weight: 500;
+        border: 1px solid var(--border-strong);
+        background: var(--bg);
+        color: var(--text);
+        padding: 7px 12px;
+        border-radius: 7px;
+        cursor: pointer;
+        display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+        transition: background 100ms, border-color 100ms, transform 80ms;
+      }
+      button.btn:hover { background: var(--bg-subtle); }
+      button.btn:active { transform: scale(0.98); }
+      button.btn.primary { background: var(--primary); color: var(--primary-fg); border-color: var(--primary); }
+      button.btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+      button.btn.danger { color: var(--danger); border-color: var(--border-strong); }
+      button.btn.danger:hover { background: rgba(220,38,38,0.08); border-color: rgba(220,38,38,0.30); }
+
+      .hint-text {
+        font-size: 11px; color: var(--text-soft); padding: 10px 16px 12px;
+        line-height: 1.45; border-bottom: 1px solid var(--border);
+      }
+
+      /* claude sessions section */
+      .session-row {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 8px;
+        padding: 6px 0; font-size: 12.5px;
+      }
+      .session-row:not(:last-child) { border-bottom: 1px solid var(--border); }
+      .session-name {
+        color: var(--text); font-weight: 500;
+        flex: 1; min-width: 0;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .session-badge {
+        font-size: 10.5px; font-weight: 500;
+        padding: 2px 7px; border-radius: 10px;
+        flex-shrink: 0;
+        background: var(--bg-subtle); color: var(--text-muted);
+      }
+      .session-badge.queued { background: var(--warning); color: white; }
+
+      .empty-state { font-size: 11.5px; color: var(--text-soft); padding: 4px 0 8px; line-height: 1.5; }
+
+      /* send-hint form (in popup) */
+      #send-form { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+      #send-form select, #send-form textarea {
+        font-family: inherit; font-size: 12.5px; color: var(--text);
+        background: var(--bg); width: 100%;
+        border: 1px solid var(--border-strong);
+        border-radius: 7px;
+        padding: 6px 9px;
+        transition: border-color 120ms, box-shadow 120ms;
+      }
+      #send-form select { padding-right: 26px; appearance: none; cursor: pointer;
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='9' height='9' viewBox='0 0 24 24' fill='none' stroke='%238e8e94' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+        background-repeat: no-repeat; background-position: right 9px center; background-size: 9px;
+      }
+      #send-form textarea { resize: vertical; min-height: 56px; line-height: 1.4; }
+      #send-form select:focus, #send-form textarea:focus {
+        outline: none; border-color: var(--primary);
+        box-shadow: 0 0 0 2px rgba(37,99,235,0.20);
+      }
+      .toggles { display: flex; flex-direction: column; gap: 2px; padding: 2px 0; }
+      .toggle-row {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 5px 0; font-size: 12px; color: var(--text);
+      }
+      .toggle-row .label { display: flex; align-items: center; gap: 7px; color: var(--text); }
+      .toggle-row svg { color: var(--text-muted); flex-shrink: 0; }
+
+      .status { font-size: 11px; color: var(--text-soft); min-height: 14px; }
+      .status.ok  { color: var(--success); }
+      .status.err { color: var(--danger); }
+
+      /* footer */
+      .footer { padding: 10px 16px; font-size: 10.5px; color: var(--text-soft); text-align: center; }
+      .kbd {
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        background: var(--bg-subtle); padding: 1px 5px; border-radius: 4px;
+        font-size: 10px; color: var(--text-muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <div class="brand">
+        <span class="name">Mochi</span>
+        <span class="sub">Browser companion</span>
+      </div>
+      <div class="conn">
+        <span id="status-dot" class="dot"></span>
+        <span id="status-text">…</span>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="kv"><span class="k">Sessions</span><span class="v" id="session-text">none</span></div>
+      <div class="kv"><span class="k">Auto-connect</span>
+        <label class="switch">
+          <input type="checkbox" id="auto-connect-switch" />
+          <span class="track"><span class="thumb"></span></span>
+        </label>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Visuals</div>
+      <div class="kv"><span class="k">Agent cursor</span>
+        <label class="switch">
+          <input type="checkbox" id="visuals-cursor" />
+          <span class="track"><span class="thumb"></span></span>
+        </label>
+      </div>
+      <div class="kv"><span class="k">Action HUD</span>
+        <label class="switch">
+          <input type="checkbox" id="visuals-hud" />
+          <span class="track"><span class="thumb"></span></span>
+        </label>
+      </div>
+      <div class="kv"><span class="k">SlowMo (ms)</span>
+        <input type="number" class="num-input" id="visuals-slowmo" min="0" max="5000" step="50" />
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Pairing</div>
+      <div class="kv"><span class="k">Profile</span><span class="v" id="profile-name">…</span></div>
+      <div class="kv"><span class="k">App port</span><span class="v" id="port-text">9234</span></div>
+      <div id="pair-row" style="display:flex; gap:8px; margin-top:8px;">
+        <input type="text" id="token-input" placeholder="Paste token from app"
+          style="flex:1; min-width:0; font-family: ui-monospace, Menlo, monospace; letter-spacing:0.06em; font-size:12.5px; color:var(--text); background:var(--bg); border:1px solid var(--border-strong); border-radius:7px; padding:6px 9px;" />
+        <button class="btn primary" id="pair-btn" style="flex:0 0 auto;">Pair</button>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px; margin-top:8px;">
+        <span style="font-size:11.5px; color:var(--text-muted); white-space:nowrap;">Port (only if app isn't 9234)</span>
+        <input type="number" id="port-input" class="num-input" placeholder="9234" min="1" max="65535" style="width:72px; text-align:left;" />
+      </div>
+      <div class="status" id="pair-status" style="margin-top:6px;"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Send to a chat</div>
+      <div id="send-form">
+        <select id="chat-select"><option value="" disabled selected>Loading…</option></select>
+        <textarea id="msg-input" placeholder="Type a message or comment to send to the chosen chat…"></textarea>
+        <button class="btn primary" id="send-btn">Send</button>
+        <div class="status" id="send-status"></div>
+        <button class="btn" id="comment-btn" style="margin-top:2px;">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          Comment on an element
+        </button>
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn" id="toggle-btn">Toggle auto-connect</button>
+      <button class="btn danger" id="end-session-btn">End</button>
+    </div>
+    <button class="btn primary" id="take-over-btn" style="display:none; margin: 0 16px 12px;">Take over (make this profile active)</button>
+
+    <div class="hint-text">
+      Pair once with the token from the app (Settings → Browser extension). Then send messages or drop comments here, or press <span class="kbd">⌘⇧M</span> on any page to comment on an element.
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

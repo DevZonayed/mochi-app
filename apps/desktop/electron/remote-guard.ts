@@ -16,7 +16,7 @@ export const REMOTE_BLOCKED_METHODS: ReadonlySet<string> = new Set<string>([
   // design comments live in local project files
   'listDesignComments', 'addDesignComment', 'setDesignCommentStatus', 'deleteDesignComment',
   // native browser extension control + design→code copy
-  'extensionStatus', 'extensionSetActive', 'copyDesignToCode',
+  'extensionStatus', 'extensionSetActive', 'extensionPath', 'extensionRevealFolder', 'copyDesignToCode',
   // local skill files + on-disk conversation import
   'addSkillToProject', 'removeSkillFromProject', 'scanConversations', 'importConversations',
   // feedbackCreateIssue spends THIS Mac's GitHub token (a remote may submit/list/triage, not file)

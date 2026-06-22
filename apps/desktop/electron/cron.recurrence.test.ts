@@ -75,9 +75,14 @@ describe('nextOccurrence — interval mode', () => {
 describe('CronRunner — catch-up for missed clock-mode slots', () => {
   beforeEach(() => { rmSync(hoisted.dir, { recursive: true, force: true }); });
 
-  /** A daily schedule whose nextRun is already 2h in the past (a missed slot). */
+  /** A daily schedule whose nextRun is already 2h in the past (a missed slot).
+      The explicit catchUpWindowMs is what makes this test deterministic — the
+      production default (`endOfDayWindow(slot)`) collapses to a TINY window when
+      the test happens to run shortly after local midnight (the 2h-ago slot lands
+      in yesterday's day-window which has already closed). Production behavior is
+      unchanged; the test just pins a stable 24h window. */
   function missedDaily(s: Store, projectId: string, catchUp: boolean) {
-    const rec = s.createSchedule({ projectId, title: 'Morning', prompt: 'run me', time: '09:00', cadence: 'daily', catchUp });
+    const rec = s.createSchedule({ projectId, title: 'Morning', prompt: 'run me', time: '09:00', cadence: 'daily', catchUp, catchUpWindowMs: 24 * 60 * 60_000 });
     // Simulate the slot having come due while the app was closed.
     s.setScheduleNextRun(rec.id, Date.now() - 2 * 60 * 60_000);
     return rec;
