@@ -822,6 +822,13 @@ export const api = {
     call<ExtensionStatus>('extensionStatus', {}, () => Promise.reject(new Error('desktop only'))),
   extensionSetActive: (clientId: string) =>
     call<ExtensionStatus>('extensionSetActive', { clientId }, () => Promise.reject(new Error('desktop only'))),
+  /** Where the bundled extension's unpacked folder lives on disk (packaged build, dev tree, or env override). */
+  extensionPath: () =>
+    call<{ path: string | null; source: 'packaged' | 'dev' | 'env-override' | 'not-found'; manifestPresent: boolean }>(
+      'extensionPath', {}, () => Promise.reject(new Error('desktop only'))),
+  /** Open the bundled extension folder in Finder/Explorer (so the user can chrome://extensions → Load Unpacked). */
+  extensionRevealFolder: () =>
+    call<{ path: string; source: string }>('extensionRevealFolder', {}, () => Promise.reject(new Error('desktop only'))),
   /** Hand off a design to code: copy its folder into a NEW coding project (lives in both tabs). Desktop-only. */
   copyDesignToCode: (id: string, name?: string) =>
     call<Project>('copyDesignToCode', { id, name }, () => Promise.reject(new Error('desktop only'))),

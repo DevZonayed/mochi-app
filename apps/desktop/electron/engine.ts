@@ -938,6 +938,58 @@ async function runClaude(
                 }
                 return json(r, 16000);
               })),
+            tool('browser_resolve_box',
+              'Return the bounding box (x, y, width, height + visibility) of an element by CSS selector. Use BEFORE browser_click_at when you need to click a precise coordinate inside a canvas/overlay, or to verify an element is on-screen.',
+              { ref: z.string().describe('CSS selector.'), tabId: z.number().optional() },
+              wrap(async (a: { ref: string; tabId?: number }) => json(await browserCall('resolve_box', a)))),
+            tool('browser_assert',
+              'Run a built-in page assertion (title contains, url contains, selector visible/count). Fails LOUDLY when the page is not in the expected state — better than scraping text and second-guessing.',
+              { kind: z.enum(['title-contains', 'url-contains', 'selector-visible', 'selector-count', 'text-present']).describe('Which assertion to run.'), target: z.string().optional().describe('Selector for selector-* assertions, otherwise unused.'), value: z.union([z.string(), z.number()]).optional().describe('Expected substring (title/url/text), count, or visibility flag.') },
+              wrap(async (a: { kind: string; target?: string; value?: string | number }) => json(await browserCall('assert', a)))),
+            tool('browser_storage_get',
+              'Read localStorage or sessionStorage from the active tab. Useful for debugging logged-in state, feature flags, cached SPA state. Pass `key` for one value, omit for ALL keys.',
+              { area: z.enum(['local', 'session']).describe('"local" = localStorage; "session" = sessionStorage.'), key: z.string().optional() },
+              wrap(async (a: { area: 'local' | 'session'; key?: string }) => {
+                const store = a.area === 'session' ? 'sessionStorage' : 'localStorage';
+                const expr = a.key
+                  ? `(() => { try { return { area: ${JSON.stringify(a.area)}, key: ${JSON.stringify(a.key)}, value: ${store}.getItem(${JSON.stringify(a.key)}) }; } catch (e) { return { error: String(e) }; } })()`
+                  : `(() => { try { const out = {}; for (let i = 0; i < ${store}.length; i++) { const k = ${store}.key(i); if (k != null) out[k] = ${store}.getItem(k); } return { area: ${JSON.stringify(a.area)}, count: Object.keys(out).length, items: out }; } catch (e) { return { error: String(e) }; } })()`;
+                const r = await browserCall('evaluate', { expression: expr, awaitPromise: false, timeoutMs: 5000 }) as { ok?: boolean; value?: unknown; error?: string };
+                if (!r?.ok) throw new Error(r?.error || 'storage_get failed');
+                return json(r.value, 12000);
+              })),
+            tool('browser_storage_set',
+              'Write a value into localStorage or sessionStorage. Use to script test fixtures, override a feature flag, restore a saved state. Pass `value:null` to remove the key.',
+              { area: z.enum(['local', 'session']), key: z.string(), value: z.string().nullable().describe('String to store, or null to remove the key.') },
+              wrap(async (a: { area: 'local' | 'session'; key: string; value: string | null }) => {
+                const store = a.area === 'session' ? 'sessionStorage' : 'localStorage';
+                const expr = a.value === null
+                  ? `(() => { try { ${store}.removeItem(${JSON.stringify(a.key)}); return { removed: ${JSON.stringify(a.key)} }; } catch (e) { return { error: String(e) }; } })()`
+                  : `(() => { try { ${store}.setItem(${JSON.stringify(a.key)}, ${JSON.stringify(a.value)}); return { set: ${JSON.stringify(a.key)}, length: ${JSON.stringify(a.value)}.length }; } catch (e) { return { error: String(e) }; } })()`;
+                const r = await browserCall('evaluate', { expression: expr, awaitPromise: false, timeoutMs: 5000 }) as { ok?: boolean; value?: unknown; error?: string };
+                if (!r?.ok) throw new Error(r?.error || 'storage_set failed');
+                return json(r.value);
+              })),
+            tool('browser_save_image',
+              'Save a base64 image (data: URL OR raw base64) to disk under the project. Pair with browser_grab_image / browser_screenshot to one-shot extract → save without falling back to Bash + base64 -D.',
+              { dataUrl: z.string().describe('Either a "data:image/png;base64,...." URL or a raw base64 string.'), filename: z.string().describe('Output filename (path is relative to the project root unless absolute). Subdirectories are created.') },
+              wrap(async (a: { dataUrl: string; filename: string }) => {
+                // Strip any data: prefix and trim whitespace defensively. Reject anything
+                // that isn't valid base64 with a clear message rather than writing garbage.
+                const stripped = a.dataUrl.replace(/^data:[^,]*,/, '').replace(/\s+/g, '');
+                if (!/^[A-Za-z0-9+/=]+$/.test(stripped)) {
+                  throw new Error('save_image: dataUrl did not decode as base64. Pass the full "data:image/...;base64,..." URL from browser_grab_image, or just the base64 body.');
+                }
+                const buf = Buffer.from(stripped, 'base64');
+                if (buf.length < 16) throw new Error('save_image: decoded payload is suspiciously small — was the dataUrl truncated?');
+                // Resolve relative to the run's cwd (the project root) and create
+                // parents so a path like "assets/screens/01.png" Just Works.
+                const target = path.isAbsolute(a.filename) ? a.filename : path.join(cwd, a.filename);
+                mkdirSync(path.dirname(target), { recursive: true });
+                const { writeFileSync } = await import('node:fs');
+                writeFileSync(target, buf);
+                return txt(`Saved ${buf.length} bytes → ${target}.`);
+              })),
             tool('browser_pdf',
               'Save the active tab as a PDF (Page.printToPDF). Returns the file path written under the user\'s Downloads folder. Configure paper size, margins, headers/footers via the standard CDP params.',
               { filename: z.string().optional().describe('Saved name (default tab title + ".pdf"). Will be uniquified.'), landscape: z.boolean().optional(), printBackground: z.boolean().optional(), paperWidth: z.number().optional().describe('Inches.'), paperHeight: z.number().optional().describe('Inches.'), scale: z.number().optional().describe('0.1..2'), tabId: z.number().optional() },
@@ -1154,7 +1206,8 @@ async function runClaude(
       'browser_wait', 'browser_wait_for_selector',
       'browser_evaluate', 'browser_grab_image', 'browser_download_url',
       'browser_cookies_get', 'browser_cookies_set', 'browser_cookies_clear',
-      'browser_cdp', 'browser_pdf',
+      'browser_cdp', 'browser_pdf', 'browser_save_image',
+      'browser_resolve_box', 'browser_assert', 'browser_storage_get', 'browser_storage_set',
       'browser_window_resize', 'browser_emulate_viewport', 'browser_clear_emulation',
       'browser_session_start', 'browser_session_end',
     ] : []),

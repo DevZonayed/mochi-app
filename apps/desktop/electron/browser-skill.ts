@@ -28,7 +28,7 @@ export const BROWSER_SKILL_ID = 'mochi/browser';
 export const BROWSER_SKILL_MD = `---
 name: browser
 description: "Use this skill whenever the user asks you to drive their REAL Chrome browser (via the Mochi extension) — open a site, log in, click, type, screenshot, extract data, watch the network, download a file, run JS in a page. Do NOT use WebFetch/WebSearch for these — use the browser_* tools listed below."
-allowed-tools: [mcp__maestro__browser_status, mcp__maestro__browser_navigate, mcp__maestro__browser_snapshot, mcp__maestro__browser_read, mcp__maestro__browser_links, mcp__maestro__browser_click, mcp__maestro__browser_type, mcp__maestro__browser_screenshot, mcp__maestro__browser_evaluate, mcp__maestro__browser_scroll, mcp__maestro__browser_press_key, mcp__maestro__browser_click_at, mcp__maestro__browser_hover, mcp__maestro__browser_drag, mcp__maestro__browser_wait, mcp__maestro__browser_wait_for_selector, mcp__maestro__browser_find_by_role_name, mcp__maestro__browser_match_count, mcp__maestro__browser_open_tab, mcp__maestro__browser_list_tabs, mcp__maestro__browser_close_tab, mcp__maestro__browser_tab_url, mcp__maestro__browser_go_back, mcp__maestro__browser_go_forward, mcp__maestro__browser_console_messages, mcp__maestro__browser_network_requests, mcp__maestro__browser_upload_file, mcp__maestro__browser_download_url, mcp__maestro__browser_grab_image, mcp__maestro__browser_cookies_get, mcp__maestro__browser_cookies_set, mcp__maestro__browser_cookies_clear, mcp__maestro__browser_cdp, mcp__maestro__browser_pdf, mcp__maestro__browser_window_resize, mcp__maestro__browser_emulate_viewport, mcp__maestro__browser_clear_emulation, mcp__maestro__browser_session_start, mcp__maestro__browser_session_end]
+allowed-tools: [mcp__maestro__browser_status, mcp__maestro__browser_navigate, mcp__maestro__browser_snapshot, mcp__maestro__browser_read, mcp__maestro__browser_links, mcp__maestro__browser_click, mcp__maestro__browser_type, mcp__maestro__browser_screenshot, mcp__maestro__browser_evaluate, mcp__maestro__browser_scroll, mcp__maestro__browser_press_key, mcp__maestro__browser_click_at, mcp__maestro__browser_hover, mcp__maestro__browser_drag, mcp__maestro__browser_wait, mcp__maestro__browser_wait_for_selector, mcp__maestro__browser_find_by_role_name, mcp__maestro__browser_match_count, mcp__maestro__browser_resolve_box, mcp__maestro__browser_assert, mcp__maestro__browser_open_tab, mcp__maestro__browser_list_tabs, mcp__maestro__browser_close_tab, mcp__maestro__browser_tab_url, mcp__maestro__browser_go_back, mcp__maestro__browser_go_forward, mcp__maestro__browser_console_messages, mcp__maestro__browser_network_requests, mcp__maestro__browser_upload_file, mcp__maestro__browser_download_url, mcp__maestro__browser_grab_image, mcp__maestro__browser_save_image, mcp__maestro__browser_storage_get, mcp__maestro__browser_storage_set, mcp__maestro__browser_cookies_get, mcp__maestro__browser_cookies_set, mcp__maestro__browser_cookies_clear, mcp__maestro__browser_cdp, mcp__maestro__browser_pdf, mcp__maestro__browser_window_resize, mcp__maestro__browser_emulate_viewport, mcp__maestro__browser_clear_emulation, mcp__maestro__browser_session_start, mcp__maestro__browser_session_end]
 ---
 
 # Browser
@@ -43,7 +43,7 @@ mcp__maestro__browser_status
 
 This tells you: is a browser connected? which profile? what tab is open? If no profile is connected, ask the user to open the Mochi Chrome extension and pair it (the app shows the token under Settings → Browser extension). Do NOT silently fall back to WebFetch.
 
-## The 40+ tools, grouped
+## The 45+ tools, grouped
 
 ### Navigate
 - \`browser_navigate({url})\` — open URL in active session (creates one on demand).
@@ -59,6 +59,8 @@ This tells you: is a browser connected? which profile? what tab is open? If no p
 - \`browser_snapshot()\` — accessibility tree (roles, names, CSS refs). Capped at 24KB. Heavier than \`browser_read\` — use it when you need refs for clicking, not for bulk reading.
 - \`browser_find_by_role_name({role, name, exact?})\` — find ONE element by accessibility role + name (button "Submit", textbox "Search"). Works on heavy SPA DOM where CSS selectors fail. **The selector rescue.**
 - \`browser_match_count({ref})\` — how many elements match a CSS selector (with 5 samples). Diagnostic — call when a click "failed" to learn whether the selector hit 0, 1, or N.
+- \`browser_resolve_box({ref})\` — bounding box (x, y, w, h, visible). Use before \`browser_click_at\` for canvas/overlay clicks.
+- \`browser_assert({kind, target?, value?})\` — built-in page assertion (\`title-contains\`, \`url-contains\`, \`selector-visible\`, \`selector-count\`, \`text-present\`). Fail loudly instead of scraping text and second-guessing.
 - \`browser_screenshot({fullPage?, elementRef?, format?})\` — PNG/JPEG dataUrl. Element-scoped via elementRef; full-page via fullPage:true.
 - \`browser_console_messages({level?, since?, limit?, clear?})\` — captured console output (log/info/warn/error). Auto-attached.
 - \`browser_network_requests({urlContains?, method?, statusGte?, statusLt?, failedOnly?})\` — captured HTTP traffic with timings + status. Filter before reading.
@@ -80,6 +82,7 @@ This tells you: is a browser connected? which profile? what tab is open? If no p
 ### Power tools (use these — the user's real workflows need them)
 - \`browser_evaluate({expression, awaitPromise?, timeoutMs?})\` — run arbitrary JavaScript in the page (CDP Runtime.evaluate). The serializable result comes back as \`{ok, value}\`. **Unlocks anything the page CAN do but no other tool exposes.**
 - \`browser_grab_image({ref?, minSize?})\` — pick an \`<img>\` on the page, draw it onto a canvas, return its bytes as base64. Use to "save the image Gemini/ChatGPT/Midjourney generated" without a download button.
+- \`browser_save_image({dataUrl, filename})\` — write a data: URL (or raw base64) to disk under the project. Pair with \`browser_grab_image\` to one-shot extract → save without Bash + \`base64 -D\`.
 - \`browser_download_url({url, filename?, conflictAction?})\` — Chrome download. Saves to the user's Downloads folder; if you give \`saveToProjectAssets:true\`, it lands inside the project's assets/ folder.
 - \`browser_pdf({filename?, landscape?, paperWidth?, paperHeight?, scale?, printBackground?})\` — render the current page as a PDF (Page.printToPDF) and download it.
 - \`browser_cdp({method, params?})\` — **THE MASTER KEY.** Run any Chrome DevTools Protocol method on the active tab. Use when nothing else exposes what you need: Emulation.setGeolocationOverride, Network.setRequestInterception, Emulation.setCPUThrottlingRate, Accessibility.getFullAXTree, Storage.clearDataForOrigin, Network.setBlockedURLs, etc. Method names use "Domain.method" form — see https://chromedevtools.github.io/devtools-protocol/
@@ -88,6 +91,8 @@ This tells you: is a browser connected? which profile? what tab is open? If no p
 - \`browser_cookies_get({url?, name?, domain?})\` — read cookies. Use to check "is the user still logged in?", read a session id, debug auth.
 - \`browser_cookies_set({url, name, value, secure?, httpOnly?, sameSite?, expirationDate?})\` — write a cookie. Use to script logged-in fixtures, drop a session cookie, override a flag.
 - \`browser_cookies_clear({url?, name?, domain?})\` — remove cookies. Without \`name\`: clears every cookie matching the URL/domain. Use to fully sign a user out before a test.
+- \`browser_storage_get({area, key?})\` — read \`localStorage\` (\`area:"local"\`) or \`sessionStorage\` (\`area:"session"\`). With \`key\` returns one value, without returns ALL keys.
+- \`browser_storage_set({area, key, value})\` — write a value. Pass \`value:null\` to remove the key. Use to script test fixtures, override a feature flag, restore a saved state.
 
 ### Layout
 - \`browser_window_resize({width?, height?, left?, top?, state?})\` — move/resize the Chrome window.
@@ -131,8 +136,9 @@ Browser tools auto-retry once when the active profile drops briefly (the extensi
 \`\`\`
 browser_grab_image({ref: "img[alt*='generated' i]"})
    → { dataUrl: "data:image/png;base64,..." }
+browser_save_image({dataUrl: "<the dataUrl above>", filename: "assets/generated/01-login.png"})
 \`\`\`
-Then write the bytes to disk (Bash + base64 -D) with the filename the user wants.
+One round-trip, no Bash, no \`base64 -D\`. The path is project-relative by default.
 
 ### "Download the file that's behind a button"
 \`\`\`
