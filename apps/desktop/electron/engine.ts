@@ -1687,7 +1687,13 @@ export class LocalEngine {
         if (code !== 0) { reject(Object.assign(new Error(buf.trim().slice(-300) || `GitHub sign-in exited ${code ?? 'unknown'}.`), { statusCode: 500 })); return; }
         const token = ghTokenFrom(ghBin);
         if (!token) { reject(Object.assign(new Error('Signed in, but could not read the token back from gh.'), { statusCode: 500 })); return; }
-        this.providers!.connect('github', token)
+        // Best-effort encrypt to Keychain — but DON'T fail the whole sign-in
+        // if Safe Storage isn't trusted on this build (ad-hoc-signed apps
+        // whose Keychain ACL the user dismissed). The token lives on disk
+        // in `gh`'s hosts.yml, and `Providers.getLocalKey('github')` reads it
+        // from there as a fallback, so all downstream consumers (git/PR,
+        // githubStatus, feedbackCreateIssue) stay functional.
+        this.providers!.connect('github', token).catch(() => { /* Safe Storage unavailable — fall back to gh CLI as source-of-truth */ })
           .then(() => githubConnectionStatus(token))
           .then(resolve)
           .catch(reject);
