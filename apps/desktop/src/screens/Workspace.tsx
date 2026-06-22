@@ -17,6 +17,7 @@ import type { IconName } from '../lib/icons';
 import { displayCodename } from '../lib/git-types';
 import { SessionStateDot } from './SessionStateDot';
 import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
+import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
@@ -103,6 +104,18 @@ const KIND_META: { key: KindFilter; label: string; icon: IconName; tint: string 
 ];
 const kindOf = (k: KindFilter) => KIND_META.find(m => m.key === k) ?? KIND_META[0];
 
+/** A row in the per-tab context menu — icon + label + optional ⌘-shortcut hint. */
+function MenuRow({ icon, label, shortcut, onClick, tone = 'default' }: { icon: IconName; label: string; shortcut?: string; onClick: (e: React.MouseEvent) => void; tone?: 'default' | 'danger' | 'good' }) {
+  const color = tone === 'danger' ? 'var(--red, #ff3b30)' : tone === 'good' ? 'var(--green)' : 'var(--ink)';
+  return (
+    <button role="menuitem" className="ws-ovf-item" onClick={onClick} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color, font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
+      <Icon name={icon} size={14} style={{ flexShrink: 0, color: tone === 'default' ? 'var(--ink-secondary)' : color }} />
+      <span style={{ flex: 1, minWidth: 0 }}>{label}</span>
+      {shortcut && <span style={{ flexShrink: 0, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', letterSpacing: '0.04em' }}>{shortcut}</span>}
+    </button>
+  );
+}
+
 export default function Workspace() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -137,6 +150,11 @@ export default function Workspace() {
   const tabStripRef = React.useRef<HTMLDivElement>(null);
   const [tabsOverflow, setTabsOverflow] = React.useState(false);
   const [ovfOpen, setOvfOpen] = React.useState(false);
+  // Per-tab right-click context menu (Rename / Copy transcript / Close), à la Conductor.
+  const [tabMenu, setTabMenu] = React.useState<{ key: string; x: number; y: number } | null>(null);
+  const [menuCopied, setMenuCopied] = React.useState<TranscriptMode | null>(null); // ✓ flash inside the open menu
+  const [copyHint, setCopyHint] = React.useState<string | null>(null);             // transient toast after a copy
+  const copyHintTimer = React.useRef<number | null>(null);
   // active chat's turns, lifted from each ChatThread, for the "Changed files" panel
   const [turnsByTab, setTurnsByTab] = React.useState<Record<string, Job[]>>({});
   // Sessions with a job running/pending right now — drives the sidebar loading spinners.
@@ -389,6 +407,47 @@ export default function Workspace() {
     setTabs(ts => ts.map(t => (t.sessionId === id ? { ...t, title } : t)));
     void api.renameSession(id, title).catch(() => {});
   };
+
+  // ── Copy transcript (concise | full) — the chat tab's context menu, à la Conductor ──
+  const showCopyHint = (msg: string) => {
+    setCopyHint(msg);
+    if (copyHintTimer.current) window.clearTimeout(copyHintTimer.current);
+    copyHintTimer.current = window.setTimeout(() => setCopyHint(null), 1700);
+  };
+  const copyTranscript = async (tab: Tab, mode: TranscriptMode) => {
+    if (!tab.sessionId) { showCopyHint('Send a message first'); return; }
+    try {
+      // The active tab's turns are already lifted into turnsByTab (live); fall back to a fetch.
+      const cached = turnsByTab[tab.key];
+      const jobs = cached && cached.length ? cached : await api.listJobs(undefined, tab.sessionId);
+      if (!jobs.length) { showCopyHint('Nothing to copy yet'); return; }
+      await navigator.clipboard?.writeText(formatTranscript(jobs, { mode, title: tab.title }));
+      showCopyHint(mode === 'concise' ? 'Copied concise transcript' : 'Copied full transcript');
+    } catch { showCopyHint('Copy failed'); }
+  };
+  const openTabMenu = (e: React.MouseEvent, t: Tab) => {
+    e.preventDefault(); e.stopPropagation();
+    setActiveKey(t.key); setMenuCopied(null);
+    setTabMenu({ key: t.key, x: e.clientX, y: e.clientY });
+  };
+  const doMenuCopy = (t: Tab, mode: TranscriptMode) => {
+    void copyTranscript(t, mode);
+    setMenuCopied(mode); // ✓ flashes on the row, then the menu closes
+    window.setTimeout(() => { setTabMenu(null); setMenuCopied(null); }, 620);
+  };
+  // ⌘⌥C → copy the active chat's concise transcript. Option+C emits 'ç', so match e.code.
+  // (A custom chord with no native-menu accelerator, so preventDefault is reliable —
+  //  unlike ⌘W, which Electron's default menu owns as Close Window.)
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey && e.altKey && !e.ctrlKey && !e.shiftKey && e.code === 'KeyC') {
+        const t = tabs.find(x => x.key === activeKey);
+        if (t && (t.kind === 'chat' || !t.kind) && t.sessionId) { e.preventDefault(); void copyTranscript(t, 'concise'); }
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [tabs, activeKey, turnsByTab]); // re-bind so the handler reads fresh tabs/turns
 
   // Filtering: by project kind + a fuzzy name search over projects AND chats.
   const q = query.trim().toLowerCase();
@@ -674,7 +733,7 @@ export default function Workspace() {
                 const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
                 const editing = chatTab && renamingId === t.sessionId;
                 return (
-                  <div key={t.key} data-tabkey={t.key} className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)}
+                  <div key={t.key} data-tabkey={t.key} className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)} onContextMenu={e => openTabMenu(e, t)}
                     style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
                       borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
                     {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: projColor(p) }} />}
@@ -742,6 +801,38 @@ export default function Workspace() {
               <Icon name="plus" size={16} stroke={2.4} />
             </button>
           </div>
+
+          {/* Per-tab context menu (right-click) — Rename / Copy concise (⌘⌥C) / Copy full / Close. */}
+          {tabMenu && (() => {
+            const t = tabs.find(x => x.key === tabMenu.key);
+            if (!t) return null;
+            const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
+            const MENU_W = 234;
+            const left = Math.max(8, Math.min(tabMenu.x, window.innerWidth - MENU_W - 8));
+            const top = Math.min(tabMenu.y, window.innerHeight - 196);
+            return (
+              <>
+                <div onClick={() => setTabMenu(null)} onContextMenu={e => { e.preventDefault(); setTabMenu(null); }} style={{ position: 'fixed', inset: 0, zIndex: 60 }} />
+                <div role="menu" style={{ position: 'fixed', left, top, zIndex: 61, minWidth: MENU_W, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--card-shadow)', padding: 5 }}>
+                  {chatTab && <MenuRow icon="pencil" label="Rename chat" onClick={() => { setTabMenu(null); setActiveKey(t.key); setRenamingId(t.sessionId!); setRenameVal(t.title); }} />}
+                  {chatTab && <MenuRow icon={menuCopied === 'concise' ? 'check' : 'command'} tone={menuCopied === 'concise' ? 'good' : 'default'} label={menuCopied === 'concise' ? 'Copied' : 'Copy concise transcript'} shortcut="⌘⌥C" onClick={() => doMenuCopy(t, 'concise')} />}
+                  {chatTab && <MenuRow icon={menuCopied === 'full' ? 'check' : 'file'} tone={menuCopied === 'full' ? 'good' : 'default'} label={menuCopied === 'full' ? 'Copied' : 'Copy full transcript'} onClick={() => doMenuCopy(t, 'full')} />}
+                  {chatTab && <div style={{ height: 1, background: 'var(--separator)', margin: '4px 8px' }} />}
+                  <MenuRow icon="x" label="Close tab" onClick={() => { setTabMenu(null); closeTab(t.key); }} />
+                </div>
+              </>
+            );
+          })()}
+
+          {/* Transient confirmation after a copy (covers the keyboard ⌘⌥C path too). */}
+          {copyHint && (
+            <div style={{ position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)', zIndex: 70, display: 'flex', alignItems: 'center', gap: 7,
+              padding: '8px 14px', borderRadius: 10, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)',
+              font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', pointerEvents: 'none' }}>
+              <Icon name={copyHint.startsWith('Copied') ? 'check' : 'command'} size={13} stroke={2.6} style={{ color: copyHint.startsWith('Copied') ? 'var(--green)' : 'var(--ink-secondary)' }} />
+              {copyHint}
+            </div>
+          )}
 
           {/* panes (chat or file — all kept mounted) + the right-side files panel */}
           <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
