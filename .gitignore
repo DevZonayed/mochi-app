@@ -36,8 +36,21 @@ release/
 *.sqlite-wal
 *.sqlite-shm
 
-# operator-local skills installed via add_skill_to_project
-.claude/
+# .claude — PRECISE ignore-list. We TRACK skills/, settings.json, CLAUDE.md
+# (project memory survives a fresh clone on a new Mac); we IGNORE Mac-local
+# transcripts, caches, and operator-private overrides.
+.claude/settings.local.json
+.claude/projects/
+.claude/.cache/
+.claude/shell-snapshots/
+.claude/todos/
+.claude/statsig/
+.claude/worktrees/
+.claude/*.local.json
+
+# .continuum — TRACK STATE.md + chain/ (project memory); IGNORE the operator's
+# pasted-image stash (Mac-local, can be large + private).
+.continuum/Attachment/
 
 # env / secrets
 .env
@@ -46,7 +59,6 @@ release/
 
 # tooling / local state
 .context/
-.continuum/
 .playwright-cli/
 .DS_Store
 *.log
