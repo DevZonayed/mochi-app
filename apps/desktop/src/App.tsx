@@ -3,6 +3,7 @@ import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { UpdateBanner } from './lib/UpdateBanner';
 import { NotificationCenter } from './lib/notify';
 import { RemotePairGate } from './lib/RemotePairGate';
+import { PrActionConfirmDialog } from './screens/PrActionConfirmDialog';
 import { IS_LOCAL } from './lib/api';
 import { hasSession, onAuthChange, primeSession } from './lib/auth';
 
@@ -106,6 +107,10 @@ export function App() {
       </React.Suspense>
       <UpdateBanner />
       <NotificationCenter />
+      {/* Mac-local: hard-button gate for the agent's pr_merge / pr_resolve_conflicts.
+          Subscribes to `pr-confirm-request` events and re-invokes the existing
+          mergeSessionPR / resolveSession IPC handlers after a HUMAN click. */}
+      {IS_LOCAL && <PrActionConfirmDialog />}
       </RemotePairGate>
       </AccountGate>
     </HashRouter>
