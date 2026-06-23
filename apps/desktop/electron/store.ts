@@ -249,6 +249,70 @@ export interface Schedule {
   catchUp?: boolean; catchUpWindowMs?: number; lastDueAt?: number; lastFireLate?: boolean;
 }
 
+/** A background "watch" the agent places on the active browser tab: evaluate
+    `condition` (a JS expression returning a boolean) every `intervalMs` and,
+    when it first becomes true, post `message` (and optional context) as a NEW
+    turn into the originating chat — starting a fresh agent turn that has the
+    full session memory + tools.
+
+    Survives:
+      - the agent's current turn ending (the watcher lives on the desktop, not
+        in the model loop)
+      - the desktop restarting (persisted in the store; resumed on boot)
+      - the active extension profile dropping briefly (the watcher pauses the
+        evaluation step, doesn't expire, picks back up when a profile returns)
+
+    Hard-bounded by `expiresAt` so a forgotten watch never runs forever.
+    `repeat:false` (default) auto-cancels after the first fire so the agent
+    doesn't get N identical notifications. `repeat:true` keeps watching and
+    fires every time the condition transitions false→true. */
+export interface BrowserWatch {
+  id: string;
+  projectId: string;
+  sessionId: string;
+  /** Human label shown in UI + included in the fire-message. */
+  title: string;
+  /** A JS expression evaluated in the page via CDP Runtime.evaluate. Must return
+      a truthy/falsy value (or a Promise resolving to one — `awaitPromise:true`). */
+  condition: string;
+  /** Optional one-line note from the agent — surfaced in the chat when the
+      condition fires, so the next-turn agent knows what to do about it. */
+  message?: string;
+  intervalMs: number;
+  /** Absolute deadline. The watcher auto-cancels at this timestamp regardless of
+      whether the condition ever fired. */
+  expiresAt: number;
+  /** When false (default), the watch auto-cancels after the first fire. When
+      true, the watcher keeps polling and fires again every time the result
+      transitions from false→true (it does NOT spam while the condition stays true). */
+  repeat: boolean;
+  createdAt: number;
+  /** ── runtime state (mutated each tick, persisted lazily) ── */
+  /** False once the watcher cancels (expired, fired-once-non-repeat, or
+      explicitly cancelled). Keeps the row around for the UI history list. */
+  active: boolean;
+  /** Wall-clock ms at the last eval; null until the first tick. */
+  lastEvalAt?: number;
+  /** Last raw evaluation result (for the UI: agent can see 'no-browser' vs.
+      'error' vs. 'false' to debug a stuck watch). */
+  lastResult?: 'true' | 'false' | 'error' | 'no-browser';
+  /** Last error string (when lastResult==='error'). */
+  lastError?: string;
+  /** How many times the condition has fired. For repeat:false watches this is
+      always 0 or 1. */
+  fireCount: number;
+  /** Wall-clock ms of the most recent fire; null until the first fire. */
+  lastFiredAt?: number;
+  /** Job id of the last fire's posted chat message (so the UI can deep-link
+      from the watch row back to the message that opened the new turn). */
+  lastJobId?: string;
+  /** Edge-detection state: the previous result, so repeat:true only fires on a
+      false→true transition (not every poll while the condition is still true). */
+  lastWasTrue?: boolean;
+  /** Cancellation cause shown in the UI history. */
+  cancelReason?: 'manual' | 'expired' | 'fired-once' | 'invalid-condition';
+}
+
 export type EngineId = 'claude' | 'codex';
 /** A model-level role choice: which engine + (optional) model id runs the role.
     `model` omitted = the engine's own default (Claude plan default / Codex default). */
@@ -503,6 +567,10 @@ interface StoreData {
   sessions: ChatSession[];
   approvals: Approval[];
   schedules: Schedule[];
+  /** Agent-placed browser watches (background poll of a CSS selector / JS
+      condition that posts a NEW chat message when the criteria becomes true).
+      See BrowserWatch + browser-watch.ts. Mac-local; not relayed. */
+  browserWatches?: BrowserWatch[];
   skills: Skill[];
   templates: Template[];
   assets: Asset[];
@@ -693,6 +761,7 @@ export class Store {
       if (!this.data.briefs) { this.data.briefs = []; dirty = true; }
       if (!this.data.researchRuns) { this.data.researchRuns = []; dirty = true; }
       if (!this.data.events) { this.data.events = []; dirty = true; }
+      if (!this.data.browserWatches) { this.data.browserWatches = []; dirty = true; }
       if (!this.data.tombstones) { this.data.tombstones = []; dirty = true; }
       // Backfill `updatedAt` on entities written by an older build (delta-sync
       // protocol needs it on every row, but it's been added incrementally).
@@ -747,7 +816,7 @@ export class Store {
         deckId: id(), deckSecret: id(), accessToken: newPairingToken(), extensionToken: newPairingToken(),
         routing: { ...DEFAULT_ROUTING }, settings: { ...DEFAULT_SETTINGS }, catalogVersion: CATALOG_VERSION,
         workspace: null,
-        projects: [], jobs: [], sessions: [], approvals: [], schedules: [], skills: [], templates: [],
+        projects: [], jobs: [], sessions: [], approvals: [], schedules: [], browserWatches: [], skills: [], templates: [],
         assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
         tombstones: [],
         chatBindings: [], pendingChats: [], commEvents: [], feedback: [],
@@ -1570,6 +1639,63 @@ export class Store {
       if (s.kind === 'whatsapp-analyze' && s.chatId === chatId && s.enabled) { s.enabled = false; s.nextRun = null; }
     }
     this.save();
+  }
+
+  // ── Browser watches (background "observe an element / condition") ───
+  /** Active + history rows, newest first. Pass `activeOnly` to filter. */
+  listBrowserWatches(opts?: { activeOnly?: boolean; sessionId?: string; projectId?: string }): BrowserWatch[] {
+    const arr = this.data.browserWatches ?? [];
+    let out = [...arr].sort((a, b) => b.createdAt - a.createdAt);
+    if (opts?.activeOnly) out = out.filter(w => w.active);
+    if (opts?.sessionId) out = out.filter(w => w.sessionId === opts.sessionId);
+    if (opts?.projectId) out = out.filter(w => w.projectId === opts.projectId);
+    return out;
+  }
+  createBrowserWatch(input: {
+    projectId: string; sessionId: string; title: string;
+    condition: string; message?: string;
+    intervalMs: number; expiresAt: number; repeat?: boolean;
+  }): BrowserWatch {
+    if (!this.data.browserWatches) this.data.browserWatches = [];
+    const rec: BrowserWatch = {
+      id: id(), projectId: input.projectId, sessionId: input.sessionId,
+      title: input.title, condition: input.condition,
+      ...(input.message ? { message: input.message } : {}),
+      intervalMs: input.intervalMs, expiresAt: input.expiresAt,
+      repeat: !!input.repeat,
+      createdAt: now(), active: true, fireCount: 0,
+    };
+    this.data.browserWatches.push(rec);
+    this.save();
+    return rec;
+  }
+  /** Patch a watch's runtime state (lastEvalAt/lastResult/lastError/fireCount/
+      lastFiredAt/lastJobId/lastWasTrue/active/cancelReason). */
+  updateBrowserWatch(watchId: string, patch: Partial<Pick<BrowserWatch,
+    'active' | 'lastEvalAt' | 'lastResult' | 'lastError' | 'fireCount'
+    | 'lastFiredAt' | 'lastJobId' | 'lastWasTrue' | 'cancelReason'>>): BrowserWatch {
+    const w = (this.data.browserWatches ?? []).find(x => x.id === watchId);
+    if (!w) throw Object.assign(new Error('browser watch not found'), { statusCode: 404 });
+    Object.assign(w, patch);
+    this.save();
+    return w;
+  }
+  /** Cancel a watch (marks inactive + records the cause). Idempotent. */
+  cancelBrowserWatch(watchId: string, reason: BrowserWatch['cancelReason'] = 'manual'): BrowserWatch | null {
+    const w = (this.data.browserWatches ?? []).find(x => x.id === watchId);
+    if (!w) return null;
+    if (w.active) { w.active = false; w.cancelReason = reason; this.save(); }
+    return w;
+  }
+  /** Hard-delete a watch (UI "clear from history"). Returns true if a row was removed. */
+  removeBrowserWatch(watchId: string): boolean {
+    const arr = this.data.browserWatches;
+    if (!arr) return false;
+    const i = arr.findIndex(x => x.id === watchId);
+    if (i < 0) return false;
+    arr.splice(i, 1);
+    this.save();
+    return true;
   }
 
   // ── Skills / Templates ─────────────────────────────────────────────
