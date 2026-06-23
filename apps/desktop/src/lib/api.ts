@@ -542,6 +542,17 @@ export interface CommsStatus {
   whatsapp: { connected: boolean; jid: string | null; name: string | null; tracked: number; sendApproved: boolean };
 }
 export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
+/** Confirmation-card metadata for the in-workspace add-project "Clone from
+    GitHub" tab. Filled by gh repo view before the user commits to a clone. */
+export interface GithubRepoMetadata {
+  name: string;
+  fullName: string;
+  description: string;
+  defaultBranch: string;
+  isPrivate: boolean;
+  htmlUrl: string;
+  sshUrl: string;
+}
 export interface FolderInspect { ok: boolean; path: string; info: RepoInfo; error?: string }
 export type CloneEvent =
   | { phase: 'start'; url: string }
@@ -907,6 +918,10 @@ export const api = {
   cloneRepo: (input: { url: string; dest: string; name?: string; dirName?: string; instructions?: string; color?: string }) =>
     call<Project>('cloneRepo', { ...input }, () =>
       req<Project>('/api/projects/clone', { method: 'POST', body: JSON.stringify(input) })),
+  /** Resolve owner/repo into a confirmation-card payload BEFORE cloning. Uses
+      the bundled `gh` (desktop-only — gh isn't a remote-control concern). */
+  githubRepoMetadata: (input: { owner: string; repo: string }) =>
+    call<GithubRepoMetadata>('githubRepoMetadata', { ...input }, () => Promise.reject(new Error('desktop only'))),
   getProjectRepo: (id: string) =>
     call<RepoInfo>('getProjectRepo', { id }, () => req<RepoInfo>(`/api/projects/${encodeURIComponent(id)}/repo`)),
   // GitHub-first project bootstrap (desktop-only; the renderer drives the UI).
