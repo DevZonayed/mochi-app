@@ -146,6 +146,13 @@ export interface Job {
   engine?: EngineId;
   model?: string;
   goal?: boolean;
+  /** Epoch ms when a session-scoped ScheduleWakeup will resume the model. While
+      set and in the future, the SDK iterator is open but dormant — the UI
+      treats this as "session closed, auto-resumes at this time" (like a
+      scheduled message) so it doesn't show "Responding…" for the dormant gap. */
+  pausedUntil?: number | null;
+  /** What's keeping the job paused. Currently only 'wakeup'. */
+  pausedReason?: 'wakeup' | null;
   createdAt: number;
   updatedAt: number;
 }
