@@ -5,9 +5,9 @@
 import { existsSync } from 'node:fs';
 import type { Store, ChatSession, Project } from './store.js';
 import type { Providers } from './providers.js';
-import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug, listConflictedFiles } from './git.js';
+import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug, listConflictedFiles, dirtyFileCount, lastCommitInfo } from './git.js';
 import { parseGitHubRemote, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, getRepo, pickMergeMethod } from './github.js';
-import { deriveState, type LocalState, type PrStatus, type SessionGitStatus, type MergePreviewResult, type ResolvePreviewResult } from './pr-state.js';
+import { deriveState, type LocalState, type LocalSnapshot, type PrStatus, type SessionGitStatus, type MergePreviewResult, type ResolvePreviewResult } from './pr-state.js';
 
 type Emit = (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => void;
 const EMPTY_LOCAL: LocalState = { isRepo: false, ahead: 0, behind: 0, dirty: false, pushed: false };
@@ -64,6 +64,14 @@ export class GitService {
     }
   }
 
+  /** Last-commit + dirty-file snapshot, populated for repos only. The
+      dock surfaces this in its expanded body; absent on no-repo. */
+  private snapshotFor(dir: string | null): LocalSnapshot | undefined {
+    if (!dir) return undefined;
+    const { subject, at } = lastCommitInfo(dir);
+    return { lastSubject: subject, lastCommitAt: at, dirtyFiles: dirtyFileCount(dir) };
+  }
+
   /** Compute (optionally with a live PR fetch), cache, and emit the status. */
   async fullStatus(session: ChatSession, opts: { withPr?: boolean } = {}): Promise<SessionGitStatus> {
     const project = this.store.getProject(session.projectId);
@@ -80,6 +88,7 @@ export class GitService {
       pr,
       state: deriveState(local, pr),
       lastCheckedAt: Date.now(),
+      snapshot: this.snapshotFor(dir),
     };
     this.cache.set(session.id, status);
     this.emit('git-status', status);
