@@ -28,6 +28,11 @@ export interface LocalSnapshot {
   lastCommitAt: number | null;
   dirtyFiles: number;
 }
+export interface LocalSnapshot {
+  lastSubject: string | null;
+  lastCommitAt: number | null;
+  dirtyFiles: number;
+}
 export interface SessionGitStatus {
   sessionId: string;
   branch: string | null;
@@ -71,6 +76,22 @@ export interface PrConfirmRequest {
   sessionId: string | null;
   /** MergePreview when action === 'pr_merge'; ResolvePreview otherwise. */
   preview: MergePreview | ResolvePreview;
+}
+
+/* ── Conflict hunks (T8) — renderer mirror of electron/git.ts ConflictHunk ── */
+export interface ConflictHunk {
+  startLine: number;
+  endLine: number;
+  oursLabel: string;
+  theirsLabel: string;
+  ours: string[];
+  base?: string[];
+  theirs: string[];
+}
+export interface ConflictFile {
+  path: string;
+  hunks: ConflictHunk[];
+  unreadable?: boolean;
 }
 
 /* ── Codename / state helpers — pure, shared by every UI surface ───────── */

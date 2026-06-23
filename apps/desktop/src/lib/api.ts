@@ -6,7 +6,7 @@
    falls back to REST against the relay server, which mirrors the Mac's pushed
    state and forwards commands to it — the web app is a remote control. */
 
-import type { SessionGitStatus, GithubConnection, MergePreviewResult, ResolvePreviewResult, PrConfirmRequest } from './git-types';
+import type { SessionGitStatus, GithubConnection, MergePreviewResult, ResolvePreviewResult, PrConfirmRequest, ConflictFile } from './git-types';
 
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
@@ -102,6 +102,10 @@ export interface ChatSession {
     mergedAt?: number;
     baseRefName?: string;
   };
+  /** T8 — last "additional instructions" the operator typed in the AI
+      conflict-resolve dialog for this chat. Pre-fills the textarea on
+      re-runs. Capped at 2KB by the IPC handler. */
+  conflictResolveHint?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -1369,6 +1373,17 @@ export const api = {
   previewSessionResolve: (sessionId: string) =>
     call<ResolvePreviewResult>('previewSessionResolve', { sessionId }, () =>
       req<ResolvePreviewResult>(`/api/sessions/${sessionId}/preview-resolve`, { method: 'POST' })),
+  /** T8 — read-only enumeration of the current worktree's conflict hunks for
+      the AI-resolve dialog's preview. Local-only (no relay route — phones
+      can't drive a manual merge resolve anyway). */
+  getConflictHunks: (sessionId: string) =>
+    call<{ files: ConflictFile[]; reason?: string }>('getConflictHunks', { sessionId },
+      () => Promise.reject(new ApiError(403, 'Conflict resolution is only available in the desktop app'))),
+  /** T8 — persist the operator's "additional instructions" for this chat so
+      re-runs pre-fill the textarea. Empty string clears the hint. */
+  setConflictResolveHint: (sessionId: string, hint: string) =>
+    call<unknown>('setConflictResolveHint', { sessionId, hint },
+      () => Promise.reject(new ApiError(403, 'Conflict resolution is only available in the desktop app'))),
   renameSessionBranch: (sessionId: string) =>
     call<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>('renameSessionBranch', { sessionId }, () =>
       req<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>(`/api/sessions/${sessionId}/rename-branch`, { method: 'POST' })),

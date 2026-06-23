@@ -239,6 +239,12 @@ export interface ChatSession {
     mergedAt?: number;
     baseRefName?: string;
   };
+  /** T8: last "additional instructions" the operator typed into the AI
+      conflict-resolve dialog for THIS chat. Pre-fills the textarea on
+      re-runs so repeat operators don't have to re-type the same hint
+      ("prefer master's schema migration", etc.). Plain string — verbatim
+      forwarded to the agent, no parsing. Capped at 2KB by the IPC handler. */
+  conflictResolveHint?: string;
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
@@ -1149,7 +1155,7 @@ export class Store {
     this.data.sessions.push(s); this.save();
     return s;
   }
-  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt' | 'codename' | 'branchRenamedAt' | 'autoPilot' | 'reviewerEnabled'>>): ChatSession {
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt' | 'codename' | 'branchRenamedAt' | 'autoPilot' | 'reviewerEnabled' | 'conflictResolveHint'>>): ChatSession {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     Object.assign(s, patch, { updatedAt: now() });
