@@ -12,6 +12,11 @@ export interface DeviceTable {
   name: string;
   platform: string;
   deck_id: string | null;
+  /** Expo push token registered by a remote so the account-scoped relay can wake
+      the closed app on alert-worthy host events (job done/failed, approval,
+      schedule-late). NULL when the device hasn't registered (e.g. host devices,
+      simulators, or Expo Go on Android — see apps/mobile/src/push.ts). */
+  push_token: string | null;
   last_seen_at: Date;
   created_at: Date;
   updated_at: Date;

@@ -14,6 +14,7 @@ import { forwardCommand } from './routing.js';
 import { routeSignal, turnCredentials } from './webrtc.js';
 import { registerHostWs } from './wsHost.js';
 import { registerRemoteWs } from './wsRemote.js';
+import { registerPushToken, unregisterPushToken } from './push.js';
 
 /** Run all migrations (device + Better Auth). Call before listen(). */
 export async function migrateAll(): Promise<void> {
@@ -64,6 +65,35 @@ export function buildAccountServer(): FastifyInstance {
     const { toDeviceId, signal } = (req.body ?? {}) as { toDeviceId?: string; signal?: unknown };
     await routeSignal(userId, deviceIdOf(req) ?? '', toDeviceId ?? '', signal);
     return { ok: true };
+  });
+
+  // ── Closed-app push registration ────────────────────────────────────────
+  // The remote (phone) registers its Expo push token here so the relay can
+  // wake the closed app on alert-worthy host events (see push.ts). The token
+  // is stored on the caller's device row (must already exist via wsRemote
+  // upsertDevice on its first WS connect) and is account-scoped — another
+  // account's token can never be steered here. 400 instead of a silent 200
+  // when the device id is missing so the mobile client logs a real error.
+  app.post('/api/push/register', async (req, reply) => {
+    const userId = (req as ReqWithUser).userId as string;
+    const deviceId = deviceIdOf(req);
+    const { token } = (req.body ?? {}) as { token?: string };
+    if (!deviceId) { await reply.code(400).send({ error: 'x-maestro-device-id header required' }); return; }
+    if (typeof token !== 'string' || !token.trim()) { await reply.code(400).send({ error: 'token required' }); return; }
+    // The device row may not exist yet (the WS is gated on picking an active
+    // host, so on first sign-in the registration call lands BEFORE the WS).
+    // Pass the device label so registerPushToken's UPSERT can seed the row.
+    const name = typeof req.headers['x-maestro-device'] === 'string' ? (req.headers['x-maestro-device'] as string) : '';
+    const platform = typeof req.headers['x-maestro-platform'] === 'string' ? (req.headers['x-maestro-platform'] as string) : '';
+    const ok = await registerPushToken(userId, deviceId, token, name, platform);
+    return { ok, deviceId };
+  });
+  app.post('/api/push/unregister', async (req, reply) => {
+    const userId = (req as ReqWithUser).userId as string;
+    const deviceId = deviceIdOf(req);
+    if (!deviceId) { await reply.code(400).send({ error: 'x-maestro-device-id header required' }); return; }
+    const ok = await unregisterPushToken(userId, deviceId);
+    return { ok, deviceId };
   });
 
   // Generic account-scoped command forward. The legacy /api/jobs|projects|… routes

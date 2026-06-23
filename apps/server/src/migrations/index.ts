@@ -1,5 +1,6 @@
 import type { Kysely } from 'kysely';
 import * as m0001 from './0001_devices.js';
+import * as m0002 from './0002_push_token.js';
 
 /** A migration applied idempotently on boot (see db.runMigrations). */
 export interface Migration {
@@ -12,4 +13,5 @@ export interface Migration {
 /** Name→migration map (names sort lexicographically). */
 export const migrations: Record<string, Migration> = {
   '0001_devices': m0001,
+  '0002_push_token': m0002,
 };

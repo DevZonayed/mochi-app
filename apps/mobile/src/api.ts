@@ -267,6 +267,10 @@ async function accountReq<T>(path: string, init?: RequestInit): Promise<T> {
         ...(token ? { authorization: `Bearer ${token}` } : {}),
         'x-maestro-device': DEVICE_NAME,
         'x-maestro-device-id': getDeviceId(),
+        // Platform tag so the relay can seed the device row on the FIRST
+        // /api/push/register (which lands before the /ws/remote ever opens —
+        // see push.ts on the server). Cheap to send on every request.
+        'x-maestro-platform': DEVICE_PLATFORM,
         ...(init?.headers ?? {}),
       },
     });
@@ -487,10 +491,13 @@ export const api = {
   submitFeedback: (input: { category: 'bug' | 'idea' | 'other'; message: string }) =>
     cmd<{ id: string }>('submitFeedback', { ...input, source: 'phone' }),
 
-  /** Register this phone's Expo push token so the server can alert a CLOSED app. */
-  registerPush: (token: string) => accountReq<{ ok: boolean; devices: number }>('/api/push/register', { method: 'POST', body: JSON.stringify({ token }) }),
-  /** Drop this phone's push token (called on sign-out). */
-  unregisterPush: (token: string) => accountReq<{ ok: boolean; devices: number }>('/api/push/unregister', { method: 'POST', body: JSON.stringify({ token }) }),
+  /** Register this phone's Expo push token so the server can alert a CLOSED
+      app. Server identifies the device via the x-maestro-device-id header
+      (sent by accountReq on every call) — the body just carries the token. */
+  registerPush: (token: string) => accountReq<{ ok: boolean; deviceId: string }>('/api/push/register', { method: 'POST', body: JSON.stringify({ token }) }),
+  /** Drop this phone's push token (called on sign-out). The relay identifies
+      the device from the x-maestro-device-id header — no body needed. */
+  unregisterPush: () => accountReq<{ ok: boolean; deviceId: string }>('/api/push/unregister', { method: 'POST', body: '{}' }),
 
   /** The phone's outbox — intents dispatched this session, newest first. */
   outbox: (): OutboxEntry[] => outboxLog.slice(),
