@@ -406,6 +406,23 @@ export function isDirty(dir: string): boolean {
   return r.ok && r.out.length > 0;
 }
 
+/** Count of modified/added/deleted files (porcelain rows). 0 when clean. */
+export function dirtyFileCount(dir: string): number {
+  const r = execGit(['-C', dir, 'status', '--porcelain']);
+  if (!r.ok || !r.out) return 0;
+  return r.out.split('\n').filter(line => line.length > 0).length;
+}
+
+/** First line of `git log -1 --format=%s\\n%at` for the current HEAD. Returns
+    null subject + null time when the branch has no commits. */
+export function lastCommitInfo(dir: string): { subject: string | null; at: number | null } {
+  const r = execGit(['-C', dir, 'log', '-1', '--format=%s%n%at']);
+  if (!r.ok || !r.out) return { subject: null, at: null };
+  const [subject = '', atStr = ''] = r.out.split('\n');
+  const at = Number(atStr) * 1000;
+  return { subject: subject || null, at: Number.isFinite(at) && at > 0 ? at : null };
+}
+
 /** Whether `remote` has `branch` (via ls-remote; works for file:// remotes in tests). */
 export function remoteHasBranch(repoDir: string, remote: string, branch: string): boolean {
   const r = execGit(['-C', repoDir, 'ls-remote', '--heads', remote, branch], { timeout: 30_000 });

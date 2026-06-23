@@ -25,6 +25,7 @@ import { discoverMemoryRepo } from './memory-repo.js';
 import { bootstrapNewProject, bootstrapProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
 import { openProjectMemory, closeMemoryWatcher } from './project-lifecycle.js';
 import type { GitService } from './git-service.js';
+import type { GitWatcher } from './git-watcher.js';
 import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { saveAttachment, substitutePlaceholders } from './attachments.js';
@@ -110,7 +111,7 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null) {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null, gitWatcher?: GitWatcher) {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -455,6 +456,9 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
             try { pruneSessionWorktree({ repoDir: proj.path, worktreeRoot: worktreeRootDir(), projectId: proj.id, sessionId: s.id, branch: s.branch, deleteBranch: false }); } catch { /* best effort */ }
           }
         }
+        // Stop the git filesystem watcher BEFORE the row vanishes — the
+        // watcher holds an fd into `.git`, which would dangle on prune.
+        try { gitWatcher?.detach(String(p.id ?? '')); } catch { /* best effort */ }
         store.deleteSession(String(p.id ?? ''));
         emit('session', { id: String(p.id ?? ''), deleted: true });
         return { ok: true };
@@ -491,6 +495,9 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (proj?.path && s.worktreePath) {
           try { pruneSessionWorktree({ repoDir: proj.path, worktreeRoot: worktreeRootDir(), projectId: proj.id, sessionId: s.id, branch: s.branch, deleteBranch: p.deleteBranch === true }); } catch { /* best effort */ }
         }
+        // The worktree is gone — close the watcher BEFORE the directory disappears
+        // so its underlying fds don't dangle and trigger spurious EPERM on macOS.
+        try { gitWatcher?.detach(s.id); } catch { /* best effort */ }
         const updated = store.updateSession(s.id, { archivedAt: Date.now(), worktreePath: undefined });
         emit('session', updated);
         return updated;
@@ -500,12 +507,18 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? ''));
         if (!s) return bad('session not found', 404);
+        // Lazy-attach the filesystem watcher on the first read for this session
+        // so live `.git` mutations (commit/push/checkout) push status updates
+        // back through the renderer's git-status event channel — without the
+        // UI having to poll. Idempotent; no-op once attached.
+        try { gitWatcher?.attach(s.id); } catch { /* best effort */ }
         return gitService.fullStatus(s, { withPr: p.withPr !== false });
       }
       case 'refreshSessionGitStatus': {
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? ''));
         if (!s) return bad('session not found', 404);
+        try { gitWatcher?.attach(s.id); } catch { /* best effort */ }
         return gitService.fullStatus(s, { withPr: true });
       }
       // ── PR actions (DESKTOP-ONLY, outward — UI confirms before calling) ─
