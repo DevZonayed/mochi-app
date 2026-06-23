@@ -24,6 +24,7 @@ import { isRemoteBlocked } from './remote-guard.js';
 import { buildIceServers } from '@maestro/realtime';
 import type { Envelope, ConnState } from '@maestro/realtime';
 import { CronRunner } from './cron.js';
+import { BrowserWatcher } from './browser-watch.js';
 import { runSmoke } from './smoke.js';
 import { Updater } from './updater.js';
 import { setEnginesRoot } from './engines.js';
@@ -510,12 +511,25 @@ app.whenReady().then(() => {
   const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs), makeWhatsappAnalyzer({ store, engine, client: whatsapp, emit }));
   engine.setCron(cron); // so the agent's schedule_* tools manage + fire through this runner
   cron.start();
+  // Background browser watcher — the agent-placed "observe an element / condition"
+  // poll that posts a NEW chat turn when the criteria fire. Runs on the desktop
+  // (not in the agent loop) so it survives turn end + desktop restarts. Uses the
+  // SAME extension bridge for evaluation and the SAME dispatch path for posting
+  // chat messages — no new transport, no new auth.
+  const browserWatcher = new BrowserWatcher({
+    store,
+    bridge: extensionBridge,
+    dispatch,
+    emit: (name, payload) => emit(name, payload, { desktopOnly: true }),
+  });
+  engine.setBrowserWatcher(browserWatcher); // hand it to the agent's MCP tools
+  browserWatcher.start();
   // Poll PR/git status for active sessions; the renderer + phone update via git-status events.
   const gitPoll = setInterval(() => { for (const s of gitService.pollable()) void gitService.fullStatus(s, { withPr: true }).catch(() => { /* transient */ }); }, 30_000);
   // Auto-update (electron-updater → GitHub Releases). Desktop-only: its events
   // never cross the relay. Polling starts after the window exists (see below).
   const updater = new Updater(emit);
-  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); host?.stop(); telegram?.stop(); whatsapp.disconnect(); codexBridge.stop(); extensionBridge?.stop(); updater.stop(); engine.bgStopAll(); });
+  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); browserWatcher.stop(); host?.stop(); telegram?.stop(); whatsapp.disconnect(); codexBridge.stop(); extensionBridge?.stop(); updater.stop(); engine.bgStopAll(); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {
