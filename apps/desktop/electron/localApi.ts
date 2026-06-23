@@ -18,12 +18,13 @@ import { ensureGitHooks, ensureCommitIdentity } from './git-identity.js';
 import { pickCityCodename } from './codenames.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
-import { ghState } from './gh-cli.js';
+import { ghState, resolveGh } from './gh-cli.js';
 import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
 import { getViewer, listOwners, parseGitHubRemote } from './github.js';
 import { discoverMemoryRepo } from './memory-repo.js';
 import { bootstrapNewProject, bootstrapProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
 import { openProjectMemory, closeMemoryWatcher } from './project-lifecycle.js';
+import { fetchRepoMetadata, makeGhRunner } from './repo-metadata.js';
 import type { GitService } from './git-service.js';
 import type { GitWatcher } from './git-watcher.js';
 import type { ExtensionBridge } from './extension-bridge.js';
@@ -376,6 +377,17 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const proj = store.getProject(String(p.id ?? ''));
         if (!proj) bad('project not found', 404);
         return proj!.path ? repoInfo(proj!.path) : { branch: null, remote: null, isRepo: false };
+      }
+      case 'githubRepoMetadata': {
+        // Preview-card metadata for the "Clone from GitHub" tab — owner/repo
+        // in, gh-resolved repo card out. Lets the UI show a confirmation
+        // (name, description, default branch, private flag) before cloning.
+        const owner = String(p.owner ?? '').trim();
+        const repo = String(p.repo ?? '').trim();
+        if (!owner || !repo) bad('owner and repo are required');
+        const gh = resolveGh();
+        if (!gh) bad('gh CLI not installed — go to Settings → GitHub to set it up.', 503);
+        return fetchRepoMetadata(owner, repo, makeGhRunner(gh!));
       }
       case 'cloneRepo': {
         const url = String(p.url ?? '').trim();

@@ -21,6 +21,7 @@ import { formatTranscript, type TranscriptMode } from '../lib/transcript-export'
 import { BranchPicker } from '../components/BranchPicker';
 import { projectColor, projectInitial } from '../lib/project-color';
 import { groupTabsByProject, isGroupExpanded as isGroupExpandedFn, prunePinnedGroups } from '../lib/tab-grouping';
+import { AddProjectModal } from '../components/AddProjectModal';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
@@ -203,7 +204,7 @@ export default function Workspace() {
   const [turnsByTab, setTurnsByTab] = React.useState<Record<string, Job[]>>({});
   // Sessions with a job running/pending right now — drives the sidebar loading spinners.
   const [runningSessions, setRunningSessions] = React.useState<Set<string>>(new Set());
-  const [addOpen, setAddOpen] = React.useState(false); // add-project menu
+  const [addOpen, setAddOpen] = React.useState(false); // in-workspace add-project modal
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => { try { return localStorage.getItem('maestro.workspace.sidebar') === '0'; } catch { return false; } });
   const toggleSidebar = () => setSidebarCollapsed(c => { const n = !c; try { localStorage.setItem('maestro.workspace.sidebar', n ? '0' : '1'); } catch { /* ignore */ } return n; });
 
@@ -382,19 +383,17 @@ export default function Workspace() {
     return out;
   }, [turnsByTab, activeKey]);
 
-  // Add-project: open a local folder as a coding project (native picker).
-  const openLocalFolder = async () => {
-    setAddOpen(false);
-    try {
-      const r = await api.pickFolder();
-      if (!r || !r.ok || !r.path) return;
-      const name = r.path.split('/').filter(Boolean).pop() ?? 'Project';
-      const proj = await api.createProject({ name, kind: 'coding', path: r.path, instructions: '', color: 'blue' });
-      setProjects(ps => (ps.some(x => x.id === proj.id) ? ps : [proj, ...ps]));
-      setExpanded(e => new Set(e).add(proj.id));
-    } catch { /* cancelled or failed */ }
-  };
-  const recents = projects.filter(p => p.path && projKind(p) !== 'design').slice(0, 5);
+  // Add-project: any of the three modal flows (from folder, new, clone)
+  // reaches us through this callback. We update the in-memory list, auto-
+  // expand the entry so the user sees the new project immediately, and
+  // raise the standard transient toast — no navigation, ever.
+  const onProjectAdded = React.useCallback((proj: Project) => {
+    setProjects(ps => (ps.some(x => x.id === proj.id) ? ps : [proj, ...ps]));
+    setExpanded(e => new Set(e).add(proj.id));
+    setCopyHint(`Project '${proj.name}' added — click to open chat`);
+    if (copyHintTimer.current) window.clearTimeout(copyHintTimer.current);
+    copyHintTimer.current = window.setTimeout(() => setCopyHint(null), 2400);
+  }, []);
 
   // keep the active tab in view + recompute whether the strip overflows
   React.useLayoutEffect(() => {
@@ -693,42 +692,14 @@ export default function Workspace() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 14px 10px' }}>
             <Icon name="terminal" size={16} style={{ color: 'var(--blue)' }} />
             <span style={{ flex: 1, font: '700 var(--fs-callout)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>CodeSpace</span>
-            <div style={{ position: 'relative' }}>
-              <button onClick={() => setAddOpen(o => !o)} title="Add a project" className="ws-newbtn" style={{ width: 28, height: 28, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'transparent', color: addOpen ? 'var(--ink)' : 'var(--ink-tertiary)' }}>
-                <Icon name="plus" size={16} stroke={2.4} />
-              </button>
-              {addOpen && (
-                <>
-                  <div onClick={() => setAddOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
-                  <div style={{ position: 'absolute', top: '100%', right: 0, zIndex: 41, marginTop: 4, width: 232, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.24))', padding: 5 }}>
-                    {([
-                      { icon: 'folder', label: 'Open project', sub: 'A local folder on this Mac', act: openLocalFolder },
-                      { icon: 'terminal', label: 'Open GitHub project', sub: 'Clone a repository', act: () => { setAddOpen(false); navigate('/projects'); } },
-                      { icon: 'plus', label: 'New project', sub: 'Start from scratch', act: () => { setAddOpen(false); navigate('/projects'); } },
-                    ] as { icon: IconName; label: string; sub: string; act: () => void }[]).map(it => (
-                      <button key={it.label} onClick={it.act} className="ws-ovf-item" style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', textAlign: 'left', padding: '8px 9px', borderRadius: 8, cursor: 'pointer' }}>
-                        <Icon name={it.icon} size={15} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
-                        <span style={{ flex: 1, minWidth: 0 }}>
-                          <span style={{ display: 'block', font: '600 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)' }}>{it.label}</span>
-                          <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 1 }}>{it.sub}</span>
-                        </span>
-                      </button>
-                    ))}
-                    {recents.length > 0 && (
-                      <div style={{ borderTop: '0.5px solid var(--separator)', margin: '5px 0 0', paddingTop: 5 }}>
-                        <div style={{ padding: '2px 9px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Recents</div>
-                        {recents.map(p => (
-                          <button key={p.id} onClick={() => { setAddOpen(false); setExpanded(e => new Set(e).add(p.id)); }} className="ws-ovf-item" title={p.path} style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '6px 9px', borderRadius: 8, cursor: 'pointer' }}>
-                            <Icon name="folder" size={13} style={{ flexShrink: 0, color: projColor(p) }} />
-                            <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
+            {/* "+" now opens the in-workspace <AddProjectModal />; no more
+                redirect to /projects (that broke the user's "everything in
+                workspace" expectation). The modal handles all three flows
+                (folder / new / clone) without leaving the page. */}
+            <button onClick={() => setAddOpen(true)} title="Add a project" className="ws-newbtn"
+              style={{ width: 28, height: 28, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'transparent', color: addOpen ? 'var(--ink)' : 'var(--ink-tertiary)' }}>
+              <Icon name="plus" size={16} stroke={2.4} />
+            </button>
           </div>
 
           {/* search + kind filter — narrow to a type, or find a project/chat by name */}
@@ -766,7 +737,7 @@ export default function Workspace() {
             {projects.length === 0 && (
               <div style={{ padding: '40px 14px', textAlign: 'center', font: '400 var(--fs-footnote)/1.55 var(--font-text)', color: 'var(--ink-tertiary)' }}>
                 No projects yet.
-                <button onClick={() => navigate('/projects')} style={{ display: 'block', margin: '12px auto 0', height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Create a project</button>
+                <button onClick={() => setAddOpen(true)} style={{ display: 'block', margin: '12px auto 0', height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Create a project</button>
               </div>
             )}
 
@@ -1144,6 +1115,11 @@ export default function Workspace() {
           </div>
         );
       })()}
+
+      {/* In-workspace add-project modal — dims the workspace but leaves it
+          visible, so the user knows they did NOT navigate away. The "+"
+          button above opens it; success returns through onProjectAdded. */}
+      <AddProjectModal open={addOpen} onClose={() => setAddOpen(false)} onAdded={onProjectAdded} />
     </AppShell>
   );
 }
