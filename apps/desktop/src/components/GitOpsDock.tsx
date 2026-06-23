@@ -535,7 +535,10 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
         onCancel={() => setComposerOpen(false)}
         onSubmit={(s, b) => { void onCommitSubmit(s, b); }} />
 
-      {/* T8 — AI conflict resolve dialog. Only rendered for pr-conflicts. */}
+      {/* T8 — AI conflict resolve dialog. Only rendered for pr-conflicts.
+          `initialHint` pre-fills the textarea with whatever the operator
+          last typed for THIS session — repeat resolves keep their context.
+          `onPersistHint` fires only on a successful Run dispatch. */}
       {aiResolveOpen && session && (
         <AiConflictResolveDialog
           open={aiResolveOpen}
@@ -543,6 +546,8 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
           projectId={session.projectId}
           branch={status.branch}
           prTitle={status.pr?.title ?? session.title ?? null}
+          initialHint={session.conflictResolveHint ?? ''}
+          onPersistHint={(hint) => { api.setConflictResolveHint(sessionId, hint).catch(() => {}); }}
           onClose={() => {
             setAiResolveOpen(false);
             setFeedback({ kind: 'ok', text: 'AI is resolving conflicts — see chat.' });
