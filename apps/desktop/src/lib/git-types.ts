@@ -28,6 +28,11 @@ export interface LocalSnapshot {
   lastCommitAt: number | null;
   dirtyFiles: number;
 }
+export interface LocalSnapshot {
+  lastSubject: string | null;
+  lastCommitAt: number | null;
+  dirtyFiles: number;
+}
 export interface SessionGitStatus {
   sessionId: string;
   branch: string | null;
