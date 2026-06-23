@@ -530,13 +530,23 @@ app.whenReady().then(() => {
   });
   engine.setBrowserWatcher(browserWatcher); // hand it to the agent's MCP tools
   browserWatcher.start();
-  // Poll PR/git status for active sessions; the renderer + phone update via git-status events.
-  // Fire one pass immediately on launch (don't wait the first 30s) so the
-  // workspace-overview strip can confirm PR-derivable states (ready-for-pr,
-  // pushed-dirty) fast instead of leaving them provisional for half a minute.
-  const pollGitStatuses = () => { for (const s of gitService.pollable()) void gitService.fullStatus(s, { withPr: true }).catch(() => { /* transient */ }); };
-  pollGitStatuses();
-  const gitPoll = setInterval(pollGitStatuses, 30_000);
+  // Git status is Conductor-style: event-driven (the per-session GitWatcher
+  // recomputes on `.git` mutations) + lazy (the renderer fetches the visible
+  // session on view). We deliberately do NOT blanket-poll every session
+  // SYNCHRONOUSLY — that froze the Node event loop at scale (dozens of worktrees
+  // × synchronous git = seconds of UI jank). The fix is that git now runs ASYNC
+  // (off the event loop, bounded by git.ts's concurrency cap), so this poll no
+  // longer blocks. We keep withPr:true (the overview strip relies on a real PR
+  // query to confirm pushed/PR rows — a withPr:false pass would leave them
+  // `provisional` and hidden) but at 3 min instead of 30s: 6× less GitHub load,
+  // and the watcher already catches local changes instantly between sweeps.
+  const RECONCILE_INTERVAL_MS = 3 * 60_000;
+  const reconcileGitStatuses = () => {
+    for (const s of gitService.pollable()) void gitService.fullStatus(s, { withPr: true }).catch(() => { /* transient */ });
+  };
+  reconcileGitStatuses(); // launch pass — fills the overview strip fast (now non-blocking)
+  const gitPoll = setInterval(reconcileGitStatuses, RECONCILE_INTERVAL_MS);
+  try { gitPoll.unref?.(); } catch { /* ignore */ }
   // Auto-update (electron-updater → GitHub Releases). Desktop-only: its events
   // never cross the relay. Polling starts after the window exists (see below).
   const updater = new Updater(emit);
