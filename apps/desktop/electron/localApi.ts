@@ -14,6 +14,7 @@ import type { WhatsAppClient } from './whatsapp.js';
 import { approveWhatsappSend } from './whatsapp-analyze.js';
 import type { Providers, ProviderId } from './providers.js';
 import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, structuredDiff } from './git.js';
+import { ensureGitHooks, ensureCommitIdentity } from './git-identity.js';
 import { pickCityCodename } from './codenames.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
@@ -270,6 +271,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           path: projPath,
           repoUrl: typeof p.repoUrl === 'string' && p.repoUrl ? p.repoUrl : undefined,
         });
+        // If the project points at an existing repo on disk, wire the
+        // trailer-stripping hook + align commit identity to the gh user.
+        if (projPath) {
+          void ensureGitHooks(projPath).catch(() => { /* best-effort */ });
+          void ensureCommitIdentity(projPath).catch(() => { /* best-effort */ });
+        }
         emit('project', proj);
         return proj;
       }
@@ -320,7 +327,14 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'inspectFolder': {
         const dir = String(p.path ?? '');
         if (!dir) bad('path required');
-        return inspectFolder(dir);
+        const result = inspectFolder(dir);
+        // Adopting an existing folder = a repo-open lifecycle point. Best-effort
+        // wire the trailer-stripping hook + align commit identity to the gh user.
+        if (result.ok && result.info.isRepo) {
+          void ensureGitHooks(dir).catch(() => { /* lifecycle side-effects never block */ });
+          void ensureCommitIdentity(dir).catch(() => { /* gh CLI may be absent */ });
+        }
+        return result;
       }
       case 'getProjectRepo': {
         const proj = store.getProject(String(p.id ?? ''));
@@ -343,6 +357,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
             instructions: typeof p.instructions === 'string' ? p.instructions : '',
             color: typeof p.color === 'string' ? p.color : 'blue',
           });
+          // Fresh clone → wire hooks + align commit identity to the gh user
+          // before the first commit in this repo can happen.
+          void ensureGitHooks(result.dir).catch(() => { /* best-effort */ });
+          void ensureCommitIdentity(result.dir).catch(() => { /* best-effort */ });
           emit('clone', { phase: 'done', projectId: proj.id, dir: result.dir, branch: result.branch });
           emit('project', proj);
           store.pushEvent({ kind: 'clone-done', title: `Cloned ${proj.name}`, subtitle: result.branch ? `branch ${result.branch}` : undefined, projectId: proj.id });
