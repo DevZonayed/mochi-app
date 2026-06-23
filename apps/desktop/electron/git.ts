@@ -535,6 +535,116 @@ export function mergeBaseIntoBranch(dir: string, base: string): { ok: boolean; c
   return conflicts.length ? { ok: false, conflicts } : { ok: false, conflicts: [], reason: m.out.slice(0, 200) };
 }
 
+// ── Conflict hunk extraction (T8 AI-resolve UI) ─────────────────────────────
+//
+// `parseConflictHunks` is the pure parser — given a file's content (with the
+// usual git markers), it returns each conflict block with the line ranges and
+// the "ours" / "theirs" payloads. Diff3-style markers (`||||||| base`) are
+// recognized so the base section can be surfaced too. Pure on purpose — the
+// renderer test exercises this directly without touching git/disk.
+
+export interface ConflictHunk {
+  /** 1-based line number of the `<<<<<<<` marker in the conflicted file. */
+  startLine: number;
+  /** 1-based line number of the `>>>>>>>` marker. */
+  endLine: number;
+  /** Label after `<<<<<<<` (typically the current/branch name, e.g. `HEAD`). */
+  oursLabel: string;
+  /** Label after `>>>>>>>` (typically the incoming branch name). */
+  theirsLabel: string;
+  /** Lines between `<<<<<<<` and `|||||||` (diff3) or `=======` (standard). */
+  ours: string[];
+  /** Diff3 only: lines between `|||||||` and `=======`. */
+  base?: string[];
+  /** Lines between `=======` and `>>>>>>>`. */
+  theirs: string[];
+}
+
+export interface ConflictFile {
+  path: string;
+  hunks: ConflictHunk[];
+  /** True if the file couldn't be read (gone, binary, perms). */
+  unreadable?: boolean;
+}
+
+/** Pure: walk a file's text, extract every `<<<<<<< / ======= / >>>>>>>` block.
+    Tolerant of diff3-style (`||||||| base`) and of mid-line whitespace.
+    Skips files with no markers. Bounded by the file size — we don't budget. */
+export function parseConflictHunks(text: string): ConflictHunk[] {
+  // Don't capture EOL chars in the line array — we reuse `n` indices for the
+  // 1-based `startLine` / `endLine` so a `\n`-vs-`\r\n` mismatch can't shift
+  // the reported ranges by one.
+  const lines = text.split(/\r?\n/);
+  const hunks: ConflictHunk[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const ln = lines[i];
+    const mStart = /^<{7}(?:\s+(.*))?$/.exec(ln);
+    if (!mStart) { i++; continue; }
+    const startLine = i + 1;
+    const oursLabel = (mStart[1] ?? '').trim();
+    const ours: string[] = [];
+    const base: string[] = [];
+    const theirs: string[] = [];
+    let sawBase = false;
+    let sawSep = false;
+    let theirsLabel = '';
+    let endLine = -1;
+    i++;
+    while (i < lines.length) {
+      const l = lines[i];
+      if (/^\|{7}(\s|$)/.test(l)) { sawBase = true; i++; continue; }
+      if (/^={7}$/.test(l))        { sawSep  = true; i++; continue; }
+      const mEnd = /^>{7}(?:\s+(.*))?$/.exec(l);
+      if (mEnd) { theirsLabel = (mEnd[1] ?? '').trim(); endLine = i + 1; i++; break; }
+      // Bucket by which separator we've crossed so far.
+      if (!sawSep && !sawBase) ours.push(l);
+      else if (!sawSep && sawBase) base.push(l);
+      else theirs.push(l);
+      i++;
+    }
+    // Drop hunks that never closed (corrupted file mid-conflict).
+    if (endLine === -1 || !sawSep) continue;
+    const hunk: ConflictHunk = { startLine, endLine, oursLabel, theirsLabel, ours, theirs };
+    if (sawBase) hunk.base = base;
+    hunks.push(hunk);
+  }
+  return hunks;
+}
+
+/** Read each file in `files` (paths relative to `dir`) from disk, parse the
+    git conflict markers, return one ConflictFile per input. Files that are
+    unreadable (binary, deleted, perms) are returned with `unreadable:true` so
+    the UI can still list them. Files with zero parsed hunks are still
+    returned (the file may have unresolved marker on a single line, etc.) but
+    keyed empty so the dialog can flag them. */
+export function getConflictHunks(dir: string, files: string[]): ConflictFile[] {
+  // Lazy-import here keeps the helper testable on a tmp dir without booting
+  // the rest of the module's heavy git binding.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { readFileSync } = require('node:fs') as typeof import('node:fs');
+  const out: ConflictFile[] = [];
+  for (const rel of files) {
+    const abs = path.join(dir, rel);
+    try {
+      const text = readFileSync(abs, 'utf8');
+      out.push({ path: rel, hunks: parseConflictHunks(text) });
+    } catch {
+      out.push({ path: rel, hunks: [], unreadable: true });
+    }
+  }
+  return out;
+}
+
+/** Convenience: ask git for the conflicted files in `dir` (during an
+    in-progress merge), then extract their hunks. Returns `{ files: [] }` when
+    there is no merge in progress. */
+export function getActiveConflictHunks(dir: string): { files: ConflictFile[] } {
+  const conf = execGit(['-C', dir, 'diff', '--name-only', '--diff-filter=U']);
+  const list = conf.ok ? conf.out.split('\n').filter(Boolean) : [];
+  return { files: getConflictHunks(dir, list) };
+}
+
 // ── Structured diff (read-only) — feeds the phone's Diff Review screen ──────
 export type DiffLineKind = 'ctx' | 'add' | 'del' | 'hunk';
 export interface DiffLineOut { t: DiffLineKind; n: string; c: string }
