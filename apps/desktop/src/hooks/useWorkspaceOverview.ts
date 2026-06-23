@@ -29,11 +29,31 @@ import {
   ensureSessionGitStatusFetched,
 } from '../lib/useSessionGitState';
 
+/* Persistence keys + helpers — exported for unit testing. Strings are stable
+   and namespaced so they don't collide with other workspace flags. */
+export const OVERVIEW_ONLY_MINE_KEY = 'maestro.workspace.overview.onlyMine';
+export const OVERVIEW_COLLAPSED_KEY = 'maestro.workspace.overview.collapsed';
+
+export function readPersistedBool(key: string, fallback: boolean): boolean {
+  try {
+    const v = (typeof localStorage !== 'undefined') ? localStorage.getItem(key) : null;
+    if (v === '1') return true;
+    if (v === '0') return false;
+    return fallback;
+  } catch { return fallback; }
+}
+
+export function writePersistedBool(key: string, value: boolean): void {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(key, value ? '1' : '0');
+  } catch { /* ignore */ }
+}
+
 export interface WorkspaceOverviewHook extends AggregateResult {
-  /** Hide projects with nothing fresh in the last 7 days. */
+  /** Persistent: hide projects with nothing fresh in the last 7 days. */
   onlyMine: boolean;
   setOnlyMine: (next: boolean) => void;
-  /** Collapse the strip (header still visible). */
+  /** Persistent collapse of the strip (header still visible). */
   collapsed: boolean;
   setCollapsed: (next: boolean) => void;
   /** Convenience for a click handler. */
@@ -50,8 +70,17 @@ export function useWorkspaceOverview(): WorkspaceOverviewHook {
   // We DON'T copy the cache into state — we read it inline from getAll…().
   const [, bumpStatuses] = React.useReducer((n: number) => n + 1, 0);
 
-  const [onlyMine, setOnlyMine] = React.useState<boolean>(true);
-  const [collapsed, setCollapsed] = React.useState<boolean>(false);
+  const [onlyMine, setOnlyMineState] = React.useState<boolean>(() => readPersistedBool(OVERVIEW_ONLY_MINE_KEY, true));
+  const [collapsed, setCollapsedState] = React.useState<boolean>(() => readPersistedBool(OVERVIEW_COLLAPSED_KEY, false));
+
+  const setOnlyMine = React.useCallback((next: boolean) => {
+    setOnlyMineState(next);
+    writePersistedBool(OVERVIEW_ONLY_MINE_KEY, next);
+  }, []);
+  const setCollapsed = React.useCallback((next: boolean) => {
+    setCollapsedState(next);
+    writePersistedBool(OVERVIEW_COLLAPSED_KEY, next);
+  }, []);
 
   // Initial load.
   React.useEffect(() => {
