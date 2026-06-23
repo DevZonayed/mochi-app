@@ -1,2 +1,0 @@
-The project's claude or codex or conductor search feature seems not working, we need to make it perfectly done the ui is visible currently that is not actually.
-→ Same story — the second background `git pull --ff-only` (exit 128, no network). Already routed around by branching off the locally-fetched `origin/master`. Fix is intact on `fix/conversation-sync-path-normalization`; no action needed.
