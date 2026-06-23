@@ -4,8 +4,17 @@
    (rather than silently degrading to "no actions"). */
 
 import { describe, test, expect } from 'vitest';
-import { actionsFor, labelFor } from './useGitOpsState';
-import type { SessionGitState } from '../lib/git-types';
+import { actionsFor, labelFor, behindBaseLabel } from './useGitOpsState';
+import type { SessionGitState, SessionGitStatus } from '../lib/git-types';
+
+function status(over: Partial<SessionGitStatus> = {}): SessionGitStatus {
+  return {
+    sessionId: 'sid', branch: 'mochi/lyon/lyon', base: 'master',
+    local: { isRepo: true, ahead: 0, behind: 0, dirty: false, pushed: false },
+    pr: null, state: 'clean', lastCheckedAt: Date.now(),
+    ...over,
+  } as SessionGitStatus;
+}
 
 const ALL_STATES: SessionGitState[] = [
   'no-repo', 'clean', 'uncommitted', 'ready-to-push', 'ready-for-pr',
@@ -108,5 +117,40 @@ describe('labelFor — state → pill label', () => {
     expect(labelFor('pr-mergeable')).not.toContain('-');
     expect(labelFor('pr-conflicts')).not.toContain('-');
     expect(labelFor('ready-to-push')).not.toContain('-');
+  });
+});
+
+describe('behindBaseLabel — "↓ behind master by N"', () => {
+  // Single source of truth for the copy on TWO surfaces (collapsed pill
+  // mini-chip + expanded dock prominent row). Tests pin both shapes so a
+  // future copy change has to be intentional.
+  test('null status → null', () => {
+    expect(behindBaseLabel(null)).toBeNull();
+  });
+  test('behind===0 → null (nothing to show)', () => {
+    expect(behindBaseLabel(status({ local: { isRepo: true, ahead: 0, behind: 0, dirty: false, pushed: false } }))).toBeNull();
+  });
+  test('null base → null (no base to call out)', () => {
+    expect(behindBaseLabel(status({ base: null, local: { isRepo: true, ahead: 0, behind: 5, dirty: false, pushed: false } }))).toBeNull();
+  });
+  test('singular: "1 commit"', () => {
+    expect(behindBaseLabel(status({ base: 'master', local: { isRepo: true, ahead: 0, behind: 1, dirty: false, pushed: false } })))
+      .toBe('Behind master by 1 commit');
+  });
+  test('plural: "N commits"', () => {
+    expect(behindBaseLabel(status({ base: 'master', local: { isRepo: true, ahead: 0, behind: 3, dirty: false, pushed: false } })))
+      .toBe('Behind master by 3 commits');
+  });
+  test('works even when local state is clean (the headline bug)', () => {
+    // The operator's complaint: after a real merge on master, the dock kept
+    // saying "No changes" — because local.behind wasn't fresh AND there
+    // was no surface for it. Now the dock shows "Behind master by N" even
+    // in `clean` state, which is exactly when this needs to be loud.
+    const s = status({ state: 'clean', local: { isRepo: true, ahead: 0, behind: 7, dirty: false, pushed: false } });
+    expect(behindBaseLabel(s)).toBe('Behind master by 7 commits');
+  });
+  test('non-master base (e.g. develop) is named correctly', () => {
+    expect(behindBaseLabel(status({ base: 'develop', local: { isRepo: true, ahead: 2, behind: 4, dirty: false, pushed: false } })))
+      .toBe('Behind develop by 4 commits');
   });
 });
