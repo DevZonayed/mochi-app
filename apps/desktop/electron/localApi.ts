@@ -19,6 +19,11 @@ import { pickCityCodename } from './codenames.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
 import { ghState } from './gh-cli.js';
+import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
+import { getViewer, listOwners, parseGitHubRemote } from './github.js';
+import { discoverMemoryRepo } from './memory-repo.js';
+import { bootstrapNewProject, bootstrapProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
+import { openProjectMemory, closeMemoryWatcher } from './project-lifecycle.js';
 import type { GitService } from './git-service.js';
 import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
@@ -270,6 +275,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           color: p.color as string | undefined, kind,
           path: projPath,
           repoUrl: typeof p.repoUrl === 'string' && p.repoUrl ? p.repoUrl : undefined,
+          // memorySlug + memoryRepoUrl come back from bootstrapProject (dual-repo
+          // flow). Renderer passes them through so subsequent openProject can
+          // find the memory clone.
+          memorySlug: typeof p.memorySlug === 'string' && p.memorySlug ? p.memorySlug : undefined,
+          memoryRepoUrl: typeof p.memoryRepoUrl === 'string' && p.memoryRepoUrl ? p.memoryRepoUrl : undefined,
         });
         // If the project points at an existing repo on disk, wire the
         // trailer-stripping hook + align commit identity to the gh user.
@@ -280,9 +290,34 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('project', proj);
         return proj;
       }
+      // openProject: lifecycle hook the renderer calls when entering a project
+      // view. Pulls the memory clone, re-verifies the four symlinks, and starts
+      // a debounced auto-push watcher on STATE.md. Idempotent — re-opening
+      // the same project reuses the watcher. No-op when the project has no
+      // memorySlug (legacy projects pre-dual-repo).
+      case 'openProject': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (!proj) return bad('project not found', 404);
+        if (!proj.memorySlug || !proj.path) return { ok: true, skipped: true as const, reason: 'no-memory-repo' };
+        try {
+          const r = await openProjectMemory({ slug: proj.memorySlug, projectPath: proj.path });
+          return { ok: true, ...r };
+        } catch (e) {
+          // Surface the symlink/clobber errors with a clear message; the UI
+          // will show this so the operator knows to resolve manually.
+          return { ok: false, error: e instanceof Error ? e.message.slice(0, 240) : 'memory lifecycle failed' };
+        }
+      }
+      // closeProject: stop the STATE watcher when the operator leaves a
+      // project view (the renderer calls this on unmount).
+      case 'closeProject': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (proj?.memorySlug) closeMemoryWatcher(proj.memorySlug);
+        return { ok: true };
+      }
       case 'updateProject': {
         const patch: Record<string, unknown> = {};
-        for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl', 'defaultBaseBranch', 'setupScript'] as const) {
+        for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl', 'defaultBaseBranch', 'setupScript', 'memorySlug', 'memoryRepoUrl'] as const) {
           if (typeof p[k] === 'string') patch[k] = p[k];
         }
         if (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') patch.kind = p.kind;
@@ -1039,6 +1074,143 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'githubLoginCancel': return engine.githubLoginCancel();
       // Whether `gh` is already present (system or managed) — gates the UI hint.
       case 'ghCliState': return ghState();
+
+      // ── GitHub-first project bootstrap ───────────────────────────────
+      // listOwners: the New-project owner picker (user + their orgs). The
+      // picker MUST be populated before checkSlug fires under a different owner;
+      // soft-fails to a single fake user row when no GitHub token is present
+      // (the bootstrap call will surface the real auth error loudly).
+      case 'listOwners': {
+        const token = providers.getLocalKey('github');
+        if (!token) return { ok: false, reason: 'not-authenticated', owners: [] as Array<{ login: string; kind: 'user' | 'org'; avatarUrl: string | null }> };
+        try {
+          const owners = await listOwners(token);
+          return { ok: true, reason: 'ok' as const, owners };
+        } catch (e) {
+          return { ok: false, reason: 'error' as const, owners: [], error: e instanceof Error ? e.message.slice(0, 160) : 'lookup failed' };
+        }
+      }
+      // checkSlug: live availability for the New-project name field. Debounced
+      // by the renderer (300ms). Returns the slugified form + whether it's
+      // free + an alternate suggestion when taken. Cheap (1–5 GitHub calls);
+      // the cascade short-circuits as soon as a free slug is found. Soft-fails
+      // when github isn't connected: the UI still shows the slug + a 'no-auth'
+      // hint, and the actual bootstrap call surfaces the same problem loudly.
+      case 'checkSlug': {
+        const rawName = String(p.name ?? '');
+        const slug = slugify(rawName);
+        const token = providers.getLocalKey('github');
+        if (!token) return { slug, available: null as boolean | null, suggestion: slug, owner: null as string | null, reason: 'not-authenticated' };
+        try {
+          const v = await getViewer(token);
+          const owner = v.login;
+          if (!owner) return { slug, available: null, suggestion: slug, owner: null, reason: 'no-login' };
+          const probe = await checkRepoAvailable(token, owner, slug);
+          if (probe.available) return { slug, available: true, suggestion: slug, owner, reason: 'ok' as const };
+          const suggestion = await suggestAvailableSlug(token, owner, rawName);
+          return { slug, available: false, suggestion, owner, existing: probe.existing, reason: 'taken' as const };
+        } catch (e) {
+          return { slug, available: null, suggestion: slug, owner: null, reason: 'error', error: e instanceof Error ? e.message.slice(0, 160) : 'lookup failed' };
+        }
+      }
+      // bootstrapProject: create BOTH GitHub repos (code + memory), seed the
+      // memory clone, symlink it into the project, commit + push the code
+      // repo. The renderer calls this from the "Create" button with the
+      // chosen owner (user OR org from the picker). Memory repo is always
+      // private + always under the logged-in user's account.
+      // The legacy single-repo path (no `owner` field) routes to the
+      // existing bootstrapNewProject — used by the adopt-folder "no GitHub
+      // remote yet" branch that hasn't been migrated to dual-repo + by the
+      // remoteOnly flow. We auto-fill `user` from the authenticated viewer.
+      case 'bootstrapProject': {
+        const name = String(p.name ?? '').trim();
+        if (!name) bad('name required');
+        const localPath = String(p.localPath ?? '').trim();
+        if (!localPath) bad('localPath required');
+        const token = providers.getLocalKey('github');
+        if (!token) bad('Sign in to GitHub before creating a GitHub-first project.', 401);
+        const isPrivate = p.private === undefined ? true : Boolean(p.private);
+        // Dual-repo branch: caller provided an owner picker selection.
+        const ownerObj = p.owner as { login?: unknown; kind?: unknown } | undefined;
+        if (ownerObj && typeof ownerObj.login === 'string' && (ownerObj.kind === 'user' || ownerObj.kind === 'org')) {
+          // Resolve the logged-in user (memory repo always under their account).
+          const v = await getViewer(token as string);
+          if (!v.login) bad('GitHub auth went stale — sign in again.', 401);
+          return bootstrapProject(token as string, {
+            user: v.login,
+            owner: { login: ownerObj.login, kind: ownerObj.kind },
+            name, localPath, private: isPrivate,
+          }, { fs: realFs, git: realGit });
+        }
+        // Legacy single-repo path.
+        const skipInit = Boolean(p.adopt) || Boolean(p.skipInit);
+        const remoteOnly = Boolean(p.remoteOnly);
+        return bootstrapNewProject(token as string, {
+          name, localPath, private: isPrivate,
+          description: typeof p.description === 'string' ? p.description.slice(0, 350) : undefined,
+          skipInit, remoteOnly,
+        }, { fs: realFs, git: realGit });
+      }
+      // adoptFolderInspect: classify an existing local folder for the adopt
+      // flow — has-git / has-github-remote / has-non-github-remote / no-git.
+      // Renderer uses this to decide whether to offer "create GitHub repo for
+      // this folder" or just record the existing remote and move on.
+      //
+      // ALSO discovers the companion memory repo (\${user}/\${slug}-memory):
+      // when the folder ALREADY has a github remote, we use that remote's
+      // repo name as the slug; otherwise we slugify the folder's basename.
+      // Returns a `memoryRepo` field with one of three states:
+      //   'memory-found'    — \${user}/\${slug}-memory exists; renderer
+      //                        offers "clone + link" on accept.
+      //   'memory-missing'  — same slug, no memory repo yet; renderer offers
+      //                        "create memory repo" on accept.
+      //   'no-github-auth'  — no GitHub token; renderer falls back to the
+      //                        old single-repo flow.
+      case 'adoptFolderInspect': {
+        const dir = String(p.path ?? '').trim();
+        if (!dir) bad('path required');
+        const inspected = inspectFolder(dir);
+        if (!inspected.ok) return { ok: false, path: dir, error: inspected.error };
+        const remote = inspected.info.isRepo ? readOriginRemote(dir) : null;
+        const isGitHub = !!remote && /github\.com[:/]/i.test(remote);
+        const kind = !inspected.info.isRepo ? 'no-git' as const
+          : !remote ? 'git-no-remote' as const
+          : isGitHub ? 'git-github' as const
+          : 'git-non-github' as const;
+
+        // Memory-repo companion discovery. Best-effort — failures here don't
+        // poison the rest of the inspection.
+        let memoryRepo: { state: 'memory-found'; cloneUrl: string; slug: string; user: string }
+                       | { state: 'memory-missing'; slug: string; user: string }
+                       | { state: 'no-github-auth' }
+                       | { state: 'error'; error: string } = { state: 'no-github-auth' };
+        const token = providers.getLocalKey('github');
+        if (token) {
+          try {
+            const v = await getViewer(token);
+            if (v.login) {
+              // Slug source: the existing GitHub remote's repo name when present
+              // (so adopting a clone of an existing project re-attaches to the
+              // SAME memory repo); else slugify the folder basename.
+              let slug = '';
+              if (isGitHub && remote) {
+                const parsed = parseGitHubRemote(remote);
+                if (parsed?.repo) slug = parsed.repo;
+              }
+              if (!slug) slug = slugify(nodePath.basename(dir));
+              const discovered = await discoverMemoryRepo(token, v.login, slug);
+              memoryRepo = discovered.exists && discovered.cloneUrl
+                ? { state: 'memory-found', cloneUrl: discovered.cloneUrl, slug, user: v.login }
+                : { state: 'memory-missing', slug, user: v.login };
+            } else {
+              memoryRepo = { state: 'error', error: 'no login on token' };
+            }
+          } catch (e) {
+            memoryRepo = { state: 'error', error: e instanceof Error ? e.message.slice(0, 160) : 'memory discovery failed' };
+          }
+        }
+        return { ok: true, path: dir, info: inspected.info, remote, kind, memoryRepo };
+      }
 
       // ── Media Studio (real fal generation) ─────────────────────
       case 'mediaRates': return media.rates();

@@ -30,6 +30,10 @@ export interface Project {
   kind?: ProjectKind;
   path?: string;
   repoUrl?: string;
+  /** Dual-repo bootstrap: the slug shared by the code repo + the memory
+      companion ('${user}/${slug}-memory'). Drives the openProject lifecycle. */
+  memorySlug?: string;
+  memoryRepoUrl?: string;
   /** Worktree base branch override (else auto-detected from origin/HEAD). */
   defaultBaseBranch?: string;
   /** Shell script run once in each new session worktree (e.g. install deps). */
@@ -820,10 +824,21 @@ export const api = {
   // Projects
   listProjects: (workspaceId?: string) =>
     call<Project[]>('listProjects', { workspaceId }, () => req<Project[]>('/api/projects' + qp({ workspaceId }))),
-  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }) =>
+  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string; memorySlug?: string; memoryRepoUrl?: string }) =>
     call<Project>('createProject', { ...input }, () =>
       req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) })),
-  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode'>>) =>
+  // openProject / closeProject: desktop-only lifecycle hooks for the dual-repo
+  // memory clone. openProject runs `git pull --rebase --autostash` on the
+  // memory repo, re-verifies the four symlinks, and starts a debounced
+  // auto-push watcher on STATE.md. closeProject stops the watcher. Both are
+  // no-ops on legacy projects (no memorySlug set). The renderer SHOULD call
+  // openProject on entry to the project view and closeProject on unmount.
+  openProject: (id: string) =>
+    call<{ ok: boolean; skipped?: true; reason?: string; pulled?: boolean; conflictsResolved?: number; linked?: boolean; watching?: boolean; error?: string }>(
+      'openProject', { id }, () => Promise.resolve({ ok: true, skipped: true as const, reason: 'remote' })),
+  closeProject: (id: string) =>
+    call<{ ok: boolean }>('closeProject', { id }, () => Promise.resolve({ ok: true })),
+  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl'>>) =>
     call<Project>('updateProject', { id, ...patch }, () =>
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   reorderProjects: (ids: string[]) =>
@@ -872,6 +887,49 @@ export const api = {
       req<Project>('/api/projects/clone', { method: 'POST', body: JSON.stringify(input) })),
   getProjectRepo: (id: string) =>
     call<RepoInfo>('getProjectRepo', { id }, () => req<RepoInfo>(`/api/projects/${encodeURIComponent(id)}/repo`)),
+  // GitHub-first project bootstrap (desktop-only; the renderer drives the UI).
+  // listOwners populates the new-project owner picker (user + their orgs)
+  // BEFORE the slug probe runs, since the slug-availability query is scoped to
+  // whichever owner is selected.
+  listOwners: () =>
+    call<{ ok: boolean; reason: 'ok' | 'not-authenticated' | 'error'; owners: Array<{ login: string; kind: 'user' | 'org'; avatarUrl: string | null }>; error?: string }>(
+      'listOwners', {}, () => Promise.reject(new Error('desktop only'))),
+  // checkSlug runs while the user types in the name field (debounced 300ms).
+  checkSlug: (name: string) =>
+    call<{ slug: string; available: boolean | null; suggestion: string; owner: string | null; existing?: { fullName: string; private: boolean }; reason: 'ok' | 'taken' | 'not-authenticated' | 'no-login' | 'error'; error?: string }>(
+      'checkSlug', { name }, () => Promise.reject(new Error('desktop only'))),
+  // Create the GitHub repo(s), seed local files, commit, set origin, push.
+  // When `owner` is passed, the dual-repo flow runs: code repo under the
+  // chosen owner + a private \${user}/\${slug}-memory companion clone + four
+  // symlinks. Without `owner`, falls back to the legacy single-repo path
+  // (used by adopt-folder + remoteOnly which haven't been migrated yet).
+  bootstrapProject: (input: { name: string; localPath: string; owner?: { login: string; kind: 'user' | 'org' }; private?: boolean; description?: string; adopt?: boolean; remoteOnly?: boolean }) =>
+    call<
+      // Dual-repo result is a superset of the legacy single-repo result;
+      // callers narrow on the presence of `memoryRepoUrl`.
+      | { slug: string; slugChanged: boolean; owner: string; fullName: string; htmlUrl: string; cloneUrl: string; localPath: string; branchPushed: string }
+      | { slug: string; slugChanged: boolean; codeRepoUrl: string; memoryRepoUrl: string; memoryPath: string; localPath: string; branchPushed: string }
+    >('bootstrapProject', { ...input }, () => Promise.reject(new Error('desktop only'))),
+  // Inspect a candidate folder to decide between "create GitHub repo for this"
+  // / "use existing remote" / "already a non-GitHub repo" in the adopt flow.
+  // Also discovers a companion memory repo (\${user}/\${slug}-memory) so the
+  // renderer can pick the right confirmation chip (clone+link vs create+link
+  // vs no-auth fallback).
+  adoptFolderInspect: (path: string) =>
+    call<{
+      ok: boolean;
+      path: string;
+      info?: RepoInfo;
+      remote?: string | null;
+      kind?: 'no-git' | 'git-no-remote' | 'git-github' | 'git-non-github';
+      memoryRepo?:
+        | { state: 'memory-found'; cloneUrl: string; slug: string; user: string }
+        | { state: 'memory-missing'; slug: string; user: string }
+        | { state: 'no-github-auth' }
+        | { state: 'error'; error: string };
+      error?: string;
+    }>(
+      'adoptFolderInspect', { path }, () => Promise.reject(new Error('desktop only'))),
   /** Native folder picker — desktop only; resolves null in the browser. */
   pickFolder: async (): Promise<FolderInspect | null> => {
     if (!bridge?.pickFolder) return null;

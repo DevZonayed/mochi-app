@@ -77,6 +77,32 @@ export async function getViewer(token: string, fetchImpl?: FetchImpl): Promise<V
   return { login: r.data?.login ?? '', scopes: r.scopes };
 }
 
+/** A choice for the new-project "owner" picker. The user themselves comes back
+    as kind:'user'; every org they belong to comes back as kind:'org'. We need
+    the kind because the create-repo endpoint differs (POST /user/repos vs
+    POST /orgs/${login}/repos) and a wrong call returns 404 with no hint. */
+export interface OwnerOption { login: string; kind: 'user' | 'org'; avatarUrl: string | null; }
+
+/** All owners the authenticated user can create a repo under: themselves first,
+    then their orgs (alphabetical). Two parallel GitHub calls; failures in the
+    orgs call don't kill the whole list (the user is the only owner that MUST
+    appear — orgs are bonus). Used by the New-project owner picker. */
+export async function listOwners(token: string, fetchImpl?: FetchImpl): Promise<OwnerOption[]> {
+  const [meRes, orgsRes] = await Promise.allSettled([
+    ghRequest<{ login: string; avatar_url?: string | null }>({ token, path: '/user', fetchImpl }),
+    ghRequest<Array<{ login: string; avatar_url?: string | null }>>({ token, path: '/user/orgs?per_page=100', fetchImpl }),
+  ]);
+  if (meRes.status !== 'fulfilled' || !meRes.value.data?.login) {
+    throw new Error('Could not resolve your GitHub login. Re-authenticate and try again.');
+  }
+  const me: OwnerOption = { login: meRes.value.data.login, kind: 'user', avatarUrl: meRes.value.data.avatar_url ?? null };
+  const orgs: OwnerOption[] = orgsRes.status === 'fulfilled' && Array.isArray(orgsRes.value.data)
+    ? orgsRes.value.data.map(o => ({ login: o.login, kind: 'org' as const, avatarUrl: o.avatar_url ?? null }))
+    : [];
+  orgs.sort((a, b) => a.login.localeCompare(b.login));
+  return [me, ...orgs];
+}
+
 /** Parse a GitHub remote URL (ssh/https) → {owner, repo}. Null for non-GitHub. */
 export function parseGitHubRemote(remote: string | null | undefined): { owner: string; repo: string } | null {
   if (!remote) return null;
@@ -171,6 +197,40 @@ export async function mergePull(token: string, owner: string, repo: string, num:
 export async function createRepo(token: string, name: string, opts: { private?: boolean } = {}, fetchImpl?: FetchImpl): Promise<{ cloneUrl: string; sshUrl: string; fullName: string }> {
   const r = await ghRequest<{ clone_url: string; ssh_url: string; full_name: string }>({ token, method: 'POST', path: '/user/repos', body: { name, private: opts.private ?? true, auto_init: false }, fetchImpl });
   return { cloneUrl: r.data.clone_url, sshUrl: r.data.ssh_url, fullName: r.data.full_name };
+}
+
+/** Create a GitHub repo under the chosen owner (the user themselves OR one of
+    their orgs), returning the full set of identifiers the bootstrap flow needs
+    to wire `origin` locally. The endpoint differs by owner kind:
+      kind:'user' → POST /user/repos                  (always the authenticated user)
+      kind:'org'  → POST /orgs/${owner.login}/repos   (must be a member with create rights)
+    Defaults to PRIVATE (Maestro projects are real working repos, not demos)
+    and `autoInit:false` (bootstrap pushes its own initial commit — GitHub's
+    auto-init README would conflict). */
+export async function createGitHubRepo(
+  token: string,
+  opts: {
+    owner: { login: string; kind: 'user' | 'org' };
+    name: string;
+    private?: boolean;
+    description?: string;
+    /** Default false; bootstrap creates the first commit locally + pushes. */
+    autoInit?: boolean;
+  },
+  fetchImpl?: FetchImpl,
+): Promise<{ owner: string; repo: string; cloneUrl: string; htmlUrl: string }> {
+  const path = opts.owner.kind === 'org' ? `/orgs/${opts.owner.login}/repos` : '/user/repos';
+  const r = await ghRequest<{ clone_url: string; html_url: string; full_name: string; owner: { login: string }; name: string }>({
+    token, method: 'POST', path,
+    body: { name: opts.name, private: opts.private ?? true, auto_init: !!opts.autoInit, description: opts.description ?? '' },
+    fetchImpl,
+  });
+  return {
+    owner: r.data.owner?.login ?? r.data.full_name.split('/')[0] ?? '',
+    repo: r.data.name ?? r.data.full_name.split('/')[1] ?? opts.name,
+    cloneUrl: r.data.clone_url,
+    htmlUrl: r.data.html_url,
+  };
 }
 
 /** Pick a merge method the repo actually allows (prefer squash → merge → rebase). */
