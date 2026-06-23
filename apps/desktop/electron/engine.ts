@@ -57,6 +57,7 @@ import {
 import { resolveGh, downloadGh } from './gh-cli.js';
 import { ghTokenFrom, githubConnectionStatus, type GithubConnection } from './github-auth.js';
 import { WakeupPauseTracker } from './wakeup-pause.js';
+import { SubAgentRouter, extractToolResultText } from './subagent-routing.js';
 import { shell } from 'electron';
 
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
@@ -1359,6 +1360,12 @@ async function runClaude(
       // Plan mode → propose a plan, no execution. Otherwise run freely on this Mac.
       permissionMode: plan ? 'plan' : 'bypassPermissions',
       includePartialMessages: !!hooks.onProgress,
+      // Forward sub-agent text + thinking blocks (not just tool_use/result)
+      // so the parent chip's expandable children[] shows the dispatched
+      // agent's WHOLE inner conversation — what #72 promised. Without this
+      // SDK flag, the operator only saw the parent chip + summary; the
+      // children array stayed empty for text-heavy sub-agents.
+      forwardSubagentText: true,
       // generate_image: in-process MCP server + auto-allow its fully-qualified name.
       // Under 'bypassPermissions' tools auto-run; allowedTools future-proofs any
       // non-bypass mode. In plan mode imageServer is null so the tool is absent.
@@ -1404,44 +1411,19 @@ async function runClaude(
       else hooks.onResumed?.();
     } catch { /* best-effort */ }
   };
-  /* Per-sub-agent transcript writers, keyed by the parent's tool_use_id.
-     Every SDK event carrying `parent_tool_use_id` belongs to a Task/Agent
-     dispatch's INNER turn loop (its tool calls, thinking, prose). Instead of
-     dropping those events on the floor (the old behaviour, which left the UI
-     showing only a one-line chip + checkmark), we route each into the parent
-     chip's `children[]` so the operator can expand the chip and SEE what the
-     sub-agent actually did. Each writer mirrors the top-level open-block /
-     toolById state but writes into the parent's own children array. */
-  interface SubWriter { open: TranscriptItem | null; openThinking: TranscriptItem | null; toolById: Map<string, TranscriptItem>; }
-  const subWriters = new Map<string, SubWriter>();
-  const SUB_CAP = 80; // soft cap per sub-agent so a chatty Plan agent doesn't bloat the transcript
-  const subWriterFor = (parentId: string): { w: SubWriter; out: TranscriptItem[] } | null => {
-    const parent = toolById.get(parentId);
-    if (!parent) return null;
-    if (!parent.children) parent.children = [];
-    let w = subWriters.get(parentId);
-    if (!w) { w = { open: null, openThinking: null, toolById: new Map() }; subWriters.set(parentId, w); }
-    return { w, out: parent.children };
-  };
-  /* Pull the sub-agent's final text response out of a tool_result.content
-     payload (which is either a string OR an array of {type:'text',text:…} blocks
-     per the Anthropic content-block convention). Used to populate `parent.result`
-     so the collapsed chip can preview the answer without forcing the user to
-     expand. */
-  const extractToolResultText = (c: unknown): string => {
-    if (typeof c === 'string') return c.trim();
-    if (Array.isArray(c)) {
-      const parts: string[] = [];
-      for (const b of c) {
-        if (b && typeof b === 'object' && (b as { type?: string }).type === 'text') {
-          const t = (b as { text?: unknown }).text;
-          if (typeof t === 'string') parts.push(t);
-        }
-      }
-      return parts.join('\n').trim();
-    }
-    return '';
-  };
+  /* Sub-agent traffic (Task/Agent dispatch INNER events) routes through a
+     dedicated router so the parent chip's `children[]` accumulates the
+     sub-agent's tool calls, thinking, and prose. Lives in subagent-routing.ts
+     so the contract is unit-tested (#72 regression: events that arrived
+     BEFORE the parent's full assistant message were silently dropped).
+     The router internally BUFFERS those out-of-order frames and replays
+     them when `attachParent(parentId)` is called below. */
+  const subRouter = new SubAgentRouter(
+    toolById,
+    (name, input, c) => toolLabel(name, input, c),
+    (name, input) => toolPreview(name, input),
+    cwd,
+  );
 
   let resultText = '';
   let usage: { input_tokens?: number; output_tokens?: number } | null = null;
@@ -1484,64 +1466,13 @@ async function runClaude(
         total_cost_usd?: number; result?: unknown;
       };
       if (m.session_id) sdkSessionId = m.session_id;
-      // Sub-agent traffic (Task/Agent dispatch INNER events) — route into the
-      // parent chip's `children[]` so the chat can render an expandable
-      // "what the sub-agent did" view instead of staring at a single chip.
+      // Sub-agent traffic (Task/Agent dispatch INNER events) — defer to the
+      // SubAgentRouter so the parent chip's `children[]` accumulates the
+      // sub-agent's tool calls, thinking, and prose. Events that arrive
+      // before the parent's full assistant message lands are buffered by
+      // the router and replayed when `attachParent` is called below.
       if (m.parent_tool_use_id) {
-        const ctx = subWriterFor(m.parent_tool_use_id);
-        if (!ctx) continue; // unknown parent → drop (defensive; shouldn't happen)
-        const { w, out } = ctx;
-        // Soft cap: stop appending new items once we've recorded plenty. Tool
-        // status/result updates are still allowed (they MUTATE existing chips,
-        // not append) so a long sub-agent still shows clean checkmarks.
-        const canAppend = out.length < SUB_CAP;
-        if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'thinking_delta') {
-          if (!w.openThinking) {
-            if (!canAppend) { progress(); continue; }
-            w.openThinking = { kind: 'thinking', text: '', ts: Date.now() }; out.push(w.openThinking);
-          }
-          w.openThinking.text += m.event.delta.thinking ?? '';
-        } else if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
-          if (!w.open) {
-            if (!canAppend) { progress(); continue; }
-            w.open = { kind: 'text', text: '', ts: Date.now() }; out.push(w.open);
-          }
-          w.open.text += m.event.delta.text ?? '';
-        } else if (m.type === 'assistant' && m.message?.content) {
-          for (const b of m.message.content) {
-            if (b.type === 'thinking' && typeof b.thinking === 'string') {
-              if (w.openThinking) { w.openThinking.text = b.thinking; w.openThinking = null; }
-              else if (b.thinking.trim() && canAppend) out.push({ kind: 'thinking', text: b.thinking, ts: Date.now() });
-            } else if (b.type === 'text' && typeof b.text === 'string') {
-              w.openThinking = null;
-              if (w.open) { w.open.text = b.text; w.open = null; }
-              else if (b.text.trim() && canAppend) out.push({ kind: 'text', text: b.text, ts: Date.now() });
-            } else if (b.type === 'tool_use') {
-              w.open = null; w.openThinking = null;
-              if (!canAppend) continue;
-              const label = toolLabel(b.name ?? '', b.input, cwd);
-              const t: TranscriptItem = { kind: 'tool', name: b.name ?? 'tool', text: label.text, toolStatus: 'running', ts: Date.now() };
-              if (label.cmd) t.cmd = label.cmd;
-              const preview = toolPreview(b.name ?? '', b.input);
-              if (preview !== undefined) t.preview = preview;
-              if (b.id) {
-                t.id = b.id;
-                w.toolById.set(b.id, t);
-                // ALSO register in the top-level map so a grand-child (a
-                // sub-agent dispatched BY a sub-agent) can find this chip.
-                toolById.set(b.id, t);
-              }
-              out.push(t);
-            }
-          }
-        } else if (m.type === 'user' && m.message?.content) {
-          for (const b of m.message.content) {
-            if (b.type === 'tool_result' && b.tool_use_id) {
-              const t = w.toolById.get(b.tool_use_id);
-              if (t) { t.toolStatus = b.is_error ? 'error' : 'done'; t.durMs = Date.now() - t.ts; }
-            }
-          }
-        }
+        subRouter.route(m);
         progress();
         continue;
       }
@@ -1591,7 +1522,14 @@ async function runClaude(
             const preview = toolPreview(b.name ?? '', b.input);
             if (preview !== undefined) t.preview = preview;
             items.push(t);
-            if (b.id) { t.id = b.id; toolById.set(b.id, t); }
+            if (b.id) {
+              t.id = b.id; toolById.set(b.id, t);
+              // The SDK can stream sub-agent INNER events BEFORE this full
+              // assistant message lands — those frames are buffered by the
+              // router keyed on parent_tool_use_id. Drain the buffer NOW so
+              // the children array reflects every frame the router saw.
+              subRouter.attachParent(b.id);
+            }
             // Remember any ScheduleWakeup so the matching tool_result can flip
             // us to paused (success path). Non-ScheduleWakeup tools no-op.
             wakeup.onToolUse(b.id, b.name, b.input);

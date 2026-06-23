@@ -25,6 +25,7 @@ import {
   validateNewLocalInput,
   buildCloneArgs,
 } from '../lib/addProjectForm';
+import { planOpenFolder, projectNameFromPath, type OpenFolderPlan } from '../lib/open-folder-flow';
 
 const MODAL_CSS = `
   .apm-tab { transition: background 120ms ease, color 120ms ease; }
@@ -71,6 +72,15 @@ export function AddProjectModal({ open, onClose, onAdded }: Props) {
   const [metaLoading, setMetaLoading] = React.useState(false);
   const [metaError, setMetaError] = React.useState<string | null>(null);
 
+  // Tab 1 (From folder) — after picking, an `adoptFolderInspect` result is
+  // turned into an OpenFolderPlan and rendered as an in-modal decision step
+  // (not a redirect). `inspecting` is the spinner state between the picker
+  // closing and the inspection landing. `pickedPath` is held so the action
+  // buttons can re-run bootstrap/createProject without re-prompting.
+  const [pickedPath, setPickedPath] = React.useState<string | null>(null);
+  const [folderPlan, setFolderPlan] = React.useState<OpenFolderPlan | null>(null);
+  const [inspecting, setInspecting] = React.useState(false);
+
   // Reset transient state every time the modal re-opens (e.g. operator
   // opens it, dismisses with Esc, opens again from a different sidebar).
   React.useEffect(() => {
@@ -80,6 +90,9 @@ export function AddProjectModal({ open, onClose, onAdded }: Props) {
     setMeta(null);
     setMetaError(null);
     setMetaLoading(false);
+    setPickedPath(null);
+    setFolderPlan(null);
+    setInspecting(false);
   }, [open]);
 
   // Esc closes — but only when we're not mid-submit (so the user doesn't
@@ -144,18 +157,130 @@ export function AddProjectModal({ open, onClose, onAdded }: Props) {
     } catch { /* user cancelled */ }
   };
 
+  /** Pick a folder + run `adoptFolderInspect` so we know which decision
+      card to show (silent proceed / create-memory / init+push / no-git).
+      We DON'T navigate or create the project yet — the operator confirms
+      via the in-modal decision step rendered from `folderPlan`. */
   const submitFromFolder = async () => {
-    setError(null); setBusy(true);
+    setError(null); setBusy(true); setFolderPlan(null);
     try {
       const r = await api.pickFolder();
       if (!r || !r.ok || !r.path) { setBusy(false); return; }
-      const name = r.path.split('/').filter(Boolean).pop() ?? 'Project';
-      const proj = await api.createProject({ name, kind: 'coding', path: r.path, instructions: '', color: 'blue' });
+      setPickedPath(r.path);
+      setInspecting(true);
+      setBusy(false);
+      // Best-effort: a failing inspect (no IPC, no token, anything) still
+      // produces a sensible plan via the fallback below.
+      let plan: OpenFolderPlan;
+      try {
+        const inspect = await api.adoptFolderInspect(r.path);
+        plan = planOpenFolder(inspect);
+      } catch (e) {
+        // No GitHub auth / no electron bridge — treat the local info we DO
+        // know (`pickFolder` returned `info: RepoInfo`) as the inspection.
+        plan = planOpenFolder({
+          ok: true, path: r.path,
+          info: r.info,
+          remote: r.info.remote,
+          kind: !r.info.isRepo ? 'no-git'
+            : !r.info.remote ? 'git-no-remote'
+            : /github\.com[:/]/i.test(r.info.remote) ? 'git-github'
+            : 'git-non-github',
+          memoryRepo: { state: 'no-github-auth' },
+          error: e instanceof Error ? e.message : undefined,
+        });
+      }
+      setInspecting(false);
+      // Silent proceed: no operator decision needed, just open the project.
+      if (plan.kind === 'silent-proceed') {
+        await runProceed(r.path, plan.proceed);
+        return;
+      }
+      setFolderPlan(plan);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to inspect folder.');
+      setInspecting(false); setBusy(false);
+    }
+  };
+
+  /** Create the project with whatever GitHub linkage the decision step
+      produced (full silent-proceed payload, or the post-bootstrap result).
+      Shared by every `From folder` action so the linkage shape stays in
+      one place. */
+  const runProceed = async (path: string, link: { repoUrl: string; memorySlug: string; memoryRepoUrl: string }) => {
+    setBusy(true);
+    try {
+      const name = projectNameFromPath(path);
+      const proj = await api.createProject({
+        name, kind: 'coding', path,
+        instructions: '', color: 'blue',
+        ...(link.repoUrl ? { repoUrl: link.repoUrl } : {}),
+        ...(link.memorySlug ? { memorySlug: link.memorySlug } : {}),
+        ...(link.memoryRepoUrl ? { memoryRepoUrl: link.memoryRepoUrl } : {}),
+      });
       onAdded(proj);
       onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to add folder.');
     } finally { setBusy(false); }
+  };
+
+  /** "Skip — local-only" / "Skip — keep local" — just register the path
+      as-is, no GitHub side effects. Same code path as runProceed with no
+      linkage so the project lands in the sidebar identically. */
+  const skipFolderPlan = async () => {
+    if (!pickedPath) return;
+    await runProceed(pickedPath, { repoUrl: '', memorySlug: '', memoryRepoUrl: '' });
+  };
+
+  /** "Create GitHub repo + push" (git-no-remote) or "Init + push to GitHub"
+      (no-git). The desktop-side bootstrap handles both (it runs `git init`
+      only when needed via `adopt`). On 401 we surface a friendly error so
+      the operator knows to sign in to GitHub first. */
+  const bootstrapFolderToGitHub = async () => {
+    if (!pickedPath || !folderPlan) return;
+    setError(null); setBusy(true);
+    try {
+      const name = projectNameFromPath(pickedPath);
+      const result = await api.bootstrapProject({
+        name, localPath: pickedPath, private: true,
+        // adopt:true skips the local `git init` when the folder is already
+        // a repo (git-no-remote case). The bootstrap helper still seeds the
+        // README/.gitignore/.continuum and runs the initial commit + push.
+        adopt: folderPlan.kind === 'git-no-remote',
+      });
+      // No `owner` passed → legacy single-repo path → `cloneUrl` is on the
+      // result. The dual-repo shape only appears when the owner picker fed
+      // in a selection (which we don't have in this surface today).
+      const repoUrl = 'cloneUrl' in result ? result.cloneUrl : '';
+      await runProceed(pickedPath, { repoUrl, memorySlug: '', memoryRepoUrl: '' });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Bootstrap failed.';
+      // 401 is the most common cause (no GitHub auth). Tell the user how to fix it
+      // INSIDE the modal — they shouldn't have to dig through Settings.
+      setError(/401|sign in/i.test(msg)
+        ? 'Sign in to GitHub first (Settings → GitHub), then try again — or click Skip to keep this folder local-only.'
+        : msg);
+      setBusy(false);
+    }
+  };
+
+  /** "Create memory repo" (github-no-memory case). The dual-repo bootstrap
+      WITHOUT an owner picker falls back to the single-repo path which won't
+      create the memory companion — so we call a tiny adopt flow instead:
+      proceed with the known repoUrl + ask the lifecycle to create the
+      memory repo on first openProject. The plan already carries the slug
+      + user so the createProject call knows the names. */
+  const createMemoryAndProceed = async () => {
+    if (!pickedPath || !folderPlan || folderPlan.kind !== 'github-no-memory') return;
+    // We optimistically wire memorySlug + memoryRepoUrl onto the project —
+    // the openProject lifecycle (`openProjectMemory` in project-lifecycle.ts)
+    // calls ensureMemoryRepo which CREATES the repo if it doesn't exist yet.
+    await runProceed(pickedPath, {
+      repoUrl: folderPlan.repoUrl,
+      memorySlug: folderPlan.memorySlug,
+      memoryRepoUrl: `https://github.com/${folderPlan.memoryUser}/${folderPlan.memorySlug}-memory`,
+    });
   };
 
   const submitNewLocal = async () => {
@@ -247,19 +372,49 @@ export function AddProjectModal({ open, onClose, onAdded }: Props) {
               <p style={{ margin: 0, font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
                 Pick a folder on your Mac — it becomes a coding project and stays in your workspace.
               </p>
-              <button
-                data-autofocus
-                onClick={submitFromFolder}
-                disabled={busy}
-                className="apm-btn"
-                style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: 8, height: 36, padding: '0 16px', borderRadius: 10, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}
-              >
-                {busy ? <span className="apm-spin" style={{ width: 13, height: 13, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.5)', borderTopColor: '#fff' }} /> : <Icon name="folder" size={15} />}
-                Pick folder…
-              </button>
-              <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-                Existing repos are detected automatically — git status will light up the sidebar.
-              </div>
+
+              {/* Step 1: pick. Hidden once we have a plan to show. */}
+              {!folderPlan && !inspecting && (
+                <>
+                  <button
+                    data-autofocus
+                    onClick={submitFromFolder}
+                    disabled={busy}
+                    className="apm-btn"
+                    style={{ alignSelf: 'flex-start', display: 'inline-flex', alignItems: 'center', gap: 8, height: 36, padding: '0 16px', borderRadius: 10, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}
+                  >
+                    {busy ? <span className="apm-spin" style={{ width: 13, height: 13, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.5)', borderTopColor: '#fff' }} /> : <Icon name="folder" size={15} />}
+                    Pick folder…
+                  </button>
+                  <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                    Existing repos are detected automatically — git status will light up the sidebar.
+                  </div>
+                </>
+              )}
+
+              {/* Inspecting spinner — between picker close and plan landing. */}
+              {inspecting && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', borderRadius: 10, background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)' }}>
+                  <span className="apm-spin" style={{ width: 14, height: 14, borderRadius: '50%', border: '2px solid var(--separator)', borderTopColor: 'var(--blue)' }} />
+                  <span style={{ font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                    Inspecting {pickedPath ? projectNameFromPath(pickedPath) : 'folder'}…
+                  </span>
+                </div>
+              )}
+
+              {/* Step 2: the decision step. Renders 1–2 action buttons based
+                  on what `planOpenFolder` resolved — the default-focused
+                  button (data-autofocus) is the recommendation per the spec. */}
+              {folderPlan && (
+                <FolderDecision
+                  plan={folderPlan}
+                  busy={busy}
+                  onInitPush={bootstrapFolderToGitHub}
+                  onCreateMemory={createMemoryAndProceed}
+                  onSkip={skipFolderPlan}
+                  onPickAnother={() => { setFolderPlan(null); setPickedPath(null); setError(null); }}
+                />
+              )}
             </div>
           )}
 
@@ -389,6 +544,85 @@ export function AddProjectModal({ open, onClose, onAdded }: Props) {
             </div>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* FolderDecision — renders the "what should we do with this folder?" card
+   the modal shows after a successful adoptFolderInspect (Bug 1). Each
+   branch lays out ONE primary recommendation (default-focused, the user
+   can hit Enter) + a secondary Skip button per the spec. The plan's
+   `recommended` field picks which button gets data-autofocus. */
+function FolderDecision({ plan, busy, onInitPush, onCreateMemory, onSkip, onPickAnother }: {
+  plan: OpenFolderPlan;
+  busy: boolean;
+  onInitPush: () => void;
+  onCreateMemory: () => void;
+  onSkip: () => void;
+  onPickAnother: () => void;
+}) {
+  if (plan.kind === 'error') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div role="alert" style={{ padding: '10px 12px', borderRadius: 10, background: 'color-mix(in srgb, var(--red, #ff3b30) 8%, transparent)', border: '0.5px solid color-mix(in srgb, var(--red, #ff3b30) 28%, transparent)', font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--red, #ff3b30)' }}>{plan.error}</div>
+        <div><button data-autofocus onClick={onPickAnother} className="apm-btn" style={{ height: 36, padding: '0 16px', borderRadius: 10, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Pick another folder…</button></div>
+      </div>
+    );
+  }
+  // silent-proceed is handled by submitFromFolder directly — it shouldn't
+  // ever reach this render path. Defensive fallback shows "ready" with one
+  // primary button to keep the operator unblocked even if the flow regresses.
+  if (plan.kind === 'silent-proceed') {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div style={{ font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>{plan.headline}</div>
+      </div>
+    );
+  }
+  const headline = plan.headline;
+  const initPushLabel = plan.kind === 'no-git' ? 'Init + push to GitHub' : 'Create GitHub repo + push';
+  const skipLabel = plan.kind === 'no-git' ? 'Skip — keep local' : 'Skip — local-only';
+  const showCreateMemory = plan.kind === 'github-no-memory';
+  const showInitPush = plan.kind === 'no-git' || plan.kind === 'git-no-remote';
+  const recommended = plan.recommended;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, padding: '14px 16px', borderRadius: 12, background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)' }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+        <span style={{ width: 24, height: 24, borderRadius: 8, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 14%, transparent)', color: 'var(--blue)' }}>
+          <Icon name={plan.kind === 'no-git' ? 'folder' : 'gitBranch'} size={14} />
+        </span>
+        <div style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink)' }}>{headline}</div>
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'flex-end' }}>
+        <button onClick={onPickAnother} disabled={busy} className="apm-btn"
+          style={{ height: 36, padding: '0 14px', borderRadius: 10, background: 'transparent', color: 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
+          Pick another
+        </button>
+        <button
+          {...(recommended === 'skip' ? { 'data-autofocus': true } : {})}
+          onClick={onSkip} disabled={busy} className="apm-btn"
+          style={{ height: 36, padding: '0 14px', borderRadius: 10, background: recommended === 'skip' ? 'var(--blue)' : 'var(--fill-tertiary)', color: recommended === 'skip' ? '#fff' : 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer', border: '1px solid var(--separator)' }}>
+          {skipLabel}
+        </button>
+        {showInitPush && (
+          <button
+            {...(recommended === 'init-push' ? { 'data-autofocus': true } : {})}
+            onClick={onInitPush} disabled={busy} className="apm-btn"
+            style={{ height: 36, padding: '0 16px', borderRadius: 10, background: recommended === 'init-push' ? 'var(--blue)' : 'var(--fill-tertiary)', color: recommended === 'init-push' ? '#fff' : 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer', border: '1px solid var(--separator)', display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+            {busy && <span className="apm-spin" style={{ width: 12, height: 12, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.5)', borderTopColor: '#fff' }} />}
+            {initPushLabel}
+          </button>
+        )}
+        {showCreateMemory && (
+          <button
+            {...(recommended === 'create-memory' ? { 'data-autofocus': true } : {})}
+            onClick={onCreateMemory} disabled={busy} className="apm-btn"
+            style={{ height: 36, padding: '0 16px', borderRadius: 10, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+            {busy && <span className="apm-spin" style={{ width: 12, height: 12, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.5)', borderTopColor: '#fff' }} />}
+            Create memory repo
+          </button>
+        )}
       </div>
     </div>
   );
