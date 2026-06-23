@@ -13,7 +13,7 @@ import type { TelegramBot } from './telegram.js';
 import type { WhatsAppClient } from './whatsapp.js';
 import { approveWhatsappSend } from './whatsapp-analyze.js';
 import type { Providers, ProviderId } from './providers.js';
-import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, structuredDiff } from './git.js';
+import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, structuredDiff, listBranches } from './git.js';
 import { ensureGitHooks, ensureCommitIdentity } from './git-identity.js';
 import { pickCityCodename } from './codenames.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
@@ -420,6 +420,27 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
       // ── Chat sessions (each turn is a Job with sessionId) ─────
       case 'listSessions': return store.listSessions(p.projectId ? String(p.projectId) : undefined);
+      // Git branches available to a project — feeds the new-chat <BranchPicker />.
+      // Read-only; degrades to [] when the project has no repoDir (non-coding).
+      case 'listBranches': {
+        const proj = store.getProject(String(p.projectId ?? ''));
+        if (!proj?.path) return [];
+        return listBranches(proj.path);
+      }
+      // Eager session-create (operator picked a branch). Optional — `sendChat`
+      // still lazy-creates with the same base when this isn't called first.
+      case 'createSession': {
+        const projectId = String(p.projectId ?? '');
+        if (!store.getProject(projectId)) return bad('project not found', 404);
+        const title = typeof p.title === 'string' ? p.title : 'New chat';
+        const codename = typeof p.codename === 'string' && p.codename
+          ? p.codename
+          : pickCityCodename(store.usedCodenamesIn(projectId));
+        const base = typeof p.base === 'string' && p.base ? p.base : undefined;
+        const s = store.createSession(projectId, title, codename, base ? { base } : undefined);
+        emit('session', s);
+        return s;
+      }
       case 'renameSession': {
         if (!p.title || typeof p.title !== 'string') bad('title required');
         const s = store.updateSession(String(p.id ?? ''), { title: (p.title as string).slice(0, 60) });
@@ -624,7 +645,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           // image please" → empty title after strip) still gets a meaningful rail
           // entry — the codename pill is the durable callsign anyway.
           const seedTitle = titleText || (rawImages.length ? 'Image' : rawFiles.length ? 'Attachment' : 'New chat');
-          session = store.createSession(projectId, seedTitle, codename);
+          // Optional base branch from the new-chat picker — pinned onto the
+          // session here so engine.ts's first run forks the worktree from it.
+          const base = typeof p.base === 'string' && p.base.trim() ? p.base.trim() : undefined;
+          session = store.createSession(projectId, seedTitle, codename, base ? { base } : undefined);
           emit('session', session);
         }
         // The project's working root — where `.continuum/Attachment/` lives.
