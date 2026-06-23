@@ -32,7 +32,7 @@ import { displayCodename, codenameFromBranch, SESSION_STATE_COLOR } from '../lib
 import type { GithubConnection } from '../lib/git-types';
 import { SessionStateDot } from '../screens/SessionStateDot';
 import { useSession } from '../lib/useSessionGitState';
-import { useGitOpsState, runGitOpsAction, type GitOpsAction } from '../hooks/useGitOpsState';
+import { useGitOpsState, runGitOpsAction, behindBaseLabel, type GitOpsAction } from '../hooks/useGitOpsState';
 import { AiConflictResolveDialog } from './AiConflictResolveDialog';
 
 /* ── inline ConfirmDialog (replace with #63's PrActionConfirmDialog when merged) ── */
@@ -343,6 +343,7 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
   const stateColor = SESSION_STATE_COLOR[status.state] || 'var(--ink-tertiary)';
   const primary = dock.primary;
   const popoverId = `git-ops-dock-pop-${sessionId}`;
+  const behindLabel = behindBaseLabel(status);
 
   return (
     <div style={{ position: 'relative', display: 'inline-flex' }}>
@@ -366,6 +367,22 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
           width: 4, height: 4, borderRadius: 2, background: stateColor, marginRight: 2,
         }} />
         <span>{dock.label}</span>
+        {/* "↓ N" mini-chip — the dock's state may still be `clean` (no local
+            changes) while the BASE branch advanced on origin. Without this,
+            the operator's only signal that their work is stale was the
+            ↑/↓ counters buried in the expanded dock. The watcher fix above
+            keeps `local.behind` fresh; this chip surfaces it. */}
+        {behindLabel && (
+          <span
+            title={behindLabel}
+            aria-label={behindLabel}
+            style={{
+              font: '700 var(--fs-caption)/1 var(--font-text)',
+              color: 'var(--orange, #ff9500)',
+              padding: '0 6px', borderRadius: 8,
+              background: 'color-mix(in srgb, var(--orange, #ff9500) 14%, transparent)',
+            }}>↓ {status.local.behind}</span>
+        )}
         {primary && primary.kind !== 'commit' && primary.kind !== 'continue' && status.pr?.number != null && (
           <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>#{status.pr.number}</span>
         )}
@@ -456,6 +473,30 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
               <span style={{ color: 'var(--ink)', font: '500 var(--fs-caption)/1 var(--font-mono)' }}>{status.base}</span>
               <span style={{ color: 'var(--ink-tertiary)', marginLeft: 'auto', font: '500 var(--fs-caption)/1 var(--font-mono)' }}>
                 ↑{status.local.ahead} · ↓{status.local.behind}
+              </span>
+            </div>
+          )}
+          {/* Prominent "behind by N" row — when local.behind > 0, the base
+              branch advanced on origin (another chat merged its PR, the
+              operator merged via browser, or the periodic git-watcher
+              fetch picked up changes). Surfaces even when the primary
+              state is `clean` (local has no changes — but the base does).
+              Lives directly below the Base row so the operator's eye
+              tracks from "Base · master ↑0 · ↓3" to the call-to-action. */}
+          {behindLabel && status.base && (
+            <div role="status"
+              aria-label={behindLabel}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8, marginTop: 8,
+                padding: '6px 10px', borderRadius: 8,
+                background: 'color-mix(in srgb, var(--orange, #ff9500) 12%, transparent)',
+                border: '0.5px solid color-mix(in srgb, var(--orange, #ff9500) 35%, transparent)',
+                font: '600 var(--fs-caption)/1.3 var(--font-text)',
+                color: 'var(--orange, #ff9500)',
+              }}>
+              <span aria-hidden="true">↓</span>
+              <span>
+                Behind <span style={{ font: '700 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink)' }}>{status.base}</span> by {status.local.behind} commit{status.local.behind === 1 ? '' : 's'}
               </span>
             </div>
           )}
