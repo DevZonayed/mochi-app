@@ -1,4 +1,4 @@
-/* createSession({ base }) — pinning the worktree base branch at chat-create
+/* createSession({ baseBranch }) — pinning the worktree base branch at chat-create
    time. The engine reads `session.baseBranch` later and forwards it into
    `ensureSessionWorktree`, so this is the data-layer contract that backs
    the new <BranchPicker /> popover. */
@@ -10,7 +10,7 @@ vi.mock('electron', () => ({ app: { getPath: () => hoisted.dir } }));
 
 import { Store } from './store.js';
 
-describe('Store.createSession — opts.base', () => {
+describe('Store.createSession — opts.baseBranch', () => {
   beforeEach(() => { rmSync(hoisted.dir, { recursive: true, force: true }); });
 
   it('omitting opts keeps the legacy zero-arg behavior (no baseBranch set)', () => {
@@ -22,26 +22,26 @@ describe('Store.createSession — opts.base', () => {
     expect(sess2.baseBranch).toBeUndefined();
   });
 
-  it('pins baseBranch when opts.base is given', () => {
+  it('pins baseBranch when opts.baseBranch is given', () => {
     const s = new Store();
     const p = s.createProject({ name: 'Repo' });
-    const sess = s.createSession(p.id, 'pick a branch', 'lyon', { base: 'feat/login' });
+    const sess = s.createSession(p.id, 'pick a branch', 'lyon', { baseBranch:'feat/login' });
     expect(sess.baseBranch).toBe('feat/login');
   });
 
-  it('trims base and ignores empty/whitespace-only values', () => {
+  it('trims baseBranch and ignores empty/whitespace-only values', () => {
     const s = new Store();
     const p = s.createProject({ name: 'Repo' });
-    const trimmed = s.createSession(p.id, 't', undefined, { base: '  develop  ' });
+    const trimmed = s.createSession(p.id, 't', undefined, { baseBranch:'  develop  ' });
     expect(trimmed.baseBranch).toBe('develop');
-    const empty = s.createSession(p.id, 'e', undefined, { base: '   ' });
+    const empty = s.createSession(p.id, 'e', undefined, { baseBranch:'   ' });
     expect(empty.baseBranch).toBeUndefined();
   });
 
   it('persists baseBranch across a Store reload', () => {
     const s = new Store();
     const p = s.createProject({ name: 'Repo' });
-    const sess = s.createSession(p.id, 'persist', 'porto', { base: 'release/2026.04' });
+    const sess = s.createSession(p.id, 'persist', 'porto', { baseBranch:'release/2026.04' });
 
     const reloaded = new Store();
     expect(reloaded.getSession(sess.id)?.baseBranch).toBe('release/2026.04');

@@ -16,6 +16,12 @@ export interface PrStatus {
   mergeable: boolean | null;
   mergeableState: 'clean' | 'dirty' | 'blocked' | 'behind' | 'unstable' | 'draft' | 'unknown';
   checks: PrCheck[];
+  /** Branch this PR targets — populated by getPullStatus from REST `base.ref`.
+      Surfaced to the renderer so the merged banner can show "Merged to <base>"
+      and the Continue handler knows where to fork the next session. */
+  baseRefName?: string;
+  /** Epoch-ms timestamp of the merge. ONLY present when `state === 'merged'`. */
+  mergedAt?: number;
 }
 export interface LocalSnapshot {
   lastSubject: string | null;

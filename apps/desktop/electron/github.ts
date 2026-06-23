@@ -170,10 +170,14 @@ async function getChecks(token: string, owner: string, repo: string, sha: string
 
 /** Full status of PR #num: state, mergeability, and the check-run rollup. */
 export async function getPullStatus(token: string, owner: string, repo: string, num: number, fetchImpl?: FetchImpl): Promise<PrStatus> {
-  const r = await ghRequest<{ number: number; html_url: string; title: string; state: string; merged: boolean; mergeable: boolean | null; mergeable_state: string; head: { sha: string } }>({ token, path: `/repos/${owner}/${repo}/pulls/${num}`, fetchImpl });
+  // `base.ref` + `merged_at` carry through: the UI's "merged on <date> to <base>"
+  // banner reads them, and the Continue handler forks the next session off the
+  // merged target branch.
+  const r = await ghRequest<{ number: number; html_url: string; title: string; state: string; merged: boolean; mergeable: boolean | null; mergeable_state: string; head: { sha: string }; base?: { ref?: string }; merged_at?: string | null }>({ token, path: `/repos/${owner}/${repo}/pulls/${num}`, fetchImpl });
   const d = r.data;
   const checks = await getChecks(token, owner, repo, d.head.sha, fetchImpl);
-  return {
+  const mergedAtMs = d.merged && d.merged_at ? Date.parse(d.merged_at) : NaN;
+  const status: PrStatus = {
     number: d.number,
     url: d.html_url,
     title: d.title,
@@ -182,6 +186,9 @@ export async function getPullStatus(token: string, owner: string, repo: string, 
     mergeableState: normalizeMergeableState(d.mergeable_state),
     checks,
   };
+  if (d.base?.ref) status.baseRefName = d.base.ref;
+  if (Number.isFinite(mergedAtMs)) status.mergedAt = mergedAtMs;
+  return status;
 }
 
 export async function createPull(token: string, owner: string, repo: string, args: { head: string; base: string; title: string; body?: string }, fetchImpl?: FetchImpl): Promise<{ number: number; url: string }> {

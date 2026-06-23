@@ -33,6 +33,12 @@ export interface PrStatus {
   mergeable: boolean | null;
   mergeableState: 'clean' | 'dirty' | 'blocked' | 'behind' | 'unstable' | 'draft' | 'unknown';
   checks: PrCheck[];
+  /** The branch this PR targets (REST `base.ref`). Surfaced to the UI so a
+      "Continue from here" handler knows where to fork the next session, and so
+      the merged banner can read `Merged to <baseRefName>`. */
+  baseRefName?: string;
+  /** Epoch-ms timestamp of the merge. ONLY set when `state === 'merged'`. */
+  mergedAt?: number;
 }
 
 /** Compact "last commit + dirty file count" snapshot for the GitOpsDock's

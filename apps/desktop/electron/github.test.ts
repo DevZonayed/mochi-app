@@ -124,6 +124,28 @@ describe('getPullStatus', () => {
     ]);
     expect((await getPullStatus('t', 'o', 'r', 7, f)).state).toBe('merged');
   });
+  // Track 7: baseRefName + mergedAt feed the merged-banner ("merged on <date>
+  // to <base>") AND the Continue handler (forks the next session off the merged
+  // base). Both fields are OPTIONAL on the type but populated whenever the
+  // upstream payload carries them.
+  test('Track 7: maps base.ref → baseRefName and merged_at → mergedAt (ms)', async () => {
+    const f = routeFetch([
+      { match: '/pulls/7', status: 200, body: { number: 7, html_url: 'u', title: 't', state: 'closed', merged: true, mergeable: null, mergeable_state: 'unknown', head: { sha: 'abc' }, base: { ref: 'master' }, merged_at: '2024-01-15T10:30:00Z' } },
+      { match: '/check-runs', status: 200, body: { check_runs: [] } },
+    ]);
+    const s = await getPullStatus('t', 'o', 'r', 7, f);
+    expect(s.baseRefName).toBe('master');
+    expect(s.mergedAt).toBe(Date.parse('2024-01-15T10:30:00Z'));
+  });
+  test('Track 7: mergedAt absent on an unmerged PR even when merged_at is null', async () => {
+    const f = routeFetch([
+      { match: '/pulls/7', status: 200, body: { number: 7, html_url: 'u', title: 't', state: 'open', merged: false, mergeable: true, mergeable_state: 'clean', head: { sha: 'abc' }, base: { ref: 'main' }, merged_at: null } },
+      { match: '/check-runs', status: 200, body: { check_runs: [] } },
+    ]);
+    const s = await getPullStatus('t', 'o', 'r', 7, f);
+    expect(s.baseRefName).toBe('main');
+    expect(s.mergedAt).toBeUndefined();
+  });
 });
 
 describe('createPull / mergePull', () => {

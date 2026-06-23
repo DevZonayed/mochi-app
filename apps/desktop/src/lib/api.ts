@@ -92,6 +92,16 @@ export interface ChatSession {
       whether files changed). The `reviewer` field above still picks the
       engine/model. Off by default. */
   reviewerEnabled?: boolean;
+  /** "Continue from here" provenance — set ONLY on sessions spawned from a
+      merged ancestor. Surfaces as the `← Continued from "<title>"` link in
+      the chat header + a seed context card above the empty transcript. */
+  continuedFrom?: {
+    sessionId: string;
+    title: string;
+    prNumber?: number;
+    mergedAt?: number;
+    baseRefName?: string;
+  };
   createdAt: number;
   updatedAt: number;
 }
@@ -1109,7 +1119,7 @@ export const api = {
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
   /** Eagerly create a session pinned to a base branch (optional — sendChat will
       lazy-create with the same base if this isn't called first). */
-  createSession: (input: { projectId: string; title?: string; codename?: string; base?: string }) =>
+  createSession: (input: { projectId: string; title?: string; codename?: string; baseBranch?: string }) =>
     call<ChatSession>('createSession', { ...input }, () =>
       req<ChatSession>('/api/sessions/create', { method: 'POST', body: JSON.stringify(input) })),
   /** All branches (local + origin) usable as a new-chat base. Default flagged first. */
@@ -1137,6 +1147,12 @@ export const api = {
       Off by default. */
   setSessionReviewer: (id: string, enabled: boolean) =>
     call<ChatSession>('setSessionReviewer', { id, enabled }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/reviewer-enabled`, { method: 'POST', body: JSON.stringify({ enabled }) })),
+  /** Track 7 — "Continue from here": fork a new session off the merged base
+      ref of an ancestor session whose PR has been merged. The ancestor stays
+      open + read-only; the new session carries `continuedFrom` provenance the
+      chat surface renders as a `← Continued from "<title>"` link + seed card. */
+  continueSession: (input: { sessionId: string; baseRefName?: string; prNumber?: number; mergedAt?: number }) =>
+    call<ChatSession>('continueSession', { ...input }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(input.sessionId)}/continue`, { method: 'POST', body: JSON.stringify(input) })),
   deleteProject: (id: string) =>
     call<{ ok: boolean }>('deleteProject', { id }, () => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 

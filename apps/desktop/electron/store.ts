@@ -226,6 +226,19 @@ export interface ChatSession {
       reviews. Default OFF — the silent "only review when files changed"
       heuristic was confusing operators. The toggle lives next to autopilot. */
   reviewerEnabled?: boolean;
+  /** "Continue from here" provenance: set on a session that was forked off a
+      MERGED ancestor session. Drives the chat's `← Continued from "<title>"`
+      link AND the seed system-context card the renderer shows above the empty
+      transcript. The continuation session is otherwise a normal session — the
+      engine doesn't auto-replay the prior transcript; the operator can ask for
+      a summary or specifics if needed. */
+  continuedFrom?: {
+    sessionId: string;
+    title: string;
+    prNumber?: number;
+    mergedAt?: number;
+    baseRefName?: string;
+  };
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
@@ -1121,15 +1134,18 @@ export class Store {
     }
     return used;
   }
-  /** Create a chat. `opts.base` pins the branch the session's worktree forks
+  /** Create a chat. `opts.baseBranch` pins the branch the session's worktree forks
       from when the engine first runs (`engine.ts` reads `session.baseBranch`
-      and passes it into `ensureSessionWorktree`). Default behavior — omit base —
-      keeps the existing `resolveBaseBranch(origin/HEAD → current → 'main')` flow. */
-  createSession(projectId: string, title: string, codename?: string, opts?: { base?: string }): ChatSession {
+      and passes it into `ensureSessionWorktree`). Default behavior — omit baseBranch —
+      keeps the existing `resolveBaseBranch(origin/HEAD → current → 'main')` flow.
+      `opts.continuedFrom` seeds the continued-from link for sessions spawned via
+      the merged-session "Continue from here" affordance (T7). */
+  createSession(projectId: string, title: string, codename?: string, opts?: { baseBranch?: string; continuedFrom?: ChatSession['continuedFrom'] }): ChatSession {
     const t = now();
     const s: ChatSession = { id: id(), projectId, title: (title.trim() || 'New chat').slice(0, 60), createdAt: t, updatedAt: t };
     if (codename) s.codename = codename;
-    if (opts?.base && opts.base.trim()) s.baseBranch = opts.base.trim();
+    if (opts?.baseBranch && opts.baseBranch.trim()) s.baseBranch = opts.baseBranch.trim();
+    if (opts?.continuedFrom) s.continuedFrom = opts.continuedFrom;
     this.data.sessions.push(s); this.save();
     return s;
   }

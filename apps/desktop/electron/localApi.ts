@@ -437,8 +437,9 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const codename = typeof p.codename === 'string' && p.codename
           ? p.codename
           : pickCityCodename(store.usedCodenamesIn(projectId));
-        const base = typeof p.base === 'string' && p.base ? p.base : undefined;
-        const s = store.createSession(projectId, title, codename, base ? { base } : undefined);
+        const baseBranch = typeof p.baseBranch === 'string' && p.baseBranch ? p.baseBranch
+          : (typeof p.base === 'string' && p.base ? p.base : undefined);
+        const s = store.createSession(projectId, title, codename, baseBranch ? { baseBranch } : undefined);
         emit('session', s);
         return s;
       }
@@ -472,6 +473,40 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const s = store.setSessionArchived(String(p.id ?? ''), p.archived === true);
         emit('session', s);
         return s;
+      }
+      // Track 7 — "Continue from here": spawn a NEW session forked off the
+      // merged PR's base branch, carrying continued-from provenance so the
+      // chat surface can render the link + seed-context card. We INTENTIONALLY
+      // don't auto-replay the prior transcript into the engine; the operator
+      // asks for what they need (avoids blasting megabytes of history into
+      // every first turn). The old session stays open for read-only reference.
+      case 'continueSession': {
+        const prev = store.getSession(String(p.sessionId ?? ''));
+        if (!prev) return bad('session not found', 404);
+        const project = store.getProject(prev.projectId);
+        if (!project) return bad('project not found', 404);
+        // Picking a NEW codename keeps the new session's branch path distinct
+        // from the merged one (which is heading for cleanup) and gives the
+        // operator a fresh callsign to refer to.
+        const codename = pickCityCodename(store.usedCodenamesIn(prev.projectId));
+        // Title: previous (truncated to 60) + ' (continued)'. The slice in
+        // createSession will hard-cap, but we leave room for the suffix here
+        // so the marker survives.
+        const prevTitle = (prev.title || 'Chat').slice(0, 60);
+        const newTitle = `${prevTitle.slice(0, 46)} (continued)`;
+        const baseBranch = typeof p.baseRefName === 'string' && p.baseRefName ? String(p.baseRefName) : prev.baseBranch;
+        const session = store.createSession(prev.projectId, newTitle, codename, {
+          baseBranch,
+          continuedFrom: {
+            sessionId: prev.id,
+            title: prev.title,
+            prNumber: typeof p.prNumber === 'number' ? p.prNumber : undefined,
+            mergedAt: typeof p.mergedAt === 'number' ? p.mergedAt : undefined,
+            baseRefName: typeof p.baseRefName === 'string' && p.baseRefName ? String(p.baseRefName) : undefined,
+          },
+        });
+        emit('session', session);
+        return session;
       }
       // Per-chat autopilot + reviewer toggles. Independent on/off booleans
       // wired to the composer's two new toggle buttons. Both default OFF —
@@ -660,8 +695,9 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           const seedTitle = titleText || (rawImages.length ? 'Image' : rawFiles.length ? 'Attachment' : 'New chat');
           // Optional base branch from the new-chat picker — pinned onto the
           // session here so engine.ts's first run forks the worktree from it.
-          const base = typeof p.base === 'string' && p.base.trim() ? p.base.trim() : undefined;
-          session = store.createSession(projectId, seedTitle, codename, base ? { base } : undefined);
+          const baseBranch = typeof p.baseBranch === 'string' && p.baseBranch.trim() ? p.baseBranch.trim()
+            : (typeof p.base === 'string' && p.base.trim() ? p.base.trim() : undefined);
+          session = store.createSession(projectId, seedTitle, codename, baseBranch ? { baseBranch } : undefined);
           emit('session', session);
         }
         // The project's working root — where `.continuum/Attachment/` lives.

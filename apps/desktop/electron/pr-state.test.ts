@@ -21,4 +21,13 @@ describe('deriveState', () => {
   });
   test('pr-merged regardless of local', () => { expect(deriveState(base, pr({ state: 'merged' }))).toBe('pr-merged'); });
   test('pr-closed unmerged', () => { expect(deriveState(base, pr({ state: 'closed' }))).toBe('pr-closed'); });
+  // Track 7: the new optional fields baseRefName + mergedAt are inert in the
+  // state machine — they're metadata the UI reads, not signal the derivation
+  // uses. Make that contract explicit so a future refactor that accidentally
+  // gates on them gets caught.
+  test('baseRefName + mergedAt are state-machine-inert', () => {
+    expect(deriveState(base, pr({ state: 'merged', baseRefName: 'main', mergedAt: 1700000000000 }))).toBe('pr-merged');
+    expect(deriveState(base, pr({ state: 'merged' }))).toBe('pr-merged');
+    expect(deriveState({ ...base, ahead: 2, pushed: true }, pr({ baseRefName: 'main' }))).toBe('pr-mergeable');
+  });
 });
