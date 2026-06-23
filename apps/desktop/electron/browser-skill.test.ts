@@ -77,6 +77,7 @@ describe('ensureBrowserSkill', () => {
       'browser_cookies_get', 'browser_cookies_set', 'browser_cookies_clear',
       'browser_cdp', 'browser_pdf', 'browser_save_image',
       'browser_resolve_box', 'browser_assert', 'browser_storage_get', 'browser_storage_set', 'browser_storage_clear',
+      'browser_watch', 'browser_watch_list', 'browser_watch_cancel',
       'browser_window_resize', 'browser_emulate_viewport', 'browser_clear_emulation',
       'browser_session_start', 'browser_session_end',
     ];

@@ -28,7 +28,7 @@ export const BROWSER_SKILL_ID = 'mochi/browser';
 export const BROWSER_SKILL_MD = `---
 name: browser
 description: "Use this skill whenever the user asks you to drive their REAL Chrome browser (via the Mochi extension) — open a site, log in, click, type, screenshot, extract data, watch the network, download a file, run JS in a page. Do NOT use WebFetch/WebSearch for these — use the browser_* tools listed below."
-allowed-tools: [mcp__maestro__browser_status, mcp__maestro__browser_navigate, mcp__maestro__browser_snapshot, mcp__maestro__browser_read, mcp__maestro__browser_links, mcp__maestro__browser_click, mcp__maestro__browser_type, mcp__maestro__browser_screenshot, mcp__maestro__browser_evaluate, mcp__maestro__browser_scroll, mcp__maestro__browser_press_key, mcp__maestro__browser_click_at, mcp__maestro__browser_hover, mcp__maestro__browser_drag, mcp__maestro__browser_wait, mcp__maestro__browser_wait_for_selector, mcp__maestro__browser_find_by_role_name, mcp__maestro__browser_match_count, mcp__maestro__browser_resolve_box, mcp__maestro__browser_assert, mcp__maestro__browser_open_tab, mcp__maestro__browser_list_tabs, mcp__maestro__browser_close_tab, mcp__maestro__browser_tab_url, mcp__maestro__browser_go_back, mcp__maestro__browser_go_forward, mcp__maestro__browser_console_messages, mcp__maestro__browser_network_requests, mcp__maestro__browser_upload_file, mcp__maestro__browser_download_url, mcp__maestro__browser_grab_image, mcp__maestro__browser_save_image, mcp__maestro__browser_storage_get, mcp__maestro__browser_storage_set, mcp__maestro__browser_storage_clear, mcp__maestro__browser_cookies_get, mcp__maestro__browser_cookies_set, mcp__maestro__browser_cookies_clear, mcp__maestro__browser_cdp, mcp__maestro__browser_pdf, mcp__maestro__browser_window_resize, mcp__maestro__browser_emulate_viewport, mcp__maestro__browser_clear_emulation, mcp__maestro__browser_session_start, mcp__maestro__browser_session_end]
+allowed-tools: [mcp__maestro__browser_status, mcp__maestro__browser_navigate, mcp__maestro__browser_snapshot, mcp__maestro__browser_read, mcp__maestro__browser_links, mcp__maestro__browser_click, mcp__maestro__browser_type, mcp__maestro__browser_screenshot, mcp__maestro__browser_evaluate, mcp__maestro__browser_scroll, mcp__maestro__browser_press_key, mcp__maestro__browser_click_at, mcp__maestro__browser_hover, mcp__maestro__browser_drag, mcp__maestro__browser_wait, mcp__maestro__browser_wait_for_selector, mcp__maestro__browser_find_by_role_name, mcp__maestro__browser_match_count, mcp__maestro__browser_resolve_box, mcp__maestro__browser_assert, mcp__maestro__browser_open_tab, mcp__maestro__browser_list_tabs, mcp__maestro__browser_close_tab, mcp__maestro__browser_tab_url, mcp__maestro__browser_go_back, mcp__maestro__browser_go_forward, mcp__maestro__browser_console_messages, mcp__maestro__browser_network_requests, mcp__maestro__browser_upload_file, mcp__maestro__browser_download_url, mcp__maestro__browser_grab_image, mcp__maestro__browser_save_image, mcp__maestro__browser_storage_get, mcp__maestro__browser_storage_set, mcp__maestro__browser_storage_clear, mcp__maestro__browser_cookies_get, mcp__maestro__browser_cookies_set, mcp__maestro__browser_cookies_clear, mcp__maestro__browser_cdp, mcp__maestro__browser_pdf, mcp__maestro__browser_window_resize, mcp__maestro__browser_emulate_viewport, mcp__maestro__browser_clear_emulation, mcp__maestro__browser_session_start, mcp__maestro__browser_session_end, mcp__maestro__browser_watch, mcp__maestro__browser_watch_list, mcp__maestro__browser_watch_cancel]
 ---
 
 # Browser
@@ -43,7 +43,7 @@ mcp__maestro__browser_status
 
 This tells you: is a browser connected? which profile? what tab is open? If no profile is connected, ask the user to open the Mochi Chrome extension and pair it (the app shows the token under Settings → Browser extension). Do NOT silently fall back to WebFetch.
 
-## The 45+ tools, grouped
+## The 48+ tools, grouped
 
 ### Navigate
 - \`browser_navigate({url})\` — open URL in active session (creates one on demand).
@@ -103,6 +103,12 @@ This tells you: is a browser connected? which profile? what tab is open? If no p
 ### Lifecycle
 - \`browser_session_start({title?, color?, url?, newWindow?})\` — explicit start (almost never needed — \`browser_navigate\` opens one automatically).
 - \`browser_session_end({closeTabs?})\` — close the session group; \`closeTabs:true\` to also close the tabs.
+
+### Watch (observe + post-on-trigger) — **the killer feature**
+The agent's CURRENT turn doesn't have to stay alive to wait. Place a watch on the page; the desktop polls it; when the condition fires it posts a NEW message into THIS chat that starts a fresh agent turn (with the full session memory + tools).
+- \`browser_watch({title, condition, message?, intervalMs?, maxDurationMs?, repeat?})\` — \`condition\` is a JS expression evaluated in the page (same engine as \`browser_evaluate\`); must return a truthy/falsy value. Returns a watch id. Use to "wait for X to happen and then act" — generation finishing, price hitting target, captcha solved, upload done, status flipping. Survives turn end + desktop restarts. One-shot by default (auto-cancels after first fire); \`repeat:true\` re-fires on every false→true transition.
+- \`browser_watch_list()\` — list watches bound to THIS chat with their state (active, fireCount, lastResult: true/false/error/no-browser, lastError, expiresAt). The diagnostic call when a watch seems stuck.
+- \`browser_watch_cancel({id})\` — stop watching. Idempotent.
 
 ## The reading ladder (cheap → expensive)
 
@@ -214,12 +220,74 @@ browser_cdp({method: "Network.setBlockedURLs", params: {urls: ["*googletagmanage
 browser_navigate({url: "https://..."})
 \`\`\`
 
+### "Wait for the Gemini/ChatGPT/Midjourney image to finish, then save it"
+This is the canonical use-case the transcript needed. End your turn — don't sit polling. The watcher fires a new turn the moment the image lands.
+\`\`\`
+browser_navigate({url: "https://gemini.google.com/app"})
+browser_find_by_role_name({role: "textbox", name: ""})       // discover the editor ref
+browser_type({ref: "<the ref>", text: "<prompt>"})
+browser_press_key({key: "Enter"})
+browser_watch({
+  title: "Wait for Gemini image",
+  condition: "document.querySelectorAll('img[alt*=generated i], img[src*=blob:]').length > 0",
+  message: "The image is ready — save it with browser_grab_image + browser_save_image.",
+  intervalMs: 2000,
+  maxDurationMs: 300000     // 5 min cap
+})
+// Your current turn ends. When the image appears, a new turn starts in this
+// same chat — you (the next-turn agent) read this message + the watch context
+// and immediately call browser_grab_image → browser_save_image.
+\`\`\`
+
+### "Watch a price and ping me when it hits a target"
+\`\`\`
+browser_navigate({url: "https://coinmarketcap.com/currencies/solana/"})
+browser_watch({
+  title: "SOL ≤ $145",
+  condition: "Number(document.querySelector('[data-test=text-cdp-price-display]').textContent.replace(/[^0-9.]/g,'')) <= 145",
+  message: "SOL crossed your threshold — decide whether to buy.",
+  intervalMs: 30000,         // every 30s — don't hammer the site
+  maxDurationMs: 86400000    // up to 24h
+})
+\`\`\`
+
+### "Watch for the captcha to be solved by the user"
+\`\`\`
+browser_watch({
+  title: "Captcha cleared",
+  condition: "!document.querySelector('.g-recaptcha, iframe[src*=recaptcha]')",
+  message: "Captcha is gone — continue the original flow.",
+  intervalMs: 1500
+})
+\`\`\`
+
+### "Watch a long-running CI build for status changes (repeat mode)"
+\`\`\`
+browser_watch({
+  title: "CI status",
+  condition: "['success','failure','cancelled'].includes(document.querySelector('[data-status]').dataset.status)",
+  message: "CI finished — read the result and decide next steps.",
+  intervalMs: 15000,
+  repeat: true,              // re-fire on every false→true transition
+  maxDurationMs: 7200000     // 2h
+})
+\`\`\`
+
+## Watch debugging
+
+If a watch isn't firing, call \`browser_watch_list\` and check \`lastResult\`:
+- \`true\` + \`fireCount > 0\` → it fired (look for the chat turn).
+- \`false\` → condition is being evaluated and returning false. Check the condition.
+- \`error\` + \`lastError\` → your expression throws. After 5 identical errors in a row the watch auto-cancels as \`invalid-condition\` and posts a notice into the chat.
+- \`no-browser\` → no Chrome profile is currently active. The watch DOES NOT expire on this — it picks back up when a profile reconnects.
+
 ## Things to NEVER do
 
 - Don't fall back to WebFetch/WebSearch when the user said "use my browser".
 - Don't open a new \`browser_session_start\` if one already exists (\`browser_navigate\` reuses it).
 - Don't paste base64 image data into your reply — pass the dataUrl through and let the user save it.
 - Don't loop \`browser_snapshot\` waiting for content — use \`browser_wait_for_selector\`.
+- Don't sit polling inside the same turn for something that might take minutes (image generation, CI build, price target) — \`browser_watch\` instead and END YOUR TURN. The next turn fires automatically when the condition is met.
 - Don't read sensitive form values (passwords, OTP) into the transcript — drive them, don't echo them.
 `;
 

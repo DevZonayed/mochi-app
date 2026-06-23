@@ -513,6 +513,16 @@ interface BrowserCtx {
   connected: () => boolean;
   profile: () => string | null;
   call: (type: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
+  /** Agent-placed background watch: poll a JS condition on the active tab and
+      post a NEW chat turn into THIS session when it transitions to true. Bound
+      to the run's projectId+sessionId so the watch can't accidentally target
+      another chat. Returns null when the desktop wasn't started with a
+      BrowserWatcher (browser_watch_* tools then degrade to a clear error). */
+  watch?: {
+    create: (input: { title: string; condition: string; message?: string; intervalMs?: number; maxDurationMs?: number; repeat?: boolean }) => import('./store.js').BrowserWatch;
+    cancel: (id: string) => import('./store.js').BrowserWatch | null;
+    list: () => import('./store.js').BrowserWatch[];
+  };
 }
 
 /* WhatsApp capability for the agent — backed by THIS Mac's Baileys socket + store.
@@ -1030,6 +1040,43 @@ async function runClaude(
                 return txt(`PDF saved to ${dl.filename ?? `~/Downloads/${filename}`} (download id ${dl.id ?? '?'}, ${(data.length * 0.75 / 1024).toFixed(1)} KB).`);
               })),
 
+            // ── Background "observe + post-on-trigger" watches ──
+            ...(browserCtx.watch ? [
+              tool('browser_watch',
+                'Place a BACKGROUND WATCH on the active browser tab: poll a JS condition every N ms, and when it transitions to TRUE, post a NEW message into THIS chat — starting a fresh agent turn that has the full session memory. Your CURRENT turn does NOT have to stay alive — the watcher runs on the desktop and survives across turns AND desktop restarts. ' +
+                'Use whenever you need to "wait for X to happen and then act": a Gemini/ChatGPT generation finishing, a payment status flipping, a price hitting a target, a CI badge turning green, a captcha being solved by the user, an upload finishing, a chat reply arriving. ' +
+                'Condition is a JS expression evaluated in the page (the same engine as browser_evaluate). MUST return a truthy/falsy value — keep it fast. Example: `!!document.querySelector(".success-toast")` / `document.title.includes("Completed")` / `Number(document.querySelector(".price").textContent.replace(/[^0-9.]/g,"")) <= 49.99` / `document.querySelectorAll("img[alt*=generated]").length > 0`. ' +
+                'Returns the watch id (use it with browser_watch_cancel). The chat message that fires includes the watch title, your message, the tab URL, and the condition — so the next-turn agent knows what to do.',
+                {
+                  title: z.string().describe('Short label, e.g. "Wait for Gemini image" or "Watch SOL price ≤ $145".'),
+                  condition: z.string().describe('JS expression evaluated in the page. Returns truthy/falsy. Avoid side effects.'),
+                  message: z.string().optional().describe('Optional one-line note. Surfaced in the chat when the condition fires.'),
+                  intervalMs: z.number().optional().describe('Poll cadence (500..300000, default 5000).'),
+                  maxDurationMs: z.number().optional().describe('Max total lifetime in ms (auto-cancels at this deadline). Default 30 min, cap 24 h.'),
+                  repeat: z.boolean().optional().describe('When true, fire EVERY time the condition transitions false→true (not just once). Default false (one-shot, then auto-cancels).'),
+                },
+                wrap(async (a: { title: string; condition: string; message?: string; intervalMs?: number; maxDurationMs?: number; repeat?: boolean }) => {
+                  const w = browserCtx.watch!.create(a);
+                  return txt(`Watching "${w.title}" — id ${w.id} (every ${w.intervalMs}ms, expires ${new Date(w.expiresAt).toISOString()}, ${w.repeat ? 'repeating' : 'one-shot'}). The watcher posts back into this chat when the condition becomes true. Cancel with browser_watch_cancel("${w.id}").`);
+                })),
+              tool('browser_watch_list',
+                'List the BROWSER WATCHES bound to THIS chat session. Shows: id, title, active flag, fireCount, lastResult (true/false/error/no-browser), lastError, expiresAt. Use to diagnose a stuck watch (e.g. lastResult=\'no-browser\' = the user needs to pair the extension; lastResult=\'error\' = your condition expression is throwing).',
+                {},
+                wrap(async () => {
+                  const list = browserCtx.watch!.list();
+                  if (list.length === 0) return txt('No browser watches for this chat. Use browser_watch to start one.');
+                  return txt(list.map(w => `- ${w.id} [${w.active ? 'active' : `done · ${w.cancelReason ?? 'cancelled'}`}] "${w.title}" — fires=${w.fireCount}, lastResult=${w.lastResult ?? '(none)'}${w.lastError ? ` (${w.lastError})` : ''}, every ${w.intervalMs}ms, expires ${new Date(w.expiresAt).toISOString()}${w.lastFiredAt ? `\n    lastFiredAt=${new Date(w.lastFiredAt).toISOString()}` : ''}\n    condition: ${w.condition.length > 200 ? w.condition.slice(0, 200) + '…' : w.condition}`).join('\n'));
+                })),
+              tool('browser_watch_cancel',
+                'Cancel a browser watch by id. Idempotent — already-cancelled watches return the row without erroring. Use when you no longer need to wait (you solved it another way, or the user changed their mind).',
+                { id: z.string() },
+                wrap(async (a: { id: string }) => {
+                  const w = browserCtx.watch!.cancel(a.id);
+                  if (!w) return txt(`No watch found with id ${a.id} (it may belong to another chat, or it was already deleted).`);
+                  return txt(`Watch ${a.id} ("${w.title}") cancelled.`);
+                })),
+            ] : []),
+
             // ── Lifecycle (almost always implicit via browser_navigate) ──
             tool('browser_session_start',
               'Explicitly start a browser session (open a tab in a Mochi-managed tab group). Almost never needed — browser_navigate creates one on demand.',
@@ -1225,6 +1272,7 @@ async function runClaude(
       'browser_resolve_box', 'browser_assert', 'browser_storage_get', 'browser_storage_set', 'browser_storage_clear',
       'browser_window_resize', 'browser_emulate_viewport', 'browser_clear_emulation',
       'browser_session_start', 'browser_session_end',
+      'browser_watch', 'browser_watch_list', 'browser_watch_cancel',
     ] : []),
     ...(scheduleCtx ? ['schedule_list', 'schedule_create', 'schedule_update', 'schedule_delete', 'schedule_toggle', 'schedule_run_now', 'projects_list', 'sessions_list'] : []),
     ...(gitCtx ? ['git_status', 'git_push', 'pr_create', 'pr_merge', 'pr_resolve_conflicts', 'branch_rename'] : []),
@@ -1709,6 +1757,13 @@ export class LocalEngine {
       simply report "no browser connected" until a Chrome profile pairs + activates. */
   private extBridge?: () => ExtensionBridgeLike | null;
   setExtensionBridge(fn: () => ExtensionBridgeLike | null) { this.extBridge = fn; }
+  /** Browser watcher — the agent-placed "observe an element / condition" background
+      poll that posts a new chat turn when the criteria fire. Injected from main.ts
+      so the agent's browser_watch_* tools route through the same persistent watcher
+      the UI manages. Null/absent = the agent's browser_watch tools simply report
+      "watcher not available" (a clean degrade, never a crash). */
+  private browserWatcher?: import('./browser-watch.js').BrowserWatcher;
+  setBrowserWatcher(w: import('./browser-watch.js').BrowserWatcher) { this.browserWatcher = w; }
   /** Public entry the UI/dispatch use to (re)generate or edit an image outside a
       coding turn — routes through the SAME backend (Codex/fal) the generate_image
       tool uses, so a one-click "Regenerate" or a "modify this image" instruction
@@ -2752,6 +2807,32 @@ export class LocalEngine {
         connected: () => bridge.hasActiveBrowser(),
         profile: () => bridge.activeProfile(),
         call: (type, params, timeoutMs) => bridge.request(type, params ?? {}, timeoutMs),
+        /* Bind a watcher view scoped to THIS run's project+session: every watch
+           the agent creates this turn fires back into the same chat. Listing /
+           cancelling stays per-session too so the agent can't see or cancel
+           someone else's watches. The watcher itself is process-wide (singleton
+           managed in main.ts); we just project a session-scoped view of it. */
+        ...(this.browserWatcher && session ? {
+          watch: {
+            create: (input) => this.browserWatcher!.create({
+              projectId: job.projectId ?? session.projectId,
+              sessionId: session.id,
+              title: input.title,
+              condition: input.condition,
+              message: input.message,
+              intervalMs: input.intervalMs,
+              maxDurationMs: input.maxDurationMs,
+              repeat: input.repeat,
+            }),
+            cancel: (id) => {
+              // Authorise: only cancel watches that belong to THIS session, so a
+              // run can't reach across chats. A misaddressed cancel is a clean no-op.
+              const w = this.store.listBrowserWatches({ sessionId: session.id }).find(x => x.id === id);
+              return w ? this.browserWatcher!.cancel(id) : null;
+            },
+            list: () => this.browserWatcher!.list({ sessionId: session.id }),
+          },
+        } : {}),
       } : undefined;
       /* Auto-install the bundled `browser` SKILL.md so the agent reads the full
          tool reference + recipes BEFORE its first browser_* call. Idempotent — it
