@@ -35,6 +35,19 @@ export interface PrStatus {
   checks: PrCheck[];
 }
 
+/** Compact "last commit + dirty file count" snapshot for the GitOpsDock's
+    expanded view. Optional — older callers (sidebar dot, project rollup)
+    don't need it, so we don't pay the `git log -1 / git status` cost
+    on the hot path. Populated by `GitService.fullStatus`. */
+export interface LocalSnapshot {
+  /** First line of `git log -1 --format=%s`. `null` when the branch has no commits. */
+  lastSubject: string | null;
+  /** Author date of the last commit (epoch ms). `null` when no commits. */
+  lastCommitAt: number | null;
+  /** Number of modified/added/deleted files in the working tree (porcelain count). */
+  dirtyFiles: number;
+}
+
 export interface SessionGitStatus {
   sessionId: string;
   branch: string | null;
@@ -43,6 +56,8 @@ export interface SessionGitStatus {
   pr: PrStatus | null;
   state: SessionGitState;
   lastCheckedAt: number;
+  /** Renderer-facing extras for the GitOpsDock; absent on older callers. */
+  snapshot?: LocalSnapshot;
 }
 
 /* ── Human-confirm preview payloads ──────────────────────────────────────

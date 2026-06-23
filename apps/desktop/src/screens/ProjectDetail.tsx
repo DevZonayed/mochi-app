@@ -30,7 +30,7 @@ import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
 import { OpenPathContext, pathIsInside, type OpenPathFn } from '../lib/openPath';
 import { displayCodename } from '../lib/git-types';
-import { GitStatusBar } from './GitStatusBar';
+import { GitOpsDock } from '../components/GitOpsDock';
 import { SessionStateDot } from './SessionStateDot';
 import { useSession, useSessionStateOnly } from '../lib/useSessionGitState';
 
@@ -2654,7 +2654,7 @@ function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projec
           <Icon name="archive" size={11} /> Archived
         </span>
       )}
-      <GitStatusBar sessionId={sessionId} variant="header" codename={code} />
+      <GitOpsDock sessionId={sessionId} codename={code} />
       <button onClick={archive} disabled={busy} title={archived ? 'Restore chat' : 'Archive chat'}
         style={{ height: 28, padding: '0 11px', borderRadius: 8, border: '0.5px solid var(--separator-strong)',
           background: 'var(--fill-secondary)', color: 'var(--ink)',
@@ -3271,7 +3271,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
         background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
       {/* Conductor-style chat header: codename + state chip + Archive. The
-          GitStatusBar gates itself for non-repo / null sessions. */}
+          GitOpsDock (Track 5) gates itself for non-repo / null sessions. */}
       <ChatHeader sessionId={activeId} projectId={projectId} />
       <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
         <div style={{ maxWidth: CHAT_W, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>

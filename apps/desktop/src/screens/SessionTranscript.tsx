@@ -10,7 +10,7 @@
 
 import React from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { GitStatusBar } from './GitStatusBar';
+// Track 5: GitStatusBar removed from the transcript — the chat header's <GitOpsDock /> is the single source of truth for git actions.
 import { Icon, type IconName } from '../lib/icons';
 import { EffortDial, CountUp } from '../lib/ui';
 import { FileChip } from '../lib/fileChip';
@@ -583,7 +583,7 @@ export default function SessionTranscript() {
                 <EffortDial value={job ? EFFORT_TO_PILL[job.effort] : 'DEEP'} compact />
               </div>
             </div>
-            <GitStatusBar sessionId={job?.sessionId ?? null} />
+            {/* Track 5: git actions are now the chat header's <GitOpsDock /> — single source of truth. */}
             {/* real engine · model badge — which engine ran this job, on this Mac */}
             {job?.engine && (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)',
