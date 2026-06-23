@@ -17,6 +17,11 @@ export interface PrStatus {
   mergeableState: 'clean' | 'dirty' | 'blocked' | 'behind' | 'unstable' | 'draft' | 'unknown';
   checks: PrCheck[];
 }
+export interface LocalSnapshot {
+  lastSubject: string | null;
+  lastCommitAt: number | null;
+  dirtyFiles: number;
+}
 export interface SessionGitStatus {
   sessionId: string;
   branch: string | null;
@@ -25,6 +30,7 @@ export interface SessionGitStatus {
   pr: PrStatus | null;
   state: SessionGitState;
   lastCheckedAt: number;
+  snapshot?: LocalSnapshot;
 }
 export interface GithubConnection { connected: boolean; login: string | null; scopes: string[] | null; hasRepoScope: boolean; }
 
