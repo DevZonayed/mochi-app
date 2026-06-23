@@ -1349,6 +1349,44 @@ async function runClaude(
   // both must survive so the final message can replace each with its canonical copy.
   let openThinking: TranscriptItem | null = null;
   const toolById = new Map<string, TranscriptItem>();
+  /* Per-sub-agent transcript writers, keyed by the parent's tool_use_id.
+     Every SDK event carrying `parent_tool_use_id` belongs to a Task/Agent
+     dispatch's INNER turn loop (its tool calls, thinking, prose). Instead of
+     dropping those events on the floor (the old behaviour, which left the UI
+     showing only a one-line chip + checkmark), we route each into the parent
+     chip's `children[]` so the operator can expand the chip and SEE what the
+     sub-agent actually did. Each writer mirrors the top-level open-block /
+     toolById state but writes into the parent's own children array. */
+  interface SubWriter { open: TranscriptItem | null; openThinking: TranscriptItem | null; toolById: Map<string, TranscriptItem>; }
+  const subWriters = new Map<string, SubWriter>();
+  const SUB_CAP = 80; // soft cap per sub-agent so a chatty Plan agent doesn't bloat the transcript
+  const subWriterFor = (parentId: string): { w: SubWriter; out: TranscriptItem[] } | null => {
+    const parent = toolById.get(parentId);
+    if (!parent) return null;
+    if (!parent.children) parent.children = [];
+    let w = subWriters.get(parentId);
+    if (!w) { w = { open: null, openThinking: null, toolById: new Map() }; subWriters.set(parentId, w); }
+    return { w, out: parent.children };
+  };
+  /* Pull the sub-agent's final text response out of a tool_result.content
+     payload (which is either a string OR an array of {type:'text',text:…} blocks
+     per the Anthropic content-block convention). Used to populate `parent.result`
+     so the collapsed chip can preview the answer without forcing the user to
+     expand. */
+  const extractToolResultText = (c: unknown): string => {
+    if (typeof c === 'string') return c.trim();
+    if (Array.isArray(c)) {
+      const parts: string[] = [];
+      for (const b of c) {
+        if (b && typeof b === 'object' && (b as { type?: string }).type === 'text') {
+          const t = (b as { text?: unknown }).text;
+          if (typeof t === 'string') parts.push(t);
+        }
+      }
+      return parts.join('\n').trim();
+    }
+    return '';
+  };
 
   let resultText = '';
   let usage: { input_tokens?: number; output_tokens?: number } | null = null;
@@ -1391,8 +1429,67 @@ async function runClaude(
         total_cost_usd?: number; result?: unknown;
       };
       if (m.session_id) sdkSessionId = m.session_id;
-      // Subagent traffic surfaces through its parent Task chip — don't interleave it.
-      if (m.parent_tool_use_id) continue;
+      // Sub-agent traffic (Task/Agent dispatch INNER events) — route into the
+      // parent chip's `children[]` so the chat can render an expandable
+      // "what the sub-agent did" view instead of staring at a single chip.
+      if (m.parent_tool_use_id) {
+        const ctx = subWriterFor(m.parent_tool_use_id);
+        if (!ctx) continue; // unknown parent → drop (defensive; shouldn't happen)
+        const { w, out } = ctx;
+        // Soft cap: stop appending new items once we've recorded plenty. Tool
+        // status/result updates are still allowed (they MUTATE existing chips,
+        // not append) so a long sub-agent still shows clean checkmarks.
+        const canAppend = out.length < SUB_CAP;
+        if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'thinking_delta') {
+          if (!w.openThinking) {
+            if (!canAppend) { progress(); continue; }
+            w.openThinking = { kind: 'thinking', text: '', ts: Date.now() }; out.push(w.openThinking);
+          }
+          w.openThinking.text += m.event.delta.thinking ?? '';
+        } else if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
+          if (!w.open) {
+            if (!canAppend) { progress(); continue; }
+            w.open = { kind: 'text', text: '', ts: Date.now() }; out.push(w.open);
+          }
+          w.open.text += m.event.delta.text ?? '';
+        } else if (m.type === 'assistant' && m.message?.content) {
+          for (const b of m.message.content) {
+            if (b.type === 'thinking' && typeof b.thinking === 'string') {
+              if (w.openThinking) { w.openThinking.text = b.thinking; w.openThinking = null; }
+              else if (b.thinking.trim() && canAppend) out.push({ kind: 'thinking', text: b.thinking, ts: Date.now() });
+            } else if (b.type === 'text' && typeof b.text === 'string') {
+              w.openThinking = null;
+              if (w.open) { w.open.text = b.text; w.open = null; }
+              else if (b.text.trim() && canAppend) out.push({ kind: 'text', text: b.text, ts: Date.now() });
+            } else if (b.type === 'tool_use') {
+              w.open = null; w.openThinking = null;
+              if (!canAppend) continue;
+              const label = toolLabel(b.name ?? '', b.input, cwd);
+              const t: TranscriptItem = { kind: 'tool', name: b.name ?? 'tool', text: label.text, toolStatus: 'running', ts: Date.now() };
+              if (label.cmd) t.cmd = label.cmd;
+              const preview = toolPreview(b.name ?? '', b.input);
+              if (preview !== undefined) t.preview = preview;
+              if (b.id) {
+                t.id = b.id;
+                w.toolById.set(b.id, t);
+                // ALSO register in the top-level map so a grand-child (a
+                // sub-agent dispatched BY a sub-agent) can find this chip.
+                toolById.set(b.id, t);
+              }
+              out.push(t);
+            }
+          }
+        } else if (m.type === 'user' && m.message?.content) {
+          for (const b of m.message.content) {
+            if (b.type === 'tool_result' && b.tool_use_id) {
+              const t = w.toolById.get(b.tool_use_id);
+              if (t) { t.toolStatus = b.is_error ? 'error' : 'done'; t.durMs = Date.now() - t.ts; }
+            }
+          }
+        }
+        progress();
+        continue;
+      }
 
       if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'thinking_delta') {
         // Extended thinking (default-on/adaptive for Opus 4.6+). Stream it into an
@@ -1436,7 +1533,7 @@ async function runClaude(
             const preview = toolPreview(b.name ?? '', b.input);
             if (preview !== undefined) t.preview = preview;
             items.push(t);
-            if (b.id) toolById.set(b.id, t);
+            if (b.id) { t.id = b.id; toolById.set(b.id, t); }
           }
         }
         progress();
@@ -1444,7 +1541,17 @@ async function runClaude(
         for (const b of m.message.content) {
           if (b.type === 'tool_result' && b.tool_use_id) {
             const t = toolById.get(b.tool_use_id);
-            if (t) { t.toolStatus = b.is_error ? 'error' : 'done'; t.durMs = Date.now() - t.ts; }
+            if (t) {
+              t.toolStatus = b.is_error ? 'error' : 'done'; t.durMs = Date.now() - t.ts;
+              // If this was a sub-agent dispatch (Task/Agent), the result
+              // content carries the sub-agent's FINAL assistant text — surface
+              // it as `result` so the collapsed chip can preview the answer
+              // ("→ <first line>…") without forcing the user to expand.
+              if (t.children) {
+                const txt = extractToolResultText((b as { content?: unknown }).content);
+                if (txt) t.result = txt;
+              }
+            }
           }
         }
         progress();

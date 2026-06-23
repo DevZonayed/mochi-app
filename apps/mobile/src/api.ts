@@ -33,6 +33,18 @@ export interface TranscriptItem {
   preview?: string;
   ask?: string;
   alt?: string;
+  /** tool only: the SDK's tool_use_id — used to route nested sub-agent events
+      back to this chip so the UI can expand to show the sub-agent's transcript. */
+  id?: string;
+  /** tool only (sub-agent calls — Task/Agent): the sub-agent's own captured
+      transcript (its tool calls, thinking, prose). Rendered inside an
+      expandable section under the parent chip. Capped on the Mac side before
+      it crosses the relay. */
+  children?: TranscriptItem[];
+  /** tool only (sub-agent calls): the sub-agent's FINAL text response,
+      unpacked from the tool_result content so the collapsed chip can preview
+      the answer and the expanded view can show it in full. */
+  result?: string;
   ts: number;
 }
 export interface Job {
