@@ -56,6 +56,7 @@ import {
 } from './retry-backoff.js';
 import { resolveGh, downloadGh } from './gh-cli.js';
 import { ghTokenFrom, githubConnectionStatus, type GithubConnection } from './github-auth.js';
+import { WakeupPauseTracker } from './wakeup-pause.js';
 import { shell } from 'electron';
 
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
@@ -357,6 +358,18 @@ interface RunHooks {
   signal?: AbortSignal;
   /** Receives the child process for codex so the caller can kill it on cancel. */
   onChild?: (child: ChildProcess) => void;
+  /** Called when the model fires `ScheduleWakeup` and the SDK's `query()` stream
+      goes DORMANT (held open across the wakeup, NOT closed — verified in the
+      wild on a job stuck 11 h with status:'running' whose transcript ended in a
+      successful ScheduleWakeup + final text and no result message). `pausedUntil`
+      is the epoch-ms timestamp the wakeup will fire. The caller surfaces this
+      as a "session closed, auto-resumes at X" state (like a scheduled message)
+      so the UI doesn't keep saying "Responding…" through the dormant gap. */
+  onPaused?: (pausedUntil: number, reason: 'wakeup') => void;
+  /** Called when the model emits its next message after a pause (the wakeup
+      fired and the SDK is resuming), OR at terminal cleanup if the run ends
+      while still paused. The caller clears the "scheduled to resume" UI. */
+  onResumed?: () => void;
 }
 
 /* Per-1M-token prices for a live cost ESTIMATE (the SDK's exact total_cost_usd
@@ -1349,6 +1362,22 @@ async function runClaude(
   // both must survive so the final message can replace each with its canonical copy.
   let openThinking: TranscriptItem | null = null;
   const toolById = new Map<string, TranscriptItem>();
+  // ScheduleWakeup pause tracking. The Claude Agent SDK holds the `query()`
+  // iterator OPEN across a ScheduleWakeup (verified in the wild: a job sat
+  // 11 h on status:'running' with the transcript ending in a successful
+  // ScheduleWakeup + final text and no result message — the status:'done'
+  // transition further down is only reached after this for-await loop exits).
+  // The helper turns the raw stream into discrete paused/resumed events; we
+  // forward each to the caller's hooks. See ./wakeup-pause.ts for the
+  // detection contract + clamp rules.
+  const wakeup = new WakeupPauseTracker();
+  const emitPause = (ev: ReturnType<WakeupPauseTracker['onToolResult']>) => {
+    if (!ev) return;
+    try {
+      if (ev.kind === 'paused') hooks.onPaused?.(ev.until, ev.reason);
+      else hooks.onResumed?.();
+    } catch { /* best-effort */ }
+  };
   /* Per-sub-agent transcript writers, keyed by the parent's tool_use_id.
      Every SDK event carrying `parent_tool_use_id` belongs to a Task/Agent
      dispatch's INNER turn loop (its tool calls, thinking, prose). Instead of
@@ -1511,6 +1540,9 @@ async function runClaude(
         committedOut += curOut; curOut = 0; // lock in this message's output
         progress();
       } else if (m.type === 'assistant' && m.message?.content) {
+        // If we were dormant waiting for a wakeup and the model just spoke
+        // again, the wakeup fired — clear the "scheduled to resume" UI.
+        emitPause(wakeup.onAssistantContent());
         model = m.message.model ?? model;
         for (const b of m.message.content) {
           if (b.type === 'thinking' && typeof b.thinking === 'string') {
@@ -1534,6 +1566,9 @@ async function runClaude(
             if (preview !== undefined) t.preview = preview;
             items.push(t);
             if (b.id) { t.id = b.id; toolById.set(b.id, t); }
+            // Remember any ScheduleWakeup so the matching tool_result can flip
+            // us to paused (success path). Non-ScheduleWakeup tools no-op.
+            wakeup.onToolUse(b.id, b.name, b.input);
           }
         }
         progress();
@@ -1552,6 +1587,10 @@ async function runClaude(
                 if (txt) t.result = txt;
               }
             }
+            // A successful ScheduleWakeup tool_result puts the SDK iterator
+            // into the dormant window; emit `paused` so the UI swaps the
+            // "Responding…" spinner for a "scheduled to resume" countdown.
+            emitPause(wakeup.onToolResult(b.tool_use_id, !!b.is_error));
           }
         }
         progress();
@@ -1578,7 +1617,7 @@ async function runClaude(
       }
     }
   } catch (e) {
-    if (e instanceof CancelledError || hooks.signal?.aborted) throw new CancelledError();
+    if (e instanceof CancelledError || hooks.signal?.aborted) { emitPause(wakeup.reset()); throw new CancelledError(); }
     const msg = e instanceof Error ? e.message : String(e);
     // The SDK does NOT yield a usable result when the agent exhausts its turn budget —
     // it THROWS, converting the `error_max_turns` result into an Error whose message is
@@ -1603,6 +1642,10 @@ async function runClaude(
       throw new Error(`${msg}${detail ? `\n${detail}` : ''}`);
     }
   }
+  // The run is leaving runClaude — whatever the reason, the "scheduled to
+  // resume" UI must not survive past this point (a terminal status from the
+  // caller would otherwise show alongside a stale countdown). Idempotent.
+  emitPause(wakeup.reset());
   // Any tool left 'running' (no matching tool_result before the stream ended)
   // would otherwise spin forever in the UI — settle it.
   for (const t of items) if (t.kind === 'tool' && t.toolStatus === 'running') { t.toolStatus = 'done'; t.durMs = Date.now() - t.ts; }
@@ -2842,6 +2885,19 @@ export class LocalEngine {
         signal: ac.signal,
         onProgress: flush,
         onChild: (child) => { handle.child = child; },
+        // ScheduleWakeup pause plumbing: persist `pausedUntil` on the Job and
+        // emit so the renderer can show "Scheduled to resume in N" instead of
+        // a stuck "Responding…". The status stays 'running' (the SDK iterator
+        // really is still open), but the renderer's `live` gate excludes paused
+        // jobs so the spinner disappears.
+        onPaused: (pausedUntil, reason) => {
+          try { this.emit('job', this.store.updateJob(jobId, { pausedUntil, pausedReason: reason })); }
+          catch { /* job may have been deleted mid-pause; best-effort */ }
+        },
+        onResumed: () => {
+          try { this.emit('job', this.store.updateJob(jobId, { pausedUntil: null, pausedReason: null })); }
+          catch { /* */ }
+        },
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
       const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input), codexBridge: this.codexBridgeFor(), openaiKey: this.providers?.getLocalKey('openai') };
@@ -3184,6 +3240,10 @@ export class LocalEngine {
       const done = this.store.updateJob(jobId, {
         status: 'done', phase: 'Done', progress: 100, stage: '',
         output, tokens, cost, model, transcript: allItems.slice(-400),
+        // Defense in depth: runClaude's terminal markResumed() already cleared
+        // this via the hook, but a turn that ends concurrently with an in-flight
+        // pause event must not persist a stale countdown alongside 'done'.
+        pausedUntil: null, pausedReason: null,
       });
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
@@ -3269,6 +3329,8 @@ export class LocalEngine {
             status: 'cancelled', phase: 'Cancelled', stage: '', error: null,
             output: pendingRef.out ?? existing.output,
             ...(pendingRef.tr.length ? { transcript: pendingRef.tr.slice(-250) } : {}),
+            // A paused turn the user just stopped must not keep its countdown.
+            pausedUntil: null, pausedReason: null,
           });
           this.emit('job', c);
           this.store.pushEvent({ kind: 'job-cancelled', title: `Cancelled: ${c.title}`, projectId: c.projectId, jobId });
@@ -3305,6 +3367,7 @@ export class LocalEngine {
       const failed = this.store.updateJob(jobId, {
         status: 'failed', phase: 'Failed', stage: '',
         error: retryNoteText ? `${errMsg}\n\n${retryNoteText}` : errMsg,
+        pausedUntil: null, pausedReason: null,
       });
       this.emit('job', failed);
       this.store.pushEvent({ kind: 'job-failed', title: `Failed: ${failed.title}`, subtitle: failed.error ?? undefined, projectId: failed.projectId, jobId });

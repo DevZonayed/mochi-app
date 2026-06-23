@@ -1959,7 +1959,14 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
    ANOTHER turn) doesn't re-parse the markdown of every settled turn. Only turns
    whose job object actually changed re-render; onRetry/onAnswer are stable. */
 const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer, isLast, pendingAsk, onExtendAsk, onCancelAsk }: { job: Job; onRetry: (input: string) => void; onAnswer: (text: string) => void; isLast: boolean; pendingAsk?: Schedule | null; onExtendAsk?: () => void; onCancelAsk?: () => void }) {
-  const live = job.status === 'running' || job.status === 'pending';
+  // ScheduleWakeup parking: while the SDK iterator is dormant waiting for a
+  // wakeup, the job stays status:'running' (the stream truly is still open)
+  // but `pausedUntil` is set. The user-facing semantics requested are "session
+  // closed, auto-resumes at X" — like a scheduled message — so the spinner,
+  // "streaming/thinking" badge, and live activity all step aside. The pause
+  // chip rendered below takes their place with a live countdown.
+  const paused = !!(job.pausedUntil && job.pausedUntil > Date.now());
+  const live = (job.status === 'running' || job.status === 'pending') && !paused;
   const engineLabel = job.engine === 'codex' ? 'Codex' : 'Claude Code';
   const provider = job.engine === 'codex' ? 'openai' as const : 'anthropic' as const;
   const transcript = job.transcript ?? [];
@@ -1971,6 +1978,16 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
     const t = setInterval(tick, 100); // tenth-of-a-second clock while running
     return () => clearInterval(t);
   }, [live]);
+  // Separate, slower tick that runs ONLY while the turn is parked on a wakeup,
+  // so the "Scheduled to resume in N" countdown advances and auto-collapses
+  // the moment `pausedUntil` slips into the past. Once per second is plenty
+  // (the chip renders minutes/seconds, not 1/10ths) and it doesn't churn
+  // through every settled turn the way the 100ms live tick would.
+  React.useEffect(() => {
+    if (!paused) return;
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, [paused]);
   const elapsedMs = (live ? Date.now() : job.updatedAt) - job.createdAt;
   const elapsed = live ? fmtDurationLive(elapsedMs) : fmtDuration(elapsedMs);
 
@@ -2054,6 +2071,21 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
           <div style={{ marginTop: hasBody ? 9 : 1, display: 'flex', alignItems: 'center', gap: 8 }}>
             <Spinner size={12} color="var(--purple)" />
             <span className="think-shimmer" style={{ font: '500 13.5px/1.4 var(--font-text)' }}>{liveActivity(job, transcript)}</span>
+          </div>
+        )}
+        {/* Parked on a ScheduleWakeup: the SDK is dormant until `pausedUntil`.
+           Treat as "closed, scheduled" — like a scheduled message — instead of
+           the stuck "Responding…" the user saw before. The 1 s tick in the
+           effect above keeps the remaining-time string fresh and auto-collapses
+           the chip the instant the wakeup fires (which clears `pausedUntil`). */}
+        {paused && (
+          <div style={{ marginTop: hasBody ? 9 : 1, display: 'inline-flex', alignItems: 'center', gap: 7, padding: '6px 11px', borderRadius: 'var(--r-pill)',
+            background: 'color-mix(in srgb, var(--purple) 9%, var(--bg-elevated))',
+            border: '0.5px solid color-mix(in srgb, var(--purple) 28%, transparent)',
+            font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)' }}>
+            <Icon name="clock" size={12} style={{ color: 'var(--purple)' }} />
+            <span style={{ color: 'var(--ink-secondary)' }}>Auto-resumes in</span>
+            <span style={{ fontVariantNumeric: 'tabular-nums', color: 'var(--ink)' }}>{fmtCountdown((job.pausedUntil ?? 0) - Date.now())}</span>
           </div>
         )}
         {job.status === 'failed' && (
@@ -2914,7 +2946,13 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   React.useEffect(() => { if (autoFocus) composerRef.current?.focus(); }, [autoFocus]);
 
   const lastTurn = turns.length ? turns[turns.length - 1] : null;
-  const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending');
+  // Parked-on-wakeup turns are NOT streaming for composer purposes: the session
+  // is closed and the next user message should send straight through (just like
+  // after a scheduled message is queued) instead of being queued behind the
+  // dormant SDK iterator. The countdown chip on the turn itself communicates
+  // the wakeup-pending state — the composer doesn't need to also reflect it.
+  const lastTurnPaused = !!(lastTurn?.pausedUntil && lastTurn.pausedUntil > Date.now());
+  const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending') && !lastTurnPaused;
 
   // The actual send — no guards. Used directly, by the queue drainer, and by steer.
   const sendRaw = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
@@ -3500,7 +3538,15 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                 ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap' }}>
                     <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn ? liveActivity(lastTurn, lastTurn.transcript ?? []) : 'Working…'}
                   </span>
-                : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{planMode ? 'Plan · ⏎' : goalMode ? 'Goal · ⏎' : queue.length ? `${queue.length} queued` : '⏎ to send'}</span>}
+                : lastTurnPaused
+                  // Parked on a ScheduleWakeup — the per-turn chip carries the
+                  // full countdown; the rail mirrors the state in one line so a
+                  // user scanning the composer doesn't mistake the dormant
+                  // session for "ready to send" without context.
+                  ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>
+                      <Icon name="clock" size={12} style={{ color: 'var(--purple)' }} /> Auto-resumes in {fmtCountdown((lastTurn?.pausedUntil ?? 0) - Date.now())}
+                    </span>
+                  : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{planMode ? 'Plan · ⏎' : goalMode ? 'Goal · ⏎' : queue.length ? `${queue.length} queued` : '⏎ to send'}</span>}
             </div>
           </div>
         </div>
