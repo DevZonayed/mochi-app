@@ -158,13 +158,24 @@ export function aggregateWorkspaceOverview(input: AggregateInput): AggregateResu
     // Map session → its current state (default 'no-repo' if cache miss; that
     // way an un-fetched session can't masquerade as "clean" — it simply
     // doesn't contribute to attention).
-    type Entry = { sessionId: string; title: string; state: SessionGitState; updatedAt: number };
+    type Entry = { sessionId: string; title: string; state: SessionGitState; updatedAt: number; provisional: boolean };
     const entries: Entry[] = projSessions.map(s => {
-      const st = statuses.get(s.id)?.state ?? 'no-repo';
-      return { sessionId: s.id, title: s.title, state: st, updatedAt: s.updatedAt };
+      const st = statuses.get(s.id);
+      const state = st?.state ?? 'no-repo';
+      // A status computed without a GitHub PR query (`prChecked === false`) can
+      // only GUESS the PR-derivable states. The cheap local-only path reports a
+      // pushed branch as `ready-for-pr` ("no PR exists — go open one") and a
+      // pushed dirty tree as `uncommitted`, but if a PR is actually open/merged
+      // the next poll reclassifies it to pr-*/pr-merged and the row vanishes.
+      // Treat such an entry as provisional so we don't show a row that's about
+      // to disappear; once the poll confirms it (prChecked === true) it surfaces
+      // with its real state. Un-pushed sessions can't have a PR, so they're
+      // never provisional — their local state is final.
+      const provisional = st?.prChecked === false && !!st.local.pushed;
+      return { sessionId: s.id, title: s.title, state, updatedAt: s.updatedAt, provisional };
     });
 
-    const attention = entries.filter(e => ATTENTION_STATES.has(e.state));
+    const attention = entries.filter(e => ATTENTION_STATES.has(e.state) && !e.provisional);
     if (attention.length === 0) continue; // every session clean → off the strip
 
     if (onlyMine) {
