@@ -19,8 +19,8 @@ import { SessionStateDot } from './SessionStateDot';
 import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
 import { BranchPicker } from '../components/BranchPicker';
-import { projectColor } from '../lib/project-color';
-import { groupTabsByProject } from '../lib/tab-grouping';
+import { projectColor, projectInitial } from '../lib/project-color';
+import { groupTabsByProject, isGroupExpanded as isGroupExpandedFn } from '../lib/tab-grouping';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
@@ -62,13 +62,33 @@ const PAGE_CSS = `
   .ws-tab:hover .ws-tab-x, .ws-tab.on .ws-tab-x { opacity: 1; }
   .ws-newbtn:hover { background: var(--fill-secondary) !important; }
   .ws-tabs::-webkit-scrollbar { height: 0; }
-  .ws-tab { transition: background 120ms ease, color 120ms ease; }
   /* project groups in the tab strip — a thin 1px vertical divider between
      groups and a 3px colored stripe at the start of each group so the eye
      can pick out which chat belongs to which project at a glance */
   .ws-tab-group { display: flex; align-items: stretch; flex-shrink: 0; }
   .ws-tab-group + .ws-tab-group { border-left: 1px solid var(--separator); }
   .ws-tab-group-stripe { width: 3px; flex-shrink: 0; }
+  /* avatar-only tabs (non-active project groups). Width-animate on
+     expand/collapse so the strip rearranges smoothly, not abruptly. */
+  .ws-tab { transition: background 120ms ease, color 120ms ease, max-width 150ms ease-out, padding 150ms ease-out; }
+  .ws-tab-avatar {
+    width: 28px; max-width: 28px;
+    padding: 0 !important;
+    display: grid; place-items: center;
+    gap: 0;
+  }
+  /* tooltip on collapsed avatar tabs — instant (no >100ms delay) */
+  .ws-tab-avatar-tip {
+    position: absolute; top: calc(100% + 4px); left: 50%; transform: translateX(-50%);
+    background: var(--bg-elevated); color: var(--ink);
+    border: 0.5px solid var(--separator); border-radius: 8px;
+    padding: 5px 9px; font: 600 var(--fs-caption)/1.2 var(--font-text);
+    box-shadow: var(--card-shadow); white-space: nowrap;
+    pointer-events: none; opacity: 0; z-index: 50;
+    transition: opacity 60ms ease;
+  }
+  .ws-tab-avatar:hover .ws-tab-avatar-tip,
+  .ws-tab-avatar:focus-visible .ws-tab-avatar-tip { opacity: 1; }
   .ws-kinds::-webkit-scrollbar { height: 0; }
   .ws-tree::-webkit-scrollbar { width: 11px; }
   .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
@@ -179,6 +199,12 @@ export default function Workspace() {
   const [addOpen, setAddOpen] = React.useState(false); // add-project menu
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => { try { return localStorage.getItem('maestro.workspace.sidebar') === '0'; } catch { return false; } });
   const toggleSidebar = () => setSidebarCollapsed(c => { const n = !c; try { localStorage.setItem('maestro.workspace.sidebar', n ? '0' : '1'); } catch { /* ignore */ } return n; });
+
+  // Tab strip project grouping (Track 6):
+  //   – `peekGroup` = the one non-active group the user clicked open to
+  //     "peek" at — collapses again when they click a different one. Not
+  //     persisted (transient peek, not a layout choice).
+  const [peekGroup, setPeekGroup] = React.useState<string | null>(null);
 
   const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
 
@@ -570,6 +596,24 @@ export default function Workspace() {
   // opens/closes tabs). Pure helper — tested in tab-grouping.test.ts.
   const tabGroups = React.useMemo(() => groupTabsByProject(tabs), [tabs]);
 
+  const activeProjectId = activeTab?.projectId ?? null;
+  const EMPTY_PINS: ReadonlySet<string> = React.useMemo(() => new Set(), []);
+  const isGroupExpanded = (projectId: string): boolean => isGroupExpandedFn(projectId, {
+    activeProjectId, pinnedGroups: EMPTY_PINS, peekGroup, groupCount: tabGroups.length,
+  });
+  const peekOpen = (projectId: string) => {
+    // Click on a collapsed group's avatar → expand it (and collapse the previously-peeked one).
+    setPeekGroup(prev => (prev === projectId ? null : projectId));
+  };
+
+  // Clean up peek state when the peeked project is closed entirely or when the
+  // user clicks it active (the "active" rule already expands it, so peek becomes redundant).
+  React.useEffect(() => {
+    if (peekGroup && (peekGroup === activeProjectId || !tabGroups.some(g => g.projectId === peekGroup))) {
+      setPeekGroup(null);
+    }
+  }, [peekGroup, activeProjectId, tabGroups]);
+
   return (
     <AppShell active="workspace">
       <style>{PAGE_CSS}</style>
@@ -804,16 +848,44 @@ export default function Workspace() {
               style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'stretch', overflowX: 'auto' }}>
               {tabGroups.map(group => {
                 const p = projById[group.projectId];
+                const expanded = isGroupExpanded(group.projectId);
                 const groupName = p?.name ?? 'Project';
                 const stripeColor = projColor(p);
                 return (
                   <div key={group.projectId} className="ws-tab-group" role="group" aria-label={groupName}>
                     {/* 3px colored left-stripe — the at-a-glance project tint */}
                     <span className="ws-tab-group-stripe" aria-hidden="true" style={{ background: stripeColor }} />
+
                     {group.tabs.map(t => {
                       const on = t.key === activeKey;
                       const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
                       const editing = chatTab && renamingId === t.sessionId;
+                      const collapsed = !expanded && !on; // active tab always shows its title
+                      const tabIcon = t.kind === 'file'
+                        ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+                        : t.kind === 'image'
+                        ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
+                        : t.kind === 'project'
+                        ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
+                        : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />;
+                      if (collapsed) {
+                        const initial = projectInitial(groupName);
+                        const a11yLabel = `${t.title} (in ${groupName})`;
+                        return (
+                          <button key={t.key} data-tabkey={t.key}
+                            type="button"
+                            role="tab" aria-selected={false} aria-label={a11yLabel}
+                            className={`ws-tab ws-tab-avatar`}
+                            onClick={() => { peekOpen(group.projectId); setActiveKey(t.key); }}
+                            onContextMenu={e => openTabMenu(e, t)}
+                            style={{ position: 'relative', borderRight: '0.5px solid var(--separator)', background: 'transparent', cursor: 'pointer', height: 'auto' }}>
+                            <span aria-hidden="true" style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center',
+                              background: `color-mix(in srgb, ${stripeColor} 22%, transparent)`,
+                              color: stripeColor, font: '700 10px/1 var(--font-display)' }}>{initial}</span>
+                            <span className="ws-tab-avatar-tip" role="tooltip">{a11yLabel}</span>
+                          </button>
+                        );
+                      }
                       return (
                         <div key={t.key} data-tabkey={t.key}
                           role="tab" aria-selected={on}
@@ -821,13 +893,7 @@ export default function Workspace() {
                           style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
                             borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
                           {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: stripeColor }} />}
-                          {t.kind === 'file'
-                            ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
-                            : t.kind === 'image'
-                            ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
-                            : t.kind === 'project'
-                            ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
-                            : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />}
+                          {tabIcon}
                           {editing && t.sessionId ? (
                             <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
                               onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}

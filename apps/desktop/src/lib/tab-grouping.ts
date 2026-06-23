@@ -35,3 +35,23 @@ export function groupTabsByProject<T extends TabLike>(tabs: readonly T[]): TabGr
   }
   return order.map(pid => ({ projectId: pid, tabs: buckets[pid] }));
 }
+
+export interface ExpansionState {
+  /** The currently active project (derived from the active tab's projectId). */
+  activeProjectId: string | null;
+  /** Projects the user has pinned open. */
+  pinnedGroups: ReadonlySet<string>;
+  /** A non-pinned project the user clicked open ("peek"). At most one. */
+  peekGroup: string | null;
+  /** How many groups exist right now. With ≤1 we never collapse. */
+  groupCount: number;
+}
+
+/** Decide whether a project's tab group renders full-width or collapsed-to-avatar. */
+export function isGroupExpanded(projectId: string, s: ExpansionState): boolean {
+  if (s.groupCount <= 1) return true;
+  if (projectId === s.activeProjectId) return true;
+  if (s.pinnedGroups.has(projectId)) return true;
+  if (s.peekGroup === projectId) return true;
+  return false;
+}

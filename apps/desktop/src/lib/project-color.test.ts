@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { PROJECT_PALETTE, colorFromId, projectColor, projectColorName } from './project-color';
+import { PROJECT_PALETTE, colorFromId, projectColor, projectColorName, projectInitial } from './project-color';
 
 describe('projectColor', () => {
   it('returns the stored color when present', () => {
@@ -29,5 +29,20 @@ describe('projectColor', () => {
     expect(projectColor(null)).toBe('var(--blue)');
     expect(projectColor(undefined)).toBe('var(--blue)');
     expect(colorFromId('')).toBe('blue');
+  });
+});
+
+describe('projectInitial', () => {
+  it('returns uppercase first letter', () => {
+    expect(projectInitial('mochi')).toBe('M');
+    expect(projectInitial('Quick Project')).toBe('Q');
+    expect(projectInitial('  spaced')).toBe('S');
+  });
+
+  it('falls back to ? when empty', () => {
+    expect(projectInitial('')).toBe('?');
+    expect(projectInitial('   ')).toBe('?');
+    expect(projectInitial(null)).toBe('?');
+    expect(projectInitial(undefined)).toBe('?');
   });
 });

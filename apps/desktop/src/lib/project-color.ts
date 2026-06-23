@@ -40,3 +40,13 @@ export function projectColorName(p: Pick<Project, 'id' | 'color'> | null | undef
 export function projectColor(p: Pick<Project, 'id' | 'color'> | null | undefined): string {
   return `var(--${projectColorName(p)})`;
 }
+
+/** A short initial for the avatar-only collapsed tab (uppercase, 1 grapheme). */
+export function projectInitial(name: string | null | undefined): string {
+  if (!name) return '?';
+  const trimmed = name.trim();
+  if (!trimmed) return '?';
+  // Prefer the first letter of the first non-space token.
+  const ch = trimmed.charAt(0);
+  return ch.toUpperCase();
+}
