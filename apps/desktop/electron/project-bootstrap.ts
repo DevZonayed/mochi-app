@@ -16,8 +16,12 @@
    stand in (no real shell-out, no real GitHub call). The renderer never sees
    any of this — it talks to localApi → bootstrapProject → bootstrapNewProject. */
 
-import { suggestAvailableSlug } from './github-slug.js';
+import { suggestAvailableSlug, slugify } from './github-slug.js';
 import { createGitHubRepo, getViewer } from './github.js';
+import {
+  ensureMemoryRepo, commitAndPushMemory, linkMemoryIntoProject,
+  seedMemoryClone, memoryClonePath, type GitRunner as MemoryGitRunner,
+} from './memory-repo.js';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -225,6 +229,159 @@ export async function bootstrapNewProject(
     cloneUrl: repo.cloneUrl,
     localPath: input.localPath,
     branchPushed: branch,
+  };
+}
+
+/* ── Dual-repo bootstrap (revised Track 2) ────────────────────────────────
+   The dual-repo flow creates BOTH the code repo (under the chosen owner —
+   user OR org) AND the memory repo (always under the user's personal
+   account, always `${user}/${slug}-memory`). The memory repo is cloned to
+   Electron's userData and symlinked into the project tree so the agent's
+   .continuum / .claude reads/writes are transparently mirrored back to a
+   private GitHub repo (across machines via `git pull`).
+
+   The previous single-repo function `bootstrapNewProject` stays for the
+   adopt-existing-clone path that hasn't grown memory-repo support yet. */
+
+export interface BootstrapProjectInput {
+  /** The logged-in user (login). Memory repo always lives under this account. */
+  user: string;
+  /** Chosen owner for the CODE repo (the picker's value). */
+  owner: { login: string; kind: 'user' | 'org' };
+  /** User-typed display name. */
+  name: string;
+  /** Absolute path on disk where the project lives. */
+  localPath: string;
+  private?: boolean;
+}
+
+export interface BootstrapProjectResult {
+  slug: string;
+  codeRepoUrl: string;     // html_url of the code repo
+  memoryRepoUrl: string;   // html_url of the memory repo
+  localPath: string;
+  /** Where the memory clone was cloned to (userData/memory/<slug>). */
+  memoryPath: string;
+  /** The branch we pushed the initial code commit to (always 'main'). */
+  branchPushed: string;
+  /** Whether the chosen slug differs from slugify(name) (i.e. `-v2` suffix). */
+  slugChanged: boolean;
+}
+
+export interface BootstrapProjectDeps {
+  fs: FsLike;
+  git: GitLike;
+  /** GitRunner for the memory-repo side (separate from `git` because the
+      memory module's surface is `run(dir, args)` not the per-method GitLike). */
+  memoryGit?: MemoryGitRunner;
+  fetchImpl?: FetchImpl;
+  /** Optional userData dir override (tests). */
+  userDataDir?: string;
+  /** Absolute path to the maestro-commit SKILL.md template. Defaults to the
+      bundled template inside apps/desktop/electron/templates/. */
+  maestroCommitTemplatePath?: string;
+  now?: () => Date;
+}
+
+/** Default location of the bundled maestro-commit skill template. Reads at
+    call-time so a missing template surfaces a clear error rather than
+    breaking module load. */
+function defaultMaestroCommitTemplate(): string {
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  return path.join(here, 'templates', 'maestro-commit.SKILL.md.tpl');
+}
+
+/** Bootstrap a brand-new dual-repo project: code repo + memory repo + seed +
+    symlinks + initial code commit + push. Returns both URLs so the UI can
+    show "Created  github.com/owner/slug  +  github.com/user/slug-memory". */
+export async function bootstrapProject(
+  token: string,
+  input: BootstrapProjectInput,
+  deps: BootstrapProjectDeps,
+): Promise<BootstrapProjectResult> {
+  const { fs, git } = deps;
+  const fetchImpl = deps.fetchImpl;
+  const memoryGit = deps.memoryGit;
+  const now = (deps.now ?? (() => new Date()))();
+
+  if (!input.name || !input.name.trim()) throw new Error('A project name is required.');
+  if (!input.localPath) throw new Error('A local path is required.');
+  if (!input.user) throw new Error('A GitHub user is required (the memory repo always lives under your personal account).');
+  if (!input.owner?.login) throw new Error('A code-repo owner is required.');
+
+  // 1. Resolve a free slug under the CODE owner (user or org).
+  const slug = await suggestAvailableSlug(token, input.owner.login, input.name, fetchImpl);
+  const slugChanged = slug !== slugify(input.name);
+
+  // 2. Memory repo: create on GitHub (user's account, always private) + clone.
+  const mem = await ensureMemoryRepo({
+    token, user: input.user, slug,
+    userDataDir: deps.userDataDir, gitRunner: memoryGit, githubFetch: fetchImpl,
+  });
+
+  // 3. Seed the memory clone (STATE.md, CLAUDE.md, settings.json, maestro-commit).
+  //    The skill body comes from the bundled template (Track 1 supplies the canonical
+  //    content; this branch ships a stub so the path always exists).
+  const templatePath = deps.maestroCommitTemplatePath ?? defaultMaestroCommitTemplate();
+  const maestroCommitSkill = (() => {
+    try { return readFileSync(templatePath, 'utf8'); }
+    catch { return '---\nname: maestro-commit\n---\n\n# Maestro commit policy\n'; }
+  })();
+  seedMemoryClone(mem.memoryPath, { projectName: input.name, now, maestroCommitSkill });
+
+  // 4. Commit + push the seed payload to the memory repo. (Best-effort: if
+  //    the operator's git push fails we still let bootstrap continue so the
+  //    code repo creation isn't blocked by a transient network issue —
+  //    the next openProject pull will retry. We do log the failure.)
+  try {
+    await commitAndPushMemory(slug, 'chore(memory): seed STATE + claude scaffolding', memoryGit, deps.userDataDir);
+  } catch (e) {
+    // Logged but not rethrown — see note above.
+    console.warn(`[bootstrap] memory-repo push failed (will retry on openProject):`, e instanceof Error ? e.message : String(e));
+  }
+
+  // 5. Create the CODE repo on GitHub under the chosen owner.
+  const codeRepo = await createGitHubRepo(token, {
+    owner: input.owner,
+    name: slug,
+    private: input.private ?? true,
+    autoInit: false,                       // we push our own initial commit
+  }, fetchImpl);
+
+  // 6. Local code-repo setup: mkdir, git init, seed README+.gitignore.
+  fs.mkdirp(input.localPath);
+  if (!git.hasRepo(input.localPath)) git.init(input.localPath);
+  const join = (a: string, b: string): string => (a.endsWith('/') ? a + b : a + '/' + b);
+  fs.writeFileIfMissing(join(input.localPath, 'README.md'), seedReadme(input.name, now));
+  fs.writeFileIfMissing(join(input.localPath, '.gitignore'), seedGitignore());
+
+  // 7. Symlink the memory clone INTO the project tree (.continuum + .claude
+  //    targets). This runs BEFORE the initial commit so the symlinks are
+  //    visible to git status, but the .gitignore (seeded above) excludes
+  //    .claude/ + .continuum/, so they never enter the commit. The agent
+  //    will read/write through these links transparently.
+  await linkMemoryIntoProject(slug, input.localPath, deps.userDataDir);
+
+  // 8. Initial code commit. Clean message — even if Track 1's prepare-commit-msg
+  //    hook hasn't landed yet, we write clean commits anyway.
+  if (needsInitialCommit(input.localPath, git)) {
+    git.addAll(input.localPath);
+    git.commit(input.localPath, 'chore(repo): initial commit');
+  }
+
+  // 9. Wire origin to the code repo + push.
+  git.setRemote(input.localPath, 'origin', codeRepo.cloneUrl);
+  const branch = git.currentBranch(input.localPath) ?? 'main';
+  git.push(input.localPath, 'origin', branch);
+
+  return {
+    slug,
+    codeRepoUrl: codeRepo.htmlUrl,
+    memoryRepoUrl: mem.htmlUrl,
+    localPath: input.localPath,
+    memoryPath: mem.memoryPath,
+    branchPushed: branch,
+    slugChanged,
   };
 }
 

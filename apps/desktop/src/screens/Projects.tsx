@@ -681,8 +681,12 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
             private: true,
             adopt: !!inspect?.ok && inspect.kind !== 'no-git',
           });
-          const proj = await api.createProject({ name: finalName, template: 'code', kind: 'coding', path: pickedPath, repoUrl: result.cloneUrl });
-          setBootstrapped({ fullName: result.fullName, htmlUrl: result.htmlUrl, slugChanged: result.slugChanged });
+          // No `owner` passed → server returns the legacy single-repo shape.
+          // Step 9 (renderer owner picker) routes the new shape through a
+          // separate code path that surfaces both URLs.
+          const legacy = result as { slug: string; slugChanged: boolean; owner: string; fullName: string; htmlUrl: string; cloneUrl: string; localPath: string; branchPushed: string };
+          const proj = await api.createProject({ name: finalName, template: 'code', kind: 'coding', path: pickedPath, repoUrl: legacy.cloneUrl });
+          setBootstrapped({ fullName: legacy.fullName, htmlUrl: legacy.htmlUrl, slugChanged: legacy.slugChanged });
           // Stay on the dialog briefly so the user sees the confirmation chip;
           // onCreated still fires so the parent navigates / refreshes the list.
           setBusy(false);

@@ -21,7 +21,7 @@ import { githubConnectionStatus, ghCliToken } from './github-auth.js';
 import { ghState } from './gh-cli.js';
 import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
 import { getViewer, listOwners } from './github.js';
-import { bootstrapNewProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
+import { bootstrapNewProject, bootstrapProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
 import type { GitService } from './git-service.js';
 import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
@@ -1081,13 +1081,15 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           return { slug, available: null, suggestion: slug, owner: null, reason: 'error', error: e instanceof Error ? e.message.slice(0, 160) : 'lookup failed' };
         }
       }
-      // bootstrapProject: create the GitHub repo + seed local files + initial
-      // commit + push. The renderer calls this from the "Create" button after
-      // checkSlug has shown what the chosen slug will be. Returns the resolved
-      // slug + html_url so the UI can show "Created github.com/owner/slug ✓".
-      // Optional `adopt`: skip `git init` for a folder that's already a repo.
-      // Optional `remoteOnly`: don't touch the working tree at all (existing
-      // committed repo, no remote — we just create + push origin).
+      // bootstrapProject: create BOTH GitHub repos (code + memory), seed the
+      // memory clone, symlink it into the project, commit + push the code
+      // repo. The renderer calls this from the "Create" button with the
+      // chosen owner (user OR org from the picker). Memory repo is always
+      // private + always under the logged-in user's account.
+      // The legacy single-repo path (no `owner` field) routes to the
+      // existing bootstrapNewProject — used by the adopt-folder "no GitHub
+      // remote yet" branch that hasn't been migrated to dual-repo + by the
+      // remoteOnly flow. We auto-fill `user` from the authenticated viewer.
       case 'bootstrapProject': {
         const name = String(p.name ?? '').trim();
         if (!name) bad('name required');
@@ -1096,6 +1098,19 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const token = providers.getLocalKey('github');
         if (!token) bad('Sign in to GitHub before creating a GitHub-first project.', 401);
         const isPrivate = p.private === undefined ? true : Boolean(p.private);
+        // Dual-repo branch: caller provided an owner picker selection.
+        const ownerObj = p.owner as { login?: unknown; kind?: unknown } | undefined;
+        if (ownerObj && typeof ownerObj.login === 'string' && (ownerObj.kind === 'user' || ownerObj.kind === 'org')) {
+          // Resolve the logged-in user (memory repo always under their account).
+          const v = await getViewer(token as string);
+          if (!v.login) bad('GitHub auth went stale — sign in again.', 401);
+          return bootstrapProject(token as string, {
+            user: v.login,
+            owner: { login: ownerObj.login, kind: ownerObj.kind },
+            name, localPath, private: isPrivate,
+          }, { fs: realFs, git: realGit });
+        }
+        // Legacy single-repo path.
         const skipInit = Boolean(p.adopt) || Boolean(p.skipInit);
         const remoteOnly = Boolean(p.remoteOnly);
         return bootstrapNewProject(token as string, {

@@ -876,10 +876,18 @@ export const api = {
   checkSlug: (name: string) =>
     call<{ slug: string; available: boolean | null; suggestion: string; owner: string | null; existing?: { fullName: string; private: boolean }; reason: 'ok' | 'taken' | 'not-authenticated' | 'no-login' | 'error'; error?: string }>(
       'checkSlug', { name }, () => Promise.reject(new Error('desktop only'))),
-  // Create the GitHub repo, seed local files, commit, set origin, push.
-  bootstrapProject: (input: { name: string; localPath: string; private?: boolean; description?: string; adopt?: boolean; remoteOnly?: boolean }) =>
-    call<{ slug: string; slugChanged: boolean; owner: string; fullName: string; htmlUrl: string; cloneUrl: string; localPath: string; branchPushed: string }>(
-      'bootstrapProject', { ...input }, () => Promise.reject(new Error('desktop only'))),
+  // Create the GitHub repo(s), seed local files, commit, set origin, push.
+  // When `owner` is passed, the dual-repo flow runs: code repo under the
+  // chosen owner + a private \${user}/\${slug}-memory companion clone + four
+  // symlinks. Without `owner`, falls back to the legacy single-repo path
+  // (used by adopt-folder + remoteOnly which haven't been migrated yet).
+  bootstrapProject: (input: { name: string; localPath: string; owner?: { login: string; kind: 'user' | 'org' }; private?: boolean; description?: string; adopt?: boolean; remoteOnly?: boolean }) =>
+    call<
+      // Dual-repo result is a superset of the legacy single-repo result;
+      // callers narrow on the presence of `memoryRepoUrl`.
+      | { slug: string; slugChanged: boolean; owner: string; fullName: string; htmlUrl: string; cloneUrl: string; localPath: string; branchPushed: string }
+      | { slug: string; slugChanged: boolean; codeRepoUrl: string; memoryRepoUrl: string; memoryPath: string; localPath: string; branchPushed: string }
+    >('bootstrapProject', { ...input }, () => Promise.reject(new Error('desktop only'))),
   // Inspect a candidate folder to decide between "create GitHub repo for this"
   // / "use existing remote" / "already a non-GitHub repo" in the adopt flow.
   adoptFolderInspect: (path: string) =>
