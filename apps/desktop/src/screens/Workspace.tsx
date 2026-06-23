@@ -774,10 +774,11 @@ export default function Workspace() {
               const projRunning = chats.some(s => runningSessions.has(s.id));
               const projActive = p.id === activeTab?.projectId;
               return (
-                // Lift the whole project above sibling rows while its "⋯" menu is open, so the
-                // dropdown isn't painted over by the next project's row (each row otherwise
-                // scopes the menu's z-index to its own stacking context).
-                <div key={p.id} className="ws-proj" style={menuProj === p.id ? { position: 'relative', zIndex: 60 } : undefined}>
+                // Lift the whole project above sibling rows while its "⋯" menu OR its branch
+                // picker is open, so the popover isn't painted over by the next project's row
+                // (the sticky `.ws-proj-head` is a z-index:2 stacking context that otherwise
+                // traps the popover's z-index, so later sibling headers paint on top of it).
+                <div key={p.id} className="ws-proj" style={(menuProj === p.id || pickerProj === p.id) ? { position: 'relative', zIndex: 60 } : undefined}>
                   <div className="ws-row ws-proj-head" {...dragProps(projDnd, p.id)} onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
                     style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer', position: 'relative', userSelect: 'none',
                       opacity: draggingProj === p.id ? 0.45 : undefined,

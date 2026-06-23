@@ -228,6 +228,44 @@ describe('aggregateWorkspaceOverview — edge cases', () => {
     expect(rows).toHaveLength(0);
   });
 
+  test('provisional ready-for-pr (pushed, PR not yet checked) is held back', () => {
+    // The cheap local-only fetch reports a pushed branch as ready-for-pr before
+    // GitHub is queried. If a PR is actually merged the next poll flips it to
+    // pr-merged and the row would vanish — so don't show it until confirmed.
+    const projects = [proj('p', 'P')];
+    const sessions = [sess('s', 'p', 't')];
+    const provisional: SessionGitStatus = {
+      sessionId: 's', branch: 'b', base: 'master',
+      local: { isRepo: true, ahead: 2, behind: 0, dirty: false, pushed: true },
+      pr: null, state: 'ready-for-pr', lastCheckedAt: 0, prChecked: false,
+    };
+    const held = aggregateWorkspaceOverview({
+      projects, sessions, statuses: statusMap(provisional), onlyMine: false, now: NOW,
+    });
+    expect(held.rows).toHaveLength(0);
+
+    // Once the poll confirms it (prChecked: true, still no PR), it surfaces.
+    const confirmed = aggregateWorkspaceOverview({
+      projects, sessions, statuses: statusMap({ ...provisional, prChecked: true }), onlyMine: false, now: NOW,
+    });
+    expect(confirmed.rows.map(r => r.topState)).toEqual(['ready-for-pr']);
+  });
+
+  test('un-pushed dirty session shows immediately even before PR check', () => {
+    // No remote branch ⇒ no PR possible ⇒ the local state is final, not a guess.
+    const projects = [proj('p', 'P')];
+    const sessions = [sess('s', 'p', 't')];
+    const localOnly: SessionGitStatus = {
+      sessionId: 's', branch: 'b', base: 'master',
+      local: { isRepo: true, ahead: 1, behind: 0, dirty: true, pushed: false },
+      pr: null, state: 'uncommitted', lastCheckedAt: 0, prChecked: false,
+    };
+    const { rows } = aggregateWorkspaceOverview({
+      projects, sessions, statuses: statusMap(localOnly), onlyMine: false, now: NOW,
+    });
+    expect(rows.map(r => r.topState)).toEqual(['uncommitted']);
+  });
+
   test('pr-merged and pr-closed do NOT trigger attention', () => {
     const projects = [proj('p1', 'M'), proj('p2', 'C')];
     const sessions = [sess('s1', 'p1', 't'), sess('s2', 'p2', 't')];

@@ -111,7 +111,12 @@ function CommitComposer({ open, onCancel, onSubmit, busy }: {
   if (!open) return null;
 
   const trimmed = subject.trim();
-  const ok = trimmed.length >= 3 && trimmed.length <= 72;
+  // Empty subject is allowed — the agent inspects the diff and writes the
+  // Conventional-Commits message itself. A non-empty subject must still be a
+  // sane 3–72 chars (the `maxLength` caps the top end). This keeps the button
+  // usable on first open instead of dead until you type 3 chars.
+  const subjectValid = trimmed.length === 0 || (trimmed.length >= 3 && trimmed.length <= 72);
+  const ok = subjectValid;
   const submit = () => { if (ok && !busy) onSubmit(trimmed, body.trim()); };
 
   return (
@@ -130,7 +135,7 @@ function CommitComposer({ open, onCancel, onSubmit, busy }: {
         }}>
         <div id="git-commit-title" style={{ font: '700 var(--fs-headline)/1.2 var(--font-text)', marginBottom: 4 }}>Commit changes</div>
         <div style={{ font: '500 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', marginBottom: 14 }}>
-          Use a Conventional-Commits prefix like <code>feat(desktop):</code> or <code>fix:</code> — the agent reads these for the changelog.
+          Use a Conventional-Commits prefix like <code>feat(desktop):</code> or <code>fix:</code> — the agent reads these for the changelog. Leave the subject blank to let the agent write the message from the diff.
         </div>
         <input ref={inputRef} value={subject} onChange={(e) => setSubject(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
@@ -164,7 +169,7 @@ function CommitComposer({ open, onCancel, onSubmit, busy }: {
               background: 'var(--blue)', color: 'white',
               font: '700 var(--fs-footnote)/1 var(--font-text)',
               cursor: ok && !busy ? 'pointer' : 'not-allowed', opacity: ok && !busy ? 1 : 0.5,
-            }}>{busy ? 'Asking agent…' : 'Ask agent to commit'}</button>
+            }}>{busy ? 'Asking agent…' : trimmed.length === 0 ? 'Let agent write & commit' : 'Ask agent to commit'}</button>
           </div>
         </div>
       </div>
@@ -322,9 +327,18 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
     if (!session?.projectId) { setFeedback({ kind: 'err', text: 'Session has no project.' }); return; }
     setBusy(true); setFeedback(null);
     try {
-      const msg = body ? `${subject}\n\n${body}` : subject;
-      const safeSubject = subject.replace(/"/g, '\\"');
-      const text = `Please commit the pending changes with this exact message:\n\n${msg}\n\nRun \`git add -A\` then \`git commit -m "${safeSubject}"\`${body ? ` followed by \`-m "<body>"\`` : ''}. Do not push.`;
+      let text: string;
+      if (!subject) {
+        // No subject typed → let the agent read the diff and compose its own
+        // Conventional-Commits message. Any body the user did type is passed as
+        // intent ("why") for the agent to fold in.
+        const why = body ? `\n\nContext to fold into the message (the "why"):\n${body}` : '';
+        text = `Please review the pending changes (\`git status\` / \`git diff\`), then commit them with a clear Conventional-Commits message you compose yourself (e.g. \`feat(desktop): …\` or \`fix: …\`). Run \`git add -A\` then \`git commit\`. Do not push.${why}`;
+      } else {
+        const msg = body ? `${subject}\n\n${body}` : subject;
+        const safeSubject = subject.replace(/"/g, '\\"');
+        text = `Please commit the pending changes with this exact message:\n\n${msg}\n\nRun \`git add -A\` then \`git commit -m "${safeSubject}"\`${body ? ` followed by \`-m "<body>"\`` : ''}. Do not push.`;
+      }
       await api.sendChat({ projectId: session.projectId, sessionId: sessionId!, text });
       setFeedback({ kind: 'ok', text: 'Asked the agent to commit.' });
     } catch (e) {

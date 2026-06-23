@@ -531,7 +531,12 @@ app.whenReady().then(() => {
   engine.setBrowserWatcher(browserWatcher); // hand it to the agent's MCP tools
   browserWatcher.start();
   // Poll PR/git status for active sessions; the renderer + phone update via git-status events.
-  const gitPoll = setInterval(() => { for (const s of gitService.pollable()) void gitService.fullStatus(s, { withPr: true }).catch(() => { /* transient */ }); }, 30_000);
+  // Fire one pass immediately on launch (don't wait the first 30s) so the
+  // workspace-overview strip can confirm PR-derivable states (ready-for-pr,
+  // pushed-dirty) fast instead of leaving them provisional for half a minute.
+  const pollGitStatuses = () => { for (const s of gitService.pollable()) void gitService.fullStatus(s, { withPr: true }).catch(() => { /* transient */ }); };
+  pollGitStatuses();
+  const gitPoll = setInterval(pollGitStatuses, 30_000);
   // Auto-update (electron-updater → GitHub Releases). Desktop-only: its events
   // never cross the relay. Polling starts after the window exists (see below).
   const updater = new Updater(emit);
