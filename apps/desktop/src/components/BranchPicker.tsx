@@ -188,6 +188,7 @@ export function BranchPicker({ projectId, onPick, onClose }: BranchPickerProps) 
       {/* Footer hint */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px 2px', borderTop: '0.5px solid var(--separator)', marginTop: 4,
         font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+        <Kbd>⌘</Kbd><span>+ click skips this picker</span>
         <span style={{ flex: 1 }} />
         <Kbd>↵</Kbd><span>pick</span>
         <Kbd>esc</Kbd><span>close</span>

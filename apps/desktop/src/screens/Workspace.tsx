@@ -685,9 +685,17 @@ export default function Workspace() {
                       <Icon name="more" size={15} />
                     </button>
                     <div style={{ position: 'relative', flexShrink: 0 }}>
-                      <button className="ws-newchat" title="New chat here — pick a base branch"
+                      <button className="ws-newchat" title="New chat here — pick a base branch (⌘+click to skip)"
                         onClick={e => {
                           e.stopPropagation();
+                          // ⌘/Ctrl+click skips the picker → instant chat off the
+                          // default branch (origin/HEAD). Preserves the zero-friction
+                          // path for power users who don't care about the base.
+                          if (e.metaKey || e.ctrlKey) {
+                            setPickerProj(null);
+                            newChat(p.id);
+                            return;
+                          }
                           setPickerProj(cur => cur === p.id ? null : p.id);
                           setMenuProj(null); // don't stack two popovers on the same header
                         }}
