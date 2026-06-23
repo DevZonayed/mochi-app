@@ -20,7 +20,7 @@ import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGit
 import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
 import { BranchPicker } from '../components/BranchPicker';
 import { projectColor, projectInitial } from '../lib/project-color';
-import { groupTabsByProject, isGroupExpanded as isGroupExpandedFn } from '../lib/tab-grouping';
+import { groupTabsByProject, isGroupExpanded as isGroupExpandedFn, prunePinnedGroups } from '../lib/tab-grouping';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
@@ -89,6 +89,10 @@ const PAGE_CSS = `
   }
   .ws-tab-avatar:hover .ws-tab-avatar-tip,
   .ws-tab-avatar:focus-visible .ws-tab-avatar-tip { opacity: 1; }
+  /* group pin chevron — manual control to keep a group expanded */
+  .ws-group-pin { opacity: 0.55; transition: opacity 120ms ease, background 120ms ease; }
+  .ws-group-pin:hover { opacity: 1; background: var(--fill-tertiary); }
+  .ws-group-pin.on { opacity: 1; }
   .ws-kinds::-webkit-scrollbar { height: 0; }
   .ws-tree::-webkit-scrollbar { width: 11px; }
   .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
@@ -116,6 +120,9 @@ interface Tab { key: string; projectId: string; sessionId: string | null; title:
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
+// Tab strip: which project groups the user pinned open. Persisted across
+// restarts so a two-project split layout survives a relaunch.
+const TAB_GROUP_PIN_KEY = 'maestro.workspace.tabGroupsPinned';
 
 function relTime(ts: number): string {
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
@@ -201,10 +208,18 @@ export default function Workspace() {
   const toggleSidebar = () => setSidebarCollapsed(c => { const n = !c; try { localStorage.setItem('maestro.workspace.sidebar', n ? '0' : '1'); } catch { /* ignore */ } return n; });
 
   // Tab strip project grouping (Track 6):
-  //   – `peekGroup` = the one non-active group the user clicked open to
+  //   – `pinnedGroups` = projects the user manually pinned open. Persisted.
+  //   – `peekGroup`    = the one non-active group the user clicked open to
   //     "peek" at — collapses again when they click a different one. Not
   //     persisted (transient peek, not a layout choice).
+  const [pinnedGroups, setPinnedGroups] = React.useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem(TAB_GROUP_PIN_KEY) || '[]')); } catch { return new Set(); }
+  });
   const [peekGroup, setPeekGroup] = React.useState<string | null>(null);
+  React.useEffect(() => { try { localStorage.setItem(TAB_GROUP_PIN_KEY, JSON.stringify([...pinnedGroups])); } catch { /* ignore */ } }, [pinnedGroups]);
+  const toggleGroupPin = (projectId: string) => setPinnedGroups(prev => {
+    const n = new Set(prev); if (n.has(projectId)) n.delete(projectId); else n.add(projectId); return n;
+  });
 
   const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
 
@@ -597,9 +612,8 @@ export default function Workspace() {
   const tabGroups = React.useMemo(() => groupTabsByProject(tabs), [tabs]);
 
   const activeProjectId = activeTab?.projectId ?? null;
-  const EMPTY_PINS: ReadonlySet<string> = React.useMemo(() => new Set(), []);
   const isGroupExpanded = (projectId: string): boolean => isGroupExpandedFn(projectId, {
-    activeProjectId, pinnedGroups: EMPTY_PINS, peekGroup, groupCount: tabGroups.length,
+    activeProjectId, pinnedGroups, peekGroup, groupCount: tabGroups.length,
   });
   const peekOpen = (projectId: string) => {
     // Click on a collapsed group's avatar → expand it (and collapse the previously-peeked one).
@@ -613,6 +627,62 @@ export default function Workspace() {
       setPeekGroup(null);
     }
   }, [peekGroup, activeProjectId, tabGroups]);
+
+  // Forget pin state for projects whose tabs are all closed. Keeps the persisted
+  // set small + avoids stale pins re-appearing when a long-gone project is reopened later.
+  React.useEffect(() => {
+    if (!pinnedGroups.size) return;
+    const pruned = prunePinnedGroups(pinnedGroups, tabGroups);
+    if (pruned.size !== pinnedGroups.size) setPinnedGroups(pruned);
+  }, [tabGroups, pinnedGroups]);
+
+  // Keyboard map for the tab strip:
+  //   ⌘⇧E  expand every group (pin them all)
+  //   ⌘⇧C  collapse every non-active group (clear pins + peek)
+  //   ⌥←/→ cycle through currently-visible tabs (skips collapsed avatars'
+  //         hidden state by always activating the next tab — selecting it
+  //         immediately expands its group via the active-projectId rule)
+  //   ⌘1…9 jump to the Nth visible tab
+  // We avoid the bare ⌘←/→ because Electron / web routing already owns them.
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // ── group expand / collapse (⌘⇧E / ⌘⇧C) ──
+      if (e.metaKey && e.shiftKey && !e.altKey && !e.ctrlKey) {
+        if (e.code === 'KeyE') {
+          e.preventDefault();
+          setPinnedGroups(new Set(tabGroups.map(g => g.projectId)));
+          return;
+        }
+        if (e.code === 'KeyC') {
+          e.preventDefault();
+          setPinnedGroups(new Set());
+          setPeekGroup(null);
+          return;
+        }
+      }
+      // ── ⌥←/⌥→: cycle through tabs in tab-strip order ──
+      // (⌘←/→ are reserved by macOS for history back/forward in many shells.)
+      if (e.altKey && !e.metaKey && !e.shiftKey && !e.ctrlKey && (e.code === 'ArrowLeft' || e.code === 'ArrowRight')) {
+        const all = tabGroups.flatMap(g => g.tabs);
+        if (!all.length) return;
+        const idx = activeKey ? all.findIndex(t => t.key === activeKey) : -1;
+        const delta = e.code === 'ArrowRight' ? 1 : -1;
+        const next = all[(Math.max(0, idx) + delta + all.length) % all.length];
+        if (next) { e.preventDefault(); setActiveKey(next.key); }
+        return;
+      }
+      // ── ⌘1…⌘9: jump to the Nth tab ──
+      if (e.metaKey && !e.shiftKey && !e.altKey && !e.ctrlKey && /^Digit[1-9]$/.test(e.code)) {
+        const n = parseInt(e.code.slice(5), 10) - 1;
+        const all = tabGroups.flatMap(g => g.tabs);
+        const tgt = all[n];
+        if (tgt) { e.preventDefault(); setActiveKey(tgt.key); }
+        return;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [tabGroups, activeKey]);
 
   return (
     <AppShell active="workspace">
@@ -849,13 +919,25 @@ export default function Workspace() {
               {tabGroups.map(group => {
                 const p = projById[group.projectId];
                 const expanded = isGroupExpanded(group.projectId);
+                const pinned = pinnedGroups.has(group.projectId);
                 const groupName = p?.name ?? 'Project';
                 const stripeColor = projColor(p);
                 return (
                   <div key={group.projectId} className="ws-tab-group" role="group" aria-label={groupName}>
                     {/* 3px colored left-stripe — the at-a-glance project tint */}
                     <span className="ws-tab-group-stripe" aria-hidden="true" style={{ background: stripeColor }} />
-
+                    {/* Pin toggle: keeps a non-active group expanded even when it isn't the active one */}
+                    {tabGroups.length > 1 && (
+                      <button type="button"
+                        className={`ws-group-pin${pinned ? ' on' : ''}`}
+                        title={pinned ? `Unpin ${groupName}` : `Pin ${groupName} expanded`}
+                        aria-label={pinned ? `Unpin ${groupName}` : `Pin ${groupName} expanded`}
+                        aria-pressed={pinned}
+                        onClick={(e) => { e.stopPropagation(); toggleGroupPin(group.projectId); }}
+                        style={{ width: 18, alignSelf: 'center', height: 26, borderRadius: 5, display: 'grid', placeItems: 'center', marginLeft: 2, color: pinned ? stripeColor : 'var(--ink-tertiary)', background: 'transparent', cursor: 'pointer', flexShrink: 0 }}>
+                        <Icon name={pinned ? 'chevronDown' : 'chevronRight'} size={12} stroke={2.4} />
+                      </button>
+                    )}
                     {group.tabs.map(t => {
                       const on = t.key === activeKey;
                       const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;

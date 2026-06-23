@@ -55,3 +55,11 @@ export function isGroupExpanded(projectId: string, s: ExpansionState): boolean {
   if (s.peekGroup === projectId) return true;
   return false;
 }
+
+/** Drop pin ids whose project no longer has any open tab. Pure. */
+export function prunePinnedGroups<T extends TabLike>(pinned: ReadonlySet<string>, groups: readonly TabGroup<T>[]): Set<string> {
+  const live = new Set(groups.map(g => g.projectId));
+  const next = new Set<string>();
+  for (const id of pinned) if (live.has(id)) next.add(id);
+  return next;
+}

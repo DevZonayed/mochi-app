@@ -4,7 +4,7 @@
  * helpers in ../lib/tab-grouping so we can verify them without a renderer.
  */
 import { describe, it, expect } from 'vitest';
-import { groupTabsByProject, isGroupExpanded, type TabLike, type ExpansionState } from '../lib/tab-grouping';
+import { groupTabsByProject, isGroupExpanded, prunePinnedGroups, type TabLike, type ExpansionState } from '../lib/tab-grouping';
 
 const tab = (key: string, projectId: string): TabLike => ({ key, projectId });
 
@@ -68,6 +68,26 @@ describe('isGroupExpanded', () => {
 
   it('does not expand a different group because another is peeked', () => {
     expect(isGroupExpanded('C', base({ activeProjectId: 'A', peekGroup: 'B' }))).toBe(false);
+  });
+});
+
+describe('prunePinnedGroups', () => {
+  it('drops pin ids whose project no longer has any open tab', () => {
+    const groups = groupTabsByProject([tab('a1', 'A'), tab('b1', 'B')]);
+    const out = prunePinnedGroups(new Set(['A', 'GONE']), groups);
+    expect([...out]).toEqual(['A']);
+  });
+
+  it('returns an empty set when no pins are still live', () => {
+    const groups = groupTabsByProject([tab('a1', 'A')]);
+    const out = prunePinnedGroups(new Set(['X', 'Y']), groups);
+    expect(out.size).toBe(0);
+  });
+
+  it('is identity when every pin is still live', () => {
+    const groups = groupTabsByProject([tab('a1', 'A'), tab('b1', 'B')]);
+    const out = prunePinnedGroups(new Set(['A', 'B']), groups);
+    expect([...out].sort()).toEqual(['A', 'B']);
   });
 });
 
