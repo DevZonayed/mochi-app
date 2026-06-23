@@ -13,6 +13,7 @@ export const REMOTE_BLOCKED_METHODS: ReadonlySet<string> = new Set<string>([
   'getProjectMemory', 'setProjectMemory', 'snapshotProject', 'archiveSessionWorktree',
   'importGithubFromCli', 'getSessionGitStatus', 'refreshSessionGitStatus',
   'pushSession', 'createSessionPR', 'mergeSessionPR', 'resolveSession',
+  'previewSessionMerge', 'previewSessionResolve',
   // design comments live in local project files
   'listDesignComments', 'addDesignComment', 'setDesignCommentStatus', 'deleteDesignComment',
   // native browser extension control + design→code copy

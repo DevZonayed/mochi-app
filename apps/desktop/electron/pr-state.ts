@@ -45,6 +45,46 @@ export interface SessionGitStatus {
   lastCheckedAt: number;
 }
 
+/* ── Human-confirm preview payloads ──────────────────────────────────────
+   When the agent calls `pr_merge` / `pr_resolve_conflicts` without the
+   renderer's `confirmed: true` flag, the handler returns a preview so the UI
+   can show a hard-button dialog. See `git-ctx.ts` for the contract. */
+
+/** What the renderer needs to render the confirm dialog for `pr_merge`. */
+export interface MergePreview {
+  prNumber: number;
+  prTitle: string;
+  prUrl: string;
+  mergeMethod: 'merge' | 'squash' | 'rebase' | 'unknown';
+  headSha: string | null;
+  mergeable: boolean | null;
+  mergeableState: PrStatus['mergeableState'];
+  checks: PrCheck[];
+}
+
+/** What the renderer needs to render the confirm dialog for `pr_resolve_conflicts`. */
+export interface ResolvePreview {
+  prNumber: number | null;
+  prTitle: string | null;
+  prUrl: string | null;
+  base: string | null;
+  branch: string | null;
+  /** Files that already carry conflict markers in the worktree (may be empty
+      if the worktree is still clean — calling the action will then pull base
+      in and the conflicts will be reported on the second call). */
+  conflictedFiles: string[];
+}
+
+/** Returned by GitService.previewMergePr — `ok:false` when no open PR. */
+export type MergePreviewResult =
+  | { ok: true; preview: MergePreview }
+  | { ok: false; reason: string };
+
+/** Returned by GitService.previewResolveSession. */
+export type ResolvePreviewResult =
+  | { ok: true; preview: ResolvePreview }
+  | { ok: false; reason: string };
+
 /** Derive the single surfaced state from local git facts + (optional) PR facts. */
 export function deriveState(local: LocalState, pr: PrStatus | null): SessionGitState {
   if (!local.isRepo) return 'no-repo';

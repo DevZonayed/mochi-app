@@ -6,6 +6,8 @@ import {
   displayCodename,
   SESSION_STATE_COLOR,
   SESSION_STATE_LABELS,
+  SESSION_STATE_STRIPE,
+  SESSION_STATE_LONG_LABELS,
 } from './git-types';
 
 describe('rollupSessionState', () => {
@@ -49,12 +51,27 @@ describe('codename helpers', () => {
 });
 
 describe('state tables are exhaustive', () => {
-  test('every state has a label AND a color', () => {
+  test('every state has a label AND a color AND a stripe AND a long label', () => {
     const states = Object.keys(SESSION_STATE_LABELS) as Array<keyof typeof SESSION_STATE_LABELS>;
     for (const s of states) {
       expect(typeof SESSION_STATE_LABELS[s]).toBe('string');
       expect(typeof SESSION_STATE_COLOR[s]).toBe('string');
+      expect(typeof SESSION_STATE_STRIPE[s]).toBe('string');
+      expect(typeof SESSION_STATE_LONG_LABELS[s]).toBe('string');
     }
     expect(states.length).toBe(10);
+  });
+  test('no-repo stripe is transparent (no visible left-border)', () => {
+    expect(SESSION_STATE_STRIPE['no-repo']).toBe('transparent');
+  });
+  test('mergeable / conflicts / uncommitted map to distinct color tokens', () => {
+    // Sanity: the most actionable states should not collide on stripe color.
+    const stripes = new Set([
+      SESSION_STATE_STRIPE['pr-mergeable'],
+      SESSION_STATE_STRIPE['pr-conflicts'],
+      SESSION_STATE_STRIPE.uncommitted,
+      SESSION_STATE_STRIPE['ready-for-pr'],
+    ]);
+    expect(stripes.size).toBe(4);
   });
 });
