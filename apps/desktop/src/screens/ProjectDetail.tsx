@@ -3296,6 +3296,18 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       setContinuing(false);
     }
   }, [activeId, mergedPr, continuing, onSessionCreated, onOpenSession]);
+  // The continued-from link jumps back to the merged ancestor's tab (if the
+  // host wired onOpenSession). Resolves the ChatSession lazily so we don't
+  // hold a stale title; falls back to a no-op when the ancestor was deleted.
+  const continuedFrom = activeSession?.continuedFrom;
+  const openAncestor = React.useCallback(async () => {
+    if (!continuedFrom || !onOpenSession) return;
+    try {
+      const list = await api.listSessions(projectId ?? undefined);
+      const ancestor = list.find(s => s.id === continuedFrom.sessionId);
+      if (ancestor) onOpenSession(ancestor);
+    } catch { /* best-effort — the link goes dead if the ancestor is gone */ }
+  }, [continuedFrom, onOpenSession, projectId]);
 
   return (
     <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)', overflow: 'hidden',
@@ -3309,6 +3321,23 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       {/* Conductor-style chat header: codename + state chip + Archive. The
           GitOpsDock (Track 5) gates itself for non-repo / null sessions. */}
       <ChatHeader sessionId={activeId} projectId={projectId} />
+      {/* Track 7: "← Continued from …" jump-link for a session forked off a
+          merged ancestor. Sits between the chat header and the transcript so
+          it's visible from the first scroll position without competing with
+          the merged banner below. */}
+      {continuedFrom && (
+        <div style={{ position: 'relative', zIndex: 1, padding: '4px 24px 0' }}>
+          <button onClick={openAncestor} disabled={!onOpenSession} title={onOpenSession ? 'Open the previous session' : undefined} style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 'var(--r-pill)',
+            background: 'transparent', border: 'none', cursor: onOpenSession ? 'pointer' : 'default',
+            font: '500 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-secondary)',
+          }}>
+            <span aria-hidden="true">←</span>
+            <span>Continued from</span>
+            <span style={{ font: '600 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink)' }}>"{continuedFrom.title}"</span>
+          </button>
+        </div>
+      )}
       {/* Track 7: merged-PR banner. Renders ONLY when the session is locked
           (state === 'pr-merged'). Sits ABOVE the transcript, NOT in the chat
           header (that's T5/GitOpsDock territory). */}
@@ -3319,6 +3348,25 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       )}
       <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
         <div style={{ maxWidth: CHAT_W, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
+          {/* Track 7: seed system-context card for a freshly-spawned continuation
+              session. Renders ONCE, above the empty-state prompt, so the agent's
+              first context is visible to the operator (and re-readable until they
+              type). Vanishes after the first turn lands. */}
+          {turns.length === 0 && continuedFrom && (
+            <div style={{ padding: '20px 20px 0', maxWidth: 620, margin: '0 auto', width: '100%' }}>
+              <div style={{ borderRadius: 12, padding: '12px 14px',
+                background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)',
+                font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)',
+              }}>
+                <div style={{ font: '700 var(--fs-caption)/1.2 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 }}>System context</div>
+                Continued from <strong style={{ color: 'var(--ink)' }}>"{continuedFrom.title}"</strong>
+                {continuedFrom.prNumber ? <> &middot; previous PR #{continuedFrom.prNumber}</> : null}
+                {continuedFrom.mergedAt ? <> merged on {new Date(continuedFrom.mergedAt).toLocaleDateString()}</> : null}
+                {continuedFrom.baseRefName ? <> into <code style={{ font: '600 var(--fs-caption)/1 var(--font-mono)' }}>{continuedFrom.baseRefName}</code></> : null}.
+                <div style={{ marginTop: 4 }}>Full prior transcript is available on the previous session — ask if you want a summary or any specific decisions referenced.</div>
+              </div>
+            </div>
+          )}
           {turns.length === 0 && (
             <div style={{ padding: '52px 20px 20px', textAlign: 'center' }}>
               <span style={{ width: 56, height: 56, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
