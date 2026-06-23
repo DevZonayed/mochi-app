@@ -22,6 +22,7 @@ import { BranchPicker } from '../components/BranchPicker';
 import { projectColor, projectInitial } from '../lib/project-color';
 import { groupTabsByProject, isGroupExpanded as isGroupExpandedFn, prunePinnedGroups } from '../lib/tab-grouping';
 import { AddProjectModal } from '../components/AddProjectModal';
+import { WorkspaceOverview } from '../components/WorkspaceOverview';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
@@ -732,6 +733,18 @@ export default function Workspace() {
               </div>
             </div>
           )}
+
+          {/* Workspace-wide attention strip — rolls up every project's
+              session git states into "X conflicts, Y mergeable, Z to push"
+              rows so the operator never has to tour each project to know
+              what needs them. Lives ABOVE the projects list, persists open. */}
+          <WorkspaceOverview onOpenSession={(projectId, sessionId) => {
+            const sess = sessions.find(s => s.id === sessionId);
+            if (sess) {
+              openSession(sess);
+              if (!expanded.has(projectId)) setExpanded(e => new Set(e).add(projectId));
+            }
+          }} />
 
           <div className="ws-tree" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '0 8px 12px' }}>
             {projects.length === 0 && (
