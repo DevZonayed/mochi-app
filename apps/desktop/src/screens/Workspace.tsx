@@ -19,6 +19,8 @@ import { SessionStateDot } from './SessionStateDot';
 import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
 import { BranchPicker } from '../components/BranchPicker';
+import { projectColor, projectInitial } from '../lib/project-color';
+import { groupTabsByProject, isGroupExpanded as isGroupExpandedFn, prunePinnedGroups } from '../lib/tab-grouping';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
@@ -55,12 +57,42 @@ const PAGE_CSS = `
   .ws-row:hover { background: var(--fill-tertiary); }
   .ws-row .ws-act { opacity: 0; transition: opacity 120ms ease; }
   .ws-row:hover .ws-act, .ws-row.ws-active .ws-act { opacity: 1; }
-  .ws-tab { transition: background 120ms ease, color 120ms ease; }
   .ws-tab:hover { background: var(--fill-tertiary); }
   .ws-tab .ws-tab-x { opacity: 0; transition: opacity 120ms ease; }
   .ws-tab:hover .ws-tab-x, .ws-tab.on .ws-tab-x { opacity: 1; }
   .ws-newbtn:hover { background: var(--fill-secondary) !important; }
   .ws-tabs::-webkit-scrollbar { height: 0; }
+  /* project groups in the tab strip — a thin 1px vertical divider between
+     groups and a 3px colored stripe at the start of each group so the eye
+     can pick out which chat belongs to which project at a glance */
+  .ws-tab-group { display: flex; align-items: stretch; flex-shrink: 0; }
+  .ws-tab-group + .ws-tab-group { border-left: 1px solid var(--separator); }
+  .ws-tab-group-stripe { width: 3px; flex-shrink: 0; }
+  /* avatar-only tabs (non-active project groups). Width-animate on
+     expand/collapse so the strip rearranges smoothly, not abruptly. */
+  .ws-tab { transition: background 120ms ease, color 120ms ease, max-width 150ms ease-out, padding 150ms ease-out; }
+  .ws-tab-avatar {
+    width: 28px; max-width: 28px;
+    padding: 0 !important;
+    display: grid; place-items: center;
+    gap: 0;
+  }
+  /* tooltip on collapsed avatar tabs — instant (no >100ms delay) */
+  .ws-tab-avatar-tip {
+    position: absolute; top: calc(100% + 4px); left: 50%; transform: translateX(-50%);
+    background: var(--bg-elevated); color: var(--ink);
+    border: 0.5px solid var(--separator); border-radius: 8px;
+    padding: 5px 9px; font: 600 var(--fs-caption)/1.2 var(--font-text);
+    box-shadow: var(--card-shadow); white-space: nowrap;
+    pointer-events: none; opacity: 0; z-index: 50;
+    transition: opacity 60ms ease;
+  }
+  .ws-tab-avatar:hover .ws-tab-avatar-tip,
+  .ws-tab-avatar:focus-visible .ws-tab-avatar-tip { opacity: 1; }
+  /* group pin chevron — manual control to keep a group expanded */
+  .ws-group-pin { opacity: 0.55; transition: opacity 120ms ease, background 120ms ease; }
+  .ws-group-pin:hover { opacity: 1; background: var(--fill-tertiary); }
+  .ws-group-pin.on { opacity: 1; }
   .ws-kinds::-webkit-scrollbar { height: 0; }
   .ws-tree::-webkit-scrollbar { width: 11px; }
   .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
@@ -88,6 +120,9 @@ interface Tab { key: string; projectId: string; sessionId: string | null; title:
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
+// Tab strip: which project groups the user pinned open. Persisted across
+// restarts so a two-project split layout survives a relaunch.
+const TAB_GROUP_PIN_KEY = 'maestro.workspace.tabGroupsPinned';
 
 function relTime(ts: number): string {
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
@@ -96,7 +131,7 @@ function relTime(ts: number): string {
   const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
   const d = Math.floor(h / 24); return d < 7 ? `${d}d ago` : `${Math.floor(d / 7)}w ago`;
 }
-const projColor = (p?: Project): string => (p?.color ? `var(--${p.color})` : 'var(--blue)');
+const projColor = (p?: Project): string => projectColor(p ?? null);
 const projKind = (p?: Project): ProjectKind => (p?.kind ?? 'general');
 const CHAT_PREVIEW = 7; // chats shown per project before "Show all"
 
@@ -171,6 +206,20 @@ export default function Workspace() {
   const [addOpen, setAddOpen] = React.useState(false); // add-project menu
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => { try { return localStorage.getItem('maestro.workspace.sidebar') === '0'; } catch { return false; } });
   const toggleSidebar = () => setSidebarCollapsed(c => { const n = !c; try { localStorage.setItem('maestro.workspace.sidebar', n ? '0' : '1'); } catch { /* ignore */ } return n; });
+
+  // Tab strip project grouping (Track 6):
+  //   – `pinnedGroups` = projects the user manually pinned open. Persisted.
+  //   – `peekGroup`    = the one non-active group the user clicked open to
+  //     "peek" at — collapses again when they click a different one. Not
+  //     persisted (transient peek, not a layout choice).
+  const [pinnedGroups, setPinnedGroups] = React.useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem(TAB_GROUP_PIN_KEY) || '[]')); } catch { return new Set(); }
+  });
+  const [peekGroup, setPeekGroup] = React.useState<string | null>(null);
+  React.useEffect(() => { try { localStorage.setItem(TAB_GROUP_PIN_KEY, JSON.stringify([...pinnedGroups])); } catch { /* ignore */ } }, [pinnedGroups]);
+  const toggleGroupPin = (projectId: string) => setPinnedGroups(prev => {
+    const n = new Set(prev); if (n.has(projectId)) n.delete(projectId); else n.add(projectId); return n;
+  });
 
   const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
 
@@ -557,6 +606,84 @@ export default function Workspace() {
     <div style={{ padding: '10px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{t}</div>
   );
 
+  // ── Tab strip: group open tabs by project, preserving the order in which
+  // each project first appeared (so the layout doesn't reshuffle as the user
+  // opens/closes tabs). Pure helper — tested in tab-grouping.test.ts.
+  const tabGroups = React.useMemo(() => groupTabsByProject(tabs), [tabs]);
+
+  const activeProjectId = activeTab?.projectId ?? null;
+  const isGroupExpanded = (projectId: string): boolean => isGroupExpandedFn(projectId, {
+    activeProjectId, pinnedGroups, peekGroup, groupCount: tabGroups.length,
+  });
+  const peekOpen = (projectId: string) => {
+    // Click on a collapsed group's avatar → expand it (and collapse the previously-peeked one).
+    setPeekGroup(prev => (prev === projectId ? null : projectId));
+  };
+
+  // Clean up peek state when the peeked project is closed entirely or when the
+  // user clicks it active (the "active" rule already expands it, so peek becomes redundant).
+  React.useEffect(() => {
+    if (peekGroup && (peekGroup === activeProjectId || !tabGroups.some(g => g.projectId === peekGroup))) {
+      setPeekGroup(null);
+    }
+  }, [peekGroup, activeProjectId, tabGroups]);
+
+  // Forget pin state for projects whose tabs are all closed. Keeps the persisted
+  // set small + avoids stale pins re-appearing when a long-gone project is reopened later.
+  React.useEffect(() => {
+    if (!pinnedGroups.size) return;
+    const pruned = prunePinnedGroups(pinnedGroups, tabGroups);
+    if (pruned.size !== pinnedGroups.size) setPinnedGroups(pruned);
+  }, [tabGroups, pinnedGroups]);
+
+  // Keyboard map for the tab strip:
+  //   ⌘⇧E  expand every group (pin them all)
+  //   ⌘⇧C  collapse every non-active group (clear pins + peek)
+  //   ⌥←/→ cycle through currently-visible tabs (skips collapsed avatars'
+  //         hidden state by always activating the next tab — selecting it
+  //         immediately expands its group via the active-projectId rule)
+  //   ⌘1…9 jump to the Nth visible tab
+  // We avoid the bare ⌘←/→ because Electron / web routing already owns them.
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // ── group expand / collapse (⌘⇧E / ⌘⇧C) ──
+      if (e.metaKey && e.shiftKey && !e.altKey && !e.ctrlKey) {
+        if (e.code === 'KeyE') {
+          e.preventDefault();
+          setPinnedGroups(new Set(tabGroups.map(g => g.projectId)));
+          return;
+        }
+        if (e.code === 'KeyC') {
+          e.preventDefault();
+          setPinnedGroups(new Set());
+          setPeekGroup(null);
+          return;
+        }
+      }
+      // ── ⌥←/⌥→: cycle through tabs in tab-strip order ──
+      // (⌘←/→ are reserved by macOS for history back/forward in many shells.)
+      if (e.altKey && !e.metaKey && !e.shiftKey && !e.ctrlKey && (e.code === 'ArrowLeft' || e.code === 'ArrowRight')) {
+        const all = tabGroups.flatMap(g => g.tabs);
+        if (!all.length) return;
+        const idx = activeKey ? all.findIndex(t => t.key === activeKey) : -1;
+        const delta = e.code === 'ArrowRight' ? 1 : -1;
+        const next = all[(Math.max(0, idx) + delta + all.length) % all.length];
+        if (next) { e.preventDefault(); setActiveKey(next.key); }
+        return;
+      }
+      // ── ⌘1…⌘9: jump to the Nth tab ──
+      if (e.metaKey && !e.shiftKey && !e.altKey && !e.ctrlKey && /^Digit[1-9]$/.test(e.code)) {
+        const n = parseInt(e.code.slice(5), 10) - 1;
+        const all = tabGroups.flatMap(g => g.tabs);
+        const tgt = all[n];
+        if (tgt) { e.preventDefault(); setActiveKey(tgt.key); }
+        return;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [tabGroups, activeKey]);
+
   return (
     <AppShell active="workspace">
       <style>{PAGE_CSS}</style>
@@ -789,44 +916,88 @@ export default function Workspace() {
             <div ref={tabStripRef} className="ws-tabs"
               onWheel={e => { const el = tabStripRef.current; if (el && Math.abs(e.deltaY) > Math.abs(e.deltaX)) el.scrollLeft += e.deltaY; }}
               style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'stretch', overflowX: 'auto' }}>
-              {tabs.map(t => {
-                const on = t.key === activeKey;
-                const p = projById[t.projectId];
-                // A chat tab is session-backed → its title can be renamed inline
-                // (mirrors the rail's double-click → input → commit flow).
-                const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
-                const editing = chatTab && renamingId === t.sessionId;
+              {tabGroups.map(group => {
+                const p = projById[group.projectId];
+                const expanded = isGroupExpanded(group.projectId);
+                const pinned = pinnedGroups.has(group.projectId);
+                const groupName = p?.name ?? 'Project';
+                const stripeColor = projColor(p);
                 return (
-                  <div key={t.key} data-tabkey={t.key} className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)} onContextMenu={e => openTabMenu(e, t)}
-                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
-                      borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
-                    {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: projColor(p) }} />}
-                    {t.kind === 'file'
-                      ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
-                      : t.kind === 'image'
-                      ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
-                      : t.kind === 'project'
-                      ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
-                      : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />}
-                    {editing && t.sessionId ? (
-                      <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
-                        onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}
-                        style={{ minWidth: 0, maxWidth: 150, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
-                    ) : (
-                      <span title={chatTab ? 'Double-click to rename' : (t.base ? `New chat off ${t.base}` : undefined)}
-                        onDoubleClick={chatTab ? (e => { e.stopPropagation(); setRenamingId(t.sessionId!); setRenameVal(t.title); }) : undefined}
-                        style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                        {t.title}
-                        {t.base && !t.sessionId && (
-                          // Subtle base-branch suffix on un-sent "New chat" tabs only.
-                          // Hidden once the session is real (its title takes over).
-                          <span style={{ marginLeft: 5, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-mono)' }}>· {t.base}</span>
-                        )}
-                      </span>
+                  <div key={group.projectId} className="ws-tab-group" role="group" aria-label={groupName}>
+                    {/* 3px colored left-stripe — the at-a-glance project tint */}
+                    <span className="ws-tab-group-stripe" aria-hidden="true" style={{ background: stripeColor }} />
+                    {/* Pin toggle: keeps a non-active group expanded even when it isn't the active one */}
+                    {tabGroups.length > 1 && (
+                      <button type="button"
+                        className={`ws-group-pin${pinned ? ' on' : ''}`}
+                        title={pinned ? `Unpin ${groupName}` : `Pin ${groupName} expanded`}
+                        aria-label={pinned ? `Unpin ${groupName}` : `Pin ${groupName} expanded`}
+                        aria-pressed={pinned}
+                        onClick={(e) => { e.stopPropagation(); toggleGroupPin(group.projectId); }}
+                        style={{ width: 18, alignSelf: 'center', height: 26, borderRadius: 5, display: 'grid', placeItems: 'center', marginLeft: 2, color: pinned ? stripeColor : 'var(--ink-tertiary)', background: 'transparent', cursor: 'pointer', flexShrink: 0 }}>
+                        <Icon name={pinned ? 'chevronDown' : 'chevronRight'} size={12} stroke={2.4} />
+                      </button>
                     )}
-                    <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
-                      <Icon name="x" size={11} stroke={2.6} />
-                    </button>
+                    {group.tabs.map(t => {
+                      const on = t.key === activeKey;
+                      const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
+                      const editing = chatTab && renamingId === t.sessionId;
+                      const collapsed = !expanded && !on; // active tab always shows its title
+                      const tabIcon = t.kind === 'file'
+                        ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+                        : t.kind === 'image'
+                        ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
+                        : t.kind === 'project'
+                        ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
+                        : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />;
+                      if (collapsed) {
+                        const initial = projectInitial(groupName);
+                        const a11yLabel = `${t.title} (in ${groupName})`;
+                        return (
+                          <button key={t.key} data-tabkey={t.key}
+                            type="button"
+                            role="tab" aria-selected={false} aria-label={a11yLabel}
+                            className={`ws-tab ws-tab-avatar`}
+                            onClick={() => { peekOpen(group.projectId); setActiveKey(t.key); }}
+                            onContextMenu={e => openTabMenu(e, t)}
+                            style={{ position: 'relative', borderRight: '0.5px solid var(--separator)', background: 'transparent', cursor: 'pointer', height: 'auto' }}>
+                            <span aria-hidden="true" style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center',
+                              background: `color-mix(in srgb, ${stripeColor} 22%, transparent)`,
+                              color: stripeColor, font: '700 10px/1 var(--font-display)' }}>{initial}</span>
+                            <span className="ws-tab-avatar-tip" role="tooltip">{a11yLabel}</span>
+                          </button>
+                        );
+                      }
+                      return (
+                        <div key={t.key} data-tabkey={t.key}
+                          role="tab" aria-selected={on}
+                          className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)} onContextMenu={e => openTabMenu(e, t)}
+                          style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
+                            borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
+                          {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: stripeColor }} />}
+                          {tabIcon}
+                          {editing && t.sessionId ? (
+                            <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
+                              onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}
+                              style={{ minWidth: 0, maxWidth: 150, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
+                          ) : (
+                            <span title={chatTab ? 'Double-click to rename' : (t.base ? `New chat off ${t.base}` : undefined)}
+                              onDoubleClick={chatTab ? (e => { e.stopPropagation(); setRenamingId(t.sessionId!); setRenameVal(t.title); }) : undefined}
+                              style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                              {t.title}
+                              {t.base && !t.sessionId && (
+                                // Subtle base-branch suffix on un-sent "New chat" tabs only.
+                                // Hidden once the session is real (its title takes over).
+                                <span style={{ marginLeft: 5, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-mono)' }}>· {t.base}</span>
+                              )}
+                            </span>
+                          )}
+                          <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+                            <Icon name="x" size={11} stroke={2.6} />
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
                 );
               })}
