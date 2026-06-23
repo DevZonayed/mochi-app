@@ -1121,10 +1121,15 @@ export class Store {
     }
     return used;
   }
-  createSession(projectId: string, title: string, codename?: string): ChatSession {
+  /** Create a chat. `opts.base` pins the branch the session's worktree forks
+      from when the engine first runs (`engine.ts` reads `session.baseBranch`
+      and passes it into `ensureSessionWorktree`). Default behavior — omit base —
+      keeps the existing `resolveBaseBranch(origin/HEAD → current → 'main')` flow. */
+  createSession(projectId: string, title: string, codename?: string, opts?: { base?: string }): ChatSession {
     const t = now();
     const s: ChatSession = { id: id(), projectId, title: (title.trim() || 'New chat').slice(0, 60), createdAt: t, updatedAt: t };
     if (codename) s.codename = codename;
+    if (opts?.base && opts.base.trim()) s.baseBranch = opts.base.trim();
     this.data.sessions.push(s); this.save();
     return s;
   }
