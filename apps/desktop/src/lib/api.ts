@@ -49,6 +49,14 @@ export interface Project {
   order?: number;
   createdAt: number;
 }
+/** A branch usable as a base for a new chat (mirrors electron/git.ts). */
+export interface BranchInfo {
+  name: string;
+  isDefault: boolean;
+  isCurrent: boolean;
+  hasRemote: boolean;
+  lastCommit: { sha: string; subject: string; date: number } | null;
+}
 export interface ChatSession {
   id: string;
   projectId: string;
@@ -1096,9 +1104,18 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; browser?: boolean; images?: { id?: string; name?: string; mime: string; dataB64: string }[]; files?: { id?: string; name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; base?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; browser?: boolean; images?: { id?: string; name?: string; mime: string; dataB64: string }[]; files?: { id?: string; name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
+  /** Eagerly create a session pinned to a base branch (optional — sendChat will
+      lazy-create with the same base if this isn't called first). */
+  createSession: (input: { projectId: string; title?: string; codename?: string; base?: string }) =>
+    call<ChatSession>('createSession', { ...input }, () =>
+      req<ChatSession>('/api/sessions/create', { method: 'POST', body: JSON.stringify(input) })),
+  /** All branches (local + origin) usable as a new-chat base. Default flagged first. */
+  listBranches: (projectId: string) =>
+    call<BranchInfo[]>('listBranches', { projectId }, () =>
+      req<BranchInfo[]>(`/api/projects/${encodeURIComponent(projectId)}/branches`)),
   renameSession: (id: string, title: string) =>
     call<ChatSession>('renameSession', { id, title }, () =>
       req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/rename`, { method: 'POST', body: JSON.stringify({ title }) })),
