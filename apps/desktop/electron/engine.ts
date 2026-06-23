@@ -20,6 +20,7 @@ import type { PublishingEngine } from './publishing.js';
 import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
 import { toolLabel, relPath } from './tool-label.js';
+import { thinkingConfigFor } from './thinking-config.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { branchSlug, isGitRepo } from './git.js';
 import { pickCityCodename } from './codenames.js';
@@ -28,6 +29,7 @@ import { allocatePortBase, sessionPortEnv } from './session-ports.js';
 import { normalizeRunMode, canStartBackgroundRun } from './run-mode.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
+import { ensureBrowserSkill } from './browser-skill.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
 import { makeGitCtx, type GitCtx } from './git-ctx.js';
@@ -40,12 +42,14 @@ import {
   enginesRoot, managedBinary, systemBinary, bundledBinary, downloadEngine, engineState,
   type EngineState, type DownloadProgress,
 } from './engines.js';
+import { codexSpawnEnv } from './node-shim.js';
 import { resetFromRateLimitInfo, isUsageLimitMessage, parseUsageLimitReset, type RateLimitInfo } from './limit-reset.js';
 import { parseAsk, timeoutAnswer, ASK_BASE_MS } from './ask-question.js';
 import {
-  detectKeepGoing, organizedContinuePrompt,
+  detectKeepGoing, extractNextItems, organizedContinuePrompt,
   KEEP_GOING_BASE_MS, KEEP_GOING_MAX_PER_SESSION, KEEP_GOING_CAP_NOTE,
 } from './keep-going.js';
+import { judgeFollowup, type JudgeResult } from './followup-judge.js';
 import {
   isRetryWorthy, retryDelayMs, retryKeyFor, retryScheduleTitle, retryNote, retryGiveUpNote,
   RETRY_MAX_ATTEMPTS,
@@ -58,6 +62,7 @@ import { shell } from 'electron';
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
 // coding agent needs real headroom — 4 turns dies mid-`ls`.
 const EFFORT_TURNS: Record<string, number> = { fast: 8, balanced: 24, deep: 48, max: 96 };
+
 // Goal mode: pursue the goal autonomously over a long horizon — far more turns.
 const GOAL_MAX_TURNS = 240;
 // When a normal (non-goal) run exhausts its per-run turn budget MID-TASK, we resume
@@ -95,13 +100,29 @@ const ASK_DIRECTIVE =
 // live-previewable HTML artifact — the OpenDesign "agent-native design" model, but
 // on Maestro's own engines + image-gen. Prepended to every turn of a design project.
 const BROWSER_DIRECTIVE =
-  `\n\n---\n\n[Browser mode ON] The user turned on BROWSER for this message: drive their REAL connected Chrome ` +
-  `via the mcp__maestro__browser_navigate / browser_snapshot / browser_read / browser_links / browser_click / ` +
-  `browser_type tools — do NOT use WebSearch/WebFetch. First call mcp__maestro__browser_status to confirm a ` +
-  `profile is connected; if none, tell the user to open the Mochi extension and pair it (the app shows the token ` +
-  `under Settings → Browser extension). Then browser_navigate to the relevant site and read it with ` +
-  `browser_snapshot / browser_read before acting. Accomplish the task on the live page; only fall back to ` +
-  `WebSearch if no browser is connected.`;
+  `\n\n---\n\n[Browser mode ON] The user turned on BROWSER for this message — drive their REAL ` +
+  `connected Chrome (their logged-in profiles, cookies, sessions) via the mcp__maestro__browser_* tools. ` +
+  `Do NOT use WebSearch/WebFetch.\n\n` +
+  `**First call: \`mcp__maestro__browser_status\`.** If no profile is connected, tell the user to open the ` +
+  `Mochi Chrome extension and pair it (the app shows the token under Settings → Browser extension), then stop ` +
+  `— do not loop.\n\n` +
+  `**The reading ladder (cheap → expensive)** — climb in order, NEVER start with snapshot on a heavy SPA:\n` +
+  `  1. \`browser_read\` — visible text. Read like a human.\n` +
+  `  2. \`browser_links\` — navigation choices.\n` +
+  `  3. \`browser_find_by_role_name\` — locate a SPECIFIC button/input by accessibility role+name (the ` +
+  `selector rescue when CSS fishing fails on heavy DOM like Gemini/ChatGPT/Linear/Figma).\n` +
+  `  4. \`browser_snapshot\` — accessibility tree (24KB cap). Only when you need refs for many elements.\n` +
+  `  5. \`browser_evaluate\` — arbitrary JS in the page. The escape hatch when nothing else exposes what you need.\n\n` +
+  `**Power tools:** \`browser_screenshot\` (viewport / fullPage / elementRef → PNG dataUrl), ` +
+  `\`browser_grab_image\` (save an <img> the page generated via canvas → base64 PNG, no download button needed), ` +
+  `\`browser_download_url\` (Chrome download to user's Downloads folder), \`browser_console_messages\` + ` +
+  `\`browser_network_requests\` (debug what broke), \`browser_emulate_viewport\` (test mobile/iPad), ` +
+  `\`browser_upload_file\` (drive file inputs), \`browser_wait_for_selector\` (instead of fixed sleeps).\n\n` +
+  `**Connection-loss recovery:** browser_* tools auto-retry once when the extension drops briefly (it ` +
+  `reconnects with exponential backoff up to ~15s). If you still get "browser profile disconnected" or ` +
+  `"No browser connected" AFTER the retry, tell the user one line and stop. Do not loop.\n\n` +
+  `Read \`.claude/skills/browser/SKILL.md\` (auto-installed in this project) for the full tool reference + ` +
+  `recipes (image-grab, heavy-DOM rescue, debugging, mobile emulation).`;
 
 const WHATSAPP_DIRECTIVE =
   `\n\n---\n\n[WhatsApp connected] This Mac is linked to the user's WhatsApp. When the user asks anything ` +
@@ -505,6 +526,16 @@ interface BrowserCtx {
   connected: () => boolean;
   profile: () => string | null;
   call: (type: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
+  /** Agent-placed background watch: poll a JS condition on the active tab and
+      post a NEW chat turn into THIS session when it transitions to true. Bound
+      to the run's projectId+sessionId so the watch can't accidentally target
+      another chat. Returns null when the desktop wasn't started with a
+      BrowserWatcher (browser_watch_* tools then degrade to a clear error). */
+  watch?: {
+    create: (input: { title: string; condition: string; message?: string; intervalMs?: number; maxDurationMs?: number; repeat?: boolean }) => import('./store.js').BrowserWatch;
+    cancel: (id: string) => import('./store.js').BrowserWatch | null;
+    list: () => import('./store.js').BrowserWatch[];
+  };
 }
 
 /* WhatsApp capability for the agent — backed by THIS Mac's Baileys socket + store.
@@ -677,9 +708,32 @@ async function runClaude(
                 return txt(r ? `Stopped background task ${a.id} (status ${r.status}).` : `No background task ${a.id}.`);
               })),
           ] : []),
-          ...(browserCtx ? [
+          ...(browserCtx ? (() => {
+            /* Retry wrapper for the extension RPC. The extension auto-reconnects with
+               exponential backoff up to 15s, so a brief drop (Wi-Fi blip, Chrome
+               restart, profile takeover) shouldn't fail the tool. We retry ONCE
+               after a 3.5s wait when the bridge reports "disconnected" / "not
+               connected"; longer outages surface to the agent so it can tell the
+               user. Non-connection errors (selector miss, bad URL, timeout) are
+               NEVER retried — they're real and need the agent's attention. */
+            const isDisconnect = (e: unknown) =>
+              /no browser connected|browser profile disconnected|not connected to the app/i.test(
+                e instanceof Error ? e.message : String(e),
+              );
+            const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+            const browserCall = async (type: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown> => {
+              try { return await browserCtx.call(type, params, timeoutMs); }
+              catch (e) {
+                if (!isDisconnect(e)) throw e;
+                await sleep(3500);
+                if (browserCtx.connected()) return await browserCtx.call(type, params, timeoutMs);
+                throw e;
+              }
+            };
+            const json = (v: unknown, max = 16000) => txt(JSON.stringify(v, null, 2).slice(0, max));
+            return [
             tool('browser_status',
-              'Check whether the user\'s real Chrome browser is connected (via the Mochi extension) and which profile is active. Use before the other browser_* tools if unsure a browser is available.',
+              'Check whether the user\'s real Chrome browser is connected (via the Mochi extension) and which profile is active. Use BEFORE other browser_* tools when in doubt, and AFTER a tool reports a disconnect to confirm.',
               {},
               wrap(async () => {
                 if (!browserCtx.connected()) return txt('No browser connected. Ask the user to open the Mochi Chrome extension and pair/activate a profile (the app shows the token under Settings → Browser extension).');
@@ -687,43 +741,365 @@ async function runClaude(
                 try { const t = await browserCtx.call('tab_url') as { url?: string }; if (t?.url) where = ` Current tab: ${t.url}`; } catch { /* no tab yet */ }
                 return txt(`Browser connected — active profile "${browserCtx.profile() ?? 'Chrome'}".${where}`);
               })),
+
+            // ── Navigation ──
             tool('browser_navigate',
-              'Open a URL in the USER\'S OWN real Chrome (their logged-in session) via the Mochi extension. Use this WHENEVER the user says "my browser", "go to my browser", "open …", "browse …", "check this site", or asks you to act on a real website (shop, search, log-in-walled page, fill a form). This is NOT WebFetch/WebSearch — it drives their actual visible browser with a live cursor. After navigating, call browser_snapshot or browser_read to see the page.',
+              'Open a URL in the USER\'S OWN real Chrome (their logged-in session) via the Mochi extension. Use WHENEVER the user says "my browser", "go to …", "open …", "browse …", or asks to act on a real website (shop, search, log-in-walled page, fill a form). NOT WebFetch/WebSearch — drives their actual visible browser with a live cursor. After navigating, call browser_read (cheapest) or browser_snapshot (for refs) to see the page.',
               { url: z.string().describe('The URL to open, including scheme, e.g. https://www.daraz.com.bd.') },
               wrap(async (a: { url: string }) => {
-                try { const r = await browserCtx.call('navigate', { url: a.url }, 45000) as { url?: string }; return txt(`Opened ${r?.url ?? a.url} in the user's browser. Use browser_snapshot or browser_read to see the page.`); }
+                try { const r = await browserCall('navigate', { url: a.url }, 45000) as { url?: string }; return txt(`Opened ${r?.url ?? a.url}. Use browser_read or browser_snapshot to see the page.`); }
                 catch (e) {
                   if (/no active session|session_start first/i.test(String((e as Error).message ?? e))) {
-                    await browserCtx.call('session_start', { url: a.url, title: 'Maestro Agent', color: 'blue' }, 45000);
-                    return txt(`Opened a new browser tab at ${a.url}. Use browser_snapshot or browser_read to see the page.`);
+                    await browserCall('session_start', { url: a.url, title: 'Maestro Agent', color: 'blue' }, 45000);
+                    return txt(`Opened a new browser tab at ${a.url}. Use browser_read or browser_snapshot to see the page.`);
                   }
                   throw e;
                 }
               })),
-            tool('browser_snapshot',
-              'Read the current page in the user\'s browser as an accessibility tree (roles, names, and CSS refs you can click). Use after browser_navigate to understand the page and find elements for browser_click.',
+            tool('browser_open_tab',
+              'Open an ADDITIONAL tab in the active browser session (the main tab stays). Use for multi-tab workflows: compare two product pages, open a sub-task, keep a reference open.',
+              { url: z.string().describe('URL to open.'), makePrimary: z.boolean().optional().describe('Make this the default tab for subsequent browser_* calls (default true).') },
+              wrap(async (a: { url: string; makePrimary?: boolean }) => json(await browserCall('open_tab', { url: a.url, makePrimary: a.makePrimary ?? true, active: true }, 45000)))),
+            tool('browser_list_tabs',
+              'List every tab in the active session (id, url, title, primary flag). Use before browser_close_tab or to switch focus.',
               {},
-              wrap(async () => txt(JSON.stringify(await browserCtx.call('snapshot'), null, 2).slice(0, 24000)))),
+              wrap(async () => json(await browserCall('list_tabs')))),
+            tool('browser_close_tab',
+              'Close a non-primary tab in the active session. Cannot close the primary tab — use browser_session_end for that.',
+              { tabId: z.number().describe('Tab id from browser_list_tabs.') },
+              wrap(async (a: { tabId: number }) => json(await browserCall('close_tab', { tabId: a.tabId })))),
+            tool('browser_tab_url',
+              'Get the current URL + title of the active tab (or a specific tab). Useful to confirm a navigation actually landed where you expected.',
+              { tabId: z.number().optional() },
+              wrap(async (a: { tabId?: number }) => json(await browserCall('tab_url', a.tabId != null ? { tabId: a.tabId } : {})))),
+            tool('browser_go_back',
+              'Press the browser Back button on the active tab.',
+              {},
+              wrap(async () => json(await browserCall('go_back')))),
+            tool('browser_go_forward',
+              'Press the browser Forward button on the active tab.',
+              {},
+              wrap(async () => json(await browserCall('go_forward')))),
+
+            // ── Read ──
             tool('browser_read',
-              'Extract the visible TEXT of the current page in the user\'s browser (optionally focused by a query). Use this to actually read content — search results, product listings, article text — after navigating.',
+              'Extract the visible TEXT of the current page (optionally focused by a query). **The CHEAPEST read tool — try this FIRST.** Use to actually read content: search results, product listings, article text, chat messages.',
               { query: z.string().optional().describe('Optional keyword/substring to focus the extraction.'), limit: z.number().optional().describe('Max blocks (default 80).') },
               wrap(async (a: { query?: string; limit?: number }) => {
-                const r = await browserCtx.call('text', { query: a.query, limit: a.limit ?? 80 }) as { text?: string };
+                const r = await browserCall('text', { query: a.query, limit: a.limit ?? 80 }) as { text?: string };
                 return txt((typeof r?.text === 'string' ? r.text : JSON.stringify(r)).slice(0, 16000));
               })),
             tool('browser_links',
-              'List links on the current page in the user\'s browser (text + href), optionally filtered. Use to find where to navigate next (a product page, a category, a result).',
+              'List links on the current page (text + href), optionally filtered. Use to find where to navigate next (a product page, a category, a result).',
               { query: z.string().optional().describe('Optional keyword to filter links.') },
-              wrap(async (a: { query?: string }) => txt(JSON.stringify(await browserCtx.call('links', { query: a.query, limit: 50 })).slice(0, 12000)))),
+              wrap(async (a: { query?: string }) => txt(JSON.stringify(await browserCall('links', { query: a.query, limit: 50 })).slice(0, 12000)))),
+            tool('browser_snapshot',
+              'Read the page as an accessibility tree (roles, names, CSS refs you can click). **24KB cap.** Heavier than browser_read — climb the reading ladder: read → links → find_by_role_name → snapshot. NEVER start with this on a heavy SPA (Gemini, Gmail, Figma) — you\'ll hit the cap and still be blind.',
+              {},
+              wrap(async () => json(await browserCall('snapshot'), 24000))),
+            tool('browser_find_by_role_name',
+              'Find ONE element by accessibility role + name (e.g. role:"button" name:"Submit"). **The selector rescue when CSS fishing fails on heavy SPA DOM (Gemini, ChatGPT, Linear, Figma).** Returns a stable CSS ref you can pass to browser_click / browser_type.',
+              { role: z.string().describe('ARIA role like "button", "textbox", "link", "tab", "menuitem".'), name: z.string().optional().describe('Accessible name (aria-label / text content). Case-insensitive substring by default.'), exact: z.boolean().optional().describe('Require exact-case full-match of name.'), tabId: z.number().optional() },
+              wrap(async (a: { role: string; name?: string; exact?: boolean; tabId?: number }) => json(await browserCall('find_by_role_name', { role: a.role, name: a.name, exact: !!a.exact, tabId: a.tabId })))),
+            tool('browser_match_count',
+              'Count how many elements match a CSS selector (with 5 sample previews). Diagnostic — call when a click "failed" to learn whether the selector hit 0, 1, or N matches.',
+              { ref: z.string().describe('CSS selector to count.'), tabId: z.number().optional() },
+              wrap(async (a: { ref: string; tabId?: number }) => json(await browserCall('match_count', { ref: a.ref, tabId: a.tabId })))),
+            tool('browser_screenshot',
+              'Capture a PNG screenshot of the active tab (viewport by default; full page or a single element supported). Returns a data: URL — pass it through to the user or extract bytes with browser_evaluate.',
+              { fullPage: z.boolean().optional().describe('Capture the WHOLE scrolled page, not just the viewport.'), elementRef: z.string().optional().describe('CSS selector — capture just that element\'s bounding box.'), format: z.enum(['png', 'jpeg']).optional() },
+              wrap(async (a: { fullPage?: boolean; elementRef?: string; format?: 'png' | 'jpeg' }) => {
+                const r = await browserCall('screenshot', { fullPage: !!a.fullPage, elementRef: a.elementRef, format: a.format ?? 'png' }, 45000) as { mode?: string; dataUrl?: string; width?: number; height?: number };
+                if (!r?.dataUrl) return json(r);
+                const len = r.dataUrl.length;
+                // Don't dump the whole base64 into the model's context — keep it lean.
+                return txt(`Screenshot captured (mode=${r.mode ?? 'viewport'}${r.width ? `, ${r.width}×${r.height}` : ''}, ${(len / 1024).toFixed(1)} KB dataUrl). dataUrl[0..80]: ${r.dataUrl.slice(0, 80)}…`);
+              })),
+            tool('browser_console_messages',
+              'Read captured browser console output (log/info/warn/error) for the active tab. The extension attaches CDP on session start and buffers up to 400 messages. Use to debug page errors.',
+              { level: z.enum(['log', 'info', 'warn', 'error', 'debug']).optional(), since: z.number().optional().describe('Unix-ms — only messages newer than this.'), limit: z.number().optional().describe('Max messages (default 100, cap 500).'), clear: z.boolean().optional().describe('Empty the buffer after reading.'), tabId: z.number().optional() },
+              wrap(async (a: { level?: string; since?: number; limit?: number; clear?: boolean; tabId?: number }) => json(await browserCall('console_messages', a)))),
+            tool('browser_network_requests',
+              'Read captured browser network traffic (HTTP requests + responses) for the active tab. Filter by URL substring, method, status range, or failedOnly. Use to debug API calls, find a download URL, check what loaded.',
+              { urlContains: z.string().optional(), method: z.string().optional(), statusGte: z.number().optional(), statusLt: z.number().optional(), failedOnly: z.boolean().optional(), includeRequestHeaders: z.boolean().optional(), includeResponseHeaders: z.boolean().optional(), limit: z.number().optional(), tabId: z.number().optional() },
+              wrap(async (a: Record<string, unknown>) => json(await browserCall('network_requests', a)))),
+
+            // ── Interact ──
             tool('browser_click',
-              'Click an element in the user\'s browser by CSS selector (get selectors from browser_snapshot). Use to press buttons, open a result, add to cart, etc. The page may navigate — follow up with browser_snapshot/browser_read.',
-              { ref: z.string().describe('A CSS selector for the element, e.g. "button.add-to-cart" or "a[href*=\'product\']".') },
-              wrap(async (a: { ref: string }) => { const r = await browserCtx.call('click', { ref: a.ref }, 45000) as { url?: string }; return txt(`Clicked ${a.ref}.${r?.url ? ` Now at ${r.url}.` : ''} Use browser_snapshot/browser_read to see the result.`); })),
+              'Click an element by CSS selector. Use to press buttons, open a result, add to cart. The page may navigate — follow up with browser_read / browser_snapshot.',
+              { ref: z.string().describe('CSS selector, e.g. "button.add-to-cart" or "a[href*=\'product\']".') },
+              wrap(async (a: { ref: string }) => { const r = await browserCall('click', { ref: a.ref }, 45000) as { url?: string }; return txt(`Clicked ${a.ref}.${r?.url ? ` Now at ${r.url}.` : ''}`); })),
+            tool('browser_click_at',
+              'Click at viewport coordinates (CSS pixels). Use AFTER browser_resolve_box or for overlays/canvases without a stable selector. Supports right/middle click and double/triple click.',
+              { x: z.number(), y: z.number(), button: z.enum(['left', 'right', 'middle']).optional(), clickCount: z.number().optional().describe('1 single, 2 double, 3 triple.'), tabId: z.number().optional() },
+              wrap(async (a: { x: number; y: number; button?: string; clickCount?: number; tabId?: number }) => json(await browserCall('click_at', a, 30000)))),
             tool('browser_type',
-              'Type text into an input/textarea in the user\'s browser (e.g. a search box). Optionally submit (press Enter) — handy for running a search.',
-              { ref: z.string().describe('CSS selector for the input.'), text: z.string().describe('The text to type.'), submit: z.boolean().optional().describe('Press Enter after typing (e.g. to run a search).') },
-              wrap(async (a: { ref: string; text: string; submit?: boolean }) => { await browserCtx.call('type', { ref: a.ref, text: a.text, submit: !!a.submit }); return txt(`Typed into ${a.ref}${a.submit ? ' and submitted' : ''}. Use browser_snapshot/browser_read to see the result.`); })),
-          ] : []),
+              'Type text into an input/textarea (e.g. a search box). Optionally submit (press Enter).',
+              { ref: z.string().describe('CSS selector for the input.'), text: z.string().describe('The text to type.'), submit: z.boolean().optional().describe('Press Enter after typing (e.g. to run a search).'), clear: z.boolean().optional().describe('Clear existing value first (default true).') },
+              wrap(async (a: { ref: string; text: string; submit?: boolean; clear?: boolean }) => { await browserCall('type', { ref: a.ref, text: a.text, submit: !!a.submit, clear: a.clear !== false }); return txt(`Typed into ${a.ref}${a.submit ? ' and submitted' : ''}.`); })),
+            tool('browser_press_key',
+              'Press a single key on the active tab. Use for Enter, Tab, Escape, ArrowDown, etc. when no text typing is needed.',
+              { key: z.string().describe('Key name, e.g. "Enter", "Tab", "Escape", "ArrowDown".') },
+              wrap(async (a: { key: string }) => json(await browserCall('press_key', { key: a.key })))),
+            tool('browser_scroll',
+              'Scroll the page. Pass deltaX/deltaY to scrollBy (relative), or x/y to scrollTo (absolute).',
+              { deltaX: z.number().optional(), deltaY: z.number().optional(), x: z.number().optional(), y: z.number().optional(), tabId: z.number().optional() },
+              wrap(async (a: { deltaX?: number; deltaY?: number; x?: number; y?: number; tabId?: number }) => json(await browserCall('scroll', a)))),
+            tool('browser_upload_file',
+              'Drive a file input (<input type="file">) in the page. Use when the user asks you to upload a file, attach an image, share a document. The file must already exist on disk; pass its absolute path.',
+              { filePaths: z.array(z.string()).describe('Absolute paths of files to upload.'), target: z.string().describe('CSS selector for the file input.'), strategies: z.array(z.enum(['direct', 'native-file-chooser', 'drag-drop'])).optional().describe('Strategy chain — defaults to ["direct"].') },
+              wrap(async (a: { filePaths: string[]; target: string; strategies?: string[] }) => json(await browserCall('upload_file', a, 60000)))),
+
+            // ── Wait ──
+            tool('browser_wait',
+              'Sleep for N milliseconds (0..60000). Use SPARINGLY — prefer browser_wait_for_selector. Suited for "let an animation finish" pauses, not for "wait until content appears".',
+              { ms: z.number() },
+              wrap(async (a: { ms: number }) => json(await browserCall('wait', { ms: a.ms })))),
+            tool('browser_wait_for_selector',
+              'Poll until a CSS selector exists (and optionally is visible). The right way to wait for content to appear (search results, generated image, modal). Replaces fixed sleeps.',
+              { ref: z.string().describe('CSS selector to wait for.'), timeoutMs: z.number().optional().describe('Max wait (default 30000, cap 180000).'), visible: z.boolean().optional().describe('Also require visible bounding box (default true).') },
+              wrap(async (a: { ref: string; timeoutMs?: number; visible?: boolean }) => {
+                const timeoutMs = Math.max(100, Math.min(180000, a.timeoutMs ?? 30000));
+                const visible = a.visible !== false;
+                const expr = `new Promise((resolve) => { const t0 = Date.now(); const tick = () => { const el = document.querySelector(${JSON.stringify(a.ref)}); if (el) { if (!${visible}) return resolve({ found: true, waitedMs: Date.now() - t0 }); const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return resolve({ found: true, waitedMs: Date.now() - t0 }); } if (Date.now() - t0 >= ${timeoutMs}) return resolve({ found: false, waitedMs: Date.now() - t0 }); setTimeout(tick, 150); }; tick(); })`;
+                const r = await browserCall('evaluate', { expression: expr, awaitPromise: true, timeoutMs: timeoutMs + 5000 }, timeoutMs + 10000) as { ok?: boolean; value?: { found?: boolean; waitedMs?: number }; error?: string };
+                if (!r?.ok) throw new Error(r?.error || 'wait_for_selector failed');
+                if (!r.value?.found) throw new Error(`selector "${a.ref}" did not appear in ${timeoutMs}ms`);
+                return txt(`Found "${a.ref}" after ${r.value.waitedMs}ms.`);
+              })),
+
+            // ── Power tools ──
+            tool('browser_evaluate',
+              'Run arbitrary JavaScript in the active tab (CDP Runtime.evaluate). Returns the serializable result as {ok, value}. The escape hatch when nothing else exposes what you need — extract data, trigger a hidden action, read computed styles, drive an unusual UI.',
+              { expression: z.string().describe('JavaScript source. Top-level await NOT supported — return a Promise and use awaitPromise.'), awaitPromise: z.boolean().optional().describe('Await the resolved Promise (default true).'), timeoutMs: z.number().optional().describe('Eval timeout (default 5000, cap 60000).') },
+              wrap(async (a: { expression: string; awaitPromise?: boolean; timeoutMs?: number }) => json(await browserCall('evaluate', { expression: a.expression, awaitPromise: a.awaitPromise !== false, returnByValue: true, timeoutMs: a.timeoutMs ?? 5000 }, (a.timeoutMs ?? 5000) + 10000)))),
+            tool('browser_grab_image',
+              'Find an <img> element on the page, draw it onto a canvas, and return its bytes as a base64 PNG dataUrl. The right way to "save the image the website just generated" (Gemini, ChatGPT, Midjourney, etc.) when there is no download button. Returns {dataUrl, width, height, src}. Tip: write the bytes to disk with Bash + base64 -D.',
+              { ref: z.string().optional().describe('CSS selector for the <img>. If omitted, picks the largest visible <img>.'), minSize: z.number().optional().describe('Minimum side length (px) to consider — default 200, to skip icons.') },
+              wrap(async (a: { ref?: string; minSize?: number }) => {
+                const minSize = a.minSize ?? 200;
+                const sel = a.ref ? JSON.stringify(a.ref) : 'null';
+                const expr = `(async () => {
+                  const refSel = ${sel};
+                  let img;
+                  if (refSel) img = document.querySelector(refSel);
+                  else {
+                    const imgs = Array.from(document.querySelectorAll('img'))
+                      .filter(i => i.complete && i.naturalWidth >= ${minSize} && i.naturalHeight >= ${minSize});
+                    img = imgs.sort((a,b) => (b.naturalWidth*b.naturalHeight) - (a.naturalWidth*a.naturalHeight))[0];
+                  }
+                  if (!img) return { found: false };
+                  // Draw to canvas. If the src is cross-origin without CORS, this throws —
+                  // fall back to fetch() + blob().
+                  try {
+                    const c = document.createElement('canvas');
+                    c.width = img.naturalWidth; c.height = img.naturalHeight;
+                    c.getContext('2d').drawImage(img, 0, 0);
+                    return { found: true, dataUrl: c.toDataURL('image/png'), width: img.naturalWidth, height: img.naturalHeight, src: img.src.slice(0, 200) };
+                  } catch (canvasErr) {
+                    try {
+                      const res = await fetch(img.src);
+                      const blob = await res.blob();
+                      const dataUrl = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
+                      return { found: true, dataUrl, width: img.naturalWidth, height: img.naturalHeight, src: img.src.slice(0, 200), via: 'fetch' };
+                    } catch (fetchErr) {
+                      return { found: false, error: 'tainted canvas + fetch failed: ' + String(fetchErr) };
+                    }
+                  }
+                })()`;
+                const r = await browserCall('evaluate', { expression: expr, awaitPromise: true, timeoutMs: 20000 }, 30000) as { ok?: boolean; value?: { found?: boolean; dataUrl?: string; width?: number; height?: number; src?: string; via?: string; error?: string }; error?: string };
+                if (!r?.ok) throw new Error(r?.error || 'grab_image failed');
+                const v = r.value;
+                if (!v?.found) throw new Error(v?.error || `no <img> matched (ref=${a.ref ?? 'auto'}, minSize=${minSize})`);
+                if (!v.dataUrl) throw new Error('image found but no dataUrl');
+                return txt(`Grabbed image ${v.width}×${v.height} from ${v.src} (${(v.dataUrl.length / 1024).toFixed(1)} KB${v.via ? `, via ${v.via}` : ''}).\ndataUrl: ${v.dataUrl}`);
+              })),
+            tool('browser_download_url',
+              'Tell Chrome to download a URL (chrome.downloads API). Use AFTER you have the file URL (e.g. found via browser_evaluate or browser_network_requests). Saves to the user\'s Downloads folder.',
+              { url: z.string().describe('Absolute URL of the file to download.'), filename: z.string().optional().describe('Suggested filename. May include a subpath relative to Downloads/.'), conflictAction: z.enum(['uniquify', 'overwrite', 'prompt']).optional() },
+              wrap(async (a: { url: string; filename?: string; conflictAction?: string }) => json(await browserCall('download_url', a, 60000)))),
+
+            // ── Layout ──
+            tool('browser_window_resize',
+              'Move/resize the Chrome window (or change its state to minimized/maximized/fullscreen). Useful for layout tests and recording sessions.',
+              { width: z.number().optional(), height: z.number().optional(), left: z.number().optional(), top: z.number().optional(), state: z.enum(['normal', 'minimized', 'maximized', 'fullscreen']).optional() },
+              wrap(async (a: Record<string, unknown>) => json(await browserCall('window_resize', a)))),
+            tool('browser_emulate_viewport',
+              'Apply device emulation (viewport size + DPR + mobile flag + UA). Use to TEST how a site renders on mobile/tablet. Presets: iphone-15-pro, iphone-se, pixel-7, ipad, desktop-hd, desktop-fhd, desktop-2k.',
+              { preset: z.string().optional(), width: z.number().optional(), height: z.number().optional(), mobile: z.boolean().optional(), userAgent: z.string().optional(), deviceScaleFactor: z.number().optional() },
+              wrap(async (a: Record<string, unknown>) => json(await browserCall('emulate_viewport', a)))),
+            tool('browser_clear_emulation',
+              'Drop device emulation — back to a normal desktop viewport. Call after browser_emulate_viewport when you\'re done testing.',
+              {},
+              wrap(async () => json(await browserCall('clear_emulation')))),
+
+            // ── Cookies + storage + master CDP ──
+            tool('browser_cookies_get',
+              'Read cookies. Pass `url` to scope to a site (preferred), or `domain` to read across all paths. With `name`, returns just that cookie. Useful for "is the user still logged in?", debugging auth, scripting an OTP flow.',
+              { url: z.string().optional().describe('Origin to query, e.g. "https://example.com". Required when `name` is given.'), name: z.string().optional(), domain: z.string().optional() },
+              wrap(async (a: { url?: string; name?: string; domain?: string }) => json(await browserCall('cookies_get', a)))),
+            tool('browser_cookies_set',
+              'Set a cookie on a URL. Use to script logged-in fixtures, drop a session cookie, override a flag. The browser enforces normal cookie rules (secure, sameSite, domain scope).',
+              { url: z.string().describe('Origin the cookie belongs to.'), name: z.string(), value: z.string(), domain: z.string().optional(), path: z.string().optional(), secure: z.boolean().optional(), httpOnly: z.boolean().optional(), sameSite: z.enum(['no_restriction', 'lax', 'strict', 'unspecified']).optional(), expirationDate: z.number().optional().describe('Unix seconds (NOT ms). Omit for a session cookie.') },
+              wrap(async (a: Record<string, unknown>) => json(await browserCall('cookies_set', a)))),
+            tool('browser_cookies_clear',
+              'Remove cookies. Without `name`: clears every cookie matching `url` (or `domain`). Use to fully sign a user out before a test, or reset a paywall.',
+              { url: z.string().optional(), name: z.string().optional(), domain: z.string().optional() },
+              wrap(async (a: { url?: string; name?: string; domain?: string }) => json(await browserCall('cookies_clear', a)))),
+            tool('browser_hover',
+              'Move the cursor over an element (fires real mouseenter/mouseover events via CDP). The right way to open a hover-menu, reveal a tooltip, or trigger CSS :hover. Synthetic events from browser_evaluate often fail for these.',
+              { ref: z.string().describe('CSS selector for the element to hover.'), tabId: z.number().optional() },
+              wrap(async (a: { ref: string; tabId?: number }) => json(await browserCall('hover', a)))),
+            tool('browser_drag',
+              'Drag from one element to another (Trello card, Figma object, slider handle, file-drop zone). Implemented as a real CDP mouse press + move-along-path + release sequence so HTML5 drag listeners fire correctly.',
+              { fromRef: z.string().describe('CSS selector for the element to drag.'), toRef: z.string().describe('CSS selector for the drop target.'), steps: z.number().optional().describe('Intermediate move events (2..40, default 12) — more = smoother path.'), tabId: z.number().optional() },
+              wrap(async (a: { fromRef: string; toRef: string; steps?: number; tabId?: number }) => json(await browserCall('drag', a, 30000)))),
+            tool('browser_cdp',
+              '**The master key.** Run ANY Chrome DevTools Protocol method on the active tab — Page.printToPDF, Emulation.setGeolocationOverride, Network.setRequestInterception, Accessibility.getFullAXTree, Network.setBlockedURLs, Emulation.setCPUThrottlingRate, Storage.clearDataForOrigin, etc. Reach for this when nothing else exposes what you need. Method names use the standard "Domain.method" form. See https://chromedevtools.github.io/devtools-protocol/',
+              { method: z.string().describe('CDP method, e.g. "Page.printToPDF", "Emulation.setGeolocationOverride", "Network.getCookies".'), params: z.record(z.unknown()).optional().describe('Method-specific params object.'), tabId: z.number().optional() },
+              wrap(async (a: { method: string; params?: Record<string, unknown>; tabId?: number }) => {
+                const r = await browserCall('cdp', { method: a.method, params: a.params ?? {}, tabId: a.tabId }, 60000) as { result?: { data?: string } };
+                // Trim base64 blobs (PDF, screenshot via CDP) so the agent's context doesn't fill up.
+                if (typeof r?.result?.data === 'string' && r.result.data.length > 1024) {
+                  return txt(`CDP ${a.method} → result.data is ${(r.result.data.length / 1024).toFixed(1)} KB base64. dataLen=${r.result.data.length}, dataHead=${r.result.data.slice(0, 80)}…\nOther keys: ${Object.keys(r.result).filter(k => k !== 'data').join(', ') || '(none)'}`);
+                }
+                return json(r, 16000);
+              })),
+            tool('browser_resolve_box',
+              'Return the bounding box (x, y, width, height + visibility) of an element by CSS selector. Use BEFORE browser_click_at when you need to click a precise coordinate inside a canvas/overlay, or to verify an element is on-screen.',
+              { ref: z.string().describe('CSS selector.'), tabId: z.number().optional() },
+              wrap(async (a: { ref: string; tabId?: number }) => json(await browserCall('resolve_box', a)))),
+            tool('browser_assert',
+              'Run a built-in page assertion (title contains, url contains, selector visible/count). Fails LOUDLY when the page is not in the expected state — better than scraping text and second-guessing.',
+              { kind: z.enum(['title-contains', 'url-contains', 'selector-visible', 'selector-count', 'text-present']).describe('Which assertion to run.'), target: z.string().optional().describe('Selector for selector-* assertions, otherwise unused.'), value: z.union([z.string(), z.number()]).optional().describe('Expected substring (title/url/text), count, or visibility flag.') },
+              wrap(async (a: { kind: string; target?: string; value?: string | number }) => json(await browserCall('assert', a)))),
+            tool('browser_storage_get',
+              'Read localStorage or sessionStorage from the active tab. Useful for debugging logged-in state, feature flags, cached SPA state. Pass `key` for one value, omit for ALL keys.',
+              { area: z.enum(['local', 'session']).describe('"local" = localStorage; "session" = sessionStorage.'), key: z.string().optional() },
+              wrap(async (a: { area: 'local' | 'session'; key?: string }) => {
+                const store = a.area === 'session' ? 'sessionStorage' : 'localStorage';
+                const expr = a.key
+                  ? `(() => { try { return { area: ${JSON.stringify(a.area)}, key: ${JSON.stringify(a.key)}, value: ${store}.getItem(${JSON.stringify(a.key)}) }; } catch (e) { return { error: String(e) }; } })()`
+                  : `(() => { try { const out = {}; for (let i = 0; i < ${store}.length; i++) { const k = ${store}.key(i); if (k != null) out[k] = ${store}.getItem(k); } return { area: ${JSON.stringify(a.area)}, count: Object.keys(out).length, items: out }; } catch (e) { return { error: String(e) }; } })()`;
+                const r = await browserCall('evaluate', { expression: expr, awaitPromise: false, timeoutMs: 5000 }) as { ok?: boolean; value?: unknown; error?: string };
+                if (!r?.ok) throw new Error(r?.error || 'storage_get failed');
+                return json(r.value, 12000);
+              })),
+            tool('browser_storage_set',
+              'Write a value into localStorage or sessionStorage. Use to script test fixtures, override a feature flag, restore a saved state. Pass `value:null` to remove the key.',
+              { area: z.enum(['local', 'session']), key: z.string(), value: z.string().nullable().describe('String to store, or null to remove the key.') },
+              wrap(async (a: { area: 'local' | 'session'; key: string; value: string | null }) => {
+                const store = a.area === 'session' ? 'sessionStorage' : 'localStorage';
+                const expr = a.value === null
+                  ? `(() => { try { ${store}.removeItem(${JSON.stringify(a.key)}); return { removed: ${JSON.stringify(a.key)} }; } catch (e) { return { error: String(e) }; } })()`
+                  : `(() => { try { ${store}.setItem(${JSON.stringify(a.key)}, ${JSON.stringify(a.value)}); return { set: ${JSON.stringify(a.key)}, length: ${JSON.stringify(a.value)}.length }; } catch (e) { return { error: String(e) }; } })()`;
+                const r = await browserCall('evaluate', { expression: expr, awaitPromise: false, timeoutMs: 5000 }) as { ok?: boolean; value?: unknown; error?: string };
+                if (!r?.ok) throw new Error(r?.error || 'storage_set failed');
+                return json(r.value);
+              })),
+            tool('browser_storage_clear',
+              'Empty an entire storage area for the active tab\'s origin (everything in localStorage or sessionStorage). Symmetric with browser_cookies_clear — use to fully reset SPA state before re-testing a flow.',
+              { area: z.enum(['local', 'session']) },
+              wrap(async (a: { area: 'local' | 'session' }) => {
+                const store = a.area === 'session' ? 'sessionStorage' : 'localStorage';
+                // Capture the count before clearing so the agent sees what it actually wiped.
+                const expr = `(() => { try { const n = ${store}.length; ${store}.clear(); return { area: ${JSON.stringify(a.area)}, cleared: n }; } catch (e) { return { error: String(e) }; } })()`;
+                const r = await browserCall('evaluate', { expression: expr, awaitPromise: false, timeoutMs: 5000 }) as { ok?: boolean; value?: unknown; error?: string };
+                if (!r?.ok) throw new Error(r?.error || 'storage_clear failed');
+                return json(r.value);
+              })),
+            tool('browser_save_image',
+              'Save a base64 image (data: URL OR raw base64) to disk under the project. Pair with browser_grab_image / browser_screenshot to one-shot extract → save without falling back to Bash + base64 -D.',
+              { dataUrl: z.string().describe('Either a "data:image/png;base64,...." URL or a raw base64 string.'), filename: z.string().describe('Output filename (path is relative to the project root unless absolute). Subdirectories are created.') },
+              wrap(async (a: { dataUrl: string; filename: string }) => {
+                // Strip any data: prefix and trim whitespace defensively. Reject anything
+                // that isn't valid base64 with a clear message rather than writing garbage.
+                const stripped = a.dataUrl.replace(/^data:[^,]*,/, '').replace(/\s+/g, '');
+                if (!/^[A-Za-z0-9+/=]+$/.test(stripped)) {
+                  throw new Error('save_image: dataUrl did not decode as base64. Pass the full "data:image/...;base64,..." URL from browser_grab_image, or just the base64 body.');
+                }
+                const buf = Buffer.from(stripped, 'base64');
+                if (buf.length < 16) throw new Error('save_image: decoded payload is suspiciously small — was the dataUrl truncated?');
+                // Resolve relative to the run's cwd (the project root) and create
+                // parents so a path like "assets/screens/01.png" Just Works.
+                const target = path.isAbsolute(a.filename) ? a.filename : path.join(cwd, a.filename);
+                mkdirSync(path.dirname(target), { recursive: true });
+                const { writeFileSync } = await import('node:fs');
+                writeFileSync(target, buf);
+                return txt(`Saved ${buf.length} bytes → ${target}.`);
+              })),
+            tool('browser_pdf',
+              'Save the active tab as a PDF (Page.printToPDF). Returns the file path written under the user\'s Downloads folder. Configure paper size, margins, headers/footers via the standard CDP params.',
+              { filename: z.string().optional().describe('Saved name (default tab title + ".pdf"). Will be uniquified.'), landscape: z.boolean().optional(), printBackground: z.boolean().optional(), paperWidth: z.number().optional().describe('Inches.'), paperHeight: z.number().optional().describe('Inches.'), scale: z.number().optional().describe('0.1..2'), tabId: z.number().optional() },
+              wrap(async (a: { filename?: string; landscape?: boolean; printBackground?: boolean; paperWidth?: number; paperHeight?: number; scale?: number; tabId?: number }) => {
+                const cdpRes = await browserCall('cdp', {
+                  method: 'Page.printToPDF',
+                  params: {
+                    landscape: !!a.landscape,
+                    printBackground: a.printBackground !== false,
+                    paperWidth: a.paperWidth ?? 8.5,
+                    paperHeight: a.paperHeight ?? 11,
+                    scale: a.scale ?? 1,
+                    transferMode: 'ReturnAsBase64',
+                  },
+                  tabId: a.tabId,
+                }, 60000) as { result?: { data?: string } };
+                const data = cdpRes?.result?.data;
+                if (!data) throw new Error('Page.printToPDF returned no data');
+                // Hand the bytes off to chrome.downloads via a data: URL — keeps the
+                // download in the user's normal Downloads folder + history.
+                const filename = a.filename ?? `page-${Date.now()}.pdf`;
+                const dl = await browserCall('download_url', { url: `data:application/pdf;base64,${data}`, filename, conflictAction: 'uniquify' }, 60000) as { filename?: string; id?: number };
+                return txt(`PDF saved to ${dl.filename ?? `~/Downloads/${filename}`} (download id ${dl.id ?? '?'}, ${(data.length * 0.75 / 1024).toFixed(1)} KB).`);
+              })),
+
+            // ── Background "observe + post-on-trigger" watches ──
+            ...(browserCtx.watch ? [
+              tool('browser_watch',
+                'Place a BACKGROUND WATCH on the active browser tab: poll a JS condition every N ms, and when it transitions to TRUE, post a NEW message into THIS chat — starting a fresh agent turn that has the full session memory. Your CURRENT turn does NOT have to stay alive — the watcher runs on the desktop and survives across turns AND desktop restarts. ' +
+                'Use whenever you need to "wait for X to happen and then act": a Gemini/ChatGPT generation finishing, a payment status flipping, a price hitting a target, a CI badge turning green, a captcha being solved by the user, an upload finishing, a chat reply arriving. ' +
+                'Condition is a JS expression evaluated in the page (the same engine as browser_evaluate). MUST return a truthy/falsy value — keep it fast. Example: `!!document.querySelector(".success-toast")` / `document.title.includes("Completed")` / `Number(document.querySelector(".price").textContent.replace(/[^0-9.]/g,"")) <= 49.99` / `document.querySelectorAll("img[alt*=generated]").length > 0`. ' +
+                'Returns the watch id (use it with browser_watch_cancel). The chat message that fires includes the watch title, your message, the tab URL, and the condition — so the next-turn agent knows what to do.',
+                {
+                  title: z.string().describe('Short label, e.g. "Wait for Gemini image" or "Watch SOL price ≤ $145".'),
+                  condition: z.string().describe('JS expression evaluated in the page. Returns truthy/falsy. Avoid side effects.'),
+                  message: z.string().optional().describe('Optional one-line note. Surfaced in the chat when the condition fires.'),
+                  intervalMs: z.number().optional().describe('Poll cadence (500..300000, default 5000).'),
+                  maxDurationMs: z.number().optional().describe('Max total lifetime in ms (auto-cancels at this deadline). Default 30 min, cap 24 h.'),
+                  repeat: z.boolean().optional().describe('When true, fire EVERY time the condition transitions false→true (not just once). Default false (one-shot, then auto-cancels).'),
+                },
+                wrap(async (a: { title: string; condition: string; message?: string; intervalMs?: number; maxDurationMs?: number; repeat?: boolean }) => {
+                  const w = browserCtx.watch!.create(a);
+                  return txt(`Watching "${w.title}" — id ${w.id} (every ${w.intervalMs}ms, expires ${new Date(w.expiresAt).toISOString()}, ${w.repeat ? 'repeating' : 'one-shot'}). The watcher posts back into this chat when the condition becomes true. Cancel with browser_watch_cancel("${w.id}").`);
+                })),
+              tool('browser_watch_list',
+                'List the BROWSER WATCHES bound to THIS chat session. Shows: id, title, active flag, fireCount, lastResult (true/false/error/no-browser), lastError, expiresAt. Use to diagnose a stuck watch (e.g. lastResult=\'no-browser\' = the user needs to pair the extension; lastResult=\'error\' = your condition expression is throwing).',
+                {},
+                wrap(async () => {
+                  const list = browserCtx.watch!.list();
+                  if (list.length === 0) return txt('No browser watches for this chat. Use browser_watch to start one.');
+                  return txt(list.map(w => `- ${w.id} [${w.active ? 'active' : `done · ${w.cancelReason ?? 'cancelled'}`}] "${w.title}" — fires=${w.fireCount}, lastResult=${w.lastResult ?? '(none)'}${w.lastError ? ` (${w.lastError})` : ''}, every ${w.intervalMs}ms, expires ${new Date(w.expiresAt).toISOString()}${w.lastFiredAt ? `\n    lastFiredAt=${new Date(w.lastFiredAt).toISOString()}` : ''}\n    condition: ${w.condition.length > 200 ? w.condition.slice(0, 200) + '…' : w.condition}`).join('\n'));
+                })),
+              tool('browser_watch_cancel',
+                'Cancel a browser watch by id. Idempotent — already-cancelled watches return the row without erroring. Use when you no longer need to wait (you solved it another way, or the user changed their mind).',
+                { id: z.string() },
+                wrap(async (a: { id: string }) => {
+                  const w = browserCtx.watch!.cancel(a.id);
+                  if (!w) return txt(`No watch found with id ${a.id} (it may belong to another chat, or it was already deleted).`);
+                  return txt(`Watch ${a.id} ("${w.title}") cancelled.`);
+                })),
+            ] : []),
+
+            // ── Lifecycle (almost always implicit via browser_navigate) ──
+            tool('browser_session_start',
+              'Explicitly start a browser session (open a tab in a Mochi-managed tab group). Almost never needed — browser_navigate creates one on demand.',
+              { url: z.string().optional(), title: z.string().optional(), color: z.string().optional(), newWindow: z.boolean().optional() },
+              wrap(async (a: Record<string, unknown>) => json(await browserCall('session_start', a, 45000)))),
+            tool('browser_session_end',
+              'Close the active browser session. Pass closeTabs:true to also close the tabs (default leaves them open, just removes the group).',
+              { closeTabs: z.boolean().optional() },
+              wrap(async (a: { closeTabs?: boolean }) => json(await browserCall('session_end', { closeTabs: !!a.closeTabs })))),
+          ];})() : []),
           ...(scheduleCtx ? [
             tool('schedule_list',
               'List recurring/scheduled tasks. Use to see what is already scheduled before creating or editing. Optionally filter by project.',
@@ -894,7 +1270,23 @@ async function runClaude(
     ...(imageGen ? ['generate_image'] : []),
     ...(skillsCtx ? ['search_skills', 'get_skill', 'download_skill', 'add_skill_to_project', 'list_project_skills', 'remove_project_skill'] : []),
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
-    ...(browserCtx ? ['browser_status', 'browser_navigate', 'browser_snapshot', 'browser_read', 'browser_links', 'browser_click', 'browser_type'] : []),
+    ...(browserCtx ? [
+      'browser_status', 'browser_navigate', 'browser_open_tab', 'browser_list_tabs', 'browser_close_tab',
+      'browser_tab_url', 'browser_go_back', 'browser_go_forward',
+      'browser_read', 'browser_links', 'browser_snapshot',
+      'browser_find_by_role_name', 'browser_match_count',
+      'browser_screenshot', 'browser_console_messages', 'browser_network_requests',
+      'browser_click', 'browser_click_at', 'browser_type', 'browser_press_key', 'browser_scroll', 'browser_upload_file',
+      'browser_hover', 'browser_drag',
+      'browser_wait', 'browser_wait_for_selector',
+      'browser_evaluate', 'browser_grab_image', 'browser_download_url',
+      'browser_cookies_get', 'browser_cookies_set', 'browser_cookies_clear',
+      'browser_cdp', 'browser_pdf', 'browser_save_image',
+      'browser_resolve_box', 'browser_assert', 'browser_storage_get', 'browser_storage_set', 'browser_storage_clear',
+      'browser_window_resize', 'browser_emulate_viewport', 'browser_clear_emulation',
+      'browser_session_start', 'browser_session_end',
+      'browser_watch', 'browser_watch_list', 'browser_watch_cancel',
+    ] : []),
     ...(scheduleCtx ? ['schedule_list', 'schedule_create', 'schedule_update', 'schedule_delete', 'schedule_toggle', 'schedule_run_now', 'projects_list', 'sessions_list'] : []),
     ...(gitCtx ? ['git_status', 'git_push', 'pr_create', 'pr_merge', 'pr_resolve_conflicts', 'branch_rename'] : []),
     ...(commsCtx ? ['wa_list_chats', 'wa_get_messages', 'wa_send_message', 'wa_mark_read'] : []),
@@ -946,6 +1338,11 @@ async function runClaude(
       // non-bypass mode. In plan mode imageServer is null so the tool is absent.
       ...(Object.keys(mergedMcpServers).length ? { mcpServers: mergedMcpServers, allowedTools: mergedAllowed } : {}),
       ...(modelOverride ? { model: modelOverride } : {}),
+      // Force extended thinking ON for all models, not just Opus 4.6+ adaptive.
+      // Without this Sonnet/Haiku stay silent and the transcript's purple
+      // "Thinking" block never appears, even though the capture path (#42) is
+      // wired end-to-end. See `thinkingConfigFor` above.
+      thinking: thinkingConfigFor(modelOverride, effort),
       ...(resume ? { resume } : {}),
       ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
       ...(apiKey ? { env: { ...process.env, ANTHROPIC_API_KEY: apiKey } as NodeJS.ProcessEnv } : {}),
@@ -980,6 +1377,44 @@ async function runClaude(
       if (ev.kind === 'paused') hooks.onPaused?.(ev.until, ev.reason);
       else hooks.onResumed?.();
     } catch { /* best-effort */ }
+  };
+  /* Per-sub-agent transcript writers, keyed by the parent's tool_use_id.
+     Every SDK event carrying `parent_tool_use_id` belongs to a Task/Agent
+     dispatch's INNER turn loop (its tool calls, thinking, prose). Instead of
+     dropping those events on the floor (the old behaviour, which left the UI
+     showing only a one-line chip + checkmark), we route each into the parent
+     chip's `children[]` so the operator can expand the chip and SEE what the
+     sub-agent actually did. Each writer mirrors the top-level open-block /
+     toolById state but writes into the parent's own children array. */
+  interface SubWriter { open: TranscriptItem | null; openThinking: TranscriptItem | null; toolById: Map<string, TranscriptItem>; }
+  const subWriters = new Map<string, SubWriter>();
+  const SUB_CAP = 80; // soft cap per sub-agent so a chatty Plan agent doesn't bloat the transcript
+  const subWriterFor = (parentId: string): { w: SubWriter; out: TranscriptItem[] } | null => {
+    const parent = toolById.get(parentId);
+    if (!parent) return null;
+    if (!parent.children) parent.children = [];
+    let w = subWriters.get(parentId);
+    if (!w) { w = { open: null, openThinking: null, toolById: new Map() }; subWriters.set(parentId, w); }
+    return { w, out: parent.children };
+  };
+  /* Pull the sub-agent's final text response out of a tool_result.content
+     payload (which is either a string OR an array of {type:'text',text:…} blocks
+     per the Anthropic content-block convention). Used to populate `parent.result`
+     so the collapsed chip can preview the answer without forcing the user to
+     expand. */
+  const extractToolResultText = (c: unknown): string => {
+    if (typeof c === 'string') return c.trim();
+    if (Array.isArray(c)) {
+      const parts: string[] = [];
+      for (const b of c) {
+        if (b && typeof b === 'object' && (b as { type?: string }).type === 'text') {
+          const t = (b as { text?: unknown }).text;
+          if (typeof t === 'string') parts.push(t);
+        }
+      }
+      return parts.join('\n').trim();
+    }
+    return '';
   };
 
   let resultText = '';
@@ -1023,8 +1458,67 @@ async function runClaude(
         total_cost_usd?: number; result?: unknown;
       };
       if (m.session_id) sdkSessionId = m.session_id;
-      // Subagent traffic surfaces through its parent Task chip — don't interleave it.
-      if (m.parent_tool_use_id) continue;
+      // Sub-agent traffic (Task/Agent dispatch INNER events) — route into the
+      // parent chip's `children[]` so the chat can render an expandable
+      // "what the sub-agent did" view instead of staring at a single chip.
+      if (m.parent_tool_use_id) {
+        const ctx = subWriterFor(m.parent_tool_use_id);
+        if (!ctx) continue; // unknown parent → drop (defensive; shouldn't happen)
+        const { w, out } = ctx;
+        // Soft cap: stop appending new items once we've recorded plenty. Tool
+        // status/result updates are still allowed (they MUTATE existing chips,
+        // not append) so a long sub-agent still shows clean checkmarks.
+        const canAppend = out.length < SUB_CAP;
+        if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'thinking_delta') {
+          if (!w.openThinking) {
+            if (!canAppend) { progress(); continue; }
+            w.openThinking = { kind: 'thinking', text: '', ts: Date.now() }; out.push(w.openThinking);
+          }
+          w.openThinking.text += m.event.delta.thinking ?? '';
+        } else if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
+          if (!w.open) {
+            if (!canAppend) { progress(); continue; }
+            w.open = { kind: 'text', text: '', ts: Date.now() }; out.push(w.open);
+          }
+          w.open.text += m.event.delta.text ?? '';
+        } else if (m.type === 'assistant' && m.message?.content) {
+          for (const b of m.message.content) {
+            if (b.type === 'thinking' && typeof b.thinking === 'string') {
+              if (w.openThinking) { w.openThinking.text = b.thinking; w.openThinking = null; }
+              else if (b.thinking.trim() && canAppend) out.push({ kind: 'thinking', text: b.thinking, ts: Date.now() });
+            } else if (b.type === 'text' && typeof b.text === 'string') {
+              w.openThinking = null;
+              if (w.open) { w.open.text = b.text; w.open = null; }
+              else if (b.text.trim() && canAppend) out.push({ kind: 'text', text: b.text, ts: Date.now() });
+            } else if (b.type === 'tool_use') {
+              w.open = null; w.openThinking = null;
+              if (!canAppend) continue;
+              const label = toolLabel(b.name ?? '', b.input, cwd);
+              const t: TranscriptItem = { kind: 'tool', name: b.name ?? 'tool', text: label.text, toolStatus: 'running', ts: Date.now() };
+              if (label.cmd) t.cmd = label.cmd;
+              const preview = toolPreview(b.name ?? '', b.input);
+              if (preview !== undefined) t.preview = preview;
+              if (b.id) {
+                t.id = b.id;
+                w.toolById.set(b.id, t);
+                // ALSO register in the top-level map so a grand-child (a
+                // sub-agent dispatched BY a sub-agent) can find this chip.
+                toolById.set(b.id, t);
+              }
+              out.push(t);
+            }
+          }
+        } else if (m.type === 'user' && m.message?.content) {
+          for (const b of m.message.content) {
+            if (b.type === 'tool_result' && b.tool_use_id) {
+              const t = w.toolById.get(b.tool_use_id);
+              if (t) { t.toolStatus = b.is_error ? 'error' : 'done'; t.durMs = Date.now() - t.ts; }
+            }
+          }
+        }
+        progress();
+        continue;
+      }
 
       if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'thinking_delta') {
         // Extended thinking (default-on/adaptive for Opus 4.6+). Stream it into an
@@ -1071,7 +1565,7 @@ async function runClaude(
             const preview = toolPreview(b.name ?? '', b.input);
             if (preview !== undefined) t.preview = preview;
             items.push(t);
-            if (b.id) toolById.set(b.id, t);
+            if (b.id) { t.id = b.id; toolById.set(b.id, t); }
             // Remember any ScheduleWakeup so the matching tool_result can flip
             // us to paused (success path). Non-ScheduleWakeup tools no-op.
             wakeup.onToolUse(b.id, b.name, b.input);
@@ -1082,7 +1576,17 @@ async function runClaude(
         for (const b of m.message.content) {
           if (b.type === 'tool_result' && b.tool_use_id) {
             const t = toolById.get(b.tool_use_id);
-            if (t) { t.toolStatus = b.is_error ? 'error' : 'done'; t.durMs = Date.now() - t.ts; }
+            if (t) {
+              t.toolStatus = b.is_error ? 'error' : 'done'; t.durMs = Date.now() - t.ts;
+              // If this was a sub-agent dispatch (Task/Agent), the result
+              // content carries the sub-agent's FINAL assistant text — surface
+              // it as `result` so the collapsed chip can preview the answer
+              // ("→ <first line>…") without forcing the user to expand.
+              if (t.children) {
+                const txt = extractToolResultText((b as { content?: unknown }).content);
+                if (txt) t.result = txt;
+              }
+            }
             // A successful ScheduleWakeup tool_result puts the SDK iterator
             // into the dormant window; emit `paused` so the UI swaps the
             // "Responding…" spinner for a "scheduled to resume" countdown.
@@ -1174,9 +1678,15 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   // API-key auth: when there is no ChatGPT subscription login, pass the stored
   // OpenAI key to `codex exec` via OPENAI_API_KEY (the provider's env_key). When a
   // subscription login exists, leave the env alone so Codex uses that.
-  const env = (!codexLoggedIn() && ctx?.openaiKey)
-    ? { ...process.env, OPENAI_API_KEY: ctx.openaiKey }
-    : process.env;
+  //
+  // PATH fix-up: Codex sub-tools (its MCP shims, hook scripts, custom MCP servers)
+  // routinely shebang `#!/usr/bin/env node`. On a Finder-launched .app the inherited
+  // PATH is bare and lacks `node`, so they fail with exit 127. codexSpawnEnv()
+  // prepends a `node` shim (Electron-as-node via ELECTRON_RUN_AS_NODE=1, same trick
+  // codex-bridge.ts already uses) plus the user's real login-shell PATH — so npm,
+  // git, gh, asdf, fnm, pyenv binaries all keep resolving too. See node-shim.ts.
+  const env = codexSpawnEnv(enginesRoot(),
+    (!codexLoggedIn() && ctx?.openaiKey) ? { OPENAI_API_KEY: ctx.openaiKey } : undefined);
   const outFile = path.join(tmpdir(), `maestro-codex-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
   // Native MCP for codex: one stdio bridge forwards the Skill-Broker and
   // background-task tools back into Maestro. Codex's sandbox auto-cancels MCP tool
@@ -1397,6 +1907,13 @@ export class LocalEngine {
       simply report "no browser connected" until a Chrome profile pairs + activates. */
   private extBridge?: () => ExtensionBridgeLike | null;
   setExtensionBridge(fn: () => ExtensionBridgeLike | null) { this.extBridge = fn; }
+  /** Browser watcher — the agent-placed "observe an element / condition" background
+      poll that posts a new chat turn when the criteria fire. Injected from main.ts
+      so the agent's browser_watch_* tools route through the same persistent watcher
+      the UI manages. Null/absent = the agent's browser_watch tools simply report
+      "watcher not available" (a clean degrade, never a crash). */
+  private browserWatcher?: import('./browser-watch.js').BrowserWatcher;
+  setBrowserWatcher(w: import('./browser-watch.js').BrowserWatcher) { this.browserWatcher = w; }
   /** Public entry the UI/dispatch use to (re)generate or edit an image outside a
       coding turn — routes through the SAME backend (Codex/fal) the generate_image
       tool uses, so a one-click "Regenerate" or a "modify this image" instruction
@@ -1661,7 +2178,9 @@ export class LocalEngine {
     try { this.codexLoginChild?.kill('SIGTERM'); } catch { /* gone */ }
     return new Promise((resolve, reject) => {
       let out = '';
-      const child = spawn(bin, ['login'], { stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
+      // Same PATH fix-up as `codex exec` — login may also shell out to node-based
+      // helpers (the device-flow page server, browser launch shims). See node-shim.ts.
+      const child = spawn(bin, ['login'], { stdio: ['ignore', 'pipe', 'pipe'], env: codexSpawnEnv(enginesRoot()) });
       this.codexLoginChild = child;
       const timer = setTimeout(() => {
         try { child.kill('SIGTERM'); } catch { /* gone */ }
@@ -1730,7 +2249,13 @@ export class LocalEngine {
         if (code !== 0) { reject(Object.assign(new Error(buf.trim().slice(-300) || `GitHub sign-in exited ${code ?? 'unknown'}.`), { statusCode: 500 })); return; }
         const token = ghTokenFrom(ghBin);
         if (!token) { reject(Object.assign(new Error('Signed in, but could not read the token back from gh.'), { statusCode: 500 })); return; }
-        this.providers!.connect('github', token)
+        // Best-effort encrypt to Keychain — but DON'T fail the whole sign-in
+        // if Safe Storage isn't trusted on this build (ad-hoc-signed apps
+        // whose Keychain ACL the user dismissed). The token lives on disk
+        // in `gh`'s hosts.yml, and `Providers.getLocalKey('github')` reads it
+        // from there as a fallback, so all downstream consumers (git/PR,
+        // githubStatus, feedbackCreateIssue) stay functional.
+        this.providers!.connect('github', token).catch(() => { /* Safe Storage unavailable — fall back to gh CLI as source-of-truth */ })
           .then(() => githubConnectionStatus(token))
           .then(resolve)
           .catch(reject);
@@ -1833,8 +2358,15 @@ export class LocalEngine {
 
   /** Arm an auto-answer countdown for an unanswered AskUserQuestion at the tail of a
       finished chat turn. No-op unless the model genuinely ended ON the question (it
-      asked and didn't act afterwards) and nothing is already armed for this session. */
+      asked and didn't act afterwards), the session has AUTOPILOT enabled (opt-in
+      per-chat — was always-on before; the operator wanted explicit control), and
+      nothing is already armed for this session. */
   private armAskFollowup(sessionId: string, projectId: string, items: TranscriptItem[], effort: Effort): boolean {
+    // Per-chat opt-in: autopilot must be ON for this session, or the auto-answer
+    // is just user-hostile (the operator typed a question to be ANSWERED, not
+    // auto-resolved). The toggle lives on the composer; default is OFF.
+    const session = this.store.getSession(sessionId);
+    if (!session?.autoPilot) return false;
     let askIdx = -1;
     for (let i = items.length - 1; i >= 0; i--) { if (items[i].kind === 'ask') { askIdx = i; break; } }
     if (askIdx === -1) return false;
@@ -1858,8 +2390,20 @@ export class LocalEngine {
       auto-continue for KEEP_GOING_BASE_MS later. Per-session cap +
       idempotent upsert keep a stuck agent from spinning forever AND keep a
       burst of re-emits from spawning duplicate schedules.
+
+      DESIGN (post-redesign):
+      1. Gated on session.autoPilot — off by default; the operator opts in
+         per-chat via the composer toggle. Was always-on; that produced too
+         many false positives.
+      2. Sonnet judge (followup-judge.ts) reads the agent's actual last
+         text + a little context and returns one of {continue, wait-for-user,
+         paused, done}. Only 'continue' arms a schedule.
+      3. Regex (detectKeepGoing) is the FALLBACK when no Anthropic API key
+         exists or the judge call fails — autopilot still works offline,
+         just less smart.
+
       Returns the schedule (or null when capped / nothing to arm). */
-  private armKeepGoingFollowup(opts: {
+  private async armKeepGoingFollowup(opts: {
     sessionId: string;
     projectId: string;
     items: TranscriptItem[];
@@ -1868,11 +2412,14 @@ export class LocalEngine {
     originalGoal?: string;
     sourceJobId: string;
     outputText: string;
-  }): void {
+  }): Promise<void> {
+    // Per-chat opt-in. Off by default; the composer's autopilot button toggles
+    // this. Skipping when off prevents auto-continue noise in chats where the
+    // operator just wants a single answer per turn.
+    const session = this.store.getSession(opts.sessionId);
+    if (!session?.autoPilot) return;
     // Last text the model emitted (the offer to continue lives there, NOT in
-    // a tool chip or thinking block). Tail-only search keeps a single match in
-    // the middle of a long body from triggering when the body ends on a real
-    // deliverable.
+    // a tool chip or thinking block).
     let lastText = '';
     for (let i = opts.items.length - 1; i >= 0; i--) {
       const it = opts.items[i];
@@ -1880,7 +2427,6 @@ export class LocalEngine {
     }
     if (!lastText && opts.outputText) lastText = opts.outputText;
     if (!lastText) return;
-    if (!detectKeepGoing(lastText)) return;
     // Don't auto-continue ON TOP OF other pending actions for the session
     // (an auto-answer, an auto-continue at limit-reset, a queued message,
     // or a pending retry-run). Those have priority — once they fire, the
@@ -1890,18 +2436,76 @@ export class LocalEngine {
       s.sessionId === opts.sessionId && s.enabled && blockingKinds.has(s.kind ?? ''),
     );
     if (hasBlocking) return;
+
+    // Sonnet judgment — gated by API key. If we get a clean verdict, trust it;
+    // if not (no key, network blip, malformed JSON), fall back to the regex.
+    const apiKey = this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined;
+    let judged: JudgeResult | null = null;
+    if (apiKey) {
+      // Gather a tiny bit of context — last 3 turns from THIS session — so the
+      // judge can distinguish "asked Y in the body, agent already answered it"
+      // from "asked Y, awaiting user". Cheap to gather; bounded in size.
+      const ctx: { role: 'user' | 'assistant'; text: string }[] = [];
+      try {
+        const jobs = this.store.listJobs(opts.projectId, opts.sessionId)
+          .filter((j) => j.id !== opts.sourceJobId)
+          .slice(-3);
+        for (const j of jobs) {
+          ctx.push({ role: 'user', text: j.input ?? '' });
+          if (j.output) ctx.push({ role: 'assistant', text: j.output });
+        }
+      } catch { /* best-effort */ }
+      judged = await judgeFollowup({
+        apiKey,
+        lastAssistantText: lastText,
+        contextTurns: ctx,
+        goalMode: opts.goalMode,
+        originalGoal: opts.originalGoal,
+      });
+    }
+    // If the judge spoke, trust it. Else fall back to the regex detector that
+    // shipped before — autopilot still works without API access (and the
+    // operator can disable the chat-level toggle if it misfires).
+    let verdict: 'continue' | 'wait-for-user' | 'paused' | 'done';
+    let reason = '';
+    let items: string[] | undefined;
+    if (judged) {
+      verdict = judged.verdict;
+      reason = judged.reason;
+      items = judged.items;
+    } else {
+      verdict = detectKeepGoing(lastText) ? 'continue' : 'done';
+      reason = 'regex fallback (no API key or judge unavailable)';
+    }
+    if (verdict !== 'continue') return;
+
     const fireAt = Date.now() + KEEP_GOING_BASE_MS;
-    const prompt = organizedContinuePrompt({
-      lastText,
-      goalMode: opts.goalMode,
-      originalGoal: opts.originalGoal,
-      attempt: this.store.keepGoingCountFor(opts.sessionId) + 1,
-      maxAttempts: KEEP_GOING_MAX_PER_SESSION,
-    });
+    // If the judge gave us items, prefer them (it saw full context); else
+    // re-extract from the last text. Either way the operator sees the
+    // agent's own next moves echoed back in the [Auto-continue]: prompt.
+    const promptItems = items && items.length ? items : extractNextItems(lastText);
+    // organizedContinuePrompt already builds the standard envelope; if the
+    // judge surfaced richer items, splice them in via the lastText overload.
+    const prompt = promptItems.length
+      ? organizedContinuePrompt({
+          lastText: `${lastText}\n\n${promptItems.map((i) => `- ${i}`).join('\n')}`,
+          goalMode: opts.goalMode,
+          originalGoal: opts.originalGoal,
+          attempt: this.store.keepGoingCountFor(opts.sessionId) + 1,
+          maxAttempts: KEEP_GOING_MAX_PER_SESSION,
+        })
+      : organizedContinuePrompt({
+          lastText,
+          goalMode: opts.goalMode,
+          originalGoal: opts.originalGoal,
+          attempt: this.store.keepGoingCountFor(opts.sessionId) + 1,
+          maxAttempts: KEEP_GOING_MAX_PER_SESSION,
+        });
+    const titleSuffix = reason ? ` — ${reason.slice(0, 60)}` : '';
     const res = this.store.upsertKeepGoingForSession({
       sessionId: opts.sessionId,
       projectId: opts.projectId,
-      title: 'Auto-continue (want me to keep going?)',
+      title: `Auto-continue${titleSuffix}`,
       prompt,
       fireAt,
       effort: opts.effort,
@@ -2366,7 +2970,40 @@ export class LocalEngine {
         connected: () => bridge.hasActiveBrowser(),
         profile: () => bridge.activeProfile(),
         call: (type, params, timeoutMs) => bridge.request(type, params ?? {}, timeoutMs),
+        /* Bind a watcher view scoped to THIS run's project+session: every watch
+           the agent creates this turn fires back into the same chat. Listing /
+           cancelling stays per-session too so the agent can't see or cancel
+           someone else's watches. The watcher itself is process-wide (singleton
+           managed in main.ts); we just project a session-scoped view of it. */
+        ...(this.browserWatcher && session ? {
+          watch: {
+            create: (input) => this.browserWatcher!.create({
+              projectId: job.projectId ?? session.projectId,
+              sessionId: session.id,
+              title: input.title,
+              condition: input.condition,
+              message: input.message,
+              intervalMs: input.intervalMs,
+              maxDurationMs: input.maxDurationMs,
+              repeat: input.repeat,
+            }),
+            cancel: (id) => {
+              // Authorise: only cancel watches that belong to THIS session, so a
+              // run can't reach across chats. A misaddressed cancel is a clean no-op.
+              const w = this.store.listBrowserWatches({ sessionId: session.id }).find(x => x.id === id);
+              return w ? this.browserWatcher!.cancel(id) : null;
+            },
+            list: () => this.browserWatcher!.list({ sessionId: session.id }),
+          },
+        } : {}),
       } : undefined;
+      /* Auto-install the bundled `browser` SKILL.md so the agent reads the full
+         tool reference + recipes BEFORE its first browser_* call. Idempotent — it
+         won't clobber an operator-edited copy. Gated on browser mode being ON for
+         this turn AND a bridge existing (browserCtx truthy implies both). */
+      if (opts.browser && browserCtx) {
+        try { ensureBrowserSkill(cwd); } catch { /* best-effort; missing doc never fails a run */ }
+      }
       // Schedule capability: let the agent inspect + manage recurring/scheduled
       // tasks and discover projects/sessions to target. Off in plan mode.
       const scheduleCtx: ScheduleCtx | undefined = (this.cron && !opts.plan) ? makeScheduleCtx(this.store, this.cron) : undefined;
@@ -2530,15 +3167,28 @@ export class LocalEngine {
       /* SP3 — primary↔reviewer loop. A reviewer engine (e.g. Codex) checks the
          primary's (e.g. Opus) changes for security/weak code/bugs; if it flags
          problems AND the turn actually changed files, the primary fixes them and
-         the reviewer re-verifies — up to REVIEW_MAX_ROUNDS. Now runs for chat too. */
+         the reviewer re-verifies — up to REVIEW_MAX_ROUNDS. Now runs for chat too.
+
+         Gating (post-redesign):
+         - reviewer model picked (!= 'off') — picks WHICH engine reviews
+         - PER-CHAT TOGGLE session.reviewerEnabled — picks WHETHER to review
+           this chat at all. Default OFF so the operator opts in explicitly.
+         - Drops the silent "only review when files changed" condition — the
+           operator complained the reviewer wasn't firing on chat turns
+           because of this hidden gate. Now: if the toggle is on, it ALWAYS
+           reviews. */
       const reviewerChoice: RoleChoice | 'off' = opts.reviewer ?? roles.reviewer;
       const reviewer: EngineId | 'off' = reviewerChoice === 'off' ? 'off' : reviewerChoice.engine;
       const reviewerModel = reviewerChoice === 'off' ? undefined : reviewerChoice.model;
       const wroteFiles = allItems.some(it => it.kind === 'tool' && IS_WRITE_TOOL_RE.test(it.name ?? ''));
       const reviewerKey = () => (this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined);
       let reviewVerdict: 'approved' | 'needs-work' | null = null;
+      // Per-chat toggle: opt-in. For NON-chat jobs (one-off runs from the
+      // research/publishing pipeline) the existing behavior stays — those
+      // aren't chats so there's no per-session toggle.
+      const reviewerOn = !isChat || (session != null && session.reviewerEnabled === true);
 
-      if (reviewer !== 'off' && this.available(reviewer) && (wroteFiles || !isChat) && !main.hitLimit && !ac.signal.aborted) {
+      if (reviewer !== 'off' && this.available(reviewer) && reviewerOn && !main.hitLimit && !ac.signal.aborted) {
         for (let round = 0; round < REVIEW_MAX_ROUNDS; round++) {
           cur = this.store.updateJob(jobId, { progress: 88, stage: `reviewer (${ENGINE_LABEL[reviewer]}) checking…` });
           this.emit('job', cur);
@@ -2619,7 +3269,11 @@ export class LocalEngine {
         try {
           const armedAsk = this.armAskFollowup(session.id, job.projectId, allItems, effort);
           if (!armedAsk) {
-            this.armKeepGoingFollowup({
+            // Awaited so the Sonnet judge has time to land BEFORE we declare
+            // the turn fully done. Cheap (~1s) and the engine has already
+            // emitted the final 'job' update, so the user sees the answer
+            // immediately — only the schedule arming waits on the judge.
+            await this.armKeepGoingFollowup({
               sessionId: session.id,
               projectId: job.projectId,
               items: allItems,

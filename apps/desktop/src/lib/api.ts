@@ -71,6 +71,15 @@ export interface ChatSession {
   /** Set when this chat was imported from an external store (read-only history). */
   importedFrom?: ConvSource;
   externalId?: string;
+  /** OPT-IN per-chat: autopilot ON for THIS chat. When true, after every
+      assistant turn the engine runs a Sonnet judgment; if it returns
+      'continue' it schedules a 1-min [Auto-continue] followup (visible +
+      cancellable in the Scheduler). Off by default. */
+  autoPilot?: boolean;
+  /** OPT-IN per-chat: run the reviewer engine on every turn (independent of
+      whether files changed). The `reviewer` field above still picks the
+      engine/model. Off by default. */
+  reviewerEnabled?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -106,6 +115,18 @@ export interface TranscriptItem {
   /** file-writing tools only: capped snapshot of the written content (hover preview). */
   preview?: string;
   ask?: string;
+  /** tool only: the SDK's tool_use_id — used to route nested sub-agent events
+      back to this chip so the UI can expand to show the sub-agent's transcript. */
+  id?: string;
+  /** tool only (sub-agent calls — Task/Agent): the sub-agent's own captured
+      transcript (its tool calls, thinking, prose). Rendered inside an
+      expandable section under the parent chip. Capped per parent on the
+      desktop side. */
+  children?: TranscriptItem[];
+  /** tool only (sub-agent calls): the sub-agent's FINAL text response,
+      unpacked from the tool_result content so the collapsed chip can preview
+      the answer and the expansion can show it in full. */
+  result?: string;
   /** image only: the Asset id (resolved to bytes on the Mac via api.assetImage; never sent to the relay). */
   assetId?: string;
   /** image only: absolute Mac-local path (reveal-in-Finder/copy; stripped from the relay snapshot). */
@@ -196,10 +217,14 @@ export interface Schedule {
   fireAt?: number;
   sessionId?: string;
   prompt?: string;
-  /** A user-scheduled chat message, an auto-continue queued when a Claude run is
-      blocked by the usage limit, or an auto-answer countdown for an unanswered
-      AskUserQuestion (fires the recommended option into the chat on timeout). */
-  kind?: 'message' | 'auto-continue' | 'auto-answer';
+  /** Schedule kind:
+      - 'message' : a user-authored chat message to fire at a future time
+      - 'auto-continue' : the usage-limit-reset auto-resume
+      - 'auto-answer' : AskUserQuestion timeout (1-min countdown)
+      - 'keep-going' : autopilot's "the agent offered to continue" 1-min countdown
+      - 'retry-run' : a failed run's retry on exponential backoff
+      - 'whatsapp-analyze' : per-chat WhatsApp quiet timer */
+  kind?: 'message' | 'auto-continue' | 'auto-answer' | 'keep-going' | 'retry-run' | 'whatsapp-analyze';
   effort?: Effort;
   browser?: boolean;
   plan?: boolean;
@@ -829,6 +854,13 @@ export const api = {
     call<ExtensionStatus>('extensionStatus', {}, () => Promise.reject(new Error('desktop only'))),
   extensionSetActive: (clientId: string) =>
     call<ExtensionStatus>('extensionSetActive', { clientId }, () => Promise.reject(new Error('desktop only'))),
+  /** Where the bundled extension's unpacked folder lives on disk (packaged build, dev tree, or env override). */
+  extensionPath: () =>
+    call<{ path: string | null; source: 'packaged' | 'dev' | 'env-override' | 'not-found'; manifestPresent: boolean }>(
+      'extensionPath', {}, () => Promise.reject(new Error('desktop only'))),
+  /** Open the bundled extension folder in Finder/Explorer (so the user can chrome://extensions → Load Unpacked). */
+  extensionRevealFolder: () =>
+    call<{ path: string; source: string }>('extensionRevealFolder', {}, () => Promise.reject(new Error('desktop only'))),
   /** Hand off a design to code: copy its folder into a NEW coding project (lives in both tabs). Desktop-only. */
   copyDesignToCode: (id: string, name?: string) =>
     call<Project>('copyDesignToCode', { id, name }, () => Promise.reject(new Error('desktop only'))),
@@ -1018,6 +1050,18 @@ export const api = {
     call<ChatSession>('pinSession', { id, pinned }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/pin`, { method: 'POST', body: JSON.stringify({ pinned }) })),
   archiveSession: (id: string, archived: boolean) =>
     call<ChatSession>('archiveSession', { id, archived }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify({ archived }) })),
+  /** Toggle autopilot for a chat. When ON, after every assistant turn the
+      engine runs a Sonnet judgment + arms a 1-min [Auto-continue] followup
+      if the agent ended on a continuation cue. A genuine user message
+      cancels any pending followup. Off by default. */
+  setSessionAutopilot: (id: string, enabled: boolean) =>
+    call<ChatSession>('setSessionAutopilot', { id, enabled }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/autopilot`, { method: 'POST', body: JSON.stringify({ enabled }) })),
+  /** Toggle the reviewer engine for a chat. When ON, every assistant turn
+      runs the reviewer (independent of whether files changed). The
+      `reviewer` field on the session picks which engine/model reviews.
+      Off by default. */
+  setSessionReviewer: (id: string, enabled: boolean) =>
+    call<ChatSession>('setSessionReviewer', { id, enabled }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/reviewer-enabled`, { method: 'POST', body: JSON.stringify({ enabled }) })),
   deleteProject: (id: string) =>
     call<{ ok: boolean }>('deleteProject', { id }, () => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 

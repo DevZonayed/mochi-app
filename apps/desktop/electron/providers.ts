@@ -11,6 +11,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Store } from './store.js';
+import { ghCliToken, ghLoggedIn } from './github-auth.js';
 
 export type ProviderId = 'anthropic' | 'openai' | 'fal' | 'github';
 
@@ -50,6 +51,17 @@ export class Providers {
     }
     const fal = this.store.providerKeyMeta('fal');
     if (fal) out.push({ provider: 'fal', method: 'apiKey', status: 'connected', detail: `API key ••••${fal.last4}`, keyLast4: fal.last4, createdAt: fal.createdAt });
+    // GitHub: prefer the gh CLI as source-of-truth (mirrors how anthropic/openai
+    // detect their CLI logins). This makes the Accounts row show "Connected"
+    // even when Safe Storage isn't available — e.g. ad-hoc-signed builds whose
+    // Keychain ACL the user dismissed — so users aren't locked out of git/PR
+    // operations by a Mac Keychain quirk they can't be expected to debug.
+    if (ghLoggedIn()) {
+      out.push({ provider: 'github', method: 'subscription', status: 'connected', detail: 'gh CLI login', createdAt: 0 });
+    } else {
+      const gh = this.store.providerKeyMeta('github');
+      if (gh) out.push({ provider: 'github', method: 'apiKey', status: 'connected', detail: `PAT ••••${gh.last4}`, keyLast4: gh.last4, createdAt: gh.createdAt });
+    }
     return out;
   }
 
@@ -87,8 +99,18 @@ export class Providers {
 
   getLocalKey(provider: ProviderId): string | undefined {
     const cipher = this.store.getProviderKeyCipher(provider);
-    if (!cipher) return undefined;
-    try { return safeStorage.decryptString(Buffer.from(cipher, 'base64')); } catch { return undefined; }
+    if (cipher) {
+      try { return safeStorage.decryptString(Buffer.from(cipher, 'base64')); } catch { /* fall through to CLI */ }
+    }
+    // gh CLI is a valid source of the GitHub token (same as ~/.claude.json
+    // for anthropic / ~/.codex for openai). All three callers — GitService
+    // for PRs, githubStatus, feedbackCreateIssue — get unblocked when Safe
+    // Storage write/read fails but `gh auth login` succeeded on disk.
+    if (provider === 'github') {
+      const t = ghCliToken();
+      if (t) return t;
+    }
+    return undefined;
   }
 
   private async validate(provider: ProviderId, key: string): Promise<{ valid: boolean; error?: string }> {

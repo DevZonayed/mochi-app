@@ -114,6 +114,11 @@ describe('Store.upsertKeepGoingForSession', () => {
   });
 });
 
+// Store.cancelKeepGoingForSession was replaced by cancelPendingFollowups
+// (broader: covers auto-answer too). The cases above for the keep-going
+// kind, plus the auto-answer/kind-isolation/idempotency/session-isolation
+// cases, live in store.cancel-followups.test.ts.
+
 describe('Store retry counter', () => {
   let s: Store;
   beforeEach(() => {

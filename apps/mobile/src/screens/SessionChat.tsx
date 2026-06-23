@@ -7,7 +7,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { useTheme } from '../theme';
 import { Icon, type IconName } from '../Icon';
 import { Mono } from '../ui';
-import { Markdown } from '../Markdown';
+import { Markdown, StreamingMarkdown } from '../Markdown';
 import { api, type Job, type TranscriptItem, type Effort, type ModelGroup } from '../api';
 import { cacheGet, cacheSet } from '../storage';
 import { pullSync, useSyncStore } from '../syncStore';
@@ -150,25 +150,31 @@ const isSkillTool = (name?: string): boolean => (name ?? '').toLowerCase() === '
 const prettySkillName = (raw: string): string => { const tail = (raw.split(':').pop() ?? raw).replace(/[-_]/g, ' ').trim(); return tail ? tail.replace(/\b\w/g, (c) => c.toUpperCase()) : raw; };
 
 // Extended thinking → calm dimmed prose under a purple header, tap to expand/collapse.
-function ThinkingRow({ item }: { item: TranscriptItem }) {
+// While the block is currently STREAMING, default to expanded + reveal text through
+// the typewriter so the user can watch the model reason in real time (matches the
+// desktop's `ThinkingNode` behavior).
+function ThinkingRow({ item, live }: { item: TranscriptItem; live?: boolean }) {
   const { theme } = useTheme();
-  const [open, setOpen] = useState(false);
+  const [override, setOverride] = useState<boolean | null>(null);
   const text = (item.text || '').trim();
   if (!text) return null;
+  const open = override ?? !!live;
   const preview = text.replace(/\s+/g, ' ').slice(0, 80);
   return (
     <View>
-      <Pressable onPress={() => setOpen((o) => !o)} style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
+      <Pressable onPress={() => setOverride(!open)} style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
         <View style={{ width: 18, height: 18, borderRadius: 6, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.purple + '24' }}>
           <Icon name="spark" size={11} color={theme.color.purple} />
         </View>
-        <Text style={{ fontSize: 11, fontWeight: '600', letterSpacing: 0.6, textTransform: 'uppercase', color: theme.color.purple }}>Thinking</Text>
+        <Text style={{ fontSize: 11, fontWeight: '600', letterSpacing: 0.6, textTransform: 'uppercase', color: theme.color.purple }}>Thinking{live ? '…' : ''}</Text>
         <Icon name={open ? 'chevronDown' : 'chevronRight'} size={13} color={theme.color.inkTertiary} />
         {!open && <Text numberOfLines={1} style={{ flex: 1, fontSize: 11, color: theme.color.inkTertiary }}>{preview}…</Text>}
       </Pressable>
       {open && (
         <View style={{ marginTop: 6, marginLeft: 8, paddingLeft: 12, borderLeftWidth: 1.5, borderLeftColor: theme.color.purple + '3d' }}>
-          <Markdown text={text} color={theme.color.inkSecondary} size={13} />
+          {live
+            ? <StreamingMarkdown text={text} live color={theme.color.inkSecondary} size={13} />
+            : <Markdown text={text} color={theme.color.inkSecondary} size={13} />}
         </View>
       )}
     </View>
@@ -195,6 +201,24 @@ function toolDisplay(name: string): { short: string; icon: IconName; tint: 'blue
 }
 const baseName = (p: string): string => (p.split(/[?#]/)[0].split(/[\\/]/).filter(Boolean).pop() || p).trim();
 
+/* Children of a sub-agent (Task/Agent dispatch) — its own tool calls, thinking
+   blocks, and prose, rendered as a calm flat list under an indent rail. Each
+   item recursively uses the same ToolRow / ThinkingRow / Markdown components
+   so a sub-agent that dispatched ITS OWN sub-agent still renders correctly. */
+function NestedTranscript({ items }: { items: TranscriptItem[] }) {
+  const { theme } = useTheme();
+  return (
+    <View style={{ gap: 4 }}>
+      {items.map((it, i) => {
+        if (it.kind === 'tool') return <ToolRow key={i} item={it} />;
+        if (it.kind === 'thinking') return <ThinkingRow key={i} item={it} />;
+        if (it.text && it.text.trim()) return <Markdown key={i} text={it.text} color={theme.color.ink} size={13} />;
+        return null;
+      })}
+    </View>
+  );
+}
+
 function ToolRow({ item }: { item: TranscriptItem }) {
   const { theme } = useTheme();
   const running = item.toolStatus === 'running';
@@ -210,7 +234,17 @@ function ToolRow({ item }: { item: TranscriptItem }) {
   const trailing = running ? <ActivityIndicator size="small" color={theme.color.purple} />
     : error ? <Icon name="x" size={13} color={theme.color.red} stroke={2.6} />
       : <Icon name="check" size={13} color={theme.color.green} stroke={2.6} />;
-  return (
+  // Sub-agent (Task/Agent dispatch) chip carries captured children OR a final
+  // response. Auto-expand while RUNNING so the phone shows the live step trail
+  // (matches the desktop), then collapse on completion with a one-line answer
+  // preview so the timeline stays calm.
+  const childCount = item.children?.length ?? 0;
+  const hasNest = childCount > 0 || !!(item.result && item.result.trim());
+  const [expanded, setExpanded] = useState(false);
+  const isOpen = hasNest && (expanded || running);
+  const stepLabel = childCount > 0 ? `${childCount} step${childCount === 1 ? '' : 's'}` : '';
+  const resultPreview = item.result ? item.result.replace(/\s+/g, ' ').trim().slice(0, 140) : '';
+  const Row = (
     <View style={{ flexDirection: 'row', alignItems: hasCmd ? 'flex-start' : 'center', gap: 9, paddingVertical: 5, paddingHorizontal: 7 }}>
       <View style={{ width: 18, alignItems: 'center', justifyContent: 'center', marginTop: hasCmd ? 1 : 0 }}>
         <Icon name={isSkill ? 'spark' : d.icon} size={15} color={glyph} />
@@ -221,11 +255,51 @@ function ToolRow({ item }: { item: TranscriptItem }) {
           {detail ? <Text numberOfLines={1} style={{ flex: 1, fontSize: 13, fontFamily: detailMono ? theme.fontFamily.mono : undefined, color: isSkill ? theme.color.ink : theme.color.inkSecondary }}>{detail}</Text> : null}
         </View>
         {hasCmd ? <Text numberOfLines={1} style={{ alignSelf: 'flex-start', maxWidth: '100%', fontSize: 11, fontFamily: theme.fontFamily.mono, color: theme.color.inkSecondary, backgroundColor: theme.color.fillTertiary, borderRadius: 5, paddingHorizontal: 6, paddingVertical: 1, overflow: 'hidden' }}>{item.cmd}</Text> : null}
+        {/* Collapsed sub-agent: one-line preview of the final answer. Reveals
+            the destination without forcing the user to tap. */}
+        {hasNest && !isOpen && resultPreview ? (
+          <Text numberOfLines={1} style={{ fontSize: 11, color: theme.color.inkTertiary }}>→ {resultPreview}{item.result && item.result.length > 140 ? '…' : ''}</Text>
+        ) : null}
       </View>
       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: hasCmd ? 2 : 0 }}>
+        {hasNest && stepLabel ? (
+          <View style={{ backgroundColor: theme.color.fillTertiary, borderRadius: 8, paddingHorizontal: 7, paddingVertical: 2 }}>
+            <Text style={{ fontSize: 10, fontWeight: '600', color: theme.color.inkTertiary }}>{stepLabel}</Text>
+          </View>
+        ) : null}
         {item.durMs != null && !running && !error ? <Text style={{ fontSize: 11, fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>{item.durMs < 1000 ? `${item.durMs}ms` : `${(item.durMs / 1000).toFixed(1)}s`}</Text> : null}
         {trailing}
+        {hasNest ? <Icon name={isOpen ? 'chevronDown' : 'chevronRight'} size={13} color={theme.color.inkTertiary} /> : null}
       </View>
+    </View>
+  );
+  if (!hasNest) return Row;
+  return (
+    <View>
+      <Pressable onPress={() => setExpanded(e => !e)} android_ripple={{ color: theme.color.fillTertiary }}>
+        {Row}
+      </Pressable>
+      {/* Sub-agent expansion: indent rail + nested transcript + a Response
+          block with the final text. Mirrors the ThinkingRow rail so the
+          nesting is visually unambiguous. */}
+      {isOpen ? (
+        <View style={{ marginLeft: 16, paddingLeft: 11, borderLeftWidth: 1.5, borderLeftColor: theme.color.purple + '3d', gap: 6, paddingTop: 4, paddingBottom: 4 }}>
+          {item.children && item.children.length > 0 ? <NestedTranscript items={item.children} /> : null}
+          {item.result && item.result.trim() ? (
+            <View style={{ marginTop: 4 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7, marginBottom: 6 }}>
+                <View style={{ width: 18, height: 18, borderRadius: 6, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.purple + '24' }}>
+                  <Icon name="check" size={11} color={theme.color.purple} stroke={2.6} />
+                </View>
+                <Text style={{ fontSize: 11, fontWeight: '600', letterSpacing: 0.6, textTransform: 'uppercase', color: theme.color.purple }}>Response</Text>
+              </View>
+              <View style={{ padding: 10, borderRadius: 10, backgroundColor: theme.color.purple + '0d', borderWidth: 0.5, borderColor: theme.color.purple + '2e' }}>
+                <Markdown text={item.result} color={theme.color.ink} size={13} />
+              </View>
+            </View>
+          ) : null}
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -399,9 +473,15 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
     && items.slice(0, finalIdx).some((t) => t.kind === 'tool' || t.kind === 'text' || t.kind === 'thinking');
   const [expanded, setExpanded] = useState(false);
 
+  // The LAST transcript item is the one currently growing — when the job is
+  // live, render it through `StreamingMarkdown` so streamed chunks reveal at a
+  // smooth, adaptive cadence (mirrors desktop's `StreamingBody`) instead of
+  // jolting into view in half-second bursts.
+  const lastIdx = items.length - 1;
+
   const renderItem = (it: TranscriptItem, i: number): React.ReactNode => {
     if (it.kind === 'tool') return <ToolRow key={i} item={it} />;
-    if (it.kind === 'thinking') return <ThinkingRow key={i} item={it} />;
+    if (it.kind === 'thinking') return <ThinkingRow key={i} item={it} live={live && i === lastIdx} />;
     if (it.kind === 'ask') return <QuestionCard key={i} ask={it.ask || it.text} onAnswer={onAnswer} answered={answered} />;
     if (it.kind === 'review') {
       const ok = it.verdict === 'approved';
@@ -421,6 +501,10 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
       );
     }
     if (it.text && it.text.trim()) {
+      // Live, growing text block → typewriter. Settled blocks render directly.
+      if (live && i === lastIdx) {
+        return <StreamingMarkdown key={i} text={it.text} live size={16} />;
+      }
       return <Markdown key={i} text={it.text.trim()} />;
     }
     return null;
@@ -459,7 +543,11 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
   } else if (job.error) {
     blocks.push(<Text key="err" style={{ fontSize: 15, lineHeight: 22, color: theme.color.red }}>{job.error}</Text>);
   } else if (job.output && job.output.trim()) {
-    blocks.push(<Markdown key="out" text={job.output.trim()} />);
+    blocks.push(
+      live
+        ? <StreamingMarkdown key="out" text={job.output} live />
+        : <Markdown key="out" text={job.output.trim()} />,
+    );
   } else if (live) {
     blocks.push(
       <View key="working" style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>

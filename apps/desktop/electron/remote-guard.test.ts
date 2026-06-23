@@ -10,7 +10,7 @@ describe('remote-guard', () => {
       'importGithubFromCli', 'getSessionGitStatus', 'refreshSessionGitStatus',
       'pushSession', 'createSessionPR', 'mergeSessionPR', 'resolveSession',
       'listDesignComments', 'addDesignComment', 'setDesignCommentStatus', 'deleteDesignComment',
-      'extensionStatus', 'extensionSetActive', 'copyDesignToCode',
+      'extensionStatus', 'extensionSetActive', 'extensionPath', 'extensionRevealFolder', 'copyDesignToCode',
       'addSkillToProject', 'removeSkillFromProject', 'scanConversations', 'importConversations',
       'feedbackCreateIssue',
       // WhatsApp chat content + control are Mac-local — never answer to a remote.

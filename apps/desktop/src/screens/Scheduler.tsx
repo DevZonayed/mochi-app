@@ -68,11 +68,20 @@ function buildWeek(): { weekDays: WeekDay[]; todayIdx: number; monday: Date } {
   return { weekDays, todayIdx, monday };
 }
 
-/* Auto-answer / auto-continue schedules are system-managed, transient one-shots
-   (a question countdown, a usage-limit resume) — they belong to the chat, not the
-   user's schedule calendar. The Scheduler only shows schedules the user owns. */
-function isUserSchedule(s: Schedule): boolean {
-  return s.kind !== 'auto-answer' && s.kind !== 'auto-continue';
+/* Calendar filter: auto-answer / auto-continue / keep-going are short-lived
+   one-shots (≤1 min from arming) — placing them in the week grid splatters
+   noise and they're usually gone by the time the user looks. They DO show up
+   in the LIST view below (so the user can see + cancel a live autopilot
+   countdown), but stay off the calendar grid. */
+function isCalendarSchedule(s: Schedule): boolean {
+  return s.kind !== 'auto-answer' && s.kind !== 'auto-continue' && s.kind !== 'keep-going';
+}
+/** True when a schedule is one of the AUTOPILOT followups (keep-going =
+    auto-continue on "want me to keep going?"; auto-answer = AskUserQuestion
+    timeout). These render in the list with a "System · countdown" badge so
+    the user can see the pending [Auto-continue] timer and cancel it. */
+function isFollowupSchedule(s: Schedule): boolean {
+  return s.kind === 'keep-going' || s.kind === 'auto-answer';
 }
 
 // 'HH:MM' → hour as a float (9.5 = 09:30); null when empty/unparseable.
@@ -116,7 +125,7 @@ function expandSchedules(schedules: Schedule[], monday: Date): CalOccurrence[] {
   const weekStart = monday.getTime();
   const weekEnd = weekStart + 7 * 24 * 60 * 60_000;
   schedules.forEach(s => {
-    if (!isUserSchedule(s)) return;          // hide system schedules from the calendar
+    if (!isCalendarSchedule(s)) return;       // hide short-lived autopilot followups from the calendar
     if (s.everyMinutes && s.everyMinutes > 0) return; // interval → shown in the list, not the clock grid
     // One-shot: place on its actual day, and only if it falls in the visible week.
     if (s.fireAt) {
@@ -262,6 +271,10 @@ interface SchedRow {
   cron: string;
   next: string;
   paused: boolean;
+  /** When set, render a "System" badge next to the name so the user knows
+      this is an autopilot followup (keep-going / auto-answer) not a manual
+      schedule they created. The user can still cancel it from this row. */
+  systemBadge?: 'autopilot' | 'autoanswer';
 }
 
 interface ScheduleRowProps { s: SchedRow; last: boolean; onPick: (s: SchedRow) => void; projMeta: ProjMeta; onToggle: (id: string, nextEnabled: boolean) => void; onDelete: (id: string) => void }
@@ -277,6 +290,14 @@ function ScheduleRow({ s, last, onPick, projMeta, onToggle, onDelete }: Schedule
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
         <span style={{ width: 9, height: 9, borderRadius: 5, background: p.color, flexShrink: 0 }} />
         <span style={{ font: '600 var(--fs-callout)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
+        {s.systemBadge && (
+          <span title={s.systemBadge === 'autopilot' ? 'Autopilot countdown — auto-continues your chat in ≤1 min' : 'AskUserQuestion countdown — auto-picks the recommended option'}
+            style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 4, height: 18, padding: '0 7px', borderRadius: 9,
+              background: 'color-mix(in srgb, var(--purple) 12%, transparent)', color: 'var(--purple)',
+              font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+            <Icon name={s.systemBadge === 'autopilot' ? 'bolt' : 'chat'} size={10} /> {s.systemBadge === 'autopilot' ? 'Autopilot' : 'Auto-answer'}
+          </span>
+        )}
       </div>
       <span style={{ font: '400 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink-secondary)' }}>{s.cron}</span>
       <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', whiteSpace: 'nowrap', color: paused ? 'var(--ink-tertiary)' : 'var(--ink)' }}>{s.next === '—' ? '—' : s.next.startsWith('in') ? s.next : `in ${s.next}`}</span>
@@ -819,16 +840,27 @@ export default function Scheduler() {
     return m;
   }, [projects]);
 
-  // adapt live schedules into the existing SchedRow shape the list renders
-  // (auto-answer / auto-continue are system-managed — hidden from the Scheduler)
-  const rows = React.useMemo<SchedRow[]>(() => schedules.filter(isUserSchedule).map(s => ({
-    id: s.id,
-    proj: s.projectId ?? '',
-    name: s.title,
-    cron: cronLine(s),
-    next: nextLine(s.nextRun),
-    paused: !s.enabled,
-  })), [schedules]);
+  // adapt live schedules into the existing SchedRow shape the list renders.
+  // Includes autopilot followups ('keep-going', 'auto-answer') so the operator
+  // can SEE and CANCEL a pending [Auto-continue] countdown — the previous
+  // behavior (filter them out) is what made the autopilot feel hidden and
+  // uncontrollable. They get a small "System" badge to distinguish from
+  // user-authored schedules. 'auto-continue' (the usage-limit-reset resume)
+  // stays filtered: the user can't usefully cancel a "continue when Claude's
+  // limit resets" — it'll just retry on next turn.
+  const rows = React.useMemo<SchedRow[]>(() => schedules
+    .filter(s => s.kind !== 'auto-continue')
+    .map(s => ({
+      id: s.id,
+      proj: s.projectId ?? '',
+      name: s.title,
+      cron: cronLine(s),
+      next: nextLine(s.nextRun ?? s.fireAt ?? null),
+      paused: !s.enabled,
+      systemBadge: s.kind === 'keep-going' ? 'autopilot' as const
+        : s.kind === 'auto-answer' ? 'autoanswer' as const
+        : undefined,
+    })), [schedules]);
 
   const onToggle = React.useCallback(async (id: string, nextEnabled: boolean) => {
     setSchedules(prev => prev.map(s => s.id === id ? { ...s, enabled: nextEnabled } : s));

@@ -90,9 +90,11 @@ const PAGE_CSS = `
   .tool-node { animation: nodePop 240ms cubic-bezier(.32,.72,0,1) both; transition: background 140ms ease; }
   .tool-node:hover { background: var(--fill-tertiary); }
 
-  /* "thinking" shimmer text before the first token */
+  /* "thinking" shimmer text before the first token —
+     low stop bumped from --ink-secondary (60% opacity) to ~78% so the dimmest
+     part of the sweep stays clearly readable on dark AND light backgrounds. */
   @keyframes thinkSweep { to { background-position: -200% 0; } }
-  .think-shimmer { background: linear-gradient(100deg, var(--ink-secondary) 32%, var(--ink) 50%, var(--ink-secondary) 68%);
+  .think-shimmer { background: linear-gradient(100deg, color-mix(in srgb, var(--ink) 78%, transparent) 32%, var(--ink) 50%, color-mix(in srgb, var(--ink) 78%, transparent) 68%);
     background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
     animation: thinkSweep 1.5s linear infinite; }
 
@@ -1669,21 +1671,28 @@ function InlineAttach({ path, images, files }: { path: string; images?: ChatImag
     tokenized into inline chips/thumbnails at the exact position the user
     dropped them in the composer. Images that aren't referenced inline (legacy
     jobs before this change persisted markers in the input) fall back to a row
-    above the bubble so nothing disappears. */
+    above the bubble so nothing disappears.
+    Each string segment between chips is run through `renderInline` so
+    `**bold**` and `` `code` `` render properly — the user reported that
+    auto-continue prompts (and their own typed messages) were showing literal
+    `**` stars in the bubble (image_kpijo.png / image_6f4zy.png). */
 function UserBubble({ text, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
-  // Split the text into [string, attachment, string, attachment, …] tokens.
+  // Split the text into [string, attachment, string, attachment, …] tokens,
+  // then run each plain-text segment through the inline-markdown renderer
+  // (same one the agent bubble uses, so the formatting is symmetric).
   const nodes = React.useMemo(() => {
     if (!text) return [] as React.ReactNode[];
     const out: React.ReactNode[] = [];
     let last = 0; let i = 0;
     ATTACH_INLINE_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
+    const pushString = (s: string) => { if (s) out.push(...renderInline(s, `ub${i++}`)); };
     while ((m = ATTACH_INLINE_RE.exec(text)) !== null) {
-      if (m.index > last) out.push(text.slice(last, m.index));
+      if (m.index > last) pushString(text.slice(last, m.index));
       out.push(<InlineAttach key={`a${i++}`} path={m[1]} images={images} files={files} />);
       last = m.index + m[0].length;
     }
-    if (last < text.length) out.push(text.slice(last));
+    if (last < text.length) pushString(text.slice(last));
     return out;
   }, [text, images, files]);
 
@@ -2145,11 +2154,13 @@ function BgTasksPanel({ tasks, onStop }: { tasks: BgTask[]; onStop: (id: string)
         <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 300, overflowY: 'auto' }}>
           {shown.map(t => (
             <div key={t.id} style={{ borderBottom: '0.5px solid var(--separator)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 12px' }}>
+              {/* minWidth:0 on the row + overflow:hidden on the middle button ensure the long command
+                  text truncates with an ellipsis instead of pushing the Stop button off the right edge. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 12px', minWidth: 0 }}>
                 <span className={t.status === 'running' ? 'breathe' : undefined} style={{ width: 7, height: 7, borderRadius: 4, background: dot(t.status), flexShrink: 0 }} />
-                <button onClick={() => setOpen(o => o === t.id ? null : t.id)} title="Show logs" style={{ flex: 1, minWidth: 0, textAlign: 'left', background: 'transparent', cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 2 }}>
-                  <span style={{ font: '600 var(--fs-caption)/1.2 var(--font-mono, ui-monospace)', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.command}</span>
-                  <span style={{ font: '500 11px/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{t.status}{t.pid != null ? ` · pid ${t.pid}` : ''}{t.exitCode != null ? ` · exit ${t.exitCode}` : ''}</span>
+                <button onClick={() => setOpen(o => o === t.id ? null : t.id)} title="Show logs" style={{ flex: '1 1 0', minWidth: 0, width: 0, overflow: 'hidden', textAlign: 'left', background: 'transparent', cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ display: 'block', width: '100%', font: '600 var(--fs-caption)/1.2 var(--font-mono, ui-monospace)', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.command}</span>
+                  <span style={{ display: 'block', width: '100%', font: '500 11px/1 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.status}{t.pid != null ? ` · pid ${t.pid}` : ''}{t.exitCode != null ? ` · exit ${t.exitCode}` : ''}</span>
                 </button>
                 {t.status === 'running' && (
                   <button onClick={() => onStop(t.id)} title="Stop this task" style={{ height: 26, padding: '0 11px', borderRadius: 7, border: '0.5px solid var(--separator)', background: 'var(--fill-secondary)', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer', flexShrink: 0 }}>Stop</button>
@@ -2697,6 +2708,34 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     }
   }, []);
   const [activeId, setActiveId] = React.useState<string | null>(sessionId);
+  // Active ChatSession (autopilot / reviewer-enabled toggles read off this).
+  // useSession live-syncs via the 'session' event emitter, so a setSessionAutopilot
+  // call from another window updates the button state here too.
+  const activeSession = useSession(activeId, projectId);
+  const autoPilotOn = activeSession?.autoPilot === true;
+  const reviewerToggleOn = activeSession?.reviewerEnabled === true;
+  // Local optimistic state so the button flips instantly when clicked, even
+  // before the api.setSession* round-trip lands. Reconciles with the session
+  // hook on the next emit.
+  const [autoPilotLocal, setAutoPilotLocal] = React.useState<boolean | null>(null);
+  const [reviewerLocal, setReviewerLocal] = React.useState<boolean | null>(null);
+  React.useEffect(() => { setAutoPilotLocal(null); setReviewerLocal(null); }, [activeId]);
+  const autoPilotEffective = autoPilotLocal ?? autoPilotOn;
+  const reviewerEffective = reviewerLocal ?? reviewerToggleOn;
+  const toggleAutoPilot = React.useCallback(async () => {
+    if (!activeId) return;
+    const next = !autoPilotEffective;
+    setAutoPilotLocal(next);
+    try { await api.setSessionAutopilot(activeId, next); }
+    catch { setAutoPilotLocal(!next); /* revert on failure */ }
+  }, [activeId, autoPilotEffective]);
+  const toggleReviewer = React.useCallback(async () => {
+    if (!activeId) return;
+    const next = !reviewerEffective;
+    setReviewerLocal(next);
+    try { await api.setSessionReviewer(activeId, next); }
+    catch { setReviewerLocal(!next); /* revert on failure */ }
+  }, [activeId, reviewerEffective]);
   const [text, setText] = React.useState('');
   // Primary (coding) + reviewer model. Remembered across the app via localStorage;
   // seeded from the workspace role defaults when the user hasn't chosen yet.
@@ -3433,6 +3472,33 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   color: goalMode ? 'var(--purple)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                 <Icon name="target" size={14} /> {primaryProvider === 'codex' ? 'Pursue goal' : 'Goal'}
               </button>
+              {/* Autopilot — per-chat opt-in. ON = engine runs a Sonnet judgment after
+                  every turn and arms a 1-min [Auto-continue] followup when the agent
+                  ended on a continuation cue. A genuine user reply cancels any pending
+                  followup. The pending countdown is visible + cancellable in the
+                  Scheduler. Off by default. */}
+              <button onClick={toggleAutoPilot} disabled={!activeId}
+                title={!activeId ? 'Send a message to enable autopilot for this chat' : autoPilotEffective ? 'Autopilot ON for this chat — auto-continues in 1 min when the agent offers to keep going. Click to disable.' : 'Autopilot OFF — turn on to auto-continue this chat when the agent ends on "want me to keep going?"'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9,
+                  cursor: activeId ? 'pointer' : 'default', opacity: activeId ? 1 : 0.5,
+                  background: autoPilotEffective ? 'color-mix(in srgb, var(--green) 14%, transparent)' : 'var(--fill-secondary)',
+                  border: autoPilotEffective ? '1px solid color-mix(in srgb, var(--green) 45%, transparent)' : '1px solid transparent',
+                  color: autoPilotEffective ? 'var(--green)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                <Icon name="bolt" size={14} /> Autopilot
+              </button>
+              {/* Reviewer — per-chat opt-in. ON = the reviewer engine runs after
+                  EVERY assistant turn (not only on file-writing turns, which was
+                  the silent-skip bug). The reviewer-model popover next to this
+                  picks WHICH engine reviews. Off by default. */}
+              <button onClick={toggleReviewer} disabled={!activeId}
+                title={!activeId ? 'Send a message to enable reviewer for this chat' : reviewerEffective ? 'Reviewer ON for this chat — every turn gets reviewed. Click to disable.' : 'Reviewer OFF — turn on to review every assistant turn (picks the engine via the sliders popover).'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9,
+                  cursor: activeId ? 'pointer' : 'default', opacity: activeId ? 1 : 0.5,
+                  background: reviewerEffective ? 'color-mix(in srgb, var(--orange) 14%, transparent)' : 'var(--fill-secondary)',
+                  border: reviewerEffective ? '1px solid color-mix(in srgb, var(--orange) 45%, transparent)' : '1px solid transparent',
+                  color: reviewerEffective ? 'var(--orange)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                <Icon name="checkCircle" size={14} /> Review
+              </button>
               <span style={{ width: 1, height: 18, background: 'var(--separator)', margin: '0 1px' }} />
               {/* schedule THIS message — pick a date/time; it fires into the chat then */}
               <div style={{ position: 'relative' }}>
@@ -3469,7 +3535,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               {schedNote && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)', display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}><Icon name="check" size={12} /> {schedNote}</span>}
               <span style={{ flex: 1, minWidth: 6 }} />
               {streaming
-                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>
+                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap' }}>
                     <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn ? liveActivity(lastTurn, lastTurn.transcript ?? []) : 'Working…'}
                   </span>
                 : lastTurnPaused

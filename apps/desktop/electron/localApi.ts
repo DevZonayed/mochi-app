@@ -27,7 +27,8 @@ import { scanConversations, parseConversation, type ConvSource } from './convers
 import { existsSync, mkdirSync, cpSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
-import { app } from 'electron';
+import { app, shell } from 'electron';
+import { locateExtension } from './extension-locator.js';
 
 type Params = Record<string, unknown>;
 
@@ -203,6 +204,34 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!b) bad('extension channel unavailable', 503);
         return b!.setActiveFromApp(String(p.clientId ?? ''));
       }
+      // Where does the bundled Chrome extension live on this machine? Powers the
+      // Settings → "Browser extension" panel: shows the path + the "Reveal folder
+      // (for Load Unpacked)" button when no profile is paired yet.
+      case 'extensionPath': {
+        // app.isPackaged + process.resourcesPath are both Electron-only — they're
+        // undefined under vitest. extension-locator handles both safely.
+        const loc = locateExtension({
+          resourcesPath: app?.isPackaged ? process.resourcesPath : undefined,
+          callerDir: __dirname,
+        });
+        return loc;
+      }
+      // Open the bundled extension folder in Finder/Explorer so the user can drag
+      // it into chrome://extensions → Load Unpacked. Returns the path that was
+      // revealed (or null if the extension wasn't shipped with this build).
+      case 'extensionRevealFolder': {
+        const loc = locateExtension({
+          resourcesPath: app?.isPackaged ? process.resourcesPath : undefined,
+          callerDir: __dirname,
+        });
+        if (!loc.path) bad('extension folder not shipped with this build', 404);
+        if (!loc.manifestPresent) bad(`extension manifest missing at ${loc.path}`, 500);
+        // openPath opens a folder in the OS file manager. (showItemInFolder would
+        // also work but on macOS it selects the folder in its parent — we want the
+        // folder itself opened so the user can grab it for Load Unpacked.)
+        try { void shell.openPath(loc.path!); } catch { /* user can still type the path */ }
+        return { path: loc.path, source: loc.source };
+      }
       // Hand off a design to code: COPY the design's folder (design/index.html +
       // assets + .continuum memory) into a NEW coding project so the design lives
       // in BOTH the Design tab and the CodeSpace. The coding agent then scaffolds
@@ -363,6 +392,20 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'archiveSession': {
         const s = store.setSessionArchived(String(p.id ?? ''), p.archived === true);
+        emit('session', s);
+        return s;
+      }
+      // Per-chat autopilot + reviewer toggles. Independent on/off booleans
+      // wired to the composer's two new toggle buttons. Both default OFF —
+      // operator opts in explicitly per chat (was always-on for legacy chats
+      // which produced too-eager auto-continues and silent reviewer skips).
+      case 'setSessionAutopilot': {
+        const s = store.updateSession(String(p.id ?? ''), { autoPilot: p.enabled === true });
+        emit('session', s);
+        return s;
+      }
+      case 'setSessionReviewer': {
+        const s = store.updateSession(String(p.id ?? ''), { reviewerEnabled: p.enabled === true });
         emit('session', s);
         return s;
       }
@@ -608,10 +651,32 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // A real user-initiated turn lands → the keep-going auto-continue
         // streak for this session resets (image_0ss8f.png: a real reply means
         // the agent isn't stuck spinning anymore, so the next stall starts
-        // fresh from attempt 1 instead of carrying yesterday's count).
+        // fresh from attempt 1 instead of carrying yesterday's count). AND
+        // any PENDING keep-going schedule is disabled, so the queued
+        // auto-continue doesn't fire on top of this fresh reply (image_su2cf.png:
+        // a "Continue please" landed and the keep-going schedule STILL fired
+        // 5 minutes later — the counter reset alone wasn't enough).
         // Auto-continue and retry-run jobs go through engine.run directly via
         // the cron, NOT sendChat, so this only fires on genuine user messages.
-        try { store.resetKeepGoingCounter(session.id); } catch { /* best-effort */ }
+        try {
+          store.resetKeepGoingCounter(session.id);
+          // CANCEL every pending autopilot followup for this session — fixes
+          // the "fires again unnecessarily" bug (image_su2cf.png): a
+          // [Auto-continue]: countdown that was armed BEFORE the user typed
+          // must not fire AFTER the user replied. Resetting the counter alone
+          // wasn't enough; the schedule row stayed live and fired ~5 min later.
+          // Now we disable BOTH 'keep-going' and 'auto-answer' rows so the
+          // user's real message is the authoritative signal. (Broader than the
+          // earlier cancelKeepGoingForSession — covers the AskUserQuestion
+          // auto-answer too, since both share the same followup lifecycle.)
+          const cancelled = store.cancelPendingFollowups(session.id);
+          // Emit the now-disabled rows so any live schedule-queue UI prunes
+          // them immediately (same shape the cron uses when it fires + disables).
+          for (const id of cancelled) {
+            const sch = store.listSchedules().find((x) => x.id === id);
+            if (sch) emit('schedule', sch);
+          }
+        } catch { /* best-effort */ }
         // Fire the run async — the reply streams in over job events.
         void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true, browser: p.browser === true });
         return { session, job };

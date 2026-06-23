@@ -79,6 +79,21 @@ export interface TranscriptItem {
   preview?: string;
   /** ask only: JSON of the AskUserQuestion input ({ questions:[{question,header,options,multiSelect}] }). */
   ask?: string;
+  /** tool only: the SDK's tool_use_id — used to route nested sub-agent events
+      (Task/Agent dispatches) back to this chip so the UI can expand to show
+      the sub-agent's own transcript. */
+  id?: string;
+  /** tool only (sub-agent calls — Task/Agent): the sub-agent's own transcript
+      — its tool calls, thinking, and prose — captured live from events tagged
+      with `parent_tool_use_id`. Renders inside an expandable section under the
+      parent chip so the operator can SEE what the sub-agent did instead of
+      staring at a duration + checkmark. Capped at 60 nested items per parent. */
+  children?: TranscriptItem[];
+  /** tool only (sub-agent calls): the sub-agent's FINAL text response,
+      unpacked from the tool_result content so the parent chip can preview the
+      answer ("→ <first 240 chars>…") without expanding. The full text shows
+      when expanded. */
+  result?: string;
   /** image only: the Asset id this image was registered as (resolved to bytes on the Mac via the maestro:assetImage IPC — never sent to the relay). */
   assetId?: string;
   /** image only: absolute local path on this Mac (used for reveal-in-Finder/copy; STRIPPED from the relay snapshot). */
@@ -189,6 +204,20 @@ export interface ChatSession {
   importedFrom?: 'claude' | 'codex' | 'conductor';
   /** Source-side conversation id; dedupes re-imports of the same conversation. */
   externalId?: string;
+  /** OPT-IN per-chat: enable the autopilot mechanism for THIS chat. When true,
+      the engine runs a Sonnet judgment after every turn — if the agent ended
+      on a continuation cue (or didn't get the human input it asked for), it
+      schedules a 1-minute followup ('keep-going' or 'auto-answer') that fires
+      "[Auto-continue]: …" / "[User answered AskUserQuestion]: …" into the session.
+      Default OFF — a genuine user message ALWAYS cancels the pending followup.
+      The toggle button lives in the composer header. */
+  autoPilot?: boolean;
+  /** OPT-IN per-chat: run the reviewer engine on EVERY turn (independent of
+      whether files changed). This is the master switch for the per-turn
+      review pass; the `reviewer` field above still picks WHICH engine/model
+      reviews. Default OFF — the silent "only review when files changed"
+      heuristic was confusing operators. The toggle lives next to autopilot. */
+  reviewerEnabled?: boolean;
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
@@ -247,6 +276,70 @@ export interface Schedule {
       intended slot timestamp of the last fire (dedupe key); lastFireLate marks
       that the last fire was a catch-up (drives the "ran late" notice). */
   catchUp?: boolean; catchUpWindowMs?: number; lastDueAt?: number; lastFireLate?: boolean;
+}
+
+/** A background "watch" the agent places on the active browser tab: evaluate
+    `condition` (a JS expression returning a boolean) every `intervalMs` and,
+    when it first becomes true, post `message` (and optional context) as a NEW
+    turn into the originating chat — starting a fresh agent turn that has the
+    full session memory + tools.
+
+    Survives:
+      - the agent's current turn ending (the watcher lives on the desktop, not
+        in the model loop)
+      - the desktop restarting (persisted in the store; resumed on boot)
+      - the active extension profile dropping briefly (the watcher pauses the
+        evaluation step, doesn't expire, picks back up when a profile returns)
+
+    Hard-bounded by `expiresAt` so a forgotten watch never runs forever.
+    `repeat:false` (default) auto-cancels after the first fire so the agent
+    doesn't get N identical notifications. `repeat:true` keeps watching and
+    fires every time the condition transitions false→true. */
+export interface BrowserWatch {
+  id: string;
+  projectId: string;
+  sessionId: string;
+  /** Human label shown in UI + included in the fire-message. */
+  title: string;
+  /** A JS expression evaluated in the page via CDP Runtime.evaluate. Must return
+      a truthy/falsy value (or a Promise resolving to one — `awaitPromise:true`). */
+  condition: string;
+  /** Optional one-line note from the agent — surfaced in the chat when the
+      condition fires, so the next-turn agent knows what to do about it. */
+  message?: string;
+  intervalMs: number;
+  /** Absolute deadline. The watcher auto-cancels at this timestamp regardless of
+      whether the condition ever fired. */
+  expiresAt: number;
+  /** When false (default), the watch auto-cancels after the first fire. When
+      true, the watcher keeps polling and fires again every time the result
+      transitions from false→true (it does NOT spam while the condition stays true). */
+  repeat: boolean;
+  createdAt: number;
+  /** ── runtime state (mutated each tick, persisted lazily) ── */
+  /** False once the watcher cancels (expired, fired-once-non-repeat, or
+      explicitly cancelled). Keeps the row around for the UI history list. */
+  active: boolean;
+  /** Wall-clock ms at the last eval; null until the first tick. */
+  lastEvalAt?: number;
+  /** Last raw evaluation result (for the UI: agent can see 'no-browser' vs.
+      'error' vs. 'false' to debug a stuck watch). */
+  lastResult?: 'true' | 'false' | 'error' | 'no-browser';
+  /** Last error string (when lastResult==='error'). */
+  lastError?: string;
+  /** How many times the condition has fired. For repeat:false watches this is
+      always 0 or 1. */
+  fireCount: number;
+  /** Wall-clock ms of the most recent fire; null until the first fire. */
+  lastFiredAt?: number;
+  /** Job id of the last fire's posted chat message (so the UI can deep-link
+      from the watch row back to the message that opened the new turn). */
+  lastJobId?: string;
+  /** Edge-detection state: the previous result, so repeat:true only fires on a
+      false→true transition (not every poll while the condition is still true). */
+  lastWasTrue?: boolean;
+  /** Cancellation cause shown in the UI history. */
+  cancelReason?: 'manual' | 'expired' | 'fired-once' | 'invalid-condition';
 }
 
 export type EngineId = 'claude' | 'codex';
@@ -503,6 +596,10 @@ interface StoreData {
   sessions: ChatSession[];
   approvals: Approval[];
   schedules: Schedule[];
+  /** Agent-placed browser watches (background poll of a CSS selector / JS
+      condition that posts a NEW chat message when the criteria becomes true).
+      See BrowserWatch + browser-watch.ts. Mac-local; not relayed. */
+  browserWatches?: BrowserWatch[];
   skills: Skill[];
   templates: Template[];
   assets: Asset[];
@@ -693,6 +790,7 @@ export class Store {
       if (!this.data.briefs) { this.data.briefs = []; dirty = true; }
       if (!this.data.researchRuns) { this.data.researchRuns = []; dirty = true; }
       if (!this.data.events) { this.data.events = []; dirty = true; }
+      if (!this.data.browserWatches) { this.data.browserWatches = []; dirty = true; }
       if (!this.data.tombstones) { this.data.tombstones = []; dirty = true; }
       // Backfill `updatedAt` on entities written by an older build (delta-sync
       // protocol needs it on every row, but it's been added incrementally).
@@ -747,7 +845,7 @@ export class Store {
         deckId: id(), deckSecret: id(), accessToken: newPairingToken(), extensionToken: newPairingToken(),
         routing: { ...DEFAULT_ROUTING }, settings: { ...DEFAULT_SETTINGS }, catalogVersion: CATALOG_VERSION,
         workspace: null,
-        projects: [], jobs: [], sessions: [], approvals: [], schedules: [], skills: [], templates: [],
+        projects: [], jobs: [], sessions: [], approvals: [], schedules: [], browserWatches: [], skills: [], templates: [],
         assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
         tombstones: [],
         chatBindings: [], pendingChats: [], commEvents: [], feedback: [],
@@ -1021,7 +1119,7 @@ export class Store {
     this.data.sessions.push(s); this.save();
     return s;
   }
-  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt' | 'codename' | 'branchRenamedAt'>>): ChatSession {
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt' | 'codename' | 'branchRenamedAt' | 'autoPilot' | 'reviewerEnabled'>>): ChatSession {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     Object.assign(s, patch, { updatedAt: now() });
@@ -1397,11 +1495,44 @@ export class Store {
       this.save();
     }
   }
+  /** Cancel every pending autopilot followup ('keep-going' or 'auto-answer')
+      for a session — called from sendChat the instant a genuine user message
+      lands. The bug this fixes (image_autopilot.png in spirit): the engine
+      armed a 5-min "[Auto-continue]:" countdown when the agent ended on
+      "ready when you are", then the user typed a real reply, but the
+      countdown ALSO fired afterwards because resetKeepGoingCounter only
+      zeroed the streak counter and left the schedule armed. Now we disable
+      every live followup row so a real reply is the authoritative signal.
+      Returns the IDs of the schedules that were disabled so the caller can
+      emit `schedule` events for the UI. */
+  cancelPendingFollowups(sessionId: string): string[] {
+    const now = Date.now();
+    const ids: string[] = [];
+    for (const s of this.data.schedules) {
+      if (s.sessionId !== sessionId) continue;
+      if (s.kind !== 'keep-going' && s.kind !== 'auto-answer') continue;
+      if (s.enabled === false) continue;
+      // Only cancel rows that haven't fired yet — a one-shot that already
+      // ran is a no-op anyway, but skipping it keeps the audit clean.
+      if (typeof s.fireAt === 'number' && s.fireAt <= now && s.lastRun) continue;
+      s.enabled = false;
+      // Clear nextRun so the schedule-queue UI shows "—" for the next-run
+      // column on a cancelled row, not a stale future timestamp.
+      s.nextRun = null;
+      ids.push(s.id);
+    }
+    if (ids.length) this.save();
+    return ids;
+  }
   /** Current consecutive-auto-continue count for a session (used by the UI
       to show "Auto-continue 3/20" on the schedule chip). */
   keepGoingCountFor(sessionId: string): number {
     return this.data.keepGoingCounters?.[sessionId] ?? 0;
   }
+  // cancelKeepGoingForSession was removed in the autopilot redesign — its
+  // narrower scope (keep-going only) is subsumed by cancelPendingFollowups
+  // above, which also handles 'auto-answer' (the AskUserQuestion countdown
+  // shares the same followup lifecycle and should cancel on a real reply too).
   /** Idempotent "retry this failed run on exponential backoff" — one PENDING
    *  retry schedule per session (or per one-off jobId). On every arming the
    *  counter bumps; on every job SUCCESS for the same key the counter resets,
@@ -1488,6 +1619,14 @@ export class Store {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (s) { s.enabled = enabled; this.save(); }
   }
+  /** Snapshot of the chat session associated with a pending followup row
+      (so the Scheduler UI can show the chat title alongside a 'keep-going' /
+      'auto-answer' row). Returns undefined when no session is linked. */
+  getSessionForSchedule(scheduleId: string): ChatSession | undefined {
+    const s = this.data.schedules.find(x => x.id === scheduleId);
+    if (!s?.sessionId) return undefined;
+    return this.getSession(s.sessionId);
+  }
   markScheduleRun(scheduleId: string, ts: number, nextRun: number | null, opts?: { dueAt?: number; late?: boolean }): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (s) {
@@ -1536,6 +1675,63 @@ export class Store {
     this.save();
   }
 
+  // ── Browser watches (background "observe an element / condition") ───
+  /** Active + history rows, newest first. Pass `activeOnly` to filter. */
+  listBrowserWatches(opts?: { activeOnly?: boolean; sessionId?: string; projectId?: string }): BrowserWatch[] {
+    const arr = this.data.browserWatches ?? [];
+    let out = [...arr].sort((a, b) => b.createdAt - a.createdAt);
+    if (opts?.activeOnly) out = out.filter(w => w.active);
+    if (opts?.sessionId) out = out.filter(w => w.sessionId === opts.sessionId);
+    if (opts?.projectId) out = out.filter(w => w.projectId === opts.projectId);
+    return out;
+  }
+  createBrowserWatch(input: {
+    projectId: string; sessionId: string; title: string;
+    condition: string; message?: string;
+    intervalMs: number; expiresAt: number; repeat?: boolean;
+  }): BrowserWatch {
+    if (!this.data.browserWatches) this.data.browserWatches = [];
+    const rec: BrowserWatch = {
+      id: id(), projectId: input.projectId, sessionId: input.sessionId,
+      title: input.title, condition: input.condition,
+      ...(input.message ? { message: input.message } : {}),
+      intervalMs: input.intervalMs, expiresAt: input.expiresAt,
+      repeat: !!input.repeat,
+      createdAt: now(), active: true, fireCount: 0,
+    };
+    this.data.browserWatches.push(rec);
+    this.save();
+    return rec;
+  }
+  /** Patch a watch's runtime state (lastEvalAt/lastResult/lastError/fireCount/
+      lastFiredAt/lastJobId/lastWasTrue/active/cancelReason). */
+  updateBrowserWatch(watchId: string, patch: Partial<Pick<BrowserWatch,
+    'active' | 'lastEvalAt' | 'lastResult' | 'lastError' | 'fireCount'
+    | 'lastFiredAt' | 'lastJobId' | 'lastWasTrue' | 'cancelReason'>>): BrowserWatch {
+    const w = (this.data.browserWatches ?? []).find(x => x.id === watchId);
+    if (!w) throw Object.assign(new Error('browser watch not found'), { statusCode: 404 });
+    Object.assign(w, patch);
+    this.save();
+    return w;
+  }
+  /** Cancel a watch (marks inactive + records the cause). Idempotent. */
+  cancelBrowserWatch(watchId: string, reason: BrowserWatch['cancelReason'] = 'manual'): BrowserWatch | null {
+    const w = (this.data.browserWatches ?? []).find(x => x.id === watchId);
+    if (!w) return null;
+    if (w.active) { w.active = false; w.cancelReason = reason; this.save(); }
+    return w;
+  }
+  /** Hard-delete a watch (UI "clear from history"). Returns true if a row was removed. */
+  removeBrowserWatch(watchId: string): boolean {
+    const arr = this.data.browserWatches;
+    if (!arr) return false;
+    const i = arr.findIndex(x => x.id === watchId);
+    if (i < 0) return false;
+    arr.splice(i, 1);
+    this.save();
+    return true;
+  }
+
   // ── Skills / Templates ─────────────────────────────────────────────
   listSkills(): Skill[] { return [...this.data.skills].sort((a, b) => (a.category + a.name).localeCompare(b.category + b.name)); }
   toggleSkill(skillId: string): Skill | undefined {
@@ -1582,10 +1778,25 @@ export class Store {
     const slimItem = (t: TranscriptItem): TranscriptItem => {
       if (t.kind === 'image') { const { imagePath: _omit, ...rest } = t; return rest; }
       const text = scrub(t.text.length > 4000 ? t.text.slice(0, 4000) + '…' : t.text);
-      return text === t.text ? t : { ...t, text };
+      // Sub-agent children: cap the array (a chatty Plan agent can run dozens
+      // of nested tool steps) AND cap each child's text the same way as a
+      // top-level item, so the relay payload stays bounded. The phone can
+      // still read the parent's `result` for the final answer.
+      const kids = t.children;
+      const slimKids = !kids ? undefined
+        : (kids.length <= 60 && !kids.some(k => k.text.length > 4000 || k.kind === 'image' || k.text.includes('@/'))) ? kids
+        : kids.slice(-60).map(slimItem);
+      // Final-response preview cap (the FULL response still lives on the Mac;
+      // 8 KB is plenty for an expanded mobile sheet without ballooning SSE frames).
+      const slimResult = t.result && t.result.length > 8000 ? t.result.slice(0, 8000) + '…' : t.result;
+      const textChanged = text !== t.text;
+      const kidsChanged = slimKids !== kids;
+      const resultChanged = slimResult !== t.result;
+      if (!textChanged && !kidsChanged && !resultChanged) return t;
+      return { ...t, ...(textChanged ? { text } : {}), ...(kidsChanged ? { children: slimKids } : {}), ...(resultChanged ? { result: slimResult } : {}) };
     };
     const transcript = !tr ? undefined
-      : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image' || t.text.includes('@/'))) ? tr
+      : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image' || t.text.includes('@/') || (t.children && t.children.length > 0) || (t.result && t.result.length > 8000))) ? tr
       : tr.slice(-60).map(slimItem);
     const needsImgStrip = j.inputImages?.some(im => im.imagePath !== undefined);
     const inputImages = needsImgStrip ? j.inputImages!.map(({ imagePath: _omit, ...rest }) => rest as ChatImage) : j.inputImages;
