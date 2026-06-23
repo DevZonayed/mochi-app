@@ -78,6 +78,22 @@ export interface PrConfirmRequest {
   preview: MergePreview | ResolvePreview;
 }
 
+/* ── Conflict hunks (T8) — renderer mirror of electron/git.ts ConflictHunk ── */
+export interface ConflictHunk {
+  startLine: number;
+  endLine: number;
+  oursLabel: string;
+  theirsLabel: string;
+  ours: string[];
+  base?: string[];
+  theirs: string[];
+}
+export interface ConflictFile {
+  path: string;
+  hunks: ConflictHunk[];
+  unreadable?: boolean;
+}
+
 /* ── Codename / state helpers — pure, shared by every UI surface ───────── */
 
 /** Display-friendly codename: `lyon` → `Lyon`, `chiang-mai` → `Chiang Mai`. */

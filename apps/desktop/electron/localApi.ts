@@ -602,6 +602,14 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
         return gitService.previewResolveSession(s);
       }
+      // T8 — read-only conflict hunk extraction for the AI-resolve dialog.
+      // Pure: no merge, no commit, no push; just parses the worktree's
+      // current `<<<<<<< / >>>>>>>` blocks. Renderer-facing.
+      case 'getConflictHunks': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.getConflictHunks(s);
+      }
       // Manual one-shot of the auto-rename hook (testing + a future "rename
       // branch now" button in the chat header).
       case 'renameSessionBranch': {
