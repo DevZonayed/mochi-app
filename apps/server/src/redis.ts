@@ -31,6 +31,19 @@ export const getSnapshot = async (hostId: string): Promise<unknown> => {
   return v ? JSON.parse(v) : null;
 };
 
+/* ── Set primitives (used by push token store) ────────────────────────── */
+export const sAdd = (key: string, member: string): Promise<number> => main.sadd(key, member);
+export const sRem = (key: string, member: string): Promise<number> => main.srem(key, member);
+export const sMembers = (key: string): Promise<string[]> => main.smembers(key);
+export const sCard = (key: string): Promise<number> => main.scard(key);
+
+/** Set a key ONLY if it doesn't exist (atomic cross-instance dedupe). Returns
+    true on first-write, false when the key was already present. */
+export async function setNxEx(key: string, value: string, ttlSec: number): Promise<boolean> {
+  const r = await main.set(key, value, 'EX', ttlSec, 'NX');
+  return r === 'OK';
+}
+
 export const publish = (channel: string, msg: unknown): Promise<number> =>
   pub.publish(channel, JSON.stringify(msg));
 

@@ -14,6 +14,7 @@ import { forwardCommand } from './routing.js';
 import { routeSignal, turnCredentials } from './webrtc.js';
 import { registerHostWs } from './wsHost.js';
 import { registerRemoteWs } from './wsRemote.js';
+import { addPushToken, removePushToken } from './push.js';
 
 /** Run all migrations (device + Better Auth). Call before listen(). */
 export async function migrateAll(): Promise<void> {
@@ -64,6 +65,24 @@ export function buildAccountServer(): FastifyInstance {
     const { toDeviceId, signal } = (req.body ?? {}) as { toDeviceId?: string; signal?: unknown };
     await routeSignal(userId, deviceIdOf(req) ?? '', toDeviceId ?? '', signal);
     return { ok: true };
+  });
+
+  // ── Expo push registration ────────────────────────────────────────────
+  // The phone POSTs its Expo push token here at launch + on foreground; we
+  // mirror the host's alert-worthy events into Expo so a CLOSED app still
+  // gets an OS notification. Account-scoped: only the user's own Macs can
+  // cause their own phones to buzz. See push.ts for the full rationale.
+  app.post('/api/push/register', async (req) => {
+    const userId = (req as ReqWithUser).userId as string;
+    const { token } = (req.body ?? {}) as { token?: string };
+    const devices = await addPushToken(userId, token ?? '');
+    return { ok: true, devices };
+  });
+  app.post('/api/push/unregister', async (req) => {
+    const userId = (req as ReqWithUser).userId as string;
+    const { token } = (req.body ?? {}) as { token?: string };
+    const devices = await removePushToken(userId, token ?? '');
+    return { ok: true, devices };
   });
 
   // Generic account-scoped command forward. The legacy /api/jobs|projects|… routes

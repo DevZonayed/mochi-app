@@ -12,6 +12,7 @@ import { upsertDevice } from './accountDevices.js';
 import { markOnline, markOffline, setSnapshot, subscribe } from './redis.js';
 import { submitResult, publishEvent } from './routing.js';
 import { routeSignal } from './webrtc.js';
+import { maybePush } from './push.js';
 
 interface HostMsg {
   type?: string; deckId?: string; name?: string; platform?: string;
@@ -50,7 +51,14 @@ export function registerHostWs(app: FastifyInstance): void {
       const id = deviceId as string;
       if (m.type === 'hello') { void onHello(m); return; }
       if (m.type === 'state') { void setSnapshot(id, m.state); void markOnline(id); return; }
-      if (m.type === 'event' && m.eventName) { publishEvent(id, m.eventName, m.data); return; }
+      if (m.type === 'event' && m.eventName) {
+        publishEvent(id, m.eventName, m.data);
+        // Mirror alert-worthy events (job:done/failed, approval, schedule-late)
+        // into Expo push so a CLOSED phone gets an OS notification — SSE only
+        // reaches a running app. Best-effort; never blocks the WS handler.
+        void maybePush(userId as string, id, m.eventName, m.data).catch(() => { /* push is best-effort */ });
+        return;
+      }
       if (m.type === 'result' && m.cmdId) { submitResult(m.cmdId, !!m.ok, m.result, m.error, m.statusCode); return; }
       if (m.type === 'signal' && m.toDeviceId) { void routeSignal(userId as string, id, m.toDeviceId, m.signal).catch(() => { /* not in account */ }); return; }
       if (m.type === 'pong') { void markOnline(id); return; }
