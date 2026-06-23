@@ -5,7 +5,7 @@
 import { existsSync } from 'node:fs';
 import type { Store, ChatSession, Project } from './store.js';
 import type { Providers } from './providers.js';
-import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug, listConflictedFiles, dirtyFileCount, lastCommitInfo } from './git.js';
+import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug, listConflictedFiles, dirtyFileCount, lastCommitInfo, getActiveConflictHunks, type ConflictFile } from './git.js';
 import { parseGitHubRemote, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, getRepo, pickMergeMethod } from './github.js';
 import { deriveState, type LocalState, type LocalSnapshot, type PrStatus, type SessionGitStatus, type MergePreviewResult, type ResolvePreviewResult } from './pr-state.js';
 
@@ -221,6 +221,17 @@ export class GitService {
         conflictedFiles,
       },
     };
+  }
+
+  /** T8: enumerate the conflict hunks currently live in this session's
+      worktree (an in-progress merge from `resolveSession`, or a manual
+      `git merge` the operator started). Pure read — no merge, no commit.
+      Returns `{ files: [] }` for no worktree / no conflicts. */
+  getConflictHunks(session: ChatSession): { files: ConflictFile[]; reason?: string } {
+    const project = this.store.getProject(session.projectId);
+    const dir = project ? this.dirFor(session, project) : null;
+    if (!dir) return { files: [], reason: 'no worktree' };
+    return getActiveConflictHunks(dir);
   }
 
   /** Merge the latest base into the session's worktree branch. Clean → push (the
