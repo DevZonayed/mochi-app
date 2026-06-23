@@ -32,7 +32,9 @@ import { OpenPathContext, pathIsInside, type OpenPathFn } from '../lib/openPath'
 import { displayCodename } from '../lib/git-types';
 import { GitOpsDock } from '../components/GitOpsDock';
 import { SessionStateDot } from './SessionStateDot';
-import { useSession, useSessionStateOnly } from '../lib/useSessionGitState';
+import { useSession, useSessionStateOnly, useSessionGitState } from '../lib/useSessionGitState';
+import { useSessionLocked } from '../hooks/useSessionLocked';
+import { MergedSessionBanner } from '../components/MergedSessionBanner';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -2667,7 +2669,7 @@ function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projec
   );
 }
 
-export function ChatThread({ projectId, project, sessionId, base, onSessionCreated, onTurns, onOpenImage, onOpenFile, flush, autoFocus }: {
+export function ChatThread({ projectId, project, sessionId, base, onSessionCreated, onOpenSession, onTurns, onOpenImage, onOpenFile, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
   sessionId: string | null;
@@ -2676,6 +2678,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       worktree forks from it on first send. Ignored once `sessionId` is real. */
   base?: string;
   onSessionCreated?: (session: ChatSession) => void;
+  /** Open an EXISTING session in the host's tab system (Workspace) or
+      navigate (ProjectDetail). Wired by Track 7's "Continue from here" so the
+      newly-spawned continuation session becomes the active tab. */
+  onOpenSession?: (session: ChatSession) => void;
   /** Lifts this chat's turns (jobs) to the parent — used by the Workspace's
       "Changed files" panel to read the write-tool activity. */
   onTurns?: (jobs: Job[]) => void;
@@ -3261,6 +3267,48 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     setMentionQuery(null); setMentionSel(0);
   };
 
+  // ── Track 7: lock-after-merge ───────────────────────────────────────────
+  // The composer is read-only when this session's PR has been merged. The
+  // banner + lock both read from the SAME `pr-merged` state, so they never
+  // disagree (e.g. banner up but composer alive, or vice versa).
+  const locked = useSessionLocked(activeId);
+  const gitStatus = useSessionGitState(activeId);
+  const mergedPr = locked && gitStatus?.pr ? gitStatus.pr : null;
+  const [continuing, setContinuing] = React.useState(false);
+  const continueFromHere = React.useCallback(async () => {
+    if (!activeId || !mergedPr || continuing) return;
+    setContinuing(true);
+    try {
+      const fresh = await api.continueSession({
+        sessionId: activeId,
+        baseRefName: mergedPr.baseRefName,
+        prNumber: mergedPr.number,
+        mergedAt: mergedPr.mergedAt,
+      });
+      // Tell the host (Workspace tabs / ProjectDetail) to OPEN the new session.
+      // We do NOT also auto-close the merged tab — the operator may want to
+      // glance back at the prior conversation while they keep going.
+      onSessionCreated?.(fresh);
+      onOpenSession?.(fresh);
+    } catch (e) {
+      setSendError(e instanceof Error ? e.message : 'Could not create the continuation session.');
+    } finally {
+      setContinuing(false);
+    }
+  }, [activeId, mergedPr, continuing, onSessionCreated, onOpenSession]);
+  // The continued-from link jumps back to the merged ancestor's tab (if the
+  // host wired onOpenSession). Resolves the ChatSession lazily so we don't
+  // hold a stale title; falls back to a no-op when the ancestor was deleted.
+  const continuedFrom = activeSession?.continuedFrom;
+  const openAncestor = React.useCallback(async () => {
+    if (!continuedFrom || !onOpenSession) return;
+    try {
+      const list = await api.listSessions(projectId ?? undefined);
+      const ancestor = list.find(s => s.id === continuedFrom.sessionId);
+      if (ancestor) onOpenSession(ancestor);
+    } catch { /* best-effort — the link goes dead if the ancestor is gone */ }
+  }, [continuedFrom, onOpenSession, projectId]);
+
   return (
     <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)', overflow: 'hidden',
       ...(flush ? {} : { borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)' }) }}>
@@ -3273,8 +3321,52 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       {/* Conductor-style chat header: codename + state chip + Archive. The
           GitOpsDock (Track 5) gates itself for non-repo / null sessions. */}
       <ChatHeader sessionId={activeId} projectId={projectId} />
+      {/* Track 7: "← Continued from …" jump-link for a session forked off a
+          merged ancestor. Sits between the chat header and the transcript so
+          it's visible from the first scroll position without competing with
+          the merged banner below. */}
+      {continuedFrom && (
+        <div style={{ position: 'relative', zIndex: 1, padding: '4px 24px 0' }}>
+          <button onClick={openAncestor} disabled={!onOpenSession} title={onOpenSession ? 'Open the previous session' : undefined} style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 'var(--r-pill)',
+            background: 'transparent', border: 'none', cursor: onOpenSession ? 'pointer' : 'default',
+            font: '500 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-secondary)',
+          }}>
+            <span aria-hidden="true">←</span>
+            <span>Continued from</span>
+            <span style={{ font: '600 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink)' }}>"{continuedFrom.title}"</span>
+          </button>
+        </div>
+      )}
+      {/* Track 7: merged-PR banner. Renders ONLY when the session is locked
+          (state === 'pr-merged'). Sits ABOVE the transcript, NOT in the chat
+          header (that's T5/GitOpsDock territory). */}
+      {mergedPr && (
+        <div style={{ position: 'relative', zIndex: 1, padding: '8px 0 4px' }}>
+          <MergedSessionBanner pr={mergedPr} onContinue={continueFromHere} continuing={continuing} />
+        </div>
+      )}
       <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
         <div style={{ maxWidth: CHAT_W, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
+          {/* Track 7: seed system-context card for a freshly-spawned continuation
+              session. Renders ONCE, above the empty-state prompt, so the agent's
+              first context is visible to the operator (and re-readable until they
+              type). Vanishes after the first turn lands. */}
+          {turns.length === 0 && continuedFrom && (
+            <div style={{ padding: '20px 20px 0', maxWidth: 620, margin: '0 auto', width: '100%' }}>
+              <div style={{ borderRadius: 12, padding: '12px 14px',
+                background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)',
+                font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)',
+              }}>
+                <div style={{ font: '700 var(--fs-caption)/1.2 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 }}>System context</div>
+                Continued from <strong style={{ color: 'var(--ink)' }}>"{continuedFrom.title}"</strong>
+                {continuedFrom.prNumber ? <> &middot; previous PR #{continuedFrom.prNumber}</> : null}
+                {continuedFrom.mergedAt ? <> merged on {new Date(continuedFrom.mergedAt).toLocaleDateString()}</> : null}
+                {continuedFrom.baseRefName ? <> into <code style={{ font: '600 var(--fs-caption)/1 var(--font-mono)' }}>{continuedFrom.baseRefName}</code></> : null}.
+                <div style={{ marginTop: 4 }}>Full prior transcript is available on the previous session — ask if you want a summary or any specific decisions referenced.</div>
+              </div>
+            </div>
+          )}
           {turns.length === 0 && (
             <div style={{ padding: '52px 20px 20px', textAlign: 'center' }}>
               <span style={{ width: 56, height: 56, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
@@ -3396,8 +3488,8 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
               <RichComposer
                 ref={composerRef}
-                disabled={!projectId}
-                placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
+                disabled={!projectId || locked}
+                placeholder={!projectId ? 'Pick a project first' : locked ? 'View only — this PR has been merged' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
                 onTextChange={setText}
                 onChips={info => {
                   setComposerBrowser(info.hasBrowser);
@@ -3445,10 +3537,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                   </button>
                 </>
               ) : (
-                <button onClick={sendComposed} disabled={!canSend || !projectId} className="send-fab" title="Send (Enter)" style={{
+                <button onClick={sendComposed} disabled={!canSend || !projectId || locked} className="send-fab" title={locked ? 'View only — this PR has been merged' : 'Send (Enter)'} style={{
                   width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
-                  background: canSend ? 'var(--blue)' : 'var(--fill-secondary)', color: canSend ? '#fff' : 'var(--ink-secondary)',
-                  boxShadow: canSend ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: canSend ? 'pointer' : 'default' }}>
+                  background: canSend && !locked ? 'var(--blue)' : 'var(--fill-secondary)', color: canSend && !locked ? '#fff' : 'var(--ink-secondary)',
+                  boxShadow: canSend && !locked ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: canSend && !locked ? 'pointer' : 'default' }}>
                   <Icon name="arrowRight" size={18} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
                 </button>
               )}
@@ -3903,7 +3995,8 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
 
       {/* thread + composer (shared) */}
       <ChatThread projectId={projectId} project={project} sessionId={activeId}
-        onSessionCreated={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }} />
+        onSessionCreated={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }}
+        onOpenSession={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }} />
 
       {syncOpen && projectId && (
         <SyncModal projectId={projectId} onClose={() => setSyncOpen(false)}
