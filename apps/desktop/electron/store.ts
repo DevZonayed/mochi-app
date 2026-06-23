@@ -151,6 +151,20 @@ export interface Job {
   inputFiles?: ChatFile[];
   /** Structured run log (assistant text blocks, tool calls, result) — capped. */
   transcript?: TranscriptItem[];
+  /** Epoch ms when the SDK iterator will be woken back up by a session-scoped
+      ScheduleWakeup. While set and in the future, the model is DORMANT — the
+      Claude Agent SDK's `query()` stream is held open across the wakeup (NOT
+      closed), so without this field the engine would keep status:'running' and
+      the UI would say "Responding…" through the entire dormant gap (verified
+      in the wild: a stuck job sat 11 h on 'running' with its transcript ending
+      in a successful ScheduleWakeup + final text and no result message).
+      Treat this like a scheduled message: session is closed, auto-wakes at
+      this time. Cleared the moment the next assistant message arrives or the
+      job transitions to a terminal state (done/failed/cancelled). */
+  pausedUntil?: number | null;
+  /** What's keeping the job paused. Currently only 'wakeup' (ScheduleWakeup
+      tool). Reserved for future 'background-task' / 'cron' parking. */
+  pausedReason?: 'wakeup' | null;
   createdAt: number; updatedAt: number;
 }
 
@@ -1241,7 +1255,7 @@ export class Store {
       try { console.log(`[store] job prune: stripped=${stripped} deleted=${deleted} total=${this.data.jobs.length}`); } catch { /* */ }
     }
   }
-  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript'>>): Job {
+  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript' | 'pausedUntil' | 'pausedReason'>>): Job {
     const cur = this.getJob(jobId);
     if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });
@@ -1276,6 +1290,11 @@ export class Store {
       j.phase = 'Failed';
       j.stage = '';
       j.error = 'Interrupted — Maestro was restarted while this job was running.';
+      // A turn parked on ScheduleWakeup at the time of the crash must not show
+      // a stale countdown alongside the new 'failed' status. (The wakeup was
+      // owned by the SDK subprocess that died with the app — it cannot fire.)
+      if (j.pausedUntil != null) j.pausedUntil = null;
+      if (j.pausedReason != null) j.pausedReason = null;
       j.updatedAt = now();
     }
     if (orphans.length) this.save();
