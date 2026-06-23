@@ -865,6 +865,20 @@ export const api = {
       req<Project>('/api/projects/clone', { method: 'POST', body: JSON.stringify(input) })),
   getProjectRepo: (id: string) =>
     call<RepoInfo>('getProjectRepo', { id }, () => req<RepoInfo>(`/api/projects/${encodeURIComponent(id)}/repo`)),
+  // GitHub-first project bootstrap (desktop-only; the renderer drives the UI).
+  // checkSlug runs while the user types in the name field (debounced 300ms).
+  checkSlug: (name: string) =>
+    call<{ slug: string; available: boolean | null; suggestion: string; owner: string | null; existing?: { fullName: string; private: boolean }; reason: 'ok' | 'taken' | 'not-authenticated' | 'no-login' | 'error'; error?: string }>(
+      'checkSlug', { name }, () => Promise.reject(new Error('desktop only'))),
+  // Create the GitHub repo, seed local files, commit, set origin, push.
+  bootstrapProject: (input: { name: string; localPath: string; private?: boolean; description?: string; adopt?: boolean; remoteOnly?: boolean }) =>
+    call<{ slug: string; slugChanged: boolean; owner: string; fullName: string; htmlUrl: string; cloneUrl: string; localPath: string; branchPushed: string }>(
+      'bootstrapProject', { ...input }, () => Promise.reject(new Error('desktop only'))),
+  // Inspect a candidate folder to decide between "create GitHub repo for this"
+  // / "use existing remote" / "already a non-GitHub repo" in the adopt flow.
+  adoptFolderInspect: (path: string) =>
+    call<{ ok: boolean; path: string; info?: RepoInfo; remote?: string | null; kind?: 'no-git' | 'git-no-remote' | 'git-github' | 'git-non-github'; error?: string }>(
+      'adoptFolderInspect', { path }, () => Promise.reject(new Error('desktop only'))),
   /** Native folder picker — desktop only; resolves null in the browser. */
   pickFolder: async (): Promise<FolderInspect | null> => {
     if (!bridge?.pickFolder) return null;
