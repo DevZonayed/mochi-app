@@ -20,7 +20,7 @@ import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
 import { ghState } from './gh-cli.js';
 import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
-import { getViewer } from './github.js';
+import { getViewer, listOwners } from './github.js';
 import { bootstrapNewProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
 import type { GitService } from './git-service.js';
 import type { ExtensionBridge } from './extension-bridge.js';
@@ -1044,6 +1044,20 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'ghCliState': return ghState();
 
       // ── GitHub-first project bootstrap ───────────────────────────────
+      // listOwners: the New-project owner picker (user + their orgs). The
+      // picker MUST be populated before checkSlug fires under a different owner;
+      // soft-fails to a single fake user row when no GitHub token is present
+      // (the bootstrap call will surface the real auth error loudly).
+      case 'listOwners': {
+        const token = providers.getLocalKey('github');
+        if (!token) return { ok: false, reason: 'not-authenticated', owners: [] as Array<{ login: string; kind: 'user' | 'org'; avatarUrl: string | null }> };
+        try {
+          const owners = await listOwners(token);
+          return { ok: true, reason: 'ok' as const, owners };
+        } catch (e) {
+          return { ok: false, reason: 'error' as const, owners: [], error: e instanceof Error ? e.message.slice(0, 160) : 'lookup failed' };
+        }
+      }
       // checkSlug: live availability for the New-project name field. Debounced
       // by the renderer (300ms). Returns the slugified form + whether it's
       // free + an alternate suggestion when taken. Cheap (1–5 GitHub calls);

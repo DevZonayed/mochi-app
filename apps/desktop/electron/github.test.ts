@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { ghRequest, getViewer, parseGitHubRemote, getRepo, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, pickMergeMethod } from './github.js';
+import { ghRequest, getViewer, parseGitHubRemote, getRepo, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, pickMergeMethod, listOwners } from './github.js';
 
 /** A fake fetch that routes by URL substring (for multi-call functions). */
 function routeFetch(routes: Array<{ match: string; status: number; body?: unknown; headers?: Record<string, string> }>): typeof fetch {
@@ -134,6 +134,59 @@ describe('createPull / mergePull', () => {
   test('mergePull returns merged + sha', async () => {
     const f = routeFetch([{ match: '/merge', status: 200, body: { merged: true, sha: 'deadbeef' } }]);
     expect(await mergePull('t', 'o', 'r', 9, 'squash', f)).toEqual({ merged: true, sha: 'deadbeef' });
+  });
+});
+
+describe('listOwners', () => {
+  // The picker MUST always have the user as the first row (they're the only
+  // safe default for someone with no org membership). Orgs come second,
+  // alphabetised — verifying both, since "first available org" would be a
+  // confusing default and hurt operator trust.
+  test('returns the user first, then orgs alphabetically', async () => {
+    const f = routeFetch([
+      { match: '/user/orgs', status: 200, body: [
+        { login: 'zeta-corp', avatar_url: 'z.png' },
+        { login: 'acme', avatar_url: 'a.png' },
+        { login: 'maple', avatar_url: null },
+      ] },
+      { match: '/user', status: 200, body: { login: 'octocat', avatar_url: 'me.png' } },
+    ]);
+    const got = await listOwners('tok', f);
+    expect(got).toEqual([
+      { login: 'octocat', kind: 'user', avatarUrl: 'me.png' },
+      { login: 'acme', kind: 'org', avatarUrl: 'a.png' },
+      { login: 'maple', kind: 'org', avatarUrl: null },
+      { login: 'zeta-corp', kind: 'org', avatarUrl: 'z.png' },
+    ]);
+  });
+  // A user with no orgs still gets a valid one-row list — exercising the path
+  // where /user/orgs returns []. (Important on a fresh GitHub account.)
+  test('user with no orgs → single-row list', async () => {
+    const f = routeFetch([
+      { match: '/user/orgs', status: 200, body: [] },
+      { match: '/user', status: 200, body: { login: 'solo', avatar_url: null } },
+    ]);
+    expect(await listOwners('tok', f)).toEqual([{ login: 'solo', kind: 'user', avatarUrl: null }]);
+  });
+  // Token whose org-read scope was revoked must STILL surface the user (the
+  // picker can't render at all without at least one option). The org call
+  // 403s; allSettled prevents that from killing the user row.
+  test('orgs call fails → user is still returned (no orgs)', async () => {
+    const f = routeFetch([
+      { match: '/user/orgs', status: 403, body: { message: 'not allowed' } },
+      { match: '/user', status: 200, body: { login: 'octo', avatar_url: null } },
+    ]);
+    expect(await listOwners('tok', f)).toEqual([{ login: 'octo', kind: 'user', avatarUrl: null }]);
+  });
+  // The flipside: no user means the token is stale. Throw rather than fake
+  // an owner list — every downstream caller assumes the first row is a real
+  // login they can push to.
+  test('user call fails → throws (token bad)', async () => {
+    const f = routeFetch([
+      { match: '/user/orgs', status: 200, body: [] },
+      { match: '/user', status: 401, body: { message: 'bad creds' } },
+    ]);
+    await expect(listOwners('tok', f)).rejects.toThrow(/login/i);
   });
 });
 

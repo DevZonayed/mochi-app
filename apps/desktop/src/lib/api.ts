@@ -866,6 +866,12 @@ export const api = {
   getProjectRepo: (id: string) =>
     call<RepoInfo>('getProjectRepo', { id }, () => req<RepoInfo>(`/api/projects/${encodeURIComponent(id)}/repo`)),
   // GitHub-first project bootstrap (desktop-only; the renderer drives the UI).
+  // listOwners populates the new-project owner picker (user + their orgs)
+  // BEFORE the slug probe runs, since the slug-availability query is scoped to
+  // whichever owner is selected.
+  listOwners: () =>
+    call<{ ok: boolean; reason: 'ok' | 'not-authenticated' | 'error'; owners: Array<{ login: string; kind: 'user' | 'org'; avatarUrl: string | null }>; error?: string }>(
+      'listOwners', {}, () => Promise.reject(new Error('desktop only'))),
   // checkSlug runs while the user types in the name field (debounced 300ms).
   checkSlug: (name: string) =>
     call<{ slug: string; available: boolean | null; suggestion: string; owner: string | null; existing?: { fullName: string; private: boolean }; reason: 'ok' | 'taken' | 'not-authenticated' | 'no-login' | 'error'; error?: string }>(

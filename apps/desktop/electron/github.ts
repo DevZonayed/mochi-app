@@ -77,6 +77,32 @@ export async function getViewer(token: string, fetchImpl?: FetchImpl): Promise<V
   return { login: r.data?.login ?? '', scopes: r.scopes };
 }
 
+/** A choice for the new-project "owner" picker. The user themselves comes back
+    as kind:'user'; every org they belong to comes back as kind:'org'. We need
+    the kind because the create-repo endpoint differs (POST /user/repos vs
+    POST /orgs/${login}/repos) and a wrong call returns 404 with no hint. */
+export interface OwnerOption { login: string; kind: 'user' | 'org'; avatarUrl: string | null; }
+
+/** All owners the authenticated user can create a repo under: themselves first,
+    then their orgs (alphabetical). Two parallel GitHub calls; failures in the
+    orgs call don't kill the whole list (the user is the only owner that MUST
+    appear — orgs are bonus). Used by the New-project owner picker. */
+export async function listOwners(token: string, fetchImpl?: FetchImpl): Promise<OwnerOption[]> {
+  const [meRes, orgsRes] = await Promise.allSettled([
+    ghRequest<{ login: string; avatar_url?: string | null }>({ token, path: '/user', fetchImpl }),
+    ghRequest<Array<{ login: string; avatar_url?: string | null }>>({ token, path: '/user/orgs?per_page=100', fetchImpl }),
+  ]);
+  if (meRes.status !== 'fulfilled' || !meRes.value.data?.login) {
+    throw new Error('Could not resolve your GitHub login. Re-authenticate and try again.');
+  }
+  const me: OwnerOption = { login: meRes.value.data.login, kind: 'user', avatarUrl: meRes.value.data.avatar_url ?? null };
+  const orgs: OwnerOption[] = orgsRes.status === 'fulfilled' && Array.isArray(orgsRes.value.data)
+    ? orgsRes.value.data.map(o => ({ login: o.login, kind: 'org' as const, avatarUrl: o.avatar_url ?? null }))
+    : [];
+  orgs.sort((a, b) => a.login.localeCompare(b.login));
+  return [me, ...orgs];
+}
+
 /** Parse a GitHub remote URL (ssh/https) → {owner, repo}. Null for non-GitHub. */
 export function parseGitHubRemote(remote: string | null | undefined): { owner: string; repo: string } | null {
   if (!remote) return null;
