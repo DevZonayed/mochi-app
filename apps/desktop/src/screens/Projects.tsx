@@ -668,8 +668,22 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
           try { inspect = await api.adoptFolderInspect(pickedPath); } catch { /* fall back to plain create below */ }
           if (inspect?.ok && inspect.kind === 'git-github') {
             // Folder already has a GitHub remote — record it on the project
-            // without recreating anything.
-            const proj = await api.createProject({ name: finalName, template: 'code', kind: 'coding', path: pickedPath, repoUrl: inspect.remote ?? undefined });
+            // without recreating anything. If we ALSO discovered a companion
+            // memory repo (\${user}/\${slug}-memory), persist its slug so the
+            // openProject lifecycle hooks the memory pull + symlinks on
+            // entry. (The actual clone happens on first openProject —
+            // ensureMemoryRepo is idempotent, so it's safe to leave the
+            // clone to the lifecycle path rather than blocking adopt here.)
+            const mem = inspect.memoryRepo;
+            const memorySlug = mem?.state === 'memory-found' || mem?.state === 'memory-missing' ? mem.slug : undefined;
+            const memoryRepoUrl = mem?.state === 'memory-found'
+              ? `https://github.com/${mem.user}/${mem.slug}-memory`
+              : undefined;
+            const proj = await api.createProject({
+              name: finalName, template: 'code', kind: 'coding', path: pickedPath,
+              repoUrl: inspect.remote ?? undefined,
+              memorySlug, memoryRepoUrl,
+            });
             onCreated(proj.id);
             return;
           }

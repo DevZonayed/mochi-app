@@ -905,8 +905,23 @@ export const api = {
     >('bootstrapProject', { ...input }, () => Promise.reject(new Error('desktop only'))),
   // Inspect a candidate folder to decide between "create GitHub repo for this"
   // / "use existing remote" / "already a non-GitHub repo" in the adopt flow.
+  // Also discovers a companion memory repo (\${user}/\${slug}-memory) so the
+  // renderer can pick the right confirmation chip (clone+link vs create+link
+  // vs no-auth fallback).
   adoptFolderInspect: (path: string) =>
-    call<{ ok: boolean; path: string; info?: RepoInfo; remote?: string | null; kind?: 'no-git' | 'git-no-remote' | 'git-github' | 'git-non-github'; error?: string }>(
+    call<{
+      ok: boolean;
+      path: string;
+      info?: RepoInfo;
+      remote?: string | null;
+      kind?: 'no-git' | 'git-no-remote' | 'git-github' | 'git-non-github';
+      memoryRepo?:
+        | { state: 'memory-found'; cloneUrl: string; slug: string; user: string }
+        | { state: 'memory-missing'; slug: string; user: string }
+        | { state: 'no-github-auth' }
+        | { state: 'error'; error: string };
+      error?: string;
+    }>(
       'adoptFolderInspect', { path }, () => Promise.reject(new Error('desktop only'))),
   /** Native folder picker — desktop only; resolves null in the browser. */
   pickFolder: async (): Promise<FolderInspect | null> => {

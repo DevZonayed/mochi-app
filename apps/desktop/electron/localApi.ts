@@ -20,7 +20,8 @@ import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
 import { ghState } from './gh-cli.js';
 import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
-import { getViewer, listOwners } from './github.js';
+import { getViewer, listOwners, parseGitHubRemote } from './github.js';
+import { discoverMemoryRepo } from './memory-repo.js';
 import { bootstrapNewProject, bootstrapProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
 import { openProjectMemory, closeMemoryWatcher } from './project-lifecycle.js';
 import type { GitService } from './git-service.js';
@@ -1154,6 +1155,17 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // flow — has-git / has-github-remote / has-non-github-remote / no-git.
       // Renderer uses this to decide whether to offer "create GitHub repo for
       // this folder" or just record the existing remote and move on.
+      //
+      // ALSO discovers the companion memory repo (\${user}/\${slug}-memory):
+      // when the folder ALREADY has a github remote, we use that remote's
+      // repo name as the slug; otherwise we slugify the folder's basename.
+      // Returns a `memoryRepo` field with one of three states:
+      //   'memory-found'    — \${user}/\${slug}-memory exists; renderer
+      //                        offers "clone + link" on accept.
+      //   'memory-missing'  — same slug, no memory repo yet; renderer offers
+      //                        "create memory repo" on accept.
+      //   'no-github-auth'  — no GitHub token; renderer falls back to the
+      //                        old single-repo flow.
       case 'adoptFolderInspect': {
         const dir = String(p.path ?? '').trim();
         if (!dir) bad('path required');
@@ -1165,7 +1177,39 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           : !remote ? 'git-no-remote' as const
           : isGitHub ? 'git-github' as const
           : 'git-non-github' as const;
-        return { ok: true, path: dir, info: inspected.info, remote, kind };
+
+        // Memory-repo companion discovery. Best-effort — failures here don't
+        // poison the rest of the inspection.
+        let memoryRepo: { state: 'memory-found'; cloneUrl: string; slug: string; user: string }
+                       | { state: 'memory-missing'; slug: string; user: string }
+                       | { state: 'no-github-auth' }
+                       | { state: 'error'; error: string } = { state: 'no-github-auth' };
+        const token = providers.getLocalKey('github');
+        if (token) {
+          try {
+            const v = await getViewer(token);
+            if (v.login) {
+              // Slug source: the existing GitHub remote's repo name when present
+              // (so adopting a clone of an existing project re-attaches to the
+              // SAME memory repo); else slugify the folder basename.
+              let slug = '';
+              if (isGitHub && remote) {
+                const parsed = parseGitHubRemote(remote);
+                if (parsed?.repo) slug = parsed.repo;
+              }
+              if (!slug) slug = slugify(nodePath.basename(dir));
+              const discovered = await discoverMemoryRepo(token, v.login, slug);
+              memoryRepo = discovered.exists && discovered.cloneUrl
+                ? { state: 'memory-found', cloneUrl: discovered.cloneUrl, slug, user: v.login }
+                : { state: 'memory-missing', slug, user: v.login };
+            } else {
+              memoryRepo = { state: 'error', error: 'no login on token' };
+            }
+          } catch (e) {
+            memoryRepo = { state: 'error', error: e instanceof Error ? e.message.slice(0, 160) : 'memory discovery failed' };
+          }
+        }
+        return { ok: true, path: dir, info: inspected.info, remote, kind, memoryRepo };
       }
 
       // ── Media Studio (real fal generation) ─────────────────────
