@@ -19,6 +19,8 @@ import { SessionStateDot } from './SessionStateDot';
 import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
 import { BranchPicker } from '../components/BranchPicker';
+import { projectColor } from '../lib/project-color';
+import { groupTabsByProject } from '../lib/tab-grouping';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
@@ -55,12 +57,18 @@ const PAGE_CSS = `
   .ws-row:hover { background: var(--fill-tertiary); }
   .ws-row .ws-act { opacity: 0; transition: opacity 120ms ease; }
   .ws-row:hover .ws-act, .ws-row.ws-active .ws-act { opacity: 1; }
-  .ws-tab { transition: background 120ms ease, color 120ms ease; }
   .ws-tab:hover { background: var(--fill-tertiary); }
   .ws-tab .ws-tab-x { opacity: 0; transition: opacity 120ms ease; }
   .ws-tab:hover .ws-tab-x, .ws-tab.on .ws-tab-x { opacity: 1; }
   .ws-newbtn:hover { background: var(--fill-secondary) !important; }
   .ws-tabs::-webkit-scrollbar { height: 0; }
+  .ws-tab { transition: background 120ms ease, color 120ms ease; }
+  /* project groups in the tab strip — a thin 1px vertical divider between
+     groups and a 3px colored stripe at the start of each group so the eye
+     can pick out which chat belongs to which project at a glance */
+  .ws-tab-group { display: flex; align-items: stretch; flex-shrink: 0; }
+  .ws-tab-group + .ws-tab-group { border-left: 1px solid var(--separator); }
+  .ws-tab-group-stripe { width: 3px; flex-shrink: 0; }
   .ws-kinds::-webkit-scrollbar { height: 0; }
   .ws-tree::-webkit-scrollbar { width: 11px; }
   .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
@@ -96,7 +104,7 @@ function relTime(ts: number): string {
   const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
   const d = Math.floor(h / 24); return d < 7 ? `${d}d ago` : `${Math.floor(d / 7)}w ago`;
 }
-const projColor = (p?: Project): string => (p?.color ? `var(--${p.color})` : 'var(--blue)');
+const projColor = (p?: Project): string => projectColor(p ?? null);
 const projKind = (p?: Project): ProjectKind => (p?.kind ?? 'general');
 const CHAT_PREVIEW = 7; // chats shown per project before "Show all"
 
@@ -557,6 +565,11 @@ export default function Workspace() {
     <div style={{ padding: '10px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{t}</div>
   );
 
+  // ── Tab strip: group open tabs by project, preserving the order in which
+  // each project first appeared (so the layout doesn't reshuffle as the user
+  // opens/closes tabs). Pure helper — tested in tab-grouping.test.ts.
+  const tabGroups = React.useMemo(() => groupTabsByProject(tabs), [tabs]);
+
   return (
     <AppShell active="workspace">
       <style>{PAGE_CSS}</style>
@@ -789,44 +802,54 @@ export default function Workspace() {
             <div ref={tabStripRef} className="ws-tabs"
               onWheel={e => { const el = tabStripRef.current; if (el && Math.abs(e.deltaY) > Math.abs(e.deltaX)) el.scrollLeft += e.deltaY; }}
               style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'stretch', overflowX: 'auto' }}>
-              {tabs.map(t => {
-                const on = t.key === activeKey;
-                const p = projById[t.projectId];
-                // A chat tab is session-backed → its title can be renamed inline
-                // (mirrors the rail's double-click → input → commit flow).
-                const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
-                const editing = chatTab && renamingId === t.sessionId;
+              {tabGroups.map(group => {
+                const p = projById[group.projectId];
+                const groupName = p?.name ?? 'Project';
+                const stripeColor = projColor(p);
                 return (
-                  <div key={t.key} data-tabkey={t.key} className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)} onContextMenu={e => openTabMenu(e, t)}
-                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
-                      borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
-                    {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: projColor(p) }} />}
-                    {t.kind === 'file'
-                      ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
-                      : t.kind === 'image'
-                      ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
-                      : t.kind === 'project'
-                      ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
-                      : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />}
-                    {editing && t.sessionId ? (
-                      <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
-                        onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}
-                        style={{ minWidth: 0, maxWidth: 150, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
-                    ) : (
-                      <span title={chatTab ? 'Double-click to rename' : (t.base ? `New chat off ${t.base}` : undefined)}
-                        onDoubleClick={chatTab ? (e => { e.stopPropagation(); setRenamingId(t.sessionId!); setRenameVal(t.title); }) : undefined}
-                        style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                        {t.title}
-                        {t.base && !t.sessionId && (
-                          // Subtle base-branch suffix on un-sent "New chat" tabs only.
-                          // Hidden once the session is real (its title takes over).
-                          <span style={{ marginLeft: 5, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-mono)' }}>· {t.base}</span>
-                        )}
-                      </span>
-                    )}
-                    <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
-                      <Icon name="x" size={11} stroke={2.6} />
-                    </button>
+                  <div key={group.projectId} className="ws-tab-group" role="group" aria-label={groupName}>
+                    {/* 3px colored left-stripe — the at-a-glance project tint */}
+                    <span className="ws-tab-group-stripe" aria-hidden="true" style={{ background: stripeColor }} />
+                    {group.tabs.map(t => {
+                      const on = t.key === activeKey;
+                      const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
+                      const editing = chatTab && renamingId === t.sessionId;
+                      return (
+                        <div key={t.key} data-tabkey={t.key}
+                          role="tab" aria-selected={on}
+                          className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)} onContextMenu={e => openTabMenu(e, t)}
+                          style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
+                            borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
+                          {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: stripeColor }} />}
+                          {t.kind === 'file'
+                            ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+                            : t.kind === 'image'
+                            ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
+                            : t.kind === 'project'
+                            ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
+                            : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />}
+                          {editing && t.sessionId ? (
+                            <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
+                              onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}
+                              style={{ minWidth: 0, maxWidth: 150, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
+                          ) : (
+                            <span title={chatTab ? 'Double-click to rename' : (t.base ? `New chat off ${t.base}` : undefined)}
+                              onDoubleClick={chatTab ? (e => { e.stopPropagation(); setRenamingId(t.sessionId!); setRenameVal(t.title); }) : undefined}
+                              style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                              {t.title}
+                              {t.base && !t.sessionId && (
+                                // Subtle base-branch suffix on un-sent "New chat" tabs only.
+                                // Hidden once the session is real (its title takes over).
+                                <span style={{ marginLeft: 5, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-mono)' }}>· {t.base}</span>
+                              )}
+                            </span>
+                          )}
+                          <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+                            <Icon name="x" size={11} stroke={2.6} />
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
                 );
               })}
