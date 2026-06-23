@@ -289,6 +289,97 @@ export function worktreeExists(repoDir: string, wtPath: string): boolean {
   return listWorktrees(repoDir).some(w => canonicalPath(w.path) === target);
 }
 
+/** ── Branch listing (powers the "new chat from branch" picker) ───────────── */
+
+export interface BranchInfo {
+  /** Plain branch name — no `refs/heads/` and no `origin/` prefix. */
+  name: string;
+  /** True when this matches `origin/HEAD` (the repo's default branch). */
+  isDefault: boolean;
+  /** True when this is the current HEAD of the MAIN repo (not a worktree). */
+  isCurrent: boolean;
+  /** True when a corresponding `origin/<name>` ref exists. */
+  hasRemote: boolean;
+  /** Tip commit metadata (subject + unix timestamp), null on parse failure. */
+  lastCommit: { sha: string; subject: string; date: number } | null;
+}
+
+/** Internal: parse one `for-each-ref` line, NUL-delimited fields. */
+function parseRefLine(line: string): { ref: string; sha: string; subject: string; date: number } | null {
+  // Format: refname\0objectname:short\0contents:subject\0committerdate:unix
+  const parts = line.split('\0');
+  if (parts.length < 4) return null;
+  const [ref, sha, subject, dateStr] = parts;
+  if (!ref) return null;
+  const date = Number(dateStr);
+  return { ref, sha, subject: (subject ?? '').slice(0, 200), date: Number.isFinite(date) ? date : 0 };
+}
+
+/** All local + remote `origin/*` branches (deduped: local wins when both exist).
+    Sort: default first, current next, then alphabetical. Never throws. */
+export function listBranches(repoDir: string): BranchInfo[] {
+  if (!repoDir || !existsSync(repoDir) || !isGitRepo(repoDir)) return [];
+
+  // Default = origin/HEAD (best-effort; missing on fresh clones / file:// remotes).
+  const defHead = execGit(['-C', repoDir, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+  const defaultName = defHead.ok && defHead.out ? defHead.out.replace(/^origin\//, '') : null;
+
+  // Current = the MAIN repo's HEAD, not any session worktree's (worktrees are
+  // children with their OWN HEAD; we want the operator's "real" current branch).
+  const curRef = execGit(['-C', repoDir, 'symbolic-ref', '--quiet', '--short', 'HEAD']);
+  const currentName = curRef.ok && curRef.out ? curRef.out : null;
+
+  // One pass over locals + origin remotes — NUL-delimited so subjects with `|`
+  // or `:` don't break the split.
+  const fmt = '%(refname)%00%(objectname:short)%00%(contents:subject)%00%(committerdate:unix)';
+  const r = execGit(['-C', repoDir, 'for-each-ref', `--format=${fmt}`, 'refs/heads/', 'refs/remotes/origin/']);
+  if (!r.ok) return [];
+
+  const byName = new Map<string, BranchInfo>();
+  for (const raw of r.out.split('\n')) {
+    if (!raw) continue;
+    const parsed = parseRefLine(raw);
+    if (!parsed) continue;
+    const { ref, sha, subject, date } = parsed;
+
+    if (ref.startsWith('refs/heads/')) {
+      const name = ref.slice('refs/heads/'.length);
+      // Local always wins — even if we later see origin/<name>, keep local's commit.
+      byName.set(name, {
+        name,
+        isDefault: name === defaultName,
+        isCurrent: name === currentName,
+        hasRemote: false,            // patched in the remote-pass below
+        lastCommit: { sha, subject, date },
+      });
+    } else if (ref.startsWith('refs/remotes/origin/')) {
+      const name = ref.slice('refs/remotes/origin/'.length);
+      if (name === 'HEAD') continue; // origin/HEAD is a symbolic ref, not a real branch
+      const existing = byName.get(name);
+      if (existing) {
+        existing.hasRemote = true;
+      } else {
+        byName.set(name, {
+          name,
+          isDefault: name === defaultName,
+          isCurrent: false, // remote-only branches aren't checked out anywhere
+          hasRemote: true,
+          lastCommit: { sha, subject, date },
+        });
+      }
+    }
+  }
+
+  const all = [...byName.values()];
+  all.sort((a, b) => {
+    if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
+    // current floats above the rest (but never above default)
+    if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  return all;
+}
+
 /** Best-effort `git fetch origin`. No-op (ok:false) when there's no origin remote. */
 export function fetchOrigin(repoDir: string): { ok: boolean; reason?: string } {
   const remotes = execGit(['-C', repoDir, 'remote']);
