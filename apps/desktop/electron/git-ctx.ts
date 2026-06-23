@@ -10,21 +10,21 @@
    something else).
 
    ── HUMAN-CONFIRM GATE (pr_merge + pr_resolve_conflicts) ──
-   Both `mergePr` and `resolveConflicts` accept an opts object with an optional
-   `confirmed: boolean` flag. The contract is two-step:
+   `mergePr` and `resolveConflicts` ALWAYS return `{ needsConfirm: true,
+   preview }` — they never actually merge or resolve. The destructive code
+   path lives in `gitService.mergePr` / `gitService.resolveSession` and is
+   reached EXCLUSIVELY through the renderer's IPC handlers
+   (`mergeSessionPR` / `resolveSession` in `localApi.ts`), which run only
+   after the operator clicks Confirm in `<PrActionConfirmDialog />`.
 
-     • confirmed !== true  → returns { needsConfirm: true, preview: {…} }
-                             WITHOUT calling GitHub or touching the worktree.
-     • confirmed === true  → runs the destructive action (same code path the
-                             chat header buttons drive).
-
-   The flag is ONLY honoured from the desktop's IPC path (the renderer is the
-   only caller that should ever pass `confirmed: true`). Agent paths in
-   engine.ts (Claude) and codex-bridge.ts (Codex) MUST strip the flag before
-   calling and treat the response as a preparation step — they then emit a
-   `pr-confirm-request` event so the renderer can show a hard-button dialog,
-   and the renderer re-invokes the action via the existing IPC handlers
-   (`mergeSessionPR` / `resolveSession`) which run unchanged.
+   A `confirmed: true` flag arriving via GitCtx is a tripwire — we strip + log
+   it and fall back to the preview gate. The operator's "11 unauthorized
+   squash-merges" incident is why this defense-in-depth check exists: even if
+   a future refactor accidentally routes an agent call through here with the
+   flag set, we never merge. Agent paths in engine.ts (Claude) and
+   codex-bridge.ts (Codex) emit a `pr-confirm-request` event so the renderer
+   can show the dialog, and the renderer re-invokes the action via the IPC
+   handlers (which use `gitService` directly, not this object).
 
    Pure logic — no MCP / electron deps — so it's unit-testable in isolation. */
 
@@ -74,14 +74,19 @@ export function isNeedsConfirm<T extends { needsConfirm?: unknown }>(r: T): r is
 
 export interface MergePrOpts {
   method?: 'merge' | 'squash' | 'rebase';
-  /** Renderer-only: skip the gate and run the merge immediately. The agent paths
-      strip this flag before reaching here so the agent can never set it. */
+  /** TRIPWIRE: this flag is rejected (stripped + console.warn) if it ever
+      reaches GitCtx. The renderer's `mergeSessionPR` IPC handler bypasses
+      GitCtx entirely and calls `gitService.mergePr` directly, so a
+      `confirmed: true` arriving here means someone is trying to merge
+      through the agent surface — which we never allow. Kept on the type
+      for API stability + so the tripwire's intent is explicit. */
   confirmed?: boolean;
 }
 
 export interface ResolveConflictsOpts {
-  /** Renderer-only: skip the gate and run the resolve immediately. The agent paths
-      strip this flag before reaching here so the agent can never set it. */
+  /** TRIPWIRE: same as MergePrOpts.confirmed — renderer must use the
+      `resolveSession` IPC handler (which calls `gitService.resolveSession`
+      directly); a `confirmed: true` reaching GitCtx is logged + dropped. */
   confirmed?: boolean;
 }
 
@@ -156,24 +161,33 @@ export function makeGitCtx(store: Store, gitService: GitService, sessionId: stri
     },
 
     async mergePr(opts) {
-      // GATE: agent paths land here with confirmed === undefined/false → preview.
-      // Renderer (IPC) paths set confirmed === true → run the actual merge.
-      if (opts?.confirmed !== true) {
-        const prev = await gitService.previewMergePr(session, { method: opts?.method });
-        if (!prev.ok) return { ok: false, reason: prev.reason };
-        return { needsConfirm: true, action: 'pr_merge', preview: prev.preview };
+      // GATE + TRIPWIRE: only the renderer's IPC handler in localApi.ts may
+      // call gitService.mergePr directly (it bypasses this object entirely).
+      // GitCtx — the agent's surface — must ALWAYS preview. Even if a future
+      // refactor accidentally routes an agent call through here with
+      // `confirmed: true`, we strip + log + refuse instead of merging. The
+      // operator's screenshot of 11 unauthorized squash-merges is the reason
+      // this defense-in-depth check exists. Do NOT downgrade to a silent
+      // pass-through.
+      if (opts?.confirmed === true) {
+        // eslint-disable-next-line no-console
+        console.warn('[git-ctx] TRIPWIRE: pr_merge called with confirmed:true via the agent path. Stripping the flag and falling back to the preview gate. The renderer must call gitService.mergePr directly via the mergeSessionPR IPC handler.');
       }
-      return gitService.mergePr(session, { method: opts.method });
+      const prev = await gitService.previewMergePr(session, { method: opts?.method });
+      if (!prev.ok) return { ok: false, reason: prev.reason };
+      return { needsConfirm: true, action: 'pr_merge', preview: prev.preview };
     },
 
     async resolveConflicts(opts) {
-      // GATE: agent paths land here with confirmed === undefined/false → preview.
-      if (opts?.confirmed !== true) {
-        const prev = await gitService.previewResolveSession(session);
-        if (!prev.ok) return { ok: false, conflicts: [], reason: prev.reason };
-        return { needsConfirm: true, action: 'pr_resolve_conflicts', preview: prev.preview };
+      // GATE + TRIPWIRE: same shape as mergePr above — confirmed:true is a
+      // renderer-only flag that should never arrive here. We strip + log.
+      if (opts?.confirmed === true) {
+        // eslint-disable-next-line no-console
+        console.warn('[git-ctx] TRIPWIRE: pr_resolve_conflicts called with confirmed:true via the agent path. Stripping the flag and falling back to the preview gate. The renderer must call gitService.resolveSession directly via the resolveSession IPC handler.');
       }
-      return gitService.resolveSession(session);
+      const prev = await gitService.previewResolveSession(session);
+      if (!prev.ok) return { ok: false, conflicts: [], reason: prev.reason };
+      return { needsConfirm: true, action: 'pr_resolve_conflicts', preview: prev.preview };
     },
 
     renameBranch() {

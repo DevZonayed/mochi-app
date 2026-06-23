@@ -36,8 +36,13 @@ release/
 *.sqlite-wal
 *.sqlite-shm
 
-# operator-local skills installed via add_skill_to_project
-.claude/
+# operator-local skills installed via add_skill_to_project — but the team
+# settings.json (PreToolUse merge-block hook) MUST ship: it's how PR #63's
+# human-confirm merge gate enforces itself against agent-side `gh pr merge` /
+# `git push origin master`. Ignore everything under .claude/ EXCEPT the
+# settings file. Do NOT delete the negation.
+.claude/*
+!.claude/settings.json
 
 # env / secrets
 .env

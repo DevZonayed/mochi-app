@@ -102,11 +102,14 @@ describe('makeGitCtx', () => {
     expect(gs.renameSessionBranch).toHaveBeenCalledTimes(1);
   });
 
-  /* ── HUMAN-CONFIRM GATE — pr_merge + pr_resolve_conflicts ────────────────
-     The contract: without `confirmed: true`, the GitCtx returns a preview
-     and DOES NOT call the destructive gitService method. With confirmed:true
-     it runs the action. Agent paths (engine.ts, codex-bridge.ts) strip the
-     flag before calling so the agent can never bypass the gate. */
+  /* ── HUMAN-CONFIRM GATE + TRIPWIRE — pr_merge + pr_resolve_conflicts ─────
+     The contract: GitCtx (the agent surface) ALWAYS returns a preview and
+     NEVER calls the destructive gitService method. Even if a `confirmed:
+     true` flag arrives — which only the renderer should ever set, and the
+     renderer bypasses GitCtx entirely via the IPC handler — we strip + log
+     + fall through to preview. This is the defense-in-depth check that
+     stops the "agent invented `confirmed:true` and squash-merged 11 PRs"
+     incident from being repeatable. */
   function setupRepoCtx() {
     const s = new Store();
     const r = repo();
@@ -132,13 +135,31 @@ describe('makeGitCtx', () => {
     expect(gs.mergePr).not.toHaveBeenCalled();
   });
 
-  test('mergePr WITH confirmed:true → runs the merge', async () => {
-    const { gs, ctx } = setupRepoCtx();
-    const r = await ctx.mergePr({ method: 'squash', confirmed: true });
-    expect(isNeedsConfirm(r)).toBe(false);
-    expect(gs.mergePr).toHaveBeenCalledTimes(1);
-    expect((gs.mergePr as ReturnType<typeof vi.fn>).mock.calls[0][1]).toEqual({ method: 'squash' });
-    expect(gs.previewMergePr).not.toHaveBeenCalled();
+  test('TRIPWIRE: mergePr WITH confirmed:true is REFUSED — never lands the merge', async () => {
+    // The agent might invent `confirmed:true` (the model has seen the schema).
+    // Even then we strip it, log a warning, and fall through to the preview
+    // gate. The destructive `gs.mergePr` must NEVER be called from GitCtx —
+    // only the renderer's IPC handler in localApi.ts may invoke it.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { gs, ctx } = setupRepoCtx();
+      const r = await ctx.mergePr({ method: 'squash', confirmed: true });
+      // Behaves exactly like an agent call WITHOUT the flag — preview + needsConfirm.
+      expect(isNeedsConfirm(r)).toBe(true);
+      if (isNeedsConfirm(r)) {
+        expect(r.action).toBe('pr_merge');
+        expect(r.preview.mergeMethod).toBe('squash');
+      }
+      expect(gs.previewMergePr).toHaveBeenCalledTimes(1);
+      expect(gs.mergePr).not.toHaveBeenCalled();
+      // Tripwire surfaced a loud warning naming the offending flag.
+      expect(warn).toHaveBeenCalled();
+      const msg = warn.mock.calls[0]?.[0] as string | undefined;
+      expect(msg).toMatch(/TRIPWIRE/);
+      expect(msg).toMatch(/confirmed:true/);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test('resolveConflicts WITHOUT confirmed → returns needsConfirm + does NOT touch worktree', async () => {
@@ -153,12 +174,21 @@ describe('makeGitCtx', () => {
     expect(gs.resolveSession).not.toHaveBeenCalled();
   });
 
-  test('resolveConflicts WITH confirmed:true → runs the resolve', async () => {
-    const { gs, ctx } = setupRepoCtx();
-    const r = await ctx.resolveConflicts({ confirmed: true });
-    expect(isNeedsConfirm(r)).toBe(false);
-    expect(gs.resolveSession).toHaveBeenCalledTimes(1);
-    expect(gs.previewResolveSession).not.toHaveBeenCalled();
+  test('TRIPWIRE: resolveConflicts WITH confirmed:true is REFUSED — never touches worktree', async () => {
+    // Same shape as the mergePr tripwire — agent surface never executes,
+    // even when the flag is set.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { gs, ctx } = setupRepoCtx();
+      const r = await ctx.resolveConflicts({ confirmed: true });
+      expect(isNeedsConfirm(r)).toBe(true);
+      expect(gs.previewResolveSession).toHaveBeenCalledTimes(1);
+      expect(gs.resolveSession).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalled();
+      expect(warn.mock.calls[0]?.[0]).toMatch(/TRIPWIRE/);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test('preview failure surfaces as ok:false with the reason (no GitHub call)', async () => {

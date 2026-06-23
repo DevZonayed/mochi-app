@@ -104,6 +104,19 @@ export function actionsFor(state: SessionGitState): GitOpsAction[] {
     so the pill stays in sync with every other badge surface in the app. */
 export function labelFor(state: SessionGitState): string { return SESSION_STATE_LABELS[state]; }
 
+/** Pure: build the "behind <base> by N commit(s)" label used by both the
+    collapsed pill mini-chip and the expanded dock prominent row. Returns
+    null when nothing should render (no base, or already up-to-date). The
+    function is the single source of truth for that copy so the two
+    surfaces never drift. */
+export function behindBaseLabel(status: SessionGitStatus | null): string | null {
+  if (!status) return null;
+  if (status.local.behind <= 0) return null;
+  if (!status.base) return null;
+  const n = status.local.behind;
+  return `Behind ${status.base} by ${n} commit${n === 1 ? '' : 's'}`;
+}
+
 export interface GitOpsState {
   /** Live status from the shared cache, or `null` while loading. */
   status: SessionGitStatus | null;

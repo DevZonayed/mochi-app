@@ -4,6 +4,34 @@ This file is read on every coding-agent session in this repo. Keep it short.
 For deeper context, the agent should consult `.continuum/STATE.md` (project
 memory) and `.claude/skills/` (installed skills).
 
+## Merge policy — agents MUST NEVER merge
+
+Merging a PR and writing to `master` are HUMAN actions. They are gated by
+PR #63's `<PrActionConfirmDialog />` and PR #66's `<GitOpsDock />`, and the
+operator has shipped a `PreToolUse` Bash hook (`.claude/settings.json` →
+`scripts/block-merge-commands.sh`) that will refuse and exit non-zero on
+every shape of the act. These rules apply to ALL modes — interactive,
+goal-mode, autonomous — without exception:
+
+- **Never** call `gh pr merge`, `gh pr merge --auto`, `gh pr review --approve`,
+  `gh pr edit --enable-auto-merge`, or `gh api repos/*/pulls/*/merge`. The
+  Bash hook denies these and returns the reason to you so you know why.
+- **Never** call the `pr_merge` MCP tool with `{ confirmed: true }`. The IPC
+  surface strips the flag and the agent-side tripwire in
+  `apps/desktop/electron/git-ctx.ts` will reject it loudly. State the intent
+  in plain English instead.
+- **Never** `git push origin master` (or `main`), and never push with
+  `--force`/`--force-with-lease` to `master`. Master is updated **only** via a
+  GitHub-side merge that the operator clicked.
+- The only `master` operation you may perform is **read-only**: `git fetch
+  origin master`, `git diff origin/master`, `git rebase origin/master` (onto
+  your own feature branch), `git log origin/master`.
+
+How to land work: push your feature branch, open the PR (`gh pr create` is
+allowed), and **stop**. The operator clicks Merge in the GitOpsDock — the
+renderer's `mergeSessionPR` IPC handler is the only sanctioned path that
+touches the GitHub merge API.
+
 ## Commit policy
 
 - Use **Conventional Commits** — see `.claude/skills/maestro-commit/SKILL.md`

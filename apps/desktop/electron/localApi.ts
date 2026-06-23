@@ -587,8 +587,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // which executes the merge immediately. It is `desktopOnly` via remote-guard,
       // so only the renderer (a human clicking "Confirm Merge" in the dialog) can
       // reach it. The AGENT path (engine.ts pr_merge tool / codex-bridge.ts) goes
-      // through GitCtx.mergePr which gates on `confirmed: true` and surfaces the
-      // dialog via the `pr-confirm-request` event instead. See git-ctx.ts.
+      // through GitCtx.mergePr which ALWAYS previews — it is structurally unable
+      // to land a merge (the `confirmed:true` flag is a tripwire that logs +
+      // strips). The dialog is surfaced via the `pr-confirm-request` event and
+      // the human's click re-enters here. See git-ctx.ts.
       case 'mergeSessionPR': {
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
