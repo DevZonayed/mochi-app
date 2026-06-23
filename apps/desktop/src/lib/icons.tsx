@@ -111,6 +111,7 @@ export type IconName =
   | 'chevronRight'
   | 'chevronDown'
   | 'gitMerge'
+  | 'gitBranch'
   | 'send'
   | 'alert'
   | 'feedback'
@@ -189,6 +190,8 @@ export function Icon({ name, size = 18, stroke = 1.75, style }: IconProps) {
     chevronRight: <polyline points="9 6 15 12 9 18"/>,
     chevronDown: <polyline points="6 9 12 15 18 9"/>,
     gitMerge: <><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="9" r="3"/><path d="M6 9v6M15 9a9 9 0 0 1-9 9"/></>,
+    // gitBranch: trunk on the left, branch line peeling off to a node on the right.
+    gitBranch: <><line x1="6" y1="3" x2="6" y2="15"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></>,
     send: <><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7Z"/></>,
     alert: <><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></>,
     // Feedback: a speech bubble carrying an exclamation — "say something".

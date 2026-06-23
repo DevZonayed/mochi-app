@@ -2667,10 +2667,14 @@ function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projec
   );
 }
 
-export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, onOpenImage, onOpenFile, flush, autoFocus }: {
+export function ChatThread({ projectId, project, sessionId, base, onSessionCreated, onTurns, onOpenImage, onOpenFile, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
   sessionId: string | null;
+  /** When opening a fresh "New chat" tab via the <BranchPicker /> popover, the
+      operator's chosen base branch — forwarded into sendChat so the session's
+      worktree forks from it on first send. Ignored once `sessionId` is real. */
+  base?: string;
   onSessionCreated?: (session: ChatSession) => void;
   /** Lifts this chat's turns (jobs) to the parent — used by the Workspace's
       "Changed files" panel to read the write-tool activity. */
@@ -2973,6 +2977,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     setSendError('');
     stickBottom.current = true;
     try {
+      // `base` is the operator's branch pick from <BranchPicker /> for an
+      // un-sent "New chat" tab. The server pins it onto the session at
+      // lazy-create time (sendChat path); ignored once a session already exists.
       const resp = await api.sendChat({
         projectId, text: body, sessionId: activeRef.current ?? undefined,
         effort: EFFORT_TO_API[effort], plan: planMode, goal: goalMode, browser: composerBrowser,
@@ -2980,6 +2987,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
         ...(reviewerKey ? { reviewerKey } : {}),
         ...(imgs.length ? { images: imgs } : {}),
         ...(files.length ? { files } : {}),
+        ...(!activeRef.current && base ? { base } : {}),
       });
       if (activeRef.current !== resp.session.id) {
         activeRef.current = resp.session.id; // match the streamed job immediately
@@ -2994,7 +3002,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
       return false;
     }
-  }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, composerBrowser, onSessionCreated]);
+  }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, composerBrowser, base, onSessionCreated]);
 
   // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
   const sendText = React.useCallback((raw: string) => {

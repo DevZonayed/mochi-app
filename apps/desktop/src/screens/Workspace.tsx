@@ -18,6 +18,7 @@ import { displayCodename, SESSION_STATE_STRIPE, SESSION_STATE_LONG_LABELS, type 
 import { SessionStateDot } from './SessionStateDot';
 import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
+import { BranchPicker } from '../components/BranchPicker';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
@@ -77,7 +78,13 @@ const PAGE_CSS = `
 `;
 
 type ProjectSection = 'settings' | 'instructions' | 'jobs' | 'skills';
-interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image' | 'project'; filePath?: string; imageAssetId?: string; imagePath?: string; projectSection?: ProjectSection }
+interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image' | 'project'; filePath?: string; imageAssetId?: string; imagePath?: string; projectSection?: ProjectSection;
+  /** Non-default base branch picked via <BranchPicker /> for a not-yet-sent
+      "New chat" tab. Forwarded into sendChat so the session's worktree forks
+      from it on first send. Default-branch picks leave this undefined so the
+      tab title stays clean (no `· master` suffix). */
+  base?: string;
+}
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
@@ -134,6 +141,8 @@ export default function Workspace() {
   const [chatsAllOpen, setChatsAllOpen] = React.useState<Set<string>>(new Set());
   // Per-project "⋯" menu (settings / jobs / instructions / reveal …).
   const [menuProj, setMenuProj] = React.useState<string | null>(null);
+  // Which project's "+" button has the <BranchPicker /> popover open (one at a time).
+  const [pickerProj, setPickerProj] = React.useState<string | null>(null);
   // Project pending a delete confirmation (the destructive modal).
   const [confirmDelProj, setConfirmDelProj] = React.useState<string | null>(null);
   // Per-project "Archived" sub-list expanded state.
@@ -357,9 +366,12 @@ export default function Workspace() {
     setTabs(ts => [...ts, { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title }]);
     setActiveKey(s.id);
   };
-  const newChat = (projectId: string) => {
+  /** Open a fresh "New chat" tab in `projectId`. Pass `base` to fork its
+      worktree from a specific branch (the picker's path); omit it for the
+      legacy default-branch flow (⌘/Ctrl+click on the "+" button). */
+  const newChat = (projectId: string, base?: string) => {
     const key = `new:${newCounter.current++}`;
-    setTabs(ts => [...ts, { key, projectId, sessionId: null, title: 'New chat' }]);
+    setTabs(ts => [...ts, { key, projectId, sessionId: null, title: 'New chat', ...(base ? { base } : {}) }]);
     setActiveKey(key);
     if (!expanded.has(projectId)) setExpanded(e => new Set(e).add(projectId));
   };
@@ -672,9 +684,36 @@ export default function Workspace() {
                     <button className="ws-newchat" title="Project · settings, jobs, memory" onClick={e => { e.stopPropagation(); setMenuProj(m => m === p.id ? null : p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0, position: 'relative' }}>
                       <Icon name="more" size={15} />
                     </button>
-                    <button className="ws-newchat" title="New chat here" onClick={e => { e.stopPropagation(); newChat(p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)', flexShrink: 0 }}>
-                      <Icon name="plus" size={14} stroke={2.4} />
-                    </button>
+                    <div style={{ position: 'relative', flexShrink: 0 }}>
+                      <button className="ws-newchat" title="New chat here — pick a base branch"
+                        onClick={e => {
+                          e.stopPropagation();
+                          setPickerProj(cur => cur === p.id ? null : p.id);
+                          setMenuProj(null); // don't stack two popovers on the same header
+                        }}
+                        style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)' }}>
+                        <Icon name="plus" size={14} stroke={2.4} />
+                      </button>
+                      {pickerProj === p.id && (
+                        <>
+                          {/* Outside-click captures every click; stops propagation on the popover. */}
+                          <div onClick={e => { e.stopPropagation(); setPickerProj(null); }} style={{ position: 'fixed', inset: 0, zIndex: 50 }} />
+                          <div onClick={e => e.stopPropagation()}
+                            style={{ position: 'absolute', top: '100%', right: 0, zIndex: 51, marginTop: 4 }}>
+                            <BranchPicker
+                              projectId={p.id}
+                              onClose={() => setPickerProj(null)}
+                              onPick={(branch, isDefault) => {
+                                setPickerProj(null);
+                                // Default → omit base so the tab title stays clean and the
+                                // engine's resolveBaseBranch path handles it (same as ⌘+click).
+                                newChat(p.id, isDefault ? undefined : branch);
+                              }}
+                            />
+                          </div>
+                        </>
+                      )}
+                    </div>
                     {menuProj === p.id && (
                       <>
                         <div onClick={e => { e.stopPropagation(); setMenuProj(null); }} style={{ position: 'fixed', inset: 0, zIndex: 50 }} />
@@ -766,9 +805,16 @@ export default function Workspace() {
                         onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}
                         style={{ minWidth: 0, maxWidth: 150, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
                     ) : (
-                      <span title={chatTab ? 'Double-click to rename' : undefined}
+                      <span title={chatTab ? 'Double-click to rename' : (t.base ? `New chat off ${t.base}` : undefined)}
                         onDoubleClick={chatTab ? (e => { e.stopPropagation(); setRenamingId(t.sessionId!); setRenameVal(t.title); }) : undefined}
-                        style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
+                        style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {t.title}
+                        {t.base && !t.sessionId && (
+                          // Subtle base-branch suffix on un-sent "New chat" tabs only.
+                          // Hidden once the session is real (its title takes over).
+                          <span style={{ marginLeft: 5, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-mono)' }}>· {t.base}</span>
+                        )}
+                      </span>
                     )}
                     <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
                       <Icon name="x" size={11} stroke={2.6} />
@@ -877,7 +923,7 @@ export default function Workspace() {
                     : t.kind === 'project'
                     ? <ProjectPanel projectId={t.projectId} section={t.projectSection} />
                     : <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
-                        sessionId={t.sessionId} onSessionCreated={onSessionCreated(t.key)} onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
+                        sessionId={t.sessionId} base={t.base} onSessionCreated={onSessionCreated(t.key)} onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
                         onOpenImage={(assetId, name, imagePath) => openImage(t.projectId, assetId, name, imagePath)}
                         onOpenFile={(filePath) => openFile(t.projectId, filePath)} />}
                 </div>
