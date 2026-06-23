@@ -30,6 +30,10 @@ export interface Project {
   kind?: ProjectKind;
   path?: string;
   repoUrl?: string;
+  /** Dual-repo bootstrap: the slug shared by the code repo + the memory
+      companion ('${user}/${slug}-memory'). Drives the openProject lifecycle. */
+  memorySlug?: string;
+  memoryRepoUrl?: string;
   /** Worktree base branch override (else auto-detected from origin/HEAD). */
   defaultBaseBranch?: string;
   /** Shell script run once in each new session worktree (e.g. install deps). */
@@ -813,10 +817,21 @@ export const api = {
   // Projects
   listProjects: (workspaceId?: string) =>
     call<Project[]>('listProjects', { workspaceId }, () => req<Project[]>('/api/projects' + qp({ workspaceId }))),
-  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }) =>
+  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string; memorySlug?: string; memoryRepoUrl?: string }) =>
     call<Project>('createProject', { ...input }, () =>
       req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) })),
-  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode'>>) =>
+  // openProject / closeProject: desktop-only lifecycle hooks for the dual-repo
+  // memory clone. openProject runs `git pull --rebase --autostash` on the
+  // memory repo, re-verifies the four symlinks, and starts a debounced
+  // auto-push watcher on STATE.md. closeProject stops the watcher. Both are
+  // no-ops on legacy projects (no memorySlug set). The renderer SHOULD call
+  // openProject on entry to the project view and closeProject on unmount.
+  openProject: (id: string) =>
+    call<{ ok: boolean; skipped?: true; reason?: string; pulled?: boolean; conflictsResolved?: number; linked?: boolean; watching?: boolean; error?: string }>(
+      'openProject', { id }, () => Promise.resolve({ ok: true, skipped: true as const, reason: 'remote' })),
+  closeProject: (id: string) =>
+    call<{ ok: boolean }>('closeProject', { id }, () => Promise.resolve({ ok: true })),
+  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl'>>) =>
     call<Project>('updateProject', { id, ...patch }, () =>
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   reorderProjects: (ids: string[]) =>

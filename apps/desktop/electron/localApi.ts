@@ -22,6 +22,7 @@ import { ghState } from './gh-cli.js';
 import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
 import { getViewer, listOwners } from './github.js';
 import { bootstrapNewProject, bootstrapProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
+import { openProjectMemory, closeMemoryWatcher } from './project-lifecycle.js';
 import type { GitService } from './git-service.js';
 import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
@@ -273,6 +274,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           color: p.color as string | undefined, kind,
           path: projPath,
           repoUrl: typeof p.repoUrl === 'string' && p.repoUrl ? p.repoUrl : undefined,
+          // memorySlug + memoryRepoUrl come back from bootstrapProject (dual-repo
+          // flow). Renderer passes them through so subsequent openProject can
+          // find the memory clone.
+          memorySlug: typeof p.memorySlug === 'string' && p.memorySlug ? p.memorySlug : undefined,
+          memoryRepoUrl: typeof p.memoryRepoUrl === 'string' && p.memoryRepoUrl ? p.memoryRepoUrl : undefined,
         });
         // If the project points at an existing repo on disk, wire the
         // trailer-stripping hook + align commit identity to the gh user.
@@ -283,9 +289,34 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('project', proj);
         return proj;
       }
+      // openProject: lifecycle hook the renderer calls when entering a project
+      // view. Pulls the memory clone, re-verifies the four symlinks, and starts
+      // a debounced auto-push watcher on STATE.md. Idempotent — re-opening
+      // the same project reuses the watcher. No-op when the project has no
+      // memorySlug (legacy projects pre-dual-repo).
+      case 'openProject': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (!proj) return bad('project not found', 404);
+        if (!proj.memorySlug || !proj.path) return { ok: true, skipped: true as const, reason: 'no-memory-repo' };
+        try {
+          const r = await openProjectMemory({ slug: proj.memorySlug, projectPath: proj.path });
+          return { ok: true, ...r };
+        } catch (e) {
+          // Surface the symlink/clobber errors with a clear message; the UI
+          // will show this so the operator knows to resolve manually.
+          return { ok: false, error: e instanceof Error ? e.message.slice(0, 240) : 'memory lifecycle failed' };
+        }
+      }
+      // closeProject: stop the STATE watcher when the operator leaves a
+      // project view (the renderer calls this on unmount).
+      case 'closeProject': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (proj?.memorySlug) closeMemoryWatcher(proj.memorySlug);
+        return { ok: true };
+      }
       case 'updateProject': {
         const patch: Record<string, unknown> = {};
-        for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl', 'defaultBaseBranch', 'setupScript'] as const) {
+        for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl', 'defaultBaseBranch', 'setupScript', 'memorySlug', 'memoryRepoUrl'] as const) {
           if (typeof p[k] === 'string') patch[k] = p[k];
         }
         if (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') patch.kind = p.kind;

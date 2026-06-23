@@ -38,6 +38,14 @@ export interface Workspace { id: string; name: string; budgetCap: number; create
 export interface Project {
   id: string; workspaceId: string; name: string; template: string; instructions: string; color: string;
   kind?: ProjectKind; path?: string; repoUrl?: string;
+  /** GitHub-first dual-repo bootstrap: the slug for both the code repo
+      (under whichever owner was picked) AND the memory repo (always
+      \${user}/\${slug}-memory). When set, openProject pulls the memory clone
+      + watches STATE.md for auto-commit. Absent on legacy projects. */
+  memorySlug?: string;
+  /** The companion memory repo's https url (for the renderer to surface as
+      a "View memory" link). Optional + redundant with memorySlug. */
+  memoryRepoUrl?: string;
   /** Worktree base branch override (else auto-detected from origin/HEAD). */
   defaultBaseBranch?: string;
   /** Shell script run once in each new session worktree (e.g. install deps). */
@@ -1027,19 +1035,20 @@ export class Store {
     while (taken.has(`${wanted} v${n}`)) n++;
     return `${wanted} v${n}`;
   }
-  createProject(args: { name: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }): Project {
+  createProject(args: { name: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string; memorySlug?: string; memoryRepoUrl?: string }): Project {
     const ws = this.data.workspace ?? this.createWorkspace('My Workspace');
     const t = now();
     const p: Project = {
       id: id(), workspaceId: ws.id, name: this.uniqueProjectName(args.name),
       template: args.template ?? 'claude-code', instructions: args.instructions ?? '', color: args.color ?? 'blue',
       kind: args.kind, path: args.path, repoUrl: args.repoUrl,
+      memorySlug: args.memorySlug, memoryRepoUrl: args.memoryRepoUrl,
       createdAt: t, updatedAt: t,
     };
     this.data.projects.push(p); this.save();
     return p;
   }
-  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode'>>): Project {
+  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl'>>): Project {
     const cur = this.getProject(projectId);
     if (!cur) throw Object.assign(new Error('project not found'), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });
