@@ -197,8 +197,12 @@ export async function bootstrapNewProject(
     }
   }
 
-  // Step 5: create the GitHub repo.
+  // Step 5: create the GitHub repo. We don't yet have an owner picker here
+  // (Step 9 of the dual-repo revision adds it); for the single-repo path
+  // currently in production we create under the authenticated user. Step 6
+  // of the dual-repo revision REWRITES this function to take owner explicitly.
   const repo = await createGitHubRepo(token, {
+    owner: { login: owner, kind: 'user' },
     name: slug,
     private: input.private,
     description: input.description,

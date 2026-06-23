@@ -199,19 +199,30 @@ export async function createRepo(token: string, name: string, opts: { private?: 
   return { cloneUrl: r.data.clone_url, sshUrl: r.data.ssh_url, fullName: r.data.full_name };
 }
 
-/** Create a GitHub repo under the authenticated user, returning the full set
-    of identifiers the bootstrap flow needs to wire `origin` locally (owner +
-    repo slug, plus the URLs). Wraps `createRepo` so callers don't have to
-    re-parse `full_name` themselves. Defaults to PRIVATE (Maestro projects
-    are real working repos, not demos). */
+/** Create a GitHub repo under the chosen owner (the user themselves OR one of
+    their orgs), returning the full set of identifiers the bootstrap flow needs
+    to wire `origin` locally. The endpoint differs by owner kind:
+      kind:'user' → POST /user/repos                  (always the authenticated user)
+      kind:'org'  → POST /orgs/${owner.login}/repos   (must be a member with create rights)
+    Defaults to PRIVATE (Maestro projects are real working repos, not demos)
+    and `autoInit:false` (bootstrap pushes its own initial commit — GitHub's
+    auto-init README would conflict). */
 export async function createGitHubRepo(
   token: string,
-  opts: { name: string; private?: boolean; description?: string },
+  opts: {
+    owner: { login: string; kind: 'user' | 'org' };
+    name: string;
+    private?: boolean;
+    description?: string;
+    /** Default false; bootstrap creates the first commit locally + pushes. */
+    autoInit?: boolean;
+  },
   fetchImpl?: FetchImpl,
 ): Promise<{ owner: string; repo: string; cloneUrl: string; htmlUrl: string }> {
+  const path = opts.owner.kind === 'org' ? `/orgs/${opts.owner.login}/repos` : '/user/repos';
   const r = await ghRequest<{ clone_url: string; html_url: string; full_name: string; owner: { login: string }; name: string }>({
-    token, method: 'POST', path: '/user/repos',
-    body: { name: opts.name, private: opts.private ?? true, auto_init: false, description: opts.description ?? '' },
+    token, method: 'POST', path,
+    body: { name: opts.name, private: opts.private ?? true, auto_init: !!opts.autoInit, description: opts.description ?? '' },
     fetchImpl,
   });
   return {

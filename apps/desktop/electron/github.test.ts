@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { ghRequest, getViewer, parseGitHubRemote, getRepo, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, pickMergeMethod, listOwners } from './github.js';
+import { ghRequest, getViewer, parseGitHubRemote, getRepo, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, pickMergeMethod, listOwners, createGitHubRepo } from './github.js';
 
 /** A fake fetch that routes by URL substring (for multi-call functions). */
 function routeFetch(routes: Array<{ match: string; status: number; body?: unknown; headers?: Record<string, string> }>): typeof fetch {
@@ -187,6 +187,47 @@ describe('listOwners', () => {
       { match: '/user', status: 401, body: { message: 'bad creds' } },
     ]);
     await expect(listOwners('tok', f)).rejects.toThrow(/login/i);
+  });
+});
+
+describe('createGitHubRepo', () => {
+  // The owner.kind choice routes the call to a DIFFERENT GitHub endpoint:
+  //   user → POST /user/repos     (always the authenticated user)
+  //   org  → POST /orgs/${login}/repos
+  // Crossing the two yields a confusing 404 with no hint, so these tests
+  // assert the exact path each branch picks.
+  test('owner.kind="user" → POSTs /user/repos', async () => {
+    const seen: string[] = [];
+    const f = (async (url: string) => {
+      seen.push(String(url));
+      return { status: 201, ok: true, headers: { get: () => null }, json: async () => ({ clone_url: 'c', html_url: 'h', full_name: 'me/repo', name: 'repo', owner: { login: 'me' } }) };
+    }) as unknown as typeof fetch;
+    const r = await createGitHubRepo('t', { owner: { login: 'me', kind: 'user' }, name: 'repo' }, f);
+    expect(seen[0]).toContain('/user/repos');
+    expect(r).toEqual({ owner: 'me', repo: 'repo', cloneUrl: 'c', htmlUrl: 'h' });
+  });
+  test('owner.kind="org" → POSTs /orgs/${login}/repos', async () => {
+    const seen: string[] = [];
+    const f = (async (url: string) => {
+      seen.push(String(url));
+      return { status: 201, ok: true, headers: { get: () => null }, json: async () => ({ clone_url: 'c', html_url: 'h', full_name: 'acme/repo', name: 'repo', owner: { login: 'acme' } }) };
+    }) as unknown as typeof fetch;
+    const r = await createGitHubRepo('t', { owner: { login: 'acme', kind: 'org' }, name: 'repo' }, f);
+    expect(seen[0]).toContain('/orgs/acme/repos');
+    expect(r.owner).toBe('acme');
+  });
+  // Two defaults we promise callers: private=true (Maestro repos are real
+  // working projects, not demos) and auto_init=false (we push our own
+  // initial commit; auto_init would race + leave a "merge" branch).
+  test('defaults private:true + auto_init:false', async () => {
+    let body: { private?: boolean; auto_init?: boolean } | undefined;
+    const f = (async (_url: string, init: { body?: string }) => {
+      body = JSON.parse(init.body ?? '{}');
+      return { status: 201, ok: true, headers: { get: () => null }, json: async () => ({ clone_url: 'c', html_url: 'h', full_name: 'me/x', name: 'x', owner: { login: 'me' } }) };
+    }) as unknown as typeof fetch;
+    await createGitHubRepo('t', { owner: { login: 'me', kind: 'user' }, name: 'x' }, f);
+    expect(body?.private).toBe(true);
+    expect(body?.auto_init).toBe(false);
   });
 });
 
