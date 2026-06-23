@@ -41,6 +41,11 @@ export interface SessionGitStatus {
   pr: PrStatus | null;
   state: SessionGitState;
   lastCheckedAt: number;
+  /** Whether GitHub was queried for this session's PR yet (mirror of
+      electron/pr-state.ts). `false` on the cheap local-only path; the workspace
+      overview uses it to avoid surfacing a PR-derivable state it can't yet
+      confirm (see workspace-overview.ts). */
+  prChecked?: boolean;
   snapshot?: LocalSnapshot;
 }
 export interface GithubConnection { connected: boolean; login: string | null; scopes: string[] | null; hasRepoScope: boolean; }

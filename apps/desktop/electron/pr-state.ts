@@ -62,6 +62,14 @@ export interface SessionGitStatus {
   pr: PrStatus | null;
   state: SessionGitState;
   lastCheckedAt: number;
+  /** Whether GitHub was actually queried for this session's PR yet. `false`
+      for the cheap local-only path (`fullStatus({ withPr:false })`) used by the
+      sidebar/overview lazy-fetch + the file-watcher. Sticky once true (a later
+      cheap recompute keeps the last known PR + this flag). Consumers that must
+      not over-claim a PR-derivable state — e.g. "ready-for-pr" literally asserts
+      "no open PR exists", which you can't know without a fetch — read this to
+      avoid showing a guess that the next poll will overturn. */
+  prChecked?: boolean;
   /** Renderer-facing extras for the GitOpsDock; absent on older callers. */
   snapshot?: LocalSnapshot;
 }

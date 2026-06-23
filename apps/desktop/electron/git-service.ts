@@ -75,9 +75,15 @@ export class GitService {
   /** Compute (optionally with a live PR fetch), cache, and emit the status. */
   async fullStatus(session: ChatSession, opts: { withPr?: boolean } = {}): Promise<SessionGitStatus> {
     const project = this.store.getProject(session.projectId);
+    const cached = this.cache.get(session.id);
     const local = project ? this.localState(session, project) : EMPTY_LOCAL;
-    let pr = this.cache.get(session.id)?.pr ?? null;
-    if (opts.withPr && project) pr = await this.prState(session, project);
+    let pr = cached?.pr ?? null;
+    const didCheckPr = !!opts.withPr && !!project;
+    if (didCheckPr) pr = await this.prState(session, project!);
+    // Sticky: once we've queried GitHub for this session, every later cheap
+    // recompute (file-watcher, local-only poll) keeps `prChecked` true so the
+    // overview strip doesn't flip the row back to a PR-unaware guess.
+    const prChecked = didCheckPr || (cached?.prChecked ?? false);
     const dir = project ? this.dirFor(session, project) : null;
     const base = session.baseBranch ?? (dir ? resolveBaseBranch(dir) : null);
     const status: SessionGitStatus = {
@@ -88,6 +94,7 @@ export class GitService {
       pr,
       state: deriveState(local, pr),
       lastCheckedAt: Date.now(),
+      prChecked,
       snapshot: this.snapshotFor(dir),
     };
     this.cache.set(session.id, status);
