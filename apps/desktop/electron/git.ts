@@ -6,7 +6,10 @@
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, readdirSync, statSync, copyFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
+import { promisify } from 'node:util';
 import path from 'node:path';
+
+const execFileP = promisify(execFile);
 
 let gitPath: string | null | undefined;
 export function resolveGit(): string | null {
@@ -202,6 +205,98 @@ function execGit(args: string[], opts: { timeout?: number } = {}): { ok: boolean
     return { ok: false, out: stderr.trim(), code: err.status ?? 1 };
   }
 }
+
+/* ── Async git (off the event loop) ──────────────────────────────────────
+   The status hot path (file-watcher recompute, overview lazy-fetch, the gentle
+   reconcile) runs MANY git reads. Done synchronously (execFileSync) each one
+   freezes the whole Node event loop until git returns — at scale (dozens of
+   worktrees) that's seconds of frozen UI. These async siblings run git via
+   execFile so the loop stays free, and a small semaphore bounds the number of
+   concurrent git processes so a burst of watcher events can't fork a storm.
+   Mutating ops (commit/push/merge/worktree add) stay sync — they run on user
+   action, never in a loop, so they can't jank the idle UI. */
+
+/** Max git child processes in flight from `execGitAsync` at once. */
+const MAX_CONCURRENT_GIT = 8;
+let activeGit = 0;
+const gitQueue: Array<() => void> = [];
+function acquireGitSlot(): Promise<void> {
+  if (activeGit < MAX_CONCURRENT_GIT) { activeGit++; return Promise.resolve(); }
+  return new Promise<void>((resolve) => { gitQueue.push(() => { activeGit++; resolve(); }); });
+}
+function releaseGitSlot(): void {
+  activeGit = Math.max(0, activeGit - 1);
+  const next = gitQueue.shift();
+  if (next) next();
+}
+
+/** Async sibling of `execGit`: never blocks the event loop, capped by the
+    module-level concurrency semaphore. Same `{ ok, out, code }` contract. */
+export async function execGitAsync(args: string[], opts: { timeout?: number } = {}): Promise<{ ok: boolean; out: string; code: number }> {
+  const git = resolveGit();
+  if (!git) return { ok: false, out: '', code: 127 };
+  await acquireGitSlot();
+  try {
+    const { stdout } = await execFileP(git, args, { encoding: 'utf8', timeout: opts.timeout ?? 15_000, maxBuffer: 16 * 1024 * 1024 });
+    return { ok: true, out: stdout.toString().trim(), code: 0 };
+  } catch (e) {
+    const err = e as { code?: number | string; status?: number; stderr?: Buffer | string };
+    const stderr = err.stderr == null ? '' : typeof err.stderr === 'string' ? err.stderr : err.stderr.toString();
+    const code = typeof err.code === 'number' ? err.code : (err.status ?? 1);
+    return { ok: false, out: stderr.trim(), code };
+  } finally {
+    releaseGitSlot();
+  }
+}
+
+/** Async twin of `resolveBaseBranch`. */
+export async function resolveBaseBranchAsync(repoDir: string): Promise<string> {
+  const head = await execGitAsync(['-C', repoDir, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+  if (head.ok && head.out) return head.out.replace(/^origin\//, '');
+  const cur = await execGitAsync(['-C', repoDir, 'rev-parse', '--abbrev-ref', 'HEAD']);
+  if (cur.ok && cur.out && cur.out !== 'HEAD') return cur.out;
+  return 'main';
+}
+
+/** Async twin of `aheadBehind`. */
+export async function aheadBehindAsync(dir: string, base: string): Promise<{ ahead: number; behind: number }> {
+  const r = await execGitAsync(['-C', dir, 'rev-list', '--left-right', '--count', `${base}...HEAD`]);
+  if (!r.ok) return { ahead: 0, behind: 0 };
+  const [left, right] = r.out.split(/\s+/);
+  const behind = Number(left);
+  const ahead = Number(right);
+  return { ahead: Number.isFinite(ahead) ? ahead : 0, behind: Number.isFinite(behind) ? behind : 0 };
+}
+
+/** Async twin of `isDirty`. */
+export async function isDirtyAsync(dir: string): Promise<boolean> {
+  const r = await execGitAsync(['-C', dir, 'status', '--porcelain']);
+  return r.ok && r.out.length > 0;
+}
+
+/** Async twin of `dirtyFileCount`. */
+export async function dirtyFileCountAsync(dir: string): Promise<number> {
+  const r = await execGitAsync(['-C', dir, 'status', '--porcelain']);
+  if (!r.ok || !r.out) return 0;
+  return r.out.split('\n').filter(line => line.length > 0).length;
+}
+
+/** Async twin of `lastCommitInfo`. */
+export async function lastCommitInfoAsync(dir: string): Promise<{ subject: string | null; at: number | null }> {
+  const r = await execGitAsync(['-C', dir, 'log', '-1', '--format=%s%n%at']);
+  if (!r.ok || !r.out) return { subject: null, at: null };
+  const [subject = '', atStr = ''] = r.out.split('\n');
+  const at = Number(atStr) * 1000;
+  return { subject: subject || null, at: Number.isFinite(at) && at > 0 ? at : null };
+}
+
+/** Async twin of `localRefExists`. */
+export async function localRefExistsAsync(dir: string, ref: string): Promise<boolean> {
+  return (await execGitAsync(['-C', dir, 'rev-parse', '--verify', '--quiet', ref])).code === 0;
+}
+
+/** Test seam: current count of in-flight async git processes (semaphore gauge). */
+export function _activeGitCount(): number { return activeGit; }
 
 /** The branch new worktrees fork from: origin/HEAD → current branch → 'main'. */
 export function resolveBaseBranch(repoDir: string): string {
