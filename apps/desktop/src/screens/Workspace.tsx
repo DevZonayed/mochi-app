@@ -1102,7 +1102,8 @@ export default function Workspace() {
                     : t.kind === 'project'
                     ? <ProjectPanel projectId={t.projectId} section={t.projectSection} />
                     : <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
-                        sessionId={t.sessionId} base={t.base} onSessionCreated={onSessionCreated(t.key)} onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
+                        sessionId={t.sessionId} base={t.base} onSessionCreated={onSessionCreated(t.key)} onOpenSession={openSession}
+                        onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
                         onOpenImage={(assetId, name, imagePath) => openImage(t.projectId, assetId, name, imagePath)}
                         onOpenFile={(filePath) => openFile(t.projectId, filePath)} />}
                 </div>

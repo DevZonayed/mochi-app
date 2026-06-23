@@ -2669,7 +2669,7 @@ function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projec
   );
 }
 
-export function ChatThread({ projectId, project, sessionId, base, onSessionCreated, onTurns, onOpenImage, onOpenFile, flush, autoFocus }: {
+export function ChatThread({ projectId, project, sessionId, base, onSessionCreated, onOpenSession, onTurns, onOpenImage, onOpenFile, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
   sessionId: string | null;
@@ -2678,6 +2678,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       worktree forks from it on first send. Ignored once `sessionId` is real. */
   base?: string;
   onSessionCreated?: (session: ChatSession) => void;
+  /** Open an EXISTING session in the host's tab system (Workspace) or
+      navigate (ProjectDetail). Wired by Track 7's "Continue from here" so the
+      newly-spawned continuation session becomes the active tab. */
+  onOpenSession?: (session: ChatSession) => void;
   /** Lifts this chat's turns (jobs) to the parent — used by the Workspace's
       "Changed files" panel to read the write-tool activity. */
   onTurns?: (jobs: Job[]) => void;
@@ -3270,6 +3274,28 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   const locked = useSessionLocked(activeId);
   const gitStatus = useSessionGitState(activeId);
   const mergedPr = locked && gitStatus?.pr ? gitStatus.pr : null;
+  const [continuing, setContinuing] = React.useState(false);
+  const continueFromHere = React.useCallback(async () => {
+    if (!activeId || !mergedPr || continuing) return;
+    setContinuing(true);
+    try {
+      const fresh = await api.continueSession({
+        sessionId: activeId,
+        baseRefName: mergedPr.baseRefName,
+        prNumber: mergedPr.number,
+        mergedAt: mergedPr.mergedAt,
+      });
+      // Tell the host (Workspace tabs / ProjectDetail) to OPEN the new session.
+      // We do NOT also auto-close the merged tab — the operator may want to
+      // glance back at the prior conversation while they keep going.
+      onSessionCreated?.(fresh);
+      onOpenSession?.(fresh);
+    } catch (e) {
+      setSendError(e instanceof Error ? e.message : 'Could not create the continuation session.');
+    } finally {
+      setContinuing(false);
+    }
+  }, [activeId, mergedPr, continuing, onSessionCreated, onOpenSession]);
 
   return (
     <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)', overflow: 'hidden',
@@ -3285,11 +3311,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       <ChatHeader sessionId={activeId} projectId={projectId} />
       {/* Track 7: merged-PR banner. Renders ONLY when the session is locked
           (state === 'pr-merged'). Sits ABOVE the transcript, NOT in the chat
-          header (that's T5/GitOpsDock territory). The Continue button hides
-          until the continuation-session handler is wired in a follow-up. */}
+          header (that's T5/GitOpsDock territory). */}
       {mergedPr && (
         <div style={{ position: 'relative', zIndex: 1, padding: '8px 0 4px' }}>
-          <MergedSessionBanner pr={mergedPr} />
+          <MergedSessionBanner pr={mergedPr} onContinue={continueFromHere} continuing={continuing} />
         </div>
       )}
       <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
@@ -3922,7 +3947,8 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
 
       {/* thread + composer (shared) */}
       <ChatThread projectId={projectId} project={project} sessionId={activeId}
-        onSessionCreated={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }} />
+        onSessionCreated={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }}
+        onOpenSession={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }} />
 
       {syncOpen && projectId && (
         <SyncModal projectId={projectId} onClose={() => setSyncOpen(false)}
