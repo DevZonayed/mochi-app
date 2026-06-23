@@ -33,6 +33,7 @@ import type { GithubConnection } from '../lib/git-types';
 import { SessionStateDot } from '../screens/SessionStateDot';
 import { useSession } from '../lib/useSessionGitState';
 import { useGitOpsState, runGitOpsAction, type GitOpsAction } from '../hooks/useGitOpsState';
+import { AiConflictResolveDialog } from './AiConflictResolveDialog';
 
 /* ── inline ConfirmDialog (replace with #63's PrActionConfirmDialog when merged) ── */
 function ConfirmDialog({ open, title, body, okText, danger, onCancel, onOk, busy }: {
@@ -216,6 +217,9 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
   const [feedback, setFeedback] = React.useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
   const [pendingConfirm, setPendingConfirm] = React.useState<GitOpsAction | null>(null);
   const [composerOpen, setComposerOpen] = React.useState(false);
+  /* T8: opens the AI-resolve dialog instead of the destructive merge-base
+     confirm when the operator clicks Resolve on a pr-conflicts session. */
+  const [aiResolveOpen, setAiResolveOpen] = React.useState(false);
   const [gh, setGh] = React.useState<GithubConnection | null>(null);
   const [copied, setCopied] = React.useState(false);
 
@@ -279,6 +283,11 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
   const trigger = (action: GitOpsAction): void => {
     if (action.stub) { setFeedback({ kind: 'ok', text: 'Coming in T7 — Continue from here.' }); return; }
     if (action.kind === 'commit') { setComposerOpen(true); return; }
+    // T8: the Resolve action on pr-conflicts opens the AI-resolve dialog
+    // (full-featured: hunk preview + optional instructions + dispatch to
+    // the chat). The legacy destructive merge-base path remains accessible
+    // via the agent's pr_resolve_conflicts tool once the dialog runs.
+    if (action.kind === 'resolve') { setAiResolveOpen(true); return; }
     if (action.destructive || action.confirm) { setPendingConfirm(action); return; }
     void execute(action);
   };
@@ -525,6 +534,23 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
       <CommitComposer open={composerOpen} busy={busy}
         onCancel={() => setComposerOpen(false)}
         onSubmit={(s, b) => { void onCommitSubmit(s, b); }} />
+
+      {/* T8 — AI conflict resolve dialog. Only rendered for pr-conflicts. */}
+      {aiResolveOpen && session && (
+        <AiConflictResolveDialog
+          open={aiResolveOpen}
+          sessionId={sessionId}
+          projectId={session.projectId}
+          branch={status.branch}
+          prTitle={status.pr?.title ?? session.title ?? null}
+          onClose={() => {
+            setAiResolveOpen(false);
+            setFeedback({ kind: 'ok', text: 'AI is resolving conflicts — see chat.' });
+            // Refresh status when the agent finishes; cheap and cached.
+            api.refreshSessionGitStatus(sessionId).catch(() => {});
+          }}
+        />
+      )}
     </div>
   );
 }
