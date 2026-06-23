@@ -79,6 +79,21 @@ export interface TranscriptItem {
   preview?: string;
   /** ask only: JSON of the AskUserQuestion input ({ questions:[{question,header,options,multiSelect}] }). */
   ask?: string;
+  /** tool only: the SDK's tool_use_id — used to route nested sub-agent events
+      (Task/Agent dispatches) back to this chip so the UI can expand to show
+      the sub-agent's own transcript. */
+  id?: string;
+  /** tool only (sub-agent calls — Task/Agent): the sub-agent's own transcript
+      — its tool calls, thinking, and prose — captured live from events tagged
+      with `parent_tool_use_id`. Renders inside an expandable section under the
+      parent chip so the operator can SEE what the sub-agent did instead of
+      staring at a duration + checkmark. Capped at 60 nested items per parent. */
+  children?: TranscriptItem[];
+  /** tool only (sub-agent calls): the sub-agent's FINAL text response,
+      unpacked from the tool_result content so the parent chip can preview the
+      answer ("→ <first 240 chars>…") without expanding. The full text shows
+      when expanded. */
+  result?: string;
   /** image only: the Asset id this image was registered as (resolved to bytes on the Mac via the maestro:assetImage IPC — never sent to the relay). */
   assetId?: string;
   /** image only: absolute local path on this Mac (used for reveal-in-Finder/copy; STRIPPED from the relay snapshot). */
@@ -1563,10 +1578,25 @@ export class Store {
     const slimItem = (t: TranscriptItem): TranscriptItem => {
       if (t.kind === 'image') { const { imagePath: _omit, ...rest } = t; return rest; }
       const text = scrub(t.text.length > 4000 ? t.text.slice(0, 4000) + '…' : t.text);
-      return text === t.text ? t : { ...t, text };
+      // Sub-agent children: cap the array (a chatty Plan agent can run dozens
+      // of nested tool steps) AND cap each child's text the same way as a
+      // top-level item, so the relay payload stays bounded. The phone can
+      // still read the parent's `result` for the final answer.
+      const kids = t.children;
+      const slimKids = !kids ? undefined
+        : (kids.length <= 60 && !kids.some(k => k.text.length > 4000 || k.kind === 'image' || k.text.includes('@/'))) ? kids
+        : kids.slice(-60).map(slimItem);
+      // Final-response preview cap (the FULL response still lives on the Mac;
+      // 8 KB is plenty for an expanded mobile sheet without ballooning SSE frames).
+      const slimResult = t.result && t.result.length > 8000 ? t.result.slice(0, 8000) + '…' : t.result;
+      const textChanged = text !== t.text;
+      const kidsChanged = slimKids !== kids;
+      const resultChanged = slimResult !== t.result;
+      if (!textChanged && !kidsChanged && !resultChanged) return t;
+      return { ...t, ...(textChanged ? { text } : {}), ...(kidsChanged ? { children: slimKids } : {}), ...(resultChanged ? { result: slimResult } : {}) };
     };
     const transcript = !tr ? undefined
-      : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image' || t.text.includes('@/'))) ? tr
+      : (tr.length <= 60 && !tr.some(t => t.text.length > 4000 || t.kind === 'image' || t.text.includes('@/') || (t.children && t.children.length > 0) || (t.result && t.result.length > 8000))) ? tr
       : tr.slice(-60).map(slimItem);
     const needsImgStrip = j.inputImages?.some(im => im.imagePath !== undefined);
     const inputImages = needsImgStrip ? j.inputImages!.map(({ imagePath: _omit, ...rest }) => rest as ChatImage) : j.inputImages;
