@@ -131,7 +131,24 @@ function renderText(text: string, keyBase: string): React.ReactNode[] {
   return out;
 }
 
+/* Children of a sub-agent (Task/Agent dispatch) — its own tool calls, thinking
+   blocks, and prose, rendered as a calm flat list under an indent rail. */
+function NestedTranscript({ items }: { items: TranscriptItem[] }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {items.map((it, i) => {
+        if (it.kind === 'tool') return <ToolStep key={i} item={it} />;
+        if (it.kind === 'thinking') return <ThinkingStep key={i} item={it} />;
+        if (it.text && it.text.trim()) return <React.Fragment key={i}>{renderText(it.text, `nt${i}`)}</React.Fragment>;
+        return null;
+      })}
+    </div>
+  );
+}
+
 // One real tool step — a FLAT row (no card), short verb + filename chip / detail.
+// Sub-agent (Task/Agent) chips carry `children[]` + a final `result`: they get a
+// chevron + step count + answer preview, and tap-to-expand into the inner work.
 function ToolStep({ item }: { item: TranscriptItem }) {
   const running = item.toolStatus === 'running';
   const error = item.toolStatus === 'error';
@@ -143,23 +160,70 @@ function ToolStep({ item }: { item: TranscriptItem }) {
   const hasCmd = !!item.cmd && !showFile && !isSkill;
   const detail = isSkill ? prettySkillName(item.text) : item.text;
   const detailFont = !isSkill && !!d.mono && !hasCmd ? 'var(--font-mono)' : 'var(--font-text)';
+  // Sub-agent chip: has captured children OR a final response. We auto-expand
+  // while it's RUNNING so the operator sees the live progress without clicking,
+  // then collapse on completion (the answer preview tells them the destination).
+  const childCount = item.children?.length ?? 0;
+  const hasNest = childCount > 0 || !!(item.result && item.result.trim());
+  const [expanded, setExpanded] = React.useState(false);
+  const isOpen = hasNest && (expanded || running);
+  const resultPreview = item.result ? item.result.replace(/\s+/g, ' ').trim().slice(0, 180) : '';
+  const stepLabel = childCount > 0 ? `${childCount} step${childCount === 1 ? '' : 's'}` : '';
   return (
-    <div style={{ display: 'flex', alignItems: hasCmd ? 'flex-start' : 'center', gap: 9, maxWidth: 720, padding: '4px 7px', borderRadius: 8 }}>
-      <span style={{ width: 16, flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'grid', placeItems: 'center', color: glyph }}><Icon name={isSkill ? 'spark' : d.icon} size={15} /></span>
-      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
-          <span style={{ font: '600 var(--fs-footnote)/1.4 var(--font-text)', color: error ? 'var(--red)' : 'var(--ink)', flexShrink: 0 }}>{short}</span>
-          {showFile
-            ? <FileChip path={item.text} preview={item.preview} />
-            : detail && <span style={{ flex: 1, minWidth: 0, font: `400 var(--fs-footnote)/1.4 ${detailFont}`, color: isSkill ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail}</span>}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: isOpen ? 4 : 0 }}>
+      <div
+        role={hasNest ? 'button' : undefined}
+        tabIndex={hasNest ? 0 : undefined}
+        onClick={hasNest ? () => setExpanded(e => !e) : undefined}
+        onKeyDown={hasNest ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(x => !x); } } : undefined}
+        className={hasNest ? 'tool-chip' : undefined}
+        style={{ display: 'flex', alignItems: hasCmd ? 'flex-start' : 'center', gap: 9, maxWidth: 720, padding: '4px 7px', borderRadius: 8, cursor: hasNest ? 'pointer' : 'default', userSelect: hasNest ? 'none' : undefined }}
+      >
+        <span style={{ width: 16, flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'grid', placeItems: 'center', color: glyph }}><Icon name={isSkill ? 'spark' : d.icon} size={15} /></span>
+        <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+            <span style={{ font: '600 var(--fs-footnote)/1.4 var(--font-text)', color: error ? 'var(--red)' : 'var(--ink)', flexShrink: 0 }}>{short}</span>
+            {showFile
+              ? <FileChip path={item.text} preview={item.preview} />
+              : detail && <span style={{ flex: 1, minWidth: 0, font: `400 var(--fs-footnote)/1.4 ${detailFont}`, color: isSkill ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail}</span>}
+          </div>
+          {hasCmd && <code style={{ alignSelf: 'flex-start', maxWidth: '100%', boxSizing: 'border-box', font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', background: 'var(--fill-tertiary)', borderRadius: 5, padding: '1px 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.cmd}</code>}
+          {/* Collapsed sub-agent: show a one-line preview of the final response
+              ("→ <first 180 chars>…"). Reveals the answer without forcing the
+              user to expand; the full text lives in the expansion below. */}
+          {hasNest && !isOpen && resultPreview && (
+            <span style={{ font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 680 }}>→ {resultPreview}{item.result && item.result.length > 180 ? '…' : ''}</span>
+          )}
         </div>
-        {hasCmd && <code style={{ alignSelf: 'flex-start', maxWidth: '100%', boxSizing: 'border-box', font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', background: 'var(--fill-tertiary)', borderRadius: 5, padding: '1px 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.cmd}</code>}
+        <span style={{ flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          {hasNest && stepLabel && (
+            <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', background: 'var(--fill-tertiary)', borderRadius: 8, padding: '2px 7px' }}>{stepLabel}</span>
+          )}
+          {running ? <span className="breathe" style={{ width: 8, height: 8, borderRadius: 4, background: isSkill ? 'var(--purple)' : d.tint }} />
+            : error ? <Icon name="x" size={12} stroke={2.6} style={{ color: 'var(--red)' }} />
+            : <>{item.durMs != null && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{fmtToolDur(item.durMs)}</span>}<Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)' }} /></>}
+          {hasNest && (
+            <Icon name={isOpen ? 'chevronDown' : 'chevronRight'} size={13} style={{ color: 'var(--ink-tertiary)' }} />
+          )}
+        </span>
       </div>
-      <span style={{ flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-        {running ? <span className="breathe" style={{ width: 8, height: 8, borderRadius: 4, background: isSkill ? 'var(--purple)' : d.tint }} />
-          : error ? <Icon name="x" size={12} stroke={2.6} style={{ color: 'var(--red)' }} />
-          : <>{item.durMs != null && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{fmtToolDur(item.durMs)}</span>}<Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)' }} /></>}
-      </span>
+      {/* Expansion: the sub-agent's OWN transcript (its tool calls, thinking,
+          prose) + a Response block with the final text. Indent rail mirrors
+          the Thinking block styling so the nesting is visually unambiguous. */}
+      {isOpen && (
+        <div style={{ marginLeft: 22, paddingLeft: 12, borderLeft: '1.5px solid color-mix(in srgb, var(--purple) 22%, var(--separator))', display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 2, paddingBottom: 4 }}>
+          {item.children && item.children.length > 0 && <NestedTranscript items={item.children} />}
+          {item.result && item.result.trim() && (
+            <div style={{ maxWidth: 700 }}>
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7, marginBottom: 6 }}>
+                <span style={{ width: 18, height: 18, borderRadius: 6, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)' }}><Icon name="check" size={11} stroke={2.6} /></span>
+                <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--purple)' }}>Response</span>
+              </div>
+              <div style={{ font: '400 var(--fs-footnote)/1.66 var(--font-text)', color: 'var(--ink)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: '10px 12px', background: 'color-mix(in srgb, var(--purple) 4%, var(--bg-elevated))', border: '0.5px solid color-mix(in srgb, var(--purple) 18%, var(--separator))', borderRadius: 10 }}>{item.result}</div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

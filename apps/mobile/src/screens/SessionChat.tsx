@@ -201,6 +201,24 @@ function toolDisplay(name: string): { short: string; icon: IconName; tint: 'blue
 }
 const baseName = (p: string): string => (p.split(/[?#]/)[0].split(/[\\/]/).filter(Boolean).pop() || p).trim();
 
+/* Children of a sub-agent (Task/Agent dispatch) — its own tool calls, thinking
+   blocks, and prose, rendered as a calm flat list under an indent rail. Each
+   item recursively uses the same ToolRow / ThinkingRow / Markdown components
+   so a sub-agent that dispatched ITS OWN sub-agent still renders correctly. */
+function NestedTranscript({ items }: { items: TranscriptItem[] }) {
+  const { theme } = useTheme();
+  return (
+    <View style={{ gap: 4 }}>
+      {items.map((it, i) => {
+        if (it.kind === 'tool') return <ToolRow key={i} item={it} />;
+        if (it.kind === 'thinking') return <ThinkingRow key={i} item={it} />;
+        if (it.text && it.text.trim()) return <Markdown key={i} text={it.text} color={theme.color.ink} size={13} />;
+        return null;
+      })}
+    </View>
+  );
+}
+
 function ToolRow({ item }: { item: TranscriptItem }) {
   const { theme } = useTheme();
   const running = item.toolStatus === 'running';
@@ -216,7 +234,17 @@ function ToolRow({ item }: { item: TranscriptItem }) {
   const trailing = running ? <ActivityIndicator size="small" color={theme.color.purple} />
     : error ? <Icon name="x" size={13} color={theme.color.red} stroke={2.6} />
       : <Icon name="check" size={13} color={theme.color.green} stroke={2.6} />;
-  return (
+  // Sub-agent (Task/Agent dispatch) chip carries captured children OR a final
+  // response. Auto-expand while RUNNING so the phone shows the live step trail
+  // (matches the desktop), then collapse on completion with a one-line answer
+  // preview so the timeline stays calm.
+  const childCount = item.children?.length ?? 0;
+  const hasNest = childCount > 0 || !!(item.result && item.result.trim());
+  const [expanded, setExpanded] = useState(false);
+  const isOpen = hasNest && (expanded || running);
+  const stepLabel = childCount > 0 ? `${childCount} step${childCount === 1 ? '' : 's'}` : '';
+  const resultPreview = item.result ? item.result.replace(/\s+/g, ' ').trim().slice(0, 140) : '';
+  const Row = (
     <View style={{ flexDirection: 'row', alignItems: hasCmd ? 'flex-start' : 'center', gap: 9, paddingVertical: 5, paddingHorizontal: 7 }}>
       <View style={{ width: 18, alignItems: 'center', justifyContent: 'center', marginTop: hasCmd ? 1 : 0 }}>
         <Icon name={isSkill ? 'spark' : d.icon} size={15} color={glyph} />
@@ -227,11 +255,51 @@ function ToolRow({ item }: { item: TranscriptItem }) {
           {detail ? <Text numberOfLines={1} style={{ flex: 1, fontSize: 13, fontFamily: detailMono ? theme.fontFamily.mono : undefined, color: isSkill ? theme.color.ink : theme.color.inkSecondary }}>{detail}</Text> : null}
         </View>
         {hasCmd ? <Text numberOfLines={1} style={{ alignSelf: 'flex-start', maxWidth: '100%', fontSize: 11, fontFamily: theme.fontFamily.mono, color: theme.color.inkSecondary, backgroundColor: theme.color.fillTertiary, borderRadius: 5, paddingHorizontal: 6, paddingVertical: 1, overflow: 'hidden' }}>{item.cmd}</Text> : null}
+        {/* Collapsed sub-agent: one-line preview of the final answer. Reveals
+            the destination without forcing the user to tap. */}
+        {hasNest && !isOpen && resultPreview ? (
+          <Text numberOfLines={1} style={{ fontSize: 11, color: theme.color.inkTertiary }}>→ {resultPreview}{item.result && item.result.length > 140 ? '…' : ''}</Text>
+        ) : null}
       </View>
       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: hasCmd ? 2 : 0 }}>
+        {hasNest && stepLabel ? (
+          <View style={{ backgroundColor: theme.color.fillTertiary, borderRadius: 8, paddingHorizontal: 7, paddingVertical: 2 }}>
+            <Text style={{ fontSize: 10, fontWeight: '600', color: theme.color.inkTertiary }}>{stepLabel}</Text>
+          </View>
+        ) : null}
         {item.durMs != null && !running && !error ? <Text style={{ fontSize: 11, fontFamily: theme.fontFamily.mono, color: theme.color.inkTertiary }}>{item.durMs < 1000 ? `${item.durMs}ms` : `${(item.durMs / 1000).toFixed(1)}s`}</Text> : null}
         {trailing}
+        {hasNest ? <Icon name={isOpen ? 'chevronDown' : 'chevronRight'} size={13} color={theme.color.inkTertiary} /> : null}
       </View>
+    </View>
+  );
+  if (!hasNest) return Row;
+  return (
+    <View>
+      <Pressable onPress={() => setExpanded(e => !e)} android_ripple={{ color: theme.color.fillTertiary }}>
+        {Row}
+      </Pressable>
+      {/* Sub-agent expansion: indent rail + nested transcript + a Response
+          block with the final text. Mirrors the ThinkingRow rail so the
+          nesting is visually unambiguous. */}
+      {isOpen ? (
+        <View style={{ marginLeft: 16, paddingLeft: 11, borderLeftWidth: 1.5, borderLeftColor: theme.color.purple + '3d', gap: 6, paddingTop: 4, paddingBottom: 4 }}>
+          {item.children && item.children.length > 0 ? <NestedTranscript items={item.children} /> : null}
+          {item.result && item.result.trim() ? (
+            <View style={{ marginTop: 4 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7, marginBottom: 6 }}>
+                <View style={{ width: 18, height: 18, borderRadius: 6, alignItems: 'center', justifyContent: 'center', backgroundColor: theme.color.purple + '24' }}>
+                  <Icon name="check" size={11} color={theme.color.purple} stroke={2.6} />
+                </View>
+                <Text style={{ fontSize: 11, fontWeight: '600', letterSpacing: 0.6, textTransform: 'uppercase', color: theme.color.purple }}>Response</Text>
+              </View>
+              <View style={{ padding: 10, borderRadius: 10, backgroundColor: theme.color.purple + '0d', borderWidth: 0.5, borderColor: theme.color.purple + '2e' }}>
+                <Markdown text={item.result} color={theme.color.ink} size={13} />
+              </View>
+            </View>
+          ) : null}
+        </View>
+      ) : null}
     </View>
   );
 }

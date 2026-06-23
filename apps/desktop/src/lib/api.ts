@@ -115,6 +115,18 @@ export interface TranscriptItem {
   /** file-writing tools only: capped snapshot of the written content (hover preview). */
   preview?: string;
   ask?: string;
+  /** tool only: the SDK's tool_use_id — used to route nested sub-agent events
+      back to this chip so the UI can expand to show the sub-agent's transcript. */
+  id?: string;
+  /** tool only (sub-agent calls — Task/Agent): the sub-agent's own captured
+      transcript (its tool calls, thinking, prose). Rendered inside an
+      expandable section under the parent chip. Capped per parent on the
+      desktop side. */
+  children?: TranscriptItem[];
+  /** tool only (sub-agent calls): the sub-agent's FINAL text response,
+      unpacked from the tool_result content so the collapsed chip can preview
+      the answer and the expansion can show it in full. */
+  result?: string;
   /** image only: the Asset id (resolved to bytes on the Mac via api.assetImage; never sent to the relay). */
   assetId?: string;
   /** image only: absolute Mac-local path (reveal-in-Finder/copy; stripped from the relay snapshot). */
