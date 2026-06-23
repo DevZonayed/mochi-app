@@ -19,6 +19,9 @@ import { pickCityCodename } from './codenames.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
 import { ghState } from './gh-cli.js';
+import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
+import { getViewer } from './github.js';
+import { bootstrapNewProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
 import type { GitService } from './git-service.js';
 import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
@@ -1039,6 +1042,71 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'githubLoginCancel': return engine.githubLoginCancel();
       // Whether `gh` is already present (system or managed) — gates the UI hint.
       case 'ghCliState': return ghState();
+
+      // ── GitHub-first project bootstrap ───────────────────────────────
+      // checkSlug: live availability for the New-project name field. Debounced
+      // by the renderer (300ms). Returns the slugified form + whether it's
+      // free + an alternate suggestion when taken. Cheap (1–5 GitHub calls);
+      // the cascade short-circuits as soon as a free slug is found. Soft-fails
+      // when github isn't connected: the UI still shows the slug + a 'no-auth'
+      // hint, and the actual bootstrap call surfaces the same problem loudly.
+      case 'checkSlug': {
+        const rawName = String(p.name ?? '');
+        const slug = slugify(rawName);
+        const token = providers.getLocalKey('github');
+        if (!token) return { slug, available: null as boolean | null, suggestion: slug, owner: null as string | null, reason: 'not-authenticated' };
+        try {
+          const v = await getViewer(token);
+          const owner = v.login;
+          if (!owner) return { slug, available: null, suggestion: slug, owner: null, reason: 'no-login' };
+          const probe = await checkRepoAvailable(token, owner, slug);
+          if (probe.available) return { slug, available: true, suggestion: slug, owner, reason: 'ok' as const };
+          const suggestion = await suggestAvailableSlug(token, owner, rawName);
+          return { slug, available: false, suggestion, owner, existing: probe.existing, reason: 'taken' as const };
+        } catch (e) {
+          return { slug, available: null, suggestion: slug, owner: null, reason: 'error', error: e instanceof Error ? e.message.slice(0, 160) : 'lookup failed' };
+        }
+      }
+      // bootstrapProject: create the GitHub repo + seed local files + initial
+      // commit + push. The renderer calls this from the "Create" button after
+      // checkSlug has shown what the chosen slug will be. Returns the resolved
+      // slug + html_url so the UI can show "Created github.com/owner/slug ✓".
+      // Optional `adopt`: skip `git init` for a folder that's already a repo.
+      // Optional `remoteOnly`: don't touch the working tree at all (existing
+      // committed repo, no remote — we just create + push origin).
+      case 'bootstrapProject': {
+        const name = String(p.name ?? '').trim();
+        if (!name) bad('name required');
+        const localPath = String(p.localPath ?? '').trim();
+        if (!localPath) bad('localPath required');
+        const token = providers.getLocalKey('github');
+        if (!token) bad('Sign in to GitHub before creating a GitHub-first project.', 401);
+        const isPrivate = p.private === undefined ? true : Boolean(p.private);
+        const skipInit = Boolean(p.adopt) || Boolean(p.skipInit);
+        const remoteOnly = Boolean(p.remoteOnly);
+        return bootstrapNewProject(token as string, {
+          name, localPath, private: isPrivate,
+          description: typeof p.description === 'string' ? p.description.slice(0, 350) : undefined,
+          skipInit, remoteOnly,
+        }, { fs: realFs, git: realGit });
+      }
+      // adoptFolderInspect: classify an existing local folder for the adopt
+      // flow — has-git / has-github-remote / has-non-github-remote / no-git.
+      // Renderer uses this to decide whether to offer "create GitHub repo for
+      // this folder" or just record the existing remote and move on.
+      case 'adoptFolderInspect': {
+        const dir = String(p.path ?? '').trim();
+        if (!dir) bad('path required');
+        const inspected = inspectFolder(dir);
+        if (!inspected.ok) return { ok: false, path: dir, error: inspected.error };
+        const remote = inspected.info.isRepo ? readOriginRemote(dir) : null;
+        const isGitHub = !!remote && /github\.com[:/]/i.test(remote);
+        const kind = !inspected.info.isRepo ? 'no-git' as const
+          : !remote ? 'git-no-remote' as const
+          : isGitHub ? 'git-github' as const
+          : 'git-non-github' as const;
+        return { ok: true, path: dir, info: inspected.info, remote, kind };
+      }
 
       // ── Media Studio (real fal generation) ─────────────────────
       case 'mediaRates': return media.rates();
