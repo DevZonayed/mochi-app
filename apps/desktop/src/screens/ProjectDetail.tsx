@@ -32,7 +32,9 @@ import { OpenPathContext, pathIsInside, type OpenPathFn } from '../lib/openPath'
 import { displayCodename } from '../lib/git-types';
 import { GitOpsDock } from '../components/GitOpsDock';
 import { SessionStateDot } from './SessionStateDot';
-import { useSession, useSessionStateOnly } from '../lib/useSessionGitState';
+import { useSession, useSessionStateOnly, useSessionGitState } from '../lib/useSessionGitState';
+import { useSessionLocked } from '../hooks/useSessionLocked';
+import { MergedSessionBanner } from '../components/MergedSessionBanner';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -3261,6 +3263,14 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     setMentionQuery(null); setMentionSel(0);
   };
 
+  // ── Track 7: lock-after-merge ───────────────────────────────────────────
+  // The composer is read-only when this session's PR has been merged. The
+  // banner + lock both read from the SAME `pr-merged` state, so they never
+  // disagree (e.g. banner up but composer alive, or vice versa).
+  const locked = useSessionLocked(activeId);
+  const gitStatus = useSessionGitState(activeId);
+  const mergedPr = locked && gitStatus?.pr ? gitStatus.pr : null;
+
   return (
     <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)', overflow: 'hidden',
       ...(flush ? {} : { borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)' }) }}>
@@ -3273,6 +3283,15 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       {/* Conductor-style chat header: codename + state chip + Archive. The
           GitOpsDock (Track 5) gates itself for non-repo / null sessions. */}
       <ChatHeader sessionId={activeId} projectId={projectId} />
+      {/* Track 7: merged-PR banner. Renders ONLY when the session is locked
+          (state === 'pr-merged'). Sits ABOVE the transcript, NOT in the chat
+          header (that's T5/GitOpsDock territory). The Continue button hides
+          until the continuation-session handler is wired in a follow-up. */}
+      {mergedPr && (
+        <div style={{ position: 'relative', zIndex: 1, padding: '8px 0 4px' }}>
+          <MergedSessionBanner pr={mergedPr} />
+        </div>
+      )}
       <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
         <div style={{ maxWidth: CHAT_W, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
           {turns.length === 0 && (
@@ -3396,8 +3415,8 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
               <RichComposer
                 ref={composerRef}
-                disabled={!projectId}
-                placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
+                disabled={!projectId || locked}
+                placeholder={!projectId ? 'Pick a project first' : locked ? 'View only — this PR has been merged' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
                 onTextChange={setText}
                 onChips={info => {
                   setComposerBrowser(info.hasBrowser);
@@ -3445,10 +3464,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                   </button>
                 </>
               ) : (
-                <button onClick={sendComposed} disabled={!canSend || !projectId} className="send-fab" title="Send (Enter)" style={{
+                <button onClick={sendComposed} disabled={!canSend || !projectId || locked} className="send-fab" title={locked ? 'View only — this PR has been merged' : 'Send (Enter)'} style={{
                   width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
-                  background: canSend ? 'var(--blue)' : 'var(--fill-secondary)', color: canSend ? '#fff' : 'var(--ink-secondary)',
-                  boxShadow: canSend ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: canSend ? 'pointer' : 'default' }}>
+                  background: canSend && !locked ? 'var(--blue)' : 'var(--fill-secondary)', color: canSend && !locked ? '#fff' : 'var(--ink-secondary)',
+                  boxShadow: canSend && !locked ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: canSend && !locked ? 'pointer' : 'default' }}>
                   <Icon name="arrowRight" size={18} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
                 </button>
               )}
