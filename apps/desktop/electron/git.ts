@@ -396,6 +396,25 @@ export function renameLocalBranch(wtDir: string, from: string, to: string): { ok
   return r.ok ? { ok: true } : { ok: false, reason: r.out.slice(0, 200) };
 }
 
+/** List worktree paths that currently carry unmerged conflict markers (status
+    code U on either side). Read-only: just inspects `git status --porcelain`,
+    so it's safe to call as part of a preview / dialog without touching the
+    worktree. Empty array on a clean worktree or non-repo. */
+export function listConflictedFiles(dir: string): string[] {
+  const r = execGit(['-C', dir, 'status', '--porcelain']);
+  if (!r.ok) return [];
+  const out: string[] = [];
+  for (const line of r.out.split('\n')) {
+    if (line.length < 3) continue;
+    const xy = line.slice(0, 2);
+    // Unmerged paths: "UU", "AA", "DD", "AU", "UA", "DU", "UD" — any 'U' in xy.
+    if (xy.includes('U') || xy === 'AA' || xy === 'DD') {
+      out.push(line.slice(3).trim());
+    }
+  }
+  return out;
+}
+
 /** Merge `base` (preferring origin/<base>) into the current branch in `dir`. A
     clean merge auto-commits; on conflict, returns the conflicted file paths and
     leaves the merge in progress so an agent/operator can resolve them. */

@@ -6,7 +6,7 @@
    falls back to REST against the relay server, which mirrors the Mac's pushed
    state and forwards commands to it — the web app is a remote control. */
 
-import type { SessionGitStatus, GithubConnection } from './git-types';
+import type { SessionGitStatus, GithubConnection, MergePreviewResult, ResolvePreviewResult, PrConfirmRequest } from './git-types';
 
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
@@ -1328,6 +1328,14 @@ export const api = {
   resolveSession: (sessionId: string) =>
     call<{ ok: boolean; conflicts: string[]; reason?: string }>('resolveSession', { sessionId }, () =>
       req<{ ok: boolean; conflicts: string[]; reason?: string }>(`/api/sessions/${sessionId}/resolve`, { method: 'POST' })),
+  /** Renderer-only previews — see electron/git-ctx.ts for the gating contract.
+      Used by PrActionConfirmDialog to render the hard-button modal. */
+  previewSessionMerge: (sessionId: string, method?: 'merge' | 'squash' | 'rebase') =>
+    call<MergePreviewResult>('previewSessionMerge', { sessionId, method }, () =>
+      req<MergePreviewResult>(`/api/sessions/${sessionId}/preview-merge`, { method: 'POST', body: JSON.stringify({ method }) })),
+  previewSessionResolve: (sessionId: string) =>
+    call<ResolvePreviewResult>('previewSessionResolve', { sessionId }, () =>
+      req<ResolvePreviewResult>(`/api/sessions/${sessionId}/preview-resolve`, { method: 'POST' })),
   renameSessionBranch: (sessionId: string) =>
     call<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>('renameSessionBranch', { sessionId }, () =>
       req<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>(`/api/sessions/${sessionId}/rename-branch`, { method: 'POST' })),
@@ -1370,7 +1378,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void; onPrConfirmRequest?: (r: PrConfirmRequest) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as RemoteDevice[]);
@@ -1392,6 +1400,7 @@ export const api = {
         if (name === 'wa-message' && handlers.onWaMessage) handlers.onWaMessage(data as WaMessageEvent);
         if (name === 'wa-chats' && handlers.onWaChats) handlers.onWaChats();
         if (name === 'wa-message-update' && handlers.onWaMessageUpdate) handlers.onWaMessageUpdate(data as { chatId: string });
+        if (name === 'pr-confirm-request' && handlers.onPrConfirmRequest) handlers.onPrConfirmRequest(data as PrConfirmRequest);
       });
     }
     if (typeof EventSource === 'undefined') return () => {};

@@ -14,7 +14,7 @@ import { ProjectPanel } from '../lib/ProjectPanel';
 import { RightSidebar, type CheckItem } from '../lib/RightSidebar';
 import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
-import { displayCodename } from '../lib/git-types';
+import { displayCodename, SESSION_STATE_STRIPE, SESSION_STATE_LONG_LABELS, type SessionGitState } from '../lib/git-types';
 import { SessionStateDot } from './SessionStateDot';
 import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
@@ -475,10 +475,27 @@ export default function Workspace() {
     const open = tabs.some(t => t.sessionId === s.id);
     const isActive = activeTab?.sessionId === s.id;
     const p = projById[s.projectId];
+    // Live git/PR state → left-border stripe colour (gray=clean, amber=
+    // uncommitted, blue=PR open, green=mergeable, red=conflicts, etc.). The
+    // hook subscribes to the shared cache, so this only re-renders when THIS
+    // session's status fires. `no-repo` → transparent stripe (invisible) so
+    // the row layout stays the same and we don't surface a misleading dot.
+    const liveState: SessionGitState | null = useSessionStateOnly(s.id);
+    const stripeColor = liveState ? SESSION_STATE_STRIPE[liveState] : 'transparent';
+    const stripeLabel = liveState && liveState !== 'no-repo' ? SESSION_STATE_LONG_LABELS[liveState] : null;
     return (
-      <div className={`ws-row${isActive ? ' ws-active' : ''}`} onClick={() => openSession(s)} style={{
-        display: 'flex', alignItems: 'center', gap: 7, padding: `5px 8px 5px ${indent}px`, borderRadius: 8, cursor: 'pointer',
-        background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
+      <div className={`ws-row${isActive ? ' ws-active' : ''}`} onClick={() => openSession(s)}
+        aria-label={stripeLabel ? `${s.title} — ${stripeLabel}` : s.title}
+        title={stripeLabel ?? undefined}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 7,
+          // Internal padding adjusted so the 4px stripe takes the leftmost
+          // pixels and the row content visually starts at the same place.
+          padding: `5px 8px 5px ${Math.max(8, indent - 4)}px`,
+          borderRadius: 8, cursor: 'pointer',
+          borderLeft: `4px solid ${stripeColor}`,
+          background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent',
+        }}>
         {runningSessions.has(s.id)
           ? <Loader size={13} color={projColor(p)} />
           : <Icon name={s.branch ? 'gitMerge' : 'chat'} size={13} style={{ flexShrink: 0, color: open ? projColor(p) : 'var(--ink-tertiary)' }} />}
