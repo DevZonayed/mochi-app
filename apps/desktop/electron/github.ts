@@ -173,6 +173,29 @@ export async function createRepo(token: string, name: string, opts: { private?: 
   return { cloneUrl: r.data.clone_url, sshUrl: r.data.ssh_url, fullName: r.data.full_name };
 }
 
+/** Create a GitHub repo under the authenticated user, returning the full set
+    of identifiers the bootstrap flow needs to wire `origin` locally (owner +
+    repo slug, plus the URLs). Wraps `createRepo` so callers don't have to
+    re-parse `full_name` themselves. Defaults to PRIVATE (Maestro projects
+    are real working repos, not demos). */
+export async function createGitHubRepo(
+  token: string,
+  opts: { name: string; private?: boolean; description?: string },
+  fetchImpl?: FetchImpl,
+): Promise<{ owner: string; repo: string; cloneUrl: string; htmlUrl: string }> {
+  const r = await ghRequest<{ clone_url: string; html_url: string; full_name: string; owner: { login: string }; name: string }>({
+    token, method: 'POST', path: '/user/repos',
+    body: { name: opts.name, private: opts.private ?? true, auto_init: false, description: opts.description ?? '' },
+    fetchImpl,
+  });
+  return {
+    owner: r.data.owner?.login ?? r.data.full_name.split('/')[0] ?? '',
+    repo: r.data.name ?? r.data.full_name.split('/')[1] ?? opts.name,
+    cloneUrl: r.data.clone_url,
+    htmlUrl: r.data.html_url,
+  };
+}
+
 /** Pick a merge method the repo actually allows (prefer squash → merge → rebase). */
 export function pickMergeMethod(repo: { allowSquash: boolean; allowMerge: boolean; allowRebase: boolean }): 'squash' | 'merge' | 'rebase' {
   if (repo.allowSquash) return 'squash';
