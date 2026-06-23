@@ -473,11 +473,105 @@ type CodeSource = 'folder' | 'clone';
 
 const baseNameOf = (p: string): string => p.split('/').filter(Boolean).pop() ?? '';
 const repoNameOf = (url: string): string => url.trim().replace(/\/+$/, '').replace(/\.git$/i, '').split(/[/:]/).pop() ?? '';
+/** Local helper — used by the slug-check effect so it doesn't fire on the
+    non-code project types where there's no folder to push. */
+const isCodeType = (type: string): boolean => type === 'code';
+
+/** Live slug-availability chip shown under the project-name input. Three
+    visual states map to the four data states: checking (neutral spinner) /
+    available (green) / taken (amber, with the v2 fallback inline) /
+    unauthenticated or error (muted hint). Pure presentation — the parent
+    owns the debounce + the actual API call. */
+function SlugChip({ state }: { state: SlugProbeState }): React.ReactElement | null {
+  if (state.status === 'checking') {
+    return (
+      <span style={{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 999, background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '500 var(--fs-caption)/1 var(--font-text)' }}>
+        <span className="breathe" style={{ width: 6, height: 6, borderRadius: 4, background: 'var(--ink-secondary)' }} />
+        Checking availability…
+      </span>
+    );
+  }
+  if (state.status === 'available' && state.owner) {
+    return (
+      <span style={{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 999, background: 'color-mix(in srgb, var(--green) 15%, var(--bg-elevated))', color: 'var(--green)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+        <Icon name="check" size={12} stroke={3} />
+        Available — <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)' }}>{state.owner}/{state.slug}</span>
+      </span>
+    );
+  }
+  if (state.status === 'taken' && state.owner) {
+    return (
+      <span style={{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 999, background: 'color-mix(in srgb, var(--orange, #ff9500) 18%, var(--bg-elevated))', color: 'var(--orange, #ff9500)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+        Name taken — will use <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)' }}>{state.owner}/{state.suggestion}</span>
+      </span>
+    );
+  }
+  if (state.status === 'unauthenticated') {
+    return (
+      <span style={{ marginTop: 8, display: 'inline-block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+        Sign in to GitHub in Settings to check availability live.
+      </span>
+    );
+  }
+  if (state.status === 'error') {
+    return (
+      <span style={{ marginTop: 8, display: 'inline-block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+        Couldn't check availability ({state.error ?? 'network error'}). Will retry on create.
+      </span>
+    );
+  }
+  return null;
+}
 
 /* Two-step New-project sheet. Step 1 picks the type. For Code projects, step 2
    has no "blank": you either Open an existing folder (that folder IS the project,
    named from its folder name) or Clone a repo into a destination you choose
    (named from the repo). Names auto-fill and de-dupe to "name v1" on collision. */
+/* Live slug-availability state for the GitHub-first name field. `null` for
+   "haven't checked yet" / "user isn't signed in" — the UI treats those
+   distinctly from a real availability answer. */
+type SlugProbeStatus = 'idle' | 'checking' | 'available' | 'taken' | 'unauthenticated' | 'error';
+interface SlugProbeState {
+  status: SlugProbeStatus;
+  slug: string;             // slugified form of the current name
+  suggestion: string;       // what bootstrap would actually use
+  owner: string | null;
+  existingFullName?: string;
+  error?: string;
+}
+
+/** A row in the new-project owner picker: the authenticated user themselves
+    or one of their orgs. Loaded once when the dialog opens. */
+interface OwnerOption { login: string; kind: 'user' | 'org'; avatarUrl: string | null }
+
+/** The new-project owner picker. Renders the user first, then orgs
+    alphabetically. Defaults to the user. Hidden when only the user is
+    available (no orgs) — there's nothing to pick. */
+function OwnerPicker({ owners, selected, onChange, disabled }: { owners: OwnerOption[]; selected: OwnerOption | null; onChange: (o: OwnerOption) => void; disabled?: boolean }): React.ReactElement | null {
+  if (owners.length <= 1) return null;
+  return (
+    <label style={{ display: 'block', marginBottom: 14 }}>
+      <span style={{ display: 'block', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 7 }}>Code-repo owner</span>
+      <select
+        disabled={disabled}
+        value={selected?.login ?? ''}
+        onChange={e => {
+          const o = owners.find(x => x.login === e.target.value);
+          if (o) onChange(o);
+        }}
+        style={{ width: '100%', height: 42, padding: '0 13px', borderRadius: 11, boxSizing: 'border-box',
+          border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-body)/1 var(--font-text)' }}>
+        {owners.map(o => (
+          <option key={o.login} value={o.login}>{o.login}{o.kind === 'org' ? ' (org)' : ''}</option>
+        ))}
+      </select>
+      <span style={{ display: 'block', marginTop: 6, font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+        Memory repo always lives under your personal account ({owners[0].login}/&lt;slug&gt;-memory) — private, never an org.
+      </span>
+    </label>
+  );
+}
+
 function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: boolean; onClose: () => void; onCreated: (projectId: string) => void; suggestedName?: string }) {
   const [step, setStep] = React.useState<1 | 2>(1);
   const [type, setType] = React.useState('code');
@@ -491,10 +585,61 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
   const [cloneLines, setCloneLines] = React.useState<string[]>([]);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState('');
+  // Push the project to GitHub on create (only meaningful for code/folder source).
+  const [pushToGitHub, setPushToGitHub] = React.useState(true);
+  const [slugProbe, setSlugProbe] = React.useState<SlugProbeState>({ status: 'idle', slug: '', suggestion: '', owner: null });
+  // Owner picker state: full list + the currently selected row (defaults to user).
+  const [owners, setOwners] = React.useState<OwnerOption[]>([]);
+  const [selectedOwner, setSelectedOwner] = React.useState<OwnerOption | null>(null);
+  // The successful bootstrap result, captured so the "Done" step can show
+  // "Created github.com/owner/slug ✓" with a click-through link. Dual-repo
+  // bootstraps populate `memoryRepoUrl` too so we can render BOTH URLs.
+  const [bootstrapped, setBootstrapped] = React.useState<{ fullName: string; htmlUrl: string; slugChanged: boolean; memoryRepoUrl?: string } | null>(null);
 
   React.useEffect(() => {
-    if (open) { setStep(1); setType('code'); setName(suggestedName ?? ''); setNameEdited(!!suggestedName); setSource('folder'); setRepoUrl(''); setPicked(null); setPickedPath(''); setDestPath(''); setCloneLines([]); setBusy(false); setError(''); }
+    if (open) {
+      setStep(1); setType('code'); setName(suggestedName ?? ''); setNameEdited(!!suggestedName); setSource('folder'); setRepoUrl(''); setPicked(null); setPickedPath(''); setDestPath(''); setCloneLines([]); setBusy(false); setError(''); setPushToGitHub(true); setSlugProbe({ status: 'idle', slug: '', suggestion: '', owner: null }); setBootstrapped(null);
+      setOwners([]); setSelectedOwner(null);
+      // Fetch the owner list once; default selection = user (always owners[0]).
+      api.listOwners().then(r => {
+        if (r.ok && r.owners.length > 0) {
+          setOwners(r.owners);
+          setSelectedOwner(r.owners[0]);
+        }
+      }).catch(() => { /* leaves the picker hidden; legacy single-repo flow still works */ });
+    }
   }, [open, suggestedName]);
+
+  /* Live slug-availability check. Debounced 300ms so a fast typist isn't
+     pummelling GitHub. Only runs when the user has typed at least 1 char,
+     is on the Code branch with GitHub-push enabled, AND is on step 2 (the
+     check is meaningless on the type picker). The leading `null` reason
+     ('not-authenticated') short-circuits to a friendly UI hint without an
+     API call. */
+  const trimmedName = name.trim();
+  const slugCheckEnabled = step === 2 && isCodeType(type) && pushToGitHub && trimmedName.length > 0;
+  React.useEffect(() => {
+    if (!slugCheckEnabled) { setSlugProbe({ status: 'idle', slug: '', suggestion: '', owner: null }); return; }
+    setSlugProbe(s => ({ ...s, status: 'checking' }));
+    const timer = setTimeout(async () => {
+      try {
+        const r = await api.checkSlug(trimmedName);
+        if (r.reason === 'not-authenticated') {
+          setSlugProbe({ status: 'unauthenticated', slug: r.slug, suggestion: r.suggestion, owner: null });
+        } else if (r.reason === 'error') {
+          setSlugProbe({ status: 'error', slug: r.slug, suggestion: r.suggestion, owner: null, error: r.error });
+        } else if (r.available === true) {
+          setSlugProbe({ status: 'available', slug: r.slug, suggestion: r.slug, owner: r.owner });
+        } else if (r.available === false) {
+          setSlugProbe({ status: 'taken', slug: r.slug, suggestion: r.suggestion, owner: r.owner, existingFullName: r.existing?.fullName });
+        }
+      } catch (e) {
+        setSlugProbe({ status: 'error', slug: '', suggestion: '', owner: null, error: e instanceof Error ? e.message.slice(0, 160) : 'lookup failed' });
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trimmedName, slugCheckEnabled]);
 
   // Stream clone progress lines while a clone is in flight.
   React.useEffect(() => {
@@ -559,7 +704,85 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
       }
       if (isCode) {
         if (!pickedPath) { setError('Choose a folder to open.'); setBusy(false); return; }
-        const proj = await api.createProject({ name: name.trim() || baseNameOf(pickedPath), template: 'code', kind: 'coding', path: pickedPath });
+        const finalName = name.trim() || baseNameOf(pickedPath);
+
+        // GitHub-first path: inspect the folder first so we know whether to
+        // skip the local `git init` (already a repo) or skip the seed/commit
+        // entirely (already a repo WITH a github remote that we just record).
+        if (pushToGitHub) {
+          let inspect: Awaited<ReturnType<typeof api.adoptFolderInspect>> | null = null;
+          try { inspect = await api.adoptFolderInspect(pickedPath); } catch { /* fall back to plain create below */ }
+          if (inspect?.ok && inspect.kind === 'git-github') {
+            // Folder already has a GitHub remote — record it on the project
+            // without recreating anything. If we ALSO discovered a companion
+            // memory repo (\${user}/\${slug}-memory), persist its slug so the
+            // openProject lifecycle hooks the memory pull + symlinks on
+            // entry. (The actual clone happens on first openProject —
+            // ensureMemoryRepo is idempotent, so it's safe to leave the
+            // clone to the lifecycle path rather than blocking adopt here.)
+            const mem = inspect.memoryRepo;
+            const memorySlug = mem?.state === 'memory-found' || mem?.state === 'memory-missing' ? mem.slug : undefined;
+            const memoryRepoUrl = mem?.state === 'memory-found'
+              ? `https://github.com/${mem.user}/${mem.slug}-memory`
+              : undefined;
+            const proj = await api.createProject({
+              name: finalName, template: 'code', kind: 'coding', path: pickedPath,
+              repoUrl: inspect.remote ?? undefined,
+              memorySlug, memoryRepoUrl,
+            });
+            onCreated(proj.id);
+            return;
+          }
+          // No GitHub remote yet (or no git at all): bootstrap a fresh repo
+          // under the SELECTED owner (Step 9 owner picker), then create the
+          // project. When the owner picker resolved (selectedOwner is set),
+          // we pass `owner` and get the dual-repo shape back (code + memory
+          // URLs). When it didn't (no GitHub auth, or list still loading),
+          // we fall back to the legacy single-repo flow.
+          const result = selectedOwner
+            ? await api.bootstrapProject({
+                name: finalName,
+                localPath: pickedPath,
+                private: true,
+                owner: { login: selectedOwner.login, kind: selectedOwner.kind },
+              })
+            : await api.bootstrapProject({
+                name: finalName,
+                localPath: pickedPath,
+                private: true,
+                adopt: !!inspect?.ok && inspect.kind !== 'no-git',
+              });
+          // Narrow on the presence of `memoryRepoUrl` (dual-repo) vs `cloneUrl`
+          // (legacy single-repo) — the two shapes don't overlap on these keys.
+          const isDual = (r: typeof result): r is Extract<typeof result, { memoryRepoUrl: string }> => 'memoryRepoUrl' in r;
+          let proj;
+          if (isDual(result)) {
+            proj = await api.createProject({
+              name: finalName, template: 'code', kind: 'coding', path: pickedPath,
+              // The dual-repo result doesn't include a clone URL — we look it
+              // up from the chosen owner + slug.
+              repoUrl: `https://github.com/${selectedOwner!.login}/${result.slug}.git`,
+              memorySlug: result.slug,
+              memoryRepoUrl: result.memoryRepoUrl,
+            });
+            setBootstrapped({
+              fullName: `${selectedOwner!.login}/${result.slug}`,
+              htmlUrl: result.codeRepoUrl,
+              slugChanged: result.slugChanged,
+              memoryRepoUrl: result.memoryRepoUrl,
+            });
+          } else {
+            proj = await api.createProject({ name: finalName, template: 'code', kind: 'coding', path: pickedPath, repoUrl: result.cloneUrl });
+            setBootstrapped({ fullName: result.fullName, htmlUrl: result.htmlUrl, slugChanged: result.slugChanged });
+          }
+          // Stay on the dialog briefly so the user sees the confirmation chip;
+          // onCreated still fires so the parent navigates / refreshes the list.
+          setBusy(false);
+          setTimeout(() => onCreated(proj.id), 850);
+          return;
+        }
+
+        const proj = await api.createProject({ name: finalName, template: 'code', kind: 'coding', path: pickedPath });
         onCreated(proj.id);
         return;
       }
@@ -700,12 +923,56 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
               </div>
             ) : null}
 
+            {/* Owner picker: only meaningful on the GitHub-first Code+folder
+                path; org members get a dropdown, solo users see nothing
+                (the picker hides itself when owners.length<=1). */}
+            {isCode && source === 'folder' && pushToGitHub && (
+              <OwnerPicker owners={owners} selected={selectedOwner} onChange={setSelectedOwner} disabled={busy} />
+            )}
             <label style={{ display: 'block' }}>
               <span style={{ display: 'block', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 7 }}>Project name{isCode ? ' · auto-filled, editable' : ''}</span>
               <input value={name} onChange={e => editName(e.target.value)} placeholder={isCode ? (source === 'clone' ? 'from the repo name' : 'from the folder name') : `${meta.label} Project`}
                 style={{ width: '100%', height: 42, padding: '0 13px', borderRadius: 11, boxSizing: 'border-box',
                   border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-body)/1 var(--font-text)' }} />
+              {/* Slug-availability chip — only on Code+folder (where we'll
+                  push to GitHub) and only once the user has typed something.
+                  We render nothing while idle so the UI doesn't flash. */}
+              {isCode && source === 'folder' && pushToGitHub && slugProbe.status !== 'idle' && (
+                <SlugChip state={slugProbe} />
+              )}
             </label>
+
+            {/* GitHub-first toggle. Only Code+folder, because Code+clone
+                already comes from GitHub and the non-code project kinds have
+                no folder to push. */}
+            {isCode && source === 'folder' && (
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', padding: '12px 14px', borderRadius: 12, background: pushToGitHub ? 'color-mix(in srgb, var(--blue) 7%, var(--bg-elevated))' : 'var(--fill-tertiary)', border: `1px solid ${pushToGitHub ? 'color-mix(in srgb, var(--blue) 40%, transparent)' : 'transparent'}` }}>
+                <input type="checkbox" checked={pushToGitHub} onChange={e => setPushToGitHub(e.target.checked)} style={{ marginTop: 2 }} />
+                <span style={{ minWidth: 0 }}>
+                  <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Create a GitHub repo for this project</span>
+                  <span style={{ display: 'block', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 3 }}>
+                    Initialises git, seeds README + .gitignore + .continuum/STATE.md, and pushes an initial commit to a private repo on your GitHub account.
+                  </span>
+                </span>
+              </label>
+            )}
+
+            {bootstrapped && (
+              <div style={{ padding: '12px 14px', borderRadius: 12, background: 'color-mix(in srgb, var(--green) 12%, var(--bg-elevated))', border: '1px solid color-mix(in srgb, var(--green) 35%, transparent)', display: 'flex', flexDirection: 'column', gap: 6, font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                  <Icon name="check" size={16} stroke={3} style={{ color: 'var(--green)', flexShrink: 0 }} />
+                  <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    Created <a href={bootstrapped.htmlUrl} target="_blank" rel="noreferrer" style={{ color: 'var(--blue)', textDecoration: 'none', font: '600 var(--fs-footnote)/1.4 var(--font-mono)' }}>github.com/{bootstrapped.fullName}</a>
+                    {bootstrapped.slugChanged && <span style={{ marginLeft: 6, color: 'var(--ink-tertiary)' }}>(name was taken — used the v2 form)</span>}
+                  </span>
+                </div>
+                {bootstrapped.memoryRepoUrl && (
+                  <div style={{ paddingLeft: 25, font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                    + memory: <a href={bootstrapped.memoryRepoUrl} target="_blank" rel="noreferrer" style={{ color: 'var(--blue)', textDecoration: 'none', font: '600 var(--fs-caption)/1.4 var(--font-mono)' }}>{bootstrapped.memoryRepoUrl.replace(/^https?:\/\//, '')}</a>
+                  </div>
+                )}
+              </div>
+            )}
 
             {error && <div style={{ padding: '10px 12px', borderRadius: 10, background: 'rgba(255,59,48,0.1)', color: 'var(--red)', font: '500 var(--fs-footnote)/1.4 var(--font-text)' }}>{error}</div>}
             </>
