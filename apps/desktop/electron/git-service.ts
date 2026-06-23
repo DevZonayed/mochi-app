@@ -5,9 +5,9 @@
 import { existsSync } from 'node:fs';
 import type { Store, ChatSession, Project } from './store.js';
 import type { Providers } from './providers.js';
-import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug } from './git.js';
+import { isGitRepo, repoInfo, aheadBehind, isDirty, localRefExists, resolveBaseBranch, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug, listConflictedFiles } from './git.js';
 import { parseGitHubRemote, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, getRepo, pickMergeMethod } from './github.js';
-import { deriveState, type LocalState, type PrStatus, type SessionGitStatus } from './pr-state.js';
+import { deriveState, type LocalState, type PrStatus, type SessionGitStatus, type MergePreviewResult, type ResolvePreviewResult } from './pr-state.js';
 
 type Emit = (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => void;
 const EMPTY_LOCAL: LocalState = { isRepo: false, ahead: 0, behind: 0, dirty: false, pushed: false };
@@ -138,6 +138,80 @@ export class GitService {
     } catch (e) {
       return { ok: false, reason: e instanceof Error ? e.message : 'merge failed' };
     }
+  }
+
+  /** READ-ONLY preview of what `mergePr` would do — used to render the human
+      confirmation dialog. Never mutates anything (no GitHub merge, no push).
+      Picks the same merge method `mergePr` would default to (or falls back to
+      'unknown' when the repo info call fails, so the dialog can still render). */
+  async previewMergePr(session: ChatSession, opts: { method?: 'merge' | 'squash' | 'rebase' } = {}): Promise<MergePreviewResult> {
+    const project = this.store.getProject(session.projectId);
+    const token = this.token();
+    if (!project?.path || !session.branch) return { ok: false, reason: 'no repo or branch' };
+    if (!token) return { ok: false, reason: 'connect GitHub first' };
+    const gh = parseGitHubRemote(repoInfo(project.path).remote);
+    if (!gh) return { ok: false, reason: 'this project has no GitHub remote' };
+    try {
+      const open = await findOpenPr(token, gh.owner, gh.repo, session.branch);
+      if (!open) return { ok: false, reason: 'no open PR for this session' };
+      const status = await getPullStatus(token, gh.owner, gh.repo, open.number);
+      let method: 'merge' | 'squash' | 'rebase' | 'unknown';
+      if (opts.method) method = opts.method;
+      else {
+        try { method = pickMergeMethod(await getRepo(token, gh.owner, gh.repo)); }
+        catch { method = 'unknown'; }
+      }
+      return {
+        ok: true,
+        preview: {
+          prNumber: status.number,
+          prTitle: status.title,
+          prUrl: status.url,
+          mergeMethod: method,
+          headSha: open.headSha,
+          mergeable: status.mergeable,
+          mergeableState: status.mergeableState,
+          checks: status.checks,
+        },
+      };
+    } catch (e) {
+      return { ok: false, reason: e instanceof Error ? e.message : 'preview failed' };
+    }
+  }
+
+  /** READ-ONLY preview of what `resolveSession` would do. Inspects the
+      worktree for existing conflict markers + reads the open PR (if any) so
+      the confirm dialog can list what will change. Never modifies the worktree. */
+  async previewResolveSession(session: ChatSession): Promise<ResolvePreviewResult> {
+    const project = this.store.getProject(session.projectId);
+    const dir = project ? this.dirFor(session, project) : null;
+    if (!dir || !session.branch) return { ok: false, reason: 'no worktree or branch' };
+    const base = session.baseBranch ?? resolveBaseBranch(dir);
+    const conflictedFiles = listConflictedFiles(dir);
+    let prNumber: number | null = null;
+    let prTitle: string | null = null;
+    let prUrl: string | null = null;
+    const token = this.token();
+    if (token && project?.path) {
+      const gh = parseGitHubRemote(repoInfo(project.path).remote);
+      if (gh) {
+        try {
+          const open = await findOpenPr(token, gh.owner, gh.repo, session.branch);
+          if (open) { prNumber = open.number; prTitle = open.title; prUrl = open.url; }
+        } catch { /* best effort — preview still works without PR info */ }
+      }
+    }
+    return {
+      ok: true,
+      preview: {
+        prNumber,
+        prTitle,
+        prUrl,
+        base,
+        branch: session.branch,
+        conflictedFiles,
+      },
+    };
   }
 
   /** Merge the latest base into the session's worktree branch. Clean → push (the

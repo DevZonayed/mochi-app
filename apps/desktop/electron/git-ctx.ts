@@ -9,13 +9,34 @@
    chat (no impersonation risk if the agent tries to set `sessionId` to
    something else).
 
+   ── HUMAN-CONFIRM GATE (pr_merge + pr_resolve_conflicts) ──
+   Both `mergePr` and `resolveConflicts` accept an opts object with an optional
+   `confirmed: boolean` flag. The contract is two-step:
+
+     • confirmed !== true  → returns { needsConfirm: true, preview: {…} }
+                             WITHOUT calling GitHub or touching the worktree.
+     • confirmed === true  → runs the destructive action (same code path the
+                             chat header buttons drive).
+
+   The flag is ONLY honoured from the desktop's IPC path (the renderer is the
+   only caller that should ever pass `confirmed: true`). Agent paths in
+   engine.ts (Claude) and codex-bridge.ts (Codex) MUST strip the flag before
+   calling and treat the response as a preparation step — they then emit a
+   `pr-confirm-request` event so the renderer can show a hard-button dialog,
+   and the renderer re-invokes the action via the existing IPC handlers
+   (`mergeSessionPR` / `resolveSession`) which run unchanged.
+
    Pure logic — no MCP / electron deps — so it's unit-testable in isolation. */
 
 import type { Store, ChatSession } from './store.js';
 import type { GitService } from './git-service.js';
 import { isGitRepo, repoInfo, structuredDiff } from './git.js';
 import { parseGitHubRemote } from './github.js';
-import type { SessionGitStatus } from './pr-state.js';
+import type { SessionGitStatus, MergePreview, ResolvePreview } from './pr-state.js';
+
+// Re-export the preview types so callers can import them from `git-ctx.js`
+// alongside the rest of the per-session ctx surface.
+export type { MergePreview, ResolvePreview } from './pr-state.js';
 
 export interface GitCtxStatus {
   branch: string | null;
@@ -37,6 +58,33 @@ export interface GitCtxConflictReport {
   reason?: string;
 }
 
+/** Returned when a destructive action is called without `confirmed: true`. */
+export interface MergeNeedsConfirm { needsConfirm: true; action: 'pr_merge'; preview: MergePreview }
+export interface ResolveNeedsConfirm { needsConfirm: true; action: 'pr_resolve_conflicts'; preview: ResolvePreview }
+
+/** Discriminated unions so TS narrows on `'needsConfirm' in r`. The "ran" branch
+ *  explicitly excludes the `needsConfirm` key (typed as `never | undefined`). */
+export type MergePrResult = MergeNeedsConfirm | { needsConfirm?: undefined; ok: boolean; reason?: string };
+export type ResolveConflictsResult = ResolveNeedsConfirm | { needsConfirm?: undefined; ok: boolean; conflicts: string[]; reason?: string };
+
+/** User-defined type guard: did we get a needs-confirm response? */
+export function isNeedsConfirm<T extends { needsConfirm?: unknown }>(r: T): r is T & { needsConfirm: true } {
+  return (r as { needsConfirm?: unknown }).needsConfirm === true;
+}
+
+export interface MergePrOpts {
+  method?: 'merge' | 'squash' | 'rebase';
+  /** Renderer-only: skip the gate and run the merge immediately. The agent paths
+      strip this flag before reaching here so the agent can never set it. */
+  confirmed?: boolean;
+}
+
+export interface ResolveConflictsOpts {
+  /** Renderer-only: skip the gate and run the resolve immediately. The agent paths
+      strip this flag before reaching here so the agent can never set it. */
+  confirmed?: boolean;
+}
+
 export interface GitCtx {
   /** Whether this session has a live worktree on a GitHub repo. Callers can
       gate UI / tool surface on this. */
@@ -49,11 +97,17 @@ export interface GitCtx {
   push(): Promise<{ ok: boolean; reason?: string }>;
   /** Open a PR (pushes first if needed). Idempotent — re-opens the existing one. */
   createPr(opts?: { title?: string; body?: string }): Promise<{ ok: boolean; url?: string; number?: number; reason?: string }>;
-  /** Merge the open PR with the repo's preferred merge method. */
-  mergePr(opts?: { method?: 'merge' | 'squash' | 'rebase' }): Promise<{ ok: boolean; reason?: string }>;
+  /** Merge the open PR with the repo's preferred merge method.
+   *
+   *  GATED: returns `{ needsConfirm: true, preview }` unless opts.confirmed === true.
+   *  Only the renderer (via IPC) is allowed to pass confirmed; agent paths must
+   *  strip the flag before calling (engine.ts + codex-bridge.ts handle that). */
+  mergePr(opts?: MergePrOpts): Promise<MergePrResult>;
   /** Pull the base branch in. Returns conflicted files when the agent must
-      resolve markers by hand (Read/Edit/commit, then call again to verify). */
-  resolveConflicts(): Promise<GitCtxConflictReport>;
+      resolve markers by hand (Read/Edit/commit, then call again to verify).
+   *
+   *  GATED: returns `{ needsConfirm: true, preview }` unless opts.confirmed === true. */
+  resolveConflicts(opts?: ResolveConflictsOpts): Promise<ResolveConflictsResult>;
   /** Manual one-shot of the auto-rename hook. No-op when title is uninformative. */
   renameBranch(): Promise<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>;
 }
@@ -101,11 +155,24 @@ export function makeGitCtx(store: Store, gitService: GitService, sessionId: stri
       return gitService.createPr(session, opts);
     },
 
-    mergePr(opts) {
-      return gitService.mergePr(session, opts);
+    async mergePr(opts) {
+      // GATE: agent paths land here with confirmed === undefined/false → preview.
+      // Renderer (IPC) paths set confirmed === true → run the actual merge.
+      if (opts?.confirmed !== true) {
+        const prev = await gitService.previewMergePr(session, { method: opts?.method });
+        if (!prev.ok) return { ok: false, reason: prev.reason };
+        return { needsConfirm: true, action: 'pr_merge', preview: prev.preview };
+      }
+      return gitService.mergePr(session, { method: opts.method });
     },
 
-    resolveConflicts() {
+    async resolveConflicts(opts) {
+      // GATE: agent paths land here with confirmed === undefined/false → preview.
+      if (opts?.confirmed !== true) {
+        const prev = await gitService.previewResolveSession(session);
+        if (!prev.ok) return { ok: false, conflicts: [], reason: prev.reason };
+        return { needsConfirm: true, action: 'pr_resolve_conflicts', preview: prev.preview };
+      }
       return gitService.resolveSession(session);
     },
 

@@ -32,7 +32,7 @@ import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, inst
 import { ensureBrowserSkill } from './browser-skill.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
-import { makeGitCtx, type GitCtx } from './git-ctx.js';
+import { makeGitCtx, isNeedsConfirm, type GitCtx } from './git-ctx.js';
 import type { GitService } from './git-service.js';
 import { waSendAllowed } from './whatsapp.js';
 import type { CronRunner } from './cron.js';
@@ -531,6 +531,17 @@ interface CommsCtx {
 /** The subset of WhatsAppClient the engine drives for the agent (injected via setComms). */
 export interface WaAgentClient { sendText(chatId: string, text: string): Promise<boolean>; markRead(chatId: string): Promise<void> }
 
+/** Side channel for the human-confirm gate (pr_merge + pr_resolve_conflicts).
+ *  When the agent calls one of those tools, runClaude/runCodex emits a
+ *  `pr-confirm-request` event so the renderer can show a hard-button modal —
+ *  the agent never gets to execute the merge / resolve on its own. */
+export interface PrConfirmRequest {
+  action: 'pr_merge' | 'pr_resolve_conflicts';
+  sessionId: string | null;
+  preview: unknown;
+}
+export type EmitConfirm = (req: PrConfirmRequest) => void;
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -544,6 +555,8 @@ async function runClaude(
   scheduleCtx?: ScheduleCtx,
   gitCtx?: GitCtx,
   commsCtx?: CommsCtx,
+  emitConfirm?: EmitConfirm,
+  sessionId?: string | null,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -1135,19 +1148,32 @@ async function runClaude(
                 return txt(`PR #${r.number} is open: ${r.url}\nUse git_status to check mergeability, then pr_merge once it\'s clean.`);
               })),
             tool('pr_merge',
-              'Merge the open PR for this chat using the repo\'s preferred merge method (auto-picks merge/squash/rebase from the allowed list). Use only when git_status reports pr-mergeable (not when it reports pr-conflicts or pr-blocked).',
+              'PREPARE a merge of the open PR for this chat (auto-picks merge/squash/rebase from the repo\'s allowed list, or pass method=merge|squash|rebase). The actual merge requires a HUMAN to click "Confirm Merge" in the desktop UI — calling this tool surfaces a confirmation dialog with the PR title, mergeable state, and check rollup. Use only when git_status reports pr-mergeable.',
               { method: z.enum(['merge', 'squash', 'rebase']).optional().describe('Override the auto-picked merge method.') },
               wrap(async (a: { method?: 'merge' | 'squash' | 'rebase' }) => {
                 if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
+                // GATE: the agent NEVER gets to set `confirmed: true` — even if the
+                // model invents the flag, we drop it here so the only caller that can
+                // execute the merge is the renderer (via mergeSessionPR IPC).
                 const r = await gitCtx.mergePr({ method: a.method });
+                if (isNeedsConfirm(r)) {
+                  if (emitConfirm) emitConfirm({ action: 'pr_merge', sessionId: sessionId ?? null, preview: r.preview });
+                  return txt(`Surfaced a merge-confirmation dialog to the user for PR #${r.preview.prNumber} (${r.preview.prTitle}). Method: ${r.preview.mergeMethod}, mergeable state: ${r.preview.mergeableState}. The user must click "Confirm Merge" in the desktop UI — you cannot land it from here. Wait for their decision, then call git_status to see whether the merge landed.`);
+                }
                 return txt(r.ok ? 'Merged. The session\'s work is on the base branch now — you can archive the worktree if you\'re done.' : `Merge failed: ${r.reason ?? 'unknown'}`);
               })),
             tool('pr_resolve_conflicts',
-              'Pull the base branch into this chat\'s branch and merge it. If clean, pushes the resulting branch automatically. If it produces conflict markers, returns the conflicted file paths so you can: (1) Read each one, (2) Edit out the <<<<<<</=======/>>>>>>> markers keeping the intended content, (3) commit via Bash (`git add -A && git commit -m "resolve conflicts"`), (4) call this tool again to confirm clean + push. Use when git_status reports pr-conflicts or when the PR is behind.',
+              'PREPARE conflict resolution: pull the base branch into this chat\'s branch. The actual operation requires a HUMAN to click "Apply Resolution" in the desktop UI — calling this tool surfaces a confirmation dialog listing the files that would change. Use when git_status reports pr-conflicts or when the PR is behind. After the human approves and conflict markers are produced, Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), commit via Bash (`git add -A && git commit -m "resolve conflicts"`), then call this tool again.',
               {},
               wrap(async () => {
                 if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
                 const r = await gitCtx.resolveConflicts();
+                if (isNeedsConfirm(r)) {
+                  if (emitConfirm) emitConfirm({ action: 'pr_resolve_conflicts', sessionId: sessionId ?? null, preview: r.preview });
+                  const cf = r.preview.conflictedFiles;
+                  const cfNote = cf.length ? ` Worktree already has ${cf.length} unmerged file(s).` : '';
+                  return txt(`Surfaced a conflict-resolution dialog to the user for ${r.preview.branch ?? 'this branch'} (base ${r.preview.base ?? '?'}).${cfNote} The user must click "Apply Resolution" in the desktop UI — you cannot pull base in from here. Wait for their decision, then call git_status (and if there are now conflicted files, Read/Edit them and commit).`);
+                }
                 if (r.ok && (!r.conflicts || r.conflicts.length === 0)) {
                   return txt('Conflicts resolved cleanly (or the branch was already up to date) — pushed the merged branch. Call git_status to verify the PR is now mergeable.');
                 }
@@ -1473,7 +1499,7 @@ async function runClaude(
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
 function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
-  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[]; gitCtx?: GitCtx },
+  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[]; gitCtx?: GitCtx; emitConfirm?: EmitConfirm; sessionId?: string | null },
   imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'codex' }));
@@ -1495,7 +1521,7 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   // calls unless danger-full-access + approval_policy=never (probe-proven), so a
   // run with any Maestro MCP tools uses that sandbox. Never on reviewer passes.
   const bridge = (!readOnly && ctx?.codexBridge && ctx.projectId) ? ctx.codexBridge : undefined;
-  const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId, git: ctx?.gitCtx }) : undefined;
+  const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId, git: ctx?.gitCtx, emitConfirm: ctx?.emitConfirm, sessionId: ctx?.sessionId ?? null }) : undefined;
   // The operator's custom stdio MCP servers (Settings → MCP servers), as codex
   // `-c mcp_servers.<name>={…}` TOML fragments. Like the maestro bridge, codex's
   // sandbox auto-cancels MCP tool calls unless danger-full-access + approval_policy
@@ -1688,7 +1714,7 @@ export class LocalEngine {
   /** In-flight engine binary downloads → their abort handle (one per engine). */
   private engineInstalls = new Map<EngineId, AbortController>();
 
-  constructor(private store: Store, private emit: (name: string, data: unknown, opts?: { live?: boolean }) => void, private providers?: Providers) {}
+  constructor(private store: Store, private emit: (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => void, private providers?: Providers) {}
 
   /* Image generation is injected from main.ts AFTER MediaEngine/PublishingEngine
      are built — via setters, so the constructor signature (and the relay dispatch
@@ -2797,9 +2823,17 @@ export class LocalEngine {
       // resolved by name from the host now); Codex takes stdio TOML fragments only.
       const claudeCustomMcp = buildClaudeCustomMcp(enabledMcpServers, process.env);
       const codexCustomFrags = buildCodexCustomMcp(enabledMcpServers, process.env).fragments;
+      // The pr_merge / pr_resolve_conflicts gate: when the agent calls one of
+      // those tools the GitCtx returns a `needsConfirm` payload (never executes);
+      // the runner emits this event so the renderer can show the hard-button
+      // dialog. The renderer is the only caller that can pass `confirmed: true`
+      // (via the existing mergeSessionPR / resolveSession IPC handlers).
+      const emitConfirm: EmitConfirm = (req) => {
+        try { this.emit('pr-confirm-request', req, { desktopOnly: true }); } catch { /* window gone */ }
+      };
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx)
-        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx }, codexImageFiles);
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null)
+        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx, emitConfirm, sessionId: session?.id ?? null }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
       // operator has to retry by hand. The retry starts the turn fresh; resumeId is

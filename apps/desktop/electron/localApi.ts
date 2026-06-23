@@ -449,16 +449,36 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           base: typeof p.base === 'string' ? p.base : undefined,
         });
       }
+      // pr_merge HUMAN-CONFIRMED path: this dispatch case calls gitService directly,
+      // which executes the merge immediately. It is `desktopOnly` via remote-guard,
+      // so only the renderer (a human clicking "Confirm Merge" in the dialog) can
+      // reach it. The AGENT path (engine.ts pr_merge tool / codex-bridge.ts) goes
+      // through GitCtx.mergePr which gates on `confirmed: true` and surfaces the
+      // dialog via the `pr-confirm-request` event instead. See git-ctx.ts.
       case 'mergeSessionPR': {
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
         const method = p.method === 'merge' || p.method === 'squash' || p.method === 'rebase' ? p.method : undefined;
         return gitService.mergePr(s, { method });
       }
+      // pr_resolve_conflicts HUMAN-CONFIRMED path — same shape as mergeSessionPR.
       case 'resolveSession': {
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
         return gitService.resolveSession(s);
+      }
+      // Renderer-only previews — return what `mergeSessionPR` / `resolveSession` WOULD do,
+      // for the confirm dialog. Read-only: no GitHub merge call, no worktree changes.
+      case 'previewSessionMerge': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        const method = p.method === 'merge' || p.method === 'squash' || p.method === 'rebase' ? p.method : undefined;
+        return gitService.previewMergePr(s, { method });
+      }
+      case 'previewSessionResolve': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.previewResolveSession(s);
       }
       // Manual one-shot of the auto-rename hook (testing + a future "rename
       // branch now" button in the chat header).
