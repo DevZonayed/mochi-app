@@ -17,6 +17,7 @@ import { Providers } from './providers.js';
 import type { Approval, Job } from './store.js';
 import { createDispatch } from './localApi.js';
 import { GitService } from './git-service.js';
+import { GitWatcher } from './git-watcher.js';
 import { buildModelGroups } from './models.js';
 import { HostClient } from './hostClient.js';
 import { DesktopP2PHost } from './p2p.js';
@@ -405,7 +406,12 @@ app.whenReady().then(() => {
   // Hand the gitService to the engine so the post-turn auto-rename hook can
   // run (otherwise it's a no-op — the engine treats gitService as optional).
   engine.setGitService(gitService);
-  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge);
+  // GitWatcher: per-session fs.watch on `.git` so commit/push/checkout in any
+  // terminal/agent flips the renderer's status pill in <300ms — no polling.
+  // Closed cleanly on app quit so we don't leak fds across reloads.
+  const gitWatcher = new GitWatcher(store, gitService);
+  app.on('before-quit', () => { try { gitWatcher.detachAll(); } catch { /* best effort */ } });
+  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge, gitWatcher);
   // Local control channel for the native browser extension (one app-owned port).
   extensionBridge = new ExtensionBridge(store, dispatch, (status) => emit('extension', status, { desktopOnly: true }));
   extensionBridge.start();
