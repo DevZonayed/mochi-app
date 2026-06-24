@@ -903,6 +903,24 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const r = engine.bgStop(String(p.id ?? ''));
         return r ?? bad('background task not found', 404);
       }
+
+      // ── Plan-mode exit gate ────────────────────────────────────
+      // The renderer's ExitPlanModeDialog calls this when the operator clicks
+      // Approve or Keep Planning. The id is the SDK's toolUseID echoed back
+      // from the `plan-mode-exit-request` event so we route the answer to the
+      // correct pending request (parallel runs can each have their own). See
+      // electron/plan-mode-gate.ts for the contract. Idempotent on stale ids
+      // — `respondExit` returns false for an unknown id (already answered or
+      // session switched), which we surface as `{ ok: false }` so the dialog
+      // can quietly close.
+      case 'exitPlanModeRespond': {
+        const id = String(p.toolUseID ?? '');
+        const approved = p.approved === true;
+        if (!id) return bad('toolUseID required');
+        const ok = engine.getPlanGate().respondExit(id, approved);
+        return { ok };
+      }
+
       case 'createAndRunJob': {
         if (!p.projectId || !p.input) bad('projectId and input required');
         if (!store.getProject(String(p.projectId))) bad('project not found', 404);

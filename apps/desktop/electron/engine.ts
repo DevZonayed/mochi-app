@@ -33,6 +33,10 @@ import { ensureBrowserSkill } from './browser-skill.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
 import { makeGitCtx, isNeedsConfirm, type GitCtx } from './git-ctx.js';
+import {
+  createPlanModeGate, BG_RUN_IN_BACKGROUND_DENY,
+  type PlanModeGate, type PlanModeExitRequest,
+} from './plan-mode-gate.js';
 import type { GitService } from './git-service.js';
 import { waSendAllowed } from './whatsapp.js';
 import type { CronRunner } from './cron.js';
@@ -566,6 +570,11 @@ export interface PrConfirmRequest {
 }
 export type EmitConfirm = (req: PrConfirmRequest) => void;
 
+/** Side channel for the plan-mode exit gate. Mirrors EmitConfirm — runClaude
+ *  calls it the moment the agent invokes ExitPlanMode, the renderer shows a
+ *  modal, and the operator's click resolves the gate's pending Promise. */
+export type EmitPlanExit = (req: PlanModeExitRequest) => void;
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -581,6 +590,9 @@ async function runClaude(
   commsCtx?: CommsCtx,
   emitConfirm?: EmitConfirm,
   sessionId?: string | null,
+  planGate?: PlanModeGate,
+  emitPlanExit?: EmitPlanExit,
+  jobId?: string | null,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -1381,6 +1393,63 @@ async function runClaude(
       ...(apiKey ? { env: { ...process.env, ANTHROPIC_API_KEY: apiKey } as NodeJS.ProcessEnv } : {}),
       ...(hooks.signal ? { abortController: abortControllerFromSignal(hooks.signal) } : {}),
       stderr: (d: string) => { stderrTail = (stderrTail + d).slice(-2000); },
+      /* canUseTool — the SDK's permission hook. Handles two cases the host MUST
+         own, and lets everything else through (the SDK's permissionMode +
+         allowedTools already gate the rest).
+
+         1. ExitPlanMode: in plan mode the SDK suspends the run on this tool
+            until the host approves. Without a canUseTool callback the call
+            never resolves → the agent stays trapped in plan mode forever. We
+            emit a `plan-mode-exit-request` event so the renderer can show a
+            modal, await the operator's decision via the shared planGate, and
+            return allow / deny accordingly.
+
+         2. Bash with `run_in_background: true`: deny + retry hint so the agent
+            re-issues against mcp__maestro__run_in_background. The built-in
+            variant spawns inside the Claude Code CLI subprocess and dies when
+            the operator force-sends (engine.cancel SIGTERMs the CLI), which is
+            the second bug the user reported. The Maestro tool spawns detached
+            off the Electron process tree, so the dev server survives a steer. */
+      canUseTool: async (toolName, input, options) => {
+        if (toolName === 'ExitPlanMode') {
+          if (!planGate || !emitPlanExit) {
+            // The host didn't wire the gate (legacy callsite or test path) —
+            // fall through to allow. Matches the previous behaviour where the
+            // SDK eventually no-op'd the ExitPlanMode call.
+            return { behavior: 'allow' };
+          }
+          const planBody = typeof (input as { plan?: unknown }).plan === 'string'
+            ? (input as { plan: string }).plan
+            : '';
+          const req: PlanModeExitRequest = {
+            toolUseID: options.toolUseID,
+            plan: planBody,
+            sessionId: sessionId ?? null,
+            jobId: jobId ?? null,
+          };
+          // Surface the request to the renderer modal. Best-effort: a missing
+          // window simply means no dialog appears, and the gate either resolves
+          // when the operator finally gets to it, or the abort signal fires.
+          try { emitPlanExit(req); } catch { /* renderer gone */ }
+          try {
+            const approved = await planGate.requestExit(req, { signal: options.signal });
+            return approved
+              ? { behavior: 'allow' }
+              : { behavior: 'deny', message: 'Operator wants more planning before any execution. Stay in plan mode, refine the plan based on their notes, and call ExitPlanMode again when ready.', interrupt: false };
+          } catch (e) {
+            // Aborted (run cancelled) — deny without interrupting; the surrounding
+            // for-await loop will see the abort signal and throw CancelledError.
+            return { behavior: 'deny', message: e instanceof Error ? e.message : 'cancelled', interrupt: false };
+          }
+        }
+        if (toolName === 'Bash' && (input as { run_in_background?: unknown }).run_in_background === true) {
+          // Force the agent off the CLI-owned background path — see the BG_*
+          // constant for the full retry hint. interrupt:false → the agent gets
+          // the message back and re-calls with mcp__maestro__run_in_background.
+          return { behavior: 'deny', message: BG_RUN_IN_BACKGROUND_DENY, interrupt: false };
+        }
+        return { behavior: 'allow' };
+      },
     },
   });
   /* Build a STRUCTURED transcript: each assistant message is its own text
@@ -1849,6 +1918,16 @@ export class LocalEngine {
   private githubLoginChild?: ChildProcess;
   /** In-flight engine binary downloads → their abort handle (one per engine). */
   private engineInstalls = new Map<EngineId, AbortController>();
+
+  /** Plan-mode exit gate: the agent's ExitPlanMode tool call parks here until
+      the operator clicks Approve / Keep Planning in the renderer dialog. Same
+      gate is exposed via getPlanGate() so localApi.ts can resolve the request
+      from the IPC side. See plan-mode-gate.ts for the full contract — this is
+      the Mac-local host side of the Claude Agent SDK's plan-mode protocol
+      which the renderer was previously missing entirely. */
+  private planGate: PlanModeGate = createPlanModeGate();
+  /** Exposed to localApi.ts so the IPC handler can resolve pending requests. */
+  getPlanGate(): PlanModeGate { return this.planGate; }
 
   constructor(private store: Store, private emit: (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => void, private providers?: Providers) {}
 
@@ -3013,8 +3092,15 @@ export class LocalEngine {
       const emitConfirm: EmitConfirm = (req) => {
         try { this.emit('pr-confirm-request', req, { desktopOnly: true }); } catch { /* window gone */ }
       };
+      // Plan-mode exit gate: emit the same desktop-only event shape so the
+      // renderer's ExitPlanModeDialog can subscribe alongside the PR confirm
+      // one. The planGate (shared instance on LocalEngine) holds the Promise
+      // the canUseTool callback awaits. See plan-mode-gate.ts.
+      const emitPlanExit: EmitPlanExit = (req) => {
+        try { this.emit('plan-mode-exit-request', req, { desktopOnly: true }); } catch { /* window gone */ }
+      };
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null)
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, this.planGate, emitPlanExit, jobId)
         : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx, emitConfirm, sessionId: session?.id ?? null }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
@@ -3087,7 +3173,10 @@ export class LocalEngine {
           };
           let cont: EngineRun;
           try {
-            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx);
+            // Continuation runs aren't in plan mode (`false` for plan above), so
+            // the gate / emit-event are only used by the BG retry-hint path. Pass
+            // them anyway so the canUseTool deny stays consistent across resumes.
+            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, undefined, session?.id ?? null, this.planGate, emitPlanExit, jobId);
           } catch (ce) { if (ce instanceof CancelledError || ac.signal.aborted) throw ce; break; }
           main = {
             text: cont.text || main.text,

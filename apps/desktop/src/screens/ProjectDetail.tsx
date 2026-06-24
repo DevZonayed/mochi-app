@@ -2777,6 +2777,19 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   const [goalMode, setGoalModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.goal') === '1'; } catch { return false; } });
   const setPlanMode = (on: boolean) => { setPlanModeState(on); try { localStorage.setItem('maestro.chat.plan', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setGoalModeState(false); try { localStorage.setItem('maestro.chat.goal', '0'); } catch { /* ignore */ } } };
   const setGoalMode = (on: boolean) => { setGoalModeState(on); try { localStorage.setItem('maestro.chat.goal', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setPlanModeState(false); try { localStorage.setItem('maestro.chat.plan', '0'); } catch { /* ignore */ } } };
+  // When the operator approves the agent's plan in ExitPlanModeDialog, the
+  // dialog flips the localStorage flag AND dispatches this custom event so our
+  // React state catches up — otherwise the next message would still pass
+  // `plan: true` (stale React state) and the SDK would re-enter plan mode for
+  // the very next turn, completely undoing the approval.
+  React.useEffect(() => {
+    const onChange = (e: Event) => {
+      const detail = (e as CustomEvent<{ on: boolean }>).detail;
+      if (typeof detail?.on === 'boolean') setPlanModeState(detail.on);
+    };
+    window.addEventListener('maestro:plan-mode-changed', onChange);
+    return () => window.removeEventListener('maestro:plan-mode-changed', onChange);
+  }, []);
   // Browser use is driven by an explicit @browser mention in the composer
   // (composerBrowser) — there's no separate toggle button to keep the bar clean.
   const primaryProvider = React.useMemo(() => {

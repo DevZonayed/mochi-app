@@ -550,7 +550,7 @@ app.whenReady().then(() => {
   // Auto-update (electron-updater → GitHub Releases). Desktop-only: its events
   // never cross the relay. Polling starts after the window exists (see below).
   const updater = new Updater(emit);
-  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); browserWatcher.stop(); host?.stop(); telegram?.stop(); whatsapp.disconnect(); codexBridge.stop(); extensionBridge?.stop(); updater.stop(); engine.bgStopAll(); });
+  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); browserWatcher.stop(); host?.stop(); telegram?.stop(); whatsapp.disconnect(); codexBridge.stop(); extensionBridge?.stop(); updater.stop(); engine.bgStopAll(); engine.getPlanGate().cancelAll('app quitting'); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {
