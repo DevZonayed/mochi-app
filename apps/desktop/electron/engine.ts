@@ -216,6 +216,22 @@ const CODEX_IMAGE_NUDGE =
   `built-in image_gen skill (NOT an SVG, NOT ASCII art). After generating, COPY the final ` +
   `selected image into the current workspace directory with a clear name like ` +
   `generated-<short>.png so it becomes a project asset, and state the saved path.`;
+// Codex plan mode: codex has no built-in plan-mode protocol like Claude's
+// SDK (no permissionMode:'plan' / ExitPlanMode tool). We emulate it with a
+// prompt directive + a read-only sandbox so the agent CAN'T accidentally
+// modify the workspace even if it tries. The plan body the agent writes
+// becomes the dialog's plan, and on approve the renderer auto-queues an
+// "execute the plan now" follow-up message (codex exec is one-shot, so the
+// approval can't continue the SAME run the way Claude's SDK does).
+const CODEX_PLAN_DIRECTIVE =
+  `\n\n---\n\n[Plan mode — propose first, do not act] The user is in plan mode. ` +
+  `DO NOT make any file changes, run any commands, or invoke any tools that mutate ` +
+  `the workspace. Your job this turn is to write ONE detailed, step-by-step plan ` +
+  `for accomplishing the request — list the files to touch, the order of changes, ` +
+  `the verification steps. Use clear headings and bullet lists. Be specific (file ` +
+  `paths, function names, exact commands) so the user can judge it. The user will ` +
+  `then approve or push back. Do not include code blocks longer than ~15 lines — ` +
+  `keep it a plan, not the implementation. End your reply with a one-line summary.`;
 const IMG_FILE_RE = /\.(png|jpe?g|webp|gif)$/i;
 /* Identify an image by its MAGIC BYTES, not a (possibly wrong) client-supplied
    mime. Returns one of the four media types Anthropic vision accepts, or null —
@@ -1426,6 +1442,7 @@ async function runClaude(
             plan: planBody,
             sessionId: sessionId ?? null,
             jobId: jobId ?? null,
+            engine: 'claude',
           };
           // Surface the request to the renderer modal. Best-effort: a missing
           // window simply means no dialog appears, and the gate either resolves
@@ -1704,7 +1721,25 @@ async function runClaude(
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
 function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
-  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[]; gitCtx?: GitCtx; emitConfirm?: EmitConfirm; sessionId?: string | null },
+  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[]; gitCtx?: GitCtx; emitConfirm?: EmitConfirm; sessionId?: string | null;
+    /** Plan mode (the operator turned on the Plan toggle in the composer). Forces
+        sandbox=read-only, disables every MCP bridge that could mutate the
+        workspace, and appends CODEX_PLAN_DIRECTIVE so codex writes a plan
+        instead of executing. After the run completes the engine parks on the
+        shared planGate (the SAME one Claude's canUseTool uses) so the operator
+        sees the SAME ExitPlanModeDialog regardless of which engine ran. */
+    plan?: boolean;
+    /** Shared plan-mode gate (LocalEngine.planGate). When `plan` is true the
+        engine emits `plan-mode-exit-request` and awaits the operator's decision
+        here before resolving the run. */
+    planGate?: PlanModeGate;
+    /** Side channel for emitting the plan-mode-exit-request event so the
+        renderer's ExitPlanModeDialog can show the plan + buttons. */
+    emitPlanExit?: EmitPlanExit;
+    /** Job id (turn). Logged + used to synthesise a deterministic toolUseID
+        for the gate (codex has no SDK-issued id). */
+    jobId?: string | null;
+  },
   imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'codex' }));
@@ -1721,19 +1756,30 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   const env = codexSpawnEnv(enginesRoot(),
     (!codexLoggedIn() && ctx?.openaiKey) ? { OPENAI_API_KEY: ctx.openaiKey } : undefined);
   const outFile = path.join(tmpdir(), `maestro-codex-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
+  // Plan mode hardening: when plan=true we treat the run like a reviewer pass
+  // — no MCP bridge, no custom MCP servers, read-only sandbox — so even if the
+  // agent tries to act despite the prompt directive, the sandbox refuses. The
+  // dialog then surfaces what the agent wrote; on approve the renderer queues
+  // the actual execution turn.
+  const planMode = !!ctx?.plan;
+  const effectiveReadOnly = readOnly || planMode;
   // Native MCP for codex: one stdio bridge forwards the Skill-Broker and
   // background-task tools back into Maestro. Codex's sandbox auto-cancels MCP tool
   // calls unless danger-full-access + approval_policy=never (probe-proven), so a
-  // run with any Maestro MCP tools uses that sandbox. Never on reviewer passes.
-  const bridge = (!readOnly && ctx?.codexBridge && ctx.projectId) ? ctx.codexBridge : undefined;
+  // run with any Maestro MCP tools uses that sandbox. Never on reviewer passes
+  // OR on plan-mode passes.
+  const bridge = (!effectiveReadOnly && ctx?.codexBridge && ctx.projectId) ? ctx.codexBridge : undefined;
   const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId, git: ctx?.gitCtx, emitConfirm: ctx?.emitConfirm, sessionId: ctx?.sessionId ?? null }) : undefined;
   // The operator's custom stdio MCP servers (Settings → MCP servers), as codex
-  // `-c mcp_servers.<name>={…}` TOML fragments. Like the maestro bridge, codex's
-  // sandbox auto-cancels MCP tool calls unless danger-full-access + approval_policy
-  // =never, so any MCP server present forces that sandbox on this (non-reviewer) run.
-  const customCodex = (!readOnly && ctx?.customCodexServers) ? ctx.customCodexServers : [];
+  // `-c mcp_servers.<name>={…}` TOML fragments. Same gating as the maestro bridge
+  // above — no custom MCP in read-only / plan-mode runs.
+  const customCodex = (!effectiveReadOnly && ctx?.customCodexServers) ? ctx.customCodexServers : [];
   const anyMcp = !!codexReg || customCodex.length > 0;
-  const sandbox = anyMcp ? 'danger-full-access' : (readOnly ? 'read-only' : 'workspace-write');
+  const sandbox = anyMcp ? 'danger-full-access' : (effectiveReadOnly ? 'read-only' : 'workspace-write');
+  // Plan-mode directive overlays the user's prompt: codex sees its real request
+  // PLUS instructions to propose a plan and not act. The dialog later surfaces
+  // codex's reply as the plan body for the operator to approve.
+  const effectivePrompt = planMode ? `${prompt}${CODEX_PLAN_DIRECTIVE}` : prompt;
   const args = [
     'exec', '--json', '--ephemeral', '--skip-git-repo-check',
     '-s', sandbox,
@@ -1743,7 +1789,7 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
     ...(model ? ['-m', model] : []),
     ...(imageFiles ?? []).flatMap(f => ['-i', f]), // vision input — codex attaches the image(s)
     '-C', cwd, '-o', outFile,
-    prompt,
+    effectivePrompt,
   ];
   return new Promise<EngineRun>((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env });
@@ -1900,6 +1946,39 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
           } catch { /* no codex home / none generated */ }
         }
         images = out.length ? out : undefined;
+      }
+      // Codex plan-mode parking: when this was a plan-only run, the agent's
+      // final text IS the plan. Park on the shared planGate (same one
+      // Claude's canUseTool uses) so the renderer's ExitPlanModeDialog
+      // surfaces it with the SAME UI regardless of which engine ran. On
+      // approve we append an approval note and resolve normally — the
+      // renderer auto-queues an "execute the plan now" follow-up message
+      // (codex exec is one-shot; we can't continue the run from inside).
+      // On deny we append a "refine" note and stay in plan mode for the
+      // next message.
+      const planText = text || proseOf(items);
+      if (planMode && ctx?.planGate && ctx?.emitPlanExit && planText && !hooks.signal?.aborted) {
+        // Synthetic id (codex has no SDK toolUseID). Pad with random so two
+        // overlapping codex plan turns can't collide on the gate's Map.
+        const toolUseID = `codex-${ctx.jobId ?? 'job'}-${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`;
+        const req: PlanModeExitRequest = {
+          toolUseID,
+          plan: planText,
+          sessionId: ctx.sessionId ?? null,
+          jobId: ctx.jobId ?? null,
+          engine: 'codex',
+        };
+        try { ctx.emitPlanExit(req); } catch { /* renderer gone */ }
+        ctx.planGate.requestExit(req, { signal: hooks.signal })
+          .then(approved => {
+            const note = approved
+              ? '\n\n— Plan approved. Executing on the next message.'
+              : '\n\n— Plan refinement requested. Stay in plan mode and revise.';
+            items.push({ kind: 'text', text: note, ts: Date.now() });
+            resolve({ text: `${text || planText}${note}`, tokens, cost: 0, model: model ?? 'codex', transcript: items, images });
+          })
+          .catch(() => { reject(new CancelledError()); });
+        return;
       }
       // Subscription run — Codex doesn't bill per-token, so cost stays 0.
       resolve({ text: text || proseOf(items) || '(no output)', tokens, cost: 0, model: model ?? 'codex', transcript: items, images });
@@ -3101,7 +3180,7 @@ export class LocalEngine {
       };
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
         ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, this.planGate, emitPlanExit, jobId)
-        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx, emitConfirm, sessionId: session?.id ?? null }, codexImageFiles);
+        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx, emitConfirm, sessionId: session?.id ?? null, plan: opts.plan, planGate: this.planGate, emitPlanExit, jobId }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
       // operator has to retry by hand. The retry starts the turn fresh; resumeId is

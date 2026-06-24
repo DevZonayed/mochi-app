@@ -125,6 +125,27 @@ export function ExitPlanModeDialog() {
       if (approved) {
         try { localStorage.setItem('maestro.chat.plan', '0'); } catch { /* storage unavailable */ }
         try { window.dispatchEvent(new CustomEvent('maestro:plan-mode-changed', { detail: { on: false } })); } catch { /* environment without CustomEvent */ }
+        // Codex's `codex exec` is one-shot — there is no SDK to "continue the
+        // same run" after permissionMode lifts, the way Claude's SDK can. So
+        // for Codex we dispatch an additional event with the plan body and
+        // session id; ProjectDetail listens and AUTO-SENDS an "execute the
+        // plan now" follow-up message (provided the user is still on the same
+        // session). Claude doesn't need this — its SDK already kept the run
+        // open through the allow decision and the agent starts executing
+        // immediately inside the same query() loop.
+        if (req.engine === 'codex') {
+          // Defer to the next paint frame so the `maestro:plan-mode-changed`
+          // dispatched above has time to flush through React state. That way
+          // the listener's sendText closure already reflects planMode=false
+          // and the follow-up message goes out with `plan: false` (instead
+          // of looping right back into a plan-only run).
+          const detail = { sessionId: req.sessionId, plan: req.plan };
+          try {
+            requestAnimationFrame(() => {
+              try { window.dispatchEvent(new CustomEvent('maestro:plan-approved-codex', { detail })); } catch { /* env without CustomEvent */ }
+            });
+          } catch { /* env without rAF (jsdom) */ }
+        }
       }
       close();
     } catch (e) {

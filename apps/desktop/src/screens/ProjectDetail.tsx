@@ -3032,6 +3032,33 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     void sendRaw(t).then(ok => { if (!ok) composerRef.current?.setText(raw); });
   }, [projectId, streaming, sendRaw, mutateQueue]);
 
+  // sendTextRef mirrors the latest sendText so the window-event listener below
+  // — registered ONCE with no deps — always calls the up-to-date closure (with
+  // the latest sendRaw, which in turn captures the latest planMode/goalMode).
+  // Without this, the listener would freeze the original closure and a Codex
+  // plan-mode approval would re-send into plan-mode by mistake.
+  const sendTextRef = React.useRef(sendText);
+  React.useEffect(() => { sendTextRef.current = sendText; }, [sendText]);
+
+  // Codex plan-mode approval auto-follow-up. Codex's `codex exec` is one-shot
+  // (unlike Claude's SDK which can continue the same run on canUseTool allow),
+  // so when the operator approves a Codex plan we have to queue a new turn
+  // explicitly to make the approval take effect. The dialog dispatches this
+  // event in rAF so React has already committed planMode=false; we ignore
+  // events for a session the operator switched away from. The follow-up
+  // message is short + unambiguous so codex knows it's executing the plan it
+  // just proposed — not re-planning.
+  React.useEffect(() => {
+    const onCodexApproved = (e: Event) => {
+      const detail = (e as CustomEvent<{ sessionId: string | null; plan: string }>).detail;
+      if (!detail) return;
+      if (detail.sessionId && detail.sessionId !== activeRef.current) return; // operator switched sessions
+      sendTextRef.current('Approved the plan above. Execute it now, following the steps you proposed.');
+    };
+    window.addEventListener('maestro:plan-approved-codex', onCodexApproved);
+    return () => window.removeEventListener('maestro:plan-approved-codex', onCodexApproved);
+  }, []);
+
   // STEER: interrupt the running turn and send right now (session resumes with context).
   const sendNow = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
     const t = raw.trim();

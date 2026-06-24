@@ -32,18 +32,27 @@
    tool — same intent, but the child outlives the steer. */
 
 export interface PlanModeExitRequest {
-  /** The SDK's unique id for this specific ExitPlanMode call. The renderer
-      sends it back unchanged so we route the answer to the right Promise. */
+  /** Stable id for this specific request. For Claude it's the SDK's toolUseID;
+      for Codex (which has no native ExitPlanMode protocol) we synthesise one
+      from the jobId so the gate's routing stays uniform across engines. */
   toolUseID: string;
-  /** Plan body (markdown) the agent passed via `ExitPlanMode({ plan: … })`. May
-      be empty if the SDK / agent didn't supply one; in that case the dialog
-      falls back to the last assistant text it has on hand. */
+  /** Plan body (markdown). For Claude this is `input.plan` from the SDK's
+      ExitPlanMode call; for Codex this is the agent's final reply text from
+      the plan-only turn (read-only sandbox + plan directive). May be empty —
+      the dialog renders a fallback in that case. */
   plan: string;
   /** The chat session this run belongs to — lets the renderer ignore stale
       requests if the operator already switched sessions. */
   sessionId: string | null;
   /** The job id (turn) running this agent — useful for logging. */
   jobId: string | null;
+  /** Which engine is parked on the gate. Determines what happens on approve:
+      Claude's SDK continues the same `query()` run when canUseTool returns
+      allow, but Codex's `codex exec` is one-shot — its plan-mode run ENDS
+      after producing the plan, so the renderer auto-queues an "execute now"
+      follow-up message to make the approval take effect. The two-step shape
+      is intrinsic to the engine difference, not a UX choice. */
+  engine: 'claude' | 'codex';
 }
 
 interface Pending {

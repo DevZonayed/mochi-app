@@ -15,8 +15,8 @@
 import { describe, it, expect } from 'vitest';
 import { createPlanModeGate, BG_RUN_IN_BACKGROUND_DENY } from './plan-mode-gate.js';
 
-const req = (id: string, plan = 'do step 1') => ({
-  toolUseID: id, plan, sessionId: 'sess-1', jobId: 'job-1',
+const req = (id: string, plan = 'do step 1', engine: 'claude' | 'codex' = 'claude') => ({
+  toolUseID: id, plan, sessionId: 'sess-1', jobId: 'job-1', engine,
 });
 
 describe('plan-mode-gate', () => {
@@ -89,5 +89,22 @@ describe('plan-mode-gate', () => {
     // The deny text is meant for the agent — has to read like an instruction,
     // not an error. Just spot-check that it's non-empty and reasonably long.
     expect(BG_RUN_IN_BACKGROUND_DENY.length).toBeGreaterThan(80);
+  });
+
+  it('routes Claude and Codex requests independently — they don\'t share the queue', async () => {
+    // The gate is engine-agnostic by design: the `engine` field rides on the
+    // request payload so the dialog can take different actions on approve
+    // (Claude continues the SDK run; Codex needs a follow-up message). But
+    // routing — who gets which Promise back — must be by toolUseID alone,
+    // because both engines can have plan turns in parallel.
+    const gate = createPlanModeGate();
+    const claudeP = gate.requestExit(req('cl-1', 'claude plan', 'claude'));
+    const codexP = gate.requestExit(req('cx-1', 'codex plan', 'codex'));
+    expect(gate.pendingCount()).toBe(2);
+    // Answer codex first, claude second — out of order; both still route right.
+    gate.respondExit('cx-1', true);
+    gate.respondExit('cl-1', false);
+    await expect(claudeP).resolves.toBe(false);
+    await expect(codexP).resolves.toBe(true);
   });
 });
