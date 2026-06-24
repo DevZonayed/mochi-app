@@ -60,6 +60,10 @@ export interface Project {
   runMode?: 'concurrent' | 'nonconcurrent';
   /** Manual display order from drag-and-drop. Lower = earlier. Unset → sorts by createdAt. */
   order?: number;
+  /** Reversible soft-hide: true → dropped from the default Projects view (desktop
+      + mobile). Absent/false = visible. Toggled via updateProject; syncs like any
+      other field on the updatedAt delta-sync. */
+  hidden?: boolean;
   createdAt: number;
   /** Set on create + bumped on every mutation (incl. reorder). Drives the
       relay's delta-sync filter (/api/sync?since=ts). */
@@ -1081,7 +1085,7 @@ export class Store {
     this.data.projects.push(p); this.save();
     return p;
   }
-  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl'>>): Project {
+  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden'>>): Project {
     const cur = this.getProject(projectId);
     if (!cur) throw Object.assign(new Error('project not found'), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });

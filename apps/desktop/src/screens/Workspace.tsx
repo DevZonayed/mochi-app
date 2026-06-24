@@ -182,6 +182,8 @@ export default function Workspace() {
   const [pickerProj, setPickerProj] = React.useState<string | null>(null);
   // Project pending a delete confirmation (the destructive modal).
   const [confirmDelProj, setConfirmDelProj] = React.useState<string | null>(null);
+  // Reveal soft-hidden projects in the rail (off by default).
+  const [showHidden, setShowHidden] = React.useState(false);
   // Per-project "Archived" sub-list expanded state.
   const [archivedOpen, setArchivedOpen] = React.useState<Set<string>>(new Set());
   const [kindFilter, setKindFilterState] = React.useState<KindFilter>(() => {
@@ -461,6 +463,12 @@ export default function Workspace() {
     setExpanded(e => { const n = new Set(e); n.delete(id); return n; });
     void api.deleteProject(id).catch(() => {});
   };
+  // Toggle a project's reversible soft-hide — optimistic, persisted via the
+  // shared updateProject path (syncs to the gallery + mobile too).
+  const setHidden = (id: string, hidden: boolean) => {
+    setProjects(ps => ps.map(p => p.id === id ? { ...p, hidden } : p));
+    void api.updateProject(id, { hidden }).catch(() => { api.listProjects().then(setProjects).catch(() => {}); });
+  };
   const commitRename = (id: string) => {
     const title = renameVal.trim(); setRenamingId(null);
     if (!title) return;
@@ -519,7 +527,9 @@ export default function Workspace() {
   // CodeSpace shows coding work only — design projects live in the Design tab.
   const codeProjects = projects.filter(p => projKind(p) !== 'design');
   const kindCount = (k: KindFilter) => (k === 'all' ? codeProjects.length : codeProjects.filter(p => projKind(p) === k).length);
-  const visibleProjects = codeProjects.filter(p => kindMatch(p) && projHit(p));
+  // Soft-hidden projects drop out of the rail unless "Show hidden" is on.
+  const hiddenCount = codeProjects.filter(p => p.hidden && kindMatch(p) && projHit(p)).length;
+  const visibleProjects = codeProjects.filter(p => kindMatch(p) && projHit(p) && (showHidden || !p.hidden));
   const sessionsByProject = (pid: string) => {
     const p = projById[pid];
     return sessions.filter(s => s.projectId === pid && !s.archived && (!q || chatHit(s) || (p && p.name.toLowerCase().includes(q)))).sort((a, b) => b.updatedAt - a.updatedAt);
@@ -762,6 +772,11 @@ export default function Workspace() {
             )}
 
             {visibleProjects.length > 0 && sectionLabel(kindFilter === 'all' ? 'Projects' : `${kindOf(kindFilter).label} projects`)}
+            {hiddenCount > 0 && (
+              <button onClick={() => setShowHidden(v => !v)} style={{ display: 'flex', alignItems: 'center', gap: 7, width: '100%', textAlign: 'left', padding: '4px 8px', margin: '0 0 2px', borderRadius: 7, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>
+                <Icon name={showHidden ? 'eye' : 'eyeOff'} size={13} /> {showHidden ? `Hide ${hiddenCount} hidden` : `Show ${hiddenCount} hidden`}
+              </button>
+            )}
             {projects.length > 0 && visibleProjects.length === 0 && (
               <div style={{ padding: '24px 14px', textAlign: 'center', font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>
                 No {kindFilter === 'all' ? '' : kindOf(kindFilter).label.toLowerCase() + ' '}projects{q ? ' match' : ''}.
@@ -787,8 +802,8 @@ export default function Workspace() {
                     <Icon name="chevronRight" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
                     {projRunning
                       ? <Loader size={14} color={projColor(p)} />
-                      : <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p) }} />}
-                    <span style={{ flex: 1, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 6, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)' }}>
+                      : <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p), opacity: p.hidden ? 0.5 : undefined }} />}
+                    <span style={{ flex: 1, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 6, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', opacity: p.hidden ? 0.5 : undefined }}>
                       <span style={{ minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
                       <ProjectRollupDot projectId={p.id} sessionIds={chats.map(c => c.id)} />
                     </span>
@@ -852,6 +867,7 @@ export default function Workspace() {
                           {p.path && <button className="ws-ovf-item" onClick={() => { setMenuProj(null); void api.revealPath(p.path!); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="folder" size={15} style={{ color: 'var(--ink-secondary)' }} /> Reveal in Finder</button>}
                           <button className="ws-ovf-item" onClick={() => { setMenuProj(null); navigate('/skills-registry'); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="spark" size={15} style={{ color: 'var(--ink-secondary)' }} /> Skills</button>
                           <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
+                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); setHidden(p.id, !p.hidden); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name={p.hidden ? 'eye' : 'eyeOff'} size={15} style={{ color: 'var(--ink-secondary)' }} /> {p.hidden ? 'Unhide project' : 'Hide project'}</button>
                           <button className="ws-ovf-item" onClick={() => { setMenuProj(null); setConfirmDelProj(p.id); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--red, #ff3b30)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="trash" size={15} /> Delete project</button>
                         </div>
                       </>

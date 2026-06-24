@@ -32,6 +32,9 @@ const PAGE_CSS = `
   /* the card/row being dragged dims while the rest reflow around it */
   .proj-card.dragging, .proj-row.dragging { opacity: 0.4; }
   .proj-menu:hover { background: var(--fill-secondary); color: var(--ink); }
+  .proj-menu-item:hover { background: var(--fill-secondary); }
+  .hidden-toggle { transition: background 120ms ease, color 120ms ease; }
+  .hidden-toggle:hover { background: var(--fill-secondary); color: var(--ink); }
   .tpl-pick { transition: transform 140ms var(--spring), box-shadow 160ms ease; }
   .tpl-pick:hover { transform: translateY(-2px); box-shadow: var(--card-shadow), 0 8px 22px rgba(15,20,60,0.12); }
 
@@ -77,6 +80,8 @@ interface Project {
   next: string;
   activity: string;
   paused?: boolean;
+  /** Reversible soft-hide — dropped from the default view, revealed via "Hidden (N)". */
+  hidden?: boolean;
   kind?: ProjectKind;
   path?: string;
   repoUrl?: string;
@@ -152,6 +157,7 @@ function toRow(p: ApiProject, jobs: Job[], pendingGates: number, sessions: ChatS
     subs: 0,
     next: '—',
     activity: 'Idle',
+    hidden: p.hidden,
     kind: p.kind,
     path: p.path,
     repoUrl: p.repoUrl,
@@ -185,6 +191,63 @@ function StatusLine({ p }: { p: Project }) {
   );
 }
 
+// ── Per-project ⋯ menu (Hide / Delete) ──────────────────────────────────────
+
+const menuItemStyle = (color: string): React.CSSProperties => ({
+  display: 'flex', alignItems: 'center', gap: 10, height: 34, padding: '0 12px', borderRadius: 8,
+  font: '600 var(--fs-subhead)/1 var(--font-text)', color, cursor: 'pointer', textAlign: 'left',
+});
+
+interface ProjectMenuProps {
+  hidden?: boolean;
+  onHide: () => void;
+  onDelete: () => void;
+}
+
+/* The per-project overflow menu. Rendered in a fixed-position layer (the card
+   clips overflow) anchored to the ⋯ trigger, with a transparent backdrop that
+   catches the outside click. Every click stopPropagation so the card's
+   open-on-click and drag handlers stay dormant. */
+function ProjectMenu({ hidden, onHide, onDelete }: ProjectMenuProps) {
+  const [open, setOpen] = React.useState(false);
+  const [anchor, setAnchor] = React.useState<{ top: number; right: number } | null>(null);
+  const btnRef = React.useRef<HTMLButtonElement>(null);
+
+  const toggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (open) { setOpen(false); return; }
+    const r = btnRef.current?.getBoundingClientRect();
+    if (r) setAnchor({ top: r.bottom + 4, right: window.innerWidth - r.right });
+    setOpen(true);
+  };
+  const pick = (fn: () => void) => (e: React.MouseEvent) => { e.stopPropagation(); setOpen(false); fn(); };
+
+  return (
+    <>
+      <button ref={btnRef} className="proj-menu" title="More" onClick={toggle} style={{
+        width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0,
+      }}><Icon name="more" size={16} /></button>
+      {open && anchor && (
+        <div onClick={e => { e.stopPropagation(); setOpen(false); }} style={{ position: 'fixed', inset: 0, zIndex: 300 }}>
+          <div onClick={e => e.stopPropagation()} role="menu" style={{
+            position: 'fixed', top: anchor.top, right: anchor.right, minWidth: 168,
+            background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12,
+            boxShadow: '0 16px 44px rgba(15,20,60,0.24)', padding: 6, display: 'flex', flexDirection: 'column', gap: 2,
+            animation: 'modalPop 140ms var(--spring)',
+          }}>
+            <button role="menuitem" className="proj-menu-item" onClick={pick(onHide)} style={menuItemStyle('var(--ink)')}>
+              <Icon name={hidden ? 'eye' : 'eyeOff'} size={15} /> {hidden ? 'Unhide' : 'Hide'}
+            </button>
+            <button role="menuitem" className="proj-menu-item" onClick={pick(onDelete)} style={menuItemStyle('var(--red, #ff3b30)')}>
+              <Icon name="trash" size={15} /> Delete
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 // ── Project card ────────────────────────────────────────────────────────────
 
 interface CardProps {
@@ -192,19 +255,21 @@ interface CardProps {
   onMenu: (id: string) => void;
   onOpen?: (id: string) => void;
   dnd?: Dnd;
+  /** Toggle this project's reversible soft-hide. */
+  onHide?: (id: string, hidden: boolean) => void;
   /** Sweep every `pr-merged` session in this project to archived. Callback fires
       after the user confirms; returns the swept count for the toast. */
   onArchiveMerged?: (projectId: string) => void | Promise<void>;
 }
 
-function ProjectCard({ p, onMenu, onOpen, dnd, onArchiveMerged }: CardProps) {
+function ProjectCard({ p, onMenu, onOpen, dnd, onHide, onArchiveMerged }: CardProps) {
   const t = TEMPLATES[p.tpl];
   const rollup = useProjectRollupState(p.id, p.sessionIds);
   return (
     <div className={`proj-card${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
       position: 'relative', background: 'var(--bg-elevated)', borderRadius: 20, overflow: 'hidden',
       border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', cursor: 'pointer',
-      display: 'flex', flexDirection: 'column',
+      display: 'flex', flexDirection: 'column', opacity: p.hidden ? 0.5 : undefined,
     }}>
       <div style={{ height: 3, background: t.tint, flexShrink: 0 }} />
       <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 14, flex: 1 }}>
@@ -224,11 +289,7 @@ function ProjectCard({ p, onMenu, onOpen, dnd, onArchiveMerged }: CardProps) {
             <span style={{ display: 'block', font: '600 var(--fs-headline)/1.2 var(--font-text)', letterSpacing: '-0.01em', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
             <span style={{ display: 'block', font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{t.label}</span>
           </span>
-          {!p.paused && (
-            <button className="proj-menu" title="Delete project" onClick={e => { e.stopPropagation(); onMenu(p.id); }} style={{
-              width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0,
-            }}><Icon name="trash" size={16} /></button>
-          )}
+          <ProjectMenu hidden={p.hidden} onHide={() => onHide?.(p.id, !p.hidden)} onDelete={() => onMenu(p.id)} />
         </div>
 
         {/* status */}
@@ -281,17 +342,19 @@ interface RowProps {
   p: Project;
   onMenu: (id: string) => void;
   onOpen?: (id: string) => void;
+  onHide?: (id: string, hidden: boolean) => void;
   last: boolean;
   dnd?: Dnd;
 }
 
-function ProjectRow({ p, onMenu, onOpen, last, dnd }: RowProps) {
+function ProjectRow({ p, onMenu, onOpen, onHide, last, dnd }: RowProps) {
   const t = TEMPLATES[p.tpl];
   const rollup = useProjectRollupState(p.id, p.sessionIds);
   return (
     <div className={`proj-row${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
       display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.4fr 0.8fr 1fr 36px', alignItems: 'center', gap: 14,
       padding: '13px 16px', borderBottom: last ? 'none' : '0.5px solid var(--separator)', cursor: 'pointer',
+      opacity: p.hidden ? 0.5 : undefined,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
         <span style={{ position: 'relative', width: 32, height: 32, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center',
@@ -315,10 +378,7 @@ function ProjectRow({ p, onMenu, onOpen, last, dnd }: RowProps) {
       </div>
       <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{p.path ? (p.repoUrl ? 'repo' : 'folder') : '—'}</span>
       <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{p.next === '—' ? p.activity : `Next ${p.next}`}</span>
-      <button className="proj-menu" title="Delete project" onClick={e => { e.stopPropagation(); onMenu(p.id); }} style={{
-        width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}>
-        <Icon name="trash" size={16} />
-      </button>
+      <ProjectMenu hidden={p.hidden} onHide={() => onHide?.(p.id, !p.hidden)} onDelete={() => onMenu(p.id)} />
     </div>
   );
 }
@@ -360,10 +420,11 @@ interface ListTableProps {
   projects: Project[];
   onMenu: (id: string) => void;
   onOpen?: (id: string) => void;
+  onHide?: (id: string, hidden: boolean) => void;
   dnd?: Dnd;
 }
 
-function ListTable({ projects, onMenu, onOpen, dnd }: ListTableProps) {
+function ListTable({ projects, onMenu, onOpen, onHide, dnd }: ListTableProps) {
   const [sort, setSort] = React.useState<string>('activity');
   const sorted = [...projects].sort((a, b) => sort === 'spend' ? b.spent - a.spent : 0);
   const cols: [string, string | null][] = [['Project', null], ['Status', null], ['Spend', 'spend'], ['Source', null], ['Schedule', 'activity'], ['', null]];
@@ -382,7 +443,7 @@ function ListTable({ projects, onMenu, onOpen, dnd }: ListTableProps) {
           </button>
         ))}
       </div>
-      {sorted.map((p, i) => <ProjectRow key={p.id} p={p} onMenu={onMenu} onOpen={onOpen} last={i === sorted.length - 1} dnd={sort === 'spend' ? undefined : dnd} />)}
+      {sorted.map((p, i) => <ProjectRow key={p.id} p={p} onMenu={onMenu} onOpen={onOpen} onHide={onHide} last={i === sorted.length - 1} dnd={sort === 'spend' ? undefined : dnd} />)}
     </div>
   );
 }
@@ -1105,6 +1166,7 @@ export default function Projects() {
   const [suggestedName, setSuggestedName] = React.useState<string | undefined>(undefined);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const [confirmDel, setConfirmDel] = React.useState<string | null>(null);
+  const [showHidden, setShowHidden] = React.useState(false);
 
   // Opened with router state { openNew: true } → open the New-project sheet.
   React.useEffect(() => {
@@ -1155,6 +1217,12 @@ export default function Projects() {
     setConfirmDel(null);
     setProjects(ps => ps.filter(p => p.id !== id));
     void api.deleteProject(id).catch(() => { void load(); });
+  };
+  // Toggle a project's reversible soft-hide — optimistic, persisted via the
+  // shared updateProject path (which bumps updatedAt so remotes resync).
+  const setHidden = (id: string, hidden: boolean) => {
+    setProjects(ps => ps.map(p => p.id === id ? { ...p, hidden } : p));
+    void api.updateProject(id, { hidden }).catch(() => { void load(); });
   };
   const open = (id: string) => { navigate(`/project-detail/${id}`); };
 
@@ -1213,6 +1281,23 @@ export default function Projects() {
     },
   }), [draggingId, load]);
 
+  // Default view drops hidden projects; the "Hidden (N)" toggle reveals them
+  // (dimmed). Derived from the already-loaded list — no extra fetch.
+  const visible = projects.filter(p => !p.hidden);
+  const hiddenCount = projects.length - visible.length;
+  const shown = showHidden ? projects : visible;
+
+  const hiddenToggle = hiddenCount > 0 && (
+    <button onClick={() => setShowHidden(v => !v)} className="hidden-toggle"
+      title={showHidden ? 'Hide hidden projects' : 'Show hidden projects'} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 7, height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)',
+      background: showHidden ? 'var(--fill-secondary)' : 'transparent', border: '0.5px solid var(--separator)',
+      color: showHidden ? 'var(--ink)' : 'var(--ink-secondary)', font: '600 var(--fs-callout)/1 var(--font-text)',
+    }}>
+      <Icon name={showHidden ? 'eye' : 'eyeOff'} size={15} /> Hidden ({hiddenCount})
+    </button>
+  );
+
   const newBtn = (
     <button onClick={() => setGalleryOpen(true)} className="primary-cta" style={{
       display: 'inline-flex', alignItems: 'center', gap: 7, height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)',
@@ -1238,6 +1323,7 @@ export default function Projects() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               <Segmented value={view} onChange={setView}
                 options={[{ key: 'grid', label: 'Grid', icon: 'layers' }, { key: 'list', label: 'List', icon: 'jobs' }]} />
+              {hiddenToggle}
               {newBtn}
             </div>
           </div>
@@ -1246,9 +1332,9 @@ export default function Projects() {
             : projects.length === 0 ? <EmptyProjects onPick={() => setGalleryOpen(true)} />
             : view === 'grid'
               ? <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(316px, 1fr))', gap: 18 }}>
-                  {projects.map(p => <ProjectCard key={p.id} p={p} onMenu={requestDelete} onOpen={open} dnd={dnd} onArchiveMerged={archiveMergedFor} />)}
+                  {shown.map(p => <ProjectCard key={p.id} p={p} onMenu={requestDelete} onOpen={open} onHide={setHidden} dnd={dnd} onArchiveMerged={archiveMergedFor} />)}
                 </div>
-              : <ListTable projects={projects} onMenu={requestDelete} onOpen={open} dnd={dnd} />}
+              : <ListTable projects={shown} onMenu={requestDelete} onOpen={open} onHide={setHidden} dnd={dnd} />}
         </div>
       </AppShell>
 

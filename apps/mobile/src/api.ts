@@ -18,7 +18,7 @@ export interface DirEntry { name: string; path: string; isDir: boolean; isRepo: 
 export interface DirListing { path: string; parent: string | null; home: string; entries: DirEntry[]; error?: string }
 
 export interface Workspace { id: string; name: string; budgetCap: number; createdAt: number }
-export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; kind?: ProjectKind; path?: string; repoUrl?: string; order?: number; createdAt: number; updatedAt: number }
+export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; kind?: ProjectKind; path?: string; repoUrl?: string; order?: number; hidden?: boolean; createdAt: number; updatedAt: number }
 /** One structured block of an agent run (mirrors the desktop, image bytes stripped). */
 export interface TranscriptItem {
   kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image';

@@ -326,6 +326,8 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // Worktree isolation settings.
         if (Array.isArray(p.copyGlobs)) patch.copyGlobs = (p.copyGlobs as unknown[]).filter((g): g is string => typeof g === 'string');
         if (p.runMode === 'concurrent' || p.runMode === 'nonconcurrent') patch.runMode = p.runMode;
+        // Reversible soft-hide from the Projects view.
+        if (typeof p.hidden === 'boolean') patch.hidden = p.hidden;
         if (Object.keys(patch).length === 0) bad('no valid project fields');
         const proj = store.updateProject(String(p.id ?? ''), patch);
         emit('project', proj);

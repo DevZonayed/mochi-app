@@ -66,6 +66,8 @@ export function OpenAIGlyph({ size = 26 }: { size?: number }) {
 // ── Names of every available line icon (keys of the `paths` map below).
 export type IconName =
   | 'check'
+  | 'eye'
+  | 'eyeOff'
   | 'paperclip'
   | 'globe'
   | 'chat'
@@ -187,6 +189,8 @@ export function Icon({ name, size = 18, stroke = 1.75, style }: IconProps) {
     checkCircle: <><circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-5"/></>,
     xCircle: <><circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/></>,
     more: <><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></>,
+    eye: <><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></>,
+    eyeOff: <><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-2.4 3.4M6.6 6.6A18 18 0 0 0 2 12s3.5 7 10 7a10.9 10.9 0 0 0 4.1-.8"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><line x1="3" y1="3" x2="21" y2="21"/></>,
     chevronRight: <polyline points="9 6 15 12 9 18"/>,
     chevronDown: <polyline points="6 9 12 15 18 9"/>,
     gitMerge: <><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="9" r="3"/><path d="M6 9v6M15 9a9 9 0 0 1-9 9"/></>,
