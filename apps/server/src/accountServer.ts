@@ -22,6 +22,28 @@ export async function migrateAll(): Promise<void> {
   await migrateAuth();
 }
 
+/** CORS headers for a hijacked Better Auth (`/api/auth/*`) response.
+
+   We hijack the reply and let Better Auth write the raw response itself (see
+   below), which means `@fastify/cors`'s `onSend` hook never runs for these
+   routes. Without this, the OPTIONS preflight gets CORS headers (cors handles it
+   directly) but the ACTUAL response does not — so a real browser origin (the
+   desktop DEV build at http://localhost:5173) can't read it and `fetch` throws
+   "Failed to fetch" on sign-in. Packaged apps load from file:// (null Origin →
+   not a CORS request) so they were unaffected and masked the bug.
+
+   We reflect the request Origin (matching the `cors({ origin: true })` policy)
+   and expose `set-auth-token` — the header the renderer reads the session token
+   from, which the browser hides on cross-origin responses unless exposed. */
+export function authCorsHeaders(origin: string | undefined): Record<string, string> {
+  if (!origin) return {};
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Expose-Headers': 'set-auth-token',
+    Vary: 'Origin',
+  };
+}
+
 export function buildAccountServer(): FastifyInstance {
   const app = Fastify({ logger: false, bodyLimit: 200 * 1024 * 1024 });
   app.register(cors, { origin: true });
@@ -32,6 +54,12 @@ export function buildAccountServer(): FastifyInstance {
   const baHandler = toNodeHandler(auth);
   app.addHook('onRequest', async (req, reply) => {
     if ((req.raw.url ?? '').startsWith('/api/auth/')) {
+      // Set CORS headers on the raw response BEFORE hijacking — @fastify/cors's
+      // onSend hook does not run for a hijacked reply, so without this the actual
+      // auth response reaches a browser with no Access-Control-Allow-Origin. See
+      // authCorsHeaders() for the full rationale.
+      const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+      for (const [k, v] of Object.entries(authCorsHeaders(origin))) reply.raw.setHeader(k, v);
       reply.hijack();
       await baHandler(req.raw, reply.raw);
     }
