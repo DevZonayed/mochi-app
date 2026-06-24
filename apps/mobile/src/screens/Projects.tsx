@@ -33,7 +33,10 @@ export function ProjectsScreen() {
   // per-screen refetch. The store is fed by /api/sync (delta-since-last-pull)
   // and the live SSE/P2P stream. Re-mounts of this screen never re-seed from
   // stale storage; the store is the source of truth.
-  const projects = useSyncStore((s) => s.projects);
+  // Soft-hidden projects (toggled from the Mac) drop out of the phone view too —
+  // the `hidden` flag rides the same delta-sync as every other project field.
+  const allProjects = useSyncStore((s) => s.projects);
+  const projects = useMemo(() => allProjects.filter((p) => !p.hidden), [allProjects]);
   const sessions = useSyncStore((s) => s.sessions);
   const jobs = useSyncStore((s) => s.jobs);
   const bootstrapped = useSyncStore((s) => s.bootstrapped);
