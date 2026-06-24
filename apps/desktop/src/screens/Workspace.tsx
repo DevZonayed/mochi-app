@@ -180,6 +180,9 @@ export default function Workspace() {
   const [menuProj, setMenuProj] = React.useState<string | null>(null);
   // Which project's "+" button has the <BranchPicker /> popover open (one at a time).
   const [pickerProj, setPickerProj] = React.useState<string | null>(null);
+  // Anchor for the open picker — attached to the live "+" button so the portaled
+  // popover positions itself against it (escapes the sidebar's overflow clip).
+  const pickerAnchorRef = React.useRef<HTMLButtonElement | null>(null);
   // Project pending a delete confirmation (the destructive modal).
   const [confirmDelProj, setConfirmDelProj] = React.useState<string | null>(null);
   // Reveal soft-hidden projects in the rail (off by default).
@@ -812,7 +815,7 @@ export default function Workspace() {
                       <Icon name="more" size={15} />
                     </button>
                     <div style={{ position: 'relative', flexShrink: 0 }}>
-                      <button className="ws-newchat" title="New chat here — pick a base branch (⌘+click to skip)"
+                      <button ref={pickerProj === p.id ? pickerAnchorRef : null} className="ws-newchat" title="New chat here — pick a base branch (⌘+click to skip)"
                         onClick={e => {
                           e.stopPropagation();
                           // ⌘/Ctrl+click skips the picker → instant chat off the
@@ -829,24 +832,20 @@ export default function Workspace() {
                         style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)' }}>
                         <Icon name="plus" size={14} stroke={2.4} />
                       </button>
+                      {/* Portaled to document.body + self-positioning against the button rect,
+                          so it can't be clipped by the sidebar's overflow. */}
                       {pickerProj === p.id && (
-                        <>
-                          {/* Outside-click captures every click; stops propagation on the popover. */}
-                          <div onClick={e => { e.stopPropagation(); setPickerProj(null); }} style={{ position: 'fixed', inset: 0, zIndex: 50 }} />
-                          <div onClick={e => e.stopPropagation()}
-                            style={{ position: 'absolute', top: '100%', right: 0, zIndex: 51, marginTop: 4 }}>
-                            <BranchPicker
-                              projectId={p.id}
-                              onClose={() => setPickerProj(null)}
-                              onPick={(branch, isDefault) => {
-                                setPickerProj(null);
-                                // Default → omit base so the tab title stays clean and the
-                                // engine's resolveBaseBranch path handles it (same as ⌘+click).
-                                newChat(p.id, isDefault ? undefined : branch);
-                              }}
-                            />
-                          </div>
-                        </>
+                        <BranchPicker
+                          anchorRef={pickerAnchorRef}
+                          projectId={p.id}
+                          onClose={() => setPickerProj(null)}
+                          onPick={(branch, isDefault) => {
+                            setPickerProj(null);
+                            // Default → omit base so the tab title stays clean and the
+                            // engine's resolveBaseBranch path handles it (same as ⌘+click).
+                            newChat(p.id, isDefault ? undefined : branch);
+                          }}
+                        />
                       )}
                     </div>
                     {menuProj === p.id && (
