@@ -47,6 +47,8 @@ export interface Project {
   runMode?: 'concurrent' | 'nonconcurrent';
   /** Manual display order from drag-and-drop. Lower = earlier. */
   order?: number;
+  /** Reversible soft-hide: true → dropped from the default Projects view. */
+  hidden?: boolean;
   createdAt: number;
 }
 /** A branch usable as a base for a new chat (mirrors electron/git.ts). */
@@ -871,7 +873,7 @@ export const api = {
       'openProject', { id }, () => Promise.resolve({ ok: true, skipped: true as const, reason: 'remote' })),
   closeProject: (id: string) =>
     call<{ ok: boolean }>('closeProject', { id }, () => Promise.resolve({ ok: true })),
-  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl'>>) =>
+  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden'>>) =>
     call<Project>('updateProject', { id, ...patch }, () =>
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   reorderProjects: (ids: string[]) =>
