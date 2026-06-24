@@ -4,11 +4,24 @@
    Enter to pick, Esc to close, `/` to focus the filter input. */
 
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { Icon } from '../lib/icons';
 import { api, type BranchInfo } from '../lib/api';
 
+// Popover geometry. The panel renders in a portal on `document.body` so it
+// escapes the sidebar's `overflow:auto` clipping (a 320px panel anchored inside
+// a 260px column used to get its left edge chopped off — see screenshot bug).
+const PANEL_W = 320;
+const PANEL_MAX_H = 420;
+const GAP = 4;     // space between the "+" trigger and the panel
+const MARGIN = 8;  // min gap kept from every viewport edge
+
 export interface BranchPickerProps {
   projectId: string;
+  /** The trigger element (the "+" button) the popover anchors to. We measure its
+      rect and position a fixed, portaled panel against it, re-placing on
+      scroll/resize so it tracks the button. */
+  anchorRef: React.RefObject<HTMLElement | null>;
   /** Called with the chosen branch + whether it's the repo's default
       (`origin/HEAD`). Default picks normally translate to "no base override"
       so the tab title stays clean and the engine's existing
@@ -17,6 +30,10 @@ export interface BranchPickerProps {
   /** Esc / outside-click closes the popover. */
   onClose: () => void;
 }
+
+/** Resolved fixed-position placement for the portaled panel. Anchored by `top`
+    when dropping below the trigger, or by `bottom` when flipped above it. */
+type Placement = { left: number; maxH: number } & ({ top: number } | { bottom: number });
 
 function relTime(ts: number): string {
   if (!ts) return '';
@@ -41,13 +58,51 @@ export function defaultIndex(all: BranchInfo[]): number {
   return i === -1 ? 0 : i;
 }
 
-export function BranchPicker({ projectId, onPick, onClose }: BranchPickerProps) {
+export function BranchPicker({ projectId, anchorRef, onPick, onClose }: BranchPickerProps) {
   const [all, setAll] = React.useState<BranchInfo[] | null>(null);
   const [loadErr, setLoadErr] = React.useState<string | null>(null);
   const [query, setQuery] = React.useState('');
   const [active, setActive] = React.useState<number>(0);
+  const [pos, setPos] = React.useState<Placement | null>(null);
   const queryRef = React.useRef<HTMLInputElement | null>(null);
   const listRef = React.useRef<HTMLDivElement | null>(null);
+  const panelRef = React.useRef<HTMLDivElement | null>(null);
+
+  // Place the panel against the trigger's rect (right-aligned, clamped on-screen),
+  // dropping below by default and flipping above when there's more room up top.
+  // useLayoutEffect runs before paint, so the panel appears already positioned.
+  React.useLayoutEffect(() => {
+    const place = () => {
+      const a = anchorRef.current?.getBoundingClientRect();
+      if (!a) return;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const left = Math.max(MARGIN, Math.min(a.right - PANEL_W, vw - PANEL_W - MARGIN));
+      const below = vh - a.bottom - GAP - MARGIN;
+      const above = a.top - GAP - MARGIN;
+      setPos(below >= above
+        ? { left, top: a.bottom + GAP, maxH: Math.min(PANEL_MAX_H, below) }
+        : { left, bottom: vh - a.top + GAP, maxH: Math.min(PANEL_MAX_H, above) });
+    };
+    place();
+    window.addEventListener('resize', place, true);
+    window.addEventListener('scroll', place, true); // track the button as the tree scrolls
+    return () => {
+      window.removeEventListener('resize', place, true);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [anchorRef]);
+
+  // Outside-click closes. The trigger is excluded so its own onClick keeps
+  // ownership of the open/close toggle (no double-fire).
+  React.useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t) || anchorRef.current?.contains(t)) return;
+      onClose();
+    };
+    document.addEventListener('mousedown', onDown, true);
+    return () => document.removeEventListener('mousedown', onDown, true);
+  }, [anchorRef, onClose]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -93,10 +148,13 @@ export function BranchPicker({ projectId, onPick, onClose }: BranchPickerProps) 
     }
   };
 
-  return (
-    <div role="dialog" aria-label="Pick a base branch" onKeyDown={onKeyDown}
+  return createPortal(
+    <div ref={panelRef} role="dialog" aria-label="Pick a base branch" onKeyDown={onKeyDown}
       style={{
-        width: 320, maxHeight: 420, display: 'flex', flexDirection: 'column',
+        position: 'fixed', zIndex: 200, left: pos?.left ?? -9999,
+        ...(pos && 'top' in pos ? { top: pos.top } : pos ? { bottom: pos.bottom } : { top: -9999 }),
+        visibility: pos ? 'visible' : 'hidden',
+        width: PANEL_W, maxHeight: pos?.maxH ?? PANEL_MAX_H, display: 'flex', flexDirection: 'column',
         background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)',
         borderRadius: 12, boxShadow: 'var(--card-shadow)', padding: 6, overflow: 'hidden',
       }}>
@@ -193,7 +251,8 @@ export function BranchPicker({ projectId, onPick, onClose }: BranchPickerProps) 
         <Kbd>↵</Kbd><span>pick</span>
         <Kbd>esc</Kbd><span>close</span>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
