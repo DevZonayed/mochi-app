@@ -4,6 +4,7 @@ import { UpdateBanner } from './lib/UpdateBanner';
 import { NotificationCenter } from './lib/notify';
 import { RemotePairGate } from './lib/RemotePairGate';
 import { PrActionConfirmDialog } from './screens/PrActionConfirmDialog';
+import { ExitPlanModeDialog } from './screens/ExitPlanModeDialog';
 import { IS_LOCAL } from './lib/api';
 import { hasSession, onAuthChange, primeSession } from './lib/auth';
 
@@ -111,6 +112,13 @@ export function App() {
           Subscribes to `pr-confirm-request` events and re-invokes the existing
           mergeSessionPR / resolveSession IPC handlers after a HUMAN click. */}
       {IS_LOCAL && <PrActionConfirmDialog />}
+      {/* Mac-local: plan-mode exit gate. The agent's ExitPlanMode call parks on
+          the host's canUseTool callback (electron/plan-mode-gate.ts); the
+          renderer subscribes to `plan-mode-exit-request` here, shows a modal
+          with the plan body, and resolves the parked request when the operator
+          clicks Approve or Keep Planning. Without this, plan mode was a dead
+          end — the agent never got the approval it was waiting on. */}
+      {IS_LOCAL && <ExitPlanModeDialog />}
       </RemotePairGate>
       </AccountGate>
     </HashRouter>
