@@ -11,7 +11,7 @@
    Pure + DOM-free so it unit-tests cleanly and can be reused outside Workspace. */
 
 import type { Job, TranscriptItem } from './api';
-import { isSkillTool, prettySkillName, toolDisplay } from './toolDisplay';
+import { isSkillTool, prettySkillName, scrubInternalMcp, toolDisplay } from './toolDisplay';
 
 export type TranscriptMode = 'concise' | 'full';
 
@@ -49,14 +49,16 @@ function toolBlock(it: TranscriptItem, mode: TranscriptMode): string {
   if (isSkillTool(name)) return `↳ Skill: ${prettySkillName(it.text || '')}`.trimEnd();
 
   const d = toolDisplay(name);
-  let detail = (it.text || '').trim();
+  // Scrub `mcp__maestro__*` plumbing so the exported transcript matches the
+  // on-screen one — our in-app MCP is the product, not an artifact to expose.
+  let detail = scrubInternalMcp((it.text || '').trim());
   if (d.file && detail) detail = mode === 'concise' ? basename(detail) : detail; // path → filename
 
   // Avoid "Run Run tests": when the detail already opens with the verb, drop the label.
   const startsWithVerb = !!detail && detail.toLowerCase().startsWith(d.short.toLowerCase());
   let head = startsWithVerb ? `↳ ${detail}` : `↳ ${d.short}${detail ? ` ${detail}` : ''}`;
 
-  const cmd = (it.cmd || '').trim();
+  const cmd = scrubInternalMcp((it.cmd || '').trim());
   const cmdInline = !!cmd && !cmd.includes('\n');
   if (cmd && (mode === 'concise' || cmdInline)) head += `: ${mode === 'concise' ? firstLine(cmd, 100) : cmd}`;
 

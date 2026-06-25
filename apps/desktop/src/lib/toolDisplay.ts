@@ -10,6 +10,25 @@ export const prettySkillName = (raw: string): string => {
   return tail ? tail.replace(/\b\w/g, c => c.toUpperCase()) : raw;
 };
 
+/** Scrub `mcp__maestro__<tool>` references from a free-form string and replace
+    them with a human-readable label ("Git status", "Wa send message"). Our
+    own in-app MCP server is part of the product — leaking
+    `mcp__maestro__git_status` into the transcript makes it read like Swagger
+    plumbing instead of a native superpower. THIRD-PARTY MCP namespaces
+    (`mcp__github__*`, `mcp__filesystem__*`) are intentionally untouched so
+    real outside integrations stay visible. Mirrors the electron-side helper
+    in `electron/tool-label.ts` (kept as a 4-line duplicate to avoid a
+    cross-realm import). Use this on `item.text`/`item.cmd` in the renderer
+    so historical transcripts get cleaned at display time too — without
+    requiring a data migration. */
+export const scrubInternalMcp = (s: string): string => {
+  if (typeof s !== 'string' || !s) return s;
+  return s.replace(/mcp__maestro__([A-Za-z0-9_]+)/g, (_m, raw: string) => {
+    const pretty = raw.replace(/[_-]+/g, ' ').trim();
+    return pretty ? pretty.charAt(0).toUpperCase() + pretty.slice(1) : raw;
+  });
+};
+
 /** A short, friendly identity for a tool — a recognizable verb + glyph + tint — so a
     row reads "Read SessionChat.tsx" instead of "mcp__maestro__read_file /Users/…".
     `file:true` means the detail is a path → render it as a filename chip (basename). */

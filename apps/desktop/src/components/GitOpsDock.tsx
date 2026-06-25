@@ -212,9 +212,15 @@ export interface GitOpsDockProps {
   sessionId: string | null;
   /** Display-friendly codename for the active session (e.g. "Lyon"). */
   codename?: string | null;
+  /** Host-supplied handler for the `pr-merged` → "Continue from here →"
+      primary action. ChatThread wires this to its `continueFromHere` (which
+      calls `api.continueSession` + opens the new tab). If absent, the
+      dock falls back to a friendly "no handler" feedback instead of silently
+      doing nothing — surfacing a wiring mistake immediately. */
+  onContinue?: () => void | Promise<void>;
 }
 
-export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
+export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps) {
   const dock = useGitOpsState(sessionId);
   const session = useSession(sessionId);
   const [expanded, setExpanded] = React.useState(false);
@@ -286,7 +292,7 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
 
   /** Run an action (either directly or behind the confirm dialog). */
   const trigger = (action: GitOpsAction): void => {
-    if (action.stub) { setFeedback({ kind: 'ok', text: 'Coming in T7 — Continue from here.' }); return; }
+    if (action.stub) { setFeedback({ kind: 'ok', text: 'Not wired yet.' }); return; }
     if (action.kind === 'commit') { setComposerOpen(true); return; }
     // T8: the Resolve action on pr-conflicts opens the AI-resolve dialog
     // (full-featured: hunk preview + optional instructions + dispatch to
@@ -301,7 +307,7 @@ export function GitOpsDock({ sessionId, codename }: GitOpsDockProps) {
     if (busy) return;
     setBusy(true); setFeedback(null);
     try {
-      const r = await runGitOpsAction(action, status);
+      const r = await runGitOpsAction(action, status, { onContinue });
       if (r.ok) {
         if (action.okText) setFeedback({ kind: 'ok', text: action.okText });
       } else setFeedback({ kind: 'err', text: r.reason || 'Action failed.' });
