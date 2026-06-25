@@ -11,7 +11,7 @@ import { Icon, type IconName } from '../lib/icons';
 import { RichComposer, type RichComposerHandle, type ComposerChip } from './RichComposer';
 import { FileTypeIcon } from '../lib/fileIcons';
 import { FileChip, IS_WRITE_TOOL } from '../lib/fileChip';
-import { toolDisplay, isSkillTool, prettySkillName } from '../lib/toolDisplay';
+import { toolDisplay, isSkillTool, prettySkillName, scrubInternalMcp } from '../lib/toolDisplay';
 import {
   GroupedList,
   Row,
@@ -34,7 +34,6 @@ import { GitOpsDock } from '../components/GitOpsDock';
 import { SessionStateDot } from './SessionStateDot';
 import { useSession, useSessionStateOnly, useSessionGitState } from '../lib/useSessionGitState';
 import { useSessionLocked } from '../hooks/useSessionLocked';
-import { MergedSessionBanner } from '../components/MergedSessionBanner';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -1265,7 +1264,9 @@ function liveActivity(job: Job, transcript: TranscriptItem[]): string {
   if (last) {
     if (last.kind === 'tool') {
       if (last.toolStatus === 'running') {
-        const what = (last.text || '').replace(/\s+/g, ' ').trim();
+        // Scrub `mcp__maestro__*` so the activity strip ("Running select:mcp__maestro__git_status")
+        // matches the rest of the transcript — our own MCP is a product feature, not plumbing.
+        const what = scrubInternalMcp((last.text || '').replace(/\s+/g, ' ').trim());
         const verb = TOOL_VERB(last.name ?? '');
         return what ? `${verb} ${what.length > 54 ? what.slice(0, 54) + '…' : what}` : `${verb}…`;
       }
@@ -1332,9 +1333,14 @@ function ToolNode({ item }: { item: TranscriptItem }) {
   const d = toolDisplay(item.name ?? '');
   const short = isSkill ? 'Skill' : d.short;
   const glyph = isSkill ? 'var(--purple)' : error ? 'var(--red)' : d.tint;
-  const showFile = !!d.file && !!item.text && !isSkill; // file tools → basename chip, not a path
-  const hasCmd = !!item.cmd && !showFile && !isSkill;
-  const detail = isSkill ? prettySkillName(item.text) : item.text;
+  // Scrub `mcp__maestro__*` plumbing from already-persisted transcripts at
+  // display time so historical chats look as native as new ones (electron's
+  // `toolLabel` cleans new tool calls at fire time; this catches the rest).
+  const cleanText = scrubInternalMcp(item.text || '');
+  const cleanCmd = item.cmd ? scrubInternalMcp(item.cmd) : item.cmd;
+  const showFile = !!d.file && !!cleanText && !isSkill; // file tools → basename chip, not a path
+  const hasCmd = !!cleanCmd && !showFile && !isSkill;
+  const detail = isSkill ? prettySkillName(cleanText) : cleanText;
   // A shell tool whose detail IS the raw command (no separate cmd chip) → mono font.
   const detailFont = !isSkill && !!d.mono && !hasCmd ? 'var(--font-mono)' : 'var(--font-text)';
   return (
@@ -1346,10 +1352,10 @@ function ToolNode({ item }: { item: TranscriptItem }) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
           <span style={{ font: '600 var(--fs-footnote)/1.4 var(--font-text)', color: error ? 'var(--red)' : 'var(--ink)', flexShrink: 0 }}>{short}</span>
           {showFile
-            ? <FileChip path={item.text} preview={item.preview} />
+            ? <FileChip path={cleanText} preview={item.preview} />
             : detail && <span style={{ flex: 1, minWidth: 0, font: `400 var(--fs-footnote)/1.4 ${detailFont}`, color: isSkill ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail}</span>}
         </div>
-        {hasCmd && <code style={{ alignSelf: 'flex-start', maxWidth: '100%', boxSizing: 'border-box', font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', background: 'var(--fill-tertiary)', borderRadius: 5, padding: '1px 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.cmd}</code>}
+        {hasCmd && <code style={{ alignSelf: 'flex-start', maxWidth: '100%', boxSizing: 'border-box', font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', background: 'var(--fill-tertiary)', borderRadius: 5, padding: '1px 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{cleanCmd}</code>}
       </div>
       <span style={{ flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
         {running ? <Spinner size={11} color={isSkill ? 'var(--purple)' : d.tint} />
@@ -2614,7 +2620,14 @@ function SessionPillDot({ sessionId }: { sessionId: string }) {
    • the Archive button (or "Restore" pill if the chat is archived) +
    • a quiet branch label so the operator sees what's actually checked out.
    Renders nothing for no session / non-repo. */
-function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projectId: string | null }) {
+function ChatHeader({ sessionId, projectId, onContinue }: {
+  sessionId: string | null;
+  projectId: string | null;
+  /** Forwarded to <GitOpsDock /> as the `pr-merged` → "Continue from here →"
+      handler. ChatThread wires its `continueFromHere` here so the dock's
+      primary action actually spawns the continuation session. */
+  onContinue?: () => void | Promise<void>;
+}) {
   const session = useSession(sessionId, projectId);
   const state = useSessionStateOnly(sessionId);
   const [busy, setBusy] = React.useState(false);
@@ -2656,7 +2669,7 @@ function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projec
           <Icon name="archive" size={11} /> Archived
         </span>
       )}
-      <GitOpsDock sessionId={sessionId} codename={code} />
+      <GitOpsDock sessionId={sessionId} codename={code} onContinue={onContinue} />
       <button onClick={archive} disabled={busy} title={archived ? 'Restore chat' : 'Archive chat'}
         style={{ height: 28, padding: '0 11px', borderRadius: 8, border: '0.5px solid var(--separator-strong)',
           background: 'var(--fill-secondary)', color: 'var(--ink)',
@@ -3359,12 +3372,13 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
         background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
       {/* Conductor-style chat header: codename + state chip + Archive. The
-          GitOpsDock (Track 5) gates itself for non-repo / null sessions. */}
-      <ChatHeader sessionId={activeId} projectId={projectId} />
+          GitOpsDock (Track 5) gates itself for non-repo / null sessions.
+          `onContinue` wires the dock's `pr-merged` → "Continue from here →"
+          primary action — there is no second banner surface for it. */}
+      <ChatHeader sessionId={activeId} projectId={projectId} onContinue={mergedPr ? continueFromHere : undefined} />
       {/* Track 7: "← Continued from …" jump-link for a session forked off a
           merged ancestor. Sits between the chat header and the transcript so
-          it's visible from the first scroll position without competing with
-          the merged banner below. */}
+          the operator can hop back to the previous chat in one click. */}
       {continuedFrom && (
         <div style={{ position: 'relative', zIndex: 1, padding: '4px 24px 0' }}>
           <button onClick={openAncestor} disabled={!onOpenSession} title={onOpenSession ? 'Open the previous session' : undefined} style={{
@@ -3376,14 +3390,6 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
             <span>Continued from</span>
             <span style={{ font: '600 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink)' }}>"{continuedFrom.title}"</span>
           </button>
-        </div>
-      )}
-      {/* Track 7: merged-PR banner. Renders ONLY when the session is locked
-          (state === 'pr-merged'). Sits ABOVE the transcript, NOT in the chat
-          header (that's T5/GitOpsDock territory). */}
-      {mergedPr && (
-        <div style={{ position: 'relative', zIndex: 1, padding: '8px 0 4px' }}>
-          <MergedSessionBanner pr={mergedPr} onContinue={continueFromHere} continuing={continuing} />
         </div>
       )}
       <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
