@@ -273,8 +273,19 @@ export default function Workspace() {
     restored.current = true;
     try {
       const saved = JSON.parse(localStorage.getItem(TABS_KEY) || '{}') as { tabs?: { projectId: string; sessionId: string }[]; active?: string };
+      // DEDUPE saved entries by sessionId — a previous race in openSession/seed
+      // paths could persist the same chat twice, which on restore renders TWO
+      // ChatThreads at `position: absolute; inset: 0` (same key, both matching
+      // activeKey), so they stack on top of each other and the user sees the
+      // "screen breaking" overlap on resume. Keep first wins.
+      const seenSid = new Set<string>();
       const rebuilt: Tab[] = (saved.tabs || [])
-        .map((t): Tab | null => { const s = sessions.find(x => x.id === t.sessionId); return s ? { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title } : null; })
+        .map((t): Tab | null => {
+          if (!t?.sessionId || seenSid.has(t.sessionId)) return null;
+          seenSid.add(t.sessionId);
+          const s = sessions.find(x => x.id === t.sessionId);
+          return s ? { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title } : null;
+        })
         .filter((t): t is Tab => !!t);
       if (rebuilt.length) { setTabs(rebuilt); setActiveKey(rebuilt.find(t => t.key === saved.active)?.key ?? rebuilt[0].key); }
     } catch { /* ignore */ }
@@ -283,7 +294,16 @@ export default function Workspace() {
   // persist tabs (only the session-backed ones survive a relaunch)
   React.useEffect(() => {
     try {
-      const payload = { tabs: tabs.filter(t => t.sessionId).map(t => ({ projectId: t.projectId, sessionId: t.sessionId })), active: activeKey };
+      // Dedupe by sessionId on the way OUT too, so even if `tabs` state
+      // briefly held a duplicate it can't poison a future cold start.
+      const seenSid = new Set<string>();
+      const payload = {
+        tabs: tabs
+          .filter(t => t.sessionId)
+          .filter(t => { if (seenSid.has(t.sessionId!)) return false; seenSid.add(t.sessionId!); return true; })
+          .map(t => ({ projectId: t.projectId, sessionId: t.sessionId })),
+        active: activeKey,
+      };
       localStorage.setItem(TABS_KEY, JSON.stringify(payload));
     } catch { /* ignore */ }
   }, [tabs, activeKey]);
@@ -415,10 +435,20 @@ export default function Workspace() {
   }, [tabs, activeKey]);
 
   const openSession = (s: ChatSession) => {
-    const existing = tabs.find(t => t.sessionId === s.id);
-    if (existing) { setActiveKey(existing.key); return; }
-    setTabs(ts => [...ts, { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title }]);
-    setActiveKey(s.id);
+    // Dedup INSIDE the functional updater — relying on `tabs` from the closure
+    // is racy: two rapid clicks (or a click+seed) both see the same stale
+    // closure with `existing === undefined`, both append, and we end up with
+    // TWO tabs sharing the same key. They both then satisfy
+    // `t.key === activeKey` in the tab pane render and stack on top of each
+    // other at `position:absolute; inset:0`, which the user sees as the
+    // chat "screen breaking" / overlapping content on resume.
+    let nextActiveKey = s.id;
+    setTabs(ts => {
+      const existing = ts.find(t => t.sessionId === s.id || t.key === s.id);
+      if (existing) { nextActiveKey = existing.key; return ts; }
+      return [...ts, { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title }];
+    });
+    setActiveKey(nextActiveKey);
   };
   /** Open a fresh "New chat" tab in `projectId`. Pass `base` to fork its
       worktree from a specific branch (the picker's path); omit it for the
@@ -1093,7 +1123,12 @@ export default function Workspace() {
                   </div>
                 </div>
               )}
-              {tabs.map(t => (
+              {/* Belt-and-braces: if a duplicate-key tab ever slips through any
+                  insertion path, only ONE entry per key is rendered. Without
+                  this, two `position:absolute; inset:0` ChatThreads stack on
+                  top of each other (both satisfy `t.key === activeKey`) and
+                  the operator sees the chat "screen breaking" overlap. */}
+              {Array.from(new Map(tabs.map(t => [t.key, t])).values()).map(t => (
                 <div key={t.key} style={{ position: 'absolute', inset: 0, display: t.key === activeKey ? 'flex' : 'none' }}>
                   {t.kind === 'file' && t.filePath
                     ? <FileViewer projectId={t.projectId} filePath={t.filePath} />
