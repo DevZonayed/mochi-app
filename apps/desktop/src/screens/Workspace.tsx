@@ -19,8 +19,8 @@ import { SessionStateDot } from './SessionStateDot';
 import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
 import { BranchPicker } from '../components/BranchPicker';
-import { projectColor, projectInitial } from '../lib/project-color';
-import { groupTabsByProject, isGroupExpanded as isGroupExpandedFn, prunePinnedGroups } from '../lib/tab-grouping';
+import { projectColor } from '../lib/project-color';
+import { projectVisibleTabs, lastTabForProject } from '../lib/tab-grouping';
 import { AddProjectModal } from '../components/AddProjectModal';
 import { WorkspaceOverview } from '../components/WorkspaceOverview';
 
@@ -64,37 +64,11 @@ const PAGE_CSS = `
   .ws-tab:hover .ws-tab-x, .ws-tab.on .ws-tab-x { opacity: 1; }
   .ws-newbtn:hover { background: var(--fill-secondary) !important; }
   .ws-tabs::-webkit-scrollbar { height: 0; }
-  /* project groups in the tab strip — a thin 1px vertical divider between
-     groups and a 3px colored stripe at the start of each group so the eye
-     can pick out which chat belongs to which project at a glance */
-  .ws-tab-group { display: flex; align-items: stretch; flex-shrink: 0; }
-  .ws-tab-group + .ws-tab-group { border-left: 1px solid var(--separator); }
+  /* 3px colored stripe at the strip's left edge — at-a-glance tint of the
+     active project. Single project per strip now (tabs are project-scoped),
+     so no inter-group dividers are needed. */
   .ws-tab-group-stripe { width: 3px; flex-shrink: 0; }
-  /* avatar-only tabs (non-active project groups). Width-animate on
-     expand/collapse so the strip rearranges smoothly, not abruptly. */
-  .ws-tab { transition: background 120ms ease, color 120ms ease, max-width 150ms ease-out, padding 150ms ease-out; }
-  .ws-tab-avatar {
-    width: 28px; max-width: 28px;
-    padding: 0 !important;
-    display: grid; place-items: center;
-    gap: 0;
-  }
-  /* tooltip on collapsed avatar tabs — instant (no >100ms delay) */
-  .ws-tab-avatar-tip {
-    position: absolute; top: calc(100% + 4px); left: 50%; transform: translateX(-50%);
-    background: var(--bg-elevated); color: var(--ink);
-    border: 0.5px solid var(--separator); border-radius: 8px;
-    padding: 5px 9px; font: 600 var(--fs-caption)/1.2 var(--font-text);
-    box-shadow: var(--card-shadow); white-space: nowrap;
-    pointer-events: none; opacity: 0; z-index: 50;
-    transition: opacity 60ms ease;
-  }
-  .ws-tab-avatar:hover .ws-tab-avatar-tip,
-  .ws-tab-avatar:focus-visible .ws-tab-avatar-tip { opacity: 1; }
-  /* group pin chevron — manual control to keep a group expanded */
-  .ws-group-pin { opacity: 0.55; transition: opacity 120ms ease, background 120ms ease; }
-  .ws-group-pin:hover { opacity: 1; background: var(--fill-tertiary); }
-  .ws-group-pin.on { opacity: 1; }
+  .ws-tab { transition: background 120ms ease, color 120ms ease; }
   .ws-kinds::-webkit-scrollbar { height: 0; }
   .ws-tree::-webkit-scrollbar { width: 11px; }
   .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
@@ -122,9 +96,16 @@ interface Tab { key: string; projectId: string; sessionId: string | null; title:
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
-// Tab strip: which project groups the user pinned open. Persisted across
-// restarts so a two-project split layout survives a relaunch.
-const TAB_GROUP_PIN_KEY = 'maestro.workspace.tabGroupsPinned';
+// Tab strip: which project is currently focused. The strip shows ONLY this
+// project's open tabs — tabs from other projects stay in storage but are
+// hidden from view (they re-appear when the operator switches projects from
+// the sidebar). Persisted so a relaunch lands on the same project.
+const ACTIVE_PROJECT_KEY = 'maestro.workspace.activeProject';
+// Per-project: the last-focused tab. When the operator switches projects, we
+// restore THAT project's last active tab instead of always jumping to its
+// first tab — preserves the operator's working set per project. Persisted
+// across restarts so multi-project context survives a relaunch.
+const LAST_TAB_BY_PROJECT_KEY = 'maestro.workspace.lastTabByProject';
 
 function relTime(ts: number): string {
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
@@ -214,19 +195,26 @@ export default function Workspace() {
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => { try { return localStorage.getItem('maestro.workspace.sidebar') === '0'; } catch { return false; } });
   const toggleSidebar = () => setSidebarCollapsed(c => { const n = !c; try { localStorage.setItem('maestro.workspace.sidebar', n ? '0' : '1'); } catch { /* ignore */ } return n; });
 
-  // Tab strip project grouping (Track 6):
-  //   – `pinnedGroups` = projects the user manually pinned open. Persisted.
-  //   – `peekGroup`    = the one non-active group the user clicked open to
-  //     "peek" at — collapses again when they click a different one. Not
-  //     persisted (transient peek, not a layout choice).
-  const [pinnedGroups, setPinnedGroups] = React.useState<Set<string>>(() => {
-    try { return new Set(JSON.parse(localStorage.getItem(TAB_GROUP_PIN_KEY) || '[]')); } catch { return new Set(); }
+  // Project-scoped tab strip:
+  //   – `activeProjectId` decides WHICH project's tabs the strip renders. Tabs
+  //     from other projects stay in storage but are hidden — re-appear when
+  //     the operator switches projects. Persisted across restarts.
+  //   – `lastActiveByProject` remembers each project's last-active tab key so
+  //     switching projects restores the operator's working position there,
+  //     not "first tab" amnesia. Persisted across restarts.
+  const [activeProjectId, setActiveProjectIdState] = React.useState<string | null>(() => {
+    try { return localStorage.getItem(ACTIVE_PROJECT_KEY); } catch { return null; }
   });
-  const [peekGroup, setPeekGroup] = React.useState<string | null>(null);
-  React.useEffect(() => { try { localStorage.setItem(TAB_GROUP_PIN_KEY, JSON.stringify([...pinnedGroups])); } catch { /* ignore */ } }, [pinnedGroups]);
-  const toggleGroupPin = (projectId: string) => setPinnedGroups(prev => {
-    const n = new Set(prev); if (n.has(projectId)) n.delete(projectId); else n.add(projectId); return n;
+  const setActiveProjectId = React.useCallback((pid: string | null) => {
+    setActiveProjectIdState(pid);
+    try { if (pid) localStorage.setItem(ACTIVE_PROJECT_KEY, pid); else localStorage.removeItem(ACTIVE_PROJECT_KEY); } catch { /* ignore */ }
+  }, []);
+  const [lastActiveByProject, setLastActiveByProject] = React.useState<Record<string, string>>(() => {
+    try { return JSON.parse(localStorage.getItem(LAST_TAB_BY_PROJECT_KEY) || '{}'); } catch { return {}; }
   });
+  React.useEffect(() => {
+    try { localStorage.setItem(LAST_TAB_BY_PROJECT_KEY, JSON.stringify(lastActiveByProject)); } catch { /* ignore */ }
+  }, [lastActiveByProject]);
 
   const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
 
@@ -287,9 +275,21 @@ export default function Workspace() {
           return s ? { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title } : null;
         })
         .filter((t): t is Tab => !!t);
-      if (rebuilt.length) { setTabs(rebuilt); setActiveKey(rebuilt.find(t => t.key === saved.active)?.key ?? rebuilt[0].key); }
+      if (rebuilt.length) {
+        setTabs(rebuilt);
+        // Restore the active key for the persisted activeProjectId (or fall
+        // back to the first tab). Importantly, also pin activeProjectId to
+        // the restored tab's project — otherwise a project-only persistence
+        // means we'd land on a project with no visible tab.
+        const pid = (() => { try { return localStorage.getItem(ACTIVE_PROJECT_KEY); } catch { return null; } })();
+        const inProj = pid ? rebuilt.filter(t => t.projectId === pid) : [];
+        const pool = inProj.length ? inProj : rebuilt;
+        const target = pool.find(t => t.key === saved.active) ?? pool[0];
+        setActiveKey(target.key);
+        if (target.projectId !== pid) setActiveProjectId(target.projectId);
+      }
     } catch { /* ignore */ }
-  }, [sessions]);
+  }, [sessions, setActiveProjectId]);
 
   // persist tabs (only the session-backed ones survive a relaunch)
   React.useEffect(() => {
@@ -353,7 +353,7 @@ export default function Workspace() {
     if (st.expand) setExpanded(e => new Set(e).add(seedProjectId));
     if (seedSessionId) {
       setTabs(ts => ts.some(t => t.sessionId === seedSessionId) ? ts : [...ts, { key: seedSessionId, projectId: seedProjectId, sessionId: seedSessionId, title: 'Building from design…' }]);
-      setActiveKey(seedSessionId);
+      setActiveKey(seedSessionId); setActiveProjectId(seedProjectId);
     }
     navigate('.', { replace: true, state: {} }); // clear so back/refresh doesn't re-seed
   }, [location.state]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -361,21 +361,55 @@ export default function Workspace() {
   const activeTab = tabs.find(t => t.key === activeKey) ?? null;
   const activeProject = activeTab ? projById[activeTab.projectId] : undefined;
 
+  // Keep activeProjectId in lock-step with the active tab's project. Uses
+  // useLayoutEffect so the strip's filter sees the new project on the SAME
+  // paint as the new active tab — no one-frame flash of "active tab not in
+  // visible list". The major open* handlers also set activeProjectId
+  // proactively, so this is a safety net for indirect setActiveKey paths
+  // (keyboard cycling, restore-from-storage, etc.).
+  React.useLayoutEffect(() => {
+    if (activeTab && activeTab.projectId !== activeProjectId) {
+      setActiveProjectId(activeTab.projectId);
+    }
+  }, [activeTab, activeProjectId, setActiveProjectId]);
+
+  // Per-project "last active tab" memory — refreshed any time activeKey changes
+  // while inside a project. Switching to a different project later restores
+  // THIS key (via lastTabForProject) instead of always grabbing the first tab.
+  React.useEffect(() => {
+    if (!activeKey || !activeTab) return;
+    setLastActiveByProject(prev => prev[activeTab.projectId] === activeKey ? prev : { ...prev, [activeTab.projectId]: activeKey });
+  }, [activeKey, activeTab]);
+
+  // Switch the strip to another project's tabs, restoring that project's
+  // last-active tab (or its first tab if we have no memory yet). Called from
+  // the sidebar project-row header so the operator can flip projects without
+  // having to click a chat first.
+  const switchToProject = React.useCallback((pid: string) => {
+    setActiveProjectId(pid);
+    const target = lastTabForProject(tabs, pid, lastActiveByProject);
+    setActiveKey(target?.key ?? null);
+  }, [tabs, lastActiveByProject, setActiveProjectId]);
+
+  // The visible-in-strip tabs (project-scoped). Storage still holds every
+  // open tab across every project — this is just the render filter.
+  const visibleTabs = React.useMemo(() => projectVisibleTabs(tabs, activeProjectId), [tabs, activeProjectId]);
+
   // Open a file as a tab (deduped on its path).
   const openFile = (projectId: string, filePath: string) => {
     const existing = tabs.find(t => t.kind === 'file' && t.filePath === filePath);
-    if (existing) { setActiveKey(existing.key); return; }
+    if (existing) { setActiveKey(existing.key); setActiveProjectId(existing.projectId); return; }
     const key = 'file:' + filePath;
     setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: filePath.split('/').pop() ?? filePath, kind: 'file', filePath }]));
-    setActiveKey(key);
+    setActiveKey(key); setActiveProjectId(projectId);
   };
   // Open a generated/attached image in its own VS Code-style tab (not Finder).
   const openImage = (projectId: string, assetId: string, name: string, imagePath?: string) => {
     const key = 'image:' + assetId;
     const existing = tabs.find(t => t.key === key);
-    if (existing) { setActiveKey(existing.key); return; }
+    if (existing) { setActiveKey(existing.key); setActiveProjectId(existing.projectId); return; }
     setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: name || 'Image', kind: 'image', imageAssetId: assetId, imagePath }]));
-    setActiveKey(key);
+    setActiveKey(key); setActiveProjectId(projectId);
   };
   // Open a project hub tab (settings / instructions+memory / jobs) — deduped.
   const openProject = (projectId: string, section: ProjectSection = 'settings') => {
@@ -383,7 +417,7 @@ export default function Workspace() {
     setTabs(ts => ts.some(t => t.key === key)
       ? ts.map(t => (t.key === key ? { ...t, projectSection: section } : t))
       : [...ts, { key, projectId, sessionId: null, title: projById[projectId]?.name ?? 'Project', kind: 'project', projectSection: section }]);
-    setActiveKey(key);
+    setActiveKey(key); setActiveProjectId(projectId);
   };
   // Files the active chat wrote (from its turns' write-tool steps), newest first.
   const changedFiles = React.useMemo(() => {
@@ -441,14 +475,21 @@ export default function Workspace() {
     // TWO tabs sharing the same key. They both then satisfy
     // `t.key === activeKey` in the tab pane render and stack on top of each
     // other at `position:absolute; inset:0`, which the user sees as the
-    // chat "screen breaking" / overlapping content on resume.
+    // chat "screen breaking" / overlapping content on resume (PR #84).
+    //
+    // We ALSO pin activeProjectId here so the project-scoped tab strip
+    // switches to the right project the moment the session is opened — for
+    // a deduped existing tab that's the EXISTING tab's project (which may
+    // differ from the session's project in edge cases like cross-project
+    // session moves), otherwise it's the session's project.
     let nextActiveKey = s.id;
+    let nextProjectId = s.projectId;
     setTabs(ts => {
       const existing = ts.find(t => t.sessionId === s.id || t.key === s.id);
-      if (existing) { nextActiveKey = existing.key; return ts; }
+      if (existing) { nextActiveKey = existing.key; nextProjectId = existing.projectId; return ts; }
       return [...ts, { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title }];
     });
-    setActiveKey(nextActiveKey);
+    setActiveKey(nextActiveKey); setActiveProjectId(nextProjectId);
   };
   /** Open a fresh "New chat" tab in `projectId`. Pass `base` to fork its
       worktree from a specific branch (the picker's path); omit it for the
@@ -456,14 +497,29 @@ export default function Workspace() {
   const newChat = (projectId: string, base?: string) => {
     const key = `new:${newCounter.current++}`;
     setTabs(ts => [...ts, { key, projectId, sessionId: null, title: 'New chat', ...(base ? { base } : {}) }]);
-    setActiveKey(key);
+    setActiveKey(key); setActiveProjectId(projectId);
     if (!expanded.has(projectId)) setExpanded(e => new Set(e).add(projectId));
   };
+  /** Close a tab. The "next active" pick is scoped to the active project so
+      the strip never silently jumps to a tab in a different project — that
+      would violate the "tabs are project-specific" rule. When the closed
+      tab was the last one in the active project, activeKey becomes null;
+      activeProjectId stays put so the operator's sidebar context is kept. */
   const closeTab = (key: string) => {
     setTabs(ts => {
-      const idx = ts.findIndex(t => t.key === key);
       const next = ts.filter(t => t.key !== key);
-      if (activeKey === key) setActiveKey(next.length ? next[Math.min(idx, next.length - 1)].key : null);
+      if (activeKey === key) {
+        const closed = ts.find(t => t.key === key);
+        const projTabs = closed ? next.filter(t => t.projectId === closed.projectId) : [];
+        if (projTabs.length) {
+          // Pick the tab next to the closed one within the project — same UX
+          // as VS Code: closing the rightmost tab activates the new rightmost.
+          const origIdx = ts.filter(t => t.projectId === closed!.projectId).findIndex(t => t.key === key);
+          setActiveKey(projTabs[Math.min(origIdx, projTabs.length - 1)].key);
+        } else {
+          setActiveKey(null);
+        }
+      }
       return next;
     });
   };
@@ -649,83 +705,35 @@ export default function Workspace() {
     <div style={{ padding: '10px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{t}</div>
   );
 
-  // ── Tab strip: group open tabs by project, preserving the order in which
-  // each project first appeared (so the layout doesn't reshuffle as the user
-  // opens/closes tabs). Pure helper — tested in tab-grouping.test.ts.
-  const tabGroups = React.useMemo(() => groupTabsByProject(tabs), [tabs]);
-
-  const activeProjectId = activeTab?.projectId ?? null;
-  const isGroupExpanded = (projectId: string): boolean => isGroupExpandedFn(projectId, {
-    activeProjectId, pinnedGroups, peekGroup, groupCount: tabGroups.length,
-  });
-  const peekOpen = (projectId: string) => {
-    // Click on a collapsed group's avatar → expand it (and collapse the previously-peeked one).
-    setPeekGroup(prev => (prev === projectId ? null : projectId));
-  };
-
-  // Clean up peek state when the peeked project is closed entirely or when the
-  // user clicks it active (the "active" rule already expands it, so peek becomes redundant).
-  React.useEffect(() => {
-    if (peekGroup && (peekGroup === activeProjectId || !tabGroups.some(g => g.projectId === peekGroup))) {
-      setPeekGroup(null);
-    }
-  }, [peekGroup, activeProjectId, tabGroups]);
-
-  // Forget pin state for projects whose tabs are all closed. Keeps the persisted
-  // set small + avoids stale pins re-appearing when a long-gone project is reopened later.
-  React.useEffect(() => {
-    if (!pinnedGroups.size) return;
-    const pruned = prunePinnedGroups(pinnedGroups, tabGroups);
-    if (pruned.size !== pinnedGroups.size) setPinnedGroups(pruned);
-  }, [tabGroups, pinnedGroups]);
-
-  // Keyboard map for the tab strip:
-  //   ⌘⇧E  expand every group (pin them all)
-  //   ⌘⇧C  collapse every non-active group (clear pins + peek)
-  //   ⌥←/→ cycle through currently-visible tabs (skips collapsed avatars'
-  //         hidden state by always activating the next tab — selecting it
-  //         immediately expands its group via the active-projectId rule)
-  //   ⌘1…9 jump to the Nth visible tab
+  // Keyboard shortcuts (project-scoped — they walk the VISIBLE tabs, which
+  // are the active project's tabs only):
+  //   ⌥←/→ cycle through the strip in left-to-right order. Stays inside the
+  //         current project — to switch projects the operator clicks a chat
+  //         in another project's sidebar list.
+  //   ⌘1…9 jump to the Nth visible tab.
   // We avoid the bare ⌘←/→ because Electron / web routing already owns them.
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // ── group expand / collapse (⌘⇧E / ⌘⇧C) ──
-      if (e.metaKey && e.shiftKey && !e.altKey && !e.ctrlKey) {
-        if (e.code === 'KeyE') {
-          e.preventDefault();
-          setPinnedGroups(new Set(tabGroups.map(g => g.projectId)));
-          return;
-        }
-        if (e.code === 'KeyC') {
-          e.preventDefault();
-          setPinnedGroups(new Set());
-          setPeekGroup(null);
-          return;
-        }
-      }
-      // ── ⌥←/⌥→: cycle through tabs in tab-strip order ──
-      // (⌘←/→ are reserved by macOS for history back/forward in many shells.)
+      // ── ⌥←/⌥→: cycle through visible tabs in strip order ──
       if (e.altKey && !e.metaKey && !e.shiftKey && !e.ctrlKey && (e.code === 'ArrowLeft' || e.code === 'ArrowRight')) {
-        const all = tabGroups.flatMap(g => g.tabs);
-        if (!all.length) return;
-        const idx = activeKey ? all.findIndex(t => t.key === activeKey) : -1;
+        if (!visibleTabs.length) return;
+        const idx = activeKey ? visibleTabs.findIndex(t => t.key === activeKey) : -1;
         const delta = e.code === 'ArrowRight' ? 1 : -1;
-        const next = all[(Math.max(0, idx) + delta + all.length) % all.length];
+        const next = visibleTabs[(Math.max(0, idx) + delta + visibleTabs.length) % visibleTabs.length];
         if (next) { e.preventDefault(); setActiveKey(next.key); }
         return;
       }
-      // ── ⌘1…⌘9: jump to the Nth tab ──
+      // ── ⌘1…⌘9: jump to the Nth visible tab ──
       if (e.metaKey && !e.shiftKey && !e.altKey && !e.ctrlKey && /^Digit[1-9]$/.test(e.code)) {
         const n = parseInt(e.code.slice(5), 10) - 1;
-        const all = tabGroups.flatMap(g => g.tabs);
-        const tgt = all[n];
+        const tgt = visibleTabs[n];
         if (tgt) { e.preventDefault(); setActiveKey(tgt.key); }
         return;
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [tabGroups, activeKey]);
+  }, [visibleTabs, activeKey]);
 
   return (
     <AppShell active="workspace">
@@ -820,14 +828,27 @@ export default function Workspace() {
               const chats = sessionsByProject(p.id);
               const isOpen = expanded.has(p.id) || (!!q && chats.length > 0);
               const projRunning = chats.some(s => runningSessions.has(s.id));
-              const projActive = p.id === activeTab?.projectId;
+              // "Active" is now tracked by activeProjectId — not derived from
+              // the active tab — so a project the operator switched into via
+              // the sidebar (without yet clicking a chat) still highlights.
+              const projActive = p.id === activeProjectId;
+              // Clicking the project header now does TWO things:
+              //   1. Switch the tab strip to this project's tabs (restoring
+              //      that project's last active tab if there is one).
+              //   2. Toggle the in-sidebar chat list open/closed.
+              // Order matters: switch first, so the strip reflects the
+              // project before the operator clicks any chat inside it.
+              const onHeaderClick = () => {
+                if (p.id !== activeProjectId) switchToProject(p.id);
+                setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; });
+              };
               return (
                 // Lift the whole project above sibling rows while its "⋯" menu OR its branch
                 // picker is open, so the popover isn't painted over by the next project's row
                 // (the sticky `.ws-proj-head` is a z-index:2 stacking context that otherwise
                 // traps the popover's z-index, so later sibling headers paint on top of it).
                 <div key={p.id} className="ws-proj" style={(menuProj === p.id || pickerProj === p.id) ? { position: 'relative', zIndex: 60 } : undefined}>
-                  <div className="ws-row ws-proj-head" {...dragProps(projDnd, p.id)} onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
+                  <div className="ws-row ws-proj-head" {...dragProps(projDnd, p.id)} onClick={onHeaderClick}
                     style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer', position: 'relative', userSelect: 'none',
                       opacity: draggingProj === p.id ? 0.45 : undefined,
                       background: projActive ? `color-mix(in srgb, ${projColor(p)} 13%, var(--bg-grouped))` : undefined }}>
@@ -939,102 +960,76 @@ export default function Workspace() {
           </div>
         </div>
 
-        {/* ── right: tab bar + active chat ── */}
+        {/* ── right: tab bar + active chat ──
+            Tabs are PROJECT-SCOPED: the strip renders `visibleTabs` (only the
+            active project's tabs). Tabs from other projects stay in storage
+            and re-appear when the operator switches projects. No more
+            cross-project grouping / pin / peek ceremony. */}
         <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           {/* tab bar */}
           <div style={{ display: 'flex', alignItems: 'stretch', height: 42, flexShrink: 0, borderBottom: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
+            {/* 3px project tint at the very start of the strip — the eye's
+                anchor that says "you're in <project>" without needing to read
+                the sidebar. Hidden when no project is focused. */}
+            {activeProjectId && (
+              <span aria-hidden="true" className="ws-tab-group-stripe" style={{ background: projColor(projById[activeProjectId]), flexShrink: 0 }} />
+            )}
             <div ref={tabStripRef} className="ws-tabs"
               onWheel={e => { const el = tabStripRef.current; if (el && Math.abs(e.deltaY) > Math.abs(e.deltaX)) el.scrollLeft += e.deltaY; }}
-              style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'stretch', overflowX: 'auto' }}>
-              {tabGroups.map(group => {
-                const p = projById[group.projectId];
-                const expanded = isGroupExpanded(group.projectId);
-                const pinned = pinnedGroups.has(group.projectId);
-                const groupName = p?.name ?? 'Project';
+              style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'stretch', overflowX: 'auto' }}
+              role="tablist" aria-label={activeProjectId ? `Open tabs in ${projById[activeProjectId]?.name ?? 'project'}` : 'Open tabs'}>
+              {visibleTabs.length === 0 && activeProjectId && (
+                <div style={{ display: 'flex', alignItems: 'center', padding: '0 12px', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                  No tabs open in {projById[activeProjectId]?.name ?? 'this project'} — click a chat in the sidebar.
+                </div>
+              )}
+              {visibleTabs.map(t => {
+                const p = projById[t.projectId];
+                const on = t.key === activeKey;
+                const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
+                const editing = chatTab && renamingId === t.sessionId;
                 const stripeColor = projColor(p);
+                const tabIcon = t.kind === 'file'
+                  ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+                  : t.kind === 'image'
+                  ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
+                  : t.kind === 'project'
+                  ? <Icon name="folder" size={12} style={{ color: stripeColor, flexShrink: 0 }} />
+                  : <Icon name="chat" size={12} style={{ color: stripeColor, flexShrink: 0 }} />;
                 return (
-                  <div key={group.projectId} className="ws-tab-group" role="group" aria-label={groupName}>
-                    {/* 3px colored left-stripe — the at-a-glance project tint */}
-                    <span className="ws-tab-group-stripe" aria-hidden="true" style={{ background: stripeColor }} />
-                    {/* Pin toggle: keeps a non-active group expanded even when it isn't the active one */}
-                    {tabGroups.length > 1 && (
-                      <button type="button"
-                        className={`ws-group-pin${pinned ? ' on' : ''}`}
-                        title={pinned ? `Unpin ${groupName}` : `Pin ${groupName} expanded`}
-                        aria-label={pinned ? `Unpin ${groupName}` : `Pin ${groupName} expanded`}
-                        aria-pressed={pinned}
-                        onClick={(e) => { e.stopPropagation(); toggleGroupPin(group.projectId); }}
-                        style={{ width: 18, alignSelf: 'center', height: 26, borderRadius: 5, display: 'grid', placeItems: 'center', marginLeft: 2, color: pinned ? stripeColor : 'var(--ink-tertiary)', background: 'transparent', cursor: 'pointer', flexShrink: 0 }}>
-                        <Icon name={pinned ? 'chevronDown' : 'chevronRight'} size={12} stroke={2.4} />
-                      </button>
+                  <div key={t.key} data-tabkey={t.key}
+                    role="tab" aria-selected={on}
+                    className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)} onContextMenu={e => openTabMenu(e, t)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
+                      borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
+                    {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: stripeColor }} />}
+                    {tabIcon}
+                    {editing && t.sessionId ? (
+                      <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
+                        onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}
+                        style={{ minWidth: 0, maxWidth: 150, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
+                    ) : (
+                      <span title={chatTab ? 'Double-click to rename' : (t.base ? `New chat off ${t.base}` : undefined)}
+                        onDoubleClick={chatTab ? (e => { e.stopPropagation(); setRenamingId(t.sessionId!); setRenameVal(t.title); }) : undefined}
+                        style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {t.title}
+                        {t.base && !t.sessionId && (
+                          // Subtle base-branch suffix on un-sent "New chat" tabs only.
+                          // Hidden once the session is real (its title takes over).
+                          <span style={{ marginLeft: 5, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-mono)' }}>· {t.base}</span>
+                        )}
+                      </span>
                     )}
-                    {group.tabs.map(t => {
-                      const on = t.key === activeKey;
-                      const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
-                      const editing = chatTab && renamingId === t.sessionId;
-                      const collapsed = !expanded && !on; // active tab always shows its title
-                      const tabIcon = t.kind === 'file'
-                        ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
-                        : t.kind === 'image'
-                        ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
-                        : t.kind === 'project'
-                        ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
-                        : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />;
-                      if (collapsed) {
-                        const initial = projectInitial(groupName);
-                        const a11yLabel = `${t.title} (in ${groupName})`;
-                        return (
-                          <button key={t.key} data-tabkey={t.key}
-                            type="button"
-                            role="tab" aria-selected={false} aria-label={a11yLabel}
-                            className={`ws-tab ws-tab-avatar`}
-                            onClick={() => { peekOpen(group.projectId); setActiveKey(t.key); }}
-                            onContextMenu={e => openTabMenu(e, t)}
-                            style={{ position: 'relative', borderRight: '0.5px solid var(--separator)', background: 'transparent', cursor: 'pointer', height: 'auto' }}>
-                            <span aria-hidden="true" style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center',
-                              background: `color-mix(in srgb, ${stripeColor} 22%, transparent)`,
-                              color: stripeColor, font: '700 10px/1 var(--font-display)' }}>{initial}</span>
-                            <span className="ws-tab-avatar-tip" role="tooltip">{a11yLabel}</span>
-                          </button>
-                        );
-                      }
-                      return (
-                        <div key={t.key} data-tabkey={t.key}
-                          role="tab" aria-selected={on}
-                          className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)} onContextMenu={e => openTabMenu(e, t)}
-                          style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
-                            borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
-                          {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: stripeColor }} />}
-                          {tabIcon}
-                          {editing && t.sessionId ? (
-                            <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
-                              onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}
-                              style={{ minWidth: 0, maxWidth: 150, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
-                          ) : (
-                            <span title={chatTab ? 'Double-click to rename' : (t.base ? `New chat off ${t.base}` : undefined)}
-                              onDoubleClick={chatTab ? (e => { e.stopPropagation(); setRenamingId(t.sessionId!); setRenameVal(t.title); }) : undefined}
-                              style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                              {t.title}
-                              {t.base && !t.sessionId && (
-                                // Subtle base-branch suffix on un-sent "New chat" tabs only.
-                                // Hidden once the session is real (its title takes over).
-                                <span style={{ marginLeft: 5, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-mono)' }}>· {t.base}</span>
-                              )}
-                            </span>
-                          )}
-                          <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
-                            <Icon name="x" size={11} stroke={2.6} />
-                          </button>
-                        </div>
-                      );
-                    })}
+                    <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+                      <Icon name="x" size={11} stroke={2.6} />
+                    </button>
                   </div>
                 );
               })}
             </div>
-            {tabsOverflow && tabs.length > 0 && (
+            {tabsOverflow && visibleTabs.length > 0 && (
               <div style={{ position: 'relative', flexShrink: 0 }}>
-                <button onClick={() => setOvfOpen(o => !o)} title="All open chats" className="ws-newbtn"
+                <button onClick={() => setOvfOpen(o => !o)} title="All open tabs in this project" className="ws-newbtn"
                   style={{ width: 34, height: '100%', display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: ovfOpen ? 'var(--ink)' : 'var(--ink-secondary)', background: 'transparent', cursor: 'pointer' }}>
                   <Icon name="chevronDown" size={15} />
                 </button>
@@ -1042,7 +1037,9 @@ export default function Workspace() {
                   <>
                     <div onClick={() => setOvfOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
                     <div style={{ position: 'absolute', top: '100%', right: 0, zIndex: 41, marginTop: 4, minWidth: 230, maxHeight: 340, overflowY: 'auto', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--card-shadow)', padding: 5 }}>
-                      {tabs.map(t => {
+                      {/* Overflow menu also scoped to the active project — same
+                          "tabs are project-specific" rule. */}
+                      {visibleTabs.map(t => {
                         const on = t.key === activeKey;
                         const p = projById[t.projectId];
                         const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
@@ -1051,7 +1048,6 @@ export default function Workspace() {
                             style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 9px', borderRadius: 8, cursor: 'pointer', background: on ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
                             <Icon name={t.kind === 'file' ? 'file' : t.kind === 'image' ? 'image' : 'chat'} size={13} style={{ flexShrink: 0, color: t.kind && t.kind !== 'chat' ? 'var(--ink-secondary)' : projColor(p) }} />
                             <span style={{ flex: 1, minWidth: 0, font: `${on ? 600 : 500} var(--fs-footnote)/1.25 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
-                            {p && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', flexShrink: 0, maxWidth: 70, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>}
                             {chatTab && t.sessionId && (
                               <button title="Rename chat" onClick={e => { e.stopPropagation(); setOvfOpen(false); setActiveKey(t.key); setRenamingId(t.sessionId!); setRenameVal(t.title); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
                                 <Icon name="pencil" size={11} stroke={2.4} />
@@ -1068,8 +1064,12 @@ export default function Workspace() {
                 )}
               </div>
             )}
-            <button onClick={() => newChat(activeTab?.projectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
-              title="New chat" className="ws-newbtn" style={{ width: 40, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
+            {/* New-chat "+" — opens the new tab in the active project (so the
+                strip stays project-scoped). Falls back to the first project
+                only when nothing is active yet. */}
+            <button onClick={() => newChat(activeProjectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
+              title={activeProjectId ? `New chat in ${projById[activeProjectId]?.name ?? 'project'}` : 'New chat'} className="ws-newbtn"
+              style={{ width: 40, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
               <Icon name="plus" size={16} stroke={2.4} />
             </button>
           </div>

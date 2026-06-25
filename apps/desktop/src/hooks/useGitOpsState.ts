@@ -26,7 +26,7 @@ export type GitOpsActionKind =
   | 'merge'       // api.mergeSessionPR
   | 'resolve'     // api.resolveSession (AI flow is T8's job — stub here)
   | 'open-pr'     // window.open(pr.url)
-  | 'continue'    // T7 will wire — no-op stub
+  | 'continue'    // T7 wired — spawns a continuation session forked off the merged base
   | 'view-diff'   // open existing diff viewer (currently transcript-side)
   | 'rename-branch'
   | 'archive';
@@ -91,9 +91,12 @@ export function actionsFor(state: SessionGitState): GitOpsAction[] {
         { kind: 'view-diff',  label: 'View diff',       tone: 'neutral', destructive: false, needsGitHub: false },
       ];
     case 'pr-merged':
-      // T7 wires this — surfaced as a styled-correctly no-op until then.
+      // T7 wired: Continue forks a new session off the merged base ref. The
+      // dock invokes the host-supplied `onContinue` callback (ChatThread owns
+      // the api.continueSession + open-the-new-tab dance) rather than running
+      // a server-side handler — there is no single "continue" API call.
       return [
-        { kind: 'continue',   label: 'Continue from here →', tone: 'primary', destructive: false, needsGitHub: false, stub: true },
+        { kind: 'continue',   label: 'Continue from here →', tone: 'primary', destructive: false, needsGitHub: false },
         { kind: 'open-pr',    label: 'Open PR on GitHub ↗', tone: 'neutral', destructive: false, needsGitHub: false },
         { kind: 'archive',    label: 'Archive worktree',    tone: 'neutral', destructive: true,  needsGitHub: false, confirm: 'Remove this session’s worktree from disk?', okText: 'Archived' },
       ];
@@ -155,7 +158,7 @@ export function useGitOpsState(sessionId: string | null | undefined): GitOpsStat
 export async function runGitOpsAction(
   action: GitOpsAction,
   status: SessionGitStatus | null,
-  opts?: { onCommit?: () => void; onContinue?: () => void; onViewDiff?: () => void },
+  opts?: { onCommit?: () => void; onContinue?: () => void | Promise<void>; onViewDiff?: () => void },
 ): Promise<{ ok: boolean; reason?: string; data?: unknown }> {
   if (!status) return { ok: false, reason: 'no session status' };
   const sid = status.sessionId;
@@ -178,7 +181,11 @@ export async function runGitOpsAction(
       return { ok: true };
     }
     case 'continue': {
-      opts?.onContinue?.(); // T7 — no-op stub today
+      // T7 wired: ChatThread supplies onContinue, which calls api.continueSession
+      // and opens the new tab. The dock itself doesn't own the session-spawn
+      // dance because the new session has to land in the host's tab system.
+      if (!opts?.onContinue) return { ok: false, reason: 'No continuation handler wired.' };
+      await opts.onContinue();
       return { ok: true };
     }
     case 'view-diff': {

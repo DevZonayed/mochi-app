@@ -76,10 +76,14 @@ describe('actionsFor — state → action list', () => {
     expect(a.destructive).toBe(false);
   });
 
-  test('pr-merged → primary is Continue (T7 stub) — non-destructive but flagged', () => {
+  test('pr-merged → primary is Continue — non-destructive, NOT a stub (wired in T7)', () => {
     const a = actionsFor('pr-merged');
     expect(a[0].kind).toBe('continue');
-    expect(a[0].stub).toBe(true);
+    expect(a[0].tone).toBe('primary');
+    expect(a[0].destructive).toBe(false);
+    // The stub flag was the placeholder during T5 — T7 wired the action via
+    // the host-supplied `onContinue` callback (ChatThread.continueFromHere).
+    expect(a[0].stub).toBeFalsy();
     // Archive worktree IS destructive and present in the secondary list.
     const archive = a.find(x => x.kind === 'archive');
     expect(archive?.destructive).toBe(true);
