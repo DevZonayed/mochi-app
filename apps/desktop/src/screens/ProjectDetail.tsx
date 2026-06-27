@@ -1323,7 +1323,9 @@ function ThinkingNode({ item, live }: { item: TranscriptItem; live?: boolean }) 
     document-like framing as the Thinking block. Reads "[icon] Read SessionChat.tsx":
     a short tool verb + a filename chip (basename) for file tools, the description for
     Bash (raw command as an inline code chip), a pattern for search. */
-function ToolNode({ item }: { item: TranscriptItem }) {
+// Memoized — a streamed turn appends tools rapidly; without this every prior
+// ToolNode re-rendered on every token tick of the parent AssistantTurn.
+const ToolNode = React.memo(function ToolNode({ item }: { item: TranscriptItem }) {
   const running = item.toolStatus === 'running';
   const error = item.toolStatus === 'error';
   const isSkill = isSkillTool(item.name);
@@ -1359,17 +1361,19 @@ function ToolNode({ item }: { item: TranscriptItem }) {
       </span>
     </div>
   );
-}
+});
 
 /** A run of consecutive tool steps — a calm flat list (no card framing), so the tools
-    read in the same document-like register as the surrounding text and the Thinking. */
-function ToolGroup({ items }: { items: TranscriptItem[] }) {
+    read in the same document-like register as the surrounding text and the Thinking.
+    Memoized + stable keys (SDK id / monotonic ts) so streaming a new tool doesn't
+    remount every prior chip on every token tick. */
+const ToolGroup = React.memo(function ToolGroup({ items }: { items: TranscriptItem[] }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 1, margin: '8px 0' }}>
-      {items.map((it, i) => <ToolNode key={i} item={it} />)}
+      {items.map((it, i) => <ToolNode key={it.id ?? `t-${it.ts ?? i}`} item={it} />)}
     </div>
   );
-}
+});
 
 /* ── Claude asks a question → a real, answerable card ─────────────────── */
 interface AskOption { label: string; description?: string }

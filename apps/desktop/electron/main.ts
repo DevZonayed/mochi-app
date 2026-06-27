@@ -143,7 +143,14 @@ const DESIGN_COMMENT_HARNESS = `(function(){
   document.addEventListener('click',onClick,true);
   document.addEventListener('keydown',function(e){ if(mode&&e.key==='Escape'){ setMode(false); parent.postMessage({__maestroDesign:true,type:'comment-cancel'},'*'); } },true);
   function setMode(on){ mode=on; try{ document.documentElement.style.cursor=on?'crosshair':''; }catch(_){} if(!on) box.style.display='none'; }
-  function renderPins(){
+  /* Pin rendering used to run on a 700ms unconditional interval which kept the
+     CPU warm on every design preview iframe even when the page was hidden or had
+     no markers. Now: rAF-coalesce, skip when document.hidden, skip when there
+     are no markers; a low-rate (2.5s) safety tick only runs WHILE markers exist
+     so animated/lazy-positioned layouts still get caught. Saves a continuous
+     ~1.4 wakeups/s per open design tab. */
+  var pinRaf=0, pinKick=0;
+  function renderPinsNow(){
     pins.innerHTML='';
     markers.forEach(function(m){
       try{ var el=document.querySelector(m.selector); if(!el) return; var r=el.getBoundingClientRect();
@@ -154,13 +161,26 @@ const DESIGN_COMMENT_HARNESS = `(function(){
       }catch(_){}
     });
   }
+  function renderPins(){
+    if (document.hidden) return;
+    if (!markers || markers.length===0){ if (pins.firstChild) pins.innerHTML=''; return; }
+    if (pinRaf) return;
+    pinRaf = requestAnimationFrame(function(){ pinRaf=0; renderPinsNow(); });
+  }
+  function ensurePinKick(){
+    if (pinKick) return;
+    pinKick = setInterval(function(){
+      if (document.hidden || !markers || markers.length===0){ clearInterval(pinKick); pinKick=0; return; }
+      renderPins();
+    }, 2500);
+  }
   window.addEventListener('scroll',renderPins,true);
   window.addEventListener('resize',renderPins,true);
-  setInterval(renderPins,700);
+  document.addEventListener('visibilitychange', function(){ if (!document.hidden) renderPins(); });
   window.addEventListener('message',function(e){
     var d=e.data; if(!d||!d.__maestro) return;
     if(d.type==='comment-mode') setMode(!!d.on);
-    if(d.type==='comment-markers'){ markers=Array.isArray(d.items)?d.items:[]; renderPins(); }
+    if(d.type==='comment-markers'){ markers=Array.isArray(d.items)?d.items:[]; renderPins(); if (markers.length) ensurePinKick(); }
     if(d.type==='flash'&&d.selector){ try{ var el=document.querySelector(d.selector); if(el){ el.scrollIntoView({behavior:'smooth',block:'center'}); frame(el); setTimeout(function(){ if(!mode) box.style.display='none'; },1300); } }catch(_){} }
   });
 })();`;
