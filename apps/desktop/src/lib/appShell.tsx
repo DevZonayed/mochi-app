@@ -199,8 +199,15 @@ function startPendingWatch(): () => void {
   const refresh = () => api.listApprovals('pending').then(a => { if (a.length !== pendingCount) { pendingCount = a.length; notifyPending(); } }).catch(() => {});
   refresh();
   const unsub = api.subscribe({ onApproval: refresh, onJob: refresh });
-  const poll = setInterval(refresh, 20000);
-  return () => { unsub(); clearInterval(poll); };
+  // Slow 20s fallback; pause when the window is hidden so the badge isn't a
+  // background CPU/network drip when the user is in another app.
+  let poll: ReturnType<typeof setInterval> | null = null;
+  const start = () => { if (!poll && !document.hidden) poll = setInterval(refresh, 20000); };
+  const stop = () => { if (poll) { clearInterval(poll); poll = null; } };
+  const onVis = () => { if (document.hidden) stop(); else { refresh(); start(); } };
+  start();
+  document.addEventListener('visibilitychange', onVis);
+  return () => { unsub(); stop(); document.removeEventListener('visibilitychange', onVis); };
 }
 export function usePendingApprovals(): number {
   const [, force] = React.useReducer((x: number) => x + 1, 0);

@@ -677,8 +677,16 @@ function ExtensionPane() {
     // The bundled-extension location is static (read once on mount). The dispatch
     // is cheap (no IO beyond an existsSync) so polling adds nothing.
     if (IS_LOCAL) void api.extensionPath().then(setExtPath).catch(() => {});
-    const t = setInterval(refetch, 2000); // live profile/active updates while the pane is open
-    return () => clearInterval(t);
+    // Live profile/active updates while the pane is open. 5s is plenty for a
+    // profile-switcher view; pause entirely when the window is hidden so the
+    // extension dispatch doesn't fire 30×/min in the background. Used to be 2s.
+    let t: ReturnType<typeof setInterval> | null = null;
+    const start = () => { if (!t && !document.hidden) t = setInterval(refetch, 5000); };
+    const stop = () => { if (t) { clearInterval(t); t = null; } };
+    const onVis = () => { if (document.hidden) stop(); else { refetch(); start(); } };
+    start();
+    document.addEventListener('visibilitychange', onVis);
+    return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
   }, [refetch]);
   const copy = () => {
     if (!status?.token) return;

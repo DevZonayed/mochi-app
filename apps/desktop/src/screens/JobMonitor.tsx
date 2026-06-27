@@ -804,10 +804,17 @@ export default function JobMonitor() {
     return unsubscribe;
   }, [refetch]);
 
-  // real now-line: advance the wall clock so running capsules + elapsed tick
+  // real now-line: advance the wall clock so running capsules + elapsed tick.
+  // Pause when the window is hidden (other tab / minimized) so a stale Jobs
+  // monitor doesn't keep waking the Mac every 5s in the background.
   React.useEffect(() => {
-    const t = setInterval(() => setNowMs(Date.now()), 5000);
-    return () => clearInterval(t);
+    let t: ReturnType<typeof setInterval> | null = null;
+    const start = () => { if (!t && !document.hidden) t = setInterval(() => setNowMs(Date.now()), 5000); };
+    const stop = () => { if (t) { clearInterval(t); t = null; } };
+    const onVis = () => { if (document.hidden) stop(); else { setNowMs(Date.now()); start(); } };
+    start();
+    document.addEventListener('visibilitychange', onVis);
+    return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
   }, []);
 
   React.useEffect(() => {

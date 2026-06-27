@@ -429,8 +429,15 @@ export default function CommsGateway() {
     api.listProjects().then(setProjects).catch(() => {});
     api.listSessions().then(setSessions).catch(() => {});
     const unsub = api.subscribe({ onComms: refetch });
-    const poll = setInterval(refetch, 8000); // pending chats arrive via long-poll on the Mac
-    return () => { unsub(); clearInterval(poll); };
+    // Pending chats arrive via long-poll on the Mac; this 8s fallback only needs
+    // to run while the Comms screen is actually visible.
+    let poll: ReturnType<typeof setInterval> | null = null;
+    const start = () => { if (!poll && !document.hidden) poll = setInterval(refetch, 8000); };
+    const stop = () => { if (poll) { clearInterval(poll); poll = null; } };
+    const onVis = () => { if (document.hidden) stop(); else { refetch(); start(); } };
+    start();
+    document.addEventListener('visibilitychange', onVis);
+    return () => { unsub(); stop(); document.removeEventListener('visibilitychange', onVis); };
   }, [refetch]);
 
   return (
