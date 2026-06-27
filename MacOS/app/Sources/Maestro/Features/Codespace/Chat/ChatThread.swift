@@ -8,7 +8,9 @@ struct ChatThread: View {
     let projectName: String
     @Binding var sessionId: String?
     var flush: Bool = false
+    var active: Bool = true
     let onSessionCreated: (ChatSession) -> Void
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
 
     @State private var store: ChatThreadStore?
     @State private var composerText = ""
@@ -111,7 +113,8 @@ struct ChatThread: View {
                             TurnView(job: job,
                                      projectRoot: projectRoot,
                                      answerable: job.id == store.turns.last?.id && job.isRunning,
-                                     onAnswer: { ans in Task { await store.answer(ans) } })
+                                     onAnswer: { ans in Task { await store.answer(ans) } },
+                                     onOpenFile: onOpenFile)
                                 .transition(.opacity.combined(with: .offset(y: 8)))
                         }
                         Color.clear.frame(height: 1).id("bottom")
@@ -121,11 +124,25 @@ struct ChatThread: View {
                     .padding(.horizontal, 24).padding(.vertical, 22)
                     .animation(.smooth(duration: 0.28), value: store.turns.count)
                 }
-                .onChange(of: store.turns.count) { proxy.scrollTo("bottom", anchor: .bottom) }
-                .onChange(of: store.turns.last?.updatedAt) { proxy.scrollTo("bottom", anchor: .bottom) }
+                .onChange(of: store.turns.count) { scrollToBottom(proxy, animated: true) }
+                .onChange(of: store.turns.last?.updatedAt) { scrollToBottom(proxy, animated: true) }
+                .onChange(of: active) { _, isActive in if isActive { scrollToBottom(proxy) } }
+                .onAppear { scrollToBottom(proxy) }
+                .onChange(of: sessionId) { _, _ in scrollToBottom(proxy) }
             }
         } else {
             emptyState
+        }
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = false) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 70_000_000)
+            if animated {
+                withAnimation(.smooth(duration: 0.18)) { proxy.scrollTo("bottom", anchor: .bottom) }
+            } else {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
         }
     }
 
