@@ -6,7 +6,9 @@ import SwiftUI
 @main
 struct Launcher {
     static func main() {
-        if CommandLine.arguments.contains("--selftest") {
+        if CommandLine.arguments.contains("--toolviz") {
+            ToolVizSelfTest.run()
+        } else if CommandLine.arguments.contains("--selftest") {
             SelfTest.run()
         } else {
             MaestroApp.main()

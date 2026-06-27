@@ -4,12 +4,13 @@ import AppKit
 /// One turn: the user's message bubble, then the assistant's work.
 struct TurnView: View {
     let job: Job
+    var projectRoot: String? = nil
     var answerable = false
     var onAnswer: (String) -> Void = { _ in }
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             UserBubble(job: job)
-            AssistantTurn(job: job, answerable: answerable, onAnswer: onAnswer)
+            AssistantTurn(job: job, projectRoot: projectRoot, answerable: answerable, onAnswer: onAnswer)
         }
     }
 }
@@ -68,6 +69,7 @@ struct UserBubble: View {
 
 struct AssistantTurn: View {
     let job: Job
+    var projectRoot: String? = nil
     var answerable = false
     var onAnswer: (String) -> Void = { _ in }
     var body: some View {
@@ -86,14 +88,14 @@ struct AssistantTurn: View {
                 let blocks = job.transcript ?? []
                 if job.isRunning {
                     ForEach(blocks) { item in
-                        TranscriptBlock(item: item, answerable: answerable && item.kind == "ask", onAnswer: onAnswer)
+                        TranscriptBlock(item: item, projectRoot: projectRoot, answerable: answerable && item.kind == "ask", onAnswer: onAnswer)
                     }
                 } else {
                     let work = blocks.filter { $0.kind == "tool" || $0.kind == "thinking" }
                     let content = blocks.filter { $0.kind != "tool" && $0.kind != "thinking" }
-                    if !work.isEmpty { WorkBar(work: work, durMs: job.transcript?.compactMap(\.durMs).reduce(0, +)) }
+                    if !work.isEmpty { WorkBar(work: work, durMs: job.transcript?.compactMap(\.durMs).reduce(0, +), projectRoot: projectRoot) }
                     ForEach(content) { item in
-                        TranscriptBlock(item: item, answerable: answerable && item.kind == "ask", onAnswer: onAnswer)
+                        TranscriptBlock(item: item, projectRoot: projectRoot, answerable: answerable && item.kind == "ask", onAnswer: onAnswer)
                     }
                 }
 
@@ -147,12 +149,13 @@ struct AssistantTurn: View {
 struct WorkBar: View {
     let work: [TranscriptItem]
     var durMs: Double?
+    var projectRoot: String? = nil
     @State private var expanded = false
 
     var body: some View {
         let tools = work.filter { $0.kind == "tool" }.count
         let thought = work.contains { $0.kind == "thinking" }
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Button { withAnimation(.smooth(duration: 0.2)) { expanded.toggle() } } label: {
                 HStack(spacing: 6) {
                     Icon(name: "check", size: 11).foregroundStyle(Tok.green)
@@ -161,12 +164,16 @@ struct WorkBar: View {
                 }
                 .padding(.horizontal, 9).padding(.vertical, 5)
                 .background(Tok.fillTertiary).clipShape(Capsule())
+                .overlay(Capsule().strokeBorder(Tok.separator, lineWidth: Tok.hairline))
             }.pressable()
             if expanded {
-                VStack(alignment: .leading, spacing: 6) { ForEach(work) { TranscriptBlock(item: $0) } }
+                VStack(alignment: .leading, spacing: 6) { ForEach(work) { TranscriptBlock(item: $0, projectRoot: projectRoot) } }
                     .padding(.leading, 8).padding(.vertical, 2)
                     .overlay(alignment: .leading) { Tok.separator.frame(width: Tok.hairline) }
                     .transition(.opacity.combined(with: .offset(y: -4)))
+            } else {
+                // The artifacts at a glance — touched files as Conductor-style chips (click to preview).
+                WorkChipBar(work: work, root: projectRoot)
             }
         }
     }
@@ -183,6 +190,7 @@ struct WorkBar: View {
 /// Renders a single transcript item by kind.
 struct TranscriptBlock: View {
     let item: TranscriptItem
+    var projectRoot: String? = nil
     var answerable = false
     var onAnswer: (String) -> Void = { _ in }
     @State private var expanded = false
@@ -193,7 +201,7 @@ struct TranscriptBlock: View {
         switch item.kind {
         case "text", "result": MarkdownText(text: item.text)
         case "thinking": thinking
-        case "tool": toolRow
+        case "tool": ToolCallRow(item: item, root: projectRoot)
         case "image": imageChip
         case "ask": answerable ? AnyView(questionCard) : AnyView(askCard)
         case "review": reviewCard
@@ -265,55 +273,6 @@ struct TranscriptBlock: View {
         }
     }
 
-    private var hasChildren: Bool { !(item.children ?? []).isEmpty }
-
-    private var toolRow: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Button { if hasChildren { expanded.toggle() } } label: {
-                HStack(spacing: 8) {
-                    statusGlyph
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(item.text).font(TokFont.text(TokFont.footnote, .medium)).foregroundStyle(Tok.ink).lineLimit(1)
-                        if let cmd = item.cmd, !cmd.isEmpty {
-                            Text(cmd).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(1)
-                        } else if hasChildren, let r = item.result, !r.isEmpty, !expanded {
-                            Text("→ \(r.prefix(120))").font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(1)
-                        }
-                    }
-                    Spacer(minLength: 0)
-                    if hasChildren {
-                        Text("\(item.children?.count ?? 0)").font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
-                        Icon(name: expanded ? "chevronDown" : "chevronRight", size: 11).foregroundStyle(Tok.inkTertiary)
-                    } else if let d = item.durMs, d > 0 {
-                        Text(durLabel(d)).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
-                    }
-                }
-            }
-            .buttonStyle(.plain).disabled(!hasChildren)
-
-            // Sub-agent (Task/Agent) transcript, nested.
-            if expanded, let kids = item.children, !kids.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(kids) { child in TranscriptBlock(item: child) }
-                    if let r = item.result, !r.isEmpty {
-                        Text(r).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkSecondary)
-                    }
-                }
-                .padding(.leading, 18).padding(.vertical, 4)
-                .overlay(alignment: .leading) { Tok.separator.frame(width: Tok.hairline) }
-            }
-        }
-        .padding(.vertical, 2)
-    }
-
-    @ViewBuilder private var statusGlyph: some View {
-        switch item.toolStatus {
-        case "running": Spinner(size: 12).tint(Tok.inkTertiary)
-        case "error": Icon(name: "x", size: 12).foregroundStyle(Tok.red)
-        default: Icon(name: "check", size: 12).foregroundStyle(Tok.green)
-        }
-    }
-
     private var imageChip: some View {
         // The app runs on the Mac, so a generated image's absolute imagePath is readable directly
         // (no relay/assetImage round-trip needed).
@@ -354,6 +313,4 @@ struct TranscriptBlock: View {
         }
         .padding(10).background(Tok.fillTertiary).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
-
-    private func durLabel(_ ms: Double) -> String { ms < 1000 ? "\(Int(ms))ms" : String(format: "%.1fs", ms / 1000) }
 }

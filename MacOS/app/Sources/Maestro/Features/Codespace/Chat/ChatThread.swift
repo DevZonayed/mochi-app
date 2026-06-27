@@ -22,6 +22,17 @@ struct ChatThread: View {
     @State private var bgToken: Int?
     @State private var schedStore: ScheduleStore?
 
+    /// Absolute root that tool paths are relative to. The brain runs each session in its own git
+    /// worktree and relativizes tool paths against THAT cwd, so prefer the session's worktreePath
+    /// (falling back to the main checkout for non-repo sessions or before the first run).
+    private var projectRoot: String? {
+        let main = env.workspace?.projects.first { $0.id == projectId }?.path
+        guard let sid = sessionId,
+              let wt = env.workspace?.sessionsByProject[projectId]?.first(where: { $0.id == sid })?.worktreePath,
+              !wt.isEmpty else { return main }
+        return wt
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             transcript
@@ -98,6 +109,7 @@ struct ChatThread: View {
                     LazyVStack(alignment: .leading, spacing: 22) {
                         ForEach(store.turns) { job in
                             TurnView(job: job,
+                                     projectRoot: projectRoot,
                                      answerable: job.id == store.turns.last?.id && job.isRunning,
                                      onAnswer: { ans in Task { await store.answer(ans) } })
                                 .transition(.opacity.combined(with: .offset(y: 8)))

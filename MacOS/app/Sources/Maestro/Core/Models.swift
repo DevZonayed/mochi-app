@@ -197,6 +197,7 @@ struct ChatSession: Codable, Identifiable, Hashable {
     var branch: String?
     var updatedAt: Double?
     var source: String?      // imported-from origin (claude/codex/conductor)
+    var worktreePath: String?  // absolute path of this session's git worktree (the run cwd)
 
     var isArchived: Bool { archived != nil }
     var displayTitle: String { (title?.isEmpty == false ? title : nil) ?? "New chat" }
