@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: native-macos-build-${{ github.ref }}
@@ -49,21 +49,50 @@ jobs:
           chmod +x MacOS/app/package-app.sh
           MacOS/app/package-app.sh release
 
-      - name: Zip app bundle
+      - id: dmg
+        name: Create DMG installer
         env:
           MAESTRO_VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p artifacts
+          rm -rf dmg-root
+          mkdir -p dmg-root
           SHORT_SHA="${GITHUB_SHA::7}"
-          ZIP="artifacts/Maestro-macOS-${MAESTRO_VERSION}-${SHORT_SHA}.zip"
-          ditto -c -k --keepParent MacOS/app/dist/Maestro.app "$ZIP"
-          shasum -a 256 "$ZIP" > "$ZIP.sha256"
+          DMG="artifacts/Maestro-macOS-${MAESTRO_VERSION}-${SHORT_SHA}.dmg"
+          ditto MacOS/app/dist/Maestro.app dmg-root/Maestro.app
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname "Maestro ${MAESTRO_VERSION}" -srcfolder dmg-root -ov -format UDZO "$DMG"
+          shasum -a 256 "$DMG" > "$DMG.sha256"
+          echo "file=$DMG" >> "$GITHUB_OUTPUT"
+          echo "tag=maestro-macos-v${MAESTRO_VERSION}" >> "$GITHUB_OUTPUT"
           ls -lh artifacts
 
-      - name: Upload downloadable build
+      - name: Upload DMG artifact
         uses: actions/upload-artifact@v6
         with:
           name: Maestro-macOS-${{ steps.version.outputs.version }}-${{ github.run_number }}
           path: artifacts/*
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish GitHub Release
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAESTRO_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ steps.dmg.outputs.tag }}
+        run: |
+          cat > release-notes.md <<EOF
+          Native macOS production build for Maestro ${MAESTRO_VERSION}.
+
+          Download the .dmg asset, open it, and drag Maestro.app into Applications.
+          EOF
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" artifacts/* --clobber
+          else
+            gh release create "$RELEASE_TAG" artifacts/* \
+              --target "$GITHUB_SHA" \
+              --title "Maestro macOS ${MAESTRO_VERSION}" \
+              --notes-file release-notes.md \
+              --latest
+          fi
