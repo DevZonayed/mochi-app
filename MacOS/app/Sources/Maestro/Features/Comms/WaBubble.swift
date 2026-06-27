@@ -7,6 +7,7 @@ struct WaBubble: View {
     let message: WaMessage
     var isGroup: Bool = false
     var onReact: (String) -> Void = { _ in }
+    var onDownload: (() async -> WaMediaDownload?)? = nil
 
     @State private var hovering = false
     @State private var pickerOpen = false
@@ -53,7 +54,7 @@ struct WaBubble: View {
                     .background(Tok.fillSecondary).clipShape(RoundedRectangle(cornerRadius: 4))
                     .frame(maxWidth: 240, alignment: .leading)
             }
-            if let media = message.media { MediaThumb(media: media) }
+            if let media = message.media { MediaThumb(media: media, onDownload: onDownload) }
             if !message.text.isEmpty {
                 Text(message.text).font(TokFont.text(14)).foregroundStyle(Tok.ink).textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
@@ -105,20 +106,54 @@ struct BubbleShape: InsettableShape {
     }
 }
 
-/// Inline media: image/sticker thumbnail from the WhatsApp base64 preview; chips for the rest.
+/// Inline media: image/sticker thumbnail (tap → full download); video/audio/document open externally.
 struct MediaThumb: View {
     let media: WaMedia
+    var onDownload: (() async -> WaMediaDownload?)? = nil
+    @State private var fullImage: NSImage?
+    @State private var busy = false
+
     var body: some View {
         switch media.kind {
         case "image", "sticker":
-            if let img = decoded {
-                Image(nsImage: img).resizable().scaledToFill()
-                    .frame(maxWidth: 260, maxHeight: 260).clipShape(RoundedRectangle(cornerRadius: 8))
-            } else { chip(icon: "spark", label: "Photo") }
-        case "video": chip(icon: "play", label: media.seconds.map { "Video · \(dur($0))" } ?? "Video")
-        case "audio": chip(icon: "play", label: "Voice message" + (media.seconds.map { " · \(dur($0))" } ?? ""))
-        default: chip(icon: "folder", label: media.fileName ?? "Document")
+            Button { Task { await tapImage() } } label: {
+                ZStack {
+                    if let img = fullImage ?? decoded {
+                        Image(nsImage: img).resizable().scaledToFill()
+                            .frame(maxWidth: 260, maxHeight: 260).clipShape(RoundedRectangle(cornerRadius: 8))
+                    } else { chip(icon: "spark", label: "Photo") }
+                    if busy { Spinner(size: 18).tint(.white) }
+                }
+            }.buttonStyle(.plain)
+        case "video": openable(icon: "play", label: media.seconds.map { "Video · \(dur($0))" } ?? "Video")
+        case "audio": openable(icon: "play", label: "Voice message" + (media.seconds.map { " · \(dur($0))" } ?? ""))
+        default: openable(icon: "folder", label: media.fileName ?? "Document")
         }
+    }
+
+    private func tapImage() async {
+        guard fullImage == nil, let onDownload else { return }
+        busy = true; defer { busy = false }
+        if let dataUrl = (await onDownload())?.dataUrl, let img = MediaThumb.image(fromDataUrl: dataUrl) { fullImage = img }
+    }
+
+    private func openable(icon: String, label: String) -> some View {
+        Button { Task { await openExternally() } } label: { chip(icon: busy ? "refresh" : icon, label: label) }.buttonStyle(.plain)
+    }
+
+    private func openExternally() async {
+        guard let onDownload else { return }
+        busy = true; defer { busy = false }
+        guard let d = await onDownload(), let dataUrl = d.dataUrl, let comma = dataUrl.firstIndex(of: ","),
+              let bytes = Data(base64Encoded: String(dataUrl[dataUrl.index(after: comma)...])) else { return }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(d.fileName ?? "wa-media-\(Int(Date().timeIntervalSince1970))")
+        try? bytes.write(to: url)
+        NSWorkspace.shared.open(url)
+    }
+
+    static func image(fromDataUrl s: String) -> NSImage? {
+        guard let comma = s.firstIndex(of: ","), let data = Data(base64Encoded: String(s[s.index(after: comma)...])) else { return nil }
+        return NSImage(data: data)
     }
     private var decoded: NSImage? {
         guard let b64 = media.thumbBase64, let data = Data(base64Encoded: b64) else { return nil }

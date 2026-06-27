@@ -128,6 +128,12 @@ final class WhatsAppStore {
         try? await client.callVoid("waReact", ["chatId": chatId, "msgId": mid, "emoji": emoji])
     }
 
+    /// Download the full media bytes for a message → a base64 data URL (image/video/audio/document).
+    func downloadMedia(_ msg: WaMessage) async -> WaMediaDownload? {
+        guard let chatId = selectedId, let mid = msg.msgId else { return nil }
+        return try? await client.call("waDownloadMedia", ["chatId": chatId, "msgId": mid], as: WaMediaDownload.self)
+    }
+
     func avatarURL(_ chat: WaChat) -> URL? {
         URL(string: avatars[chat.chatId] ?? chat.avatarUrl ?? "")
     }

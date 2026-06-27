@@ -123,6 +123,8 @@ struct WaMessage: Codable, Identifiable, Hashable {
     var status: String?     // sent | delivered | read
 }
 
+struct WaMediaDownload: Codable { var dataUrl: String?; var mimetype: String?; var fileName: String? }
+
 struct WhatsAppStatus: Codable {
     var connected: Bool?
     var name: String?
@@ -183,6 +185,7 @@ struct ExtensionPeer: Codable, Identifiable, Hashable {
 struct ExtensionStatus: Codable {
     var running: Bool?; var port: Int?; var token: String?; var path: String?; var peers: [ExtensionPeer]?
 }
+struct GitHubDevice: Codable { var stage: String?; var pct: Int?; var userCode: String?; var verificationUri: String? }
 
 struct ChatSession: Codable, Identifiable, Hashable {
     let id: String

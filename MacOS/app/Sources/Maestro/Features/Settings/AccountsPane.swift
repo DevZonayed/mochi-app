@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Provider accounts + API keys + OAuth, and the on-demand engine-binary download (EngineSetup).
 struct AccountsPane: View {
@@ -7,6 +8,8 @@ struct AccountsPane: View {
     @State private var engines: [String: EngineState] = [:]
     @State private var keyDrafts: [String: String] = [:]
     @State private var busy: String?
+    @State private var ghDevice: GitHubDevice?
+    @State private var ghToken: Int?
 
     private struct P { let id: String; let name: String; let tint: Color; let hint: String; let oauth: String? }
     private let providers: [P] = [
@@ -29,7 +32,19 @@ struct AccountsPane: View {
                 engineRow("Codex engine", "codex", Tok.ink, last: true)
             }
         }
-        .task { await refresh() }
+        .task {
+            await refresh()
+            if ghToken == nil {
+                ghToken = env.client.onEvent { ev in
+                    guard ev.name == "github-device", let d = decodeJSON(ev.data, as: GitHubDevice.self) else { return }
+                    Task { @MainActor in
+                        ghDevice = d
+                        if d.stage == "code", let uri = d.verificationUri, let url = URL(string: uri) { NSWorkspace.shared.open(url) }
+                    }
+                }
+            }
+        }
+        .onDisappear { if let t = ghToken { env.client.removeHandler(t); ghToken = nil } }
     }
 
     private func conn(_ id: String) -> ProviderConn? { conns.first { $0.provider == id } }
@@ -48,7 +63,11 @@ struct AccountsPane: View {
                 Button("Disconnect") { Task { await disconnect(p.id) } }.buttonStyle(.plain)
                     .font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.red)
             } else if let label = p.oauth {
-                PillButton(title: busy == p.id ? "Signing in…" : label, kind: .plain, busy: busy == p.id) { Task { await oauth(p) } }
+                if p.id == "github", busy == "github", let dev = ghDevice {
+                    ghDeviceView(dev)
+                } else {
+                    PillButton(title: busy == p.id ? "Signing in…" : label, kind: .plain, busy: busy == p.id) { Task { await oauth(p) } }
+                }
             } else {
                 HStack(spacing: 6) {
                     SecureField(p.hint, text: Binding(get: { keyDrafts[p.id] ?? "" }, set: { keyDrafts[p.id] = $0 }))
@@ -96,9 +115,27 @@ struct AccountsPane: View {
         keyDrafts[id] = ""; await refresh()
     }
     private func disconnect(_ id: String) async { try? await env.client.callVoid("disconnectProvider", ["provider": id]); await refresh() }
+    private func ghDeviceView(_ dev: GitHubDevice) -> some View {
+        Group {
+            if dev.stage == "downloading-cli" {
+                Text("Downloading gh CLI… \(dev.pct ?? 0)%").font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkSecondary)
+            } else if dev.stage == "code", let code = dev.userCode {
+                HStack(spacing: 6) {
+                    Text(code).font(TokFont.mono(TokFont.footnote, .bold)).tracking(2).foregroundStyle(Tok.ink)
+                        .padding(.horizontal, 8).frame(height: 26).background(Tok.fillSecondary).clipShape(RoundedRectangle(cornerRadius: 7))
+                    Button { NativeBridge.copy(code) } label: { Icon(name: "command", size: 12).foregroundStyle(Tok.inkTertiary) }.buttonStyle(.plain)
+                    Text("→ browser").font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
+                }
+            } else {
+                Text("Starting…").font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
+            }
+        }
+    }
+
     private func oauth(_ p: P) async {
-        busy = p.id; defer { busy = nil }
+        busy = p.id; if p.id == "github" { ghDevice = nil }; defer { busy = nil }
         try? await env.client.callRaw(p.id == "github" ? "githubLogin" : "codexLogin", [:])
+        ghDevice = nil
         await refresh()
     }
     private func install(_ id: String) async {

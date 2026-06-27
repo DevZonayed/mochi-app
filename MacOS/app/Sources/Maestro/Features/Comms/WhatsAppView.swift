@@ -137,7 +137,9 @@ struct WhatsAppView: View {
                             }
                             ForEach(Array(store.messages.enumerated()), id: \.element.id) { i, m in
                                 if daySeparator(store.messages, i) { daySeparatorView(m.ts) }
-                                WaBubble(message: m, isGroup: chat.kind == "group", onReact: { emoji in Task { await store.react(m, emoji) } })
+                                WaBubble(message: m, isGroup: chat.kind == "group",
+                                         onReact: { emoji in Task { await store.react(m, emoji) } },
+                                         onDownload: { await store.downloadMedia(m) })
                             }
                             Color.clear.frame(height: 1).id("wa-bottom")
                         }

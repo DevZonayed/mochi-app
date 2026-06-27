@@ -202,17 +202,43 @@ struct TranscriptBlock: View {
         }
     }
 
+    private var hasChildren: Bool { !(item.children ?? []).isEmpty }
+
     private var toolRow: some View {
-        HStack(spacing: 8) {
-            statusGlyph
-            VStack(alignment: .leading, spacing: 1) {
-                Text(item.text).font(TokFont.text(TokFont.footnote, .medium)).foregroundStyle(Tok.ink).lineLimit(1)
-                if let cmd = item.cmd, !cmd.isEmpty {
-                    Text(cmd).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(1)
+        VStack(alignment: .leading, spacing: 6) {
+            Button { if hasChildren { expanded.toggle() } } label: {
+                HStack(spacing: 8) {
+                    statusGlyph
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(item.text).font(TokFont.text(TokFont.footnote, .medium)).foregroundStyle(Tok.ink).lineLimit(1)
+                        if let cmd = item.cmd, !cmd.isEmpty {
+                            Text(cmd).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(1)
+                        } else if hasChildren, let r = item.result, !r.isEmpty, !expanded {
+                            Text("→ \(r.prefix(120))").font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                    if hasChildren {
+                        Text("\(item.children?.count ?? 0)").font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
+                        Icon(name: expanded ? "chevronDown" : "chevronRight", size: 11).foregroundStyle(Tok.inkTertiary)
+                    } else if let d = item.durMs, d > 0 {
+                        Text(durLabel(d)).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
+                    }
                 }
             }
-            Spacer(minLength: 0)
-            if let d = item.durMs, d > 0 { Text(durLabel(d)).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary) }
+            .buttonStyle(.plain).disabled(!hasChildren)
+
+            // Sub-agent (Task/Agent) transcript, nested.
+            if expanded, let kids = item.children, !kids.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(kids) { child in TranscriptBlock(item: child) }
+                    if let r = item.result, !r.isEmpty {
+                        Text(r).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkSecondary)
+                    }
+                }
+                .padding(.leading, 18).padding(.vertical, 4)
+                .overlay(alignment: .leading) { Tok.separator.frame(width: Tok.hairline) }
+            }
         }
         .padding(.vertical, 2)
     }
