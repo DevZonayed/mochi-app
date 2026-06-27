@@ -2,7 +2,7 @@ import SwiftUI
 import Observation
 
 enum Route: String, CaseIterable, Identifiable {
-    case codespace, design, comms, whatsapp, settings
+    case codespace, design, comms, whatsapp, schedule, settings
     var id: String { rawValue }
     var label: String {
         switch self {
@@ -10,6 +10,7 @@ enum Route: String, CaseIterable, Identifiable {
         case .design: return "Design"
         case .comms: return "Comms"
         case .whatsapp: return "WhatsApp"
+        case .schedule: return "Schedule"
         case .settings: return "Settings"
         }
     }
@@ -19,11 +20,12 @@ enum Route: String, CaseIterable, Identifiable {
         case .design: return "brush"
         case .comms: return "chat"
         case .whatsapp: return "whatsapp"
+        case .schedule: return "clock"
         case .settings: return "settings"
         }
     }
-    /// The genre top-nav shows these four; Settings is the trailing gear.
-    static let navBar: [Route] = [.codespace, .design, .comms, .whatsapp]
+    /// The genre top-nav shows these; Settings is the trailing gear.
+    static let navBar: [Route] = [.codespace, .design, .comms, .whatsapp, .schedule]
 }
 
 /// Root container for app-wide singletons. Injected via `.environment`.
@@ -34,6 +36,9 @@ final class AppEnv {
     let client: MaestroClient
     let supervisor: SidecarSupervisor
     var route: Route = .codespace
+    /// The CodeSpace workspace lives at app scope so its tree/tabs persist across route switches
+    /// (each route is its own view that gets rebuilt on navigation).
+    var workspace: WorkspaceStore?
 
     init() {
         let c = MaestroClient()
@@ -41,5 +46,10 @@ final class AppEnv {
         supervisor = SidecarSupervisor(client: c)
     }
 
-    func boot() { supervisor.start() }
+    func boot() {
+        supervisor.start()
+        let w = WorkspaceStore(client: client)
+        workspace = w
+        Task { await w.start() }
+    }
 }

@@ -202,6 +202,36 @@ struct ChatSession: Codable, Identifiable, Hashable {
     var displayTitle: String { (title?.isEmpty == false ? title : nil) ?? "New chat" }
 }
 
+// MARK: - Schedules
+
+/// A scheduled job — mirrors `Schedule` in apps/desktop/electron/store.ts. Covers both the
+/// one-shot "queued message" (fireAt + sessionId + prompt) and recurring tasks (time + cadence,
+/// or everyMinutes). System kinds (auto-continue / auto-answer / keep-going / retry-run /
+/// whatsapp-analyze) also flow through here; the UI renders them read-only. We model only the
+/// fields the UI needs; presentation helpers live in `ScheduleFormat.swift`.
+struct Schedule: Codable, Identifiable, Hashable {
+    let id: String
+    var projectId: String?
+    var title: String
+    var time: String?         // "HH:MM" for recurring clock schedules
+    var cadence: String?      // "daily" | "weekdays" | "weekend" | "Mon, Wed, Fri" | …
+    var enabled: Bool
+    var nextRun: Double?
+    var lastRun: Double?
+    var createdAt: Double
+    var fireAt: Double?       // one-shot absolute fire time (ms)
+    var sessionId: String?
+    var prompt: String?
+    var kind: String?         // nil/"message" = user; others are system-created
+    var effort: String?
+    var browser: Bool?
+    var plan: Bool?
+    var goal: Bool?
+    var everyMinutes: Int?    // interval recurrence
+    var catchUp: Bool?
+    var paused: Bool?
+}
+
 /// A server-pushed event (`maestro:event` → our WS `{t:"event"}`).
 struct MaestroEvent {
     let name: String

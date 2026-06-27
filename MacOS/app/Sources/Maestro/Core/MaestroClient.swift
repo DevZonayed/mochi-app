@@ -78,6 +78,14 @@ final class MaestroClient {
     }
 
     func callRaw(_ method: String, _ params: [String: Any]) async throws -> Data {
+        // The first screen can issue calls before the sidecar WS has finished connecting — give it
+        // a short grace period rather than failing instantly (fixes "empty on first load").
+        if task == nil {
+            for _ in 0..<200 {
+                try? await Task.sleep(for: .milliseconds(50))
+                if task != nil { break }
+            }
+        }
         guard let task else { throw RPCError.notConnected }
         let id = nextId; nextId += 1
         let payload: [String: Any] = ["t": "call", "id": id, "method": method, "params": params]

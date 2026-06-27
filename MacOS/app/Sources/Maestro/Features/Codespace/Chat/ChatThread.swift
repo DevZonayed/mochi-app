@@ -7,6 +7,7 @@ struct ChatThread: View {
     let projectId: String
     let projectName: String
     @Binding var sessionId: String?
+    var flush: Bool = false
     let onSessionCreated: (ChatSession) -> Void
 
     @State private var store: ChatThreadStore?
@@ -15,8 +16,11 @@ struct ChatThread: View {
     @State private var effort = "balanced"
     @State private var plan = false
     @State private var goal = false
+    @State private var autopilot = false
+    @State private var review = false
     @State private var bgTasks: [BgTask] = []
     @State private var bgToken: Int?
+    @State private var schedStore: ScheduleStore?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -26,19 +30,31 @@ struct ChatThread: View {
                 Text(err).font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.red)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20).padding(.bottom, 6)
             }
+            if let schedStore, !schedStore.pending(forSession: sessionId).isEmpty {
+                ScheduledQueuePanel(store: schedStore, sessionId: sessionId) { s in
+                    composerText = s.prompt ?? ""
+                    Task { await schedStore.delete(s.id) }
+                }
+                .frame(maxWidth: 1180).padding(.horizontal, 20).padding(.bottom, 8)
+            }
             Composer(text: $composerText, model: $model, effort: $effort, plan: $plan, goal: $goal,
+                     autopilot: $autopilot, review: $review, sessionActive: sessionId != nil,
                      streaming: store?.streaming ?? false,
                      disabled: store == nil,
-                     onSend: send, onStop: stop)
+                     onSend: send, onStop: stop,
+                     onSchedule: scheduleFromComposer)
                 .frame(maxWidth: 1180)
                 .padding(.horizontal, 20).padding(.bottom, 16)
+                .onChange(of: autopilot) { _, v in Task { await store?.setAutopilot(v) } }
+                .onChange(of: review) { _, v in Task { await store?.setReviewer(v) } }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.bgElevated)
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+        .clipShape(RoundedRectangle(cornerRadius: flush ? 0 : 18, style: .continuous))
+        .overlay { if !flush { RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline) } }
         .task {
             if store == nil { let s = ChatThreadStore(projectId: projectId, client: env.client); s.start(); store = s }
+            if schedStore == nil { let s = ScheduleStore(client: env.client); await s.start(); schedStore = s }
             await store?.bind(sessionId)
             await loadBg()
             if bgToken == nil {
@@ -51,7 +67,7 @@ struct ChatThread: View {
             }
         }
         .onChange(of: sessionId) { _, new in Task { await store?.bind(new) } }
-        .onDisappear { store?.stop(); if let t = bgToken { env.client.removeHandler(t); bgToken = nil } }
+        .onDisappear { store?.stop(); schedStore?.stop(); if let t = bgToken { env.client.removeHandler(t); bgToken = nil } }
     }
 
     private var bgPanel: some View {
@@ -84,12 +100,14 @@ struct ChatThread: View {
                             TurnView(job: job,
                                      answerable: job.id == store.turns.last?.id && job.isRunning,
                                      onAnswer: { ans in Task { await store.answer(ans) } })
+                                .transition(.opacity.combined(with: .offset(y: 8)))
                         }
                         Color.clear.frame(height: 1).id("bottom")
                     }
                     .frame(maxWidth: 1180)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, 24).padding(.vertical, 22)
+                    .animation(.smooth(duration: 0.28), value: store.turns.count)
                 }
                 .onChange(of: store.turns.count) { proxy.scrollTo("bottom", anchor: .bottom) }
                 .onChange(of: store.turns.last?.updatedAt) { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -128,5 +146,24 @@ struct ChatThread: View {
     private func stop() {
         guard let store, let running = store.turns.last(where: { $0.isRunning }) else { return }
         Task { await store.cancel(running) }
+    }
+
+    /// Schedule the typed message for later (composer clock button). Clears the composer on success;
+    /// the queued message then appears in the panel above with a live countdown.
+    private func scheduleFromComposer(_ req: ScheduleRequest) {
+        let text = composerText.trimmed
+        guard !text.isEmpty, let schedStore else { return }
+        Task { @MainActor in
+            let ok: Bool
+            switch req {
+            case .once(let fireAt):
+                ok = await schedStore.scheduleMessage(fireAt: fireAt, prompt: text, sessionId: sessionId,
+                                                      projectId: projectId, effort: effort, plan: plan, goal: goal)
+            case .repeating(let opts):
+                ok = await schedStore.createRecurring(title: String(text.prefix(60)), prompt: text,
+                                                      projectId: projectId, sessionId: sessionId, opts: opts, effort: effort)
+            }
+            if ok { composerText = "" }
+        }
     }
 }

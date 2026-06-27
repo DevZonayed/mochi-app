@@ -8,12 +8,18 @@ struct Composer: View {
     @Binding var effort: String
     @Binding var plan: Bool
     @Binding var goal: Bool
+    @Binding var autopilot: Bool
+    @Binding var review: Bool
+    var sessionActive: Bool = false
     var streaming: Bool
     var disabled: Bool
     let onSend: () -> Void
     let onStop: () -> Void
+    /// When set, the composer shows a clock button that schedules the typed message for later.
+    var onSchedule: ((ScheduleRequest) -> Void)? = nil
 
     @FocusState private var focused: Bool
+    @State private var schedOpen = false
 
     static let models: [(id: String, name: String)] = [
         ("auto", "Auto"), ("claude:opus", "Claude · Opus"), ("claude:sonnet", "Claude · Sonnet"),
@@ -78,18 +84,41 @@ struct Composer: View {
 
             togglePill("Plan", "spark", Tok.blue, on: plan) { plan.toggle(); if plan { goal = false } }
             togglePill("Goal", "target", Tok.purple, on: goal) { goal.toggle(); if goal { plan = false } }
+            togglePill("Autopilot", "bolt", Tok.green, on: autopilot, disabled: !sessionActive) { autopilot.toggle() }
+            togglePill("Review", "check", Tok.orange, on: review, disabled: !sessionActive) { review.toggle() }
+
+            if onSchedule != nil { scheduleButton }
 
             Spacer()
             Text(streaming ? "running…" : "⏎ to send").font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
         }
     }
 
-    private func togglePill(_ label: String, _ icon: String, _ tint: Color, on: Bool, _ action: @escaping () -> Void) -> some View {
+    private func togglePill(_ label: String, _ icon: String, _ tint: Color, on: Bool, disabled: Bool = false, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            HStack(spacing: 4) { Icon(name: icon, size: 12); Text(label).font(TokFont.text(TokFont.caption, .semibold)) }
-                .foregroundStyle(on ? tint : Tok.inkSecondary).padding(.horizontal, 9).frame(height: 28)
-                .background(on ? tint.opacity(0.14) : Tok.fillSecondary).clipShape(RoundedRectangle(cornerRadius: 8))
-        }.buttonStyle(.plain)
+            HStack(spacing: 4) { Icon(name: icon, size: 11); Text(label).font(TokFont.text(TokFont.caption, .semibold)) }
+                .foregroundStyle(on ? tint : Tok.inkSecondary).padding(.horizontal, 8).frame(height: 26)
+                .background(on ? tint.opacity(0.16) : Tok.fillSecondary).clipShape(RoundedRectangle(cornerRadius: 7))
+        }.pressable().disabled(disabled).opacity(disabled ? 0.45 : 1)
+        .help(disabled ? "Available once the chat has started" : label)
+    }
+
+    private var scheduleButton: some View {
+        Button { schedOpen.toggle() } label: {
+            HStack(spacing: 4) {
+                Icon(name: "clock", size: 11)
+                Text("Schedule").font(TokFont.text(TokFont.caption, .semibold))
+            }
+            .foregroundStyle(schedOpen ? Tok.blue : Tok.inkSecondary).padding(.horizontal, 8).frame(height: 26)
+            .background(schedOpen ? Tok.blue.opacity(0.14) : Tok.fillSecondary)
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(schedOpen ? Tok.blue.opacity(0.45) : .clear, lineWidth: 1))
+        }
+        .pressable().disabled(!canSend).opacity(canSend ? 1 : 0.45)
+        .help(canSend ? "Schedule this message to send later" : "Type a message to schedule it")
+        .popover(isPresented: $schedOpen, arrowEdge: .top) {
+            SchedulePicker { req in schedOpen = false; onSchedule?(req) }
+        }
     }
 
     private var effortIndex: Int { Self.efforts.firstIndex(of: effort) ?? 1 }
@@ -100,8 +129,8 @@ struct Composer: View {
 
     private func fab(icon: String, color: Color, fg: Color = .white, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Icon(name: icon, size: 16, weight: .semibold).foregroundStyle(fg)
-                .frame(width: 38, height: 38).background(color).clipShape(Circle())
-        }.buttonStyle(.plain)
+            Icon(name: icon, size: 15, weight: .semibold).foregroundStyle(fg)
+                .frame(width: 34, height: 34).background(color).clipShape(Circle())
+        }.pressable(scale: 0.9)
     }
 }

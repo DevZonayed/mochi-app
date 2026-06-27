@@ -8,19 +8,31 @@ struct RootView: View {
             Wallpaper()
             VStack(spacing: 0) {
                 TopNav()
-                Group {
-                    switch env.route {
-                    case .codespace: CodespaceView()
-                    case .design: DesignWorkspace()
-                    case .comms: CommsGateway()
-                    case .whatsapp: WhatsAppView()
-                    case .settings: SettingsView()
-                    }
+                ZStack {
+                    routeContent
+                        .id(env.route)
+                        .transition(.asymmetric(insertion: .opacity.combined(with: .offset(y: 6)), removal: .opacity))
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .animation(.smooth(duration: 0.26), value: env.route)
             }
+            // Let the nav row rise into the title bar so it sits inline with the traffic lights
+            // (no wasted empty strip up top) — the standard macOS unified-toolbar look.
+            .ignoresSafeArea(.container, edges: .top)
         }
         .background(Tok.bg)
+        .background(WindowConfigurator(barHeight: 40))
+    }
+
+    @ViewBuilder private var routeContent: some View {
+        switch env.route {
+        case .codespace: WorkspaceView()
+        case .design: DesignWorkspace()
+        case .comms: CommsGateway()
+        case .whatsapp: WhatsAppView()
+        case .schedule: ScheduleView()
+        case .settings: SettingsView()
+        }
     }
 }
 

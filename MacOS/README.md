@@ -1,7 +1,7 @@
 # Maestro — native macOS app
 
-A native **SwiftUI** rebuild of the Maestro desktop app, scoped to five surfaces (Codespace,
-Design, Comms, WhatsApp, Settings). It replaces the Electron/Chromium UI with native SwiftUI
+A native **SwiftUI** rebuild of the Maestro desktop app, scoped to six surfaces (Codespace,
+Design, Comms, WhatsApp, Schedule, Settings). It replaces the Electron/Chromium UI with native SwiftUI
 while **reusing the existing Node "brain"** (the `apps/desktop/electron/` logic) as a headless
 sidecar over a loopback WebSocket. See `docs/superpowers/specs/2026-06-27-macos-native-migration-design.md`.
 
@@ -63,12 +63,13 @@ node MacOS/sidecar/src/smoke-test.mjs
 cd MacOS/app && ./package-app.sh release   # → MacOS/app/dist/Maestro.app
 ```
 
-## Status — all five surfaces + packaging complete (2026-06-27)
+## Status — six surfaces + packaging complete (2026-06-27)
 
 - **P0** foundation/proof · **P1** Codespace (gallery · inline create · chat thread · project
   settings) · **P2** Design (rail · chat · live WKWebView preview · comment harness · hand-off) ·
   **P3** Comms + WhatsApp (gateway + two-pane messenger) · **P4** Settings (6 sections) ·
-  **P5** packaging (esbuild → single 11 MB brain bundle, self-contained `.app`).
+  **P5** Schedule (calendar/list, composer picker, inline queue, cron-backed firing) ·
+  **P6** packaging (esbuild → single 11 MB brain bundle, self-contained `.app`).
 - Every screen runs on the real headless brain and is verified against the operator's live data
   (`swift build` clean + `Maestro --selftest`): 13 projects, 28 sessions, 24 skills, 236 WhatsApp
   chats, 4 providers, both engines ready.
@@ -86,7 +87,7 @@ Homebrew's is a wrapper; ship official Node or fetch on first run like the engin
 needs a Developer ID (ad-hoc signed otherwise).
 
 ### Backlog (non-blocking polish)
-Chat: composer model/effort/Plan/Goal toggles, queue/scheduled/bg panels, AskUserQuestion card,
+Chat: composer model/effort/Plan/Goal toggles, bg panel polish, AskUserQuestion card,
 inline image bytes, minimap. WhatsApp: media send/full-download, reaction picker, load-earlier.
 Design: splitter resize, snapshot, fullscreen. Settings: live engine-download %, GitHub device-code.
 

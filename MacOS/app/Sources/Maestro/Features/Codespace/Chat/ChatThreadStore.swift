@@ -77,6 +77,10 @@ final class ChatThreadStore {
         try? await client.callVoid("cancelJob", ["id": job.id])
     }
 
+    /// Per-session run modes (need a session to exist).
+    func setAutopilot(_ on: Bool) async { guard let sid = sessionId else { return }; try? await client.callVoid("setSessionAutopilot", ["id": sid, "enabled": on]) }
+    func setReviewer(_ on: Bool) async { guard let sid = sessionId else { return }; try? await client.callVoid("setSessionReviewer", ["id": sid, "enabled": on]) }
+
     /// Answer the pending AskUserQuestion for this session (resumes the run).
     func answer(_ text: String) async {
         guard let sid = sessionId, !text.trimmed.isEmpty else { return }

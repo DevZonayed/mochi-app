@@ -62,6 +62,8 @@ enum Tok {
 
     // Ink (text)
     static let ink          = Color.dyn(NSColor(hex: "#000000"), NSColor(hex: "#FFFFFF"))
+    /// Softened body text for long-form reading — easier on the eye than pure #000/#FFF.
+    static let inkBody      = Color.dyn(.rgba(28, 28, 32, 0.92), .rgba(235, 235, 245, 0.90))
     static let inkSecondary = Color.dyn(.rgba(60, 60, 67, 0.60), .rgba(235, 235, 245, 0.60))
     static let inkTertiary  = Color.dyn(.rgba(60, 60, 67, 0.30), .rgba(235, 235, 245, 0.30))
 

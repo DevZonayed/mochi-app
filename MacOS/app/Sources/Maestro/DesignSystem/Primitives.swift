@@ -1,5 +1,39 @@
 import SwiftUI
 
+// MARK: - Interaction feedback (hover + press) — the "click feel" the plain style lacks.
+
+/// Press = quick scale + dim, spring-animated. Apply with `.pressable()`.
+struct PressableButtonStyle: ButtonStyle {
+    var scale: CGFloat = 0.96
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? scale : 1)
+            .opacity(configuration.isPressed ? 0.78 : 1)
+            .animation(.spring(response: 0.22, dampingFraction: 0.55), value: configuration.isPressed)
+            .contentShape(Rectangle())
+    }
+}
+
+extension View {
+    func pressable(scale: CGFloat = 0.96) -> some View { buttonStyle(PressableButtonStyle(scale: scale)) }
+
+    /// Animated hover background fill (e.g. nav items, tabs, rows).
+    func hoverFill(_ color: Color = Tok.fillTertiary, radius: CGFloat = 8) -> some View {
+        modifier(HoverFill(color: color, radius: radius))
+    }
+}
+
+struct HoverFill: ViewModifier {
+    let color: Color; let radius: CGFloat
+    @State private var hovering = false
+    func body(content: Content) -> some View {
+        content
+            .background(hovering ? color : .clear, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .animation(.easeOut(duration: 0.12), value: hovering)
+            .onHover { hovering = $0 }
+    }
+}
+
 // Shared SwiftUI primitives ported from src/lib/ui.tsx. Reused across every screen.
 
 /// Primary/quiet/plain pill button.
@@ -14,18 +48,18 @@ struct PillButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 7) {
-                if busy { Spinner(size: 14).foregroundStyle(fg) }
-                else if let icon { Icon(name: icon, size: 16, weight: .semibold) }
-                Text(title).font(TokFont.text(TokFont.callout, .semibold))
+            HStack(spacing: 6) {
+                if busy { Spinner(size: 12).foregroundStyle(fg) }
+                else if let icon { Icon(name: icon, size: 14, weight: .semibold) }
+                Text(title).font(TokFont.text(TokFont.subhead, .semibold))
             }
             .foregroundStyle(fg)
-            .padding(.horizontal, kind == .quiet ? 12 : 18)
-            .frame(height: kind == .quiet ? 40 : 44)
+            .padding(.horizontal, kind == .quiet ? 11 : 14)
+            .frame(height: kind == .quiet ? 30 : 34)
             .background(bg)
             .clipShape(RoundedRectangle(cornerRadius: Tok.Radius.pill, style: .continuous))
         }
-        .buttonStyle(.plain)
+        .pressable()
         .disabled(disabled || busy)
         .opacity(disabled ? 0.6 : 1)
     }
@@ -57,9 +91,10 @@ struct IconButton: View {
         Button(action: action) {
             Icon(name: icon, size: iconSize).foregroundStyle(tint)
                 .frame(width: size, height: size)
+                .hoverFill(Tok.fillSecondary, radius: 8)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .pressable()
     }
 }
 

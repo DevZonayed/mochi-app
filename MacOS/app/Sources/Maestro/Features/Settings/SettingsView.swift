@@ -23,9 +23,13 @@ struct SettingsView: View {
         HStack(spacing: 0) {
             nav
             ScrollView {
-                pane.frame(maxWidth: section == .skills ? .infinity : 640, alignment: .leading)
+                pane
+                    .id(section)
+                    .transition(.asymmetric(insertion: .opacity.combined(with: .offset(y: 8)), removal: .opacity))
+                    .frame(maxWidth: section == .skills ? .infinity : 640, alignment: .leading)
                     .padding(.horizontal, 32).padding(.vertical, 28).frame(maxWidth: .infinity, alignment: .leading)
             }
+            .animation(.smooth(duration: 0.24), value: section)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -35,7 +39,7 @@ struct SettingsView: View {
             Text("Settings").font(TokFont.display(TokFont.title2, .bold)).foregroundStyle(Tok.ink)
                 .padding(.horizontal, 10).padding(.bottom, 14)
             ForEach(Section.allCases) { s in
-                Button { section = s } label: {
+                Button { withAnimation(.smooth(duration: 0.22)) { section = s } } label: {
                     HStack(spacing: 11) {
                         Icon(name: s.icon, size: 15)
                             .foregroundStyle(section == s ? .white : s.tint)

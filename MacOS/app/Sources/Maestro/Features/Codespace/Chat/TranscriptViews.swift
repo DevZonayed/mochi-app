@@ -16,6 +16,28 @@ struct TurnView: View {
 
 struct UserBubble: View {
     let job: Job
+
+    /// Render `@/long/path/to/file.png` file mentions as compact `@file.png` chips (highlighted),
+    /// instead of dumping the raw path — à la Conductor.
+    static func mentionStyled(_ s: String) -> AttributedString {
+        var out = AttributedString()
+        let words = s.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+        for (i, w) in words.enumerated() {
+            if i > 0 { out += AttributedString(" ") }
+            if w.count > 1, w.hasPrefix("@") {
+                let path = String(w.dropFirst())
+                let name = path.contains("/") ? (path as NSString).lastPathComponent : path
+                var chip = AttributedString("@" + name)
+                chip.font = .system(size: 12.5, weight: .semibold)
+                chip.foregroundColor = .white
+                chip.backgroundColor = Color.white.opacity(0.22)
+                out += chip
+            } else {
+                out += AttributedString(w)
+            }
+        }
+        return out
+    }
     var body: some View {
         HStack {
             Spacer(minLength: 60)
@@ -30,7 +52,7 @@ struct UserBubble: View {
                         }
                     }
                 }
-                Text(job.input)
+                Text(Self.mentionStyled(job.input))
                     .font(TokFont.text(14)).foregroundStyle(.white)
                     .textSelection(.enabled)
                     .padding(.horizontal, 13).padding(.vertical, 9)
@@ -59,9 +81,20 @@ struct AssistantTurn: View {
                     if let m = job.model { Text(m).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary) }
                     if job.goal == true { badge("GOAL", Tok.purple) }
                 }
-                // blocks
-                ForEach(job.transcript ?? []) { item in
-                    TranscriptBlock(item: item, answerable: answerable && item.kind == "ask", onAnswer: onAnswer)
+                // blocks — while running, show everything live; once settled, collapse the
+                // tool/thinking "work" into a WorkBar and keep the prose/result.
+                let blocks = job.transcript ?? []
+                if job.isRunning {
+                    ForEach(blocks) { item in
+                        TranscriptBlock(item: item, answerable: answerable && item.kind == "ask", onAnswer: onAnswer)
+                    }
+                } else {
+                    let work = blocks.filter { $0.kind == "tool" || $0.kind == "thinking" }
+                    let content = blocks.filter { $0.kind != "tool" && $0.kind != "thinking" }
+                    if !work.isEmpty { WorkBar(work: work, durMs: job.transcript?.compactMap(\.durMs).reduce(0, +)) }
+                    ForEach(content) { item in
+                        TranscriptBlock(item: item, answerable: answerable && item.kind == "ask", onAnswer: onAnswer)
+                    }
                 }
 
                 // status / meta
@@ -109,6 +142,44 @@ struct AssistantTurn: View {
     }
 }
 
+/// Collapsed "Worked Ns · thought · N tools" summary for a settled turn — expands to reveal the
+/// tool/thinking work. Mirrors Conductor: the run log folds away once the response is done.
+struct WorkBar: View {
+    let work: [TranscriptItem]
+    var durMs: Double?
+    @State private var expanded = false
+
+    var body: some View {
+        let tools = work.filter { $0.kind == "tool" }.count
+        let thought = work.contains { $0.kind == "thinking" }
+        VStack(alignment: .leading, spacing: 6) {
+            Button { withAnimation(.smooth(duration: 0.2)) { expanded.toggle() } } label: {
+                HStack(spacing: 6) {
+                    Icon(name: "check", size: 11).foregroundStyle(Tok.green)
+                    Text(summary(tools: tools, thought: thought)).font(TokFont.text(TokFont.caption, .medium)).foregroundStyle(Tok.inkSecondary)
+                    Icon(name: expanded ? "chevronDown" : "chevronRight", size: 10).foregroundStyle(Tok.inkTertiary)
+                }
+                .padding(.horizontal, 9).padding(.vertical, 5)
+                .background(Tok.fillTertiary).clipShape(Capsule())
+            }.pressable()
+            if expanded {
+                VStack(alignment: .leading, spacing: 6) { ForEach(work) { TranscriptBlock(item: $0) } }
+                    .padding(.leading, 8).padding(.vertical, 2)
+                    .overlay(alignment: .leading) { Tok.separator.frame(width: Tok.hairline) }
+                    .transition(.opacity.combined(with: .offset(y: -4)))
+            }
+        }
+    }
+
+    private func summary(tools: Int, thought: Bool) -> String {
+        var parts: [String] = []
+        if let d = durMs, d > 0 { parts.append("Worked \(d < 1000 ? "\(Int(d))ms" : String(format: "%.0fs", d / 1000))") } else { parts.append("Worked") }
+        if thought { parts.append("thought") }
+        if tools > 0 { parts.append("\(tools) tool\(tools == 1 ? "" : "s")") }
+        return parts.joined(separator: " · ")
+    }
+}
+
 /// Renders a single transcript item by kind.
 struct TranscriptBlock: View {
     let item: TranscriptItem
@@ -120,13 +191,13 @@ struct TranscriptBlock: View {
 
     var body: some View {
         switch item.kind {
-        case "text", "result": markdown(item.text)
+        case "text", "result": MarkdownText(text: item.text)
         case "thinking": thinking
         case "tool": toolRow
         case "image": imageChip
         case "ask": answerable ? AnyView(questionCard) : AnyView(askCard)
         case "review": reviewCard
-        default: markdown(item.text)
+        default: MarkdownText(text: item.text)
         }
     }
 
@@ -174,14 +245,6 @@ struct TranscriptBlock: View {
     private func submitCustom() {
         let t = custom.trimmed; guard !t.isEmpty else { return }
         answered = t; onAnswer(t)
-    }
-
-    private func markdown(_ s: String) -> some View {
-        Text(attributed(s)).font(TokFont.text(14)).foregroundStyle(Tok.ink)
-            .textSelection(.enabled).lineSpacing(3).fixedSize(horizontal: false, vertical: true)
-    }
-    private func attributed(_ s: String) -> AttributedString {
-        (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
     }
 
     private var thinking: some View {

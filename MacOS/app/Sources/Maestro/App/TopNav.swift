@@ -9,9 +9,6 @@ struct TopNav: View {
     var body: some View {
         @Bindable var env = env
         HStack(spacing: 8) {
-            MaestroMark(size: 22)
-                .padding(.trailing, 2)
-
             HStack(spacing: 3) {
                 ForEach(Route.navBar) { r in
                     NavPill(route: r, active: env.route == r) { env.route = r }
@@ -20,13 +17,13 @@ struct TopNav: View {
 
             Spacer(minLength: 0)
 
-            tbIcon(scheme == .dark ? "sun" : "moon") { env.theme.toggle(current: scheme) }
+            tbIcon(scheme == .dark ? "sun" : "moon") { withAnimation(.smooth(duration: 0.35)) { env.theme.toggle(current: scheme) } }
             tbIcon("search") {}
             tbIcon("settings", active: env.route == .settings) { env.route = .settings }
         }
-        .padding(.leading, 80) // clear the traffic lights
-        .padding(.trailing, 14)
-        .frame(height: 46)
+        .padding(.leading, 76) // clear the traffic lights
+        .padding(.trailing, 10)
+        .frame(height: 40)
         .background(.ultraThinMaterial)
         .overlay(alignment: .bottom) {
             Tok.separator.frame(height: Tok.hairline)
@@ -35,14 +32,13 @@ struct TopNav: View {
 
     private func tbIcon(_ name: String, active: Bool = false, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Icon(name: name, size: 18)
+            Icon(name: name, size: 15)
                 .foregroundStyle(active ? Tok.ink : Tok.inkSecondary)
-                .frame(width: 34, height: 34)
-                .background(Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: Tok.Radius.icon, style: .continuous))
+                .frame(width: 28, height: 28)
+                .hoverFill(Tok.fillSecondary, radius: 7)
+                .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .contentShape(Rectangle())
+        .pressable()
     }
 }
 
@@ -54,22 +50,22 @@ struct NavPill: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: active ? 7 : 0) {
-                Icon(name: route.icon, size: 18, weight: active ? .semibold : .medium)
+            HStack(spacing: active ? 6 : 0) {
+                Icon(name: route.icon, size: 15, weight: active ? .semibold : .medium)
                 if active {
                     Text(route.label)
-                        .font(TokFont.text(TokFont.subhead, .semibold))
+                        .font(TokFont.text(TokFont.footnote, .semibold))
                         .fixedSize()
                 }
             }
             .foregroundStyle(active ? Color.white : Tok.inkSecondary)
-            .padding(.horizontal, active ? 12 : 0)
-            .frame(width: active ? nil : 34, height: active ? 32 : 34)
+            .padding(.horizontal, active ? 10 : 0)
+            .frame(width: active ? nil : 28, height: 28)
             .background(active ? Tok.blue : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: active ? Tok.Radius.pill : Tok.Radius.icon, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: active ? Tok.Radius.pill : 7, style: .continuous))
+            .hoverFill(active ? .clear : Tok.fillSecondary, radius: 7)
         }
-        .buttonStyle(.plain)
-        .contentShape(Rectangle())
+        .pressable()
         .animation(.spring(response: 0.32, dampingFraction: 0.82), value: active)
     }
 }
