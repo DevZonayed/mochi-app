@@ -240,6 +240,7 @@ struct ToolFileChip: View {
     var root: String?
     var preview: String? = nil
     var toolName: String? = nil
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
     /// Cap the path width so head-truncation engages even inside an unconstrained FlowLayout.
     var maxPathWidth: CGFloat = 260
     @State private var hovering = false
@@ -247,7 +248,7 @@ struct ToolFileChip: View {
     private var abs: String? { ToolViz.absolutePath(rel, root: root) }
 
     var body: some View {
-        Button { if let abs { FilePreviewWindowController.shared.open(path: abs) } } label: {
+        Button { if let abs { onOpenFile(abs) } } label: {
             HStack(spacing: 6) {
                 FileTypeIcon(name: rel)
                 Text(pathAttr).lineLimit(1).truncationMode(.head).frame(maxWidth: maxPathWidth, alignment: .leading)
@@ -288,6 +289,7 @@ struct ToolFileChip: View {
 struct ToolCallRow: View {
     let item: TranscriptItem
     var root: String?
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
     var projectRoot: String? { root }
     @State private var expanded = false
 
@@ -319,7 +321,7 @@ struct ToolCallRow: View {
 
             if expanded, let kids = item.children, !kids.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    ForEach(kids) { TranscriptBlock(item: $0, projectRoot: projectRoot) }
+                    ForEach(kids) { TranscriptBlock(item: $0, projectRoot: projectRoot, onOpenFile: onOpenFile) }
                     if let r = item.result, !r.isEmpty {
                         Text(r).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkSecondary)
                     }
@@ -345,7 +347,7 @@ struct ToolCallRow: View {
                         .font(TokFont.text(TokFont.footnote, .semibold))
                         .foregroundStyle(error ? Tok.red : Tok.ink)
                     if showFile {
-                        ToolFileChip(rel: detailText, root: projectRoot, preview: item.preview, toolName: item.name)
+                        ToolFileChip(rel: detailText, root: projectRoot, preview: item.preview, toolName: item.name, onOpenFile: onOpenFile)
                     } else if !detailText.isEmpty {
                         Text(detailText)
                             .font(d.mono && !hasCmd ? TokFont.mono(TokFont.footnote) : TokFont.text(TokFont.footnote))
@@ -406,6 +408,7 @@ struct WorkChipBar: View {
     let work: [TranscriptItem]
     var root: String?
     var limit: Int = 8
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
 
     private var chips: [(rel: String, item: TranscriptItem)] {
         var seen = Set<String>(); var out: [(String, TranscriptItem)] = []
@@ -424,7 +427,7 @@ struct WorkChipBar: View {
             let extra = all.count - shown.count
             FlowLayout(spacing: 6, lineSpacing: 6) {
                 ForEach(Array(shown.enumerated()), id: \.offset) { _, c in
-                    ToolFileChip(rel: c.rel, root: root, preview: c.item.preview, toolName: c.item.name)
+                    ToolFileChip(rel: c.rel, root: root, preview: c.item.preview, toolName: c.item.name, onOpenFile: onOpenFile)
                 }
                 if extra > 0 {
                     Text("+\(extra) more").font(TokFont.text(TokFont.caption, .medium)).foregroundStyle(Tok.inkTertiary)

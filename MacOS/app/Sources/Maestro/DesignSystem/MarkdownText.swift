@@ -23,6 +23,7 @@ struct MarkdownText: View {
         case code(String, lang: String?)
         case bullets([String])
         case ordered([String])
+        case table(headers: [String], rows: [[String]])
         case quote(String)
         case rule
     }
@@ -60,6 +61,43 @@ struct MarkdownText: View {
                     }
                 }
             }
+        case .table(let headers, let rows):
+            VStack(alignment: .leading, spacing: 0) {
+                Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+                    GridRow {
+                        ForEach(Array(headers.enumerated()), id: \.offset) { _, cell in
+                            Text(Self.inline(cell))
+                                .font(TokFont.text(TokFont.caption, .semibold))
+                                .foregroundStyle(Tok.ink)
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 7)
+                                .background(Tok.fillTertiary)
+                        }
+                    }
+                    ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                        GridRow {
+                            ForEach(0..<headers.count, id: \.self) { col in
+                                Text(Self.inline(col < row.count ? row[col] : ""))
+                                    .font(TokFont.text(13))
+                                    .foregroundStyle(Tok.inkBody)
+                                    .lineSpacing(2)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 7)
+                                    .background(rowIndex.isMultiple(of: 2) ? Color.clear : Tok.fillTertiary.opacity(0.52))
+                            }
+                        }
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+            .padding(.vertical, 2)
         case .quote(let t):
             Text(Self.inline(t)).font(TokFont.text(14)).foregroundStyle(Tok.inkSecondary)
                 .padding(.leading, 10).overlay(alignment: .leading) { Tok.separatorStrong.frame(width: 2.5) }
@@ -98,6 +136,18 @@ struct MarkdownText: View {
                 while i < lines.count, !lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("```") { code.append(lines[i]); i += 1 }
                 blocks.append(.code(code.joined(separator: "\n"), lang: lang.isEmpty ? nil : lang)); i += 1; continue
             }
+            if i + 1 < lines.count, isTableRow(trimmed), isTableSeparator(lines[i + 1].trimmingCharacters(in: .whitespaces)) {
+                flushAll()
+                let headers = tableCells(trimmed)
+                i += 2
+                var rows: [[String]] = []
+                while i < lines.count, isTableRow(lines[i].trimmingCharacters(in: .whitespaces)) {
+                    rows.append(tableCells(lines[i].trimmingCharacters(in: .whitespaces)))
+                    i += 1
+                }
+                if !headers.isEmpty { blocks.append(.table(headers: headers, rows: rows)) }
+                continue
+            }
             if let m = headingMatch(trimmed) { flushAll(); blocks.append(.heading(level: m.0, text: m.1)); i += 1; continue }
             if trimmed == "---" || trimmed == "***" || trimmed == "___" { flushAll(); blocks.append(.rule); i += 1; continue }
             if trimmed.hasPrefix("> ") { flushPara(); flushLists(); blocks.append(.quote(String(trimmed.dropFirst(2)))); i += 1; continue }
@@ -124,6 +174,23 @@ struct MarkdownText: View {
         guard let dot = s.firstIndex(of: "."), s[s.startIndex..<dot].allSatisfy(\.isNumber), !s[s.startIndex..<dot].isEmpty,
               s.index(after: dot) < s.endIndex, s[s.index(after: dot)] == " " else { return nil }
         return String(s[s.index(dot, offsetBy: 2)...])
+    }
+    private static func isTableRow(_ s: String) -> Bool {
+        s.contains("|") && tableCells(s).count > 1
+    }
+    private static func isTableSeparator(_ s: String) -> Bool {
+        let cells = tableCells(s)
+        return cells.count > 1 && cells.allSatisfy { cell in
+            let stripped = cell.replacingOccurrences(of: ":", with: "")
+            return stripped.count >= 3 && stripped.allSatisfy { $0 == "-" }
+        }
+    }
+    private static func tableCells(_ s: String) -> [String] {
+        var body = s.trimmingCharacters(in: .whitespaces)
+        if body.hasPrefix("|") { body.removeFirst() }
+        if body.hasSuffix("|") { body.removeLast() }
+        return body.split(separator: "|", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
     }
 
     /// Inline markdown (bold/italic/`code`/links) → AttributedString, with `code` runs styled.

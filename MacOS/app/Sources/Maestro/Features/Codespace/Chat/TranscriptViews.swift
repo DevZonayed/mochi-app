@@ -7,16 +7,18 @@ struct TurnView: View {
     var projectRoot: String? = nil
     var answerable = false
     var onAnswer: (String) -> Void = { _ in }
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            UserBubble(job: job)
-            AssistantTurn(job: job, projectRoot: projectRoot, answerable: answerable, onAnswer: onAnswer)
+            UserBubble(job: job, onOpenFile: onOpenFile)
+            AssistantTurn(job: job, projectRoot: projectRoot, answerable: answerable, onAnswer: onAnswer, onOpenFile: onOpenFile)
         }
     }
 }
 
 struct UserBubble: View {
     let job: Job
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
 
     /// Render `@/long/path/to/file.png` file mentions as compact `@file.png` chips (highlighted),
     /// instead of dumping the raw path — à la Conductor.
@@ -46,10 +48,7 @@ struct UserBubble: View {
                 if let imgs = job.inputImages, !imgs.isEmpty {
                     HStack(spacing: 6) {
                         ForEach(Array(imgs.enumerated()), id: \.offset) { _, ref in
-                            if let p = ref.imagePath, let img = NSImage(contentsOfFile: p) {
-                                Image(nsImage: img).resizable().scaledToFill().frame(width: 96, height: 96)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            }
+                            UserAttachmentChip(ref: ref, onOpenFile: onOpenFile)
                         }
                     }
                 }
@@ -67,11 +66,59 @@ struct UserBubble: View {
     }
 }
 
+struct UserAttachmentChip: View {
+    let ref: ChatImageRef
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
+    @State private var hovering = false
+
+    private var title: String {
+        ref.name ?? ref.imagePath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "image"
+    }
+
+    var body: some View {
+        Button {
+            if let p = ref.imagePath { onOpenFile(p) }
+        } label: {
+            HStack(spacing: 7) {
+                if let p = ref.imagePath, let img = NSImage(contentsOfFile: p) {
+                    Image(nsImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 28, height: 28)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                } else {
+                    Image(systemName: "photo")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Tok.green)
+                        .frame(width: 28, height: 28)
+                        .background(Tok.green.opacity(0.18))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                Text(title)
+                    .font(TokFont.text(TokFont.footnote, .medium))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+            }
+            .padding(.leading, 4)
+            .padding(.trailing, 9)
+            .padding(.vertical, 4)
+            .background(Color.white.opacity(hovering ? 0.28 : 0.20))
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Color.white.opacity(0.18), lineWidth: Tok.hairline))
+        }
+        .buttonStyle(.plain)
+        .disabled(ref.imagePath == nil)
+        .onHover { hovering = $0 }
+        .help(ref.imagePath ?? title)
+    }
+}
+
 struct AssistantTurn: View {
     let job: Job
     var projectRoot: String? = nil
     var answerable = false
     var onAnswer: (String) -> Void = { _ in }
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Circle().fill(Tok.purple.opacity(0.16)).frame(width: 30, height: 30)
@@ -88,14 +135,14 @@ struct AssistantTurn: View {
                 let blocks = job.transcript ?? []
                 if job.isRunning {
                     ForEach(blocks) { item in
-                        TranscriptBlock(item: item, projectRoot: projectRoot, answerable: answerable && item.kind == "ask", onAnswer: onAnswer)
+                        TranscriptBlock(item: item, projectRoot: projectRoot, answerable: answerable && item.kind == "ask", onAnswer: onAnswer, onOpenFile: onOpenFile)
                     }
                 } else {
                     let work = blocks.filter { $0.kind == "tool" || $0.kind == "thinking" }
                     let content = blocks.filter { $0.kind != "tool" && $0.kind != "thinking" }
-                    if !work.isEmpty { WorkBar(work: work, durMs: job.transcript?.compactMap(\.durMs).reduce(0, +), projectRoot: projectRoot) }
+                    if !work.isEmpty { WorkBar(work: work, durMs: job.transcript?.compactMap(\.durMs).reduce(0, +), projectRoot: projectRoot, onOpenFile: onOpenFile) }
                     ForEach(content) { item in
-                        TranscriptBlock(item: item, projectRoot: projectRoot, answerable: answerable && item.kind == "ask", onAnswer: onAnswer)
+                        TranscriptBlock(item: item, projectRoot: projectRoot, answerable: answerable && item.kind == "ask", onAnswer: onAnswer, onOpenFile: onOpenFile)
                     }
                 }
 
@@ -150,6 +197,7 @@ struct WorkBar: View {
     let work: [TranscriptItem]
     var durMs: Double?
     var projectRoot: String? = nil
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
     @State private var expanded = false
 
     var body: some View {
@@ -167,13 +215,13 @@ struct WorkBar: View {
                 .overlay(Capsule().strokeBorder(Tok.separator, lineWidth: Tok.hairline))
             }.pressable()
             if expanded {
-                VStack(alignment: .leading, spacing: 6) { ForEach(work) { TranscriptBlock(item: $0, projectRoot: projectRoot) } }
+                VStack(alignment: .leading, spacing: 6) { ForEach(work) { TranscriptBlock(item: $0, projectRoot: projectRoot, onOpenFile: onOpenFile) } }
                     .padding(.leading, 8).padding(.vertical, 2)
                     .overlay(alignment: .leading) { Tok.separator.frame(width: Tok.hairline) }
                     .transition(.opacity.combined(with: .offset(y: -4)))
             } else {
                 // The artifacts at a glance — touched files as Conductor-style chips (click to preview).
-                WorkChipBar(work: work, root: projectRoot)
+                WorkChipBar(work: work, root: projectRoot, onOpenFile: onOpenFile)
             }
         }
     }
@@ -193,6 +241,7 @@ struct TranscriptBlock: View {
     var projectRoot: String? = nil
     var answerable = false
     var onAnswer: (String) -> Void = { _ in }
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
     @State private var expanded = false
     @State private var answered: String?
     @State private var custom = ""
@@ -201,7 +250,7 @@ struct TranscriptBlock: View {
         switch item.kind {
         case "text", "result": MarkdownText(text: item.text)
         case "thinking": thinking
-        case "tool": ToolCallRow(item: item, root: projectRoot)
+        case "tool": ToolCallRow(item: item, root: projectRoot, onOpenFile: onOpenFile)
         case "image": imageChip
         case "ask": answerable ? AnyView(questionCard) : AnyView(askCard)
         case "review": reviewCard
@@ -278,11 +327,30 @@ struct TranscriptBlock: View {
         // (no relay/assetImage round-trip needed).
         Group {
             if let path = item.imagePath, let img = NSImage(contentsOfFile: path) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Image(nsImage: img).resizable().scaledToFit()
-                        .frame(maxWidth: 360, maxHeight: 360)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+                VStack(alignment: .leading, spacing: 7) {
+                    Button { onOpenFile(path) } label: {
+                        ZStack(alignment: .bottomLeading) {
+                            Image(nsImage: img).resizable().scaledToFit()
+                                .frame(maxWidth: 420, maxHeight: 420)
+                                .background(Tok.fillTertiary)
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+                            HStack(spacing: 6) {
+                                Image(systemName: "photo")
+                                    .font(.system(size: 11.5, weight: .semibold))
+                                Text(URL(fileURLWithPath: path).lastPathComponent)
+                                    .font(TokFont.text(TokFont.caption, .semibold))
+                                    .lineLimit(1)
+                            }
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(.black.opacity(0.46))
+                            .clipShape(Capsule())
+                            .padding(8)
+                        }
+                    }
+                    .buttonStyle(.plain)
                     if let alt = item.alt, !alt.isEmpty {
                         Text(alt).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(2)
                     }

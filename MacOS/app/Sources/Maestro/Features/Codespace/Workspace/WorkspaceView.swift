@@ -80,7 +80,14 @@ struct WorkspaceView: View {
         let on = store.activeKey == tab.id
         let tint = ProjectColor.template(store.project(tab.projectId)?.kind)
         return HStack(spacing: 6) {
-            Icon(name: tab.kind == .project ? "folder" : "chat", size: 12).foregroundStyle(tint)
+            if tab.kind == .file {
+                Image(systemName: ToolViz.fileSymbol(tab.title))
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(ToolViz.extColor(tab.title))
+                    .frame(width: 12, height: 12)
+            } else {
+                Icon(name: tab.kind == .project ? "folder" : "chat", size: 12).foregroundStyle(tint)
+            }
             Text(tab.title).font(TokFont.text(TokFont.caption, on ? .semibold : .medium))
                 .foregroundStyle(on ? Tok.ink : Tok.inkSecondary).lineLimit(1)
             Button { store.closeTab(tab.id) } label: { Icon(name: "x", size: 10, weight: .bold).foregroundStyle(Tok.inkTertiary).frame(width: 16, height: 16).hoverFill(Tok.fillSecondary, radius: 5) }.pressable()
@@ -101,14 +108,20 @@ struct WorkspaceView: View {
             Tok.bgElevated
             ForEach(store.tabs.filter { $0.kind == .chat && $0.projectId == store.activeProjectId }) { tab in
                 ChatThread(projectId: tab.projectId, projectName: store.project(tab.projectId)?.name ?? "",
-                           sessionId: sessionBinding(store, tab), flush: true,
-                           onSessionCreated: { store.bindCreatedSession(tabKey: tab.id, session: $0) })
+                           sessionId: sessionBinding(store, tab), flush: true, active: store.activeKey == tab.id,
+                           onSessionCreated: { store.bindCreatedSession(tabKey: tab.id, session: $0) },
+                           onOpenFile: { store.openFile($0, projectId: tab.projectId) })
                     .opacity(store.activeKey == tab.id ? 1 : 0)
                     .allowsHitTesting(store.activeKey == tab.id)
             }
             if let t = store.activeTab, t.kind == .project, let p = store.project(t.projectId) {
                 ProjectPanel(project: p, section: sectionBinding(store, t), onClose: { store.closeTab(t.id) })
                     .background(Tok.bg)
+                    .transition(.opacity)
+            }
+            if let t = store.activeTab, t.kind == .file, let p = t.filePath {
+                FilePreviewWindow(url: URL(fileURLWithPath: p))
+                    .background(Tok.bgElevated)
                     .transition(.opacity)
             }
             if store.activeTab == nil { emptyState(store).transition(.opacity) }

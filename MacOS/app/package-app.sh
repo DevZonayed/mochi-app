@@ -7,12 +7,27 @@ set -euo pipefail
 
 CONFIG="${1:-release}"
 APP_NAME="Maestro"
+VERSION="${MAESTRO_VERSION:-0.1.28}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT/.build/$CONFIG"
 OUT="$ROOT/dist"
 APP="$OUT/$APP_NAME.app"
 
-echo "▸ swift build -c $CONFIG"
+resolve_path() {
+  local target="$1"
+  local dir
+
+  while [ -L "$target" ]; do
+    dir="$(cd "$(dirname "$target")" && pwd -P)"
+    target="$(readlink "$target")"
+    [[ "$target" = /* ]] || target="$dir/$target"
+  done
+
+  dir="$(cd "$(dirname "$target")" && pwd -P)"
+  printf '%s/%s\n' "$dir" "$(basename "$target")"
+}
+
+echo "▸ swift build -c $CONFIG (version $VERSION)"
 swift build -c "$CONFIG" --package-path "$ROOT"
 
 echo "▸ assembling $APP"
@@ -30,8 +45,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>cloud.nexalance.maestro</string>
   <key>CFBundleExecutable</key><string>$APP_NAME</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.28</string>
-  <key>CFBundleVersion</key><string>0.1.28</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -52,7 +67,7 @@ mkdir -p "$RES_SC/bin" "$RES_SC/node_modules"
 cp "$SIDECAR/dist/maestro-sidecar.mjs" "$RES_SC/maestro-sidecar.mjs"
 
 echo "▸ embedding node runtime"
-REAL_NODE="$(readlink -f "$(command -v node)")"
+REAL_NODE="$(resolve_path "$(command -v node)")"
 NODE_SZ=$(stat -f%z "$REAL_NODE" 2>/dev/null || echo 0)
 if [ "$NODE_SZ" -gt 5000000 ]; then
   cp "$REAL_NODE" "$RES_SC/bin/node" && chmod +x "$RES_SC/bin/node"
@@ -61,6 +76,10 @@ else
   echo "  ⚠ system node is a relocated/wrapper binary ($((NODE_SZ/1024))K), not embeddable."
   echo "    Ship the official Node binary from nodejs.org/dist (~90MB) here, OR fetch it on"
   echo "    first run into userData (like the Claude/Codex engines). Dev uses the system node."
+  if [ "${MAESTRO_REQUIRE_EMBEDDED_NODE:-0}" = "1" ]; then
+    echo "    MAESTRO_REQUIRE_EMBEDDED_NODE=1 is set; refusing to publish a non-self-contained app."
+    exit 1
+  fi
 fi
 
 echo "▸ embedding externalized native deps"

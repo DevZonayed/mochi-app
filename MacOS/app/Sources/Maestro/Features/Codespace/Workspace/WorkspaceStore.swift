@@ -3,13 +3,14 @@ import Observation
 
 /// One open tab in the CodeSpace workspace — a chat, or a project hub (settings/instructions/…).
 struct WorkTab: Identifiable, Hashable {
-    enum Kind: Hashable { case chat, project }
+    enum Kind: Hashable { case chat, project, file }
     let id: String                 // stable key
     var projectId: String
     var sessionId: String?         // chat tab: the session (nil = a fresh, not-yet-created chat)
     var title: String
     var kind: Kind
     var section: ProjectSection?   // project tab: which hub section
+    var filePath: String?          // file tab: absolute path shown in the preview pane
 }
 
 enum ProjectSection: String, CaseIterable { case instructions = "Instructions", skills = "Skills & tools", settings = "Settings" }
@@ -125,20 +126,34 @@ final class WorkspaceStore {
     func openChat(_ s: ChatSession) {
         activeProjectId = s.projectId
         if let existing = tabs.first(where: { $0.sessionId == s.id }) { activeKey = existing.id; return }
-        let tab = WorkTab(id: "chat:\(s.id)", projectId: s.projectId ?? "", sessionId: s.id, title: s.displayTitle, kind: .chat, section: nil)
+        let tab = WorkTab(id: "chat:\(s.id)", projectId: s.projectId ?? "", sessionId: s.id, title: s.displayTitle, kind: .chat, section: nil, filePath: nil)
         tabs.append(tab); activeKey = tab.id
     }
     func newChat(_ pid: String) {
         guard !pid.isEmpty else { return }
         activeProjectId = pid
-        let tab = WorkTab(id: "new:\(pid):\(tabs.count)", projectId: pid, sessionId: nil, title: "New chat", kind: .chat, section: nil)
+        let tab = WorkTab(id: "new:\(pid):\(tabs.count)", projectId: pid, sessionId: nil, title: "New chat", kind: .chat, section: nil, filePath: nil)
         tabs.append(tab); activeKey = tab.id
     }
     func openProjectPanel(_ pid: String, _ section: ProjectSection) {
         activeProjectId = pid
         let key = "project:\(pid)"
         if let i = tabs.firstIndex(where: { $0.id == key }) { tabs[i].section = section; activeKey = key; return }
-        let tab = WorkTab(id: key, projectId: pid, sessionId: nil, title: project(pid)?.name ?? "Project", kind: .project, section: section)
+        let tab = WorkTab(id: key, projectId: pid, sessionId: nil, title: project(pid)?.name ?? "Project", kind: .project, section: section, filePath: nil)
+        tabs.append(tab); activeKey = key
+    }
+    func openFile(_ path: String, projectId pid: String? = nil) {
+        let abs = path.hasPrefix("~") ? (path as NSString).expandingTildeInPath : path
+        guard abs.hasPrefix("/") else { return }
+        let key = "file:\(abs)"
+        if let existing = tabs.first(where: { $0.id == key }) {
+            activeProjectId = existing.projectId
+            activeKey = key
+            return
+        }
+        let owner = pid ?? activeProjectId ?? projects.first?.id ?? "files"
+        activeProjectId = owner
+        let tab = WorkTab(id: key, projectId: owner, sessionId: nil, title: URL(fileURLWithPath: abs).lastPathComponent, kind: .file, section: nil, filePath: abs)
         tabs.append(tab); activeKey = key
     }
     func closeTab(_ key: String) {

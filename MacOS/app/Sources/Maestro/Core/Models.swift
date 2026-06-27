@@ -178,6 +178,21 @@ struct RemoteDevice: Codable, Identifiable, Hashable {
     var id: String; var name: String?; var live: Bool?; var lastSeen: Double?
 }
 struct PairingResult: Codable { var token: String?; var relayUrl: String?; var devices: [RemoteDevice]? }
+struct AccountDevice: Codable, Identifiable, Hashable {
+    var id: String
+    var role: String
+    var name: String?
+    var platform: String?
+    var deckId: String?
+    var online: Bool
+    var lastSeen: Double?
+}
+struct AccountStatus: Codable, Hashable {
+    var signedIn: Bool
+    var deviceId: String?
+    var serverUrl: String?
+    var devices: [AccountDevice]?
+}
 struct ExtensionPeer: Codable, Identifiable, Hashable {
     var clientId: String?; var name: String?; var active: Bool?
     var id: String { clientId ?? name ?? UUID().uuidString }

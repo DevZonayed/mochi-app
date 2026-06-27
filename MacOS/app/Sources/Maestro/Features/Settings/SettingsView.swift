@@ -135,33 +135,62 @@ struct EnginesPane: View {
 // MARK: - Devices
 struct DevicesPane: View {
     @Environment(AppEnv.self) private var env
-    @State private var devices: [RemoteDevice] = []
+    @State private var status = AccountStatus(signedIn: false, deviceId: nil, serverUrl: nil, devices: [])
+    @State private var email = ""
+    @State private var password = ""
+    @State private var name = ""
+    @State private var register = false
+    @State private var busy = false
+    @State private var error: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             PaneHead(title: "Devices", sub: "This Mac is the brain; phones and web are remotes.")
-            GroupedList(header: "This Mac") {
+            if status.signedIn {
+                signedInView
+            } else {
+                signInView
+            }
+        }
+        .task { await refresh() }
+    }
+
+    private var signedInView: some View {
+        let hosts = (status.devices ?? []).filter { $0.role == "host" }
+        let remotes = (status.devices ?? []).filter { $0.role != "host" }
+        let thisMac = hosts.first { $0.id == status.deviceId } ?? hosts.first
+        return VStack(alignment: .leading, spacing: 22) {
+            HStack(spacing: 8) {
+                PillButton(title: busy ? "Refreshing..." : "Refresh", kind: .quiet, busy: busy) { Task { await refresh() } }
+                PillButton(title: "Sign out", kind: .plain) { Task { await signOut() } }
+            }
+            GroupedList(header: "This Mac", footer: status.serverUrl.map { "Account server: \($0)" }) {
                 GLRow(last: true) {
-                    Icon(name: "cpu", size: 18).foregroundStyle(Tok.green).frame(width: 36, height: 36).background(Tok.green.opacity(0.14)).clipShape(RoundedRectangle(cornerRadius: 9))
+                    let online = thisMac?.online == true
+                    Icon(name: "cpu", size: 18).foregroundStyle(online ? Tok.green : Tok.red).frame(width: 36, height: 36).background((online ? Tok.green : Tok.red).opacity(0.14)).clipShape(RoundedRectangle(cornerRadius: 9))
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(Host.current().localizedName ?? "This Mac").font(TokFont.text(TokFont.callout, .semibold)).foregroundStyle(Tok.ink)
-                        Text("macOS · host · online").font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.green)
+                        Text(thisMac?.name ?? Host.current().localizedName ?? "This Mac").font(TokFont.text(TokFont.callout, .semibold)).foregroundStyle(Tok.ink)
+                        Text(online ? "macOS · host · online on mobile" : "macOS · host · offline on mobile")
+                            .font(TokFont.text(TokFont.caption)).foregroundStyle(online ? Tok.green : Tok.red)
+                        if let id = status.deviceId {
+                            Text(id).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(1).truncationMode(.middle)
+                        }
                     }
                     Spacer()
                 }
             }
             GroupedList(header: "Your remotes") {
-                if devices.isEmpty {
-                    Text("No remotes paired. Pair a phone from the mobile app.").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary)
+                if remotes.isEmpty {
+                    Text("No remotes signed in yet. Open the mobile app with this same account.").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary)
                         .padding(.horizontal, 14).padding(.vertical, 14).frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    ForEach(Array(devices.enumerated()), id: \.element.id) { i, d in
-                        GLRow(last: i == devices.count - 1) {
-                            Icon(name: "smartphone", size: 18).foregroundStyle(d.live == true ? Tok.teal : Tok.inkTertiary)
+                    ForEach(Array(remotes.enumerated()), id: \.element.id) { i, d in
+                        GLRow(last: i == remotes.count - 1) {
+                            Icon(name: "smartphone", size: 18).foregroundStyle(d.online ? Tok.teal : Tok.inkTertiary)
                                 .frame(width: 36, height: 36).background(Tok.fillTertiary).clipShape(RoundedRectangle(cornerRadius: 9))
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(d.name ?? "Remote").font(TokFont.text(TokFont.callout, .semibold)).foregroundStyle(Tok.ink)
-                                Text(d.live == true ? "online now" : "last seen \(RelTime.ago(d.lastSeen))").font(TokFont.text(TokFont.caption)).foregroundStyle(d.live == true ? Tok.green : Tok.inkTertiary)
+                                Text(d.online ? "online now" : "last seen \(RelTime.ago(d.lastSeen))").font(TokFont.text(TokFont.caption)).foregroundStyle(d.online ? Tok.green : Tok.inkTertiary)
                             }
                             Spacer()
                         }
@@ -169,7 +198,54 @@ struct DevicesPane: View {
                 }
             }
         }
-        .task { devices = (try? await env.client.call("getPairing", as: PairingResult.self))?.devices ?? [] }
+    }
+
+    private var signInView: some View {
+        GroupedList(header: register ? "Create account" : "Sign in", footer: "Use the same Maestro account on mobile. The Mac will appear online there after this connects.") {
+            if register {
+                GLRow(last: false) {
+                    TextField("Name", text: $name).textFieldStyle(.plain).font(TokFont.text(TokFont.footnote)).inputBox()
+                }
+            }
+            GLRow(last: false) {
+                TextField("Email", text: $email).textFieldStyle(.plain).font(TokFont.text(TokFont.footnote)).inputBox()
+            }
+            GLRow(last: false) {
+                SecureField("Password", text: $password).textFieldStyle(.plain).font(TokFont.text(TokFont.footnote)).inputBox()
+            }
+            GLRow(last: true) {
+                if let error {
+                    Text(error).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.red).lineLimit(2)
+                }
+                Spacer()
+                Button(register ? "Have an account?" : "Create account") { register.toggle(); error = nil }
+                    .buttonStyle(.plain).font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.inkSecondary)
+                PillButton(title: busy ? "Connecting..." : (register ? "Create" : "Sign in"), kind: .primary, disabled: email.trimmed.isEmpty || password.isEmpty, busy: busy) {
+                    Task { await submitAuth() }
+                }
+            }
+        }
+    }
+
+    private func refresh() async {
+        busy = true; defer { busy = false }
+        do { status = try await env.client.call("accountStatus", as: AccountStatus.self); error = nil }
+        catch { self.error = error.localizedDescription }
+    }
+
+    private func submitAuth() async {
+        busy = true; defer { busy = false }
+        do {
+            let method = register ? "accountSignUp" : "accountSignIn"
+            status = try await env.client.call(method, ["name": name, "email": email, "password": password], as: AccountStatus.self)
+            password = ""; error = nil
+        } catch { self.error = error.localizedDescription }
+    }
+
+    private func signOut() async {
+        busy = true; defer { busy = false }
+        do { status = try await env.client.call("accountSignOut", as: AccountStatus.self); error = nil }
+        catch { self.error = error.localizedDescription }
     }
 }
 

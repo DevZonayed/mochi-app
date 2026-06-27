@@ -20,7 +20,12 @@ struct QuickLookPreview: NSViewRepresentable {
         if (nsView.previewItem as? URL) != url { nsView.previewItem = url as QLPreviewItem }
     }
 
-    static func dismantleNSView(_ nsView: QLPreviewView, coordinator: ()) { nsView.close() }
+    static func dismantleNSView(_ nsView: QLPreviewView, coordinator: ()) {
+        // `close()` can call through QuickLook's deactivate path while SwiftUI is already tearing
+        // the host down, which trips a private QL assertion on macOS 26. Let AppKit release the
+        // view naturally after clearing the item instead.
+        nsView.previewItem = nil
+    }
 }
 
 /// File status so a folder / missing path renders a graceful message instead of an empty preview.
