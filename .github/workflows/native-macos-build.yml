@@ -2,11 +2,6 @@ name: Build native macOS app
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Bundle version written into Maestro.app"
-        required: true
-        default: "0.1.28"
 
 permissions:
   contents: read
@@ -18,25 +13,29 @@ concurrency:
 jobs:
   build:
     name: Build downloadable Maestro.app
-    runs-on: macos-14
+    runs-on: macos-15
     env:
-      MAESTRO_VERSION: ${{ inputs.version }}
       MAESTRO_REQUIRE_EMBEDDED_NODE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - id: version
+        name: Compute build version
+        run: node .github/scripts/next-native-version.mjs
+
       - name: Show toolchain
         run: |
+          echo "MAESTRO_VERSION=${{ steps.version.outputs.version }}"
           node --version
           pnpm --version
           swift --version
@@ -44,11 +43,15 @@ jobs:
           uname -m
 
       - name: Build production app bundle
+        env:
+          MAESTRO_VERSION: ${{ steps.version.outputs.version }}
         run: |
           chmod +x MacOS/app/package-app.sh
           MacOS/app/package-app.sh release
 
       - name: Zip app bundle
+        env:
+          MAESTRO_VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p artifacts
           SHORT_SHA="${GITHUB_SHA::7}"
@@ -58,9 +61,9 @@ jobs:
           ls -lh artifacts
 
       - name: Upload downloadable build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: Maestro-macOS-${{ inputs.version }}-${{ github.run_number }}
+          name: Maestro-macOS-${{ steps.version.outputs.version }}-${{ github.run_number }}
           path: artifacts/*
           if-no-files-found: error
           retention-days: 30
