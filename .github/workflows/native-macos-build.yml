@@ -1,0 +1,66 @@
+name: Build native macOS app
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Bundle version written into Maestro.app"
+        required: true
+        default: "0.1.28"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-macos-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build downloadable Maestro.app
+    runs-on: macos-14
+    env:
+      MAESTRO_VERSION: ${{ inputs.version }}
+      MAESTRO_REQUIRE_EMBEDDED_NODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Show toolchain
+        run: |
+          node --version
+          pnpm --version
+          swift --version
+          xcodebuild -version
+          uname -m
+
+      - name: Build production app bundle
+        run: |
+          chmod +x MacOS/app/package-app.sh
+          MacOS/app/package-app.sh release
+
+      - name: Zip app bundle
+        run: |
+          mkdir -p artifacts
+          SHORT_SHA="${GITHUB_SHA::7}"
+          ZIP="artifacts/Maestro-macOS-${MAESTRO_VERSION}-${SHORT_SHA}.zip"
+          ditto -c -k --keepParent MacOS/app/dist/Maestro.app "$ZIP"
+          shasum -a 256 "$ZIP" > "$ZIP.sha256"
+          ls -lh artifacts
+
+      - name: Upload downloadable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Maestro-macOS-${{ inputs.version }}-${{ github.run_number }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
