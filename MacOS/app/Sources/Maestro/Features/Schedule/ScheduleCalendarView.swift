@@ -1,226 +1,192 @@
 import SwiftUI
 
-/// The calendar mode of the Schedule screen: a Monday-first week grid with hour rows, schedule
-/// chips placed at their fire time, a live red now-line, and an interval banner (recurring
-/// every-N-hours schedules have no single time slot, so they ride above the grid).
+/// The calendar mode of the Scheduler: the current Mon–Sun week with an hour grid, schedule chips
+/// placed at their fire time (colored by project), a live red now-line, and an honest empty state.
+/// Mirrors Scheduler.tsx CalendarView (no week navigation — always the current week).
 struct ScheduleCalendarView: View {
     let store: ScheduleStore
+    let projMeta: [String: SchedProjMeta]
     let onEdit: (Schedule) -> Void
-    @State private var weekOffset = 0
 
-    private let rowH: CGFloat = 46
-    private let gutterW: CGFloat = 46
+    private let rowH: CGFloat = 48
+    private let gutterW: CGFloat = 56
+
+    private struct Occ: Identifiable { let id: String; let schedule: Schedule; let col: Int; let hour: Double }
 
     var body: some View {
         let cal = Calendar.current
-        let days = weekDays(offset: weekOffset, cal: cal)
-        let (minH, maxH) = hourRange(days: days, cal: cal)
+        let (days, todayIdx, _) = week(cal)
+        let occ = occurrences(days: days, cal: cal)
+        let (gridStart, gridEnd) = hourRange(occ)
+        let hours = Array(gridStart...gridEnd)
+
         VStack(spacing: 0) {
-            header(days: days, cal: cal)
+            dayHeader(days: days, todayIdx: todayIdx, cal: cal)
             Divider().overlay(Tok.separator)
             ScrollView {
-                HStack(alignment: .top, spacing: 0) {
-                    gutter(minH: minH, maxH: maxH)
-                    ForEach(days, id: \.self) { day in
-                        dayColumn(day: day, minH: minH, maxH: maxH, cal: cal)
-                    }
+                TimelineView(.periodic(from: .now, by: 30)) { ctx in
+                    grid(hours: hours, gridStart: gridStart, occ: occ, todayIdx: todayIdx, now: ctx.date, cal: cal)
                 }
-                .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 24)
             }
+            .overlay { if occ.isEmpty { emptyOverlay } }
         }
+        .background(Tok.bgElevated)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+        .padding(.bottom, 24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: Header
-
-    private func header(days: [Date], cal: Calendar) -> some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 10) {
-                navBtn(flip: true) { weekOffset -= 1 }
-                Text(rangeLabel(days)).font(TokFont.text(TokFont.subhead, .semibold)).foregroundStyle(Tok.ink)
-                navBtn(flip: false) { weekOffset += 1 }
-                if weekOffset != 0 {
-                    Button("Today") { weekOffset = 0 }
-                        .buttonStyle(.plain).font(TokFont.text(TokFont.footnote, .semibold)).foregroundStyle(Tok.blue)
+    // MARK: Day header
+    private func dayHeader(days: [Date], todayIdx: Int, cal: Calendar) -> some View {
+        HStack(spacing: 0) {
+            Color.clear.frame(width: gutterW)
+            ForEach(Array(days.enumerated()), id: \.offset) { i, day in
+                let today = i == todayIdx
+                VStack(spacing: 6) {
+                    Text(day.formatted(.dateTime.weekday(.abbreviated)).uppercased())
+                        .font(TokFont.text(TokFont.caption, .semibold)).tracking(0.4)
+                        .foregroundStyle(today ? Tok.red : Tok.inkTertiary)
+                    Text(day.formatted(.dateTime.day()))
+                        .font(TokFont.text(TokFont.callout, today ? .bold : .semibold))
+                        .foregroundStyle(today ? .white : Tok.ink)
+                        .frame(width: 28, height: 28).background(today ? Tok.red : .clear).clipShape(Circle())
                 }
-                Spacer()
-                intervalBanner
-            }
-            HStack(spacing: 0) {
-                Color.clear.frame(width: gutterW)
-                ForEach(days, id: \.self) { day in dayHeader(day, cal: cal) }
-            }
-        }
-        .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 8)
-    }
-
-    private func navBtn(flip: Bool, _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Icon(name: "chevronRight", size: 13).rotationEffect(.degrees(flip ? 180 : 0))
-                .foregroundStyle(Tok.inkSecondary).frame(width: 26, height: 26)
-                .hoverFill(Tok.fillSecondary, radius: 7).contentShape(Rectangle())
-        }.pressable()
-    }
-
-    private func dayHeader(_ day: Date, cal: Calendar) -> some View {
-        let isToday = cal.isDateInToday(day)
-        return VStack(spacing: 2) {
-            Text(day.formatted(.dateTime.weekday(.abbreviated)))
-                .font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.inkTertiary)
-            Text(day.formatted(.dateTime.day()))
-                .font(TokFont.text(TokFont.subhead, isToday ? .bold : .regular))
-                .foregroundStyle(isToday ? .white : Tok.ink)
-                .frame(width: 26, height: 26).background(isToday ? Tok.blue : .clear).clipShape(Circle())
-        }.frame(maxWidth: .infinity)
-    }
-
-    @ViewBuilder private var intervalBanner: some View {
-        let intervals = store.schedules.filter { $0.isInterval && $0.enabled }
-        if !intervals.isEmpty {
-            HStack(spacing: 6) {
-                ForEach(intervals.prefix(4)) { s in
-                    Button { onEdit(s) } label: {
-                        HStack(spacing: 4) {
-                            Icon(name: "refresh", size: 9)
-                            Text(s.recurrenceLabel).font(TokFont.text(10, .semibold))
-                        }
-                        .foregroundStyle(s.kindTint).padding(.horizontal, 8).frame(height: 22)
-                        .background(s.kindTint.opacity(0.14)).clipShape(Capsule())
-                    }.buttonStyle(.plain).help(s.title)
-                }
+                .frame(maxWidth: .infinity).padding(.vertical, 10)
+                .overlay(alignment: .leading) { Tok.separator.frame(width: Tok.hairline) }
             }
         }
     }
 
     // MARK: Grid
+    private func grid(hours: [Int], gridStart: Int, occ: [Occ], todayIdx: Int, now: Date, cal: Calendar) -> some View {
+        let nowHour = Double(cal.component(.hour, from: now)) + Double(cal.component(.minute, from: now)) / 60
+        let nowVisible = nowHour >= Double(gridStart) && nowHour <= Double(hours.last ?? gridStart)
+        let nowTop = (nowHour - Double(gridStart)) * rowH
+        return HStack(alignment: .top, spacing: 0) {
+            // hour gutter
+            VStack(spacing: 0) {
+                ForEach(hours, id: \.self) { h in
+                    ZStack(alignment: .topTrailing) {
+                        Color.clear.frame(height: rowH)
+                        if h != gridStart {
+                            Text(fmtHour(h)).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
+                                .offset(y: -7).padding(.trailing, 8)
+                        }
+                    }
+                }
+            }
+            .frame(width: gutterW)
+            .overlay(alignment: .trailing) { Tok.separator.frame(width: Tok.hairline) }
 
-    private func gutter(minH: Int, maxH: Int) -> some View {
-        let rows = maxH - minH + 1
-        return VStack(spacing: 0) {
-            ForEach(0..<rows, id: \.self) { i in
-                Text(hourLabel(minH + i)).font(TokFont.text(9)).foregroundStyle(Tok.inkTertiary)
-                    .frame(width: gutterW, height: rowH, alignment: .topTrailing)
-                    .padding(.trailing, 6).offset(y: -5)
+            // day columns
+            ForEach(0..<7, id: \.self) { di in
+                dayColumn(di: di, hours: hours, gridStart: gridStart, occ: occ.filter { $0.col == di }, today: di == todayIdx, nowTop: nowVisible && di == todayIdx ? nowTop : nil)
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if nowVisible {
+                HStack(spacing: 0) {
+                    Color.clear.frame(width: gutterW)
+                    Tok.red.frame(height: 1.5).frame(maxWidth: .infinity)
+                }
+                .offset(y: nowTop).allowsHitTesting(false)
             }
         }
     }
 
-    private func dayColumn(day: Date, minH: Int, maxH: Int, cal: Calendar) -> some View {
-        let rows = maxH - minH + 1
-        let height = CGFloat(rows) * rowH
-        let occ: [(s: Schedule, at: Date)] = store.schedules.compactMap { s in
-            guard let d = scheduleOccurrence(s, on: day, cal: cal) else { return nil }
-            return (s, d)
-        }
-        return ZStack(alignment: .topLeading) {
+    private func dayColumn(di: Int, hours: [Int], gridStart: Int, occ: [Occ], today: Bool, nowTop: CGFloat?) -> some View {
+        ZStack(alignment: .topLeading) {
             VStack(spacing: 0) {
-                ForEach(0..<rows, id: \.self) { _ in
-                    VStack(spacing: 0) {
-                        Tok.separator.frame(height: Tok.hairline)
-                        Spacer(minLength: 0)
-                    }.frame(height: rowH)
+                ForEach(hours, id: \.self) { _ in
+                    Color.clear.frame(height: rowH)
+                        .overlay(alignment: .bottom) { Tok.separator.frame(height: Tok.hairline) }
                 }
             }
-            ForEach(Array(occ.enumerated()), id: \.offset) { _, item in
-                let c = cal.dateComponents([.hour, .minute], from: item.at)
-                let y = (CGFloat((c.hour ?? 0) - minH) + CGFloat(c.minute ?? 0) / 60) * rowH
-                CalChip(schedule: item.s, at: item.at) { onEdit(item.s) }
-                    .padding(.horizontal, 3).offset(y: y + 1)
+            ForEach(occ) { o in
+                CalChip(schedule: o.schedule, color: chipColor(o.schedule), onTap: { onEdit(o.schedule) })
+                    .padding(.horizontal, 3)
+                    .offset(y: (o.hour - Double(gridStart)) * rowH + 2)
             }
-            if cal.isDateInToday(day) {
-                TimelineView(.periodic(from: .now, by: 30)) { ctx in
-                    let c = cal.dateComponents([.hour, .minute], from: ctx.date)
-                    let y = (CGFloat((c.hour ?? 0) - minH) + CGFloat(c.minute ?? 0) / 60) * rowH
-                    NowLine().offset(y: y - 0.75)
-                }
+            if let nowTop {
+                Circle().fill(Tok.red).frame(width: 9, height: 9).offset(x: -4.5, y: nowTop - 4.5)
             }
         }
-        .frame(height: height).frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity)
+        .background(today ? Tok.red.opacity(0.03) : .clear)
         .overlay(alignment: .leading) { Tok.separator.frame(width: Tok.hairline) }
     }
 
-    // MARK: Date helpers
-
-    private func weekDays(offset: Int, cal: Calendar) -> [Date] {
-        let today = cal.startOfDay(for: .now)
-        let backToMon = (cal.component(.weekday, from: today) + 5) % 7   // days since Monday
-        guard let monday = cal.date(byAdding: .day, value: -backToMon + offset * 7, to: today) else { return [] }
-        return (0..<7).compactMap { cal.date(byAdding: .day, value: $0, to: monday) }
+    private var emptyOverlay: some View {
+        VStack(spacing: 4) {
+            Text("Nothing scheduled this week").font(TokFont.text(TokFont.callout, .semibold)).foregroundStyle(Tok.inkSecondary)
+            Text("Create a schedule and it appears here on its day & time.")
+                .font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary).multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: 320).padding(24).frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
     }
 
-    private func hourRange(days: [Date], cal: Calendar) -> (Int, Int) {
-        var minH = 6, maxH = 22
+    // MARK: Data
+    private func week(_ cal: Calendar) -> ([Date], Int, Date) {
+        let today = cal.startOfDay(for: .now)
+        let todayIdx = (cal.component(.weekday, from: today) + 5) % 7   // Mon=0…Sun=6
+        let monday = cal.date(byAdding: .day, value: -todayIdx, to: today) ?? today
+        let days = (0..<7).compactMap { cal.date(byAdding: .day, value: $0, to: monday) }
+        return (days, todayIdx, monday)
+    }
+
+    /// Calendar-eligible occurrences: clock/one-shot schedules placed on their day(s). Intervals and
+    /// short-lived autopilot followups are excluded (they live in the list).
+    private func occurrences(days: [Date], cal: Calendar) -> [Occ] {
+        var out: [Occ] = []
         for s in store.schedules {
-            for day in days {
-                guard let occ = scheduleOccurrence(s, on: day, cal: cal) else { continue }
-                let h = cal.component(.hour, from: occ)
-                minH = min(minH, h); maxH = max(maxH, h)
+            guard s.kind != "auto-answer", s.kind != "auto-continue", s.kind != "keep-going" else { continue }
+            if s.isInterval { continue }
+            for (col, day) in days.enumerated() {
+                guard let at = scheduleOccurrence(s, on: day, cal: cal) else { continue }
+                if s.isOneShot, !s.enabled { continue }
+                let hour = Double(cal.component(.hour, from: at)) + Double(cal.component(.minute, from: at)) / 60
+                out.append(Occ(id: "\(s.id):\(col)", schedule: s, col: col, hour: hour))
             }
         }
+        return out
+    }
+
+    private func hourRange(_ occ: [Occ]) -> (Int, Int) {
+        var minH = 6, maxH = 22
+        for o in occ { minH = min(minH, Int(o.hour)); maxH = max(maxH, Int(ceil(o.hour))) }
         return (max(0, minH), min(23, maxH))
     }
 
-    private func rangeLabel(_ days: [Date]) -> String {
-        guard let a = days.first, let b = days.last else { return "" }
-        let m1 = a.formatted(.dateTime.month(.abbreviated)), d1 = a.formatted(.dateTime.day())
-        let m2 = b.formatted(.dateTime.month(.abbreviated)), d2 = b.formatted(.dateTime.day())
-        return m1 == m2 ? "\(m1) \(d1) – \(d2)" : "\(m1) \(d1) – \(m2) \(d2)"
+    private func chipColor(_ s: Schedule) -> Color {
+        s.projectId.flatMap { projMeta[$0]?.color } ?? Tok.inkTertiary
     }
 
-    private func hourLabel(_ h: Int) -> String {
+    private func fmtHour(_ h: Int) -> String {
         let hr = h % 12 == 0 ? 12 : h % 12
         return "\(hr) \(h < 12 ? "AM" : "PM")"
     }
 }
 
-/// A schedule chip placed in a calendar day column.
+/// A schedule chip placed in a calendar day column (colored by project, clock glyph, dim if paused).
 private struct CalChip: View {
     let schedule: Schedule
-    let at: Date
+    let color: Color
     let onTap: () -> Void
     var body: some View {
         Button(action: onTap) {
-            HStack(spacing: 4) {
-                Text(at.formatted(.dateTime.hour(.defaultDigits(amPM: .narrow)).minute(.twoDigits)))
-                    .font(TokFont.mono(9, .semibold))
+            HStack(spacing: 5) {
+                Icon(name: "clock", size: 11).foregroundStyle(color)
                 Text(schedule.title.isEmpty ? "Untitled" : schedule.title)
-                    .font(TokFont.text(10, .medium)).lineLimit(1)
+                    .font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.ink).lineLimit(1)
+                Spacer(minLength: 0)
             }
-            .foregroundStyle(schedule.kindTint)
-            .padding(.horizontal, 6).padding(.vertical, 3)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(schedule.kindTint.opacity(0.16))
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(schedule.kindTint.opacity(0.3), lineWidth: Tok.hairline))
+            .padding(.horizontal, 7).frame(height: 30)
+            .background(ZStack { Tok.bgElevated; color.opacity(0.14) })
+            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(color.opacity(0.35), lineWidth: 1))
+            .overlay(alignment: .leading) { color.frame(width: 3).clipShape(RoundedRectangle(cornerRadius: 1.5)) }
+            .opacity(schedule.enabled ? 1 : 0.45)
         }.buttonStyle(.plain)
     }
-}
-
-/// The live "now" indicator drawn across today's column.
-private struct NowLine: View {
-    var body: some View {
-        HStack(spacing: 0) {
-            Circle().fill(Tok.red).frame(width: 7, height: 7)
-            Tok.red.frame(height: 1.5)
-        }
-    }
-}
-
-/// The concrete fire time of `schedule` on `day`, or nil if it doesn't occur then. Interval
-/// schedules return nil (they have no single time-of-day and ride the banner instead).
-func scheduleOccurrence(_ s: Schedule, on day: Date, cal: Calendar = .current) -> Date? {
-    if s.isOneShot, let f = s.fireAt {
-        let d = Date(timeIntervalSince1970: f / 1000)
-        return cal.isDate(d, inSameDayAs: day) ? d : nil
-    }
-    if s.isInterval { return nil }
-    guard s.hasClock, let t = s.time else { return nil }
-    let cadence = s.cadence?.lowercased() ?? ""
-    let days = daysFromCadence(s.cadence)
-    let isDaily = cadence.contains("daily") || days.count == 7 || (days.isEmpty && cadence.isEmpty)
-    let wd = (cal.component(.weekday, from: day) + 5) % 7   // 0=Mon … 6=Sun
-    if !isDaily && !days.contains(wd) { return nil }
-    let parts = t.split(separator: ":")
-    guard parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]) else { return nil }
-    return cal.date(bySettingHour: h, minute: m, second: 0, of: day)
 }

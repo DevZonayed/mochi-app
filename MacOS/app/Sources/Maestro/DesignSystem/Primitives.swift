@@ -1,6 +1,73 @@
 import SwiftUI
+import AppKit
 
 // MARK: - Interaction feedback (hover + press) — the "click feel" the plain style lacks.
+
+/// A small "Copy"→"Copied ✓" chip (caption 600, inkTertiary → green for 1.3s). Used by code-card
+/// headers and the per-turn copy button. Mirrors the web `CopyButton`.
+struct CopyChip: View {
+    let text: String
+    var label: String = "Copy"
+    var hoverOnly: Bool = false
+    @State private var copied = false
+    @State private var hovering = false
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            copied = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) { copied = false }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc").font(.system(size: 10, weight: .semibold))
+                Text(copied ? "Copied" : label).font(TokFont.text(TokFont.caption, .semibold))
+            }
+            .foregroundStyle(copied ? Tok.green : Tok.inkTertiary)
+            .padding(.horizontal, 7).frame(height: 22)
+            .background(hovering ? Tok.fillTertiary : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .opacity(hoverOnly && !hovering && !copied ? 0 : 1)
+        }
+        .buttonStyle(.plain).pressable(scale: 0.95)
+        .onHover { hovering = $0 }
+    }
+}
+
+/// A blinking purple caret appended after live-streaming text (mirrors `.chat-caret`).
+struct StreamCaret: View {
+    var height: CGFloat = 15
+    @State private var on = true
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+            .fill(Tok.purple)
+            .frame(width: 7, height: height)
+            .opacity(on ? 1 : 0)
+            .onAppear { withAnimation(.linear(duration: 0.53).repeatForever(autoreverses: true)) { on = false } }
+    }
+}
+
+/// Shimmering single-line text used for the live-activity heartbeat (mirrors `.think-shimmer`).
+struct ShimmerText: View {
+    let text: String
+    var size: CGFloat = 13.5
+    @State private var phase: CGFloat = -1
+    var body: some View {
+        Text(text)
+            .font(.system(size: size, weight: .medium))
+            .foregroundStyle(Tok.inkSecondary)
+            .overlay(
+                GeometryReader { geo in
+                    LinearGradient(colors: [.clear, Tok.ink.opacity(0.9), .clear],
+                                   startPoint: .leading, endPoint: .trailing)
+                        .frame(width: geo.size.width * 0.5)
+                        .offset(x: phase * geo.size.width * 1.5)
+                        .blendMode(.plusLighter)
+                }
+                .mask(Text(text).font(.system(size: size, weight: .medium)))
+                .allowsHitTesting(false)
+            )
+            .onAppear { withAnimation(.linear(duration: 1.5).repeatForever(autoreverses: false)) { phase = 1 } }
+    }
+}
 
 /// Press = quick scale + dim, spring-animated. Apply with `.pressable()`.
 struct PressableButtonStyle: ButtonStyle {

@@ -1,11 +1,23 @@
 import SwiftUI
+import AppKit
 
-/// A lightweight block-level Markdown renderer for chat messages — headings, paragraphs, bullet/
-/// ordered lists, fenced code blocks, and inline (bold/italic/`code`/links). SwiftUI's
-/// `AttributedString(markdown:)` only does *inline* syntax, so `###`/lists/code-fences would show
-/// raw; this parses blocks and styles each with the right type ramp + a softened body ink.
+/// A block-level Markdown renderer for chat messages, ported to match the Electron chat's bespoke
+/// `renderChatBody`/`renderProse` (NOT a generic library): chat headings are 15/13.5px bold, body
+/// prose is 14px/1.62 in `--ink`, inline code is a fill-tertiary highlight, bold is 600, file paths
+/// (bare or `` `code` ``-wrapped) are clickable blue links, fenced code renders as a header-barred
+/// card, and tables get grid lines + column alignment. The chat deliberately does NOT render
+/// `*italic*` or `[md](links)` — only bold + code + paths — so literal `*` survive.
 struct MarkdownText: View {
     let text: String
+    /// Root that relative file-path links resolve against (for click-to-open). nil → only absolute/~ paths link.
+    var projectRoot: String? = nil
+    /// Base prose size (chat = 14, thinking/response = 13).
+    var baseSize: CGFloat = 14
+    /// Base body ink (chat = `--ink`; thinking body = inkSecondary).
+    var bodyColor: Color = Tok.ink
+    /// AppKit body color for the selectable text view (must match `bodyColor`).
+    var nsBodyColor: NSColor = TokNS.ink
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -14,6 +26,14 @@ struct MarkdownText: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .environment(\.openURL, OpenURLAction { url in
+            guard url.scheme == "maestrofile" else { return .systemAction }
+            if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+               let p = comps.queryItems?.first(where: { $0.name == "p" })?.value {
+                onOpenFile(p)
+            }
+            return .handled
+        })
     }
 
     // MARK: blocks
@@ -22,8 +42,8 @@ struct MarkdownText: View {
         case paragraph(String)
         case code(String, lang: String?)
         case bullets([String])
-        case ordered([String])
-        case table(headers: [String], rows: [[String]])
+        case ordered(start: Int, items: [String])
+        case table(headers: [String], rows: [[String]], aligns: [TextAlignment])
         case quote(String)
         case rule
     }
@@ -31,95 +51,117 @@ struct MarkdownText: View {
     @ViewBuilder private func view(_ b: Block) -> some View {
         switch b {
         case .heading(let level, let t):
-            Text(Self.inline(t))
-                .font(headingFont(level)).foregroundStyle(Tok.ink)
-                .padding(.top, level <= 2 ? 4 : 2)
+            Text(Self.headingAttr(t)).font(headingFont(level)).foregroundStyle(Tok.ink)
+                .tracking(level <= 2 ? -0.15 : -0.1)
+                .padding(.top, level <= 2 ? 6 : 3)
         case .paragraph(let t):
-            Text(Self.inline(t)).font(TokFont.text(14)).foregroundStyle(Tok.inkBody)
-                .lineSpacing(3.5).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-        case .code(let code, _):
-            Text(code).font(TokFont.mono(12.5)).foregroundStyle(Tok.inkBody)
-                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                .padding(10).background(Tok.fillTertiary)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+            SelectableText(attributed: NSMarkdown.inline(t, projectRoot: projectRoot, size: baseSize, color: nsBodyColor), onOpenFile: onOpenFile)
+        case .code(let code, let lang):
+            CodeCardView(code: code, lang: lang)
         case .bullets(let items):
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 5) {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, it in
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("•").font(TokFont.text(14)).foregroundStyle(Tok.inkTertiary)
-                        Text(Self.inline(it)).font(TokFont.text(14)).foregroundStyle(Tok.inkBody).lineSpacing(3).fixedSize(horizontal: false, vertical: true)
+                    HStack(alignment: .top, spacing: 8) {
+                        Text("•").font(TokFont.text(baseSize)).foregroundStyle(Tok.inkTertiary)
+                        SelectableText(attributed: NSMarkdown.inline(it, projectRoot: projectRoot, size: baseSize, color: nsBodyColor), onOpenFile: onOpenFile)
                     }
                 }
             }
-        case .ordered(let items):
-            VStack(alignment: .leading, spacing: 4) {
+        case .ordered(let start, let items):
+            VStack(alignment: .leading, spacing: 5) {
                 ForEach(Array(items.enumerated()), id: \.offset) { i, it in
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("\(i + 1).").font(TokFont.mono(13)).foregroundStyle(Tok.inkTertiary)
-                        Text(Self.inline(it)).font(TokFont.text(14)).foregroundStyle(Tok.inkBody).lineSpacing(3).fixedSize(horizontal: false, vertical: true)
+                    HStack(alignment: .top, spacing: 8) {
+                        Text("\(start + i).")
+                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(Tok.inkTertiary)
+                            .frame(minWidth: 17, alignment: .trailing)
+                        SelectableText(attributed: NSMarkdown.inline(it, projectRoot: projectRoot, size: baseSize, color: nsBodyColor), onOpenFile: onOpenFile)
                     }
                 }
             }
-        case .table(let headers, let rows):
-            VStack(alignment: .leading, spacing: 0) {
-                Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
-                    GridRow {
-                        ForEach(Array(headers.enumerated()), id: \.offset) { _, cell in
-                            Text(Self.inline(cell))
-                                .font(TokFont.text(TokFont.caption, .semibold))
-                                .foregroundStyle(Tok.ink)
-                                .lineLimit(2)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 7)
-                                .background(Tok.fillTertiary)
-                        }
-                    }
-                    ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
-                        GridRow {
-                            ForEach(0..<headers.count, id: \.self) { col in
-                                Text(Self.inline(col < row.count ? row[col] : ""))
-                                    .font(TokFont.text(13))
-                                    .foregroundStyle(Tok.inkBody)
-                                    .lineSpacing(2)
-                                    .textSelection(.enabled)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.horizontal, 9)
-                                    .padding(.vertical, 7)
-                                    .background(rowIndex.isMultiple(of: 2) ? Color.clear : Tok.fillTertiary.opacity(0.52))
-                            }
-                        }
-                    }
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
-            .padding(.vertical, 2)
+        case .table(let headers, let rows, let aligns):
+            tableView(headers: headers, rows: rows, aligns: aligns)
         case .quote(let t):
-            Text(Self.inline(t)).font(TokFont.text(14)).foregroundStyle(Tok.inkSecondary)
-                .padding(.leading, 10).overlay(alignment: .leading) { Tok.separatorStrong.frame(width: 2.5) }
+            SelectableText(attributed: NSMarkdown.inline(t, projectRoot: projectRoot, size: baseSize, color: TokNS.inkSecondary), onOpenFile: onOpenFile)
+                .padding(.leading, 12).padding(.vertical, 4)
+                .overlay(alignment: .leading) { Tok.separatorStrong.frame(width: 3) }
         case .rule:
             Tok.separator.frame(height: Tok.hairline).padding(.vertical, 2)
         }
     }
 
     private func headingFont(_ level: Int) -> Font {
-        switch level { case 1: TokFont.display(19, .bold); case 2: TokFont.display(16.5, .bold); case 3: TokFont.text(15, .semibold); default: TokFont.text(14, .semibold) }
+        // Chat heading ramp: h1==h2 = 15 bold, h3==h4 = 13.5 bold (display family).
+        level <= 2 ? TokFont.display(15, .bold) : TokFont.display(13.5, .bold)
+    }
+
+    // MARK: table
+    private func align(_ a: TextAlignment) -> Alignment {
+        switch a { case .leading: .leading; case .center: .center; case .trailing: .trailing }
+    }
+    private func tableView(headers: [String], rows: [[String]], aligns: [TextAlignment]) -> some View {
+        let cols = headers.count
+        func a(_ i: Int) -> TextAlignment { i < aligns.count ? aligns[i] : .leading }
+        return VStack(spacing: 0) {
+            Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
+                GridRow {
+                    ForEach(0..<cols, id: \.self) { c in
+                        Text(inline(headers[c]))
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(Tok.ink)
+                            .multilineTextAlignment(a(c))
+                            .frame(maxWidth: .infinity, alignment: align(a(c)))
+                            .padding(.horizontal, 12).padding(.vertical, 7)
+                            .background(Tok.fillTertiary)
+                            .overlay(alignment: .leading) { if c > 0 { Tok.separator.frame(width: Tok.hairline) } }
+                    }
+                }
+                ForEach(Array(rows.enumerated()), id: \.offset) { ri, row in
+                    GridRow {
+                        ForEach(0..<cols, id: \.self) { c in
+                            Text(inline(c < row.count ? row[c] : ""))
+                                .font(TokFont.text(13)).foregroundStyle(Tok.inkSecondary)
+                                .multilineTextAlignment(a(c))
+                                .lineSpacing(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: align(a(c)))
+                                .padding(.horizontal, 12).padding(.vertical, 6)
+                                .background(ri.isMultiple(of: 2) ? Color.clear : Tok.fillTertiary.opacity(0.35))
+                                .overlay(alignment: .top) { Tok.separator.frame(height: Tok.hairline) }
+                                .overlay(alignment: .leading) { if c > 0 { Tok.separator.frame(width: Tok.hairline) } }
+                        }
+                    }
+                }
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+        .padding(.vertical, 2)
     }
 
     // MARK: parsing
+    /// Parsed-block cache — chat transcripts re-render the same text on every scroll/stream tick;
+    /// re-running the block parser each time is a real cost on long chats. Bounded, main-thread only.
+    private static var parseCache: [String: [Block]] = [:]
+
     static func parse(_ src: String) -> [Block] {
+        if let cached = parseCache[src] { return cached }
+        let blocks = parseUncached(src)
+        if parseCache.count > 240 { parseCache.removeAll(keepingCapacity: true) }
+        parseCache[src] = blocks
+        return blocks
+    }
+
+    private static func parseUncached(_ src: String) -> [Block] {
         var blocks: [Block] = []
         var para: [String] = []
         var bullets: [String] = []
         var ordered: [String] = []
+        var orderedStart = 1
         func flushPara() { if !para.isEmpty { blocks.append(.paragraph(para.joined(separator: "\n"))); para = [] } }
         func flushLists() {
             if !bullets.isEmpty { blocks.append(.bullets(bullets)); bullets = [] }
-            if !ordered.isEmpty { blocks.append(.ordered(ordered)); ordered = [] }
+            if !ordered.isEmpty { blocks.append(.ordered(start: orderedStart, items: ordered)); ordered = []; orderedStart = 1 }
         }
         func flushAll() { flushPara(); flushLists() }
 
@@ -139,20 +181,21 @@ struct MarkdownText: View {
             if i + 1 < lines.count, isTableRow(trimmed), isTableSeparator(lines[i + 1].trimmingCharacters(in: .whitespaces)) {
                 flushAll()
                 let headers = tableCells(trimmed)
+                let aligns = tableAligns(lines[i + 1].trimmingCharacters(in: .whitespaces))
                 i += 2
                 var rows: [[String]] = []
                 while i < lines.count, isTableRow(lines[i].trimmingCharacters(in: .whitespaces)) {
                     rows.append(tableCells(lines[i].trimmingCharacters(in: .whitespaces)))
                     i += 1
                 }
-                if !headers.isEmpty { blocks.append(.table(headers: headers, rows: rows)) }
+                if !headers.isEmpty { blocks.append(.table(headers: headers, rows: rows, aligns: aligns)) }
                 continue
             }
             if let m = headingMatch(trimmed) { flushAll(); blocks.append(.heading(level: m.0, text: m.1)); i += 1; continue }
             if trimmed == "---" || trimmed == "***" || trimmed == "___" { flushAll(); blocks.append(.rule); i += 1; continue }
             if trimmed.hasPrefix("> ") { flushPara(); flushLists(); blocks.append(.quote(String(trimmed.dropFirst(2)))); i += 1; continue }
             if let item = bulletMatch(trimmed) { flushPara(); if !ordered.isEmpty { flushLists() }; bullets.append(item); i += 1; continue }
-            if let item = orderedMatch(trimmed) { flushPara(); if !bullets.isEmpty { flushLists() }; ordered.append(item); i += 1; continue }
+            if let m = orderedMatch(trimmed) { flushPara(); if !bullets.isEmpty { flushLists() }; if ordered.isEmpty { orderedStart = m.0 }; ordered.append(m.1); i += 1; continue }
             if trimmed.isEmpty { flushAll(); i += 1; continue }
             flushLists(); para.append(line); i += 1
         }
@@ -163,26 +206,32 @@ struct MarkdownText: View {
     private static func headingMatch(_ s: String) -> (Int, String)? {
         var level = 0; var idx = s.startIndex
         while idx < s.endIndex, s[idx] == "#", level < 6 { level += 1; idx = s.index(after: idx) }
-        guard level > 0, idx < s.endIndex, s[idx] == " " else { return nil }
+        guard level > 0, level <= 4, idx < s.endIndex, s[idx] == " " else { return nil }   // chat: h1–h4 only
         return (level, String(s[s.index(after: idx)...]))
     }
     private static func bulletMatch(_ s: String) -> String? {
         for p in ["- ", "* ", "+ "] where s.hasPrefix(p) { return String(s.dropFirst(2)) }
         return nil
     }
-    private static func orderedMatch(_ s: String) -> String? {
-        guard let dot = s.firstIndex(of: "."), s[s.startIndex..<dot].allSatisfy(\.isNumber), !s[s.startIndex..<dot].isEmpty,
+    private static func orderedMatch(_ s: String) -> (Int, String)? {
+        guard let dot = s.firstIndex(where: { $0 == "." || $0 == ")" }) else { return nil }
+        let numStr = s[s.startIndex..<dot]
+        guard !numStr.isEmpty, numStr.allSatisfy(\.isNumber), let n = Int(numStr),
               s.index(after: dot) < s.endIndex, s[s.index(after: dot)] == " " else { return nil }
-        return String(s[s.index(dot, offsetBy: 2)...])
+        return (n, String(s[s.index(dot, offsetBy: 2)...]))
     }
-    private static func isTableRow(_ s: String) -> Bool {
-        s.contains("|") && tableCells(s).count > 1
-    }
+    private static func isTableRow(_ s: String) -> Bool { s.contains("|") && tableCells(s).count > 1 }
     private static func isTableSeparator(_ s: String) -> Bool {
         let cells = tableCells(s)
         return cells.count > 1 && cells.allSatisfy { cell in
             let stripped = cell.replacingOccurrences(of: ":", with: "")
             return stripped.count >= 3 && stripped.allSatisfy { $0 == "-" }
+        }
+    }
+    private static func tableAligns(_ s: String) -> [TextAlignment] {
+        tableCells(s).map { cell in
+            let l = cell.hasPrefix(":"); let r = cell.hasSuffix(":")
+            if l && r { return .center }; if r { return .trailing }; return .leading
         }
     }
     private static func tableCells(_ s: String) -> [String] {
@@ -193,13 +242,133 @@ struct MarkdownText: View {
             .map { String($0).trimmingCharacters(in: .whitespaces) }
     }
 
-    /// Inline markdown (bold/italic/`code`/links) → AttributedString, with `code` runs styled.
-    static func inline(_ s: String) -> AttributedString {
-        var a = (try? AttributedString(markdown: s, options: .init(allowsExtendedAttributes: true, interpretedSyntax: .inlineOnlyPreservingWhitespace, failurePolicy: .returnPartiallyParsedIfPossible))) ?? AttributedString(s)
-        for run in a.runs where run.inlinePresentationIntent?.contains(.code) == true {
-            a[run.range].font = .system(size: 12.5, design: .monospaced)
-            a[run.range].foregroundColor = Tok.anthropic
+    /// Heading text: strip the inline markers (chat headings render plain bold).
+    private static func headingAttr(_ s: String) -> AttributedString {
+        AttributedString(s.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: ""))
+    }
+
+    // MARK: inline (bold / code / clickable paths) — NOT italic/links (matches chat renderInline)
+    func inline(_ s: String) -> AttributedString { Self.inline(s, projectRoot: projectRoot, baseSize: baseSize, bodyColor: bodyColor) }
+
+    static func inline(_ s: String, projectRoot: String?, baseSize: CGFloat, bodyColor: Color) -> AttributedString {
+        var out = AttributedString()
+        let chars = Array(s)
+        var i = 0
+        var plain = ""
+        func flush() { if !plain.isEmpty { out += linkify(plain, projectRoot: projectRoot, baseSize: baseSize, bodyColor: bodyColor); plain = "" } }
+        while i < chars.count {
+            // `code`
+            if chars[i] == "`", let close = nextIndex(chars, of: "`", from: i + 1) {
+                flush()
+                out += codeOrPath(String(chars[(i + 1)..<close]), projectRoot: projectRoot, baseSize: baseSize)
+                i = close + 1; continue
+            }
+            // **bold**
+            if chars[i] == "*", i + 1 < chars.count, chars[i + 1] == "*", let close = nextDouble(chars, from: i + 2) {
+                flush()
+                var b = AttributedString(String(chars[(i + 2)..<close]))
+                b.font = .system(size: baseSize, weight: .semibold); b.foregroundColor = bodyColor
+                out += b
+                i = close + 2; continue
+            }
+            plain.append(chars[i]); i += 1
         }
+        flush()
+        return out
+    }
+
+    private static func nextIndex(_ a: [Character], of ch: Character, from: Int) -> Int? {
+        var i = from; while i < a.count { if a[i] == ch { return i }; i += 1 }; return nil
+    }
+    private static func nextDouble(_ a: [Character], from: Int) -> Int? {
+        var i = from; while i + 1 < a.count { if a[i] == "*" && a[i + 1] == "*" { return i }; i += 1 }; return nil
+    }
+
+    /// A `` `code` `` span: a path link if it looks like a path, else a fill-tertiary code highlight.
+    private static func codeOrPath(_ inner: String, projectRoot: String?, baseSize: CGFloat) -> AttributedString {
+        let codeSize = baseSize * 0.92
+        if ToolViz.looksLikePath(inner), let link = fileURL(inner, projectRoot) {
+            var a = AttributedString(inner)
+            a.font = .system(size: codeSize, weight: .medium, design: .monospaced)
+            a.foregroundColor = Tok.blue; a.underlineStyle = .single; a.link = link
+            return a
+        }
+        var a = AttributedString(inner)
+        a.font = .system(size: codeSize, weight: .medium, design: .monospaced)
+        a.foregroundColor = Tok.ink; a.backgroundColor = Tok.fillTertiary
         return a
+    }
+
+    /// Linkify bare file paths in a plain run (absolute / `~` / dotted-relative with a slash).
+    private static func linkify(_ s: String, projectRoot: String?, baseSize: CGFloat, bodyColor: Color) -> AttributedString {
+        func plainRun(_ t: String) -> AttributedString { var a = AttributedString(t); a.font = .system(size: baseSize); a.foregroundColor = bodyColor; return a }
+        let pattern = #"(?:(?:~|\.\.?)?/)[^\s)\]}'"`,;]+|[A-Za-z0-9_.@\-]+(?:/[A-Za-z0-9_.@\-]+)+"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return plainRun(s) }
+        let ns = s as NSString
+        var out = AttributedString(); var last = 0
+        for m in re.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
+            if m.range.location > last { out += plainRun(ns.substring(with: NSRange(location: last, length: m.range.location - last))) }
+            let full = ns.substring(with: m.range)
+            var tok = full
+            while let c = tok.last, ".,;:".contains(c) { tok.removeLast() }   // don't eat trailing punctuation
+            if !tok.isEmpty, let link = fileURL(tok, projectRoot) {
+                var a = AttributedString(tok); a.font = .system(size: baseSize)
+                a.foregroundColor = Tok.blue; a.underlineStyle = .single; a.link = link
+                out += a
+                if full.count > tok.count { out += plainRun(String(full.dropFirst(tok.count))) }
+            } else {
+                out += plainRun(full)
+            }
+            last = m.range.location + m.range.length
+        }
+        if last < ns.length { out += plainRun(ns.substring(from: last)) }
+        return out
+    }
+
+    /// A `maestrofile://open?p=<abs>` URL for a path, resolved against the project root. nil when a
+    /// relative path can't be resolved (no root) — then it stays plain text, not a dead link.
+    private static func fileURL(_ p: String, _ root: String?) -> URL? {
+        guard let abs = ToolViz.absolutePath(p, root: root),
+              let enc = abs.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return nil }
+        return URL(string: "maestrofile://open?p=\(enc)")
+    }
+}
+
+/// A fenced code block as a header-barred card (uppercase lang label + hover copy), horizontally
+/// scrollable, mono 12.5/1.6 in `--ink` over `--bg-grouped` — mirrors the chat `CodeCard`.
+struct CodeCardView: View {
+    let code: String
+    var lang: String?
+    private var tall: Bool { code.components(separatedBy: "\n").count > 18 }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text((lang ?? "code").uppercased())
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced)).tracking(0.4)
+                    .foregroundStyle(Tok.inkTertiary)
+                Spacer(minLength: 8)
+                CopyChip(text: code)   // always visible
+            }
+            .padding(.leading, 12).padding(.trailing, 8).frame(height: 30)
+            .background(Tok.ink.opacity(0.04))
+            .overlay(alignment: .bottom) { Tok.separator.frame(height: Tok.hairline) }
+
+            // Selectable, horizontally scrollable; tall blocks cap at 360pt and scroll vertically.
+            if tall {
+                ScrollView([.horizontal, .vertical], showsIndicators: true) { codeBody }.frame(height: 360)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) { codeBody }
+            }
+        }
+        .background(Tok.bgGrouped)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+        .padding(.vertical, 3)
+    }
+
+    private var codeBody: some View {
+        SelectableText(attributed: NSMarkdown.code(code), wraps: false)
+            .padding(.horizontal, 13).padding(.vertical, 11)
     }
 }

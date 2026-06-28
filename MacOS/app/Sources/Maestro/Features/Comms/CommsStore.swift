@@ -14,6 +14,7 @@ final class CommsStore {
     var projects: [Project] = []
 
     var qrImageData: String?   // base64 data-url while linking
+    var pairingCode: String?   // shown when linking via phone number instead of QR
     var linking = false
     var busy = false
     var error: String?
@@ -52,15 +53,22 @@ final class CommsStore {
     func disconnectTelegram() async { try? await client.callVoid("disconnectTelegram"); await refresh() }
 
     // MARK: whatsapp link / QR
-    func linkWhatsApp() async {
-        error = nil; linking = true
-        _ = try? await client.callRaw("whatsappLink", [:])
+    /// Link the number. With no `phone` → QR flow; with a `phone` → request a pairing code that the
+    /// operator types into WhatsApp → Linked Devices → "Link with phone number".
+    func linkWhatsApp(phone: String? = nil) async {
+        error = nil; linking = true; pairingCode = nil; qrImageData = nil
+        var params: [String: Any] = [:]
+        if let phone, !phone.isEmpty { params["phone"] = phone }
+        let link = try? await client.call("whatsappLink", params, as: WhatsAppLink.self)
+        if link?.method == "pairing" { pairingCode = link?.code }
         qrTask?.cancel()
         qrTask = Task { [weak self] in
             for _ in 0..<120 { // ~5 min
                 if Task.isCancelled { return }
                 guard let self else { return }
-                self.qrImageData = (try? await self.client.call("whatsappQr", as: WaQrResult.self))?.dataUrl
+                if self.pairingCode == nil {
+                    self.qrImageData = (try? await self.client.call("whatsappQr", as: WaQrResult.self))?.dataUrl
+                }
                 let st = try? await self.client.call("whatsappStatus", as: WhatsAppStatus.self)
                 if st?.connected == true { await self.refresh(); return }
                 try? await Task.sleep(for: .milliseconds(2500))
@@ -68,7 +76,7 @@ final class CommsStore {
         }
     }
     func cancelLink() async { stopLinking(); try? await client.callVoid("unlinkWhatsApp"); await refresh() }
-    private func stopLinking() { linking = false; qrImageData = nil; qrTask?.cancel(); qrTask = nil }
+    private func stopLinking() { linking = false; qrImageData = nil; pairingCode = nil; qrTask?.cancel(); qrTask = nil }
 
     func disconnectWhatsApp() async { try? await client.callVoid("disconnectWhatsApp"); await refresh() }
     func unlinkWhatsApp() async { stopLinking(); try? await client.callVoid("unlinkWhatsApp"); await refresh() }

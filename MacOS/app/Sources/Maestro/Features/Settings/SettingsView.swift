@@ -6,15 +6,15 @@ struct SettingsView: View {
     @State private var section: Section = .engines
 
     enum Section: String, CaseIterable, Identifiable {
-        case engines = "Engines", skills = "Skills & tools", mcp = "MCP servers"
+        case notifications = "Notifications", engines = "Engines", skills = "Skills & tools", mcp = "MCP servers"
         case accounts = "Accounts & keys", ext = "Browser extension", devices = "Devices"
         var id: String { rawValue }
         var icon: String {
-            switch self { case .engines: "cpu"; case .skills: "spark"; case .mcp: "terminal"
+            switch self { case .notifications: "bell"; case .engines: "cpu"; case .skills: "spark"; case .mcp: "terminal"
             case .accounts: "key"; case .ext: "globe"; case .devices: "smartphone" }
         }
         var tint: Color {
-            switch self { case .engines: Tok.purple; case .skills: Tok.indigo; case .mcp: Tok.teal
+            switch self { case .notifications: Tok.orange; case .engines: Tok.purple; case .skills: Tok.indigo; case .mcp: Tok.teal
             case .accounts: Tok.blue; case .ext: Tok.blue; case .devices: Tok.teal }
         }
     }
@@ -62,6 +62,7 @@ struct SettingsView: View {
 
     @ViewBuilder private var pane: some View {
         switch section {
+        case .notifications: NotificationsPane()
         case .engines: EnginesPane()
         case .skills: SettingsSkillsPane()
         case .mcp: McpPane()

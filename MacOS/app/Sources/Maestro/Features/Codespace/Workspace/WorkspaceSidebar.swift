@@ -1,8 +1,10 @@
 import SwiftUI
+import AppKit
 
 /// The CodeSpace left tree: header, filter, and projects → chats (expandable), with the per-project
 /// hub on the ⋯ menu. Mirrors Workspace.tsx's sidebar.
 struct WorkspaceSidebar: View {
+    @Environment(AppEnv.self) private var env
     @Bindable var store: WorkspaceStore
     var width: CGFloat = 260
     let onAddProject: () -> Void
@@ -10,6 +12,9 @@ struct WorkspaceSidebar: View {
     @State private var renamingId: String?
     @State private var renameText = ""
     @State private var hoverSession: String?
+    @State private var hoverProject: String?
+    @State private var confirmDeleteProject: Project?
+    @State private var pickerProject: Project?   // project whose base-branch picker is open
 
     var body: some View {
         VStack(spacing: 0) {
@@ -19,6 +24,7 @@ struct WorkspaceSidebar: View {
         }
         .frame(width: width)
         .background(Tok.bgGrouped)
+        .sheet(item: $confirmDeleteProject) { deleteProjectModal($0) }
     }
 
     private var header: some View {
@@ -111,14 +117,23 @@ struct WorkspaceSidebar: View {
                 Spacer(minLength: 0)
                 let n = store.activeSessions(p.id).count
                 if n > 0 { Text("\(n)").font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary) }
-                Menu {
-                    Button("Instructions") { store.openProjectPanel(p.id, .instructions) }
-                    Button("Skills & tools") { store.openProjectPanel(p.id, .skills) }
-                    Button("Settings") { store.openProjectPanel(p.id, .settings) }
-                    Divider()
-                    Button("New chat") { store.newChat(p.id) }
-                } label: { Icon(name: "more", size: 15).foregroundStyle(Tok.inkSecondary).frame(width: 20, height: 20).contentShape(Rectangle()) }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                // ⋯ menu + blue "+" new-chat — revealed on row hover (or while active).
+                if hoverProject == p.id || active {
+                    projectMenu(p)
+                    Button {
+                        // ⌘/Ctrl+click skips the picker and starts a chat off the default branch.
+                        let skip = NSEvent.modifierFlags.contains(.command) || NSEvent.modifierFlags.contains(.control)
+                        if skip { store.newChat(p.id) } else { pickerProject = p }
+                    } label: {
+                        Icon(name: "plus", size: 14, weight: .bold).foregroundStyle(Tok.blue).frame(width: 20, height: 20).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain).help("New chat here — pick a base branch (⌘+click to skip)")
+                    .popover(isPresented: Binding(get: { pickerProject?.id == p.id }, set: { if !$0 { pickerProject = nil } }), arrowEdge: .trailing) {
+                        BranchPicker(projectId: p.id, client: env.client,
+                                     onPick: { branch, isDefault in store.newChat(p.id, base: isDefault ? nil : branch); pickerProject = nil },
+                                     onClose: { pickerProject = nil })
+                    }
+                }
             }
             .padding(.horizontal, 6).padding(.vertical, 5)
             .background(active ? tint.opacity(0.13) : .clear)
@@ -126,6 +141,7 @@ struct WorkspaceSidebar: View {
             .hoverFill(active ? .clear : Tok.fillTertiary, radius: 6)
             .overlay(alignment: .leading) { if active { tint.frame(width: 2.5).padding(.vertical, 5) } }
             .contentShape(Rectangle())
+            .onHover { hoverProject = $0 ? p.id : (hoverProject == p.id ? nil : hoverProject) }
             .onTapGesture { if p.id != store.activeProjectId { store.switchToProject(p.id) }; store.toggleExpand(p.id) }
             .draggable(p.id) { // drag handle for reordering
                 HStack(spacing: 6) { Icon(name: "folder", size: 13).foregroundStyle(tint); Text(p.name).font(TokFont.text(TokFont.caption, .semibold)) }
@@ -140,11 +156,21 @@ struct WorkspaceSidebar: View {
                 let sessions = store.activeSessions(p.id)
                 if sessions.isEmpty {
                     Button { store.newChat(p.id) } label: {
-                        HStack(spacing: 6) { Icon(name: "plus", size: 12).foregroundStyle(Tok.blue); Text("New chat").font(TokFont.text(TokFont.caption, .medium)).foregroundStyle(Tok.inkSecondary) }
+                        HStack(spacing: 6) { Icon(name: "plus", size: 12).foregroundStyle(Tok.inkTertiary); Text("New chat").font(TokFont.text(TokFont.caption, .medium)).foregroundStyle(Tok.inkTertiary) }
                             .padding(.leading, 26).padding(.vertical, 5)
                     }.buttonStyle(.plain)
                 } else {
-                    ForEach(sessions) { sessionRow($0, tint: tint) }
+                    // Cap the active list at 7 (CHAT_PREVIEW) unless searching or expanded.
+                    let showAll = store.chatsAllOpen.contains(p.id) || !store.query.isEmpty
+                    let shown = showAll ? sessions : Array(sessions.prefix(7))
+                    ForEach(shown) { sessionRow($0, tint: tint) }
+                    if store.query.isEmpty && sessions.count > 7 {
+                        Button { store.toggleChatsOpen(p.id) } label: {
+                            Text(showAll ? "Show less" : "Show all \(sessions.count) chats")
+                                .font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.blue)
+                                .padding(.leading, 26).padding(.vertical, 4)
+                        }.buttonStyle(.plain)
+                    }
                 }
                 let arch = store.archivedSessions(p.id)
                 if !arch.isEmpty {
@@ -186,11 +212,69 @@ struct WorkspaceSidebar: View {
         .animation(.easeOut(duration: 0.12), value: hoverSession)
         .contentShape(Rectangle())
         .onTapGesture { if renamingId != s.id { store.openChat(s) } }
-        .onHover { hoverSession = $0 ? s.id : (hoverSession == s.id ? nil : hoverSession) }
+        .onHover { hovering in
+            hoverSession = hovering ? s.id : (hoverSession == s.id ? nil : hoverSession)
+            // Preload this session's transcript so opening it is instant.
+            if hovering, let pid = s.projectId { TranscriptCache.shared.prefetch(s.id, projectId: pid, client: env.client) }
+        }
     }
 
     private func miniAction(_ icon: String, _ action: @escaping () -> Void) -> some View {
         Button(action: action) { Icon(name: icon, size: 11).foregroundStyle(Tok.inkTertiary).frame(width: 18, height: 18).contentShape(Rectangle()) }.buttonStyle(.plain)
+    }
+
+    /// The per-project ⋯ menu — Electron order: Project settings / Instructions & memory / Project
+    /// skills / Jobs · Reveal in Finder · Hide / Delete. (The global skills-registry shortcut is
+    /// omitted — the native sidebar has no route to it.)
+    private func projectMenu(_ p: Project) -> some View {
+        Menu {
+            Button { store.openProjectPanel(p.id, .settings) } label: { Label("Project settings", systemImage: "gearshape") }
+            Button { store.openProjectPanel(p.id, .instructions) } label: { Label("Instructions & memory", systemImage: "bookmark") }
+            Button { store.openProjectPanel(p.id, .skills) } label: { Label("Project skills", systemImage: "sparkles") }
+            Button { store.openProjectPanel(p.id, .jobs) } label: { Label("Jobs", systemImage: "list.bullet") }
+            Divider()
+            if let path = p.path, !path.isEmpty {
+                Button { NativeBridge.reveal(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
+            }
+            Divider()
+            Button { store.setHidden(p, !(p.hidden ?? false)) } label: {
+                Label(p.hidden == true ? "Unhide project" : "Hide project", systemImage: p.hidden == true ? "eye" : "eye.slash")
+            }
+            Button(role: .destructive) { confirmDeleteProject = p } label: { Label("Delete project", systemImage: "trash") }
+        } label: {
+            Icon(name: "more", size: 15).foregroundStyle(Tok.inkSecondary).frame(width: 20, height: 20).contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+    }
+
+    /// "Delete project?" confirm sheet — matches the Electron destructive modal copy.
+    private func deleteProjectModal(_ p: Project) -> some View {
+        let n = store.activeSessions(p.id).count + store.archivedSessions(p.id).count
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Icon(name: "trash", size: 20).foregroundStyle(Tok.red)
+                    .frame(width: 40, height: 40).background(Tok.red.opacity(0.14))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Delete project?").font(TokFont.display(TokFont.headline, .bold)).foregroundStyle(Tok.ink)
+                    Text(p.name).font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkSecondary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            Text("This removes the project and its \(n) chat\(n == 1 ? "" : "s") from Maestro. The folder on disk is left untouched. This can't be undone.")
+                .font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Spacer()
+                Button("Cancel") { confirmDeleteProject = nil }.buttonStyle(.plain)
+                    .font(TokFont.text(TokFont.footnote, .semibold)).foregroundStyle(Tok.ink)
+                    .padding(.horizontal, 14).frame(height: 32).background(Tok.fillSecondary).clipShape(Capsule())
+                Button("Delete project") { store.deleteProject(p); confirmDeleteProject = nil }.buttonStyle(.plain)
+                    .font(TokFont.text(TokFont.footnote, .semibold)).foregroundStyle(.white)
+                    .padding(.horizontal, 14).frame(height: 32).background(Tok.red).clipShape(Capsule())
+            }
+        }
+        .padding(20).frame(width: 380)
     }
     private func sectionLabel(_ t: String) -> some View {
         Text(t.uppercased()).font(TokFont.text(TokFont.caption, .bold)).tracking(0.5).foregroundStyle(Tok.inkTertiary)
