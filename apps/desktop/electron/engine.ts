@@ -591,6 +591,26 @@ export type EmitConfirm = (req: PrConfirmRequest) => void;
  *  modal, and the operator's click resolves the gate's pending Promise. */
 export type EmitPlanExit = (req: PlanModeExitRequest) => void;
 
+/** Format the `add_skill_to_project` tool reply. A registry skill installed
+ *  mid-turn is NOT re-scanned by the running CLI (settingSources discovery is a
+ *  startup-only scan), so we deliver the SKILL.md body INLINE — the agent can
+ *  follow it this turn without depending on a separate Read it sometimes skipped.
+ *  Body is capped at 32k (mirrors download_skill); when it couldn't be read we
+ *  fall back to the read nudge. Pure: the fs read happens in the caller. */
+export function formatSkillInstallReply(
+  rec: { name: string; slug: string; sha256?: string },
+  skillMdBody: string | null,
+): string {
+  const head = `Installed "${rec.name}" → .claude/skills/${rec.slug}/SKILL.md`
+    + `${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}.`
+    + ` It is now active for this project — invoke it via the Skill tool when relevant.`;
+  if (!skillMdBody) return `${head} Now read that file and follow it.`;
+  const trimmed = skillMdBody.length > 32000
+    ? skillMdBody.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]'
+    : skillMdBody;
+  return `${head}\n\nFollow these instructions for the task:\n\n---\n${trimmed}\n---`;
+}
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -617,6 +637,12 @@ async function runClaude(
   // the SDK fall back to a path that doesn't exist.
   if (!binary) throw Object.assign(new Error('Claude engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'claude' });
   let stderrTail = '';
+  // Live SDK query handle, assigned once query() is constructed below. Captured by
+  // the in-process maestro MCP tools (e.g. add_skill_to_project) so a mid-turn skill
+  // install can ask the running CLI to re-scan .claude/skills via reloadSkills().
+  // settingSources discovery is a STARTUP-only scan, so without this a freshly
+  // installed SKILL.md isn't surfaced as a first-class Skill until the next turn.
+  let activeQuery: ReturnType<typeof query> | null = null;
   /* Give Claude a real image capability. Claude Code ships no text→image tool,
      so without this it improvises (hand-written SVG). The in-process MCP tool's
      handler runs in THIS process (so it can call fal/MediaEngine via the injected
@@ -689,11 +715,24 @@ async function runClaude(
                 return txt(`# ${c.name}\n\nid=${c.id}\nsha256=${c.sha256 ?? 'unknown'}\n\n${body}`);
               })),
             tool('add_skill_to_project',
-              'Install a skill from the registry into THIS project (writes it to .claude/skills/<slug>/SKILL.md). After installing, READ that SKILL.md and follow it for the task. Use a skillId returned by search_skills.',
+              'Install a skill from the registry into THIS project (writes it to .claude/skills/<slug>/SKILL.md). The install RETURNS the skill\'s instructions inline and activates it as a Skill for this session — follow those instructions for the task. Use a skillId returned by search_skills.',
               { skillId: z.string().describe('The skill id from search_skills, e.g. "anthropics/skills/pdf".') },
               wrap(async (a: { skillId: string }) => {
                 const rec = await skillsCtx.install(a.skillId);
-                return txt(`Installed "${rec.name}" → .claude/skills/${rec.slug}/SKILL.md${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}. Now read that file and follow it.`);
+                // settingSources discovery is a STARTUP-only scan, so this just-written
+                // SKILL.md is invisible to the running CLI's Skill listing until the next
+                // turn. Ask the live session to re-scan now so the Skill tool can invoke it
+                // this session. Detached + best-effort: the inline body below already
+                // delivers the instructions this turn, so a missing/failed reload never
+                // blocks the agent loop (and the detached call can't deadlock the
+                // tool round-trip on the control channel).
+                void Promise.resolve().then(() => activeQuery?.reloadSkills?.()).catch(() => {});
+                // Deliver the skill body inline so the agent follows it immediately rather
+                // than depending on a follow-up Read it sometimes skipped ("dynamically
+                // loaded but not followed").
+                let body: string | null = null;
+                try { body = readFileSync(path.join(cwd, '.claude', 'skills', rec.slug, 'SKILL.md'), 'utf8'); } catch { /* fall back to the read nudge */ }
+                return txt(formatSkillInstallReply(rec, body));
               })),
             tool('list_project_skills',
               'List skills already installed in this project. Use this before searching if the needed capability may already be present.',
@@ -1469,6 +1508,10 @@ async function runClaude(
       },
     },
   });
+  // Expose the live query handle to the in-process maestro MCP tools (e.g.
+  // add_skill_to_project → reloadSkills). Tools only fire during iteration
+  // below, which is always after this assignment, so the closure capture is safe.
+  activeQuery = it;
   /* Build a STRUCTURED transcript: each assistant message is its own text
      block, each tool/skill call is a chip with status + duration, and the
      final result closes the run. Live deltas stream into the open block;
