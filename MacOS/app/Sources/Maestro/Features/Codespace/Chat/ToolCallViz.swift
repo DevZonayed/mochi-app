@@ -28,22 +28,25 @@ enum ToolViz {
         let n = raw.lowercased()
         func m(_ pat: String) -> Bool { n.range(of: pat, options: .regularExpression) != nil }
 
-        if m("multiedit|multi_edit|^edit|apply_patch|str_replace") { return .init(short: "Edit",  symbol: "pencil",                    tint: hex("#F5A623"), isFile: true,  mono: false) }
-        if m("^write|create_file|^notebook")                       { return .init(short: "Write", symbol: "square.and.pencil",          tint: hex("#34C759"), isFile: true,  mono: false) }
-        if m("^read|^view|^cat|open_file")                          { return .init(short: "Read",  symbol: "doc.text.magnifyingglass",   tint: hex("#5B8DEF"), isFile: true,  mono: false) }
-        if m("grep|^search$|ripgrep")                               { return .init(short: "Search",symbol: "magnifyingglass",            tint: hex("#AF52DE"), isFile: false, mono: false) }
-        if m("glob|^ls$|list_dir|list_files|^find")                 { return .init(short: "Find",  symbol: "asterisk",                   tint: hex("#AF52DE"), isFile: false, mono: false) }
-        if m("websearch|web_search")                                { return .init(short: "Web search",symbol: "globe",                  tint: hex("#30B0C7"), isFile: false, mono: false) }
-        if m("webfetch|web_fetch|^fetch|^http")                     { return .init(short: "Fetch", symbol: "arrow.down.circle",          tint: hex("#30B0C7"), isFile: false, mono: false) }
-        if m("browser|navigate|snapshot|playwright")                { return .init(short: "Browser",symbol: "safari",                    tint: hex("#007AFF"), isFile: false, mono: false) }
-        if m("image|photo|picture|generate_image")                  { return .init(short: "Image", symbol: "wand.and.stars",             tint: hex("#FF2D55"), isFile: false, mono: false) }
-        if m("todo")                                                { return .init(short: "Plan",  symbol: "checklist",                  tint: hex("#34C759"), isFile: false, mono: false) }
-        if m("task|subagent|^agent|dispatch")                       { return .init(short: "Agent", symbol: "person.2.badge.gearshape",   tint: hex("#FF9500"), isFile: false, mono: false) }
-        if m("schedule")                                            { return .init(short: "Schedule",symbol:"calendar.badge.clock",      tint: hex("#FF9500"), isFile: false, mono: false) }
-        if m("wa_|whatsapp")                                        { return .init(short: "WhatsApp",symbol:"message.fill",              tint: hex("#25D366"), isFile: false, mono: false) }
-        if m("bash|shell|^run|exec|terminal|command")               { return .init(short: "Run",   symbol: "terminal",                   tint: hex("#8E8E93"), isFile: false, mono: true) }
+        // Tints/glyphs mirror `lib/toolDisplay.ts` EXACTLY: file ops + search = teal, web = indigo,
+        // image/agent = purple, plan/run = blue. Read & Write share the `doc` (file) glyph like the
+        // reference. (Earlier this file used per-verb iOS accents — that departure is now removed.)
+        if m("multiedit|multi_edit|^edit|apply_patch|str_replace") { return .init(short: "Edit",  symbol: "pencil",          tint: Tok.teal,   isFile: true,  mono: false) }
+        if m("^write|create_file|^notebook")                       { return .init(short: "Write", symbol: "doc",             tint: Tok.teal,   isFile: true,  mono: false) }
+        if m("^read|^view|^cat|open_file")                          { return .init(short: "Read",  symbol: "doc",             tint: Tok.teal,   isFile: true,  mono: false) }
+        if m("grep|^search$|ripgrep")                               { return .init(short: "Search",symbol: "magnifyingglass", tint: Tok.teal,   isFile: false, mono: false) }
+        if m("glob|^ls$|list_dir|list_files|^find")                 { return .init(short: "Find",  symbol: "magnifyingglass", tint: Tok.teal,   isFile: false, mono: false) }
+        if m("websearch|web_search")                                { return .init(short: "Web search",symbol: "binoculars", tint: Tok.indigo, isFile: false, mono: false) }
+        if m("webfetch|web_fetch|^fetch|^http")                     { return .init(short: "Fetch", symbol: "globe",           tint: Tok.indigo, isFile: false, mono: false) }
+        if m("browser|navigate|snapshot|playwright")                { return .init(short: "Browser",symbol: "globe",          tint: Tok.indigo, isFile: false, mono: false) }
+        if m("image|photo|picture|generate_image")                  { return .init(short: "Image", symbol: "photo",           tint: Tok.purple, isFile: false, mono: false) }
+        if m("todo")                                                { return .init(short: "Plan",  symbol: "checkmark.circle",tint: Tok.blue,   isFile: false, mono: false) }
+        if m("task|subagent|^agent|dispatch")                       { return .init(short: "Agent", symbol: "sparkles",        tint: Tok.purple, isFile: false, mono: false) }
+        if m("schedule")                                            { return .init(short: "Schedule",symbol:"calendar.badge.clock", tint: Tok.orange, isFile: false, mono: false) }
+        if m("wa_|whatsapp")                                        { return .init(short: "WhatsApp",symbol:"message.fill",   tint: hex("#25D366"), isFile: false, mono: false) }
+        if m("bash|shell|^run|exec|terminal|command")               { return .init(short: "Run",   symbol: "terminal",        tint: Tok.blue,   isFile: false, mono: true) }
         let pretty = prettify(raw)
-        return .init(short: pretty.isEmpty ? "Tool" : pretty, symbol: "wrench.and.screwdriver", tint: Tok.inkSecondary, isFile: false, mono: false)
+        return .init(short: pretty.isEmpty ? "Tool" : pretty, symbol: "command", tint: Tok.inkSecondary, isFile: false, mono: false)
     }
 
     static func isSkill(_ name: String?) -> Bool { (name ?? "").lowercased() == "skill" }
@@ -127,7 +130,8 @@ enum ToolViz {
     /// extension string so TypeScript/Python/Go/Rust chips are distinguishable at a glance.
     private static let glyphExts: Set<String> = ["png", "jpg", "jpeg", "gif", "svg", "webp", "heic", "pdf", "zip", "lock"]
     static func badgeUsesSymbol(_ name: String) -> Bool { glyphExts.contains(fileExt(name)) }
-    static func badgeText(_ name: String) -> String { let e = fileExt(name); return e.isEmpty ? "•" : String(e.prefix(4)) }
+    /// Badge text mirrors `fileChip.tsx` `(ext || 'file').slice(0,4)`.
+    static func badgeText(_ name: String) -> String { let e = fileExt(name); return e.isEmpty ? "file" : String(e.prefix(4)) }
 
     private static let extSymbol: [String: String] = [
         "swift": "swift",
@@ -155,16 +159,19 @@ enum ToolViz {
         "svelte": "chevron.left.forwardslash.chevron.right", "dart": "chevron.left.forwardslash.chevron.right",
     ]
 
+    /// Aligned 1:1 with `lib/fileChip.tsx` EXT_COLOR (GitHub-linguist accents). Extensions not in
+    /// this map fall back to ink-tertiary (matching the reference).
     private static let extColorHex: [String: String] = [
-        "js": "#F7DF1E", "cjs": "#F7DF1E", "mjs": "#F7DF1E", "jsx": "#61DAFB", "ts": "#3178C6", "tsx": "#3178C6",
-        "json": "#E8A33D", "jsonc": "#E8A33D", "py": "#3776AB", "rb": "#CC342D", "go": "#00ADD8", "rs": "#DEA584", "php": "#777BB4",
-        "html": "#E34F26", "htm": "#E34F26", "css": "#1572B6", "scss": "#CC6699", "sass": "#CC6699", "md": "#8A9199", "mdx": "#FCB32C",
-        "sh": "#4EAA25", "bash": "#4EAA25", "zsh": "#4EAA25", "yml": "#CB171E", "yaml": "#CB171E", "toml": "#9C4221", "ini": "#6D8086",
-        "env": "#ECD53F", "sql": "#E38C00", "java": "#EA2D2E", "kt": "#7F52FF", "swift": "#F05138", "c": "#5C6BC0", "h": "#9575CD",
-        "cpp": "#00599C", "cs": "#68217A", "vue": "#41B883", "svelte": "#FF3E00", "dart": "#00B4AB", "xml": "#F1662A", "svg": "#FFB13B",
-        "txt": "#8A9199", "lock": "#8A9199", "dockerfile": "#2496ED", "png": "#26A69A", "jpg": "#26A69A", "jpeg": "#26A69A",
-        "webp": "#26A69A", "heic": "#42A5F5", "gif": "#AB47BC", "pdf": "#E5252A", "zip": "#FBC02D", "csv": "#1D6F42",
-        "gitignore": "#F05033", "plist": "#8A9199",
+        "js": "#f7df1e", "cjs": "#f7df1e", "mjs": "#f7df1e", "jsx": "#61dafb", "ts": "#3178c6", "tsx": "#3178c6",
+        "json": "#cbcb41", "jsonc": "#cbcb41", "py": "#3572a5", "rb": "#cc342d", "go": "#00add8", "rs": "#dea584", "php": "#777bb4",
+        "html": "#e34c26", "htm": "#e34c26", "css": "#2965f1", "scss": "#c6538c", "sass": "#c6538c", "md": "#519aba", "mdx": "#519aba",
+        "sh": "#89e051", "bash": "#89e051", "zsh": "#89e051", "yml": "#cb171e", "yaml": "#cb171e", "toml": "#9c4221", "ini": "#6d8086",
+        "env": "#cbcb41", "sql": "#e38c00", "java": "#b07219", "kt": "#a97bff", "swift": "#f05138", "c": "#599bd6", "h": "#599bd6",
+        "cpp": "#f34b7d", "cs": "#178600", "vue": "#41b883", "svelte": "#ff3e00", "dart": "#00b4ab", "xml": "#0060ac", "svg": "#ffb13b",
+        "txt": "#9aa0a6", "lock": "#9aa0a6", "dockerfile": "#2496ed",
+        // Media/binary kept for the file-tree (Phase 5); the transcript chip shows ext text either way.
+        "png": "#26a69a", "jpg": "#26a69a", "jpeg": "#26a69a", "webp": "#26a69a", "heic": "#42a5f5",
+        "gif": "#ab47bc", "pdf": "#e5252a", "zip": "#fbc02d", "csv": "#1d6f42", "gitignore": "#f05033", "plist": "#9aa0a6",
     ]
 
     /// Rejoin a project-relative path with the project root so a chip can be previewed. Absolute
@@ -217,19 +224,18 @@ private extension String {
 /// foreground ink is luminance-clamped so bright accents stay legible on a white tile in light mode.
 struct FileTypeIcon: View {
     let name: String
+    /// Larger variant for the file tree (Phase 5). The transcript chip uses the default.
+    var compact: Bool = true
     var body: some View {
-        Group {
-            if ToolViz.badgeUsesSymbol(name) {
-                Image(systemName: ToolViz.fileSymbol(name)).font(.system(size: 10.5, weight: .semibold))
-            } else {
-                Text(ToolViz.badgeText(name)).font(.system(size: 9, weight: .heavy, design: .monospaced))
-            }
-        }
-        .foregroundStyle(ToolViz.extInk(name))
-        .frame(width: 22, height: 16)
-        .background(ToolViz.extColor(name).opacity(0.20))
-        .overlay(RoundedRectangle(cornerRadius: 4, style: .continuous).strokeBorder(ToolViz.extColor(name).opacity(0.34), lineWidth: 0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        Text(ToolViz.badgeText(name))
+            .font(.system(size: compact ? 9 : 9.5, weight: .bold, design: .monospaced))
+            .tracking(0.18)
+            .foregroundStyle(ToolViz.extInk(name))
+            .padding(.horizontal, 4)
+            .frame(minWidth: 18, idealWidth: 18)
+            .frame(height: 16)
+            .background(ToolViz.extColor(name).opacity(0.22))
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
     }
 }
 
@@ -251,36 +257,18 @@ struct ToolFileChip: View {
         Button { if let abs { onOpenFile(abs) } } label: {
             HStack(spacing: 6) {
                 FileTypeIcon(name: rel)
-                Text(pathAttr).lineLimit(1).truncationMode(.head).frame(maxWidth: maxPathWidth, alignment: .leading)
+                Text(ToolViz.baseName(rel))
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Tok.ink)
+                    .lineLimit(1).truncationMode(.tail).frame(maxWidth: maxPathWidth, alignment: .leading)
             }
-            .padding(.horizontal, 7).padding(.vertical, 3)
-            .background(hovering ? Tok.fillSecondary : Tok.fillTertiary)
+            .padding(.horizontal, hovering ? 7 : 0).padding(.vertical, hovering ? 3 : 0)
+            .background(hovering ? Tok.fillSecondary : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
         }
         .buttonStyle(.plain).pressable(scale: 0.97)
         .onHover { hovering = $0 }
         .help((abs ?? rel) + " — click to preview")
-    }
-
-    /// dimmed directory prefix + emphasised basename, head-truncated so the filename always shows.
-    /// dir/base are split on the actual last separator so the chip never garbles trailing-slash or
-    /// query-string paths.
-    private var pathAttr: AttributedString {
-        let (dir, base): (String, String) = {
-            if let i = rel.lastIndex(where: { $0 == "/" || $0 == "\\" }) {
-                return (String(rel[...i]), String(rel[rel.index(after: i)...]))
-            }
-            return ("", rel)
-        }()
-        var a = AttributedString()
-        if !dir.isEmpty {
-            var d = AttributedString(dir); d.foregroundColor = Tok.inkTertiary
-            d.font = .system(size: 12, design: .monospaced); a += d
-        }
-        var b = AttributedString(base.isEmpty ? rel : base); b.foregroundColor = Tok.ink
-        b.font = .system(size: 12.5, weight: .medium, design: .monospaced); a += b
-        return a
     }
 }
 
@@ -292,12 +280,18 @@ struct ToolCallRow: View {
     var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
     var projectRoot: String? { root }
     @State private var expanded = false
+    @State private var hovering = false
 
     private var d: ToolViz.Display { ToolViz.display(item.name) }
     private var skill: Bool { ToolViz.isSkill(item.name) }
     private var error: Bool { item.toolStatus == "error" }
     private var running: Bool { item.toolStatus == "running" }
     private var hasChildren: Bool { !(item.children ?? []).isEmpty }
+    private var hasNest: Bool { hasChildren || !(item.result?.trimmed.isEmpty ?? true) }
+    /// Auto-expanded while the sub-agent is RUNNING (mirrors SessionTranscript `isOpen`).
+    private var isOpen: Bool { hasNest && (expanded || running) }
+    /// The Response-block rail/tile tint (purple-mixed-with-separator).
+    private var purpleRail: Color { Tok.purple.opacity(0.45) }
     private var detailText: String { skill ? ToolViz.prettySkill(ToolViz.scrubInternalMcp(item.text)) : ToolViz.detail(item) }
     private var showFile: Bool { d.isFile && !detailText.isEmpty && !skill }
     private var cleanCmd: String? { item.cmd.map(ToolViz.scrubInternalMcp).flatMap { $0.isEmpty ? nil : $0 } }
@@ -309,35 +303,56 @@ struct ToolCallRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: isOpen ? 4 : 0) {
             // Only wrap the row in a (toggle) Button when it actually expands — a disabled Button
             // would also disable the nested file chip's Button, killing the click-to-preview.
-            if hasChildren {
+            if hasNest {
                 Button { withAnimation(.smooth(duration: 0.2)) { expanded.toggle() } } label: { row }
                     .buttonStyle(.plain)
             } else {
                 row
             }
 
-            if expanded, let kids = item.children, !kids.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(kids) { TranscriptBlock(item: $0, projectRoot: projectRoot, onOpenFile: onOpenFile) }
-                    if let r = item.result, !r.isEmpty {
-                        Text(r).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkSecondary)
+            if isOpen {
+                // The sub-agent's OWN transcript + a purple "RESPONSE" card, behind a purple-tinted
+                // indent rail (marginLeft 22, paddingLeft 12 — mirrors the reference).
+                HStack(alignment: .top, spacing: 12) {
+                    purpleRail.frame(width: 1.5)
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let kids = item.children, !kids.isEmpty {
+                            ForEach(kids) { TranscriptBlock(item: $0, projectRoot: projectRoot, onOpenFile: onOpenFile) }
+                        }
+                        if let r = item.result?.trimmed, !r.isEmpty { responseBlock(r) }
                     }
                 }
-                .padding(.leading, 18).padding(.vertical, 4)
-                .overlay(alignment: .leading) { Tok.separator.frame(width: Tok.hairline) }
+                .padding(.leading, 22).padding(.top, 2).padding(.bottom, 4)
                 .transition(.opacity.combined(with: .offset(y: -4)))
             }
         }
-        .padding(.vertical, 1)
+    }
+
+    /// The purple-tinted "RESPONSE" card shown for a finished sub-agent.
+    private func responseBlock(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)).foregroundStyle(Tok.purple)
+                    .frame(width: 18, height: 18).background(Tok.purple.opacity(0.14))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                Text("RESPONSE").font(TokFont.text(TokFont.caption, .semibold)).tracking(0.7).foregroundStyle(Tok.purple)
+            }
+            MarkdownText(text: text, projectRoot: projectRoot, baseSize: 13, bodyColor: Tok.ink)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12).padding(.vertical, 10)
+                .background(ZStack { Tok.bgElevated; Tok.purple.opacity(0.04) })
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Tok.purple.opacity(0.18), lineWidth: Tok.hairline))
+        }
     }
 
     private var row: some View {
         HStack(alignment: hasCmd ? .top : .center, spacing: 9) {
             Image(systemName: skill ? "sparkles" : d.symbol)
-                .font(.system(size: 13.5, weight: .medium))
+                .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(skill ? Tok.purple : (error ? Tok.red : d.tint))
                 .frame(width: 16).padding(.top, hasCmd ? 2 : 0)
 
@@ -371,7 +386,10 @@ struct ToolCallRow: View {
             Spacer(minLength: 6)
             trailing.padding(.top, hasCmd ? 2 : 0)
         }
+        .padding(.horizontal, 7).padding(.vertical, 4)
+        .background(hovering ? Tok.fillTertiary : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .contentShape(Rectangle())
+        .onHover { hovering = $0 }
     }
 
     @ViewBuilder private var trailing: some View {

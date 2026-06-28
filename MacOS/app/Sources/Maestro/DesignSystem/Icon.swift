@@ -28,6 +28,11 @@ struct Icon: View {
         "maximize": "arrow.up.left.and.arrow.down.right", "minimize": "arrow.down.right.and.arrow.up.left",
         "bookmark": "bookmark", "paperclip": "paperclip", "sliders": "slider.horizontal.3",
         "command": "command",
+        // Tool/transcript + file-surface glyphs (parity with lib/icons.tsx)
+        "file": "doc", "image": "photo", "checkCircle": "checkmark.circle",
+        "xCircle": "xmark.circle", "gitBranch": "arrow.triangle.branch",
+        "copy": "doc.on.doc", "pause": "pause.fill",
+        "arrowLeft": "arrow.left", "arrowRight": "arrow.right", "dollar": "dollarsign",
     ]
 
     var body: some View {

@@ -32,9 +32,10 @@ import { readProjectState, writeProjectState, listCheckpoints } from './continuu
 import { saveAttachment, substitutePlaceholders } from './attachments.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
 import { scanConversations, parseConversation, type ConvSource } from './conversation-sync.js';
-import { existsSync, mkdirSync, cpSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, cpSync, readdirSync, statSync, realpathSync, promises as fsp } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { app, shell } from 'electron';
 import { locateExtension } from './extension-locator.js';
 
@@ -111,6 +112,40 @@ function normalizeMcpInput(p: Params): Omit<CustomMcpServer, 'id' | 'createdAt'>
 function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
+
+/* ── File/dir/command surface (ported VERBATIM from the Electron-only
+   `ipcMain.handle('maestro:*')` channels in main.ts so the headless macOS
+   sidecar — which serves ONLY dispatch(method, params) — gets identical
+   behavior: same path confinement, caps, filters, sort, and return shapes). */
+
+const IMG_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
+
+/* Resolve `rel` to a canonical path that is provably INSIDE the project root.
+   Defends against `..` escapes and symlinks pointing out of the repo. Accepts
+   either a path relative to the root or an absolute path that lands inside it. */
+const resolveInsideRoot = (rawRoot: string, rel: string): string => {
+  const root = rawRoot.startsWith('~/') || rawRoot === '~' ? nodePath.join(app.getPath('home'), rawRoot.slice(1)) : rawRoot;
+  const rootReal = realpathSync(nodePath.resolve(root));
+  const target = nodePath.resolve(rootReal, String(rel ?? ''));
+  const relToRoot = nodePath.relative(rootReal, target);
+  if (relToRoot.startsWith('..') || nodePath.isAbsolute(relToRoot)) throw new Error('path escapes project');
+  const real = realpathSync(target);
+  const relReal = nodePath.relative(rootReal, real);
+  if (relReal.startsWith('..') || nodePath.isAbsolute(relReal)) throw new Error('symlink escapes project');
+  return real;
+};
+
+/** A project's working root on disk for the file/dir arms (matches the
+    `projectRoot` helper in main.ts). Throws if the project has no folder. */
+const rootOfProject = (store: Store, projectId: unknown): string => {
+  const root = store.getProject(String(projectId))?.path;
+  if (!root) throw new Error('this project has no folder on disk');
+  return root;
+};
+
+/** Module-level map of runId → child process for the `runCommand`/`killCommand`
+    pair (matches the `runningCmds` map in main.ts). */
+const runningCmds = new Map<string, ChildProcess>();
 
 export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null, gitWatcher?: GitWatcher) {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
@@ -1707,6 +1742,129 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
       // ── Pairing (desktop-only; never enters relay snapshots) ──
       case 'getPairing': return { token: store.accessToken, relayUrl, devices: store.getRemoteDevices() };
+
+      // ── File / dir / command surface ───────────────────────────
+      // Ported VERBATIM from the Electron-only `maestro:*` IPC channels in
+      // main.ts so the headless macOS sidecar gets identical behavior. These
+      // throw (via plain Error or `bad`) on failure rather than returning the
+      // main.ts `{ ok, error }` envelope — dispatch arms return data directly
+      // and the WS/IPC layer surfaces thrown errors to the caller.
+
+      // Reveal a path in Finder — path-guarded. Expands a leading ~.
+      case 'revealPath': {
+        const pth = p.path;
+        if (typeof pth !== 'string' || !pth) return bad('no path');
+        const abs = pth.startsWith('~/') || pth === '~' ? nodePath.join(app.getPath('home'), pth.slice(1)) : pth;
+        if (existsSync(abs)) { shell.showItemInFolder(abs); return { ok: true }; }
+        return bad('path not found', 404);
+      }
+
+      // Inline image bytes for the chat, keyed by a TRUSTED Asset id (the caller
+      // never supplies a path, so there's no traversal surface).
+      case 'assetImage': {
+        const a = store.getAsset(String(p.assetId ?? ''));
+        if (!a?.localPath || !existsSync(a.localPath)) return bad('no local image', 404);
+        const st = await fsp.stat(a.localPath);
+        if (st.size > 12 * 1024 * 1024) return bad('image too large to preview');
+        const ext = (a.localPath.split('.').pop() ?? 'png').toLowerCase();
+        const mime = IMG_MIME[ext] ?? 'application/octet-stream';
+        const b64 = (await fsp.readFile(a.localPath)).toString('base64');
+        return { dataUrl: `data:${mime};base64,${b64}` };
+      }
+
+      // Read a file's text — confined to the project folder.
+      case 'readFile': {
+        const real = resolveInsideRoot(rootOfProject(store, p.projectId), String(p.path ?? ''));
+        const st = await fsp.stat(real);
+        if (!st.isFile()) return bad('not a file');
+        if (st.size > 2 * 1024 * 1024) {
+          const fd = await fsp.open(real, 'r');
+          try { const buf = Buffer.alloc(512 * 1024); const { bytesRead } = await fd.read(buf, 0, buf.length, 0); return { path: real, text: buf.subarray(0, bytesRead).toString('utf8'), bytes: st.size, truncated: true }; }
+          finally { await fd.close(); }
+        }
+        const text = await fsp.readFile(real, 'utf8');
+        if (text.includes('\u0000')) return bad('binary file');
+        return { path: real, text, bytes: st.size, truncated: false };
+      }
+
+      // Write a file's text — confined to the project folder, ONLY overwrites an
+      // existing regular text file (no creating new files, no overwriting binaries).
+      case 'writeFile': {
+        const text = p.text;
+        if (typeof text !== 'string') return bad('text must be a string');
+        if (text.length > 4 * 1024 * 1024) return bad('file too large to save here (4 MB cap)');
+        if (text.includes('\u0000')) return bad('refused to write NUL byte (binary)');
+        const real = resolveInsideRoot(rootOfProject(store, p.projectId), String(p.path ?? ''));
+        const st = await fsp.stat(real);
+        if (!st.isFile()) return bad('not a file');
+        await fsp.writeFile(real, text, 'utf8');
+        const next = await fsp.stat(real);
+        return { path: real, bytes: next.size, mtime: next.mtimeMs };
+      }
+
+      // List a directory's immediate entries — confined to the project.
+      case 'listDir': {
+        const real = resolveInsideRoot(rootOfProject(store, p.projectId), String(p.path ?? ''));
+        const st = await fsp.stat(real);
+        if (!st.isDirectory()) return bad('not a directory');
+        const dirents = await fsp.readdir(real, { withFileTypes: true });
+        const entries = dirents
+          .filter(d => d.name !== '.git' && d.name !== 'node_modules' && d.name !== '.DS_Store')
+          .slice(0, 5000)
+          .map(d => ({ name: d.name, path: nodePath.join(real, d.name), kind: d.isDirectory() ? 'dir' : d.isFile() ? 'file' : 'other' }))
+          .sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'dir' ? -1 : 1));
+        return { path: real, entries };
+      }
+
+      // Flat list of the project's files (project-relative paths) for fast
+      // @-mention file search. Common build/vendor dirs are skipped and the
+      // walk is capped so even huge repos stay snappy.
+      case 'listProjectFiles': {
+        const root = rootOfProject(store, p.projectId);
+        const IGNORE = new Set(['.git', 'node_modules', '.DS_Store', 'dist', 'build', '.next', 'out', 'coverage', '.turbo', '.cache', 'target', '.venv', 'venv', '__pycache__', '.idea', '.vscode', '.parcel-cache', 'vendor', '.gradle', 'Pods', '.expo']);
+        const CAP = 20000;
+        const files: string[] = [];
+        const walk = async (dir: string, rel: string): Promise<void> => {
+          if (files.length >= CAP) return;
+          let dirents;
+          try { dirents = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+          for (const d of dirents) {
+            if (files.length >= CAP) return;
+            if (IGNORE.has(d.name)) continue;
+            const childRel = rel ? `${rel}/${d.name}` : d.name;
+            if (d.isDirectory()) await walk(nodePath.join(dir, d.name), childRel);
+            else if (d.isFile()) files.push(childRel);
+          }
+        };
+        await walk(root, '');
+        files.sort();
+        return { files, truncated: files.length >= CAP };
+      }
+
+      // Run/Terminal: spawn a shell command in the project folder and stream
+      // output back over the event bus as a `cmd-output` event with payload
+      // { runId, stream:'out'|'err'|'exit', chunk?, code? }.
+      case 'runCommand': {
+        const root = store.getProject(String(p.projectId ?? ''))?.path;
+        if (!root) return bad('this project has no folder');
+        const command = p.command;
+        if (typeof command !== 'string' || !command.trim()) return bad('command required');
+        const runId = `${Date.now().toString(36)}-${process.hrtime.bigint().toString(36)}`;
+        const child = spawn('/bin/zsh', ['-lc', command], { cwd: root, env: { ...process.env } });
+        runningCmds.set(runId, child);
+        const send = (stream: string, chunk: string, code?: number) => { try { emit('cmd-output', { runId, stream, chunk, code }); } catch { /* bus gone */ } };
+        child.stdout?.on('data', (d: Buffer) => send('out', String(d)));
+        child.stderr?.on('data', (d: Buffer) => send('err', String(d)));
+        child.on('close', (code) => { runningCmds.delete(runId); send('exit', '', code ?? 0); });
+        child.on('error', (err) => { runningCmds.delete(runId); send('err', err.message + '\n'); send('exit', '', 1); });
+        return { runId };
+      }
+      case 'killCommand': {
+        const runId = String(p.runId ?? '');
+        const c = runningCmds.get(runId);
+        if (c) { try { c.kill('SIGTERM'); } catch { /* gone */ } runningCmds.delete(runId); return { ok: true }; }
+        return { ok: false };
+      }
 
       default:
         return bad(`unknown method: ${method}`, 404);

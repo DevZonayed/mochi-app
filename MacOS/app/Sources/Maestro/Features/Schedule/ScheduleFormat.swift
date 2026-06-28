@@ -84,6 +84,38 @@ func fmtWhen(_ tsMs: Double) -> String {
     return "\(date), \(time)"
 }
 
+/// The web "next run" relative string from a next-fire ms timestamp: "—" / "due now" / "5m" / "2h 3m".
+func nextLine(_ nextRun: Double?) -> String {
+    guard let nextRun else { return "—" }
+    let ms = nextRun - Date().timeIntervalSince1970 * 1000
+    if ms <= 0 { return "due now" }
+    let mins = Int((ms / 60000).rounded())
+    if mins < 60 { return "\(mins)m" }
+    let hrs = mins / 60
+    if hrs < 24 { return "\(hrs)h \(mins % 60)m" }
+    let days = hrs / 24
+    return "\(days)d \(hrs % 24)h"
+}
+
+/// The concrete fire time of `schedule` on `day`, or nil if it doesn't occur then. Interval
+/// schedules return nil (no single time-of-day — they live in the list, not the clock grid).
+func scheduleOccurrence(_ s: Schedule, on day: Date, cal: Calendar = .current) -> Date? {
+    if s.isOneShot, let f = s.fireAt {
+        let d = Date(timeIntervalSince1970: f / 1000)
+        return cal.isDate(d, inSameDayAs: day) ? d : nil
+    }
+    if s.isInterval { return nil }
+    guard s.hasClock, let t = s.time else { return nil }
+    let cadence = s.cadence?.lowercased() ?? ""
+    let days = daysFromCadence(s.cadence)
+    let isDaily = cadence.contains("daily") || days.count == 7 || (days.isEmpty && cadence.isEmpty)
+    let wd = (cal.component(.weekday, from: day) + 5) % 7   // 0=Mon … 6=Sun
+    if !isDaily && !days.contains(wd) { return nil }
+    let parts = t.split(separator: ":")
+    guard parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]) else { return nil }
+    return cal.date(bySettingHour: h, minute: m, second: 0, of: day)
+}
+
 // MARK: - Schedule-derived presentation
 
 extension Schedule {
@@ -123,6 +155,31 @@ extension Schedule {
         case "retry-run":       return "RETRY"
         case "whatsapp-analyze":return "WHATSAPP"
         default:                return nil
+        }
+    }
+
+    /// The web "cron line": "Every 1h · catch-up" / "once at 00:01" / "Every day at 09:00" / "On demand".
+    var cronLine: String {
+        if isInterval, let m = everyMinutes {
+            let h = m / 60, mm = m % 60
+            let base = "Every \(h > 0 ? "\(h)h" : "")\(mm > 0 ? " \(mm)m" : "")".trimmingCharacters(in: .whitespaces)
+            return base + (catchUp == true ? " · catch-up" : "")
+        }
+        let cad = (cadence ?? "").trimmingCharacters(in: .whitespaces)
+        let t = (time ?? "").trimmingCharacters(in: .whitespaces)
+        if cad.isEmpty && t.isEmpty { return "On demand" }
+        if t.isEmpty { return cad }
+        let everyDay = cad.isEmpty || cad.lowercased().contains("every day") || cad == "*" || cad.lowercased() == "daily"
+        let base = everyDay ? "Every day at \(t)" : "\(cad) at \(t)"
+        return base + (catchUp == true ? " · catch-up" : "")
+    }
+
+    /// The web "system badge" for autopilot followups: keep-going → Autopilot; auto-answer → Auto-answer.
+    var systemBadge: (label: String, icon: String)? {
+        switch kind {
+        case "keep-going": return ("Autopilot", "bolt")
+        case "auto-answer": return ("Auto-answer", "bolt")
+        default: return nil
         }
     }
 

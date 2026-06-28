@@ -8,6 +8,8 @@ struct CommsGateway: View {
     @State private var tab: Tab = .channels
     @State private var tgToken = ""
     @State private var recipient = ""
+    @State private var recipientSaved = false
+    @State private var waPhone = ""
     @State private var bindTarget: PendingChat?
 
     enum Tab: String, CaseIterable { case channels = "Channels", bindings = "Bindings", activity = "Activity" }
@@ -16,7 +18,7 @@ struct CommsGateway: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 Text("Comms").font(TokFont.display(TokFont.largeTitle, .bold)).foregroundStyle(Tok.ink)
-                Text("Drive Maestro from Telegram, and keep WhatsApp on this Mac.")
+                Text("Drive Maestro from Telegram, and let WhatsApp chats summarize themselves to your number when they go quiet — all on this Mac.")
                     .font(TokFont.text(TokFont.subhead)).foregroundStyle(Tok.inkSecondary).padding(.top, 4).padding(.bottom, 20)
 
                 SegmentedControl(options: Tab.allCases.map { ($0, tabLabel($0), nil) },
@@ -87,44 +89,138 @@ struct CommsGateway: View {
                 if store.wa?.sendApproved == false {
                     HStack(spacing: 10) {
                         Icon(name: "shield", size: 18).foregroundStyle(Tok.orange)
-                        Text("Before Maestro messages summaries to your own number, it needs your OK.").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.ink)
+                        Text(approvalText(store)).font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.ink)
                         Spacer()
                         Button("Allow") { Task { await store.approveSend() } }.buttonStyle(.plain)
                             .font(TokFont.text(TokFont.footnote, .semibold)).foregroundStyle(.white).padding(.horizontal, 14).frame(height: 34).background(Tok.green).clipShape(Capsule())
                     }
                     .padding(12).background(Tok.orange.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: 12))
                 }
-                HStack(spacing: 8) {
-                    TextField("Your number (digits)", text: $recipient).textFieldStyle(.plain).font(TokFont.mono(TokFont.footnote)).inputBox()
-                        .onSubmit { Task { await store.setRecipient(recipient.trimmed) } }
-                    PillButton(title: "Save", kind: .plain) { Task { await store.setRecipient(recipient.trimmed) } }
-                }
-                Toggle(isOn: Binding(get: { store.wa?.agentSendToOthers ?? false }, set: { v in Task { await store.setAgentSend(v) } })) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Let the agent message contacts").font(TokFont.text(TokFont.callout, .semibold)).foregroundStyle(Tok.ink)
-                        Text("The agent can always message your own number; turn this on to message others.").font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkSecondary)
-                    }
-                }.toggleStyle(.switch).tint(Tok.green)
-                HStack {
-                    PillButton(title: "Open WhatsApp", icon: "whatsapp", kind: .plain) { env.route = .whatsapp }
-                    Spacer()
-                    Button("Pause") { Task { await store.disconnectWhatsApp() } }.buttonStyle(.plain).font(TokFont.text(TokFont.footnote, .semibold)).foregroundStyle(Tok.inkSecondary)
-                    Button("Unlink") { Task { await store.unlinkWhatsApp() } }.buttonStyle(.plain).font(TokFont.text(TokFont.footnote, .semibold)).foregroundStyle(Tok.red)
+                recipientSection(store)
+                agentSendCard(store)
+                HStack(alignment: .center, spacing: 12) {
+                    Text("Open the WhatsApp space to read and reply to every chat. Assign chats to a project under Bindings; a chat that goes quiet for 15 min is summarized to you.")
+                        .font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    actionPill("Open WhatsApp", bg: Tok.green, fg: .white) { env.route = .whatsapp }
+                    actionPill("Pause", bordered: true) { Task { await store.disconnectWhatsApp() } }
+                    actionPill("Unlink", fg: Tok.red, bordered: true) { Task { await store.unlinkWhatsApp() } }
                 }
             } else if store.linking {
                 VStack(spacing: 10) {
-                    if let img = qrImage(store.qrImageData) {
-                        Image(nsImage: img).resizable().interpolation(.none).frame(width: 200, height: 200)
+                    if let code = store.pairingCode {
+                        Text("Pairing code").font(TokFont.text(TokFont.callout, .semibold)).foregroundStyle(Tok.ink)
+                        Text(code).font(.system(size: TokFont.title2, weight: .semibold, design: .monospaced)).tracking(3).foregroundStyle(Tok.ink)
+                        Text("Enter it in WhatsApp → Linked Devices → Link with phone number.")
+                            .font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkSecondary).multilineTextAlignment(.center)
+                    } else if let img = qrImage(store.qrImageData) {
+                        Image(nsImage: img).resizable().interpolation(.none).frame(width: 180, height: 180)
                             .padding(8).background(.white).clipShape(RoundedRectangle(cornerRadius: 12))
-                        Text("Scan with WhatsApp → Linked devices").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkSecondary)
+                        Text("Scan to link your number").font(TokFont.text(TokFont.callout, .semibold)).foregroundStyle(Tok.ink)
+                        VStack(alignment: .leading, spacing: 3) {
+                            qrStep(1, "Open WhatsApp on your phone")
+                            qrStep(2, "Settings → Linked Devices → Link a Device")
+                            qrStep(3, "Point it at this code")
+                        }
                     } else {
                         Spinner(size: 20).tint(Tok.green); Text("Starting…").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary)
                     }
                     Button("Cancel") { Task { await store.cancelLink() } }.buttonStyle(.plain).font(TokFont.text(TokFont.footnote, .semibold)).foregroundStyle(Tok.inkSecondary)
                 }.frame(maxWidth: .infinity)
             } else {
-                PillButton(title: "Link your number", kind: .primary) { Task { await store.linkWhatsApp() } }
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .top, spacing: 10) {
+                        Icon(name: "alert", size: 16).foregroundStyle(Tok.red).padding(.top, 1)
+                        Text("This links your **personal** number via an unofficial connection. WhatsApp may ban numbers that automate — this is your own informed choice. Your chats are read and stored only on this Mac (never sent to the relay).")
+                            .font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.ink).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Tok.red.opacity(0.09)).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    HStack(spacing: 8) {
+                        TextField("Phone for a pairing code (optional)", text: $waPhone).textFieldStyle(.plain).font(TokFont.mono(TokFont.footnote)).inputBox()
+                        PillButton(title: (store.wa?.linkedAt != nil) ? "Re-link number" : "Link your number", kind: .primary) {
+                            Task { await store.linkWhatsApp(phone: waPhone.trimmed.isEmpty ? nil : waPhone.trimmed) }
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    /// "Your number — where summaries & confirmations go" — the personal-number recipient field.
+    private func recipientSection(_ store: CommsStore) -> some View {
+        let pa = digits(store.wa?.jid)
+        let typed = digits(recipient)
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Your number — where summaries & confirmations go").font(TokFont.text(TokFont.callout, .semibold)).foregroundStyle(Tok.ink)
+            Text(Self.recipientHelp(pa))
+                .font(TokFont.text(TokFont.caption)).lineSpacing(2).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                TextField("e.g. 8801604123482", text: $recipient).textFieldStyle(.plain).font(TokFont.mono(TokFont.footnote)).inputBox()
+                    .onSubmit { saveRecipient(store) }
+                Button { saveRecipient(store) } label: {
+                    Text(recipientSaved ? "Saved ✓" : "Save").font(TokFont.text(TokFont.footnote, .semibold))
+                        .foregroundStyle(.white).padding(.horizontal, 16).frame(height: 38)
+                        .background(Tok.green).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }.buttonStyle(.plain)
+            }
+            if !typed.isEmpty { Text("Will message: +\(typed)").font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary) }
+        }
+        .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Tok.bgGrouped).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+    }
+
+    /// The recipient help line as a markdown AttributedString (bold parts in `--ink`, rest secondary).
+    private static func recipientHelp(_ pa: String) -> AttributedString {
+        let md = "The linked account above is your “PA” number\(pa.isEmpty ? "" : " (\(pa))"). Enter the **personal** number you want to receive on — full international format, **country code, no “+” and no leading 0**. Leave blank to use the linked number."
+        var a = (try? AttributedString(markdown: md)) ?? AttributedString(md)
+        a.foregroundColor = Tok.inkSecondary
+        for run in a.runs where run.inlinePresentationIntent?.contains(.stronglyEmphasized) == true {
+            a[run.range].foregroundColor = Tok.ink
+        }
+        return a
+    }
+
+    private func saveRecipient(_ store: CommsStore) {
+        Task { await store.setRecipient(recipient.trimmed); recipientSaved = true; try? await Task.sleep(for: .seconds(1.5)); recipientSaved = false }
+    }
+
+    /// "Let the agent message contacts" card row.
+    private func agentSendCard(_ store: CommsStore) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Let the agent message contacts").font(TokFont.text(TokFont.callout, .semibold)).foregroundStyle(Tok.ink)
+                Text("The agent can always message your own number. Turn this on to let it message other people too.")
+                    .font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkSecondary)
+            }
+            Spacer(minLength: 8)
+            Toggle("", isOn: Binding(get: { store.wa?.agentSendToOthers ?? false }, set: { v in Task { await store.setAgentSend(v) } }))
+                .labelsHidden().toggleStyle(.switch).tint(Tok.green)
+        }
+        .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Tok.bgGrouped).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+    }
+
+    private func actionPill(_ title: String, bg: Color = .clear, fg: Color = Tok.ink, bordered: Bool = false, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title).font(TokFont.text(TokFont.footnote, .semibold)).foregroundStyle(fg)
+                .padding(.horizontal, 16).frame(height: 38).background(bg).clipShape(Capsule())
+                .overlay { if bordered { Capsule().strokeBorder(Tok.separator, lineWidth: Tok.hairline) } }
+        }.buttonStyle(.plain)
+    }
+
+    private func approvalText(_ store: CommsStore) -> String {
+        let base = "Before Maestro messages summaries to your own number, it needs your OK."
+        let n = store.wa?.pendingSummaries?.count ?? 0
+        return n > 0 ? base + " \(n) waiting." : base
+    }
+
+    private func qrStep(_ n: Int, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            Text("\(n).").font(TokFont.mono(TokFont.caption, .semibold)).foregroundStyle(Tok.inkTertiary)
+            Text(text).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkSecondary)
         }
     }
 

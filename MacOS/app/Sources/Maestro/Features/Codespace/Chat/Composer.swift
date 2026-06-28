@@ -21,10 +21,6 @@ struct Composer: View {
     @FocusState private var focused: Bool
     @State private var schedOpen = false
 
-    static let models: [(id: String, name: String)] = [
-        ("auto", "Auto"), ("claude:opus", "Claude · Opus"), ("claude:sonnet", "Claude · Sonnet"),
-        ("claude:haiku", "Claude · Haiku"), ("codex", "Codex"),
-    ]
     static let efforts = ["fast", "balanced", "deep", "max"]
 
     var body: some View {
@@ -46,6 +42,13 @@ struct Composer: View {
                             send(); return .handled
                         }
                 }
+                // Drag a file from the file tree → drop it here to add an @-reference.
+                .dropDestination(for: String.self) { items, _ in
+                    let refs = items.filter { $0.hasPrefix("/") || $0.hasPrefix("~") }.map { "@" + $0 }
+                    guard !refs.isEmpty else { return false }
+                    text += (text.isEmpty || text.hasSuffix(" ") ? "" : " ") + refs.joined(separator: " ") + " "
+                    return true
+                }
                 if streaming { fab(icon: "square", color: Tok.red, action: onStop) }
                 fab(icon: "send", color: canSend ? Tok.blue : Tok.fillSecondary, fg: canSend ? .white : Tok.inkTertiary) { send() }
                     .disabled(!canSend)
@@ -62,16 +65,7 @@ struct Composer: View {
 
     private var controlsRow: some View {
         HStack(spacing: 6) {
-            Menu {
-                ForEach(Self.models, id: \.id) { m in Button(m.name) { model = m.id } }
-            } label: {
-                HStack(spacing: 5) {
-                    Text(Self.models.first { $0.id == model }?.name ?? "Auto").font(TokFont.text(TokFont.caption, .semibold))
-                    Icon(name: "chevronDown", size: 10)
-                }
-                .foregroundStyle(Tok.inkSecondary).padding(.horizontal, 9).frame(height: 28)
-                .background(Tok.fillSecondary).clipShape(RoundedRectangle(cornerRadius: 8))
-            }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            ModelPicker(value: $model, compact: true)
 
             Button { cycleEffort() } label: {
                 HStack(spacing: 5) {

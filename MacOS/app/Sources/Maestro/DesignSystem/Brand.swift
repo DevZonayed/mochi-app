@@ -51,3 +51,40 @@ struct MaestroMark: View {
         .frame(width: size, height: size)
     }
 }
+
+// MARK: - Provider glyphs (ported 1:1 from lib/icons.tsx AnthropicGlyph/OpenAIGlyph)
+
+/// The Anthropic wordmark "A" (monochrome, inherits the given color). viewBox 40×40.
+struct AnthropicGlyph: View {
+    var size: CGFloat = 16
+    var color: Color = Tok.ink
+    private static let d = "M24.4 8h-5.1l8.9 24h5.3L24.4 8Zm-12.2 0L3 32h5.4l1.86-5.1h9.0L18.4 32h5.4L14.6 8h-2.4Zm-.2 14.4 2.96-8.1 2.96 8.1h-5.92Z"
+    var body: some View {
+        SVGShape(pathData: Self.d, viewBox: CGSize(width: 40, height: 40))
+            .fill(color, style: FillStyle(eoFill: true))
+            .frame(width: size, height: size)
+    }
+}
+
+/// The OpenAI knot (monochrome, inherits the given color). viewBox 40×40.
+struct OpenAIGlyph: View {
+    var size: CGFloat = 16
+    var color: Color = Tok.ink
+    private static let d = "M34.3 17.2a8.6 8.6 0 0 0-.74-7.06 8.7 8.7 0 0 0-9.37-4.17A8.6 8.6 0 0 0 17.7 3.2a8.7 8.7 0 0 0-8.29 6.02 8.6 8.6 0 0 0-5.74 4.17 8.7 8.7 0 0 0 1.07 10.2 8.6 8.6 0 0 0 .74 7.06 8.7 8.7 0 0 0 9.37 4.17 8.6 8.6 0 0 0 6.49 2.79 8.7 8.7 0 0 0 8.29-6.03 8.6 8.6 0 0 0 5.74-4.17 8.7 8.7 0 0 0-1.06-10.2Zm-12.9 18a6.45 6.45 0 0 1-4.14-1.5l.2-.12 6.88-3.97a1.12 1.12 0 0 0 .57-.98v-9.7l2.91 1.68a.1.1 0 0 1 .06.08v8.03a6.48 6.48 0 0 1-6.48 6.47Zm-13.9-5.94a6.44 6.44 0 0 1-.77-4.34l.2.12 6.89 3.98a1.12 1.12 0 0 0 1.13 0l8.41-4.86v3.36a.1.1 0 0 1-.04.09l-6.96 4.02a6.48 6.48 0 0 1-8.85-2.37ZM5.7 14.55a6.45 6.45 0 0 1 3.37-2.84v8.18a1.12 1.12 0 0 0 .56.97l8.4 4.85-2.9 1.68a.1.1 0 0 1-.1 0l-6.96-4.02a6.48 6.48 0 0 1-2.37-8.82Zm23.92 5.56-8.41-4.86 2.9-1.67a.1.1 0 0 1 .1 0l6.96 4.01a6.47 6.47 0 0 1-1 11.67v-8.18a1.12 1.12 0 0 0-.55-.97Zm2.9-4.36-.2-.12-6.88-3.98a1.12 1.12 0 0 0-1.13 0l-8.41 4.86v-3.36a.1.1 0 0 1 .04-.09l6.96-4.01a6.47 6.47 0 0 1 9.62 6.7Zm-18.2 6 -2.91-1.68a.1.1 0 0 1-.06-.08v-8.03a6.47 6.47 0 0 1 10.62-4.97l-.2.11-6.88 3.97a1.12 1.12 0 0 0-.57.98l-.01 9.69Zm1.58-3.4 3.75-2.16 3.75 2.16v4.33l-3.75 2.16-3.75-2.16v-4.33Z"
+    var body: some View {
+        SVGShape(pathData: Self.d, viewBox: CGSize(width: 40, height: 40))
+            .fill(color, style: FillStyle(eoFill: true))
+            .frame(width: size, height: size)
+    }
+}
+
+/// Picks the brand glyph for an engine. `provider == "openai"` (Codex) → OpenAI; else Anthropic.
+struct ProviderGlyph: View {
+    let provider: String
+    var size: CGFloat = 16
+    var color: Color = Tok.ink
+    var body: some View {
+        if provider == "openai" { OpenAIGlyph(size: size, color: color) }
+        else { AnthropicGlyph(size: size, color: color) }
+    }
+}

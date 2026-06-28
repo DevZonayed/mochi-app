@@ -66,7 +66,10 @@ struct WaBubble: View {
             }
         }
         .padding(EdgeInsets(top: 7, leading: 10, bottom: 5, trailing: 10))
-        .background(message.fromMe ? Color.green.opacity(0.18) : Tok.bgElevated)
+        // Outgoing = token green (#34C759) at 22% over an elevated base (matches color-mix on bg-elevated).
+        .background {
+            if message.fromMe { ZStack { Tok.bgElevated; Tok.green.opacity(0.22) } } else { Tok.bgElevated }
+        }
         .clipShape(BubbleShape(fromMe: message.fromMe))
         .overlay(BubbleShape(fromMe: message.fromMe).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
         .frame(maxWidth: 460, alignment: message.fromMe ? .trailing : .leading)

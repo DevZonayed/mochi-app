@@ -17,13 +17,32 @@ struct Project: Codable, Identifiable, Hashable {
     var defaultBaseBranch: String?
     var setupScript: String?
     var runMode: String?     // "concurrent" | "nonconcurrent"
+    var copyGlobs: [String]? // gitignored files copied into each new worktree
     var spent: Double?
     var sessionIds: [String]?
 
     enum CodingKeys: String, CodingKey {
         case id, name, kind, template, color, path, repoUrl, hidden
-        case instructions, defaultBaseBranch, setupScript, runMode, spent, sessionIds
+        case instructions, defaultBaseBranch, setupScript, runMode, copyGlobs, spent, sessionIds
     }
+}
+
+/// A project's durable memory (`.continuum/STATE.md`) + recent checkpoints. From `getProjectMemory`.
+struct ProjectMemory: Codable {
+    var state: String
+    var checkpoints: [Checkpoint]?
+    struct Checkpoint: Codable, Identifiable, Hashable { var id: Int; var summary: String }
+}
+
+/// A git branch in the base-branch picker (from `listBranches`). `lastCommit.date` is in SECONDS.
+struct BranchInfo: Codable, Identifiable, Hashable {
+    var name: String
+    var isDefault: Bool
+    var isCurrent: Bool
+    var hasRemote: Bool
+    var lastCommit: Commit?
+    struct Commit: Codable, Hashable { var sha: String; var subject: String; var date: Double }
+    var id: String { name }
 }
 
 // MARK: - Skills & capabilities (project settings)
@@ -132,6 +151,17 @@ struct WhatsAppStatus: Codable {
     var sendApproved: Bool?
     var agentSendToOthers: Bool?
     var notifyJid: String?
+    var linkedAt: Double?
+    var pendingSummaries: [WaPendingSummary]?
+}
+/// A quiet-chat summary awaiting send approval (we only need the count). Decodes from any object.
+struct WaPendingSummary: Codable, Hashable {}
+
+/// Result of `whatsappLink`: either a QR image or a pairing code (when a phone number was supplied).
+struct WhatsAppLink: Codable {
+    var method: String        // "qr" | "pairing"
+    var dataUrl: String?
+    var code: String?
 }
 struct WaAvatarResult: Codable { var url: String? }
 struct WaQrResult: Codable { var dataUrl: String? }

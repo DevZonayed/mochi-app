@@ -1,132 +1,139 @@
 import SwiftUI
 
-/// The list mode of the Schedule screen: schedules grouped by project, each row with a live
-/// countdown, enable toggle (recurring user schedules), edit, and delete.
+/// The list mode of the Scheduler: schedules grouped by project (colored dot + name + count),
+/// each row a grid of [name + system badge | cron | next | delete + switch]. Mirrors Scheduler.tsx.
 struct ScheduleListView: View {
     let store: ScheduleStore
-    let projectNames: [String: String]
+    let projMeta: [String: SchedProjMeta]
     let onEdit: (Schedule) -> Void
+
+    private var groups: [(projectId: String?, items: [Schedule])] {
+        // Drop 'auto-continue' (the usage-reset resume — not usefully cancelable), like the web.
+        store.byProject.compactMap { g in
+            let items = g.items.filter { $0.kind != "auto-continue" }
+            return items.isEmpty ? nil : (g.projectId, items)
+        }
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                ForEach(store.byProject, id: \.projectId) { group in
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text((group.projectId.flatMap { projectNames[$0] } ?? "No project").uppercased())
-                            .font(TokFont.text(TokFont.caption, .semibold)).tracking(0.5)
-                            .foregroundStyle(Tok.inkTertiary)
-                            .padding(.horizontal, 14).padding(.bottom, 7)
+                if groups.isEmpty {
+                    Text("Nothing scheduled yet. Create one with “New schedule”.")
+                        .font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary)
+                        .frame(maxWidth: .infinity).padding(.vertical, 40)
+                }
+                ForEach(groups, id: \.projectId) { group in
+                    let meta = group.projectId.flatMap { projMeta[$0] }
+                    let color = meta?.color ?? Tok.inkTertiary
+                    VStack(alignment: .leading, spacing: 11) {
+                        HStack(spacing: 8) {
+                            Circle().fill(color).frame(width: 9, height: 9)
+                            Text((meta?.name ?? "Workspace").uppercased())
+                                .font(TokFont.text(TokFont.footnote, .bold)).tracking(0.4).foregroundStyle(Tok.inkSecondary)
+                            Text("· \(group.items.count)").font(TokFont.text(TokFont.footnote, .medium)).foregroundStyle(Tok.inkTertiary)
+                        }
+                        .padding(.horizontal, 2)
                         VStack(spacing: 0) {
                             ForEach(Array(group.items.enumerated()), id: \.element.id) { i, s in
-                                ScheduleRow(schedule: s, store: store, onEdit: onEdit, last: i == group.items.count - 1)
+                                ScheduleRow(schedule: s, store: store, color: color, onEdit: onEdit, last: i == group.items.count - 1)
                             }
                         }
                         .background(Tok.bgGrouped)
-                        .clipShape(RoundedRectangle(cornerRadius: Tok.Radius.group, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: Tok.Radius.group, style: .continuous)
-                            .strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
                     }
                 }
             }
             .frame(maxWidth: 920).frame(maxWidth: .infinity)
-            .padding(.horizontal, 24).padding(.vertical, 22)
+            .padding(.horizontal, 28).padding(.top, 4).padding(.bottom, 28)
         }
     }
 }
 
-/// A single schedule row — its countdown ticks once a second via `TimelineView`.
+/// One schedule row — countdown ticks once a second via TimelineView.
 struct ScheduleRow: View {
     let schedule: Schedule
     let store: ScheduleStore
+    let color: Color
     let onEdit: (Schedule) -> Void
     var last: Bool = false
+    @State private var hover = false
+
+    private var paused: Bool { !schedule.enabled }
 
     var body: some View {
         VStack(spacing: 0) {
-            TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                row(now: ctx.date.timeIntervalSince1970 * 1000)
-            }
-            if !last { Tok.separator.frame(height: Tok.hairline).padding(.leading, 14) }
+            row
+            if !last { Tok.separator.frame(height: Tok.hairline) }
         }
     }
 
-    private func row(now: Double) -> some View {
-        let next = schedule.nextFireAt
-        let left = (next ?? 0) - now
-        let soon = next != nil && schedule.enabled && left <= 60_000 && left > -90_000
-        return HStack(spacing: 12) {
-            BreathingDot(color: schedule.kindTint, active: soon)
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    if let badge = schedule.kindBadge { KindBadge(text: badge, tint: schedule.kindTint) }
-                    Text(schedule.title.isEmpty ? "Untitled" : schedule.title)
-                        .font(TokFont.text(TokFont.footnote, .medium)).foregroundStyle(Tok.ink).lineLimit(1)
+    private var row: some View {
+        HStack(spacing: 14) {
+            // name + system badge
+            HStack(spacing: 10) {
+                Circle().fill(color).frame(width: 9, height: 9)
+                Text(schedule.title.isEmpty ? "Untitled" : schedule.title)
+                    .font(TokFont.text(TokFont.callout, .semibold)).foregroundStyle(Tok.ink).lineLimit(1)
+                if let badge = schedule.systemBadge {
+                    HStack(spacing: 4) {
+                        Icon(name: badge.icon, size: 10)
+                        Text(badge.label.uppercased()).font(TokFont.text(9, .bold)).tracking(0.4)
+                    }
+                    .foregroundStyle(Tok.purple).padding(.horizontal, 7).frame(height: 18)
+                    .background(Tok.purple.opacity(0.12)).clipShape(Capsule())
                 }
-                Text(detailLine).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(1)
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 8)
-            countdown(next: next, left: left, soon: soon)
-            if schedule.isEditable && schedule.isRecurring {
-                MSwitch(on: Binding(get: { schedule.enabled },
-                                    set: { v in Task { await store.setEnabled(schedule, v) } }))
-                    .scaleEffect(0.78)
+            .frame(maxWidth: .infinity, alignment: .leading).layoutPriority(2)
+
+            Text(schedule.cronLine).font(TokFont.text(TokFont.subhead)).foregroundStyle(Tok.inkSecondary)
+                .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading).layoutPriority(1)
+
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                Text(nextDisplay).font(TokFont.mono(TokFont.footnote, .semibold))
+                    .foregroundStyle(paused ? Tok.inkTertiary : Tok.ink).frame(width: 92, alignment: .trailing)
             }
-            if schedule.isEditable { rowButton("pencil") { onEdit(schedule) } }
-            rowButton("trash", tint: Tok.red) { Task { await store.delete(schedule.id) } }
+
+            HStack(spacing: 8) {
+                Button { Task { await store.delete(schedule.id) } } label: {
+                    Icon(name: "x", size: 14).foregroundStyle(hover ? Tok.red : Tok.inkTertiary)
+                        .frame(width: 24, height: 24).background(hover ? Tok.red.opacity(0.12) : .clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                }.buttonStyle(.plain).opacity(hover ? 1 : 0.55).help("Remove schedule")
+                MSwitch(on: Binding(get: { schedule.enabled }, set: { v in Task { await store.setEnabled(schedule, v) } })).scaleEffect(0.7)
+            }
+            .frame(width: 96, alignment: .trailing)
         }
-        .padding(.horizontal, 14).padding(.vertical, 10).frame(minHeight: 56)
+        .padding(.horizontal, 16).padding(.vertical, 13)
+        .opacity(paused ? 0.6 : 1)
+        .background(hover ? Tok.fillTertiary : .clear)
+        .contentShape(Rectangle())
+        .onHover { hover = $0 }
+        .onTapGesture { if schedule.isEditable { onEdit(schedule) } }
     }
 
-    @ViewBuilder private func countdown(next: Double?, left: Double, soon: Bool) -> some View {
-        if next != nil && schedule.enabled {
-            Text(fmtCountdown(left)).font(TokFont.mono(TokFont.footnote, .semibold))
-                .foregroundStyle(soon ? Tok.orange : schedule.kindTint)
-                .frame(minWidth: 74, alignment: .trailing)
-        } else {
-            Text(schedule.paused == true ? "Paused" : "Off")
-                .font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.inkTertiary)
-                .frame(minWidth: 74, alignment: .trailing)
-        }
-    }
-
-    private var detailLine: String {
-        if schedule.isOneShot, let f = schedule.fireAt { return fmtWhen(f) }
-        var s = schedule.recurrenceLabel
-        if let n = schedule.nextRun, schedule.enabled { s += " · next \(fmtWhen(n))" }
-        return s
-    }
-
-    private func rowButton(_ icon: String, tint: Color = Tok.inkSecondary, _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Icon(name: icon, size: 14).foregroundStyle(tint)
-                .frame(width: 26, height: 26).hoverFill(Tok.fillSecondary, radius: 7).contentShape(Rectangle())
-        }.pressable()
+    /// Live "next" — "—" / "due now" / "in 5m".
+    private var nextDisplay: String {
+        guard schedule.enabled else { return "—" }
+        let n = nextLine(schedule.nextFireAt)
+        return n == "—" || n == "due now" ? n : "in \(n)"
     }
 }
 
-/// A small status dot that gently breathes when its schedule is about to fire.
+/// A small status dot that gently breathes when its schedule is about to fire (used by the inline
+/// composer queue panel too).
 struct BreathingDot: View {
     let color: Color
     var active: Bool = false
     var size: CGFloat = 7
     @State private var pulse = false
-
     var body: some View {
         Circle().fill(color).frame(width: size, height: size)
             .scaleEffect(active && pulse ? 1.4 : 1)
             .opacity(active && pulse ? 0.45 : 1)
             .animation(active ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true) : .default, value: pulse)
             .onAppear { pulse = true }
-    }
-}
-
-/// Uppercase pill badge for system schedule kinds (auto-continue, etc.).
-struct KindBadge: View {
-    let text: String
-    let tint: Color
-    var body: some View {
-        Text(text).font(TokFont.text(9, .bold)).tracking(0.4).foregroundStyle(tint)
-            .padding(.horizontal, 6).frame(height: 16)
-            .background(tint.opacity(0.15)).clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
     }
 }
