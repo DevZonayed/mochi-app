@@ -194,7 +194,15 @@ export class CodexBridge {
           auditStatus: meta?.auditStatus,
           addedBy: 'agent',
         });
-        return txt(`Installed "${rec.name}" -> .claude/skills/${rec.slug}/SKILL.md${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}. Read that file before using the skill.`);
+        // Deliver the skill body INLINE so the agent follows it THIS turn instead of
+        // depending on a follow-up Read it sometimes skipped ("dynamically loaded but not
+        // followed"). Codex surfaces skills via the per-turn project_skills index (no
+        // Agent-SDK startup-scan to refresh), so inline body is the robust same-turn
+        // delivery. Mirrors the download_skill 32k cap above.
+        const installedBody = content.skillMd.length > 32000
+          ? content.skillMd.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]'
+          : content.skillMd;
+        return txt(`Installed "${rec.name}" -> .claude/skills/${rec.slug}/SKILL.md${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}.\n\nFollow these instructions for the task:\n\n---\n${installedBody}\n---`);
       }
       case 'list_project_skills': {
         if (!reg.skills) return errRes('skill tools are not enabled for this run');
