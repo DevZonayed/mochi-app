@@ -61,6 +61,13 @@ struct UserBubble: View {
                         }
                     }
                 }
+                if let files = job.inputFiles, !files.isEmpty {
+                    HStack(spacing: 6) {
+                        ForEach(Array(files.enumerated()), id: \.offset) { _, f in
+                            UserFileChip(file: f, onOpenFile: onOpenFile)
+                        }
+                    }
+                }
                 Text(Self.mentionStyled(job.input))
                     .font(TokFont.text(14)).foregroundStyle(.white)
                     .padding(.horizontal, 14).padding(.vertical, 10)
@@ -110,6 +117,30 @@ struct UserAttachmentChip: View {
             .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Color.white.opacity(0.18), lineWidth: Tok.hairline))
         }
         .buttonStyle(.plain).disabled(ref.imagePath == nil).onHover { hovering = $0 }.help(ref.imagePath ?? title)
+    }
+}
+
+/// A non-image attachment chip on the user bubble (text/file) — doc glyph + name, opens the saved file.
+struct UserFileChip: View {
+    let file: ChatFileRef
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
+    @State private var hovering = false
+
+    var body: some View {
+        Button { if let p = file.path { onOpenFile(p) } } label: {
+            HStack(spacing: 7) {
+                Image(systemName: file.kind == "text" ? "doc.text" : "doc")
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                    .frame(width: 28, height: 28).background(Color.white.opacity(0.18))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                Text(file.name).font(TokFont.text(TokFont.footnote, .medium)).foregroundStyle(.white).lineLimit(1)
+            }
+            .padding(.leading, 4).padding(.trailing, 9).padding(.vertical, 4)
+            .background(Color.white.opacity(hovering ? 0.28 : 0.20))
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Color.white.opacity(0.18), lineWidth: Tok.hairline))
+        }
+        .buttonStyle(.plain).disabled(file.path == nil).onHover { hovering = $0 }.help(file.path ?? file.name)
     }
 }
 
@@ -233,11 +264,15 @@ struct AssistantTurn: View {
                     Text("Paused — will resume").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.orange)
                 }
             } else {
+                // Fixed-height row: streaming swaps `liveActivity` constantly; a constant row
+                // height keeps the bottom-most element stable so the bottom-anchored scroll
+                // doesn't oscillate (the "shaking at the bottom" bug).
                 HStack(spacing: 8) {
                     Spinner(size: 12).tint(Tok.purple)
                     ShimmerText(text: liveActivity)
                     StreamCaret(height: 15)
                 }
+                .frame(height: 18, alignment: .leading)
             }
         } else if job.status == "failed" {
             failureCard
