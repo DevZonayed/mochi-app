@@ -271,14 +271,14 @@ export const DEFAULT_MODELS: ModelOption[] = [
 ];
 
 /* One flat picker = engine AND model in a single click (no nested menus).
-   Claude entries use the CLI's stable aliases (opus/sonnet/haiku) so they always
-   resolve to your plan's current version; Codex runs your ~/.codex default. */
+   Kept for older surfaces; active chat/settings model variants come from the
+   provider-backed ModelPicker. */
 export const CHAT_MODELS: ModelOption[] = [
-  { id: 'auto',          name: 'Auto',            provider: 'auto',      sub: 'Routing default',        cost: 0 },
-  { id: 'claude:opus',   name: 'Claude · Opus',   provider: 'anthropic', sub: 'Most capable',           cost: 0 },
-  { id: 'claude:sonnet', name: 'Claude · Sonnet', provider: 'anthropic', sub: 'Balanced speed & depth', cost: 0 },
-  { id: 'claude:haiku',  name: 'Claude · Haiku',  provider: 'anthropic', sub: 'Fastest replies',        cost: 0 },
-  { id: 'codex',         name: 'Codex',           provider: 'openai',    sub: 'Your codex default',     cost: 0 },
+  { id: 'auto',                         name: 'Auto',                 provider: 'auto',      sub: 'Routing default',        cost: 0 },
+  { id: 'claude:claude-opus-4-8',       name: 'Claude · Opus 4.8',    provider: 'anthropic', sub: 'Most capable',           cost: 0 },
+  { id: 'claude:claude-sonnet-4-6',     name: 'Claude · Sonnet 4.6',  provider: 'anthropic', sub: 'Balanced speed & depth', cost: 0 },
+  { id: 'claude:claude-haiku-4-5-20251001', name: 'Claude · Haiku 4.5', provider: 'anthropic', sub: 'Fastest replies',        cost: 0 },
+  { id: 'codex',                        name: 'Codex',                provider: 'openai',    sub: 'Your codex default',     cost: 0 },
 ];
 
 /** Map a CHAT_MODELS id → the engine/model pair the dispatcher understands. */

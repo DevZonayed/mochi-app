@@ -4,7 +4,7 @@
 
 import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem, FeedbackCategory, FeedbackContext, FeedbackSource, CustomMcpServer, McpKv } from './store.js';
 import { answerMessage, nextExtend } from './ask-question.js';
-import { resolveModelKey, buildModelGroups } from './models.js';
+import { resolveModelKey, buildModelGroups, refreshModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
 import type { ResearchEngine } from './research.js';
@@ -1656,7 +1656,9 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'engineStatus': return engine.statuses();
 
       // ── Model registry (provider-owned catalog) ───────────────
-      case 'listModels': return buildModelGroups(engine.statuses());
+      case 'listModels':
+        await refreshModelGroups(providers, { force: p.refresh === true });
+        return buildModelGroups(engine.statuses());
 
       // ── Roles (model-level primary / reviewer) ─────────────────
       case 'getRoles': return store.getRoles();
