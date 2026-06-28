@@ -20,6 +20,7 @@ struct Job: Codable, Identifiable, Hashable {
     var goal: Bool?
     var transcript: [TranscriptItem]?
     var inputImages: [ChatImageRef]?
+    var inputFiles: [ChatFileRef]?
     var pausedUntil: Double?
     var pausedReason: String?
     var createdAt: Double
@@ -81,4 +82,15 @@ struct ChatImageRef: Codable, Hashable {
     var name: String?
     var width: Double?
     var height: Double?
+}
+
+/// A non-image file/text attached to a user message. Mirrors `ChatFile` in store.ts.
+struct ChatFileRef: Codable, Hashable {
+    var id: String?
+    var name: String
+    var kind: String?       // "text" | "file"
+    var mime: String?
+    var bytes: Double?
+    var path: String?
+    var preview: String?
 }

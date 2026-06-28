@@ -22,6 +22,8 @@ final class ChatThreadStore {
         self.client = client
     }
 
+    /// A turn is live. NOTE: a ScheduleWakeup pause keeps `status == "running"` (the SDK iterator
+    /// stays open), so a paused turn IS still streaming — the composer queue must hold behind it.
     var streaming: Bool { turns.contains { $0.isRunning } }
 
     func start() {
@@ -43,12 +45,17 @@ final class ChatThreadStore {
         else { turns = []; loading = true }
         do {
             let fresh = try await client.call("listJobs", ["projectId": projectId, "sessionId": sid], as: [Job].self).sorted { $0.createdAt < $1.createdAt }
-            if self.sessionId == sid {           // ignore a stale fetch if we've since rebound
+            // Only the bind that still owns the session may write turns OR clear loading — a
+            // superseded fetch resolving late must not flip a newer bind's loading flag off (that
+            // flashed the empty "What should we build?" state on an existing, still-loading chat).
+            if self.sessionId == sid {
                 turns = fresh
                 TranscriptCache.shared.put(sid, fresh)
+                loading = false
             }
-        } catch { /* keep cached/empty */ }
-        loading = false
+        } catch {
+            if self.sessionId == sid { loading = false }   // failed fetch on the current session
+        }
     }
 
     private func onJob(_ job: Job) {
@@ -66,10 +73,34 @@ final class ChatThreadStore {
     /// Send a message. Lazily creates the session on the first send and reports it back so the
     /// rail can add + select it.
     func send(_ text: String, effort: String = "balanced", plan: Bool = false, goal: Bool = false,
-              modelKey: String = "auto", base: String? = nil, onSessionCreated: @escaping (ChatSession) -> Void) async {
+              modelKey: String = "auto", reviewerKey: String? = nil, base: String? = nil,
+              attachments: [ComposerAttachment] = [],
+              onSessionCreated: @escaping (ChatSession) -> Void) async {
         sendError = nil
-        var params: [String: Any] = ["projectId": projectId, "text": text, "effort": effort, "plan": plan, "goal": goal]
+        // Each chip already sits inline in `text` as its `«attach:<id>»` marker (the brain rewrites it
+        // to an inline `@<absPath>` and strips it from the rail title). Append only any marker that's
+        // somehow missing, so attachments are never lost but inline ones aren't duplicated.
+        var finalText = text
+        let missing = attachments.filter { !text.contains("«attach:\($0.id)»") }
+        if !missing.isEmpty {
+            let marks = missing.map { "«attach:\($0.id)»" }.joined(separator: " ")
+            finalText = finalText.isEmpty ? marks : finalText + " " + marks
+        }
+        var params: [String: Any] = ["projectId": projectId, "text": finalText, "effort": effort, "plan": plan, "goal": goal]
+        let images = attachments.filter { $0.kind == .image }
+        let files = attachments.filter { $0.kind != .image }
+        if !images.isEmpty {
+            params["images"] = images.map { ["id": $0.id, "name": $0.name, "mime": $0.mime, "dataB64": $0.dataB64] }
+        }
+        if !files.isEmpty {
+            params["files"] = files.map { a -> [String: Any] in
+                a.kind == .text
+                    ? ["id": a.id, "name": a.name, "kind": "text", "content": a.content]
+                    : ["id": a.id, "name": a.name, "kind": "file", "mime": a.mime, "dataB64": a.dataB64]
+            }
+        }
         if modelKey != "auto" { params["modelKey"] = modelKey }
+        if let reviewerKey, !reviewerKey.isEmpty { params["reviewerKey"] = reviewerKey }
         if let sid = sessionId { params["sessionId"] = sid }
         // Fork the new worktree from a non-default base only on the first send (session creation).
         else if let base, !base.isEmpty { params["base"] = base }

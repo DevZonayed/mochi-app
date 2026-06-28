@@ -237,7 +237,7 @@ async function handleAccountCall(method: string, params: Record<string, unknown>
       if (!r.token) throw Object.assign(new Error('signed in but no session token was returned'), { statusCode: 500 });
       writeAccountToken(r.token);
       startAccountHost(r.token);
-      return { signedIn: true, deviceId: store.deck.deckId, devices: await accountDevices().catch(() => []) };
+      return { signedIn: true, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: await accountDevices().catch(() => []) };
     }
     case 'accountSignUp': {
       const name = String(params.name ?? '').trim() || 'Maestro User';
@@ -248,13 +248,13 @@ async function handleAccountCall(method: string, params: Record<string, unknown>
       if (!r.token) throw Object.assign(new Error('account created but no session token was returned'), { statusCode: 500 });
       writeAccountToken(r.token);
       startAccountHost(r.token);
-      return { signedIn: true, deviceId: store.deck.deckId, devices: await accountDevices().catch(() => []) };
+      return { signedIn: true, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: await accountDevices().catch(() => []) };
     }
     case 'accountSignOut':
       if (accountSessionToken) await authPost('/api/auth/sign-out', {}, accountSessionToken).catch(() => ({ token: '', body: null, status: 0 }));
       stopAccountHost();
       clearAccountToken();
-      return { signedIn: false, deviceId: store.deck.deckId, devices: [] };
+      return { signedIn: false, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: [] };
     default:
       return undefined;
   }

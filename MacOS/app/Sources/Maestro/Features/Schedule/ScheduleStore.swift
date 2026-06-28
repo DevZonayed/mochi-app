@@ -101,9 +101,17 @@ final class ScheduleStore {
     // MARK: Derived
 
     /// The per-chat one-shot messages the inline composer queue renders.
-    func pending(forSession sessionId: String?) -> [Schedule] {
+    /// Mirrors the web chat queue: enabled message/auto-continue one-shots for this
+    /// session with a future fire time, plus a short grace window while the fire event
+    /// is propagating.
+    func pending(forSession sessionId: String?, now: Double = Date().timeIntervalSince1970 * 1000) -> [Schedule] {
         guard let sessionId else { return [] }
-        return sorted.filter { $0.sessionId == sessionId && $0.isQueuedMessage }
+        return sorted.filter {
+            $0.sessionId == sessionId
+            && $0.enabled
+            && ($0.kind == "message" || $0.kind == "auto-continue" || ($0.kind == nil && $0.isQueuedMessage))
+            && ($0.fireAt ?? 0) > now - 35_000
+        }
     }
 
     /// Grouped by project for the list view; the "No project" group is last, others keep

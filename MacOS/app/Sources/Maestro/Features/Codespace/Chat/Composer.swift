@@ -4,6 +4,7 @@ import SwiftUI
 /// streaming). Enter sends, Shift+Enter newlines, ⌘↵ sends.
 struct Composer: View {
     @Binding var text: String
+    @Binding var attachments: [ComposerAttachment]
     @Binding var model: String
     @Binding var effort: String
     @Binding var plan: Bool
@@ -15,10 +16,13 @@ struct Composer: View {
     var disabled: Bool
     let onSend: () -> Void
     let onStop: () -> Void
+    /// ⌘↩ while a turn is running — interrupt and steer (set by Issue 4). Falls back to a normal send.
+    var onSendNow: (() -> Void)? = nil
     /// When set, the composer shows a clock button that schedules the typed message for later.
     var onSchedule: ((ScheduleRequest) -> Void)? = nil
+    /// Number of messages queued behind the running turn (Issue 4) — shown in the footer hint.
+    var queuedCount: Int = 0
 
-    @FocusState private var focused: Bool
     @State private var schedOpen = false
 
     static let efforts = ["fast", "balanced", "deep", "max"]
@@ -32,15 +36,12 @@ struct Composer: View {
                             .font(TokFont.text(14)).foregroundStyle(Tok.inkTertiary)
                             .padding(.horizontal, 4).padding(.vertical, 8).allowsHitTesting(false)
                     }
-                    TextField("", text: $text, axis: .vertical)
-                        .textFieldStyle(.plain).font(TokFont.text(14)).foregroundStyle(Tok.ink)
-                        .lineLimit(1...10).padding(.horizontal, 4).padding(.vertical, 8)
-                        .focused($focused).disabled(disabled)
-                        .onKeyPress { press in
-                            guard press.key == .return else { return .ignored }
-                            if press.modifiers.contains(.shift) { return .ignored }
-                            send(); return .handled
-                        }
+                    ComposerTextView(text: $text, disabled: disabled,
+                                     attachmentsById: Dictionary(attachments.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a }),
+                                     onReturn: { send() }, onCommandReturn: { sendNow() },
+                                     onAttach: addAttachments)
+                        .frame(minHeight: 22)
+                        .padding(.horizontal, 4).padding(.vertical, 6)
                 }
                 // Drag a file from the file tree → drop it here to add an @-reference.
                 .dropDestination(for: String.self) { items, _ in
@@ -60,7 +61,6 @@ struct Composer: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(effortAccent.opacity(0.5), lineWidth: 1))
         .cardShadow()
-        .keyboardShortcut(.return, modifiers: .command)
     }
 
     private var controlsRow: some View {
@@ -84,8 +84,23 @@ struct Composer: View {
             if onSchedule != nil { scheduleButton }
 
             Spacer()
-            Text(streaming ? "running…" : "⏎ to send").font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
+            Text(footerHint).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
         }
+    }
+
+    private var footerHint: String {
+        if streaming { return queuedCount > 0 ? "\(queuedCount) queued · ⏎ to queue · ⌘⏎ to steer" : "⏎ to queue · ⌘⏎ to steer" }
+        return queuedCount > 0 ? "\(queuedCount) queued" : "⏎ to send"
+    }
+
+    /// Register pasted attachments (honoring the cap) and return the accepted slice so the editor
+    /// inserts an inline chip only for those.
+    private func addAttachments(_ atts: [ComposerAttachment]) -> [ComposerAttachment] {
+        let room = kMaxComposerAttachments - attachments.count
+        guard room > 0 else { return [] }
+        let accepted = Array(atts.prefix(room))
+        attachments.append(contentsOf: accepted)
+        return accepted
     }
 
     private func togglePill(_ label: String, _ icon: String, _ tint: Color, on: Bool, disabled: Bool = false, _ action: @escaping () -> Void) -> some View {
@@ -118,8 +133,9 @@ struct Composer: View {
     private var effortIndex: Int { Self.efforts.firstIndex(of: effort) ?? 1 }
     private var effortAccent: Color { [Tok.green, Tok.blue, Tok.orange, Tok.red][effortIndex] }
     private func cycleEffort() { effort = Self.efforts[(effortIndex + 1) % 4] }
-    private var canSend: Bool { !disabled && !text.trimmed.isEmpty }
+    private var canSend: Bool { !disabled && (!text.trimmed.isEmpty || !attachments.isEmpty) }
     private func send() { guard canSend else { return }; onSend() }
+    private func sendNow() { guard canSend else { return }; (onSendNow ?? onSend)() }
 
     private func fab(icon: String, color: Color, fg: Color = .white, action: @escaping () -> Void) -> some View {
         Button(action: action) {

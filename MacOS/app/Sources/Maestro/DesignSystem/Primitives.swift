@@ -54,6 +54,12 @@ struct ShimmerText: View {
         Text(text)
             .font(.system(size: size, weight: .medium))
             .foregroundStyle(Tok.inkSecondary)
+            // Single-line, vertically-locked: the heartbeat string changes on every streaming
+            // tick — if it can wrap, its height wobbles, and at the bottom of a transcript that
+            // re-triggers `.defaultScrollAnchor(.bottom)` re-pinning → a visible scroll shake.
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .fixedSize(horizontal: false, vertical: true)
             .overlay(
                 GeometryReader { geo in
                     LinearGradient(colors: [.clear, Tok.ink.opacity(0.9), .clear],
@@ -62,8 +68,9 @@ struct ShimmerText: View {
                         .offset(x: phase * geo.size.width * 1.5)
                         .blendMode(.plusLighter)
                 }
-                .mask(Text(text).font(.system(size: size, weight: .medium)))
+                .mask(Text(text).font(.system(size: size, weight: .medium)).lineLimit(1))
                 .allowsHitTesting(false)
+                .clipped()
             )
             .onAppear { withAnimation(.linear(duration: 1.5).repeatForever(autoreverses: false)) { phase = 1 } }
     }
