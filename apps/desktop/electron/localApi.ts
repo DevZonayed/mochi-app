@@ -747,7 +747,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // a half-truncated absolute file path.
         const titleText = text
           .replace(/«attach:[A-Za-z0-9_-]+»/g, '')
-          .replace(/@\S*\.continuum\/Attachment\/[A-Za-z0-9._-]+/g, '')
+          .replace(/@\S*\.continuum\/Attachment\/[A-Za-z0-9._/-]+/g, '')
           .replace(/[ \t]+/g, ' ')
           .replace(/\s*\n\s*/g, ' ')
           .trim();
@@ -775,6 +775,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // The agent sees an inline file reference exactly where the user typed
         // it, and can `Read` the file directly with its standard tools.
         const projectCwd = projectRootOf(project!);
+        // Group every attachment for THIS chat under a branch-named subfolder
+        // (`.continuum/Attachment/<branchSlug>/…`) so each chat's pastes/images/
+        // files live together. Prefer the checked-out branch; for a brand-new
+        // session the branch isn't assigned until the engine first runs, so fall
+        // back to the stable per-session codename ("lyon", "porto" …).
+        const attachBranch = session.branch ?? session.codename;
         const idToPath = new Map<string, string>();
         // Resolve the chosen primary + reviewer. A picker key (modelKey /
         // reviewerKey) is resolved provider-side; legacy engine/model still works.
@@ -808,7 +814,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           if (!buf.length || buf.length > 16 * 1024 * 1024) continue;
           const chipId = String(im?.id ?? '') || `img-${seenAssets.size}-${Date.now().toString(36)}`;
           try {
-            const saved = saveAttachment(projectCwd, { id: chipId, kind: 'image', name: String(im?.name ?? 'pasted.png'), bytes: buf, mime: String(im?.mime ?? '') });
+            const saved = saveAttachment(projectCwd, { id: chipId, kind: 'image', name: String(im?.name ?? 'pasted.png'), bytes: buf, mime: String(im?.mime ?? ''), branch: attachBranch });
             const asset = publishing.importAsset(saved.absPath, projectId);
             if (seenAssets.has(asset.id)) continue; // identical bytes attached twice → one entry
             seenAssets.add(asset.id);
@@ -832,7 +838,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
             if (!content.trim()) continue;
             const capped = content.slice(0, 1024 * 1024); // file on disk — looser cap than the old in-prompt one
             try {
-              const saved = saveAttachment(projectCwd, { id: chipId, kind: 'text', name, content: capped });
+              const saved = saveAttachment(projectCwd, { id: chipId, kind: 'text', name, content: capped, branch: attachBranch });
               idToPath.set(chipId, saved.absPath);
               inputFiles.push({ id: chipId, name: saved.name, kind: 'text', bytes: saved.bytes, path: saved.absPath, preview: capped.slice(0, 160).replace(/\s+/g, ' ').trim() });
             } catch { /* skip an unwritable text */ }
@@ -843,7 +849,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
             try { buf = Buffer.from(b64, 'base64'); } catch { continue; }
             if (!buf.length || buf.length > 30 * 1024 * 1024) continue;
             try {
-              const saved = saveAttachment(projectCwd, { id: chipId, kind: 'file', name, bytes: buf, mime: String(f?.mime ?? '') });
+              const saved = saveAttachment(projectCwd, { id: chipId, kind: 'file', name, bytes: buf, mime: String(f?.mime ?? ''), branch: attachBranch });
               idToPath.set(chipId, saved.absPath);
               inputFiles.push({ id: chipId, name: saved.name, kind: 'file', mime: String(f?.mime ?? ''), bytes: saved.bytes, path: saved.absPath, preview: saved.name });
             } catch { /* skip an unwritable file */ }

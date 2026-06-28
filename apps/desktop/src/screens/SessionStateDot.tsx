@@ -11,6 +11,8 @@
 import React from 'react';
 import type { SessionGitState } from '../lib/git-types';
 import { SESSION_STATE_COLOR, SESSION_STATE_LABELS } from '../lib/git-types';
+import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
+import { useSessionRunning, useProjectRunning } from '../lib/useSessionRunning';
 
 export interface SessionStateDotProps {
   state: SessionGitState | null | undefined;
@@ -59,4 +61,47 @@ export function SessionStateDot({ state, size = 8, title, reserveSpace }: Sessio
       }} />
     </span>
   );
+}
+
+/* ───────────────── Running indicator ─────────────────
+   While a session's job is actively running, its pill/icon shows a smooth
+   spinning ring INSTEAD of the git-state dot — the clearest "the agent is
+   working right now" cue. The arc is a conic-gradient masked into a ring so it
+   reads at very small sizes (7–11px) where a border-spinner would look like a
+   solid dot. `@keyframes spin` is defined globally in index.css. */
+export function RunningDot({ size = 9, title = 'Running', tint = 'var(--purple)' }: { size?: number; title?: string; tint?: string }) {
+  const thick = Math.max(1.5, size / 4);
+  const inner = size / 2 - thick;
+  return (
+    <span role="img" aria-label={title} title={title} style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: size, height: size, flexShrink: 0 }}>
+      <span style={{
+        width: size, height: size, borderRadius: '50%', display: 'inline-block',
+        // A ~250° arc with soft edges; rotating gives a smooth indeterminate spin.
+        background: `conic-gradient(from 0deg, transparent 0deg, ${tint} 70deg, ${tint} 300deg, transparent 360deg)`,
+        WebkitMask: `radial-gradient(circle, transparent ${inner}px, #000 ${inner + 0.5}px)`,
+        mask: `radial-gradient(circle, transparent ${inner}px, #000 ${inner + 0.5}px)`,
+        animation: 'spin 0.75s linear infinite',
+      }} />
+    </span>
+  );
+}
+
+/** The dot shown on a SESSION row/pill: a spinning ring while the agent is
+    running, otherwise the git/PR state dot. Drop-in for <SessionStateDot/>. */
+export function SessionActivityDot({ sessionId, size = 8 }: { sessionId: string | null | undefined; size?: number }) {
+  const running = useSessionRunning(sessionId);
+  const state = useSessionStateOnly(sessionId);
+  if (running) return <RunningDot size={Math.max(9, size + 1)} />;
+  return <SessionStateDot state={state} size={size} reserveSpace />;
+}
+
+/** The dot shown on a PROJECT icon: a spinning ring if ANY of the project's
+    sessions is running, otherwise the worst-state-wins git rollup. Returns null
+    when there's nothing to show (no running + no repo state). */
+export function ProjectActivityDot({ projectId, sessionIds, size = 10 }: { projectId: string | null | undefined; sessionIds: string[]; size?: number }) {
+  const running = useProjectRunning(projectId, sessionIds);
+  const rollup = useProjectRollupState(projectId, sessionIds);
+  if (running) return <RunningDot size={Math.max(11, size + 1)} />;
+  if (rollup && rollup !== 'no-repo') return <SessionStateDot state={rollup} size={size} />;
+  return null;
 }

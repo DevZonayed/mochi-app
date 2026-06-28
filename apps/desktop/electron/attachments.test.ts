@@ -45,6 +45,27 @@ describe('attachments', () => {
     expect(attachmentsDirFor(cwd)).toBe(d);
   });
 
+  it('attachmentsDirFor scopes under a branch-named subfolder when branch is given', () => {
+    // Slashes in the branch collapse to one dashed folder name.
+    const d = attachmentsDirFor(cwd, 'mochi/lyon/fix-auth');
+    expect(d).toBe(path.join(cwd, '.continuum', 'Attachment', 'mochi-lyon-fix-auth'));
+    expect(existsSync(d)).toBe(true);
+    // No branch → legacy flat layout (backward compatible).
+    expect(attachmentsDirFor(cwd)).toBe(path.join(cwd, '.continuum', 'Attachment'));
+    expect(attachmentsDirFor(cwd, '')).toBe(path.join(cwd, '.continuum', 'Attachment'));
+  });
+
+  it('saveAttachment writes inside the branch subfolder when branch is given', () => {
+    const saved = saveAttachment(cwd, { id: '7-defg', kind: 'text', name: 'note.txt', content: 'branch notes', branch: 'mochi/lyon/fix-auth' });
+    expect(saved.absPath).toMatch(/\/\.continuum\/Attachment\/mochi-lyon-fix-auth\/note_defg\.txt$/);
+    expect(existsSync(saved.absPath)).toBe(true);
+    expect(readFileSync(saved.absPath, 'utf8')).toBe('branch notes');
+    // Omitting branch keeps the legacy flat path so old saves still work.
+    const flat = saveAttachment(cwd, { id: '7-defg', kind: 'text', name: 'note.txt', content: 'flat' });
+    expect(flat.absPath).toMatch(/\/\.continuum\/Attachment\/note_defg\.txt$/);
+    expect(flat.absPath).not.toMatch(/mochi-lyon-fix-auth/);
+  });
+
   it('refuses to save when no bytes/content/srcPath is given', () => {
     expect(() => saveAttachment(cwd, { id: 'a-b', kind: 'file', name: 'empty.bin' })).toThrowError(/no bytes/);
   });
@@ -76,6 +97,12 @@ describe('attachments', () => {
     const text = 'check @/Users/jonayed/Desktop/TestProject/.continuum/Attachment/pested_text_35345.txt and then @/Volumes/Work/myrepo/.continuum/Attachment/shot_xy.png';
     expect(scrubAbsPathsForRelay(text))
       .toBe('check @.continuum/Attachment/pested_text_35345.txt and then @.continuum/Attachment/shot_xy.png');
+  });
+
+  it('scrubAbsPathsForRelay preserves the branch subfolder segment of the path', () => {
+    const text = 'see @/Users/me/proj/.continuum/Attachment/mochi-lyon-fix-auth/note_defg.txt here';
+    expect(scrubAbsPathsForRelay(text))
+      .toBe('see @.continuum/Attachment/mochi-lyon-fix-auth/note_defg.txt here');
   });
 
   it('scrubAbsPathsForRelay leaves non-attachment paths alone (no surprise rewriting)', () => {

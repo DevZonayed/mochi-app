@@ -21,13 +21,22 @@
 
 import React from 'react';
 import { Icon } from '../lib/icons';
-import { SessionStateDot } from '../screens/SessionStateDot';
+import { SessionStateDot, RunningDot } from '../screens/SessionStateDot';
+import { useSessionRunning } from '../lib/useSessionRunning';
 import { SESSION_STATE_COLOR, SESSION_STATE_LABELS } from '../lib/git-types';
 import type { SessionGitState } from '../lib/git-types';
 import {
   useWorkspaceOverview,
   type WorkspaceOverviewHook,
 } from '../hooks/useWorkspaceOverview';
+
+/* Overview strip dot: a spinning ring when the row's top session is actively
+   running, else the project's worst-state rollup dot. */
+function OverviewDot({ topSessionId, topState }: { topSessionId: string; topState: SessionGitState | null }) {
+  const running = useSessionRunning(topSessionId);
+  if (running) return <RunningDot size={10} />;
+  return <SessionStateDot state={topState} size={9} />;
+}
 import {
   rowAriaLabel,
   emptyStateMessage,
@@ -176,7 +185,7 @@ export function WorkspaceOverview({ onOpenSession, data }: WorkspaceOverviewProp
                 title={rowTooltip(row)}
                 onClick={() => onOpenSession(row.projectId, row.topSessionId)}
                 style={{ background: 'transparent', border: 'none' }}>
-                <SessionStateDot state={row.topState} size={9} />
+                <OverviewDot topSessionId={row.topSessionId} topState={row.topState} />
                 <span aria-hidden="true" style={{
                   display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                   width: 18, height: 18, borderRadius: 5, flexShrink: 0,

@@ -56,8 +56,8 @@ const styles = `
   .sheet-pop { animation: sheetPop 220ms var(--spring); }
   @keyframes sheetPop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
 
-  .tl-scroll::-webkit-scrollbar, .inspector ::-webkit-scrollbar { width: 11px; height: 11px; }
-  .tl-scroll::-webkit-scrollbar-thumb, .inspector ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+  .tl-scroll::-webkit-scrollbar, .inspector ::-webkit-scrollbar { width: 8px; height: 8px; }
+  .tl-scroll::-webkit-scrollbar-thumb, .inspector ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
 `;
 
 /* ────────────────────────────────────────────────────────────────────────

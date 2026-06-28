@@ -58,19 +58,19 @@ label,
   color: var(--ink);
 }
 
-/* ───────────────── Scrollbars ─────────────────
-   One global, theme-aware definition so every scroll area matches the theme
-   instead of falling back to the chunky native macOS bar. Thin, fully rounded,
-   overlay-style: the thumb floats inside a transparent gutter (the 3px clipped
-   border) and brightens on hover. The track stays invisible. Colour is mixed
-   from --ink, so it reads correctly in both light and dark. (Screens can still
-   opt a bar out with height:0 for horizontal tab strips, etc.)
-   NOTE: deliberately NOT setting `scrollbar-width`/`scrollbar-color` — in
-   Chromium 121+ those switch the engine to the plain standard scrollbar and make
-   it IGNORE these ::-webkit-scrollbar rules (losing the rounded floating thumb). */
+ /* ───────────────── Scrollbars ─────────────────
+    One global, theme-aware definition so every scroll area matches the theme
+    instead of falling back to the chunky native macOS bar. Thin, fully rounded,
+    overlay-style: the thumb floats inside a transparent gutter (the clipped
+    border) and brightens on hover. The track stays invisible. Colour is mixed
+    from --ink, so it reads correctly in both light and dark. (Screens can still
+    opt a bar out with height:0 for horizontal tab strips, etc.)
+    NOTE: deliberately NOT setting `scrollbar-width`/`scrollbar-color` — in
+    Chromium 121+ those switch the engine to the plain standard scrollbar and make
+    it IGNORE these ::-webkit-scrollbar rules (losing the rounded floating thumb). */
 *::-webkit-scrollbar {
-  width: 11px;
-  height: 11px;
+  width: 8px;
+  height: 8px;
 }
 *::-webkit-scrollbar-track,
 *::-webkit-scrollbar-corner {
@@ -79,7 +79,7 @@ label,
 *::-webkit-scrollbar-thumb {
   background: color-mix(in srgb, var(--ink) 22%, transparent);
   border-radius: 999px;
-  border: 3px solid transparent;
+  border: 2px solid transparent;
   background-clip: padding-box;
   min-height: 34px;
 }
@@ -94,3 +94,12 @@ label,
 /* Horizontal strips that scroll sideways when narrow (e.g. the files-panel tabs)
    must hide the chunky horizontal bar — they scroll by wheel/trackpad instead. */
 .ws-tabs::-webkit-scrollbar { height: 0; width: 0; }
+
+/* Global spinner keyframes — defined here so <Spinner/> (lib/ui) and the running
+   indicator dots animate on EVERY surface, including popovers/lists rendered
+   outside a screen that defines its own copy. */
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes maestro-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}

@@ -1811,7 +1811,7 @@ export class Store {
       so the phone gets the chip's POSITION + name without the operator's home
       directory. */
   slimJobForRelay(j: Job): Job {
-    const scrub = (s: string): string => s.replace(/@(\/[^\s]+\/\.continuum\/Attachment\/([A-Za-z0-9._-]+))/g, (_m, _full: string, base: string) => `@.continuum/Attachment/${base}`);
+    const scrub = (s: string): string => s.replace(/@(\/[^\s]+\/\.continuum\/Attachment\/([A-Za-z0-9._/-]+))/g, (_m, _full: string, base: string) => `@.continuum/Attachment/${base}`);
     const rawOut = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
     const out = rawOut ? scrub(rawOut) : rawOut;
     const tr = j.transcript;
