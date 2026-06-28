@@ -477,7 +477,7 @@ export const api = {
 
   listTemplates: () => cmd<Template[]>('listTemplates'),
   /** Grouped, pickable models with per-provider runnable state (from the Mac). */
-  listModels: () => cmd<ModelGroup[]>('listModels'),
+  listModels: (refresh = false) => cmd<ModelGroup[]>('listModels', refresh ? { refresh: true } : {}),
 
   /** Operator defaults, stored on the Mac (effort/engine the new-job composer inherits). */
   getSettings: () => cmd<AppSettings | null>('getSettings'),
