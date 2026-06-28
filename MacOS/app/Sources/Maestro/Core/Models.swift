@@ -279,8 +279,15 @@ struct ChatSession: Codable, Identifiable, Hashable {
     /// Per-chat model overrides the brain persists on every send (read back to restore the picker).
     var primary: RoleChoice?
     var reviewer: RoleChoiceOrOff?
+    /// Per-chat run toggles the brain persists (read back to restore the composer toggles).
+    var reviewerEnabled: Bool?
+    var autoPilot: Bool?
     /// Picker key for this chat's remembered worker model, if any.
     var primaryKey: String? { primary?.key }
+    /// Picker key for this chat's remembered reviewer model — nil when the reviewer is
+    /// `off`/unset, so the composer's reviewer picker only ever shows a real model (the
+    /// Review toggle owns whether the reviewer runs; the picker owns which model).
+    var reviewerModelKey: String? { if case .choice(let c) = reviewer { return c.key }; return nil }
     var source: String?      // imported-from origin (claude/codex/conductor)
     var worktreePath: String?  // absolute path of this session's git worktree (the run cwd)
 
