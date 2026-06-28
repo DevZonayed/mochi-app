@@ -3,6 +3,7 @@ import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { UpdateBanner } from './lib/UpdateBanner';
 import { NotificationCenter } from './lib/notify';
 import { RemotePairGate } from './lib/RemotePairGate';
+import { ErrorBoundary } from './lib/ErrorBoundary';
 import { PrActionConfirmDialog } from './screens/PrActionConfirmDialog';
 import { ExitPlanModeDialog } from './screens/ExitPlanModeDialog';
 import { IS_LOCAL } from './lib/api';
@@ -77,6 +78,7 @@ export function App() {
     <HashRouter>
       <AccountGate>
       <RemotePairGate>
+      <ErrorBoundary name="app">
       <React.Suspense fallback={null}>
         <Routes>
           <Route path="/" element={<Navigate to={entryPath()} replace />} />
@@ -106,6 +108,7 @@ export function App() {
           <Route path="*" element={<Navigate to={entryPath()} replace />} />
         </Routes>
       </React.Suspense>
+      </ErrorBoundary>
       <UpdateBanner />
       <NotificationCenter />
       {/* Mac-local: hard-button gate for the agent's pr_merge / pr_resolve_conflicts.

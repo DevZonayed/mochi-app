@@ -10,8 +10,9 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, type Project as ApiProject, type Job, type ProjectKind, type FolderInspect, type ChatSession, IS_LOCAL } from '../lib/api';
-import { SessionStateDot } from './SessionStateDot';
+import { SessionStateDot, RunningDot } from './SessionStateDot';
 import { useProjectRollupState } from '../lib/useSessionGitState';
+import { useProjectRunning } from '../lib/useSessionRunning';
 
 /* Page-specific CSS from Projects.html <style> (the app-shell already provides
    the spin/app-wallpaper/nav-item/ws-header/search-field/tb-icon hooks, but we
@@ -265,6 +266,7 @@ interface CardProps {
 function ProjectCard({ p, onMenu, onOpen, dnd, onHide, onArchiveMerged }: CardProps) {
   const t = TEMPLATES[p.tpl];
   const rollup = useProjectRollupState(p.id, p.sessionIds);
+  const running = useProjectRunning(p.id, p.sessionIds);
   return (
     <div className={`proj-card${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
       position: 'relative', background: 'var(--bg-elevated)', borderRadius: 20, overflow: 'hidden',
@@ -278,10 +280,10 @@ function ProjectCard({ p, onMenu, onOpen, dnd, onHide, onArchiveMerged }: CardPr
           <span style={{ position: 'relative', width: 42, height: 42, borderRadius: 12, flexShrink: 0, display: 'grid', placeItems: 'center',
             background: `color-mix(in srgb, ${t.tint} 15%, transparent)`, color: t.tint }}>
             <Icon name={t.icon} size={22} />
-            {rollup && rollup !== 'no-repo' && (
+            {(running || (rollup && rollup !== 'no-repo')) && (
               <span style={{ position: 'absolute', right: -2, bottom: -2, width: 14, height: 14, borderRadius: 7,
                 background: 'var(--bg-elevated)', display: 'grid', placeItems: 'center', boxShadow: '0 0 0 1px var(--separator)' }}>
-                <SessionStateDot state={rollup} size={10} />
+                {running ? <RunningDot size={11} /> : <SessionStateDot state={rollup} size={10} />}
               </span>
             )}
           </span>
@@ -350,6 +352,7 @@ interface RowProps {
 function ProjectRow({ p, onMenu, onOpen, onHide, last, dnd }: RowProps) {
   const t = TEMPLATES[p.tpl];
   const rollup = useProjectRollupState(p.id, p.sessionIds);
+  const running = useProjectRunning(p.id, p.sessionIds);
   return (
     <div className={`proj-row${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
       display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.4fr 0.8fr 1fr 36px', alignItems: 'center', gap: 14,
@@ -360,10 +363,10 @@ function ProjectRow({ p, onMenu, onOpen, onHide, last, dnd }: RowProps) {
         <span style={{ position: 'relative', width: 32, height: 32, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center',
           background: `color-mix(in srgb, ${t.tint} 15%, transparent)`, color: t.tint }}>
           <Icon name={t.icon} size={17} />
-          {rollup && rollup !== 'no-repo' && (
+          {(running || (rollup && rollup !== 'no-repo')) && (
             <span style={{ position: 'absolute', right: -2, bottom: -2, width: 12, height: 12, borderRadius: 6,
               background: 'var(--bg-elevated)', display: 'grid', placeItems: 'center', boxShadow: '0 0 0 1px var(--separator)' }}>
-              <SessionStateDot state={rollup} size={8} />
+              {running ? <RunningDot size={9} /> : <SessionStateDot state={rollup} size={8} />}
             </span>
           )}
         </span>
