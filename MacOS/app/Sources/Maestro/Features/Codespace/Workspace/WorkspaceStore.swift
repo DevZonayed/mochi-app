@@ -11,9 +11,19 @@ struct WorkTab: Identifiable, Hashable {
     var kind: Kind
     var section: ProjectSection?   // project tab: which hub section
     var filePath: String?          // file tab: absolute path shown in the preview pane
+    var base: String? = nil        // chat tab: base branch to fork the worktree from (nil = default)
 }
 
-enum ProjectSection: String, CaseIterable { case instructions = "Instructions", skills = "Skills & tools", settings = "Settings" }
+/// The per-project hub sections, in Electron order. `skills` is labeled "Skills" (not "Skills & tools").
+enum ProjectSection: String, CaseIterable {
+    case settings = "Settings", instructions = "Instructions", memory = "Memory", skills = "Skills", whatsapp = "WhatsApp", jobs = "Jobs"
+    var icon: String {
+        switch self {
+        case .settings: "settings"; case .instructions: "bookmark"; case .memory: "spark"
+        case .skills: "spark"; case .whatsapp: "whatsapp"; case .jobs: "jobs"
+        }
+    }
+}
 
 enum KindFilter: String, CaseIterable {
     case all, code, design, content, research
@@ -34,6 +44,7 @@ final class WorkspaceStore {
     var sessionsByProject: [String: [ChatSession]] = [:]
     var expanded: Set<String> = []
     var archivedOpen: Set<String> = []
+    var chatsAllOpen: Set<String> = []      // projects whose chat list is expanded past the 7-cap
     var tabs: [WorkTab] = []
     var activeKey: String?
     var activeProjectId: String?
@@ -90,7 +101,14 @@ final class WorkspaceStore {
         }
         await loadProjects()
         if activeProjectId == nil { activeProjectId = visibleProjects.first?.id }
-        if let pid = activeProjectId { expanded.insert(pid); await loadSessions(pid) }
+        if let pid = activeProjectId { expanded.insert(pid); await loadSessions(pid); prewarm(pid) }
+    }
+
+    /// Warm the cache with the active project's most-recent chats so the first click is instant.
+    func prewarm(_ pid: String) {
+        for s in activeSessions(pid).prefix(3) {
+            TranscriptCache.shared.prefetch(s.id, projectId: pid, client: client)
+        }
     }
     func stop() { for t in tokens { client.removeHandler(t) }; tokens = [] }
 
@@ -117,7 +135,7 @@ final class WorkspaceStore {
     }
     func switchToProject(_ pid: String) {
         activeProjectId = pid
-        if sessionsByProject[pid] == nil { Task { await loadSessions(pid) } }
+        Task { if sessionsByProject[pid] == nil { await loadSessions(pid) }; prewarm(pid) }
         // restore this project's last tab if any
         activeKey = tabs.last { $0.projectId == pid }?.id
     }
@@ -129,11 +147,19 @@ final class WorkspaceStore {
         let tab = WorkTab(id: "chat:\(s.id)", projectId: s.projectId ?? "", sessionId: s.id, title: s.displayTitle, kind: .chat, section: nil, filePath: nil)
         tabs.append(tab); activeKey = tab.id
     }
-    func newChat(_ pid: String) {
+    /// Start a fresh (lazy-created) chat tab. Auto-expands the project subtree so the new chat is
+    /// visible in the tree (the missing `expanded.insert` was the "nothing happened" bug). `base`
+    /// forks the worktree from a non-default branch when the picker supplies one.
+    func newChat(_ pid: String, base: String? = nil) {
         guard !pid.isEmpty else { return }
         activeProjectId = pid
-        let tab = WorkTab(id: "new:\(pid):\(tabs.count)", projectId: pid, sessionId: nil, title: "New chat", kind: .chat, section: nil, filePath: nil)
+        expanded.insert(pid)
+        if sessionsByProject[pid] == nil { Task { await loadSessions(pid) } }
+        let tab = WorkTab(id: "new:\(pid):\(tabs.count)", projectId: pid, sessionId: nil, title: "New chat", kind: .chat, section: nil, filePath: nil, base: base)
         tabs.append(tab); activeKey = tab.id
+    }
+    func toggleChatsOpen(_ pid: String) {
+        if chatsAllOpen.contains(pid) { chatsAllOpen.remove(pid) } else { chatsAllOpen.insert(pid) }
     }
     func openProjectPanel(_ pid: String, _ section: ProjectSection) {
         activeProjectId = pid
@@ -182,5 +208,18 @@ final class WorkspaceStore {
     func delete(_ s: ChatSession) async {
         tabs.removeAll { $0.sessionId == s.id }
         try? await client.callVoid("deleteSession", ["id": s.id])
+    }
+
+    // MARK: project ops (from the ⋯ menu)
+    func setHidden(_ p: Project, _ hidden: Bool) {
+        if let i = projects.firstIndex(where: { $0.id == p.id }) { projects[i].hidden = hidden }
+        Task { try? await client.callVoid("updateProject", ["id": p.id, "hidden": hidden]) }
+    }
+    func deleteProject(_ p: Project) {
+        tabs.removeAll { $0.projectId == p.id }
+        projects.removeAll { $0.id == p.id }
+        sessionsByProject[p.id] = nil
+        if activeProjectId == p.id { activeProjectId = visibleProjects.first?.id; activeKey = nil }
+        Task { try? await client.callVoid("deleteProject", ["id": p.id]) }
     }
 }

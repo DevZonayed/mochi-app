@@ -5,6 +5,7 @@ import SwiftUI
 struct TopNav: View {
     @Environment(AppEnv.self) private var env
     @Environment(\.colorScheme) private var scheme
+    @State private var feedbackOpen = false
 
     var body: some View {
         @Bindable var env = env
@@ -17,8 +18,9 @@ struct TopNav: View {
 
             Spacer(minLength: 0)
 
-            tbIcon(scheme == .dark ? "sun" : "moon") { withAnimation(.smooth(duration: 0.35)) { env.theme.toggle(current: scheme) } }
             tbIcon("search") {}
+            tbIcon("feedback") { feedbackOpen = true }
+            tbIcon(scheme == .dark ? "sun" : "moon") { withAnimation(.smooth(duration: 0.35)) { env.theme.toggle(current: scheme) } }
             tbIcon("settings", active: env.route == .settings) { env.route = .settings }
         }
         .padding(.leading, 76) // clear the traffic lights
@@ -27,6 +29,9 @@ struct TopNav: View {
         .background(.ultraThinMaterial)
         .overlay(alignment: .bottom) {
             Tok.separator.frame(height: Tok.hairline)
+        }
+        .sheet(isPresented: $feedbackOpen) {
+            FeedbackModal(screen: String(describing: env.route), onClose: { feedbackOpen = false }).environment(env)
         }
     }
 

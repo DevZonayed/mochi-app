@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// The conversation pane: streamed transcript + composer. Owns a ChatThreadStore bound to the
 /// active session (nil = a fresh chat that lazy-creates on first send).
@@ -7,12 +8,16 @@ struct ChatThread: View {
     let projectId: String
     let projectName: String
     @Binding var sessionId: String?
+    var base: String? = nil       // base branch for a fresh chat (forked on first send)
     var flush: Bool = false
     var active: Bool = true
     let onSessionCreated: (ChatSession) -> Void
     var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
 
     @State private var store: ChatThreadStore?
+    /// Render only the last N turns (messenger-style) — older turns lazy-load on "Load earlier"
+    /// or when the minimap jumps back. Keeps long chats smooth instead of mounting every turn.
+    @State private var visibleCount = 8
     @State private var composerText = ""
     @State private var model = "auto"
     @State private var effort = "balanced"
@@ -106,43 +111,78 @@ struct ChatThread: View {
 
     @ViewBuilder private var transcript: some View {
         if let store, !store.turns.isEmpty {
+            let all = store.turns
+            let start = max(0, all.count - visibleCount)
+            let windowed = Array(all[start...])
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 22) {
-                        ForEach(store.turns) { job in
+                        if start > 0 {
+                            Button { loadEarlier(proxy, all: all) } label: {
+                                HStack(spacing: 6) {
+                                    Icon(name: "chevronDown", size: 11).rotationEffect(.degrees(180))
+                                    Text("Load earlier messages").font(TokFont.text(TokFont.caption, .semibold))
+                                }
+                                .foregroundStyle(Tok.blue).padding(.horizontal, 12).padding(.vertical, 6)
+                                .background(Tok.fillTertiary).clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain).frame(maxWidth: .infinity)
+                        }
+                        ForEach(windowed) { job in
                             TurnView(job: job,
                                      projectRoot: projectRoot,
-                                     answerable: job.id == store.turns.last?.id && job.isRunning,
+                                     answerable: job.id == all.last?.id && job.isRunning,
                                      onAnswer: { ans in Task { await store.answer(ans) } },
                                      onOpenFile: onOpenFile)
-                                .transition(.opacity.combined(with: .offset(y: 8)))
+                                .id(job.id)
                         }
                         Color.clear.frame(height: 1).id("bottom")
                     }
                     .frame(maxWidth: 1180)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, 24).padding(.vertical, 22)
-                    .animation(.smooth(duration: 0.28), value: store.turns.count)
                 }
-                .onChange(of: store.turns.count) { scrollToBottom(proxy, animated: true) }
-                .onChange(of: store.turns.last?.updatedAt) { scrollToBottom(proxy, animated: true) }
-                .onChange(of: active) { _, isActive in if isActive { scrollToBottom(proxy) } }
-                .onAppear { scrollToBottom(proxy) }
-                .onChange(of: sessionId) { _, _ in scrollToBottom(proxy) }
+                // Messenger-style: start (and stay) pinned to the bottom; growth at the bottom
+                // follows the live stream without a per-token scroll, which is what caused the jank.
+                .defaultScrollAnchor(.bottom)
+                // Click empty transcript space → drop focus so any text selection clears.
+                .background { Color.clear.contentShape(Rectangle()).onTapGesture { NSApp.keyWindow?.makeFirstResponder(nil) } }
+                .overlay(alignment: .trailing) {
+                    TurnMinimap(turns: all.map { MiniTurn(id: $0.id, title: miniTitle($0), running: $0.isRunning) },
+                                onJump: { id in jump(to: id, proxy: proxy, all: all) })
+                        .padding(.trailing, 2)
+                }
+                .onChange(of: sessionId) { _, _ in visibleCount = 8 }
             }
         } else {
             emptyState
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = false) {
+    private func miniTitle(_ job: Job) -> String {
+        let first = job.input.split(separator: "\n").first.map(String.init) ?? job.input
+        let t = first.trimmed
+        return t.isEmpty ? "Untitled" : t
+    }
+
+    /// Reveal +12 older turns while keeping the current top turn in view.
+    private func loadEarlier(_ proxy: ScrollViewProxy, all: [Job]) {
+        let anchorId = Array(all.suffix(visibleCount)).first?.id
+        visibleCount = min(all.count, visibleCount + 12)
+        if let anchorId {
+            Task { @MainActor in try? await Task.sleep(nanoseconds: 80_000_000); proxy.scrollTo(anchorId, anchor: .top) }
+        }
+    }
+
+    /// Jump to any turn from the minimap — expand the window to include it, then scroll.
+    private func jump(to id: String, proxy: ScrollViewProxy, all: [Job]) {
+        if let idx = all.firstIndex(where: { $0.id == id }) {
+            let needed = all.count - idx + 1
+            if needed > visibleCount { visibleCount = min(all.count, needed) }
+        }
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 70_000_000)
-            if animated {
-                withAnimation(.smooth(duration: 0.18)) { proxy.scrollTo("bottom", anchor: .bottom) }
-            } else {
-                proxy.scrollTo("bottom", anchor: .bottom)
-            }
+            try? await Task.sleep(nanoseconds: 90_000_000)
+            withAnimation(.smooth(duration: 0.25)) { proxy.scrollTo(id, anchor: .top) }
         }
     }
 
@@ -165,7 +205,7 @@ struct ChatThread: View {
         guard !text.isEmpty, let store else { return }
         composerText = ""
         Task {
-            await store.send(text, effort: effort, plan: plan, goal: goal, modelKey: model) { session in
+            await store.send(text, effort: effort, plan: plan, goal: goal, modelKey: model, base: base) { session in
                 onSessionCreated(session)
                 sessionId = session.id
             }

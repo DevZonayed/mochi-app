@@ -2,6 +2,11 @@ import SwiftUI
 
 struct RootView: View {
     @Environment(AppEnv.self) private var env
+    @State private var minElapsed = false
+
+    /// Ready once the sidecar's first project list has loaded (and a short minimum so the splash
+    /// doesn't flash on a warm start).
+    private var ready: Bool { (env.workspace.map { !$0.loading } ?? false) && minElapsed }
 
     var body: some View {
         ZStack {
@@ -19,9 +24,13 @@ struct RootView: View {
             // Let the nav row rise into the title bar so it sits inline with the traffic lights
             // (no wasted empty strip up top) — the standard macOS unified-toolbar look.
             .ignoresSafeArea(.container, edges: .top)
+
+            if !ready { LaunchScreen().transition(.opacity).zIndex(10) }
         }
         .background(Tok.bg)
         .background(WindowConfigurator(barHeight: 40))
+        .animation(.easeOut(duration: 0.4), value: ready)
+        .task { try? await Task.sleep(for: .milliseconds(650)); minElapsed = true }
     }
 
     @ViewBuilder private var routeContent: some View {

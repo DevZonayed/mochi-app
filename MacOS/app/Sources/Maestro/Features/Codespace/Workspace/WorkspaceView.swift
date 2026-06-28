@@ -20,6 +20,10 @@ struct WorkspaceView: View {
                         main(store)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    // VS Code-style right panel — file tree + Edited/Checks + command dock.
+                    if let pid = store.activeProjectId, let p = store.project(pid)?.path, !p.isEmpty {
+                        WorkspaceRightSidebar(store: store)
+                    }
                 }
             } else {
                 Spinner(size: 20).tint(Tok.inkTertiary).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -90,6 +94,10 @@ struct WorkspaceView: View {
             }
             Text(tab.title).font(TokFont.text(TokFont.caption, on ? .semibold : .medium))
                 .foregroundStyle(on ? Tok.ink : Tok.inkSecondary).lineLimit(1)
+            // Un-sent new chat off a non-default branch shows its base, e.g. "New chat · feature-x".
+            if tab.sessionId == nil, let base = tab.base, !base.isEmpty {
+                Text("· \(base)").font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(1)
+            }
             Button { store.closeTab(tab.id) } label: { Icon(name: "x", size: 10, weight: .bold).foregroundStyle(Tok.inkTertiary).frame(width: 16, height: 16).hoverFill(Tok.fillSecondary, radius: 5) }.pressable()
         }
         .padding(.leading, 11).padding(.trailing, 6)
@@ -108,7 +116,7 @@ struct WorkspaceView: View {
             Tok.bgElevated
             ForEach(store.tabs.filter { $0.kind == .chat && $0.projectId == store.activeProjectId }) { tab in
                 ChatThread(projectId: tab.projectId, projectName: store.project(tab.projectId)?.name ?? "",
-                           sessionId: sessionBinding(store, tab), flush: true, active: store.activeKey == tab.id,
+                           sessionId: sessionBinding(store, tab), base: tab.base, flush: true, active: store.activeKey == tab.id,
                            onSessionCreated: { store.bindCreatedSession(tabKey: tab.id, session: $0) },
                            onOpenFile: { store.openFile($0, projectId: tab.projectId) })
                     .opacity(store.activeKey == tab.id ? 1 : 0)
@@ -120,8 +128,7 @@ struct WorkspaceView: View {
                     .transition(.opacity)
             }
             if let t = store.activeTab, t.kind == .file, let p = t.filePath {
-                FilePreviewWindow(url: URL(fileURLWithPath: p))
-                    .background(Tok.bgElevated)
+                FileViewer(projectId: t.projectId, path: p)
                     .transition(.opacity)
             }
             if store.activeTab == nil { emptyState(store).transition(.opacity) }

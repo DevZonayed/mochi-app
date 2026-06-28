@@ -7,21 +7,23 @@ struct ScheduleSheetContext: Identifiable {
     var prefillProjectId: String? = nil
 }
 
-/// The top-level Schedule destination: a List ⇄ Calendar of every schedule, with a "New
-/// schedule" sheet. Owns a `ScheduleStore` and a one-shot project list (for names + the picker).
+/// Project name + color for the schedule list/calendar (mirrors the web `projMeta`).
+struct SchedProjMeta { let name: String; let color: Color }
+
+/// The top-level Schedule destination — "Scheduler": a Calendar ⇄ List of every schedule with a
+/// "New schedule" sheet. Mirrors the web Scheduler.tsx.
 struct ScheduleView: View {
     @Environment(AppEnv.self) private var env
     @State private var store: ScheduleStore?
     @State private var projects: [Project] = []
-    @State private var mode: Mode = .list
+    @State private var mode: Mode = .calendar
     @State private var sheet: ScheduleSheetContext?
 
-    enum Mode: Hashable { case list, calendar }
+    enum Mode: Hashable { case calendar, list }
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
             header
-            Divider().overlay(Tok.separator)
             content
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -36,46 +38,42 @@ struct ScheduleView: View {
         }
     }
 
-    private var projectNames: [String: String] {
-        Dictionary(projects.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+    /// Project meta keyed by id (name + color); used by both list groups and calendar chips.
+    private var projMeta: [String: SchedProjMeta] {
+        Dictionary(projects.map { ($0.id, SchedProjMeta(name: $0.name, color: ProjectColor.color($0.color))) },
+                   uniquingKeysWith: { a, _ in a })
     }
 
     private var header: some View {
-        HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Schedule").font(TokFont.display(TokFont.title1, .bold)).foregroundStyle(Tok.ink)
-                Text(subtitle).font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 14) {
+                Text("Scheduler").font(TokFont.display(TokFont.largeTitle, .bold)).tracking(-0.6).foregroundStyle(Tok.ink)
+                Spacer()
+                SegmentedControl(options: [(.calendar, "Calendar", "calendar"), (.list, "List", "jobs")], value: $mode)
+                PillButton(title: "New schedule", icon: "plus") { sheet = ScheduleSheetContext(id: "new", editing: nil) }
             }
-            Spacer()
-            SegmentedControl(options: modeOptions, value: $mode)
-            PillButton(title: "New schedule", icon: "plus") { sheet = ScheduleSheetContext(id: "new", editing: nil) }
+            HStack(spacing: 8) {
+                Icon(name: "shield", size: 14).foregroundStyle(Tok.green)
+                Text("Schedules fire on this Mac while Maestro is running. A missed time rolls forward — or, with catch-up on, still runs later the same day.")
+                    .font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkSecondary)
+            }
         }
-        .padding(.horizontal, 28).padding(.vertical, 18)
-    }
-
-    private var subtitle: String {
-        let n = store?.schedules.count ?? 0
-        return n == 0 ? "Queued messages & recurring tasks" : "\(n) scheduled"
-    }
-
-    private var modeOptions: [(value: Mode, label: String, icon: String?)] {
-        [(.list, "List", "jobs"), (.calendar, "Calendar", "calendar")]
+        .padding(.horizontal, 28).padding(.top, 24).padding(.bottom, 18)
     }
 
     @ViewBuilder private var content: some View {
         if let store {
             if store.loading && store.schedules.isEmpty {
                 Spinner(size: 22).tint(Tok.inkTertiary).frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if store.schedules.isEmpty {
-                emptyState
             } else {
                 switch mode {
-                case .list:
-                    ScheduleListView(store: store, projectNames: projectNames) { s in
+                case .calendar:
+                    ScheduleCalendarView(store: store, projMeta: projMeta) { s in
                         sheet = ScheduleSheetContext(id: s.id, editing: s)
                     }
-                case .calendar:
-                    ScheduleCalendarView(store: store) { s in
+                    .padding(.horizontal, 28).padding(.bottom, 0)
+                case .list:
+                    ScheduleListView(store: store, projMeta: projMeta) { s in
                         sheet = ScheduleSheetContext(id: s.id, editing: s)
                     }
                 }
@@ -83,20 +81,5 @@ struct ScheduleView: View {
         } else {
             Spinner(size: 22).tint(Tok.inkTertiary).frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 14) {
-            Icon(name: "clock", size: 30).foregroundStyle(.white)
-                .frame(width: 60, height: 60)
-                .background(LinearGradient(colors: [Tok.blue, Tok.indigo], startPoint: .topLeading, endPoint: .bottomTrailing))
-                .clipShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
-            Text("Nothing scheduled").font(TokFont.display(TokFont.title2, .bold)).foregroundStyle(Tok.ink)
-            Text("Schedule a message from any chat, or create a recurring task.")
-                .font(TokFont.text(TokFont.subhead)).foregroundStyle(Tok.inkSecondary).multilineTextAlignment(.center)
-            PillButton(title: "New schedule", icon: "plus") { sheet = ScheduleSheetContext(id: "new", editing: nil) }
-                .padding(.top, 4)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

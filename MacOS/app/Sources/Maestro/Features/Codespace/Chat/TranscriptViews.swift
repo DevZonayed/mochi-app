@@ -1,6 +1,12 @@
 import SwiftUI
 import AppKit
 
+/// Put a string on the pasteboard (chat copy).
+@MainActor func copyToPasteboard(_ s: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(s, forType: .string)
+}
+
 /// One turn: the user's message bubble, then the assistant's work.
 struct TurnView: View {
     let job: Job
@@ -16,12 +22,14 @@ struct TurnView: View {
     }
 }
 
+// MARK: - User bubble
+
 struct UserBubble: View {
     let job: Job
     var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
 
     /// Render `@/long/path/to/file.png` file mentions as compact `@file.png` chips (highlighted),
-    /// instead of dumping the raw path — à la Conductor.
+    /// instead of dumping the raw path — à la Conductor. Bold (`**…**`) is honored inline.
     static func mentionStyled(_ s: String) -> AttributedString {
         var out = AttributedString()
         let words = s.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
@@ -41,6 +49,7 @@ struct UserBubble: View {
         }
         return out
     }
+
     var body: some View {
         HStack {
             Spacer(minLength: 60)
@@ -54,13 +63,16 @@ struct UserBubble: View {
                 }
                 Text(Self.mentionStyled(job.input))
                     .font(TokFont.text(14)).foregroundStyle(.white)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 13).padding(.vertical, 9)
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    // Vertical gradient: a touch-lightened blue at the top → full blue (matches the web).
                     .background(
-                        LinearGradient(colors: [Tok.blue, Tok.bluePress], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        LinearGradient(colors: [Color(nsColor: NSColor(hex: "#0F82FF")), Tok.blue],
+                                       startPoint: .top, endPoint: .bottom)
                     )
                     .clipShape(.rect(topLeadingRadius: 18, bottomLeadingRadius: 18, bottomTrailingRadius: 5, topTrailingRadius: 18))
+                    .shadow(color: Tok.blue.opacity(0.30), radius: 7, y: 4)
                     .frame(maxWidth: 640, alignment: .trailing)
+                    .contextMenu { Button { copyToPasteboard(job.input) } label: { Label("Copy", systemImage: "doc.on.doc") } }
             }
         }
     }
@@ -82,35 +94,46 @@ struct UserAttachmentChip: View {
             HStack(spacing: 7) {
                 if let p = ref.imagePath, let img = NSImage(contentsOfFile: p) {
                     Image(nsImage: img)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 28, height: 28)
+                        .resizable().scaledToFill().frame(width: 28, height: 28)
                         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 } else {
                     Image(systemName: "photo")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Tok.green)
-                        .frame(width: 28, height: 28)
-                        .background(Tok.green.opacity(0.18))
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(Tok.green)
+                        .frame(width: 28, height: 28).background(Tok.green.opacity(0.18))
                         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
-                Text(title)
-                    .font(TokFont.text(TokFont.footnote, .medium))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
+                Text(title).font(TokFont.text(TokFont.footnote, .medium)).foregroundStyle(.white).lineLimit(1)
             }
-            .padding(.leading, 4)
-            .padding(.trailing, 9)
-            .padding(.vertical, 4)
+            .padding(.leading, 4).padding(.trailing, 9).padding(.vertical, 4)
             .background(Color.white.opacity(hovering ? 0.28 : 0.20))
             .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Color.white.opacity(0.18), lineWidth: Tok.hairline))
         }
-        .buttonStyle(.plain)
-        .disabled(ref.imagePath == nil)
-        .onHover { hovering = $0 }
-        .help(ref.imagePath ?? title)
+        .buttonStyle(.plain).disabled(ref.imagePath == nil).onHover { hovering = $0 }.help(ref.imagePath ?? title)
     }
+}
+
+// MARK: - Assistant turn
+
+/// Grouping so consecutive tool calls render as a tight list (Electron `ToolGroup` gap:1) while
+/// other blocks keep the larger turn rhythm.
+private enum RBlock: Identifiable {
+    case tools([TranscriptItem])
+    case single(TranscriptItem)
+    var id: String {
+        switch self {
+        case .tools(let t): return "tools-\(t.first?.id ?? "")-\(t.count)"
+        case .single(let s): return s.id
+        }
+    }
+}
+private func groupBlocks(_ items: [TranscriptItem]) -> [RBlock] {
+    var out: [RBlock] = []; var run: [TranscriptItem] = []
+    func flush() { if !run.isEmpty { out.append(.tools(run)); run = [] } }
+    for it in items {
+        if it.kind == "tool" { run.append(it) } else { flush(); out.append(.single(it)) }
+    }
+    flush(); return out
 }
 
 struct AssistantTurn: View {
@@ -119,49 +142,141 @@ struct AssistantTurn: View {
     var answerable = false
     var onAnswer: (String) -> Void = { _ in }
     var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
+
+    private var provider: String { job.engine == "codex" ? "openai" : "anthropic" }
+    private var hasBody: Bool { (job.transcript ?? []).contains { ($0.kind == "text" || $0.kind == "result") && !$0.text.trimmed.isEmpty } }
+    private var replyText: String? { (job.transcript ?? []).last { ($0.kind == "text" || $0.kind == "result") && !$0.text.trimmed.isEmpty }?.text }
+
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Circle().fill(Tok.purple.opacity(0.16)).frame(width: 30, height: 30)
-                .overlay(Icon(name: "spark", size: 15).foregroundStyle(Tok.purple))
+            avatar
             VStack(alignment: .leading, spacing: 10) {
-                // header
-                HStack(spacing: 8) {
-                    Text(engineLabel).font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.inkSecondary)
-                    if let m = job.model { Text(m).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary) }
-                    if job.goal == true { badge("GOAL", Tok.purple) }
-                }
-                // blocks — while running, show everything live; once settled, collapse the
-                // tool/thinking "work" into a WorkBar and keep the prose/result.
-                let blocks = job.transcript ?? []
-                if job.isRunning {
-                    ForEach(blocks) { item in
-                        TranscriptBlock(item: item, projectRoot: projectRoot, answerable: answerable && item.kind == "ask", onAnswer: onAnswer, onOpenFile: onOpenFile)
-                    }
-                } else {
-                    let work = blocks.filter { $0.kind == "tool" || $0.kind == "thinking" }
-                    let content = blocks.filter { $0.kind != "tool" && $0.kind != "thinking" }
-                    if !work.isEmpty { WorkBar(work: work, durMs: job.transcript?.compactMap(\.durMs).reduce(0, +), projectRoot: projectRoot, onOpenFile: onOpenFile) }
-                    ForEach(content) { item in
-                        TranscriptBlock(item: item, projectRoot: projectRoot, answerable: answerable && item.kind == "ask", onAnswer: onAnswer, onOpenFile: onOpenFile)
-                    }
-                }
+                header
+                blocksView
+                statusView
+            }
+            .contextMenu { if let r = replyText, !r.trimmed.isEmpty { Button { copyToPasteboard(r) } label: { Label("Copy response", systemImage: "doc.on.doc") } } }
+            Spacer(minLength: 0)
+        }
+    }
 
-                // status / meta
-                if job.status == "running" || job.status == "pending" {
-                    HStack(spacing: 7) {
-                        Spinner(size: 12).tint(Tok.purple)
-                        Text(job.isPaused ? "Paused — will resume" : "Responding…")
-                            .font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.purple)
-                    }
-                } else if job.status == "failed" {
-                    failureCard
-                } else if job.status == "cancelled" {
-                    Text("Stopped").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary)
-                } else {
-                    metaLine
+    // 30×30 elevated rounded-square card with the provider brand glyph (spinner while live, no body yet).
+    private var avatar: some View {
+        ZStack {
+            if job.isRunning && !hasBody {
+                Spinner(size: 14).tint(Tok.purple)
+            } else {
+                ProviderGlyph(provider: provider, size: 16, color: Tok.ink)
+            }
+        }
+        .frame(width: 30, height: 30)
+        .background(Tok.bgElevated)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
+        .shadow(color: .dyn(.rgba(15, 20, 50, 0.06), .rgba(0, 0, 0, 0.4)), radius: 1.5, y: 1)
+        .padding(.top, 1)
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text(engineLabel).font(TokFont.text(TokFont.footnote, .semibold)).foregroundStyle(Tok.ink)
+            if let m = job.model, m != job.engine { Text(m).font(TokFont.mono(TokFont.caption)).foregroundStyle(Tok.inkTertiary) }
+            if job.goal == true { badge("GOAL", Tok.purple) }
+            if job.isRunning {
+                HStack(spacing: 5) {
+                    Circle().fill(Tok.purple).frame(width: 6, height: 6)
+                        .modifier(Breathe())
+                    Text(hasBody ? "streaming" : "thinking").font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.purple)
                 }
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 6)
+            if let r = replyText, !r.trimmed.isEmpty {
+                CopyChip(text: r)
+            }
+        }
+    }
+
+    @ViewBuilder private var blocksView: some View {
+        let blocks = job.transcript ?? []
+        if job.isRunning {
+            renderGroups(groupBlocks(blocks), live: true)
+        } else {
+            let work = blocks.filter { $0.kind == "tool" || $0.kind == "thinking" }
+            let content = blocks.filter { $0.kind != "tool" && $0.kind != "thinking" }
+            if !work.isEmpty {
+                WorkBar(work: work, elapsedMs: max(0, (job.updatedAt ?? job.createdAt) - job.createdAt),
+                        projectRoot: projectRoot, onOpenFile: onOpenFile)
+            }
+            renderGroups(groupBlocks(content), live: false)
+        }
+    }
+
+    @ViewBuilder private func renderGroups(_ groups: [RBlock], live: Bool) -> some View {
+        ForEach(groups) { g in
+            switch g {
+            case .tools(let ts):
+                VStack(alignment: .leading, spacing: 1) {
+                    ForEach(ts) { ToolCallRow(item: $0, root: projectRoot, onOpenFile: onOpenFile) }
+                }
+            case .single(let it):
+                TranscriptBlock(item: it, projectRoot: projectRoot, live: live,
+                                answerable: answerable && it.kind == "ask", onAnswer: onAnswer, onOpenFile: onOpenFile)
+            }
+        }
+    }
+
+    @ViewBuilder private var statusView: some View {
+        if job.isRunning {
+            if job.isPaused {
+                HStack(spacing: 7) {
+                    Icon(name: "pause", size: 12).foregroundStyle(Tok.orange)
+                    Text("Paused — will resume").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.orange)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Spinner(size: 12).tint(Tok.purple)
+                    ShimmerText(text: liveActivity)
+                    StreamCaret(height: 15)
+                }
+            }
+        } else if job.status == "failed" {
+            failureCard
+        } else if job.status == "cancelled" {
+            Text("Stopped").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary)
+        } else {
+            metaLine
+        }
+    }
+
+    /// Contextual heartbeat string (mirrors `liveActivity` in ProjectDetail.tsx).
+    private var liveActivity: String {
+        let items = job.transcript ?? []
+        guard let last = items.last else { return "Thinking…" }
+        switch last.kind {
+        case "tool":
+            if last.toolStatus == "running" {
+                let verb = toolVerb(ToolViz.display(last.name).short)
+                let detail = String(ToolViz.detail(last).trimmed.prefix(54))
+                return detail.isEmpty ? "\(verb)…" : "\(verb) \(detail)…"
+            }
+            return "Thinking…"
+        case "thinking": return "Thinking…"
+        case "image": return "Saving image…"
+        case "ask": return "Waiting for your answer…"
+        case "text", "result": return "Responding…"
+        default: return "Thinking…"
+        }
+    }
+    private func toolVerb(_ short: String) -> String {
+        switch short {
+        case "Image": return "Generating image"
+        case "Run": return "Running"
+        case "Edit": return "Editing"
+        case "Write": return "Writing"
+        case "Read": return "Reading"
+        case "Search", "Find": return "Searching"
+        case "Browser", "Fetch", "Web search": return "Browsing"
+        default: return "Working"
         }
     }
 
@@ -186,16 +301,27 @@ struct AssistantTurn: View {
     }
 
     private func badge(_ t: String, _ c: Color) -> some View {
-        Text(t).font(TokFont.text(TokFont.caption, .bold)).foregroundStyle(c)
-            .padding(.horizontal, 6).padding(.vertical, 2).background(c.opacity(0.14)).clipShape(Capsule())
+        Text(t).font(TokFont.text(9, .bold)).tracking(0.4).foregroundStyle(c)
+            .padding(.horizontal, 6).padding(.vertical, 2).background(c.opacity(0.14)).clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
     }
 }
 
+/// Breathing opacity (1 → .45 → 1) for the live status dot — mirrors `.breathe`.
+private struct Breathe: ViewModifier {
+    @State private var dim = false
+    func body(content: Content) -> some View {
+        content.opacity(dim ? 0.45 : 1)
+            .onAppear { withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { dim = true } }
+    }
+}
+
+// MARK: - Work bar (collapsed settled work)
+
 /// Collapsed "Worked Ns · thought · N tools" summary for a settled turn — expands to reveal the
-/// tool/thinking work. Mirrors Conductor: the run log folds away once the response is done.
+/// tool/thinking work behind an indent rail. `elapsedMs` is the turn wall-clock.
 struct WorkBar: View {
     let work: [TranscriptItem]
-    var durMs: Double?
+    var elapsedMs: Double
     var projectRoot: String? = nil
     var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
     @State private var expanded = false
@@ -206,8 +332,8 @@ struct WorkBar: View {
         VStack(alignment: .leading, spacing: 8) {
             Button { withAnimation(.smooth(duration: 0.2)) { expanded.toggle() } } label: {
                 HStack(spacing: 6) {
-                    Icon(name: "check", size: 11).foregroundStyle(Tok.green)
-                    Text(summary(tools: tools, thought: thought)).font(TokFont.text(TokFont.caption, .medium)).foregroundStyle(Tok.inkSecondary)
+                    Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(Tok.green)
+                    Text(summary(tools: tools, thought: thought)).font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.inkSecondary)
                     Icon(name: expanded ? "chevronDown" : "chevronRight", size: 10).foregroundStyle(Tok.inkTertiary)
                 }
                 .padding(.horizontal, 9).padding(.vertical, 5)
@@ -215,46 +341,121 @@ struct WorkBar: View {
                 .overlay(Capsule().strokeBorder(Tok.separator, lineWidth: Tok.hairline))
             }.pressable()
             if expanded {
-                VStack(alignment: .leading, spacing: 6) { ForEach(work) { TranscriptBlock(item: $0, projectRoot: projectRoot, onOpenFile: onOpenFile) } }
-                    .padding(.leading, 8).padding(.vertical, 2)
-                    .overlay(alignment: .leading) { Tok.separator.frame(width: Tok.hairline) }
-                    .transition(.opacity.combined(with: .offset(y: -4)))
-            } else {
-                // The artifacts at a glance — touched files as Conductor-style chips (click to preview).
-                WorkChipBar(work: work, root: projectRoot, onOpenFile: onOpenFile)
+                HStack(alignment: .top, spacing: 11) {
+                    Tok.separator.frame(width: 1.5)
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(groupedTight) { g in
+                            switch g {
+                            case .tools(let ts): VStack(alignment: .leading, spacing: 1) { ForEach(ts) { ToolCallRow(item: $0, root: projectRoot, onOpenFile: onOpenFile) } }
+                            case .single(let it): TranscriptBlock(item: it, projectRoot: projectRoot, onOpenFile: onOpenFile)
+                            }
+                        }
+                    }.opacity(0.85)
+                }
+                .padding(.leading, 2)
+                .transition(.opacity.combined(with: .offset(y: -4)))
             }
         }
     }
 
+    private var groupedTight: [RBlock] { groupBlocks(work) }
+
     private func summary(tools: Int, thought: Bool) -> String {
-        var parts: [String] = []
-        if let d = durMs, d > 0 { parts.append("Worked \(d < 1000 ? "\(Int(d))ms" : String(format: "%.0fs", d / 1000))") } else { parts.append("Worked") }
+        var parts: [String] = ["Worked \(fmtDuration(elapsedMs))"]
         if thought { parts.append("thought") }
         if tools > 0 { parts.append("\(tools) tool\(tools == 1 ? "" : "s")") }
         return parts.joined(separator: " · ")
     }
+    private func fmtDuration(_ ms: Double) -> String {
+        let s = Int((ms / 1000).rounded())
+        if s < 60 { return "\(s)s" }
+        return "\(s / 60)m \(s % 60)s"
+    }
 }
+
+// MARK: - Thinking block
+
+/// The agent's extended thinking: a purple-tile spark glyph + uppercase tracked label, a collapsed
+/// one-line preview, and a markdown body behind a purple-tinted rail. Auto-opens while the turn is live.
+struct ThinkingBlock: View {
+    let item: TranscriptItem
+    var projectRoot: String? = nil
+    var live: Bool = false
+    @State private var expanded = false
+    private var isOpen: Bool { expanded || live }
+
+    var body: some View {
+        let text = item.text.trimmed
+        if !text.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Button { expanded.toggle() } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "sparkles").font(.system(size: 11, weight: .medium)).foregroundStyle(Tok.purple)
+                            .frame(width: 18, height: 18).background(Tok.purple.opacity(0.14))
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        Text(live ? "THINKING…" : "THINKING")
+                            .font(TokFont.text(TokFont.caption, .semibold)).tracking(0.7).foregroundStyle(Tok.purple)
+                            .modifier(ConditionalBreathe(on: live))
+                        if !isOpen {
+                            Text(preview(text)).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(1)
+                        }
+                        Spacer(minLength: 4)
+                        Icon(name: isOpen ? "chevronDown" : "chevronRight", size: 11).foregroundStyle(Tok.inkTertiary)
+                    }
+                    .contentShape(Rectangle())
+                }.buttonStyle(.plain)
+                if isOpen {
+                    HStack(alignment: .top, spacing: 13) {
+                        Tok.purple.opacity(0.42).frame(width: 1.5)
+                        VStack(alignment: .leading, spacing: 6) {
+                            MarkdownText(text: text, projectRoot: projectRoot, baseSize: 13, bodyColor: Tok.inkSecondary, nsBodyColor: TokNS.inkSecondary)
+                            if live { StreamCaret(height: 14) }
+                        }
+                    }
+                    .padding(.leading, 8)
+                    .transition(.opacity)
+                }
+            }
+        }
+    }
+
+    private func preview(_ s: String) -> String {
+        let collapsed = s.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression).trimmed
+        return collapsed.count > 96 ? String(collapsed.prefix(96)) + "…" : collapsed
+    }
+}
+
+private struct ConditionalBreathe: ViewModifier {
+    let on: Bool
+    @State private var dim = false
+    func body(content: Content) -> some View {
+        content.opacity(on && dim ? 0.5 : 1)
+            .onAppear { if on { withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { dim = true } } }
+    }
+}
+
+// MARK: - Transcript block dispatch
 
 /// Renders a single transcript item by kind.
 struct TranscriptBlock: View {
     let item: TranscriptItem
     var projectRoot: String? = nil
+    var live: Bool = false
     var answerable = false
     var onAnswer: (String) -> Void = { _ in }
     var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
-    @State private var expanded = false
     @State private var answered: String?
     @State private var custom = ""
 
     var body: some View {
         switch item.kind {
-        case "text", "result": MarkdownText(text: item.text)
-        case "thinking": thinking
+        case "text", "result": MarkdownText(text: item.text, projectRoot: projectRoot, onOpenFile: onOpenFile)
+        case "thinking": ThinkingBlock(item: item, projectRoot: projectRoot, live: live)
         case "tool": ToolCallRow(item: item, root: projectRoot, onOpenFile: onOpenFile)
         case "image": imageChip
         case "ask": answerable ? AnyView(questionCard) : AnyView(askCard)
         case "review": reviewCard
-        default: MarkdownText(text: item.text)
+        default: MarkdownText(text: item.text, projectRoot: projectRoot, onOpenFile: onOpenFile)
         }
     }
 
@@ -304,27 +505,7 @@ struct TranscriptBlock: View {
         answered = t; onAnswer(t)
     }
 
-    private var thinking: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Button { expanded.toggle() } label: {
-                HStack(spacing: 6) {
-                    Icon(name: "spark", size: 12).foregroundStyle(Tok.purple)
-                    Text("Thinking").font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.purple)
-                    Icon(name: expanded ? "chevronDown" : "chevronRight", size: 11).foregroundStyle(Tok.inkTertiary)
-                }
-            }.buttonStyle(.plain)
-            if expanded {
-                Text(item.text).font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkSecondary)
-                    .lineSpacing(2).fixedSize(horizontal: false, vertical: true)
-            } else {
-                Text(String(item.text.prefix(96))).font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary).lineLimit(1)
-            }
-        }
-    }
-
     private var imageChip: some View {
-        // The app runs on the Mac, so a generated image's absolute imagePath is readable directly
-        // (no relay/assetImage round-trip needed).
         Group {
             if let path = item.imagePath, let img = NSImage(contentsOfFile: path) {
                 VStack(alignment: .leading, spacing: 7) {
@@ -336,28 +517,20 @@ struct TranscriptBlock: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
                             HStack(spacing: 6) {
-                                Image(systemName: "photo")
-                                    .font(.system(size: 11.5, weight: .semibold))
-                                Text(URL(fileURLWithPath: path).lastPathComponent)
-                                    .font(TokFont.text(TokFont.caption, .semibold))
-                                    .lineLimit(1)
+                                Image(systemName: "photo").font(.system(size: 11.5, weight: .semibold))
+                                Text(URL(fileURLWithPath: path).lastPathComponent).font(TokFont.text(TokFont.caption, .semibold)).lineLimit(1)
                             }
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(.black.opacity(0.46))
-                            .clipShape(Capsule())
-                            .padding(8)
+                            .foregroundStyle(.white).padding(.horizontal, 8).padding(.vertical, 5)
+                            .background(.black.opacity(0.46)).clipShape(Capsule()).padding(8)
                         }
-                    }
-                    .buttonStyle(.plain)
+                    }.buttonStyle(.plain)
                     if let alt = item.alt, !alt.isEmpty {
                         Text(alt).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary).lineLimit(2)
                     }
                 }
             } else {
                 HStack(spacing: 8) {
-                    Icon(name: "spark", size: 14).foregroundStyle(Tok.teal)
+                    Icon(name: "image", size: 14).foregroundStyle(Tok.purple)
                     Text(item.alt ?? "Generated image").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkSecondary).lineLimit(1)
                 }
                 .padding(8).background(Tok.fillTertiary).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
