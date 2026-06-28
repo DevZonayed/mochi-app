@@ -383,7 +383,7 @@ export interface Roles {
   /** Reviewer model — reviews it, or 'off'. */
   reviewer: RoleChoice | 'off';
 }
-export const DEFAULT_ROLES: Roles = { primary: { engine: 'claude', model: 'opus' }, reviewer: 'off' };
+export const DEFAULT_ROLES: Roles = { primary: { engine: 'claude', model: 'claude-opus-4-8' }, reviewer: 'off' };
 export interface Routing {
   /** Master agent — runs jobs. Mirrors roles.primary.engine for back-compat. */
   master: EngineId;
@@ -806,7 +806,7 @@ export class Store {
       if (this.data.routing && !this.data.routing.roles) {
         const r = this.data.routing;
         this.data.routing.roles = {
-          primary: { engine: r.master ?? 'claude', model: (r.master ?? 'claude') === 'claude' ? 'opus' : undefined },
+          primary: { engine: r.master ?? 'claude', model: (r.master ?? 'claude') === 'claude' ? 'claude-opus-4-8' : undefined },
           reviewer: r.reviewer && r.reviewer !== 'off' ? { engine: r.reviewer } : 'off',
         };
         dirty = true;

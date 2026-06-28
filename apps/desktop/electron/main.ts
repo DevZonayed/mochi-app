@@ -18,7 +18,7 @@ import type { Approval, Job } from './store.js';
 import { createDispatch } from './localApi.js';
 import { GitService } from './git-service.js';
 import { GitWatcher } from './git-watcher.js';
-import { buildModelGroups } from './models.js';
+import { buildModelGroups, refreshModelGroups } from './models.js';
 import { HostClient } from './hostClient.js';
 import { DesktopP2PHost } from './p2p.js';
 import { isRemoteBlocked } from './remote-guard.js';
@@ -497,6 +497,7 @@ app.whenReady().then(() => {
       onSignal: (did, signal) => p2pHost?.onSignal(did, signal),
     });
     host.start();
+    void refreshModelGroups(providers, { force: true }).then(() => host?.pushSnapshot()).catch(() => {});
   };
 
   // The renderer owns the account session (it logs in over raw fetch + persists

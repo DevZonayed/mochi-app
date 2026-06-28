@@ -30,7 +30,7 @@ import { createDispatch } from '../../../apps/desktop/electron/localApi.js';
 import { setEnginesRoot } from '../../../apps/desktop/electron/engines.js';
 import { bootstrapNodePath } from '../../../apps/desktop/electron/node-shim.js';
 import { HostClient } from '../../../apps/desktop/electron/hostClient.js';
-import { buildModelGroups } from '../../../apps/desktop/electron/models.js';
+import { buildModelGroups, refreshModelGroups } from '../../../apps/desktop/electron/models.js';
 import { isRemoteBlocked } from '../../../apps/desktop/electron/remote-guard.js';
 import type { Asset, Job } from '../../../apps/desktop/electron/store.js';
 
@@ -186,6 +186,7 @@ function startAccountHost(token: string): void {
     onCommand: (method, params) => handleRemoteCommand(method, params),
   });
   accountHost.start();
+  void refreshModelGroups(providers, { force: true }).then(() => accountHost?.pushSnapshot()).catch(() => {});
 }
 
 function stopAccountHost(): void {
