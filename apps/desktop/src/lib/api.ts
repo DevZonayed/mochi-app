@@ -1423,10 +1423,10 @@ export const api = {
       req<Routing>('/api/routing', { method: 'POST', body: JSON.stringify(patch) })),
 
   // Model registry (provider-owned catalog) + per-role (primary/reviewer) model defaults
-  listModels: () => call<ModelGroup[]>('listModels', {}, () => req<ModelGroup[]>('/api/models')),
+  listModels: (refresh = false) => call<ModelGroup[]>('listModels', refresh ? { refresh: true } : {}, () => req<ModelGroup[]>('/api/models')),
   getRoles: () => call<Roles>('getRoles', {}, async () => {
     const r = await req<Routing>('/api/routing');
-    return r.roles ?? { primary: { engine: 'claude', model: 'opus' }, reviewer: 'off' };
+    return r.roles ?? { primary: { engine: 'claude', model: 'claude-opus-4-8' }, reviewer: 'off' };
   }),
   setRoles: (patch: { primaryKey?: string; reviewerKey?: string }) =>
     call<Roles>('setRoles', { ...patch }, () =>

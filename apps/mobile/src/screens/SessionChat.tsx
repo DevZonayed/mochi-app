@@ -624,8 +624,20 @@ export function SessionChatScreen() {
   const changeEffort = (e: Effort) => { setEffort(e); if (sessionId) cacheSet(`effort.${sessionId}`, e); };
   const changeModel = (key: string) => { setModelKey(key); if (sessionId) cacheSet(`model.${sessionId}`, key); };
 
-  // Load the Mac's model catalog (cache-then-network) for the picker.
-  useEffect(() => { api.listModels().then((g) => { setModels(g); cacheSet('models', g); }).catch(() => {}); }, []);
+  // Keep the Mac's live model catalog fresh for the picker.
+  useEffect(() => {
+    let alive = true;
+    const load = (refresh = false) => {
+      api.listModels(refresh).then((g) => {
+        if (!alive) return;
+        setModels(g);
+        cacheSet('models', g);
+      }).catch(() => {});
+    };
+    load(true);
+    const timer = setInterval(() => load(), 60_000);
+    return () => { alive = false; clearInterval(timer); };
+  }, []);
 
   // Top up the store on (re-)open so a chat that's been idle while another
   // tab was in front catches up cleanly.
