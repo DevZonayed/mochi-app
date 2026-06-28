@@ -232,6 +232,41 @@ struct ExtensionStatus: Codable {
 }
 struct GitHubDevice: Codable { var stage: String?; var pct: Int?; var userCode: String?; var verificationUri: String? }
 
+// MARK: - Model roles (worker / reviewer)
+
+/// One model role choice — mirrors the brain's `RoleChoice` (`{ engine, model? }`). Its picker key
+/// is `"<engine>:<model>"`, matching `ModelDescriptor.key` (e.g. `claude:claude-opus-4-8`).
+struct RoleChoice: Codable, Hashable {
+    var engine: String
+    var model: String?
+    var key: String { model?.isEmpty == false ? "\(engine):\(model!)" : engine }
+}
+
+/// The reviewer is either a model choice or explicitly `"off"` (the brain sends `RoleChoice | 'off'`).
+enum RoleChoiceOrOff: Codable, Hashable {
+    case off
+    case choice(RoleChoice)
+
+    var key: String { switch self { case .off: "off"; case .choice(let c): c.key } }
+    var isOff: Bool { if case .off = self { return true }; return false }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let s = try? c.decode(String.self), s == "off" { self = .off; return }
+        self = .choice(try c.decode(RoleChoice.self))
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self { case .off: try c.encode("off"); case .choice(let v): try c.encode(v) }
+    }
+}
+
+/// The worker/reviewer defaults — mirrors the brain's `Roles` (`getRoles`/`setRoles`).
+struct Roles: Codable, Hashable {
+    var primary: RoleChoice
+    var reviewer: RoleChoiceOrOff
+}
+
 struct ChatSession: Codable, Identifiable, Hashable {
     let id: String
     var title: String?
@@ -241,6 +276,11 @@ struct ChatSession: Codable, Identifiable, Hashable {
     var pinned: Bool?
     var branch: String?
     var updatedAt: Double?
+    /// Per-chat model overrides the brain persists on every send (read back to restore the picker).
+    var primary: RoleChoice?
+    var reviewer: RoleChoiceOrOff?
+    /// Picker key for this chat's remembered worker model, if any.
+    var primaryKey: String? { primary?.key }
     var source: String?      // imported-from origin (claude/codex/conductor)
     var worktreePath: String?  // absolute path of this session's git worktree (the run cwd)
 

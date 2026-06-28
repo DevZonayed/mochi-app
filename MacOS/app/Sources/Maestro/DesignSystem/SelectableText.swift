@@ -129,6 +129,59 @@ enum NSMarkdown {
         return out
     }
 
+    /// A markdown heading → bold NSAttributedString, so headings are drag-selectable like prose
+    /// (plain SwiftUI `Text` headings showed an arrow cursor and couldn't be selected). Mirrors the
+    /// SwiftUI `headingFont`/`headingAttr`: h1–h2 = 15 bold, h3–h4 = 13.5 bold, with the inline
+    /// `**`/`` ` `` markers stripped (chat headings render plain bold).
+    static func heading(_ s: String, level: Int) -> NSAttributedString {
+        let size: CGFloat = level <= 2 ? 15 : 13.5
+        let clean = s.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: "")
+        let para = NSMutableParagraphStyle(); para.lineSpacing = 2
+        return NSAttributedString(string: clean, attributes: [
+            .font: NSFont.systemFont(ofSize: size, weight: .bold),
+            .foregroundColor: TokNS.ink,
+            .kern: level <= 2 ? -0.15 : -0.1,
+            .paragraphStyle: para,
+        ])
+    }
+
+    /// A run of consecutive prose blocks (headings/paragraphs/lists/quotes/rules) flattened into ONE
+    /// attributed string so a single mouse drag selects across all of them — the per-block text views
+    /// each held their own selection, so you couldn't select multiple lines/blocks at once.
+    static func prose(_ blocks: [MarkdownText.Block], projectRoot: String?, size: CGFloat, color: NSColor) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        func newlineIfNeeded() { if out.length > 0 { out.append(NSAttributedString(string: "\n")) } }
+        for b in blocks {
+            switch b {
+            case .heading(let level, let t):
+                newlineIfNeeded(); out.append(heading(t, level: level))
+            case .paragraph(let t):
+                newlineIfNeeded(); out.append(inline(t, projectRoot: projectRoot, size: size, color: color))
+            case .bullets(let items):
+                for it in items {
+                    newlineIfNeeded()
+                    out.append(NSAttributedString(string: "•  ", attributes: [.font: NSFont.systemFont(ofSize: size), .foregroundColor: TokNS.inkTertiary]))
+                    out.append(inline(it, projectRoot: projectRoot, size: size, color: color))
+                }
+            case .ordered(let start, let items):
+                for (j, it) in items.enumerated() {
+                    newlineIfNeeded()
+                    out.append(NSAttributedString(string: "\(start + j).  ", attributes: [.font: NSFont.monospacedSystemFont(ofSize: size * 0.92, weight: .semibold), .foregroundColor: TokNS.inkTertiary]))
+                    out.append(inline(it, projectRoot: projectRoot, size: size, color: color))
+                }
+            case .quote(let t):
+                newlineIfNeeded(); out.append(inline(t, projectRoot: projectRoot, size: size, color: TokNS.inkSecondary))
+            case .rule:
+                newlineIfNeeded(); out.append(NSAttributedString(string: "──────────", attributes: [.font: NSFont.systemFont(ofSize: size), .foregroundColor: TokNS.inkTertiary]))
+            case .code, .table:
+                break   // rendered as their own views, never folded into a prose run
+            }
+        }
+        let para = NSMutableParagraphStyle(); para.lineSpacing = size >= 14 ? 3.5 : 3; para.paragraphSpacing = 3
+        out.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: out.length))
+        return out
+    }
+
     /// Fenced code body → mono NSAttributedString (no wrap; the card scrolls it).
     static func code(_ s: String) -> NSAttributedString {
         let para = NSMutableParagraphStyle(); para.lineSpacing = 3

@@ -20,9 +20,18 @@ struct MarkdownText: View {
     var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            ForEach(Array(Self.parse(text).enumerated()), id: \.offset) { _, block in
-                view(block)
+        VStack(alignment: .leading, spacing: 9) {
+            ForEach(Array(Self.grouped(Self.parse(text)).enumerated()), id: \.offset) { _, g in
+                switch g {
+                case .prose(let blocks):
+                    // One text view per contiguous prose run → a single drag selects across all of
+                    // its headings/paragraphs/lists (was one view per block = no multi-line select).
+                    SelectableText(attributed: NSMarkdown.prose(blocks, projectRoot: projectRoot, size: baseSize, color: nsBodyColor), onOpenFile: onOpenFile)
+                case .code(let code, let lang):
+                    CodeCardView(code: code, lang: lang)
+                case .table(let headers, let rows, let aligns):
+                    tableView(headers: headers, rows: rows, aligns: aligns)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -48,51 +57,21 @@ struct MarkdownText: View {
         case rule
     }
 
-    @ViewBuilder private func view(_ b: Block) -> some View {
-        switch b {
-        case .heading(let level, let t):
-            Text(Self.headingAttr(t)).font(headingFont(level)).foregroundStyle(Tok.ink)
-                .tracking(level <= 2 ? -0.15 : -0.1)
-                .padding(.top, level <= 2 ? 6 : 3)
-        case .paragraph(let t):
-            SelectableText(attributed: NSMarkdown.inline(t, projectRoot: projectRoot, size: baseSize, color: nsBodyColor), onOpenFile: onOpenFile)
-        case .code(let code, let lang):
-            CodeCardView(code: code, lang: lang)
-        case .bullets(let items):
-            VStack(alignment: .leading, spacing: 5) {
-                ForEach(Array(items.enumerated()), id: \.offset) { _, it in
-                    HStack(alignment: .top, spacing: 8) {
-                        Text("•").font(TokFont.text(baseSize)).foregroundStyle(Tok.inkTertiary)
-                        SelectableText(attributed: NSMarkdown.inline(it, projectRoot: projectRoot, size: baseSize, color: nsBodyColor), onOpenFile: onOpenFile)
-                    }
-                }
-            }
-        case .ordered(let start, let items):
-            VStack(alignment: .leading, spacing: 5) {
-                ForEach(Array(items.enumerated()), id: \.offset) { i, it in
-                    HStack(alignment: .top, spacing: 8) {
-                        Text("\(start + i).")
-                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(Tok.inkTertiary)
-                            .frame(minWidth: 17, alignment: .trailing)
-                        SelectableText(attributed: NSMarkdown.inline(it, projectRoot: projectRoot, size: baseSize, color: nsBodyColor), onOpenFile: onOpenFile)
-                    }
-                }
-            }
-        case .table(let headers, let rows, let aligns):
-            tableView(headers: headers, rows: rows, aligns: aligns)
-        case .quote(let t):
-            SelectableText(attributed: NSMarkdown.inline(t, projectRoot: projectRoot, size: baseSize, color: TokNS.inkSecondary), onOpenFile: onOpenFile)
-                .padding(.leading, 12).padding(.vertical, 4)
-                .overlay(alignment: .leading) { Tok.separatorStrong.frame(width: 3) }
-        case .rule:
-            Tok.separator.frame(height: Tok.hairline).padding(.vertical, 2)
-        }
-    }
+    /// A renderable group: a contiguous prose run (one selectable text view), a code card, or a table.
+    enum Group { case prose([Block]); case code(String, String?); case table([String], [[String]], [TextAlignment]) }
 
-    private func headingFont(_ level: Int) -> Font {
-        // Chat heading ramp: h1==h2 = 15 bold, h3==h4 = 13.5 bold (display family).
-        level <= 2 ? TokFont.display(15, .bold) : TokFont.display(13.5, .bold)
+    /// Fold consecutive prose blocks together; code/table break the run.
+    static func grouped(_ blocks: [Block]) -> [Group] {
+        var out: [Group] = []; var run: [Block] = []
+        func flush() { if !run.isEmpty { out.append(.prose(run)); run = [] } }
+        for b in blocks {
+            switch b {
+            case .code(let c, let l): flush(); out.append(.code(c, l))
+            case .table(let h, let r, let a): flush(); out.append(.table(h, r, a))
+            default: run.append(b)
+            }
+        }
+        flush(); return out
     }
 
     // MARK: table
@@ -240,11 +219,6 @@ struct MarkdownText: View {
         if body.hasSuffix("|") { body.removeLast() }
         return body.split(separator: "|", omittingEmptySubsequences: false)
             .map { String($0).trimmingCharacters(in: .whitespaces) }
-    }
-
-    /// Heading text: strip the inline markers (chat headings render plain bold).
-    private static func headingAttr(_ s: String) -> AttributedString {
-        AttributedString(s.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: ""))
     }
 
     // MARK: inline (bold / code / clickable paths) — NOT italic/links (matches chat renderInline)
