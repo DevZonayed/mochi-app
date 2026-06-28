@@ -16,6 +16,7 @@ import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
 import { displayCodename, SESSION_STATE_STRIPE, SESSION_STATE_LONG_LABELS, type SessionGitState } from '../lib/git-types';
 import { SessionStateDot } from './SessionStateDot';
+import { ErrorBoundary } from '../lib/ErrorBoundary';
 import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
 import { BranchPicker } from '../components/BranchPicker';
@@ -70,8 +71,8 @@ const PAGE_CSS = `
   .ws-tab-group-stripe { width: 3px; flex-shrink: 0; }
   .ws-tab { transition: background 120ms ease, color 120ms ease; }
   .ws-kinds::-webkit-scrollbar { height: 0; }
-  .ws-tree::-webkit-scrollbar { width: 11px; }
-  .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+  .ws-tree::-webkit-scrollbar { width: 8px; }
+  .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
   .ws-tree:hover::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 40%, transparent); background-clip: padding-box; }
   .ws-proj:hover .ws-newchat { opacity: 1; }
   .ws-newchat { opacity: 0; transition: opacity 120ms ease; }
@@ -1136,11 +1137,11 @@ export default function Workspace() {
                     ? <ImageViewer assetId={t.imageAssetId} name={t.title} imagePath={t.imagePath} />
                     : t.kind === 'project'
                     ? <ProjectPanel projectId={t.projectId} section={t.projectSection} />
-                    : <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
+                    : <ErrorBoundary name="chat"><ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
                         sessionId={t.sessionId} base={t.base} onSessionCreated={onSessionCreated(t.key)} onOpenSession={openSession}
                         onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
                         onOpenImage={(assetId, name, imagePath) => openImage(t.projectId, assetId, name, imagePath)}
-                        onOpenFile={(filePath) => openFile(t.projectId, filePath)} />}
+                        onOpenFile={(filePath) => openFile(t.projectId, filePath)} /></ErrorBoundary>}
                 </div>
               ))}
             </div>

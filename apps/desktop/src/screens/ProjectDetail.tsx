@@ -31,8 +31,8 @@ import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type
 import { OpenPathContext, pathIsInside, type OpenPathFn } from '../lib/openPath';
 import { displayCodename } from '../lib/git-types';
 import { GitOpsDock } from '../components/GitOpsDock';
-import { SessionStateDot } from './SessionStateDot';
-import { useSession, useSessionStateOnly, useSessionGitState } from '../lib/useSessionGitState';
+import { SessionStateDot, SessionActivityDot } from './SessionStateDot';
+import { useSession, useSessionGitState } from '../lib/useSessionGitState';
 import { useSessionLocked } from '../hooks/useSessionLocked';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
@@ -69,9 +69,9 @@ export const COMPOSER_CSS = `
   .att-card { animation: attIn 130ms cubic-bezier(.32,.72,0,1); }
   @keyframes attIn { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
   .att-scroll { scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: var(--fill-secondary) transparent; overscroll-behavior: contain; }
-  .att-scroll::-webkit-scrollbar { width: 11px; height: 11px; }
+  .att-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
   .att-scroll::-webkit-scrollbar-track { background: transparent; }
-  .att-scroll::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 9px; border: 3px solid transparent; background-clip: padding-box; }
+  .att-scroll::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 9px; border: 2px solid transparent; background-clip: padding-box; }
   .att-scroll::-webkit-scrollbar-thumb:hover { background: var(--ink-quaternary, var(--ink-tertiary)); background-clip: padding-box; }
 `;
 
@@ -206,8 +206,8 @@ const PAGE_CSS = `
   @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
   @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
 
-  main::-webkit-scrollbar { width: 11px; }
-  main::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+  main::-webkit-scrollbar { width: 8px; }
+  main::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
   textarea::placeholder { color: var(--ink-tertiary); }
   ::selection { background: rgba(0,122,255,0.22); }
 `;
@@ -1631,10 +1631,13 @@ function UserImageThumb({ img }: { img: ChatImage }) {
 }
 
 /* Match an `@<path>` inline attachment marker that points into the project's
-   `.continuum/Attachment/` directory. Works on both forms the bubble can see:
-   the desktop's absolute `@/Users/.../proj/.continuum/Attachment/x.png`, and
-   the relay-scrubbed `@.continuum/Attachment/x.png` the phone receives. */
-const ATTACH_INLINE_RE = /@(\S*\.continuum\/Attachment\/([A-Za-z0-9._-]+))/g;
+   `.continuum/Attachment/` directory (including a per-branch subfolder). Works
+   on both forms the bubble can see: the desktop's absolute
+   `@/Users/.../proj/.continuum/Attachment/<branch>/x.png`, and the
+   relay-scrubbed `@.continuum/Attachment/<branch>/x.png` the phone receives.
+   Group 2 is the subpath (branch/file or just file); `basenameOf` extracts the
+   final segment for matching against inputImages/inputFiles. */
+const ATTACH_INLINE_RE = /@(\S*\.continuum\/Attachment\/([A-Za-z0-9._/-]+))/g;
 /** Basename of a saved attachment path — the lookup key against inputImages /
     inputFiles, since those carry their `.continuum/Attachment/` filename. */
 const basenameOf = (p: string): string => p.split('/').filter(Boolean).pop() || p;
@@ -1714,7 +1717,7 @@ function UserBubble({ text, images, files }: { text: string; images?: ChatImage[
   const referencedBases = React.useMemo(() => {
     const s = new Set<string>(); if (!text) return s;
     const r = new RegExp(ATTACH_INLINE_RE.source, 'g'); let mm: RegExpExecArray | null;
-    while ((mm = r.exec(text)) !== null) s.add(mm[2]);
+    while ((mm = r.exec(text)) !== null) s.add(basenameOf(mm[2]));
     return s;
   }, [text]);
   const orphanImages = (images ?? []).filter(im => !referencedBases.has(basenameOf(im.imagePath ?? '')) && !referencedBases.has(im.name ?? ''));
@@ -2612,10 +2615,10 @@ const fmtBytes = (n?: number): string => (n == null ? '' : n < 1024 ? `${n} B` :
 const attachLabel = (a: Attach): string => (a.kind === 'text' && a.name === 'Pasted text.txt' ? 'Pasted text' : a.name);
 
 /* Tiny live state dot for the session rails — subscribes once via the shared
-   cache so a long rail with 20 chats doesn't open 20 sockets. */
+   cache so a long rail with 20 chats doesn't open 20 sockets. Shows a spinning
+   ring while the session's job is running, else the git/PR state dot. */
 function SessionPillDot({ sessionId }: { sessionId: string }) {
-  const state = useSessionStateOnly(sessionId);
-  return <SessionStateDot state={state} size={8} reserveSpace />;
+  return <SessionActivityDot sessionId={sessionId} size={8} />;
 }
 
 /* Chat header bar — sits at the very top of the chat. Conductor-style:
@@ -2633,7 +2636,6 @@ function ChatHeader({ sessionId, projectId, onContinue }: {
   onContinue?: () => void | Promise<void>;
 }) {
   const session = useSession(sessionId, projectId);
-  const state = useSessionStateOnly(sessionId);
   const [busy, setBusy] = React.useState(false);
   if (!sessionId || !session) return null;
 
@@ -2658,7 +2660,7 @@ function ChatHeader({ sessionId, projectId, onContinue }: {
       {code && (
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 'var(--r-pill)',
           background: 'var(--fill-secondary)', font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', letterSpacing: '0.02em' }}>
-          <SessionStateDot state={state} size={8} reserveSpace />
+          <SessionActivityDot sessionId={sessionId} size={8} />
           {displayCodename(code)}
         </span>
       )}
@@ -3186,7 +3188,9 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   // images sends now (interrupting a running turn so turns never overlap mid-stream).
   // On failure the text + images are restored so nothing is lost.
   const sendComposed = React.useCallback(() => {
-    const t = text.trim(); const imgs = attachments;
+    // Read straight from the composer (the DOM is the source of truth) so a
+    // pending rAF-coalesced state update can never make Enter send stale text.
+    const t = (composerRef.current?.getText() ?? text).trim(); const imgs = attachments;
     if ((!t && !imgs.length) || !projectId) return;
     if (!imgs.length) { sendText(text); return; }
     composerRef.current?.clear(); setAttachments([]);
@@ -3202,7 +3206,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   // stop button) is still available for the rare case someone actually wants
   // to kill the run. When idle, ⌘↩ just sends immediately (no queue to skip).
   const sendComposedNow = React.useCallback(() => {
-    const t = text.trim(); const imgs = attachments;
+    const t = (composerRef.current?.getText() ?? text).trim(); const imgs = attachments;
     if ((!t && !imgs.length) || !projectId) return;
     composerRef.current?.clear();
     setAttachments([]);
@@ -3250,7 +3254,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   // time, carrying the run intent (effort/browser/plan/goal). Clears on success.
   const scheduleMessage = (fireAt: number) => {
     if (!projectId) return;
-    const body = text.trim();
+    const body = (composerRef.current?.getText() ?? text).trim();
     if (!body) { setSchedOpen(false); setSendError('Type a message first, then schedule it.'); return; }
     void api.scheduleMessage({
       projectId, sessionId: activeRef.current ?? undefined, prompt: body, fireAt,
@@ -3266,7 +3270,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   // chat, carrying the run intent. Clears the composer on success.
   const scheduleRecurring = (o: { everyMinutes?: number; time?: string; cadence?: string; catchUp: boolean }) => {
     if (!projectId) return;
-    const body = text.trim();
+    const body = (composerRef.current?.getText() ?? text).trim();
     if (!body) { setSchedOpen(false); setSendError('Type a message first, then schedule it.'); return; }
     void api.createSchedule({
       title: body.slice(0, 60), projectId, sessionId: activeRef.current ?? undefined, prompt: body,
