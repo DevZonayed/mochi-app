@@ -236,8 +236,8 @@ struct ChatThread: View {
                 }
             }
             // Messenger-style auto-follow, but only while the viewport is already near the bottom.
-            // `.defaultScrollAnchor(.bottom)` continuously re-anchors during stream/layout changes
-            // and can make AppKit stretch/rebound the scrollbar; the observer pins explicitly.
+            // The observer (above) pins explicitly + coalesces stream resizes, and forces thin overlay
+            // scrollers — together they avoid the `.defaultScrollAnchor(.bottom)` re-anchor shake.
             // Click empty transcript space → drop focus so any text selection clears.
             .background { Color.clear.contentShape(Rectangle()).onTapGesture { NSApp.keyWindow?.makeFirstResponder(nil) } }
             .overlay(alignment: .trailing) {

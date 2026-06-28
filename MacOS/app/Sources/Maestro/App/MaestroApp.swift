@@ -19,6 +19,11 @@ struct Launcher {
 struct MaestroApp: App {
     @State private var env = AppEnv()
 
+    init() {
+        // Thin overlay scrollbars app-wide (Codespace + every screen) instead of the bold legacy bars.
+        OverlayScrollers.install()
+    }
+
     var body: some Scene {
         Window("Maestro", id: "main") {
             RootView()
