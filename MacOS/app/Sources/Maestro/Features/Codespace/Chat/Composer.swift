@@ -22,6 +22,8 @@ struct Composer: View {
     var onSchedule: ((ScheduleRequest) -> Void)? = nil
     /// Number of messages queued behind the running turn (Issue 4) — shown in the footer hint.
     var queuedCount: Int = 0
+    /// Live context-window / usage gauge data. nil or `!visible` hides the gauge.
+    var usage: UsageInfo? = nil
 
     @State private var schedOpen = false
 
@@ -84,6 +86,7 @@ struct Composer: View {
             if onSchedule != nil { scheduleButton }
 
             Spacer()
+            if let usage, usage.visible { UsageGauge(info: usage) }
             Text(footerHint).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
         }
     }

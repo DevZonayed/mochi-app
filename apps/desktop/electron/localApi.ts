@@ -22,6 +22,7 @@ import { ghState, resolveGh } from './gh-cli.js';
 import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
 import { getViewer, listOwners, parseGitHubRemote } from './github.js';
 import { discoverMemoryRepo } from './memory-repo.js';
+import { getClaudeUsage } from './claude-usage.js';
 import { bootstrapNewProject, bootstrapProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
 import { openProjectMemory, closeMemoryWatcher } from './project-lifecycle.js';
 import { fetchRepoMetadata, makeGhRunner } from './repo-metadata.js';
@@ -158,6 +159,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'dashboard': return store.dashboard();
       case 'budget': return store.budget();
       case 'costs': return store.costs();
+      case 'claudeUsage': return getClaudeUsage(p.force === true);
       case 'listEvents': return store.listEvents();
 
       // ── Settings ───────────────────────────────────────────────

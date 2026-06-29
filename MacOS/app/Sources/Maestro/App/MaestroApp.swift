@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Process entry. `--selftest` runs a headless integration check (boots the sidecar, connects
 /// over WS, calls a real RPC, prints, exits) without opening a window — used to verify the
@@ -8,6 +9,8 @@ struct Launcher {
     static func main() {
         if CommandLine.arguments.contains("--toolviz") {
             ToolVizSelfTest.run()
+        } else if CommandLine.arguments.contains("--statusdemo") {
+            StatusBarDemo.run()
         } else if CommandLine.arguments.contains("--selftest") {
             SelfTest.run()
         } else {
@@ -25,7 +28,7 @@ struct MaestroApp: App {
                 .environment(env)
                 .preferredColorScheme(env.theme.resolved)
                 .frame(minWidth: 1040, minHeight: 700)
-                .task { env.boot() }
+                .task { env.boot(); NSApp.activate(ignoringOtherApps: true) }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1320, height: 860)
