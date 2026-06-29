@@ -7,15 +7,15 @@ struct SettingsView: View {
 
     enum Section: String, CaseIterable, Identifiable {
         case notifications = "Notifications", engines = "Engines", skills = "Skills & tools", mcp = "MCP servers"
-        case accounts = "Accounts & keys", ext = "Browser extension", devices = "Devices"
+        case accounts = "Accounts & keys", ext = "Browser extension", browser = "Browser", devices = "Devices"
         var id: String { rawValue }
         var icon: String {
             switch self { case .notifications: "bell"; case .engines: "cpu"; case .skills: "spark"; case .mcp: "terminal"
-            case .accounts: "key"; case .ext: "globe"; case .devices: "smartphone" }
+            case .accounts: "key"; case .ext: "globe"; case .browser: "globe"; case .devices: "smartphone" }
         }
         var tint: Color {
             switch self { case .notifications: Tok.orange; case .engines: Tok.purple; case .skills: Tok.indigo; case .mcp: Tok.teal
-            case .accounts: Tok.blue; case .ext: Tok.blue; case .devices: Tok.teal }
+            case .accounts: Tok.blue; case .ext: Tok.blue; case .browser: Tok.teal; case .devices: Tok.teal }
         }
     }
 
@@ -38,7 +38,7 @@ struct SettingsView: View {
         switch section {
         case .skills: return 1100
         case .devices: return 940
-        case .mcp, .accounts, .ext: return 860
+        case .mcp, .accounts, .ext, .browser: return 860
         default: return 760
         }
     }
@@ -77,6 +77,7 @@ struct SettingsView: View {
         case .mcp: McpPane()
         case .accounts: AccountsPane()
         case .ext: ExtensionPane()
+        case .browser: BrowserPane()
         case .devices: DevicesPane()
         }
     }
