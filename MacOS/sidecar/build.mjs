@@ -32,9 +32,13 @@ const result = await build({
   format: 'esm',
   target: 'node22',
   // Native addons + packages that load assets/addons relative to their own dir can't be inlined —
-  // keep them external (copied as node_modules beside the bundle).
+  // keep them external (copied as node_modules beside the bundle). `playwright-core` vendors
+  // chromium-bidi inside its pre-built coreBundle.js — a `require("chromium-bidi/…")` esbuild
+  // can't resolve since it isn't a real installed package — AND locates browser binaries relative
+  // to its own dir, so it must stay external. `fsevents` is a macOS-only `.node` addon esbuild has
+  // no loader for (pulled in as an optional transitive of a file-watcher).
   external: process.argv.includes('--external-natives')
-    ? ['better-sqlite3', 'sharp', 'jimp', 'link-preview-js', 'qrcode-terminal']
+    ? ['better-sqlite3', 'sharp', 'jimp', 'link-preview-js', 'qrcode-terminal', 'playwright-core', 'fsevents']
     : [],
   // Node's ESM `import.meta.url` is preserved; bare node: builtins stay external automatically.
   banner: { js: "import{createRequire as __cr}from'node:module';import{fileURLToPath as __ffu}from'node:url';const require=__cr(import.meta.url);const __filename=__ffu(import.meta.url);const __dirname=__filename.slice(0,Math.max(0,__filename.lastIndexOf('/')));" },
