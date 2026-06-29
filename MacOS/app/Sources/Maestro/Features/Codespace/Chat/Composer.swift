@@ -25,6 +25,8 @@ struct Composer: View {
     var onSchedule: ((ScheduleRequest) -> Void)? = nil
     /// Number of messages queued behind the running turn (Issue 4) — shown in the footer hint.
     var queuedCount: Int = 0
+    /// Live context-window / usage gauge data. nil or `!visible` hides the gauge.
+    var usage: UsageInfo? = nil
     /// Fired ONLY on a user tap of the Review / Autopilot pills (never on programmatic restore),
     /// so switching sessions can sync the toggles to the session without writing back to the brain.
     var onReviewChanged: (Bool) -> Void = { _ in }
@@ -95,6 +97,7 @@ struct Composer: View {
             if onSchedule != nil { scheduleButton }
 
             Spacer()
+            if let usage, usage.visible { UsageGauge(info: usage) }
             Text(footerHint).font(TokFont.text(TokFont.caption)).foregroundStyle(Tok.inkTertiary)
         }
     }

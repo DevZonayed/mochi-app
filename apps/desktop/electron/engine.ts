@@ -329,6 +329,10 @@ interface EngineRun {
   hitLimit?: boolean;
   limitResetsAt?: number;
   limitType?: string;
+  /** Total input size of the last request (input + cache-read + cache-creation tokens) =
+      how full the context window was on the most recent turn. Surfaced to the UI as a
+      "context remaining" gauge. Undefined if the SDK reported no usage. */
+  contextTokens?: number;
 }
 
 /** A finished image: a real raster file on this Mac + the Asset it was saved as. */
@@ -1573,7 +1577,7 @@ async function runClaude(
   );
 
   let resultText = '';
-  let usage: { input_tokens?: number; output_tokens?: number } | null = null;
+  let usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | null = null;
   let cost = 0;
   let model = 'claude';
   let sdkSessionId: string | undefined;
@@ -1625,7 +1629,7 @@ async function runClaude(
         parent_tool_use_id?: string | null;
         message?: { content?: { type: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; is_error?: boolean }[]; model?: string };
         event?: { type?: string; delta?: { type?: string; text?: string; thinking?: string }; usage?: { output_tokens?: number } };
-        usage?: { input_tokens?: number; output_tokens?: number };
+        usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
         total_cost_usd?: number; result?: unknown;
       };
       if (m.session_id) sdkSessionId = m.session_id;
@@ -1804,6 +1808,11 @@ async function runClaude(
     hitLimit,
     limitResetsAt,
     limitType,
+    // How full the context window was on the final request: the whole prompt = fresh input +
+    // cache reads + cache writes. (Output isn't counted — it's the answer, not the prompt.)
+    contextTokens: usage
+      ? (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
+      : undefined,
   };
 }
 
@@ -3388,6 +3397,8 @@ export class LocalEngine {
             transcript: [...main.transcript, ...cont.transcript],
             images: [...(main.images ?? []), ...(cont.images ?? [])],
             hitMaxTurns: cont.hitMaxTurns,
+            // The latest continuation's prompt reflects the freshest, fullest context.
+            contextTokens: cont.contextTokens ?? main.contextTokens,
           };
         }
         // Auto-continue exhausted and STILL not finished → pause gracefully. The work is
@@ -3502,6 +3513,11 @@ export class LocalEngine {
       const done = this.store.updateJob(jobId, {
         status: 'done', phase: 'Done', progress: 100, stage: '',
         output, tokens, cost, model, transcript: allItems.slice(-400),
+        // How full the context window was on the last request — drives the native
+        // "context remaining" gauge. Plus the usage-limit reset time when this turn
+        // was capped, so the gauge can show "Claude limit · resets in …".
+        contextTokens: main.contextTokens,
+        limitResetsAt: main.hitLimit ? (main.limitResetsAt ?? null) : null,
         // Defense in depth: runClaude's terminal markResumed() already cleared
         // this via the hook, but a turn that ends concurrently with an in-flight
         // pause event must not persist a stale countdown alongside 'done'.

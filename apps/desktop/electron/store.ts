@@ -182,6 +182,14 @@ export interface Job {
   /** What's keeping the job paused. Currently only 'wakeup' (ScheduleWakeup
       tool). Reserved for future 'background-task' / 'cron' parking. */
   pausedReason?: 'wakeup' | null;
+  /** Latest request's total input size (input + cache-read + cache-creation tokens) — i.e.
+      how full the model's context window was on the most recent turn. Lets the native UI show
+      a "context remaining" gauge against the model's window size. Output-only `tokens` above is
+      unrelated (it counts generated tokens for cost). */
+  contextTokens?: number;
+  /** Epoch ms when the claude.ai usage limit lifts, if this turn was blocked by it — so the UI
+      can surface a "Claude limit · resets in …" hint. null/undefined when not limited. */
+  limitResetsAt?: number | null;
   createdAt: number; updatedAt: number;
 }
 
@@ -1303,7 +1311,7 @@ export class Store {
       try { console.log(`[store] job prune: stripped=${stripped} deleted=${deleted} total=${this.data.jobs.length}`); } catch { /* */ }
     }
   }
-  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript' | 'pausedUntil' | 'pausedReason'>>): Job {
+  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript' | 'pausedUntil' | 'pausedReason' | 'contextTokens' | 'limitResetsAt'>>): Job {
     const cur = this.getJob(jobId);
     if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });
