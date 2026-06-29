@@ -99,6 +99,53 @@ struct DesignComment: Codable, Identifiable, Hashable {
 struct DesignCommentsResult: Codable { var comments: [DesignComment] }
 struct AddCommentResult: Codable { var comment: DesignComment }
 
+// MARK: - Browser
+
+/// Live state of a project's agent browser (the sidecar's Chrome/CDP session). From `browserStatus`
+/// / the `"browser"` event. `lastScreenshotAt` is in ms; `error` is set when the session failed.
+struct BrowserStatus: Codable, Hashable {
+    let projectId: String
+    let open: Bool
+    let url: String?
+    let title: String?
+    let tabCount: Int
+    let lastScreenshotAt: Double?
+    let chromeVersion: String?
+    let error: String?
+}
+
+/// Browser preferences (the `browser` field of the app settings). Sent partially under `browser`.
+struct BrowserSettings: Codable, Hashable {
+    var enabled: Bool
+    var headless: Bool
+    var chromePath: String?
+    var defaultStartUrl: String?
+    var windowWidth: Double?
+    var windowHeight: Double?
+}
+
+/// Thin envelope to pluck `browser` out of the full `getSettings` object (unknown keys ignored).
+struct SettingsEnvelope: Codable { var browser: BrowserSettings? }
+
+/// `browserScreenshot` result — a `data:image/png;base64,…` string.
+struct BrowserShot: Codable { var dataUrl: String }
+
+/// `browserRevealProfile` result — the profile dir to reveal in Finder.
+struct BrowserProfilePath: Codable { var path: String }
+
+/// One of the user's real Chrome profiles. `dir` is "Default"/"Profile 2"; `name` is the display name.
+struct ChromeProfile: Codable, Hashable, Identifiable { let dir: String; let name: String; var id: String { dir } }
+
+/// `browserListChromeProfiles` result — the user's real Chrome profiles to seed from.
+struct ChromeProfileList: Codable { let profiles: [ChromeProfile] }
+
+/// The golden seed profile. All-zero/empty (`sourceDir == ""`) when no seed is set.
+struct SeedInfo: Codable { let sourceDir: String; let sourceName: String; let importedAt: Double; let cookieCount: Int }
+
+/// Real Chrome install/run state (from `browserChromeStatus`). Drives the not-installed banner and
+/// the quit-before-import confirmation.
+struct ChromeStatus: Codable { let installed: Bool; let path: String?; let version: String?; let running: Bool }
+
 // MARK: - WhatsApp
 
 struct WaChat: Codable, Identifiable, Hashable {

@@ -2036,6 +2036,10 @@ export class LocalEngine {
       "watcher not available" (a clean degrade, never a crash). */
   private browserWatcher?: import('./browser-watch.js').BrowserWatcher;
   setBrowserWatcher(w: import('./browser-watch.js').BrowserWatcher) { this.browserWatcher = w; }
+  /** Playwright-backed per-project browser (native app / sidecar). When set, it
+      takes precedence over the legacy ExtensionBridge as the browser_* backend. */
+  private browserManager?: import('./browser/manager.js').BrowserManager;
+  setBrowserManager(m: import('./browser/manager.js').BrowserManager) { this.browserManager = m; }
   /** Public entry the UI/dispatch use to (re)generate or edit an image outside a
       coding turn — routes through the SAME backend (Codex/fal) the generate_image
       tool uses, so a one-click "Regenerate" or a "modify this image" instruction
@@ -2851,6 +2855,10 @@ export class LocalEngine {
       } else {
         prompt = `${base}${cur.input}`;
       }
+      // Hidden per-turn context (e.g. browser page-context from the Send-hint
+      // overlay): appended to the model's prompt but NEVER rendered in the chat
+      // (the transcript shows job.input only), so our context format isn't exposed.
+      if (cur.agentContext) prompt += `\n\n${cur.agentContext}`;
       if (goalMode) prompt += GOAL_DIRECTIVE;
       // AskUserQuestion in this app renders as an interactive countdown card; the SDK
       // reports the call as "dismissed" headless, which the model otherwise narrates.
@@ -3088,10 +3096,15 @@ export class LocalEngine {
       // when asked to use "my browser". Claude turns only (not plan mode); each
       // browser_* tool reports clearly if no profile is connected.
       const bridge = this.extBridge?.() ?? null;
-      const browserCtx: BrowserCtx | undefined = (bridge && !opts.plan) ? {
-        connected: () => bridge.hasActiveBrowser(),
-        profile: () => bridge.activeProfile(),
-        call: (type, params, timeoutMs) => bridge.request(type, params ?? {}, timeoutMs),
+      // Prefer the in-process Playwright manager (native app / sidecar) when it's
+      // wired AND scoped to a project; otherwise fall back to the legacy
+      // ExtensionBridge (Electron). Both expose the same { connected, profile, call }.
+      const mgrPid = job.projectId ?? session?.projectId ?? null;
+      const mgr = (this.browserManager && mgrPid) ? this.browserManager : null;
+      const browserCtx: BrowserCtx | undefined = ((mgr || bridge) && !opts.plan) ? {
+        connected: () => (mgr ? mgr.status(mgrPid!).open : bridge!.hasActiveBrowser()),
+        profile: () => (mgr ? (mgr.status(mgrPid!).open ? `project:${mgrPid}` : null) : bridge!.activeProfile()),
+        call: (type, params, timeoutMs) => (mgr ? mgr.call(mgrPid!, type, params ?? {}, timeoutMs) : bridge!.request(type, params ?? {}, timeoutMs)),
         /* Bind a watcher view scoped to THIS run's project+session: every watch
            the agent creates this turn fires back into the same chat. Listing /
            cancelling stays per-session too so the agent can't see or cancel

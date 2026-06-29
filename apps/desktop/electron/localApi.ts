@@ -147,7 +147,7 @@ const rootOfProject = (store: Store, projectId: unknown): string => {
     pair (matches the `runningCmds` map in main.ts). */
 const runningCmds = new Map<string, ChildProcess>();
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null, gitWatcher?: GitWatcher) {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null, gitWatcher?: GitWatcher, browserManager?: import('./browser/manager.js').BrowserManager) {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -173,10 +173,84 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           const v = p.feedbackRepo.trim().slice(0, 140);
           if (v === '' || REPO_RE.test(v)) patch.feedbackRepo = v;
         }
+        if (p.browser && typeof p.browser === 'object') {
+          const cur = store.getSettings().browser ?? { enabled: true, headless: false };
+          const b = p.browser as Record<string, unknown>;
+          patch.browser = {
+            ...cur,
+            ...(typeof b.enabled === 'boolean' ? { enabled: b.enabled } : {}),
+            ...(typeof b.headless === 'boolean' ? { headless: b.headless } : {}),
+            ...(typeof b.chromePath === 'string' ? { chromePath: b.chromePath } : {}),
+            ...(typeof b.defaultStartUrl === 'string' ? { defaultStartUrl: b.defaultStartUrl } : {}),
+            ...(typeof b.windowWidth === 'number' ? { windowWidth: b.windowWidth } : {}),
+            ...(typeof b.windowHeight === 'number' ? { windowHeight: b.windowHeight } : {}),
+          };
+        }
         if (Object.keys(patch).length === 0) bad('no valid settings fields');
         const next = store.setSettings(patch);
         emit('settings', next);
         return next;
+      }
+
+      // ── Browser (Playwright, per-project) ──────────────────────
+      case 'browserOpen': {
+        if (!browserManager) bad('browser unavailable', 503);
+        const pid = String(p.projectId ?? ''); if (!pid) bad('projectId required');
+        return browserManager!.open(pid, typeof p.startUrl === 'string' ? { startUrl: p.startUrl } : undefined);
+      }
+      case 'browserClose': {
+        if (!browserManager) bad('browser unavailable', 503);
+        await browserManager!.close(String(p.projectId ?? '')); return { ok: true };
+      }
+      case 'browserNavigate': {
+        if (!browserManager) bad('browser unavailable', 503);
+        const pid = String(p.projectId ?? ''); if (!pid) bad('projectId required');
+        if (typeof p.url !== 'string') bad('url required');
+        return browserManager!.navigate(pid, p.url as string);
+      }
+      case 'browserStatus': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return p.projectId ? browserManager!.status(String(p.projectId)) : browserManager!.statusAll();
+      }
+      case 'browserScreenshot': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return browserManager!.screenshot(String(p.projectId ?? ''), { fullPage: !!p.fullPage });
+      }
+      case 'browserListComments': // browser comments persist in the project design-comments store
+        return dispatch('listDesignComments', { id: p.projectId });
+      case 'browserClearData': {
+        if (!browserManager) bad('browser unavailable', 503);
+        await browserManager!.clearData(String(p.projectId ?? '')); return { ok: true };
+      }
+      case 'browserRevealProfile': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return { path: browserManager!.profileDir(String(p.projectId ?? '')) };
+      }
+      // Seed profile: pick one real Chrome profile → every project's browser starts from it.
+      case 'browserListChromeProfiles': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return { profiles: browserManager!.listChromeProfiles() };
+      }
+      case 'browserChromeStatus': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return browserManager!.chromeStatus();
+      }
+      case 'browserInstallChrome': {
+        if (!browserManager) bad('browser unavailable', 503);
+        browserManager!.openChromeDownload(); return { ok: true };
+      }
+      case 'browserImportSeed': {
+        if (!browserManager) bad('browser unavailable', 503);
+        const profileDir = String(p.profileDir ?? ''); if (!profileDir) bad('profileDir required');
+        return browserManager!.importSeed(profileDir, typeof p.sourceName === 'string' ? p.sourceName : undefined, p.quitChrome === true);
+      }
+      case 'browserSeedInfo': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return browserManager!.seedInfo() ?? { sourceDir: '', sourceName: '', importedAt: 0, cookieCount: 0 };
+      }
+      case 'browserClearSeed': {
+        if (!browserManager) bad('browser unavailable', 503);
+        browserManager!.clearSeed(); return { ok: true };
       }
 
       // ── Workspace ──────────────────────────────────────────────
@@ -866,7 +940,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // none of those leak a `«attach:…»` placeholder or a sliced abs path.
         const jobTitle = (titleText || (rawImages.length ? 'Image' : rawFiles.length ? 'Attachment' : '')).slice(0, 60);
 
-        const job = store.createJob(projectId, finalText, jobTitle, p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined);
+        // `agentContext` (e.g. browser page-context) is delivered to the model in the
+        // prompt but never rendered in the transcript — it stays off the user's screen.
+        const agentContext = typeof p.agentContext === 'string' && p.agentContext.trim() ? p.agentContext.slice(0, 200_000) : undefined;
+        const job = store.createJob(projectId, finalText, jobTitle, p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined, agentContext);
         emit('job', job);
         // A real user-initiated turn lands → the keep-going auto-continue
         // streak for this session resets (image_0ss8f.png: a real reply means

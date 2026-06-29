@@ -222,4 +222,15 @@ final class WorkspaceStore {
         if activeProjectId == p.id { activeProjectId = visibleProjects.first?.id; activeKey = nil }
         Task { try? await client.callVoid("deleteProject", ["id": p.id]) }
     }
+
+    /// Open this project's REAL Chrome window (Playwright `channel:'chrome'`, the
+    /// project's own persistent profile) — an actual external browser, not an in-app
+    /// view. Idempotent: re-opening focuses the existing window.
+    func openBrowser(_ p: Project) {
+        Task { try? await client.callVoid("browserOpen", ["projectId": p.id]) }
+    }
+    /// Tear down this project's Chrome window + Playwright context (frees the profile).
+    func closeBrowser(_ p: Project) {
+        Task { try? await client.callVoid("browserClose", ["projectId": p.id]) }
+    }
 }
