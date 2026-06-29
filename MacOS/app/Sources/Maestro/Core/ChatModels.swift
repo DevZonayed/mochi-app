@@ -23,6 +23,11 @@ struct Job: Codable, Identifiable, Hashable {
     var inputFiles: [ChatFileRef]?
     var pausedUntil: Double?
     var pausedReason: String?
+    /// How full the context window was on the last request (input + cache-read + cache-creation
+    /// tokens). Drives the composer's context-remaining gauge. nil for engines that don't report it.
+    var contextTokens: Double?
+    /// Epoch ms when the Claude usage limit lifts, set only when this turn was capped.
+    var limitResetsAt: Double?
     var createdAt: Double
     var updatedAt: Double?
 

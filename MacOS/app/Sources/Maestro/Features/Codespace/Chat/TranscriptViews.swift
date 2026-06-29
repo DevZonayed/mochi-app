@@ -269,7 +269,7 @@ struct AssistantTurn: View {
                 // doesn't oscillate (the "shaking at the bottom" bug).
                 HStack(spacing: 8) {
                     Spinner(size: 12).tint(Tok.purple)
-                    ShimmerText(text: liveActivity)
+                    ShimmerText(text: LiveActivity.label(for: job))
                     StreamCaret(height: 15)
                 }
                 .frame(height: 18, alignment: .leading)
@@ -280,38 +280,6 @@ struct AssistantTurn: View {
             Text("Stopped").font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkTertiary)
         } else {
             metaLine
-        }
-    }
-
-    /// Contextual heartbeat string (mirrors `liveActivity` in ProjectDetail.tsx).
-    private var liveActivity: String {
-        let items = job.transcript ?? []
-        guard let last = items.last else { return "Thinking…" }
-        switch last.kind {
-        case "tool":
-            if last.toolStatus == "running" {
-                let verb = toolVerb(ToolViz.display(last.name).short)
-                let detail = String(ToolViz.detail(last).trimmed.prefix(54))
-                return detail.isEmpty ? "\(verb)…" : "\(verb) \(detail)…"
-            }
-            return "Thinking…"
-        case "thinking": return "Thinking…"
-        case "image": return "Saving image…"
-        case "ask": return "Waiting for your answer…"
-        case "text", "result": return "Responding…"
-        default: return "Thinking…"
-        }
-    }
-    private func toolVerb(_ short: String) -> String {
-        switch short {
-        case "Image": return "Generating image"
-        case "Run": return "Running"
-        case "Edit": return "Editing"
-        case "Write": return "Writing"
-        case "Read": return "Reading"
-        case "Search", "Find": return "Searching"
-        case "Browser", "Fetch", "Web search": return "Browsing"
-        default: return "Working"
         }
     }
 

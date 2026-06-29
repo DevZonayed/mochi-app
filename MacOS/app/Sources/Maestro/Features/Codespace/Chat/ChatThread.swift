@@ -49,6 +49,35 @@ struct ChatThread: View {
     @State private var bgToken: Int?
     @State private var schedStore: ScheduleStore?
     @State private var suppressTranscriptBottomPin = false
+    /// Bumped to ask the transcript to scroll back to the running turn (driven by the LiveStatusBar tap).
+    @State private var jumpToken = 0
+
+    /// The turn currently in flight, if any — drives the pinned LiveStatusBar above the composer.
+    private var runningJob: Job? { store?.turns.last(where: { $0.isRunning }) }
+
+    /// USD spent today (brain `costs()`), shown in the composer usage gauge's popover.
+    @State private var todaySpend: Double?
+    /// Live Claude subscription limits (brain `claudeUsage()` → /api/oauth/usage).
+    @State private var claudeUsage: ClaudeUsage?
+
+    /// Subscription limits + context fill + spend + any usage-limit reset, for the composer's UsageGauge.
+    private var usageInfo: UsageInfo {
+        let ctxJob = store?.turns.last { ($0.contextTokens ?? 0) > 0 }
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        let limited = store?.turns.last { ($0.limitResetsAt ?? 0) > nowMs }
+        return UsageInfo(claude: claudeUsage,
+                         contextTokens: ctxJob?.contextTokens,
+                         model: ctxJob?.model ?? (model == "auto" ? nil : model),
+                         todaySpend: todaySpend,
+                         limitResetsAt: limited?.limitResetsAt)
+    }
+
+    private func loadCosts() async {
+        if let c = try? await env.client.call("costs", as: CostsData.self) { todaySpend = c.today }
+    }
+    private func loadClaudeUsage() async {
+        if let u = try? await env.client.call("claudeUsage", as: ClaudeUsage.self) { claudeUsage = u }
+    }
 
     /// Absolute root that tool paths are relative to. The brain runs each session in its own git
     /// worktree and relativizes tool paths against THAT cwd, so prefer the session's worktreePath
@@ -87,17 +116,29 @@ struct ChatThread: View {
                 }
                 .frame(maxWidth: 1180).padding(.horizontal, 20).padding(.bottom, 8)
             }
+            // Wrapper keeps the spring scoped to the bar's own insert/remove, so the other
+            // above-composer panels (queue, scheduled, bg) don't get swept up in the animation
+            // when a turn happens to start/stop on the same frame they change.
+            VStack(spacing: 0) {
+                if let running = runningJob {
+                    LiveStatusBar(job: running, onJump: jumpToRunningTurn)
+                        .frame(maxWidth: 1180)
+                        .padding(.horizontal, 20).padding(.bottom, 8)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .animation(.spring(response: 0.36, dampingFraction: 0.85), value: runningJob != nil)
             Composer(text: $composerText, attachments: $attachments, model: $model, effort: $effort, plan: $plan, goal: $goal,
                      autopilot: $autopilot, review: $review, reviewerKey: $reviewerKey, sessionActive: sessionId != nil,
                      streaming: store?.streaming ?? false,
                      disabled: store == nil,
                      onSend: send, onStop: stop, onSendNow: sendNow,
-                     onSchedule: scheduleFromComposer, queuedCount: queue.count,
+                     onSchedule: scheduleFromComposer, queuedCount: queue.count, usage: usageInfo,
                      onReviewChanged: { v in reviewToggled(v) },
                      onAutopilotChanged: { v in Task { await store?.setAutopilot(v) } })
                 .frame(maxWidth: 1180)
                 .padding(.horizontal, 20).padding(.bottom, 16)
-                .onChange(of: store?.streaming ?? false) { _, running in if !running { drainQueue() } }
+                .onChange(of: store?.streaming ?? false) { _, running in if !running { drainQueue(); Task { await loadCosts(); await loadClaudeUsage() } } }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.bgElevated)
@@ -110,6 +151,8 @@ struct ChatThread: View {
             await seedRoles()
             loadQueue()
             await loadBg()
+            await loadCosts()
+            await loadClaudeUsage()
             if bgToken == nil {
                 bgToken = env.client.onEvent { ev in
                     guard ev.name == "bg", let t = decodeJSON(ev.data, as: BgTask.self), t.projectId == projectId else { return }
@@ -325,6 +368,10 @@ struct ChatThread: View {
                     .padding(.trailing, 2)
             }
             .onChange(of: sessionId) { _, _ in visibleCount = 8 }
+            // LiveStatusBar tap: scroll back down to the live turn (it's always the last one).
+            .onChange(of: jumpToken) { _, _ in
+                withAnimation(.smooth(duration: 0.28)) { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
         }
     }
 
@@ -480,6 +527,12 @@ struct ChatThread: View {
     private func stop() {
         guard let store, let running = store.turns.last(where: { $0.isRunning }) else { return }
         Task { await store.cancel(running) }
+    }
+
+    /// LiveStatusBar tap — re-arm bottom-pinning and scroll the transcript back to the running turn.
+    private func jumpToRunningTurn() {
+        suppressTranscriptBottomPin = false
+        jumpToken &+= 1
     }
 
     // MARK: - Local message queue (persisted per session, options included)
