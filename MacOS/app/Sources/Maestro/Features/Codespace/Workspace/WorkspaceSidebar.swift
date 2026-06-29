@@ -233,6 +233,9 @@ struct WorkspaceSidebar: View {
             Button { store.openProjectPanel(p.id, .skills) } label: { Label("Project skills", systemImage: "sparkles") }
             Button { store.openProjectPanel(p.id, .jobs) } label: { Label("Jobs", systemImage: "list.bullet") }
             Divider()
+            Button { store.openBrowser(p) } label: { Label("Open browser", systemImage: "globe") }
+            Button { store.closeBrowser(p) } label: { Label("Close browser", systemImage: "xmark.circle") }
+            Divider()
             if let path = p.path, !path.isEmpty {
                 Button { NativeBridge.reveal(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
             }

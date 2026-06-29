@@ -82,13 +82,17 @@ else
   fi
 fi
 
-echo "▸ embedding externalized native deps"
+echo "▸ embedding externalized native deps (full dependency closure)"
 REPO_NM="$ROOT/../../node_modules"
-for m in sharp jimp link-preview-js qrcode-terminal better-sqlite3; do
-  [ -d "$REPO_NM/$m" ] && cp -R "$REPO_NM/$m" "$RES_SC/node_modules/" 2>/dev/null || true
-done
-# sharp's native libvips lives in @img/* sibling packages.
-if [ -d "$REPO_NM/@img" ]; then mkdir -p "$RES_SC/node_modules/@img"; cp -R "$REPO_NM/@img/." "$RES_SC/node_modules/@img/" 2>/dev/null || true; fi
+# Copy the FULL dependency closure of the externalized packages, not just the top-level names.
+# Under pnpm's hoisted node-linker the transitive deps are laid out FLAT at the repo root
+# (better-sqlite3→bindings→file-uri-to-path, sharp→color/detect-libc/semver/@img/*), so a
+# per-package copy silently drops them and the packaged sidecar crashes at boot (MODULE_NOT_FOUND).
+# playwright-core is kept external (see sidecar/build.mjs) and powers the native
+# per-project browser — embed its closure so the packaged sidecar can import it at
+# runtime. fsevents is the macOS-only file-watcher addon (optional; tiny).
+node "$SIDECAR/embed-externals.mjs" "$REPO_NM" "$RES_SC/node_modules" \
+  better-sqlite3 sharp jimp link-preview-js qrcode-terminal playwright-core fsevents
 
 echo "▸ ad-hoc codesign"
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "  (codesign skipped)"

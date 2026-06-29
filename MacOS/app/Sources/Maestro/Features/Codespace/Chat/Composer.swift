@@ -11,6 +11,9 @@ struct Composer: View {
     @Binding var goal: Bool
     @Binding var autopilot: Bool
     @Binding var review: Bool
+    /// Reviewer model picker key ("<provider>:<model>"). Shown next to the Review pill when
+    /// Review is on — the Review toggle owns whether the reviewer runs, this owns which model.
+    @Binding var reviewerKey: String
     var sessionActive: Bool = false
     var streaming: Bool
     var disabled: Bool
@@ -24,6 +27,10 @@ struct Composer: View {
     var queuedCount: Int = 0
     /// Live context-window / usage gauge data. nil or `!visible` hides the gauge.
     var usage: UsageInfo? = nil
+    /// Fired ONLY on a user tap of the Review / Autopilot pills (never on programmatic restore),
+    /// so switching sessions can sync the toggles to the session without writing back to the brain.
+    var onReviewChanged: (Bool) -> Void = { _ in }
+    var onAutopilotChanged: (Bool) -> Void = { _ in }
 
     @State private var schedOpen = false
 
@@ -80,8 +87,12 @@ struct Composer: View {
 
             togglePill("Plan", "spark", Tok.blue, on: plan) { plan.toggle(); if plan { goal = false } }
             togglePill("Goal", "target", Tok.purple, on: goal) { goal.toggle(); if goal { plan = false } }
-            togglePill("Autopilot", "bolt", Tok.green, on: autopilot, disabled: !sessionActive) { autopilot.toggle() }
-            togglePill("Review", "check", Tok.orange, on: review, disabled: !sessionActive) { review.toggle() }
+            togglePill("Autopilot", "bolt", Tok.green, on: autopilot, disabled: !sessionActive) { autopilot.toggle(); onAutopilotChanged(autopilot) }
+            togglePill("Review", "check", Tok.orange, on: review, disabled: !sessionActive) { review.toggle(); onReviewChanged(review) }
+            if review {
+                ModelPicker(value: $reviewerKey, compact: true, triggerLabel: "Reviews:")
+                    .help("Which model reviews this chat's changes while Review is on")
+            }
 
             if onSchedule != nil { scheduleButton }
 

@@ -11,6 +11,7 @@ import { app } from 'electron';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import type { BrowserSettings } from './browser/types.js';
 import { quietDeadline } from './whatsapp-quiet.js';
 import { WaStore, type WaChatMeta, type WaStoredMessage, type WaMessageInput, type WaChatKind } from './wa-store.js';
 import type { RemoteDevice } from './relay.js';
@@ -72,8 +73,8 @@ export interface Project {
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
     final result. The chat renders these as separate blocks with timings. */
 export interface TranscriptItem {
-  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image';
-  /** text/result: the content. thinking: the model's reasoning prose. tool: the HUMAN label (Bash description, relative file path, search pattern…). ask: prompt. review: the findings. image: a short caption (the prompt). */
+  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image' | 'steer';
+  /** text/result: the content. thinking: the model's reasoning prose. tool: the HUMAN label (Bash description, relative file path, search pattern…). ask: prompt. review: the findings. image: a short caption (the prompt). steer: a user message injected mid-turn (the agent picks it up at the next boundary without the turn being killed + reseeded). */
   text: string;
   /** tool: tool name. review: the reviewer engine's label. */
   name?: string;
@@ -161,6 +162,10 @@ export interface Job {
   inputImages?: ChatImage[];
   /** Non-image files attached to the user's message (text inlined, files referenced). */
   inputFiles?: ChatFile[];
+  /** Hidden per-turn context (e.g. browser page-context from the Send-hint overlay).
+      Appended to the model's prompt but NEVER rendered in the transcript (which shows
+      `input` only) — so our context-gathering format isn't exposed to the user. */
+  agentContext?: string;
   /** Structured run log (assistant text blocks, tool calls, result) — capped. */
   transcript?: TranscriptItem[];
   /** Epoch ms when the SDK iterator will be woken back up by a session-scoped
@@ -593,8 +598,10 @@ export interface AppSettings {
   notifications?: NotificationSettings;
   /** Opt-in: try a direct desktop↔phone WebRTC channel before the relay (default off). */
   p2pEnabled?: boolean;
+  /** Playwright-backed per-project browser (native app). */
+  browser?: BrowserSettings;
 }
-export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], p2pEnabled: false, notifications: { ...DEFAULT_NOTIFICATIONS } };
+export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], p2pEnabled: false, notifications: { ...DEFAULT_NOTIFICATIONS }, browser: { enabled: true, headless: false } };
 
 export interface BudgetData { cap: number; spent: number; byProject: { projectId: string; name: string; color: string; spent: number }[] }
 export interface CostsData {
@@ -1249,7 +1256,7 @@ export class Store {
     return projectId ? all.filter(j => j.projectId === projectId) : all.slice(0, 200);
   }
   getJob(jobId: string): Job | undefined { return this.data.jobs.find(j => j.id === jobId); }
-  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[], inputFiles?: ChatFile[]): Job {
+  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[], inputFiles?: ChatFile[], agentContext?: string): Job {
     const t = now();
     const j: Job = {
       id: id(), projectId, title: title || input.slice(0, 60) || (inputImages?.length ? 'Image' : inputFiles?.length ? inputFiles[0].name : 'Message'), status: 'pending', phase: 'Queued', progress: 0,
@@ -1257,6 +1264,7 @@ export class Store {
       sessionId,
       ...(inputImages && inputImages.length ? { inputImages } : {}),
       ...(inputFiles && inputFiles.length ? { inputFiles } : {}),
+      ...(agentContext ? { agentContext } : {}),
       createdAt: t, updatedAt: t,
     };
     this.data.jobs.push(j);

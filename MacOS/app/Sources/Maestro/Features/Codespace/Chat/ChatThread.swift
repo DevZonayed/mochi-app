@@ -34,8 +34,12 @@ struct ChatThread: View {
     /// reviewer runs the user's chosen model when Review is enabled.
     @State private var reviewerKey = ""
     @State private var defaultWorkerKey = ""
+    /// Global reviewer default (empty when the workspace reviewer is "off") — seeds fresh chats.
+    @State private var defaultReviewerKey = ""
     /// Persisted per-session worker model picks: { sessionId: pickerKey }.
     @AppStorage("maestro.chat.models") private var chatModelsJSON = "{}"
+    /// Persisted per-session reviewer model picks: { sessionId: pickerKey }.
+    @AppStorage("maestro.chat.reviewers") private var chatReviewersJSON = "{}"
     @State private var effort = "balanced"
     @State private var plan = false
     @State private var goal = false
@@ -125,15 +129,15 @@ struct ChatThread: View {
             }
             .animation(.spring(response: 0.36, dampingFraction: 0.85), value: runningJob != nil)
             Composer(text: $composerText, attachments: $attachments, model: $model, effort: $effort, plan: $plan, goal: $goal,
-                     autopilot: $autopilot, review: $review, sessionActive: sessionId != nil,
+                     autopilot: $autopilot, review: $review, reviewerKey: $reviewerKey, sessionActive: sessionId != nil,
                      streaming: store?.streaming ?? false,
                      disabled: store == nil,
                      onSend: send, onStop: stop, onSendNow: sendNow,
-                     onSchedule: scheduleFromComposer, queuedCount: queue.count, usage: usageInfo)
+                     onSchedule: scheduleFromComposer, queuedCount: queue.count, usage: usageInfo,
+                     onReviewChanged: { v in reviewToggled(v) },
+                     onAutopilotChanged: { v in Task { await store?.setAutopilot(v) } })
                 .frame(maxWidth: 1180)
                 .padding(.horizontal, 20).padding(.bottom, 16)
-                .onChange(of: autopilot) { _, v in Task { await store?.setAutopilot(v) } }
-                .onChange(of: review) { _, v in Task { await store?.setReviewer(v) } }
                 .onChange(of: store?.streaming ?? false) { _, running in if !running { drainQueue(); Task { await loadCosts(); await loadClaudeUsage() } } }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -158,8 +162,9 @@ struct ChatThread: View {
                 }
             }
         }
-        .onChange(of: sessionId) { _, new in Task { await store?.bind(new) }; restoreModel(for: new); loadQueue() }
+        .onChange(of: sessionId) { _, new in Task { await store?.bind(new) }; restoreModel(for: new); restoreReviewer(for: new); restoreToggles(for: new); loadQueue() }
         .onChange(of: model) { _, v in if let sid = sessionId, v != "auto", !v.isEmpty { setChatModel(sid, v) } }
+        .onChange(of: reviewerKey) { _, v in if let sid = sessionId, v != "off", !v.isEmpty { setChatReviewer(sid, v) } }
         // Deleting an inline chip removes its «attach:id» marker from the text — drop that payload too.
         .onChange(of: composerText) { _, t in
             if !attachments.isEmpty { attachments.removeAll { !t.contains("«attach:\($0.id)»") } }
@@ -180,18 +185,40 @@ struct ChatThread: View {
         env.workspace?.sessionsByProject[projectId]?.first { $0.id == sid }?.primaryKey
     }
 
+    // MARK: - Per-chat reviewer-model memory (mirrors the worker-model memory above)
+
+    private func chatReviewers() -> [String: String] {
+        (try? JSONDecoder().decode([String: String].self, from: Data(chatReviewersJSON.utf8))) ?? [:]
+    }
+    private func setChatReviewer(_ sid: String, _ key: String) {
+        var m = chatReviewers(); m[sid] = key
+        chatReviewersJSON = String(data: (try? JSONEncoder().encode(m)) ?? Data("{}".utf8), encoding: .utf8) ?? "{}"
+    }
+    private func sessionReviewerKey(_ sid: String) -> String? {
+        env.workspace?.sessionsByProject[projectId]?.first { $0.id == sid }?.reviewerModelKey
+    }
+
     /// Load the Settings defaults, then settle `model` to: this chat's remembered pick → the brain's
-    /// persisted per-chat model → the default worker.
+    /// persisted per-chat model → the default worker. Same precedence settles the reviewer model.
     private func seedRoles() async {
         guard let roles = try? await env.client.call("getRoles", as: Roles.self) else { return }
         defaultWorkerKey = roles.primary.key
-        if reviewerKey.isEmpty { reviewerKey = roles.reviewer.key }
+        // Global reviewer default, but never "off" — the Review toggle owns whether the reviewer runs,
+        // so an empty default lets the composer's reviewer ModelPicker self-seed a real runnable model.
+        defaultReviewerKey = roles.reviewer.isOff ? "" : roles.reviewer.key
         // Authoritative initial pick: this chat's remembered model → the brain's persisted per-chat
         // model → the Settings default worker. Set unconditionally so a fresh chat honors the default
         // even though the composer's ModelPicker self-seeds to a favorite first.
         let restored = sessionId.flatMap { chatModels()[$0] } ?? sessionId.flatMap { sessionPrimaryKey($0) }
         if let restored, !restored.isEmpty { model = restored }
         else if !roles.primary.key.isEmpty { model = roles.primary.key }
+        // Same precedence for the reviewer: this chat's remembered reviewer → the brain's persisted
+        // per-chat reviewer → the global reviewer default → empty (picker self-seeds when shown).
+        let restoredRev = sessionId.flatMap { chatReviewers()[$0] } ?? sessionId.flatMap { sessionReviewerKey($0) }
+        if let restoredRev, restoredRev != "off", !restoredRev.isEmpty { reviewerKey = restoredRev }
+        else { reviewerKey = defaultReviewerKey }
+        // Reflect the session's persisted Review / Autopilot state on the composer toggles.
+        restoreToggles(for: sessionId)
     }
 
     /// Restore a chat's remembered worker model when switching sessions. Opening a brand-new chat
@@ -202,6 +229,58 @@ struct ChatThread: View {
         else if let key = sessionPrimaryKey(sid), !key.isEmpty { model = key }
         else if !defaultWorkerKey.isEmpty, model == "auto" { model = defaultWorkerKey }
         if model != "auto", !model.isEmpty { setChatModel(sid, model) }
+    }
+
+    /// Restore a chat's remembered reviewer model when switching sessions: this chat's remembered
+    /// pick → the brain's persisted per-chat reviewer → the global reviewer default (empty if the
+    /// workspace reviewer is "off", so the composer's reviewer ModelPicker self-seeds a real model).
+    private func restoreReviewer(for sid: String?) {
+        guard let sid else { reviewerKey = defaultReviewerKey; return }
+        if let saved = chatReviewers()[sid], saved != "off", !saved.isEmpty { reviewerKey = saved }
+        else if let key = sessionReviewerKey(sid), !key.isEmpty { reviewerKey = key }
+        else { reviewerKey = defaultReviewerKey }
+        if reviewerKey != "off", !reviewerKey.isEmpty { setChatReviewer(sid, reviewerKey) }
+    }
+
+    /// Sync the Review / Autopilot pills to the session's persisted state WITHOUT writing back to the
+    /// brain — those writes happen only on a user tap (the composer's onReviewChanged/onAutopilotChanged
+    /// callbacks). A fresh chat (nil) resets both to off.
+    private func restoreToggles(for sid: String?) {
+        let s = sid.flatMap { id in env.workspace?.sessionsByProject[projectId]?.first { $0.id == id } }
+        let reviewing = s?.reviewerEnabled ?? false
+        review = reviewing
+        autopilot = s?.autoPilot ?? false
+        // A session restored with Review ON must carry a concrete reviewer model, or the reviewed
+        // turn would silently fall back to "off". Seed the best available key when none is set.
+        if reviewing, reviewerKey.isEmpty || reviewerKey == "off" { reviewerKey = fallbackReviewerKey() }
+    }
+
+    /// A user tap on the Review pill. Turning it on with no reviewer model yet picks a concrete one
+    /// up front, so the very first reviewed turn actually runs a model instead of silently falling
+    /// back to "off".
+    private func reviewToggled(_ on: Bool) {
+        if on, reviewerKey.isEmpty || reviewerKey == "off" { reviewerKey = fallbackReviewerKey() }
+        Task { await store?.setReviewer(on) }
+    }
+
+    /// Best available runnable model key for the reviewer when none is chosen — favorite/first from
+    /// the catalog, else the current worker model, else the workspace worker default. Effectively
+    /// never empty (roles.primary.key is always set), so a reviewed turn can't fall back to "off"
+    /// just because the model catalog hasn't finished loading yet.
+    private func fallbackReviewerKey() -> String {
+        if let k = firstRunnableReviewerKey() { return k }
+        if model != "auto", !model.isEmpty { return model }
+        if !defaultWorkerKey.isEmpty { return defaultWorkerKey }
+        return defaultReviewerKey
+    }
+
+    /// First favorite runnable model (else the first runnable) from the shared catalog cache — mirrors
+    /// the ModelPicker's own default seed, so the reviewer is set before the picker is ever opened.
+    private func firstRunnableReviewerKey() -> String? {
+        let runnable = ModelCatalogCache.groups.filter(\.runnable).flatMap(\.models)
+        let favs = Set((UserDefaults.standard.string(forKey: "maestro.favoriteModels") ?? "")
+            .split(separator: ",").map(String.init))
+        return runnable.first(where: { favs.contains($0.key) })?.key ?? runnable.first?.key
     }
 
     private var bgPanel: some View {
@@ -279,8 +358,8 @@ struct ChatThread: View {
                 }
             }
             // Messenger-style auto-follow, but only while the viewport is already near the bottom.
-            // `.defaultScrollAnchor(.bottom)` continuously re-anchors during stream/layout changes
-            // and can make AppKit stretch/rebound the scrollbar; the observer pins explicitly.
+            // The observer (above) pins explicitly + coalesces stream resizes, and forces thin overlay
+            // scrollers — together they avoid the `.defaultScrollAnchor(.bottom)` re-anchor shake.
             // Click empty transcript space → drop focus so any text selection clears.
             .background { Color.clear.contentShape(Rectangle()).onTapGesture { NSApp.keyWindow?.makeFirstResponder(nil) } }
             .overlay(alignment: .trailing) {
@@ -390,16 +469,34 @@ struct ChatThread: View {
         }
     }
 
-    /// ⌘↩: interrupt the running turn and send this message immediately (steer).
+    /// ⌘↩: steer the running turn — inject this message into the LIVE session so the
+    /// agent picks it up at the next boundary (no cancel + reseed, context kept). Falls
+    /// back to the old interrupt-and-send when there's no live turn, the turn already
+    /// settled, or images are attached (which can't ride the text-only steer channel).
     private func sendNow() {
         let text = composerText.trimmed
         guard !text.isEmpty || !attachments.isEmpty, let store else { return }
         let atts = attachments
         composerText = ""; attachments = []
-        // `dispatching` is set synchronously below, so the cancel's running→idle transition can't
-        // sneak in a concurrent drain before the steered send creates its own running turn.
-        if let running = store.turns.last(where: { $0.isRunning }) { Task { await store.cancel(running) } }
-        dispatchSend(text: text, atts: atts, effort: effort, plan: plan, goal: goal)
+        let running = store.turns.last(where: { $0.isRunning })
+        // No live turn, or an attachment send: the original interrupt-and-send path.
+        guard let running, atts.isEmpty else {
+            if let running { Task { await store.cancel(running) } }
+            dispatchSend(text: text, atts: atts, effort: effort, plan: plan, goal: goal)
+            return
+        }
+        // `dispatching` is set synchronously so the fallback cancel's running→idle
+        // transition can't sneak in a concurrent drain before we decide.
+        dispatching = true
+        Task {
+            if await store.steer(running, text: text) {
+                dispatching = false   // steer landed; the live turn keeps running, the queue holds behind it
+                return
+            }
+            // Turn already settled or not steerable — interrupt and send as a fresh turn.
+            await store.cancel(running)
+            dispatchSend(text: text, atts: atts, effort: effort, plan: plan, goal: goal)
+        }
     }
 
     private func dispatchSend(text: String, atts: [ComposerAttachment], effort: String, plan: Bool, goal: Bool) {

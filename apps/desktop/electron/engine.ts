@@ -41,6 +41,7 @@ import type { GitService } from './git-service.js';
 import { waSendAllowed } from './whatsapp.js';
 import type { CronRunner } from './cron.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
+import { createSteerableInput, type SteerableInput } from './steerable-input.js';
 import type { Providers } from './providers.js';
 import {
   enginesRoot, managedBinary, systemBinary, bundledBinary, downloadEngine, engineState,
@@ -397,6 +398,13 @@ interface RunHooks {
   onResumed?: () => void;
 }
 
+/** Injects a user message into a LIVE Claude turn via the SDK's streaming-input
+    channel + `interrupt()` (NOT a cancel-and-reseed). Returns true if delivered;
+    false if the turn already settled (channel closed) so the caller falls back to a
+    normal send. Registered per-run via runClaude's `onSteerReady`. See
+    ./steerable-input.ts. */
+export type SteerFn = (text: string) => Promise<boolean>;
+
 /* Per-1M-token prices for a live cost ESTIMATE (the SDK's exact total_cost_usd
    replaces it when the run finishes). Standard Anthropic pricing; cache reads
    ~10% of input, cache writes ~25% over input. */
@@ -595,6 +603,26 @@ export type EmitConfirm = (req: PrConfirmRequest) => void;
  *  modal, and the operator's click resolves the gate's pending Promise. */
 export type EmitPlanExit = (req: PlanModeExitRequest) => void;
 
+/** Format the `add_skill_to_project` tool reply. A registry skill installed
+ *  mid-turn is NOT re-scanned by the running CLI (settingSources discovery is a
+ *  startup-only scan), so we deliver the SKILL.md body INLINE — the agent can
+ *  follow it this turn without depending on a separate Read it sometimes skipped.
+ *  Body is capped at 32k (mirrors download_skill); when it couldn't be read we
+ *  fall back to the read nudge. Pure: the fs read happens in the caller. */
+export function formatSkillInstallReply(
+  rec: { name: string; slug: string; sha256?: string },
+  skillMdBody: string | null,
+): string {
+  const head = `Installed "${rec.name}" → .claude/skills/${rec.slug}/SKILL.md`
+    + `${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}.`
+    + ` It is now active for this project — invoke it via the Skill tool when relevant.`;
+  if (!skillMdBody) return `${head} Now read that file and follow it.`;
+  const trimmed = skillMdBody.length > 32000
+    ? skillMdBody.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]'
+    : skillMdBody;
+  return `${head}\n\nFollow these instructions for the task:\n\n---\n${trimmed}\n---`;
+}
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -613,6 +641,11 @@ async function runClaude(
   planGate?: PlanModeGate,
   emitPlanExit?: EmitPlanExit,
   jobId?: string | null,
+  /** When provided, this run uses the SDK's STREAMING-INPUT mode so the user can
+      STEER it: the callback is handed a SteerFn the moment the live query is built
+      (and `null` when the run ends). Only the primary chat turn passes this — sub-runs
+      (reviewer, fix, max-turns continuation, plan mode) stay on the one-shot prompt. */
+  onSteerReady?: (steer: SteerFn | null) => void,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -621,6 +654,12 @@ async function runClaude(
   // the SDK fall back to a path that doesn't exist.
   if (!binary) throw Object.assign(new Error('Claude engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'claude' });
   let stderrTail = '';
+  // Live SDK query handle, assigned once query() is constructed below. Captured by
+  // the in-process maestro MCP tools (e.g. add_skill_to_project) so a mid-turn skill
+  // install can ask the running CLI to re-scan .claude/skills via reloadSkills().
+  // settingSources discovery is a STARTUP-only scan, so without this a freshly
+  // installed SKILL.md isn't surfaced as a first-class Skill until the next turn.
+  let activeQuery: ReturnType<typeof query> | null = null;
   /* Give Claude a real image capability. Claude Code ships no text→image tool,
      so without this it improvises (hand-written SVG). The in-process MCP tool's
      handler runs in THIS process (so it can call fal/MediaEngine via the injected
@@ -693,11 +732,24 @@ async function runClaude(
                 return txt(`# ${c.name}\n\nid=${c.id}\nsha256=${c.sha256 ?? 'unknown'}\n\n${body}`);
               })),
             tool('add_skill_to_project',
-              'Install a skill from the registry into THIS project (writes it to .claude/skills/<slug>/SKILL.md). After installing, READ that SKILL.md and follow it for the task. Use a skillId returned by search_skills.',
+              'Install a skill from the registry into THIS project (writes it to .claude/skills/<slug>/SKILL.md). The install RETURNS the skill\'s instructions inline and activates it as a Skill for this session — follow those instructions for the task. Use a skillId returned by search_skills.',
               { skillId: z.string().describe('The skill id from search_skills, e.g. "anthropics/skills/pdf".') },
               wrap(async (a: { skillId: string }) => {
                 const rec = await skillsCtx.install(a.skillId);
-                return txt(`Installed "${rec.name}" → .claude/skills/${rec.slug}/SKILL.md${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}. Now read that file and follow it.`);
+                // settingSources discovery is a STARTUP-only scan, so this just-written
+                // SKILL.md is invisible to the running CLI's Skill listing until the next
+                // turn. Ask the live session to re-scan now so the Skill tool can invoke it
+                // this session. Detached + best-effort: the inline body below already
+                // delivers the instructions this turn, so a missing/failed reload never
+                // blocks the agent loop (and the detached call can't deadlock the
+                // tool round-trip on the control channel).
+                void Promise.resolve().then(() => activeQuery?.reloadSkills?.()).catch(() => {});
+                // Deliver the skill body inline so the agent follows it immediately rather
+                // than depending on a follow-up Read it sometimes skipped ("dynamically
+                // loaded but not followed").
+                let body: string | null = null;
+                try { body = readFileSync(path.join(cwd, '.claude', 'skills', rec.slug, 'SKILL.md'), 'utf8'); } catch { /* fall back to the read nudge */ }
+                return txt(formatSkillInstallReply(rec, body));
               })),
             tool('list_project_skills',
               'List skills already installed in this project. Use this before searching if the needed capability may already be present.',
@@ -1361,24 +1413,29 @@ async function runClaude(
   const mergedAllowed = [...maestroAllowed, ...(customMcp?.allowedTools ?? [])];
   /* Vision input: when the user attached images, the prompt becomes a streamed
      user message carrying text + base64 image blocks (a plain string can't hold
-     images). Verified the SDK accepts this with resume/abort. Otherwise the
-     simple string prompt path is unchanged. */
+     images). Verified the SDK accepts this with resume/abort. STEERABLE turns ALSO
+     use a streamed user message — fed through a pushable channel — so a STEER can
+     inject a follow-up mid-session (interrupt + next-turn pickup) instead of killing
+     the turn and reseeding. Otherwise the simple string prompt path is unchanged. */
   const VALID_MEDIA = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
-  const promptArg = (images && images.length)
-    ? (async function* () {
-        yield {
-          type: 'user' as const,
-          parent_tool_use_id: null,
-          message: {
-            role: 'user' as const,
-            content: [
-              { type: 'text' as const, text: prompt },
-              ...images.map(im => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: (VALID_MEDIA.has(im.mime) ? im.mime : 'image/png'), data: im.b64 } })),
-            ],
-          },
-        };
-      })() as unknown as Parameters<typeof query>[0]['prompt']
-    : prompt;
+  const imageBlocks = (images ?? []).map(im => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: (VALID_MEDIA.has(im.mime) ? im.mime : 'image/png'), data: im.b64 } }));
+  const userMsg = (text: string, withImages: boolean) => ({
+    type: 'user' as const,
+    parent_tool_use_id: null,
+    message: { role: 'user' as const, content: [{ type: 'text' as const, text }, ...(withImages ? imageBlocks : [])] },
+  });
+  // Live steerable channel (streaming-input turns only). Held so the result handler
+  // can close it on a settled turn and the steer closure can push follow-ups into it.
+  let steerInput: SteerableInput<ReturnType<typeof userMsg>> | null = null;
+  let promptArg: Parameters<typeof query>[0]['prompt'];
+  if (onSteerReady) {
+    steerInput = createSteerableInput(userMsg(prompt, true));
+    promptArg = steerInput.stream as unknown as Parameters<typeof query>[0]['prompt'];
+  } else if (images && images.length) {
+    promptArg = (async function* () { yield userMsg(prompt, true); })() as unknown as Parameters<typeof query>[0]['prompt'];
+  } else {
+    promptArg = prompt;
+  }
   const it = query({
     prompt: promptArg,
     options: {
@@ -1473,6 +1530,10 @@ async function runClaude(
       },
     },
   });
+  // Expose the live query handle to the in-process maestro MCP tools (e.g.
+  // add_skill_to_project → reloadSkills). Tools only fire during iteration
+  // below, which is always after this assignment, so the closure capture is safe.
+  activeQuery = it;
   /* Build a STRUCTURED transcript: each assistant message is its own text
      block, each tool/skill call is a chip with status + duration, and the
      final result closes the run. Live deltas stream into the open block;
@@ -1541,6 +1602,22 @@ async function runClaude(
     return { tokens, cost: Math.round(cost * 1000) / 1000 };
   };
   const progress = () => hooks.onProgress?.(proseOf(items), items, liveUsage());
+  // Steerable turns: hand the host a SteerFn that injects a user message into THIS
+  // live session. It pushes the message into the input channel, surfaces it inline
+  // as a `steer` transcript item, then interrupts the current turn so the agent
+  // abandons what it's doing and picks the steer up at the next boundary — same
+  // subprocess, full context kept (no cancel + resume). Cleared when the run ends.
+  if (onSteerReady && steerInput) {
+    const channel = steerInput;
+    onSteerReady(async (text: string): Promise<boolean> => {
+      if (channel.closed) return false;
+      if (!channel.push(userMsg(text, false))) return false;
+      items.push({ kind: 'steer', text, ts: Date.now() });
+      progress();
+      try { await it.interrupt(); } catch { /* no active turn to interrupt — the queued msg is picked up at the next pull */ }
+      return true;
+    });
+  }
   try {
     for await (const raw of it as AsyncIterable<Record<string, unknown>>) {
       if (hooks.signal?.aborted) throw new CancelledError();
@@ -1668,6 +1745,12 @@ async function runClaude(
         // Snap the live counters to the SDK's authoritative totals.
         if (usage?.output_tokens != null) { committedOut = usage.output_tokens; curOut = 0; }
         if (m.total_cost_usd != null) finalCost = m.total_cost_usd;
+        // Streaming-input (steerable) turns keep the SDK session OPEN after a result
+        // so a steer can still be delivered. Close the input when this turn settled
+        // with nothing pending (or it bailed on a turn/usage cap) so the SDK finalises
+        // and this loop ends; leave it open when a steer is mid-flight (an interrupt
+        // just fired) so the agent picks it up as the next turn.
+        if (steerInput && !steerInput.closed && (steerInput.pending() === 0 || hitMaxTurns || hitLimit)) steerInput.close();
       }
     }
   } catch (e) {
@@ -1700,6 +1783,11 @@ async function runClaude(
   // resume" UI must not survive past this point (a terminal status from the
   // caller would otherwise show alongside a stale countdown). Idempotent.
   emitPause(wakeup.reset());
+  // Steerable turn is over: close the input channel (idempotent — the SDK has
+  // already ended the stream by here) and clear the host's SteerFn so a late steer
+  // falls back to a normal send instead of pushing into a finished session.
+  steerInput?.close();
+  onSteerReady?.(null);
   // Any tool left 'running' (no matching tool_result before the stream ended)
   // would otherwise spin forever in the UI — settle it.
   for (const t of items) if (t.kind === 'tool' && t.toolStatus === 'running') { t.toolStatus = 'done'; t.durMs = Date.now() - t.ts; }
@@ -1999,8 +2087,9 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
 const ENGINE_LABEL: Record<EngineId, string> = { claude: 'Claude Code', codex: 'Codex' };
 
 export class LocalEngine {
-  /** jobId → live cancel handle (abort for claude, child for codex). */
-  private running = new Map<string, { ac: AbortController; child?: ChildProcess }>();
+  /** jobId → live cancel handle (abort for claude, child for codex). `steer` is set
+      while a steerable Claude chat turn is mid-flight (see engine.steer / runClaude). */
+  private running = new Map<string, { ac: AbortController; child?: ChildProcess; steer?: SteerFn }>();
   /** In-flight `codex login` child (browser OAuth), if any. */
   private codexLoginChild?: ChildProcess;
   private githubLoginChild?: ChildProcess;
@@ -2045,6 +2134,10 @@ export class LocalEngine {
       "watcher not available" (a clean degrade, never a crash). */
   private browserWatcher?: import('./browser-watch.js').BrowserWatcher;
   setBrowserWatcher(w: import('./browser-watch.js').BrowserWatcher) { this.browserWatcher = w; }
+  /** Playwright-backed per-project browser (native app / sidecar). When set, it
+      takes precedence over the legacy ExtensionBridge as the browser_* backend. */
+  private browserManager?: import('./browser/manager.js').BrowserManager;
+  setBrowserManager(m: import('./browser/manager.js').BrowserManager) { this.browserManager = m; }
   /** Public entry the UI/dispatch use to (re)generate or edit an image outside a
       coding turn — routes through the SAME backend (Codex/fal) the generate_image
       tool uses, so a one-click "Regenerate" or a "modify this image" instruction
@@ -2469,6 +2562,20 @@ export class LocalEngine {
 
   isRunning(jobId: string): boolean { return this.running.has(jobId); }
 
+  /** STEER a running chat turn: inject a follow-up user message into the LIVE Claude
+      Agent SDK session (streaming input + `interrupt()`) so the agent abandons its
+      current turn and picks the message up at the next boundary — same subprocess,
+      full context, NO cancel-and-reseed. Returns `{ steered:false }` when the job
+      isn't running a steerable turn (already finished, codex, plan mode, or a non-
+      chat run) so the caller can fall back to a normal send. */
+  async steer(jobId: string, text: string): Promise<{ steered: boolean }> {
+    const t = text.trim();
+    const steer = this.running.get(jobId)?.steer;
+    if (!t || !steer) return { steered: false };
+    try { return { steered: await steer(t) }; }
+    catch { return { steered: false }; }
+  }
+
   /** Recent finished turns of a chat session, formatted for prompt stitching
       (codex has no resumable session, so context rides in the prompt). */
   private chatHistory(sessionId: string, excludeJobId: string): string {
@@ -2749,7 +2856,7 @@ export class LocalEngine {
     }
 
     const ac = new AbortController();
-    const handle: { ac: AbortController; child?: ChildProcess } = { ac };
+    const handle: { ac: AbortController; child?: ChildProcess; steer?: SteerFn } = { ac };
     this.running.set(jobId, handle);
 
     let cur = this.store.updateJob(jobId, {
@@ -2860,6 +2967,10 @@ export class LocalEngine {
       } else {
         prompt = `${base}${cur.input}`;
       }
+      // Hidden per-turn context (e.g. browser page-context from the Send-hint
+      // overlay): appended to the model's prompt but NEVER rendered in the chat
+      // (the transcript shows job.input only), so our context format isn't exposed.
+      if (cur.agentContext) prompt += `\n\n${cur.agentContext}`;
       if (goalMode) prompt += GOAL_DIRECTIVE;
       // AskUserQuestion in this app renders as an interactive countdown card; the SDK
       // reports the call as "dismissed" headless, which the model otherwise narrates.
@@ -3097,10 +3208,15 @@ export class LocalEngine {
       // when asked to use "my browser". Claude turns only (not plan mode); each
       // browser_* tool reports clearly if no profile is connected.
       const bridge = this.extBridge?.() ?? null;
-      const browserCtx: BrowserCtx | undefined = (bridge && !opts.plan) ? {
-        connected: () => bridge.hasActiveBrowser(),
-        profile: () => bridge.activeProfile(),
-        call: (type, params, timeoutMs) => bridge.request(type, params ?? {}, timeoutMs),
+      // Prefer the in-process Playwright manager (native app / sidecar) when it's
+      // wired AND scoped to a project; otherwise fall back to the legacy
+      // ExtensionBridge (Electron). Both expose the same { connected, profile, call }.
+      const mgrPid = job.projectId ?? session?.projectId ?? null;
+      const mgr = (this.browserManager && mgrPid) ? this.browserManager : null;
+      const browserCtx: BrowserCtx | undefined = ((mgr || bridge) && !opts.plan) ? {
+        connected: () => (mgr ? mgr.status(mgrPid!).open : bridge!.hasActiveBrowser()),
+        profile: () => (mgr ? (mgr.status(mgrPid!).open ? `project:${mgrPid}` : null) : bridge!.activeProfile()),
+        call: (type, params, timeoutMs) => (mgr ? mgr.call(mgrPid!, type, params ?? {}, timeoutMs) : bridge!.request(type, params ?? {}, timeoutMs)),
         /* Bind a watcher view scoped to THIS run's project+session: every watch
            the agent creates this turn fires back into the same chat. Listing /
            cancelling stays per-session too so the agent can't see or cancel
@@ -3187,8 +3303,14 @@ export class LocalEngine {
       const emitPlanExit: EmitPlanExit = (req) => {
         try { this.emit('plan-mode-exit-request', req, { desktopOnly: true }); } catch { /* window gone */ }
       };
+      // Steering: only the PRIMARY chat turn is steerable (not plan mode, not a
+      // one-off non-chat job). When that run builds its live query it hands back a
+      // SteerFn, which we park on the job handle so engine.steer(jobId, text) can
+      // reach the live session; it's cleared (null) the moment the run ends.
+      const onSteerReady: ((s: SteerFn | null) => void) | undefined =
+        (isChat && !opts.plan) ? (s) => { handle.steer = s ?? undefined; } : undefined;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, this.planGate, emitPlanExit, jobId)
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, this.planGate, emitPlanExit, jobId, onSteerReady)
         : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx, emitConfirm, sessionId: session?.id ?? null, plan: opts.plan, planGate: this.planGate, emitPlanExit, jobId }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
