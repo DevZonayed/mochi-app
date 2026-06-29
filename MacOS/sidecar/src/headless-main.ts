@@ -16,6 +16,7 @@ import { serveDesign } from './design-serve.ts';
 import { Store } from '../../../apps/desktop/electron/store.js';
 import { Providers } from '../../../apps/desktop/electron/providers.js';
 import { LocalEngine } from '../../../apps/desktop/electron/engine.js';
+import { BrowserManager } from '../../../apps/desktop/electron/browser/manager.js';
 import { MediaEngine } from '../../../apps/desktop/electron/media.js';
 import { ResearchEngine } from '../../../apps/desktop/electron/research.js';
 import { PublishingEngine } from '../../../apps/desktop/electron/publishing.js';
@@ -130,11 +131,23 @@ const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(n
   makeWhatsappAnalyzer({ store, engine, client: whatsapp, emit }));
 try { engine.setCron(cron); } catch (e) { warn('setCron', e); }
 
+// Playwright-backed browser for the native app: one persistent context per project,
+// driving the user's INSTALLED Chrome (channel:'chrome', nothing bundled). Replaces
+// the old extension control channel on the native path. The agent reaches it via
+// engine.setBrowserManager; the Swift app reaches it via the browser* RPCs below.
+const browserManager = new BrowserManager({
+  userDataDir: shimApp.getPath('userData'),
+  settings: () => store.getSettings().browser ?? { enabled: true, headless: false },
+  dispatch: (m, p) => dispatch(m, p),
+  emit: (s) => emit('browser', s),
+});
+try { engine.setBrowserManager(browserManager); } catch (e) { warn('setBrowserManager', e); }
+
 // The full local dispatch — identical to what the renderer reached over Electron IPC.
-// getExtensionBridge → null for now (the browser-extension control channel is a later phase).
+// getExtensionBridge → null (the native app uses Playwright, not the Chrome extension).
 const dispatch = createDispatch(
   store, engine, media, research, publishing, telegram, whatsapp, providers,
-  emit, RELAY_URL, gitService, () => null, gitWatcher,
+  emit, RELAY_URL, gitService, () => null, gitWatcher, browserManager,
 );
 
 function isJob(x: unknown): x is Job {
@@ -299,6 +312,7 @@ async function boot() {
       try { stopAccountHost(); } catch { /* noop */ }
       try { cron.stop(); } catch { /* noop */ }
       try { gitWatcher.detachAll(); } catch { /* noop */ }
+      try { void browserManager.shutdown(); } catch { /* noop */ }
       try { host.close(); } catch { /* noop */ }
       process.exit(0);
     });

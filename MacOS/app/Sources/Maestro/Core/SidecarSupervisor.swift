@@ -31,10 +31,17 @@ final class SidecarSupervisor {
 
     private var process: Process?
     private let client: MaestroClient
+    /// True only while an intentional `stop()` is in flight, so `onExit` can tell a
+    /// deliberate teardown (app quit) from a crash that should auto-restart.
+    private var stopping = false
+    private var restartAttempts = 0
+    private var restartTask: Task<Void, Never>?
     init(client: MaestroClient) { self.client = client }
 
     func start() {
         guard process == nil else { return }
+        stopping = false
+        restartTask?.cancel(); restartTask = nil
         status = .starting
         guard let launch = resolveLaunch() else {
             status = .failed("sidecar binary not found — run `pnpm --dir MacOS/sidecar build` first")
@@ -70,6 +77,8 @@ final class SidecarSupervisor {
     }
 
     func stop() {
+        stopping = true
+        restartTask?.cancel(); restartTask = nil
         process?.terminate()
         process = nil
         status = .stopped
@@ -78,13 +87,28 @@ final class SidecarSupervisor {
     private func onReady(_ ep: SidecarEndpoint) {
         endpoint = ep
         status = .running(ep)
+        restartAttempts = 0   // a healthy connect resets the backoff for the next crash
         client.connect(ep)
     }
 
+    /// The sidecar process ended. If it was an intentional `stop()`, stay stopped.
+    /// Otherwise the engine crashed/was killed — auto-restart with capped backoff so
+    /// the app self-heals instead of being stranded at "Not connected" forever.
     private func onExit() {
         client.disconnect()
         process = nil
-        if case .running = status { status = .stopped }
+        endpoint = nil
+        if stopping { return }
+        let attempt = restartAttempts
+        restartAttempts += 1
+        let delayMs = min(5000, 250 << min(attempt, 5))  // 250ms,500,1s,2s,4s,5s…
+        status = .failed("engine stopped — reconnecting…")
+        restartTask?.cancel()
+        restartTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(delayMs))
+            guard let self, !self.stopping, self.process == nil else { return }
+            self.start()
+        }
     }
 
     private struct Launch { let exec: URL; let args: [String] }
