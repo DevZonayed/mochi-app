@@ -490,8 +490,29 @@ struct TranscriptBlock: View {
         case "image": imageChip
         case "ask": answerable ? AnyView(questionCard) : AnyView(askCard)
         case "review": reviewCard
+        case "steer": steerRow
         default: MarkdownText(text: item.text, projectRoot: projectRoot, onOpenFile: onOpenFile)
         }
+    }
+
+    /// A user message injected mid-turn via ⌘↩ (steer): the agent picks it up at the
+    /// next boundary without the turn being killed + reseeded. Rendered as a tinted
+    /// interjection so it's clearly distinct from the agent's own prose.
+    private var steerRow: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "arrowshape.turn.up.right.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Tok.blue)
+                .padding(.top, 2)
+            Text(item.text)
+                .font(TokFont.text(TokFont.subhead))
+                .foregroundStyle(Tok.ink)
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(Tok.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Tok.blue.opacity(0.25), lineWidth: 1))
     }
 
     /// Interactive AskUserQuestion card: option chips + a type-your-own field → answerQuestion.
