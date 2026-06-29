@@ -73,8 +73,8 @@ export interface Project {
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
     final result. The chat renders these as separate blocks with timings. */
 export interface TranscriptItem {
-  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image';
-  /** text/result: the content. thinking: the model's reasoning prose. tool: the HUMAN label (Bash description, relative file path, search pattern…). ask: prompt. review: the findings. image: a short caption (the prompt). */
+  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image' | 'steer';
+  /** text/result: the content. thinking: the model's reasoning prose. tool: the HUMAN label (Bash description, relative file path, search pattern…). ask: prompt. review: the findings. image: a short caption (the prompt). steer: a user message injected mid-turn (the agent picks it up at the next boundary without the turn being killed + reseeded). */
   text: string;
   /** tool: tool name. review: the reviewer engine's label. */
   name?: string;

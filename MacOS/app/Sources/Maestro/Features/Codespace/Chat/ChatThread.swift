@@ -422,16 +422,34 @@ struct ChatThread: View {
         }
     }
 
-    /// ⌘↩: interrupt the running turn and send this message immediately (steer).
+    /// ⌘↩: steer the running turn — inject this message into the LIVE session so the
+    /// agent picks it up at the next boundary (no cancel + reseed, context kept). Falls
+    /// back to the old interrupt-and-send when there's no live turn, the turn already
+    /// settled, or images are attached (which can't ride the text-only steer channel).
     private func sendNow() {
         let text = composerText.trimmed
         guard !text.isEmpty || !attachments.isEmpty, let store else { return }
         let atts = attachments
         composerText = ""; attachments = []
-        // `dispatching` is set synchronously below, so the cancel's running→idle transition can't
-        // sneak in a concurrent drain before the steered send creates its own running turn.
-        if let running = store.turns.last(where: { $0.isRunning }) { Task { await store.cancel(running) } }
-        dispatchSend(text: text, atts: atts, effort: effort, plan: plan, goal: goal)
+        let running = store.turns.last(where: { $0.isRunning })
+        // No live turn, or an attachment send: the original interrupt-and-send path.
+        guard let running, atts.isEmpty else {
+            if let running { Task { await store.cancel(running) } }
+            dispatchSend(text: text, atts: atts, effort: effort, plan: plan, goal: goal)
+            return
+        }
+        // `dispatching` is set synchronously so the fallback cancel's running→idle
+        // transition can't sneak in a concurrent drain before we decide.
+        dispatching = true
+        Task {
+            if await store.steer(running, text: text) {
+                dispatching = false   // steer landed; the live turn keeps running, the queue holds behind it
+                return
+            }
+            // Turn already settled or not steerable — interrupt and send as a fresh turn.
+            await store.cancel(running)
+            dispatchSend(text: text, atts: atts, effort: effort, plan: plan, goal: goal)
+        }
     }
 
     private func dispatchSend(text: String, atts: [ComposerAttachment], effort: String, plan: Bool, goal: Bool) {

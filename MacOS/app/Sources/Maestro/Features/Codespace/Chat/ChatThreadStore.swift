@@ -2,6 +2,7 @@ import SwiftUI
 import Observation
 
 private struct SendChatResult: Decodable { let session: ChatSession; let job: Job }
+private struct SteerResult: Decodable { let steered: Bool }
 
 /// The conversation for ONE {project, session}: its turns (jobs), live streaming via the `job`
 /// event stream, send (lazy-creates a session on first send), and cancel.
@@ -115,6 +116,18 @@ final class ChatThreadStore {
 
     func cancel(_ job: Job) async {
         try? await client.callVoid("cancelJob", ["id": job.id])
+    }
+
+    /// Steer a running turn: inject `text` into the LIVE Claude session (the brain
+    /// interrupts the current turn and the agent picks the message up at the next
+    /// boundary) instead of cancelling + reseeding — same session, full context kept.
+    /// Returns false when the turn already settled or isn't steerable, so the caller
+    /// falls back to a normal send.
+    func steer(_ job: Job, text: String) async -> Bool {
+        let t = text.trimmed
+        guard !t.isEmpty else { return false }
+        do { return try await client.call("steerJob", ["id": job.id, "text": t], as: SteerResult.self).steered }
+        catch { return false }
     }
 
     /// Per-session run modes (need a session to exist).

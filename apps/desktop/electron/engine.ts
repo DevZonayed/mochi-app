@@ -41,6 +41,7 @@ import type { GitService } from './git-service.js';
 import { waSendAllowed } from './whatsapp.js';
 import type { CronRunner } from './cron.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
+import { createSteerableInput, type SteerableInput } from './steerable-input.js';
 import type { Providers } from './providers.js';
 import {
   enginesRoot, managedBinary, systemBinary, bundledBinary, downloadEngine, engineState,
@@ -393,6 +394,13 @@ interface RunHooks {
   onResumed?: () => void;
 }
 
+/** Injects a user message into a LIVE Claude turn via the SDK's streaming-input
+    channel + `interrupt()` (NOT a cancel-and-reseed). Returns true if delivered;
+    false if the turn already settled (channel closed) so the caller falls back to a
+    normal send. Registered per-run via runClaude's `onSteerReady`. See
+    ./steerable-input.ts. */
+export type SteerFn = (text: string) => Promise<boolean>;
+
 /* Per-1M-token prices for a live cost ESTIMATE (the SDK's exact total_cost_usd
    replaces it when the run finishes). Standard Anthropic pricing; cache reads
    ~10% of input, cache writes ~25% over input. */
@@ -629,6 +637,11 @@ async function runClaude(
   planGate?: PlanModeGate,
   emitPlanExit?: EmitPlanExit,
   jobId?: string | null,
+  /** When provided, this run uses the SDK's STREAMING-INPUT mode so the user can
+      STEER it: the callback is handed a SteerFn the moment the live query is built
+      (and `null` when the run ends). Only the primary chat turn passes this — sub-runs
+      (reviewer, fix, max-turns continuation, plan mode) stay on the one-shot prompt. */
+  onSteerReady?: (steer: SteerFn | null) => void,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -1396,24 +1409,29 @@ async function runClaude(
   const mergedAllowed = [...maestroAllowed, ...(customMcp?.allowedTools ?? [])];
   /* Vision input: when the user attached images, the prompt becomes a streamed
      user message carrying text + base64 image blocks (a plain string can't hold
-     images). Verified the SDK accepts this with resume/abort. Otherwise the
-     simple string prompt path is unchanged. */
+     images). Verified the SDK accepts this with resume/abort. STEERABLE turns ALSO
+     use a streamed user message — fed through a pushable channel — so a STEER can
+     inject a follow-up mid-session (interrupt + next-turn pickup) instead of killing
+     the turn and reseeding. Otherwise the simple string prompt path is unchanged. */
   const VALID_MEDIA = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
-  const promptArg = (images && images.length)
-    ? (async function* () {
-        yield {
-          type: 'user' as const,
-          parent_tool_use_id: null,
-          message: {
-            role: 'user' as const,
-            content: [
-              { type: 'text' as const, text: prompt },
-              ...images.map(im => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: (VALID_MEDIA.has(im.mime) ? im.mime : 'image/png'), data: im.b64 } })),
-            ],
-          },
-        };
-      })() as unknown as Parameters<typeof query>[0]['prompt']
-    : prompt;
+  const imageBlocks = (images ?? []).map(im => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: (VALID_MEDIA.has(im.mime) ? im.mime : 'image/png'), data: im.b64 } }));
+  const userMsg = (text: string, withImages: boolean) => ({
+    type: 'user' as const,
+    parent_tool_use_id: null,
+    message: { role: 'user' as const, content: [{ type: 'text' as const, text }, ...(withImages ? imageBlocks : [])] },
+  });
+  // Live steerable channel (streaming-input turns only). Held so the result handler
+  // can close it on a settled turn and the steer closure can push follow-ups into it.
+  let steerInput: SteerableInput<ReturnType<typeof userMsg>> | null = null;
+  let promptArg: Parameters<typeof query>[0]['prompt'];
+  if (onSteerReady) {
+    steerInput = createSteerableInput(userMsg(prompt, true));
+    promptArg = steerInput.stream as unknown as Parameters<typeof query>[0]['prompt'];
+  } else if (images && images.length) {
+    promptArg = (async function* () { yield userMsg(prompt, true); })() as unknown as Parameters<typeof query>[0]['prompt'];
+  } else {
+    promptArg = prompt;
+  }
   const it = query({
     prompt: promptArg,
     options: {
@@ -1580,6 +1598,22 @@ async function runClaude(
     return { tokens, cost: Math.round(cost * 1000) / 1000 };
   };
   const progress = () => hooks.onProgress?.(proseOf(items), items, liveUsage());
+  // Steerable turns: hand the host a SteerFn that injects a user message into THIS
+  // live session. It pushes the message into the input channel, surfaces it inline
+  // as a `steer` transcript item, then interrupts the current turn so the agent
+  // abandons what it's doing and picks the steer up at the next boundary — same
+  // subprocess, full context kept (no cancel + resume). Cleared when the run ends.
+  if (onSteerReady && steerInput) {
+    const channel = steerInput;
+    onSteerReady(async (text: string): Promise<boolean> => {
+      if (channel.closed) return false;
+      if (!channel.push(userMsg(text, false))) return false;
+      items.push({ kind: 'steer', text, ts: Date.now() });
+      progress();
+      try { await it.interrupt(); } catch { /* no active turn to interrupt — the queued msg is picked up at the next pull */ }
+      return true;
+    });
+  }
   try {
     for await (const raw of it as AsyncIterable<Record<string, unknown>>) {
       if (hooks.signal?.aborted) throw new CancelledError();
@@ -1707,6 +1741,12 @@ async function runClaude(
         // Snap the live counters to the SDK's authoritative totals.
         if (usage?.output_tokens != null) { committedOut = usage.output_tokens; curOut = 0; }
         if (m.total_cost_usd != null) finalCost = m.total_cost_usd;
+        // Streaming-input (steerable) turns keep the SDK session OPEN after a result
+        // so a steer can still be delivered. Close the input when this turn settled
+        // with nothing pending (or it bailed on a turn/usage cap) so the SDK finalises
+        // and this loop ends; leave it open when a steer is mid-flight (an interrupt
+        // just fired) so the agent picks it up as the next turn.
+        if (steerInput && !steerInput.closed && (steerInput.pending() === 0 || hitMaxTurns || hitLimit)) steerInput.close();
       }
     }
   } catch (e) {
@@ -1739,6 +1779,11 @@ async function runClaude(
   // resume" UI must not survive past this point (a terminal status from the
   // caller would otherwise show alongside a stale countdown). Idempotent.
   emitPause(wakeup.reset());
+  // Steerable turn is over: close the input channel (idempotent — the SDK has
+  // already ended the stream by here) and clear the host's SteerFn so a late steer
+  // falls back to a normal send instead of pushing into a finished session.
+  steerInput?.close();
+  onSteerReady?.(null);
   // Any tool left 'running' (no matching tool_result before the stream ended)
   // would otherwise spin forever in the UI — settle it.
   for (const t of items) if (t.kind === 'tool' && t.toolStatus === 'running') { t.toolStatus = 'done'; t.durMs = Date.now() - t.ts; }
@@ -2033,8 +2078,9 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
 const ENGINE_LABEL: Record<EngineId, string> = { claude: 'Claude Code', codex: 'Codex' };
 
 export class LocalEngine {
-  /** jobId → live cancel handle (abort for claude, child for codex). */
-  private running = new Map<string, { ac: AbortController; child?: ChildProcess }>();
+  /** jobId → live cancel handle (abort for claude, child for codex). `steer` is set
+      while a steerable Claude chat turn is mid-flight (see engine.steer / runClaude). */
+  private running = new Map<string, { ac: AbortController; child?: ChildProcess; steer?: SteerFn }>();
   /** In-flight `codex login` child (browser OAuth), if any. */
   private codexLoginChild?: ChildProcess;
   private githubLoginChild?: ChildProcess;
@@ -2507,6 +2553,20 @@ export class LocalEngine {
 
   isRunning(jobId: string): boolean { return this.running.has(jobId); }
 
+  /** STEER a running chat turn: inject a follow-up user message into the LIVE Claude
+      Agent SDK session (streaming input + `interrupt()`) so the agent abandons its
+      current turn and picks the message up at the next boundary — same subprocess,
+      full context, NO cancel-and-reseed. Returns `{ steered:false }` when the job
+      isn't running a steerable turn (already finished, codex, plan mode, or a non-
+      chat run) so the caller can fall back to a normal send. */
+  async steer(jobId: string, text: string): Promise<{ steered: boolean }> {
+    const t = text.trim();
+    const steer = this.running.get(jobId)?.steer;
+    if (!t || !steer) return { steered: false };
+    try { return { steered: await steer(t) }; }
+    catch { return { steered: false }; }
+  }
+
   /** Recent finished turns of a chat session, formatted for prompt stitching
       (codex has no resumable session, so context rides in the prompt). */
   private chatHistory(sessionId: string, excludeJobId: string): string {
@@ -2787,7 +2847,7 @@ export class LocalEngine {
     }
 
     const ac = new AbortController();
-    const handle: { ac: AbortController; child?: ChildProcess } = { ac };
+    const handle: { ac: AbortController; child?: ChildProcess; steer?: SteerFn } = { ac };
     this.running.set(jobId, handle);
 
     let cur = this.store.updateJob(jobId, {
@@ -3234,8 +3294,14 @@ export class LocalEngine {
       const emitPlanExit: EmitPlanExit = (req) => {
         try { this.emit('plan-mode-exit-request', req, { desktopOnly: true }); } catch { /* window gone */ }
       };
+      // Steering: only the PRIMARY chat turn is steerable (not plan mode, not a
+      // one-off non-chat job). When that run builds its live query it hands back a
+      // SteerFn, which we park on the job handle so engine.steer(jobId, text) can
+      // reach the live session; it's cleared (null) the moment the run ends.
+      const onSteerReady: ((s: SteerFn | null) => void) | undefined =
+        (isChat && !opts.plan) ? (s) => { handle.steer = s ?? undefined; } : undefined;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, this.planGate, emitPlanExit, jobId)
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, this.planGate, emitPlanExit, jobId, onSteerReady)
         : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx, emitConfirm, sessionId: session?.id ?? null, plan: opts.plan, planGate: this.planGate, emitPlanExit, jobId }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
