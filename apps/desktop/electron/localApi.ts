@@ -1009,6 +1009,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const c = engine.cancel(String(p.id ?? ''));
         return c ?? bad('job is not running', 409);
       }
+      // Steer a running chat turn: inject a follow-up into the LIVE session instead
+      // of cancelling + reseeding. { steered:false } ⇒ the turn already settled, so
+      // the caller (composer ⌘↩) falls back to a normal send.
+      case 'steerJob': return engine.steer(String(p.id ?? ''), String(p.text ?? ''));
       case 'deleteJob': { store.deleteJob(String(p.id ?? '')); return { ok: true }; }
 
       // ── Background tasks (long-lived processes the agent started) ──
