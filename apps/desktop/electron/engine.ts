@@ -21,6 +21,7 @@ import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
 import { toolLabel, relPath } from './tool-label.js';
 import { thinkingConfigFor } from './thinking-config.js';
+import { looksLikeImageRequest } from './image-intent.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { branchSlug, isGitRepo } from './git.js';
 import { pickCityCodename } from './codenames.js';
@@ -196,21 +197,56 @@ const PR_DIRECTIVE =
   `<<<<<<</=======/>>>>>>> markers keeping the intended content, Bash-commit, then call ` +
   `pr_resolve_conflicts again to confirm clean + push.\n` +
   `• "push" / "send to github" without a PR ask: call git_push.\n` +
+  `• "fix the CI" / "the checks are failing" / a PR reports failing checks: inspect GitHub Actions ` +
+  `with read-only Bash — \`gh pr checks\`, then \`gh run view <run-id> --log\` (run id is in the ` +
+  `check's details URL; if a log is still streaming, \`gh api /repos/<owner>/<repo>/actions/jobs/` +
+  `<job-id>/logs\`). Summarize the failing snippet, FIX the code, commit, then call git_push and ` +
+  `re-check. Treat non-GitHub-Actions checks (Buildkite, etc.) as external — report the details URL ` +
+  `only, don't chase them.\n` +
+  `• "address the review comments" / "respond to the PR feedback": fetch the threads with ` +
+  `\`gh api repos/<owner>/<repo>/pulls/<n>/comments\` (and \`.../reviews\`), work through each ` +
+  `actionable thread (edit the files), commit, then call git_push. Briefly note which comments you ` +
+  `addressed.\n` +
   `• Status questions ("what's the state?" / "is the PR ready?"): call git_status.\n\n` +
   `Always run git_status BEFORE the action so you know what step the lifecycle is on. ` +
-  `Bash is still the right tool for commits, diffs, and inspections — just not for the ` +
-  `push/PR/merge/resolve actions themselves.`;
+  `Bash is still the right tool for commits, diffs, and inspections (incl. read-only \`gh\` checks/` +
+  `comments lookups) — just not for the push/PR/merge/resolve actions themselves.`;
 // SP3 — primary↔reviewer loop: how many review→fix→re-review rounds at most.
 const REVIEW_MAX_ROUNDS = 2;
-// Codex already ships a native built-in `image_gen` skill (rides the ChatGPT
-// sign-in, no key). When the message reads like an image request, nudge codex to
-// use it (not SVG) and copy the final PNG into the workspace so we can harvest it.
-const IMAGE_INTENT_RE = /\b(image|picture|photo|logo|icon|illustration|render|drawing|draw|png|jpe?g|graphic|artwork|wallpaper|avatar|sprite|mockup|poster|thumbnail)\b/i;
-const CODEX_IMAGE_NUDGE =
-  `\n\n---\n\n[Image output] If this involves generating or editing an image, use your ` +
-  `built-in image_gen skill (NOT an SVG, NOT ASCII art). After generating, COPY the final ` +
-  `selected image into the current workspace directory with a clear name like ` +
-  `generated-<short>.png so it becomes a project asset, and state the saved path.`;
+// Image generation. When a turn reads like an image request, inject the OpenAI
+// `imagegen` skill methodology (use-case taxonomy + structured prompt spec +
+// augmentation/edit-invariant rules) so BOTH engines shape a high-quality prompt
+// before generating — Claude via the maestro `generate_image` MCP tool (runs under
+// autopilot/bypassPermissions, no approval), Codex via its native built-in image_gen.
+// Image-generation intent detection lives in a pure module (./image-intent) so it is
+// unit-tested without loading this heavy Electron/SDK module. It deliberately avoids a
+// bare keyword match — "render"/"icon"/"logo" appear in ordinary coding asks.
+// Shared prompt-shaping method (adapted from openai/skills .system/imagegen). Keep
+// it tight — it is prepended to the turn, not a full document.
+const IMAGE_METHOD =
+  `\n\n---\n\n[Image generation — follow the imagegen method] This turn involves creating or editing ` +
+  `an image. Produce a REAL raster asset — never SVG, ASCII art, or HTML/CSS placeholders. Before you ` +
+  `call the tool, shape the request into a short structured spec (this materially improves quality):\n` +
+  `  • Use case (pick one): photorealistic-natural | product-mockup | ui-mockup | infographic-diagram | ` +
+  `logo-brand | illustration-story | stylized-concept | historical-scene | text-localization | ` +
+  `identity-preserve | precise-object-edit | lighting-weather | background-extraction | style-transfer | ` +
+  `compositing | sketch-to-render\n` +
+  `  • Asset type · Scene/backdrop · Subject · Style/medium · Composition/framing · Lighting/mood · ` +
+  `Color palette · Materials/textures · Text (verbatim, in quotes) · Constraints · Avoid\n` +
+  `Augmentation rules: if the user's prompt is already specific, NORMALIZE it — do not invent extra ` +
+  `characters, brands, slogans, or palettes. If it is generic, add only composition/lighting/polish cues ` +
+  `that materially help. For EDITS, restate invariants every iteration ("change only X; keep Y unchanged") ` +
+  `and save non-destructively (e.g. hero-v2.png) — never overwrite unless replacement was explicitly asked.`;
+// Claude variant: route through the maestro generate_image tool (auto-runs under autopilot).
+const IMAGE_DIRECTIVE_CLAUDE = IMAGE_METHOD +
+  `\nCall the \`generate_image\` tool with your shaped prompt; it runs automatically (no permission needed) ` +
+  `and the saved PNG is shown inline — just reference the returned path in your reply. Issue one ` +
+  `generate_image call per requested asset/variant.`;
+// Codex variant: use its built-in image_gen skill, then harvest the PNG into the workspace.
+const IMAGE_DIRECTIVE_CODEX = IMAGE_METHOD +
+  `\nUse your built-in image_gen skill (NOT an SVG, NOT ASCII art). After generating, COPY the final ` +
+  `selected image into the current workspace directory with a clear name like generated-<short>.png so it ` +
+  `becomes a project asset, and state the saved path.`;
 const IMG_FILE_RE = /\.(png|jpe?g|webp|gif)$/i;
 /* Identify an image by its MAGIC BYTES, not a (possibly wrong) client-supplied
    mime. Returns one of the four media types Anthropic vision accepts, or null —
@@ -607,15 +643,24 @@ async function runClaude(
         tools: [
           ...(imageGen ? [tool(
             'generate_image',
-            'Generate a real raster image (PNG) from a text description and save it to the project. ' +
+            'Generate OR edit a real raster image (PNG) and save it to the project. ' +
             'Use this WHENEVER the user asks to create, draw, render, or generate an image, logo, icon, ' +
             'illustration, picture, sprite, mockup, or photo. Do NOT hand-write SVG or ASCII art for these ' +
-            'requests — call this tool. The saved PNG is shown inline in the chat automatically; just ' +
+            'requests — call this tool. Shape the prompt as a structured spec (scene/backdrop → subject → ' +
+            'style/medium → composition → lighting → constraints/avoid; quote any in-image text verbatim) ' +
+            'rather than a bare phrase — it materially improves quality. To EDIT an existing image, pass its ' +
+            'file path as sourceImagePath and write `prompt` as the change to make ("add a balloon in the ' +
+            'sky"); the backend keeps the original and applies only that edit — restate invariants ("change ' +
+            'only X; keep Y unchanged"). The saved PNG is shown inline in the chat automatically; just ' +
             'reference the returned path in your reply.',
-            { prompt: z.string().describe('A detailed description of the image to generate.'),
-              aspect: z.enum(['1:1', '16:9', '9:16']).optional().describe('Aspect ratio. Default 1:1.') },
-            wrap(async (args: { prompt: string; aspect?: '1:1' | '16:9' | '9:16' }) => {
-              const res = await imageGen!(args.prompt, { aspect: args.aspect, projectId });
+            { prompt: z.string().describe('For a new image: a detailed, structured description (scene, subject, style, composition, lighting, constraints). For an edit (sourceImagePath set): the change to apply, with invariants. Quote any in-image text verbatim.'),
+              aspect: z.enum(['1:1', '16:9', '9:16']).optional().describe('Aspect ratio. Default 1:1. Ignored when editing a source image.'),
+              sourceImagePath: z.string().optional().describe('Absolute or project-relative path to an existing image file to EDIT (e.g. a previously generated asset). When set, `prompt` is read as an edit instruction and the original image is preserved except for the requested change.') },
+            wrap(async (args: { prompt: string; aspect?: '1:1' | '16:9' | '9:16'; sourceImagePath?: string }) => {
+              const srcPath = args.sourceImagePath
+                ? (path.isAbsolute(args.sourceImagePath) ? args.sourceImagePath : path.resolve(cwd, args.sourceImagePath))
+                : undefined;
+              const res = await imageGen!(args.prompt, { aspect: args.aspect, projectId, sourceImagePath: srcPath });
               items.push({ kind: 'image', text: args.prompt.slice(0, 200), imagePath: res.path,
                 assetId: res.assetId, alt: res.alt ?? args.prompt.slice(0, 200), width: res.width, height: res.height, ts: Date.now() });
               progress();
@@ -2740,9 +2785,14 @@ export class LocalEngine {
       if (!opts.plan && (master === 'claude' || (master === 'codex' && job.projectId))) prompt += BG_DIRECTIVE;
       // Design genre: steer the turn toward the live, self-contained design artifact.
       if (project?.kind === 'design') prompt += DESIGN_DIRECTIVE;
-      // Codex ships a native image_gen skill — nudge it to use that (not SVG) and
-      // drop the PNG in the workspace so we can harvest + display it inline.
-      if (master === 'codex' && IMAGE_INTENT_RE.test(cur.input)) prompt += CODEX_IMAGE_NUDGE;
+      // Image intent → inject the imagegen-skill methodology so the agent shapes a
+      // structured, high-quality prompt before generating. Claude routes through the
+      // maestro generate_image tool (mounted when imageGen is configured + not plan);
+      // Codex uses its native built-in image_gen. Both run under autopilot.
+      if (looksLikeImageRequest(cur.input)) {
+        if (master === 'codex') prompt += IMAGE_DIRECTIVE_CODEX;
+        else if (!opts.plan && this.imageGen) prompt += IMAGE_DIRECTIVE_CLAUDE;
+      }
       // Vision input: images the user attached to this message. Read + sniff each
       // ONCE from disk; keep only real png/jpeg/gif/webp (ignore a wrong client
       // mime, and never relabel — a bad type would 400 the whole Claude turn).
@@ -2900,7 +2950,7 @@ export class LocalEngine {
         },
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
-      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input), codexBridge: this.codexBridgeFor(), openaiKey: this.providers?.getLocalKey('openai') };
+      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: looksLikeImageRequest(cur.input), codexBridge: this.codexBridgeFor(), openaiKey: this.providers?.getLocalKey('openai') };
       // Let the agent discover + self-install registry skills mid-run (Claude MCP).
       const projForSkills = job.projectId;
       const skillsCtx: SkillsCtx | undefined = (projForSkills && !opts.plan) ? {
