@@ -1,0 +1,138 @@
+name: Build native WebKit macOS app
+
+on:
+  release:
+    types: [published]
+  workflow_run:
+    workflows: ["Release desktop app"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub Release tag to attach assets to. Leave blank to only upload the workflow artifact.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: native-webkit-macos-${{ github.event.release.tag_name || inputs.release_tag || github.event.workflow_run.id || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Maestro WebKit for macOS
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: macos-15
+    env:
+      MAESTRO_REQUIRE_EMBEDDED_NODE: "1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - id: version
+        name: Resolve app version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RELEASE_TAG:-}" ] && [ "$EVENT_NAME" = "workflow_run" ]; then
+            RELEASE_TAG="$(gh release list --limit 1 --json tagName,isDraft --jq 'map(select(.isDraft | not)) | .[0].tagName // ""')"
+          fi
+
+          version=""
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            version="$RELEASE_TAG"
+            version="${version#maestro-webkit-v}"
+            version="${version#maestro-macos-v}"
+            version="${version#maestro-native-v}"
+            version="${version#maestro-v}"
+            version="${version#v}"
+          fi
+
+          if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          else
+            base="$(node -p "require('./apps/desktop/package.json').version")"
+            IFS=. read -r major minor patch <<< "$base"
+            version="${major}.${minor}.$((patch + GITHUB_RUN_NUMBER))"
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG:-}" >> "$GITHUB_OUTPUT"
+          echo "MAESTRO_VERSION=$version"
+
+      - name: Show toolchain
+        run: |
+          echo "MAESTRO_VERSION=${{ steps.version.outputs.version }}"
+          echo "RELEASE_TAG=${{ steps.version.outputs.release_tag }}"
+          node --version
+          pnpm --version
+          swift --version
+          xcodebuild -version
+          uname -m
+
+      - name: Build production app bundle
+        env:
+          MAESTRO_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          chmod +x MacOS/webview-app/package-app.sh
+          MacOS/webview-app/package-app.sh release
+
+      - name: Smoke test bundled sidecar
+        run: node MacOS/sidecar/src/smoke-test.mjs --bundle
+
+      - id: package
+        name: Create DMG installer
+        env:
+          MAESTRO_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts
+          rm -rf dmg-root
+          mkdir -p dmg-root
+
+          short_sha="${GITHUB_SHA::7}"
+          dmg="artifacts/Maestro-WebKit-macOS-${MAESTRO_VERSION}-${short_sha}.dmg"
+          app="MacOS/webview-app/dist/Maestro WebKit.app"
+
+          test -d "$app"
+          ditto "$app" "dmg-root/Maestro WebKit.app"
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname "Maestro WebKit ${MAESTRO_VERSION}" -srcfolder dmg-root -ov -format UDZO "$dmg"
+          shasum -a 256 "$dmg" > "$dmg.sha256"
+
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
+          ls -lh artifacts
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Maestro-WebKit-macOS-${{ steps.version.outputs.version }}-${{ github.run_number }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach assets to GitHub Release
+        if: steps.version.outputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" >/dev/null
+          gh release upload "$RELEASE_TAG" artifacts/* --clobber

@@ -13,7 +13,7 @@ vi.mock('electron', () => ({ app: { getPath: () => hoisted.dir } }));
 
 import { Store } from './store.js';
 import type { GitService } from './git-service.js';
-import { makeGitCtx, nextActionFor } from './git-ctx.js';
+import { makeGitCtx, nextActionFor, isNeedsConfirm } from './git-ctx.js';
 
 const cleanupRepos: string[] = [];
 afterEach(() => { for (const d of cleanupRepos.splice(0)) { try { rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } } });
@@ -37,6 +37,21 @@ function fakeGitService() {
     mergePr:             vi.fn(async () => ({ ok: true })),
     resolveSession:      vi.fn(async () => ({ ok: true, conflicts: [] as string[] })),
     renameSessionBranch: vi.fn(async () => ({ ok: true, unchanged: true })),
+    previewMergePr:      vi.fn(async () => ({
+      ok: true as const,
+      preview: {
+        prNumber: 42, prTitle: 'feat: x', prUrl: 'https://github.com/x/y/pull/42',
+        mergeMethod: 'squash' as const, headSha: 'abc1234',
+        mergeable: true, mergeableState: 'clean' as const, checks: [],
+      },
+    })),
+    previewResolveSession: vi.fn(async () => ({
+      ok: true as const,
+      preview: {
+        prNumber: 42, prTitle: 'feat: x', prUrl: 'https://github.com/x/y/pull/42',
+        base: 'main', branch: 'mochi/lyon/lyon', conflictedFiles: [] as string[],
+      },
+    })),
   } as unknown as GitService;
 }
 
@@ -65,7 +80,7 @@ describe('makeGitCtx', () => {
     expect(ctx?.available()).toBe(true);
   });
 
-  test('push/createPr/mergePr/resolveConflicts/renameBranch each route to the right gitService call', async () => {
+  test('push/createPr route to the right gitService call', async () => {
     const s = new Store();
     const r = repo();
     execFileSync('git', ['-C', r, 'remote', 'add', 'origin', 'https://github.com/me/proj.git'], { encoding: 'utf8' });
@@ -83,15 +98,116 @@ describe('makeGitCtx', () => {
     expect(gs.createPr).toHaveBeenCalledTimes(1);
     expect((gs.createPr as ReturnType<typeof vi.fn>).mock.calls[0][1]).toEqual({ title: 't', body: 'b' });
 
-    await ctx.mergePr({ method: 'squash' });
-    expect(gs.mergePr).toHaveBeenCalledTimes(1);
-    expect((gs.mergePr as ReturnType<typeof vi.fn>).mock.calls[0][1]).toEqual({ method: 'squash' });
-
-    await ctx.resolveConflicts();
-    expect(gs.resolveSession).toHaveBeenCalledTimes(1);
-
     await ctx.renameBranch();
     expect(gs.renameSessionBranch).toHaveBeenCalledTimes(1);
+  });
+
+  /* ── HUMAN-CONFIRM GATE + TRIPWIRE — pr_merge + pr_resolve_conflicts ─────
+     The contract: GitCtx (the agent surface) ALWAYS returns a preview and
+     NEVER calls the destructive gitService method. Even if a `confirmed:
+     true` flag arrives — which only the renderer should ever set, and the
+     renderer bypasses GitCtx entirely via the IPC handler — we strip + log
+     + fall through to preview. This is the defense-in-depth check that
+     stops the "agent invented `confirmed:true` and squash-merged 11 PRs"
+     incident from being repeatable. */
+  function setupRepoCtx() {
+    const s = new Store();
+    const r = repo();
+    execFileSync('git', ['-C', r, 'remote', 'add', 'origin', 'https://github.com/me/proj.git'], { encoding: 'utf8' });
+    const proj = s.createProject({ name: 'p', path: r });
+    const sess = s.createSession(proj.id, 'first', 'lyon');
+    s.updateSession(sess.id, { branch: 'mochi/lyon/lyon', worktreePath: r, baseBranch: 'main' });
+    const gs = fakeGitService();
+    const ctx = makeGitCtx(s, gs, sess.id)!;
+    return { gs, ctx };
+  }
+
+  test('mergePr WITHOUT confirmed → returns needsConfirm + does NOT call GitHub', async () => {
+    const { gs, ctx } = setupRepoCtx();
+    const r = await ctx.mergePr({ method: 'squash' });
+    expect(isNeedsConfirm(r)).toBe(true);
+    if (isNeedsConfirm(r)) {
+      expect(r.action).toBe('pr_merge');
+      expect(r.preview.prNumber).toBe(42);
+      expect(r.preview.mergeMethod).toBe('squash');
+    }
+    expect(gs.previewMergePr).toHaveBeenCalledTimes(1);
+    expect(gs.mergePr).not.toHaveBeenCalled();
+  });
+
+  test('TRIPWIRE: mergePr WITH confirmed:true is REFUSED — never lands the merge', async () => {
+    // The agent might invent `confirmed:true` (the model has seen the schema).
+    // Even then we strip it, log a warning, and fall through to the preview
+    // gate. The destructive `gs.mergePr` must NEVER be called from GitCtx —
+    // only the renderer's IPC handler in localApi.ts may invoke it.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { gs, ctx } = setupRepoCtx();
+      const r = await ctx.mergePr({ method: 'squash', confirmed: true });
+      // Behaves exactly like an agent call WITHOUT the flag — preview + needsConfirm.
+      expect(isNeedsConfirm(r)).toBe(true);
+      if (isNeedsConfirm(r)) {
+        expect(r.action).toBe('pr_merge');
+        expect(r.preview.mergeMethod).toBe('squash');
+      }
+      expect(gs.previewMergePr).toHaveBeenCalledTimes(1);
+      expect(gs.mergePr).not.toHaveBeenCalled();
+      // Tripwire surfaced a loud warning naming the offending flag.
+      expect(warn).toHaveBeenCalled();
+      const msg = warn.mock.calls[0]?.[0] as string | undefined;
+      expect(msg).toMatch(/TRIPWIRE/);
+      expect(msg).toMatch(/confirmed:true/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('resolveConflicts WITHOUT confirmed → returns needsConfirm + does NOT touch worktree', async () => {
+    const { gs, ctx } = setupRepoCtx();
+    const r = await ctx.resolveConflicts();
+    expect(isNeedsConfirm(r)).toBe(true);
+    if (isNeedsConfirm(r)) {
+      expect(r.action).toBe('pr_resolve_conflicts');
+      expect(r.preview.branch).toBe('mochi/lyon/lyon');
+    }
+    expect(gs.previewResolveSession).toHaveBeenCalledTimes(1);
+    expect(gs.resolveSession).not.toHaveBeenCalled();
+  });
+
+  test('TRIPWIRE: resolveConflicts WITH confirmed:true is REFUSED — never touches worktree', async () => {
+    // Same shape as the mergePr tripwire — agent surface never executes,
+    // even when the flag is set.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { gs, ctx } = setupRepoCtx();
+      const r = await ctx.resolveConflicts({ confirmed: true });
+      expect(isNeedsConfirm(r)).toBe(true);
+      expect(gs.previewResolveSession).toHaveBeenCalledTimes(1);
+      expect(gs.resolveSession).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalled();
+      expect(warn.mock.calls[0]?.[0]).toMatch(/TRIPWIRE/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('preview failure surfaces as ok:false with the reason (no GitHub call)', async () => {
+    const s = new Store();
+    const r = repo();
+    execFileSync('git', ['-C', r, 'remote', 'add', 'origin', 'https://github.com/me/proj.git'], { encoding: 'utf8' });
+    const proj = s.createProject({ name: 'p', path: r });
+    const sess = s.createSession(proj.id, 'first', 'lyon');
+    s.updateSession(sess.id, { branch: 'mochi/lyon/lyon', worktreePath: r, baseBranch: 'main' });
+    const gs = fakeGitService();
+    (gs.previewMergePr as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: false, reason: 'no open PR for this session' });
+    const ctx = makeGitCtx(s, gs, sess.id)!;
+    const res = await ctx.mergePr();
+    expect(isNeedsConfirm(res)).toBe(false);
+    if (!isNeedsConfirm(res)) {
+      expect(res.ok).toBe(false);
+      expect(res.reason).toBe('no open PR for this session');
+    }
+    expect(gs.mergePr).not.toHaveBeenCalled();
   });
 
   test('status() flattens the SessionGitStatus + adds a next-action hint', async () => {

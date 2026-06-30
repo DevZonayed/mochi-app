@@ -172,6 +172,41 @@ async function getTabUrl(tabId) {
   try { return (await chrome.tabs.get(tabId))?.url ?? null; } catch { return null; }
 }
 
+// 0.4.2: dock the agent's session into a Chrome window the user ALREADY has
+// open, instead of spawning a fresh one. The old `getLastFocused` call alone
+// would return null when the user's focus was in another app (the Maestro
+// Electron UI being the obvious case), so the fallback in sessionStart fired
+// `chrome.windows.create` even though Chrome had a perfectly good window
+// sitting right there. Order:
+//
+//   1. getLastFocused({windowTypes:["normal"]}) — preferred (most-recently
+//      used normal Chrome window). Honoured even when minimized; we'd rather
+//      restore that one (Chrome will when we activate a tab in it) than
+//      create a third window.
+//   2. getAll({windowTypes:["normal"]}) — pick any non-minimized window if
+//      available, otherwise any window. This catches the "Chrome is running
+//      but no window is currently focused" case.
+//   3. null — caller must create a new window (truly no normal Chrome window
+//      exists, e.g. Chrome isn't running).
+//
+// Exported via `_test` for unit coverage.
+async function pickExistingWindow() {
+  try {
+    const focused = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+    if (focused && focused.id != null) return focused;
+  } catch {}
+  try {
+    const all = await chrome.windows.getAll({ windowTypes: ["normal"] });
+    if (Array.isArray(all) && all.length) {
+      const usable = all.find((w) => w && w.state !== "minimized" && w.id != null);
+      if (usable) return usable;
+      const anyWithId = all.find((w) => w && w.id != null);
+      if (anyWithId) return anyWithId;
+    }
+  } catch {}
+  return null;
+}
+
 function dropSession(clientId) {
   const s = sessions.get(clientId);
   if (!s) return;
@@ -1229,8 +1264,15 @@ async function sessionStart(input = {}, clientId) {
     win = await chrome.windows.create(opts);
     tab = win.tabs?.[0] ?? (await chrome.tabs.query({ windowId: win.id }))[0];
   } else {
-    try { win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }); }
-    catch { win = await chrome.windows.create({ type: "normal" }); }
+    // 0.4.2: pickExistingWindow falls through getLastFocused → getAll so we
+    // dock into the user's existing Chrome window instead of spawning a fresh
+    // one whenever Chrome has ANY normal window open. The old code called
+    // getLastFocused alone — when the user's focus was in another app (e.g.
+    // the Maestro Electron UI) Chrome could return null and we'd hit the
+    // catch path → chrome.windows.create → an unwanted second window even
+    // though the user's existing window was right there.
+    win = await pickExistingWindow();
+    if (!win) win = await chrome.windows.create({ type: "normal" });
     // ALWAYS create the session tab as `active: true` within its window — that
     // prevents Chrome's hidden-tab throttling (rAF paused, timers ≥1s) which
     // breaks SPAs like React/Cloudflare during automation. The OS-level focus

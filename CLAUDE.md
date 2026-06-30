@@ -4,6 +4,34 @@ This file is read on every coding-agent session in this repo. Keep it short.
 For deeper context, the agent should consult `.continuum/STATE.md` (project
 memory) and `.claude/skills/` (installed skills).
 
+## Merge policy — agents MUST NEVER merge
+
+Merging a PR and writing to `master` are HUMAN actions. They are gated by
+PR #63's `<PrActionConfirmDialog />` and PR #66's `<GitOpsDock />`, and the
+operator has shipped a `PreToolUse` Bash hook (`.claude/settings.json` →
+`scripts/block-merge-commands.sh`) that will refuse and exit non-zero on
+every shape of the act. These rules apply to ALL modes — interactive,
+goal-mode, autonomous — without exception:
+
+- **Never** call `gh pr merge`, `gh pr merge --auto`, `gh pr review --approve`,
+  `gh pr edit --enable-auto-merge`, or `gh api repos/*/pulls/*/merge`. The
+  Bash hook denies these and returns the reason to you so you know why.
+- **Never** call the `pr_merge` MCP tool with `{ confirmed: true }`. The IPC
+  surface strips the flag and the agent-side tripwire in
+  `apps/desktop/electron/git-ctx.ts` will reject it loudly. State the intent
+  in plain English instead.
+- **Never** `git push origin master` (or `main`), and never push with
+  `--force`/`--force-with-lease` to `master`. Master is updated **only** via a
+  GitHub-side merge that the operator clicked.
+- The only `master` operation you may perform is **read-only**: `git fetch
+  origin master`, `git diff origin/master`, `git rebase origin/master` (onto
+  your own feature branch), `git log origin/master`.
+
+How to land work: push your feature branch, open the PR (`gh pr create` is
+allowed), and **stop**. The operator clicks Merge in the GitOpsDock — the
+renderer's `mergeSessionPR` IPC handler is the only sanctioned path that
+touches the GitHub merge API.
+
 ## Commit policy
 
 - Use **Conventional Commits** — see `.claude/skills/maestro-commit/SKILL.md`
@@ -19,6 +47,29 @@ memory) and `.claude/skills/` (installed skills).
   open / clone / adopt. It uses `gh api user` and falls back to
   `<login>@users.noreply.github.com` if the operator's email is private. The
   trailer-stripping hook is wired the same way via `ensureGitHooks`.
+
+## Commit & push gating — when the agent may write to git
+
+The Merge policy above governs the one thing the agent may NEVER do; these rules
+govern WHEN it may touch git at all. They mirror the operator's standing workflow
+and apply to ALL modes — interactive, goal-mode, autonomous:
+
+- **Commit or push only when the user explicitly asks.** Do not auto-commit
+  finished work — leave it staged/unstaged and report what's ready. The operator
+  decides when a checkpoint is worth recording.
+- **If you are on the default branch (`master`/`main`), branch first.** Never
+  commit directly onto `master`; cut a feature branch (`<user>/<topic>`) and
+  commit there.
+- **To land work:** push the feature branch and open the PR (`gh pr create
+  --base master` is allowed), then **stop**. The operator merges via the
+  GitOpsDock (see the Merge policy above — agents MUST NEVER merge).
+- **For actions that are hard to reverse or outward-facing** (push, PR open,
+  anything that leaves this Mac), confirm with the operator first unless they've
+  already said to proceed; approval for one step does not extend to the next.
+- **No AI-attribution anywhere.** Per the Commit policy above, never add
+  `Co-Authored-By: Claude` / `Generated with Claude Code` trailers to commits, and
+  keep PR titles/bodies free of AI-attribution too — the operator's clients read
+  this history.
 
 ## Repo layout (one-liner)
 

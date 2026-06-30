@@ -5,7 +5,7 @@ import { existsSync, realpathSync, mkdirSync, promises as fsp } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { Store } from './store.js';
 import { LocalEngine } from './engine.js';
-import { MediaEngine } from './media.js';
+import { MediaEngine, mediaModelForKind } from './media.js';
 import { ResearchEngine } from './research.js';
 import { PublishingEngine } from './publishing.js';
 import { CodexBridge } from './codex-bridge.js';
@@ -17,7 +17,8 @@ import { Providers } from './providers.js';
 import type { Approval, Job } from './store.js';
 import { createDispatch } from './localApi.js';
 import { GitService } from './git-service.js';
-import { buildModelGroups } from './models.js';
+import { GitWatcher } from './git-watcher.js';
+import { buildModelGroups, refreshModelGroups } from './models.js';
 import { HostClient } from './hostClient.js';
 import { DesktopP2PHost } from './p2p.js';
 import { isRemoteBlocked } from './remote-guard.js';
@@ -143,7 +144,14 @@ const DESIGN_COMMENT_HARNESS = `(function(){
   document.addEventListener('click',onClick,true);
   document.addEventListener('keydown',function(e){ if(mode&&e.key==='Escape'){ setMode(false); parent.postMessage({__maestroDesign:true,type:'comment-cancel'},'*'); } },true);
   function setMode(on){ mode=on; try{ document.documentElement.style.cursor=on?'crosshair':''; }catch(_){} if(!on) box.style.display='none'; }
-  function renderPins(){
+  /* Pin rendering used to run on a 700ms unconditional interval which kept the
+     CPU warm on every design preview iframe even when the page was hidden or had
+     no markers. Now: rAF-coalesce, skip when document.hidden, skip when there
+     are no markers; a low-rate (2.5s) safety tick only runs WHILE markers exist
+     so animated/lazy-positioned layouts still get caught. Saves a continuous
+     ~1.4 wakeups/s per open design tab. */
+  var pinRaf=0, pinKick=0;
+  function renderPinsNow(){
     pins.innerHTML='';
     markers.forEach(function(m){
       try{ var el=document.querySelector(m.selector); if(!el) return; var r=el.getBoundingClientRect();
@@ -154,13 +162,26 @@ const DESIGN_COMMENT_HARNESS = `(function(){
       }catch(_){}
     });
   }
+  function renderPins(){
+    if (document.hidden) return;
+    if (!markers || markers.length===0){ if (pins.firstChild) pins.innerHTML=''; return; }
+    if (pinRaf) return;
+    pinRaf = requestAnimationFrame(function(){ pinRaf=0; renderPinsNow(); });
+  }
+  function ensurePinKick(){
+    if (pinKick) return;
+    pinKick = setInterval(function(){
+      if (document.hidden || !markers || markers.length===0){ clearInterval(pinKick); pinKick=0; return; }
+      renderPins();
+    }, 2500);
+  }
   window.addEventListener('scroll',renderPins,true);
   window.addEventListener('resize',renderPins,true);
-  setInterval(renderPins,700);
+  document.addEventListener('visibilitychange', function(){ if (!document.hidden) renderPins(); });
   window.addEventListener('message',function(e){
     var d=e.data; if(!d||!d.__maestro) return;
     if(d.type==='comment-mode') setMode(!!d.on);
-    if(d.type==='comment-markers'){ markers=Array.isArray(d.items)?d.items:[]; renderPins(); }
+    if(d.type==='comment-markers'){ markers=Array.isArray(d.items)?d.items:[]; renderPins(); if (markers.length) ensurePinKick(); }
     if(d.type==='flash'&&d.selector){ try{ var el=document.querySelector(d.selector); if(el){ el.scrollIntoView({behavior:'smooth',block:'center'}); frame(el); setTimeout(function(){ if(!mode) box.style.display='none'; },1300); } }catch(_){} }
   });
 })();`;
@@ -393,6 +414,22 @@ app.whenReady().then(() => {
     if (!asset.localPath) throw new Error(`image was ${editing ? 'edited' : 'generated'} but saving it locally failed — please try again`);
     return { path: asset.localPath, assetId: asset.id, alt: prompt.slice(0, 200), width: asset.width, height: asset.height };
   });
+  // Speech / music / video for the agent — same fal MediaEngine as images, no
+  // Codex path (Codex has no media skill). Each kind maps to a fal model; the
+  // finished file is streamed to ~/Maestro/<project>/assets/ and shows up in the
+  // Media library via the store's asset events (no chat-transcript renderer needed).
+  engine.setMediaGen(async (prompt, opts) => {
+    const modelKey = mediaModelForKind(opts.kind, !!opts.sourceImagePath);
+    // Video renders take noticeably longer on fal than audio — give it more room.
+    const timeoutMs = opts.kind === 'video' ? 6 * 60 * 1000 : 3 * 60 * 1000;
+    const asset = await media.generateAndWait({
+      modelKey, prompt, projectId: opts.projectId ?? null,
+      voice: opts.voice, durationS: opts.durationS, aspect: opts.aspect,
+      imagePath: opts.sourceImagePath,
+    }, timeoutMs);
+    if (!asset.localPath) throw new Error('media was generated but saving it locally failed — please try again');
+    return { path: asset.localPath, assetId: asset.id, url: asset.url ?? undefined, kind: asset.kind, durationS: asset.durationS ?? undefined };
+  });
   telegram = new TelegramBot(store, engine, providers, emit);
   telegram.resumeOnBoot();
   // WhatsApp: the Mac owns one Baileys socket for the operator's own number.
@@ -405,7 +442,12 @@ app.whenReady().then(() => {
   // Hand the gitService to the engine so the post-turn auto-rename hook can
   // run (otherwise it's a no-op — the engine treats gitService as optional).
   engine.setGitService(gitService);
-  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge);
+  // GitWatcher: per-session fs.watch on `.git` so commit/push/checkout in any
+  // terminal/agent flips the renderer's status pill in <300ms — no polling.
+  // Closed cleanly on app quit so we don't leak fds across reloads.
+  const gitWatcher = new GitWatcher(store, gitService);
+  app.on('before-quit', () => { try { gitWatcher.detachAll(); } catch { /* best effort */ } });
+  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge, gitWatcher);
   // Local control channel for the native browser extension (one app-owned port).
   extensionBridge = new ExtensionBridge(store, dispatch, (status) => emit('extension', status, { desktopOnly: true }));
   extensionBridge.start();
@@ -471,6 +513,7 @@ app.whenReady().then(() => {
       onSignal: (did, signal) => p2pHost?.onSignal(did, signal),
     });
     host.start();
+    void refreshModelGroups(providers, { force: true }).then(() => host?.pushSnapshot()).catch(() => {});
   };
 
   // The renderer owns the account session (it logs in over raw fetch + persists
@@ -524,12 +567,27 @@ app.whenReady().then(() => {
   });
   engine.setBrowserWatcher(browserWatcher); // hand it to the agent's MCP tools
   browserWatcher.start();
-  // Poll PR/git status for active sessions; the renderer + phone update via git-status events.
-  const gitPoll = setInterval(() => { for (const s of gitService.pollable()) void gitService.fullStatus(s, { withPr: true }).catch(() => { /* transient */ }); }, 30_000);
+  // Git status is Conductor-style: event-driven (the per-session GitWatcher
+  // recomputes on `.git` mutations) + lazy (the renderer fetches the visible
+  // session on view). We deliberately do NOT blanket-poll every session
+  // SYNCHRONOUSLY — that froze the Node event loop at scale (dozens of worktrees
+  // × synchronous git = seconds of UI jank). The fix is that git now runs ASYNC
+  // (off the event loop, bounded by git.ts's concurrency cap), so this poll no
+  // longer blocks. We keep withPr:true (the overview strip relies on a real PR
+  // query to confirm pushed/PR rows — a withPr:false pass would leave them
+  // `provisional` and hidden) but at 3 min instead of 30s: 6× less GitHub load,
+  // and the watcher already catches local changes instantly between sweeps.
+  const RECONCILE_INTERVAL_MS = 3 * 60_000;
+  const reconcileGitStatuses = () => {
+    for (const s of gitService.pollable()) void gitService.fullStatus(s, { withPr: true }).catch(() => { /* transient */ });
+  };
+  reconcileGitStatuses(); // launch pass — fills the overview strip fast (now non-blocking)
+  const gitPoll = setInterval(reconcileGitStatuses, RECONCILE_INTERVAL_MS);
+  try { gitPoll.unref?.(); } catch { /* ignore */ }
   // Auto-update (electron-updater → GitHub Releases). Desktop-only: its events
   // never cross the relay. Polling starts after the window exists (see below).
   const updater = new Updater(emit);
-  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); browserWatcher.stop(); host?.stop(); telegram?.stop(); whatsapp.disconnect(); codexBridge.stop(); extensionBridge?.stop(); updater.stop(); engine.bgStopAll(); });
+  app.on('before-quit', () => { clearInterval(gitPoll); cron.stop(); browserWatcher.stop(); host?.stop(); telegram?.stop(); whatsapp.disconnect(); codexBridge.stop(); extensionBridge?.stop(); updater.stop(); engine.bgStopAll(); engine.getPlanGate().cancelAll('app quitting'); });
 
   ipcMain.handle('maestro:call', async (_e, method: string, params: Record<string, unknown>) => {
     try {

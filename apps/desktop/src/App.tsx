@@ -1,8 +1,11 @@
 import React from 'react';
-import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { HashRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { UpdateBanner } from './lib/UpdateBanner';
 import { NotificationCenter } from './lib/notify';
 import { RemotePairGate } from './lib/RemotePairGate';
+import { ErrorBoundary } from './lib/ErrorBoundary';
+import { PrActionConfirmDialog } from './screens/PrActionConfirmDialog';
+import { ExitPlanModeDialog } from './screens/ExitPlanModeDialog';
 import { IS_LOCAL } from './lib/api';
 import { hasSession, onAuthChange, primeSession } from './lib/auth';
 
@@ -70,11 +73,28 @@ function AccountGate({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+/* Bridges native macOS menu commands into the SPA router. The WebKit shell's
+   App menu fires `window.dispatchEvent(new CustomEvent('maestro:open-settings'))`
+   on ⌘, ; here we turn that into a route change so the standard Settings
+   shortcut works like a native app. Must live inside <HashRouter> for
+   useNavigate(). */
+function NativeMenuBridge() {
+  const navigate = useNavigate();
+  React.useEffect(() => {
+    const openSettings = () => navigate('/settings');
+    window.addEventListener('maestro:open-settings', openSettings);
+    return () => window.removeEventListener('maestro:open-settings', openSettings);
+  }, [navigate]);
+  return null;
+}
+
 export function App() {
   return (
     <HashRouter>
+      <NativeMenuBridge />
       <AccountGate>
       <RemotePairGate>
+      <ErrorBoundary name="app">
       <React.Suspense fallback={null}>
         <Routes>
           <Route path="/" element={<Navigate to={entryPath()} replace />} />
@@ -104,8 +124,20 @@ export function App() {
           <Route path="*" element={<Navigate to={entryPath()} replace />} />
         </Routes>
       </React.Suspense>
+      </ErrorBoundary>
       <UpdateBanner />
       <NotificationCenter />
+      {/* Mac-local: hard-button gate for the agent's pr_merge / pr_resolve_conflicts.
+          Subscribes to `pr-confirm-request` events and re-invokes the existing
+          mergeSessionPR / resolveSession IPC handlers after a HUMAN click. */}
+      {IS_LOCAL && <PrActionConfirmDialog />}
+      {/* Mac-local: plan-mode exit gate. The agent's ExitPlanMode call parks on
+          the host's canUseTool callback (electron/plan-mode-gate.ts); the
+          renderer subscribes to `plan-mode-exit-request` here, shows a modal
+          with the plan body, and resolves the parked request when the operator
+          clicks Approve or Keep Planning. Without this, plan mode was a dead
+          end — the agent never got the approval it was waiting on. */}
+      {IS_LOCAL && <ExitPlanModeDialog />}
       </RemotePairGate>
       </AccountGate>
     </HashRouter>

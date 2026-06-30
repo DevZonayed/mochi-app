@@ -21,6 +21,7 @@ import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
 import { toolLabel, relPath } from './tool-label.js';
 import { thinkingConfigFor } from './thinking-config.js';
+import { looksLikeImageRequest } from './image-intent.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { branchSlug, isGitRepo } from './git.js';
 import { pickCityCodename } from './codenames.js';
@@ -32,11 +33,16 @@ import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, inst
 import { ensureBrowserSkill } from './browser-skill.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
-import { makeGitCtx, type GitCtx } from './git-ctx.js';
+import { makeGitCtx, isNeedsConfirm, type GitCtx } from './git-ctx.js';
+import {
+  createPlanModeGate, BG_RUN_IN_BACKGROUND_DENY,
+  type PlanModeGate, type PlanModeExitRequest,
+} from './plan-mode-gate.js';
 import type { GitService } from './git-service.js';
 import { waSendAllowed } from './whatsapp.js';
 import type { CronRunner } from './cron.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
+import { createSteerableInput, type SteerableInput } from './steerable-input.js';
 import type { Providers } from './providers.js';
 import {
   enginesRoot, managedBinary, systemBinary, bundledBinary, downloadEngine, engineState,
@@ -57,6 +63,7 @@ import {
 import { resolveGh, downloadGh } from './gh-cli.js';
 import { ghTokenFrom, githubConnectionStatus, type GithubConnection } from './github-auth.js';
 import { WakeupPauseTracker } from './wakeup-pause.js';
+import { SubAgentRouter, extractToolResultText } from './subagent-routing.js';
 import { shell } from 'electron';
 
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
@@ -196,21 +203,72 @@ const PR_DIRECTIVE =
   `<<<<<<</=======/>>>>>>> markers keeping the intended content, Bash-commit, then call ` +
   `pr_resolve_conflicts again to confirm clean + push.\n` +
   `• "push" / "send to github" without a PR ask: call git_push.\n` +
+  `• "fix the CI" / "the checks are failing" / a PR reports failing checks: inspect GitHub Actions ` +
+  `with read-only Bash — \`gh pr checks\`, then \`gh run view <run-id> --log\` (run id is in the ` +
+  `check's details URL; if a log is still streaming, \`gh api /repos/<owner>/<repo>/actions/jobs/` +
+  `<job-id>/logs\`). Summarize the failing snippet, FIX the code, commit, then call git_push and ` +
+  `re-check. Treat non-GitHub-Actions checks (Buildkite, etc.) as external — report the details URL ` +
+  `only, don't chase them.\n` +
+  `• "address the review comments" / "respond to the PR feedback": fetch the threads with ` +
+  `\`gh api repos/<owner>/<repo>/pulls/<n>/comments\` (and \`.../reviews\`), work through each ` +
+  `actionable thread (edit the files), commit, then call git_push. Briefly note which comments you ` +
+  `addressed.\n` +
   `• Status questions ("what's the state?" / "is the PR ready?"): call git_status.\n\n` +
   `Always run git_status BEFORE the action so you know what step the lifecycle is on. ` +
-  `Bash is still the right tool for commits, diffs, and inspections — just not for the ` +
-  `push/PR/merge/resolve actions themselves.`;
+  `Bash is still the right tool for commits, diffs, and inspections (incl. read-only \`gh\` checks/` +
+  `comments lookups) — just not for the push/PR/merge/resolve actions themselves.`;
 // SP3 — primary↔reviewer loop: how many review→fix→re-review rounds at most.
 const REVIEW_MAX_ROUNDS = 2;
-// Codex already ships a native built-in `image_gen` skill (rides the ChatGPT
-// sign-in, no key). When the message reads like an image request, nudge codex to
-// use it (not SVG) and copy the final PNG into the workspace so we can harvest it.
-const IMAGE_INTENT_RE = /\b(image|picture|photo|logo|icon|illustration|render|drawing|draw|png|jpe?g|graphic|artwork|wallpaper|avatar|sprite|mockup|poster|thumbnail)\b/i;
-const CODEX_IMAGE_NUDGE =
-  `\n\n---\n\n[Image output] If this involves generating or editing an image, use your ` +
-  `built-in image_gen skill (NOT an SVG, NOT ASCII art). After generating, COPY the final ` +
-  `selected image into the current workspace directory with a clear name like ` +
-  `generated-<short>.png so it becomes a project asset, and state the saved path.`;
+// Image generation. When a turn reads like an image request, inject the OpenAI
+// `imagegen` skill methodology (use-case taxonomy + structured prompt spec +
+// augmentation/edit-invariant rules) so BOTH engines shape a high-quality prompt
+// before generating — Claude via the maestro `generate_image` MCP tool (runs under
+// autopilot/bypassPermissions, no approval), Codex via its native built-in image_gen.
+// Image-generation intent detection lives in a pure module (./image-intent) so it is
+// unit-tested without loading this heavy Electron/SDK module. It deliberately avoids a
+// bare keyword match — "render"/"icon"/"logo" appear in ordinary coding asks.
+// Shared prompt-shaping method (adapted from openai/skills .system/imagegen). Keep
+// it tight — it is prepended to the turn, not a full document.
+const IMAGE_METHOD =
+  `\n\n---\n\n[Image generation — follow the imagegen method] This turn involves creating or editing ` +
+  `an image. Produce a REAL raster asset — never SVG, ASCII art, or HTML/CSS placeholders. Before you ` +
+  `call the tool, shape the request into a short structured spec (this materially improves quality):\n` +
+  `  • Use case (pick one): photorealistic-natural | product-mockup | ui-mockup | infographic-diagram | ` +
+  `logo-brand | illustration-story | stylized-concept | historical-scene | text-localization | ` +
+  `identity-preserve | precise-object-edit | lighting-weather | background-extraction | style-transfer | ` +
+  `compositing | sketch-to-render\n` +
+  `  • Asset type · Scene/backdrop · Subject · Style/medium · Composition/framing · Lighting/mood · ` +
+  `Color palette · Materials/textures · Text (verbatim, in quotes) · Constraints · Avoid\n` +
+  `Augmentation rules: if the user's prompt is already specific, NORMALIZE it — do not invent extra ` +
+  `characters, brands, slogans, or palettes. If it is generic, add only composition/lighting/polish cues ` +
+  `that materially help. For EDITS, restate invariants every iteration ("change only X; keep Y unchanged") ` +
+  `and save non-destructively (e.g. hero-v2.png) — never overwrite unless replacement was explicitly asked.`;
+// Claude variant: route through the maestro generate_image tool (auto-runs under autopilot).
+const IMAGE_DIRECTIVE_CLAUDE = IMAGE_METHOD +
+  `\nCall the \`generate_image\` tool with your shaped prompt; it runs automatically (no permission needed) ` +
+  `and the saved PNG is shown inline — just reference the returned path in your reply. Issue one ` +
+  `generate_image call per requested asset/variant.`;
+// Codex variant: use its built-in image_gen skill, then harvest the PNG into the workspace.
+const IMAGE_DIRECTIVE_CODEX = IMAGE_METHOD +
+  `\nUse your built-in image_gen skill (NOT an SVG, NOT ASCII art). After generating, COPY the final ` +
+  `selected image into the current workspace directory with a clear name like generated-<short>.png so it ` +
+  `becomes a project asset, and state the saved path.`;
+// Codex plan mode: codex has no built-in plan-mode protocol like Claude's
+// SDK (no permissionMode:'plan' / ExitPlanMode tool). We emulate it with a
+// prompt directive + a read-only sandbox so the agent CAN'T accidentally
+// modify the workspace even if it tries. The plan body the agent writes
+// becomes the dialog's plan, and on approve the renderer auto-queues an
+// "execute the plan now" follow-up message (codex exec is one-shot, so the
+// approval can't continue the SAME run the way Claude's SDK does).
+const CODEX_PLAN_DIRECTIVE =
+  `\n\n---\n\n[Plan mode — propose first, do not act] The user is in plan mode. ` +
+  `DO NOT make any file changes, run any commands, or invoke any tools that mutate ` +
+  `the workspace. Your job this turn is to write ONE detailed, step-by-step plan ` +
+  `for accomplishing the request — list the files to touch, the order of changes, ` +
+  `the verification steps. Use clear headings and bullet lists. Be specific (file ` +
+  `paths, function names, exact commands) so the user can judge it. The user will ` +
+  `then approve or push back. Do not include code blocks longer than ~15 lines — ` +
+  `keep it a plan, not the implementation. End your reply with a one-line summary.`;
 const IMG_FILE_RE = /\.(png|jpe?g|webp|gif)$/i;
 /* Identify an image by its MAGIC BYTES, not a (possibly wrong) client-supplied
    mime. Returns one of the four media types Anthropic vision accepts, or null —
@@ -307,6 +365,10 @@ interface EngineRun {
   hitLimit?: boolean;
   limitResetsAt?: number;
   limitType?: string;
+  /** Total input size of the last request (input + cache-read + cache-creation tokens) =
+      how full the context window was on the most recent turn. Surfaced to the UI as a
+      "context remaining" gauge. Undefined if the SDK reported no usage. */
+  contextTokens?: number;
 }
 
 /** A finished image: a real raster file on this Mac + the Asset it was saved as. */
@@ -319,6 +381,25 @@ export interface ImageGenResult { path: string; assetId?: string; alt?: string; 
     that image instead of generating a fresh one. */
 export interface ImageGenOpts { aspect?: string; projectId?: string | null; sourceImagePath?: string; sourceImageUrl?: string }
 export type ImageGenFn = (prompt: string, opts: ImageGenOpts) => Promise<ImageGenResult>;
+
+/** A finished non-image media asset (voiceover, music, or video): a real file on
+    this Mac + the Asset it was saved as. */
+export interface MediaGenResult { path: string; assetId?: string; url?: string; kind: string; durationS?: number }
+/** What the agent asked the media backend to produce. `kind` selects the model
+    family; the rest are per-kind shaping knobs. A `sourceImagePath` on a video
+    request animates that still (image→video) instead of generating from text. */
+export interface MediaGenOpts {
+  kind: 'speech' | 'music' | 'video';
+  projectId?: string | null;
+  voice?: string;
+  durationS?: number;
+  aspect?: string;
+  sourceImagePath?: string;
+}
+/** The pluggable speech/music/video backend the maestro media tools call.
+    Satisfied by fal (MediaEngine) — wired in main.ts, never via the relay
+    dispatch, so no key/bytes touch the server. Mirrors ImageGenFn. */
+export type MediaGenFn = (prompt: string, opts: MediaGenOpts) => Promise<MediaGenResult>;
 
 /** Running totals streamed during a run so the UI counts cost/tokens live. */
 export interface LiveUsage { tokens: number; cost: number }
@@ -371,6 +452,13 @@ interface RunHooks {
       while still paused. The caller clears the "scheduled to resume" UI. */
   onResumed?: () => void;
 }
+
+/** Injects a user message into a LIVE Claude turn via the SDK's streaming-input
+    channel + `interrupt()` (NOT a cancel-and-reseed). Returns true if delivered;
+    false if the turn already settled (channel closed) so the caller falls back to a
+    normal send. Registered per-run via runClaude's `onSteerReady`. See
+    ./steerable-input.ts. */
+export type SteerFn = (text: string) => Promise<boolean>;
 
 /* Per-1M-token prices for a live cost ESTIMATE (the SDK's exact total_cost_usd
    replaces it when the run finishes). Standard Anthropic pricing; cache reads
@@ -560,6 +648,42 @@ interface CommsCtx {
 /** The subset of WhatsAppClient the engine drives for the agent (injected via setComms). */
 export interface WaAgentClient { sendText(chatId: string, text: string): Promise<boolean>; markRead(chatId: string): Promise<void> }
 
+/** Side channel for the human-confirm gate (pr_merge + pr_resolve_conflicts).
+ *  When the agent calls one of those tools, runClaude/runCodex emits a
+ *  `pr-confirm-request` event so the renderer can show a hard-button modal —
+ *  the agent never gets to execute the merge / resolve on its own. */
+export interface PrConfirmRequest {
+  action: 'pr_merge' | 'pr_resolve_conflicts';
+  sessionId: string | null;
+  preview: unknown;
+}
+export type EmitConfirm = (req: PrConfirmRequest) => void;
+
+/** Side channel for the plan-mode exit gate. Mirrors EmitConfirm — runClaude
+ *  calls it the moment the agent invokes ExitPlanMode, the renderer shows a
+ *  modal, and the operator's click resolves the gate's pending Promise. */
+export type EmitPlanExit = (req: PlanModeExitRequest) => void;
+
+/** Format the `add_skill_to_project` tool reply. A registry skill installed
+ *  mid-turn is NOT re-scanned by the running CLI (settingSources discovery is a
+ *  startup-only scan), so we deliver the SKILL.md body INLINE — the agent can
+ *  follow it this turn without depending on a separate Read it sometimes skipped.
+ *  Body is capped at 32k (mirrors download_skill); when it couldn't be read we
+ *  fall back to the read nudge. Pure: the fs read happens in the caller. */
+export function formatSkillInstallReply(
+  rec: { name: string; slug: string; sha256?: string },
+  skillMdBody: string | null,
+): string {
+  const head = `Installed "${rec.name}" → .claude/skills/${rec.slug}/SKILL.md`
+    + `${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}.`
+    + ` It is now active for this project — invoke it via the Skill tool when relevant.`;
+  if (!skillMdBody) return `${head} Now read that file and follow it.`;
+  const trimmed = skillMdBody.length > 32000
+    ? skillMdBody.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]'
+    : skillMdBody;
+  return `${head}\n\nFollow these instructions for the task:\n\n---\n${trimmed}\n---`;
+}
+
 async function runClaude(
   prompt: string, cwd: string, effort: Effort,
   apiKey: string | undefined, maxTurnsOverride: number | undefined, hooks: RunHooks,
@@ -573,6 +697,17 @@ async function runClaude(
   scheduleCtx?: ScheduleCtx,
   gitCtx?: GitCtx,
   commsCtx?: CommsCtx,
+  emitConfirm?: EmitConfirm,
+  sessionId?: string | null,
+  planGate?: PlanModeGate,
+  emitPlanExit?: EmitPlanExit,
+  jobId?: string | null,
+  /** When provided, this run uses the SDK's STREAMING-INPUT mode so the user can
+      STEER it: the callback is handed a SteerFn the moment the live query is built
+      (and `null` when the run ends). Only the primary chat turn passes this — sub-runs
+      (reviewer, fix, max-turns continuation, plan mode) stay on the one-shot prompt. */
+  onSteerReady?: (steer: SteerFn | null) => void,
+  mediaGen?: MediaGenFn,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -581,6 +716,12 @@ async function runClaude(
   // the SDK fall back to a path that doesn't exist.
   if (!binary) throw Object.assign(new Error('Claude engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'claude' });
   let stderrTail = '';
+  // Live SDK query handle, assigned once query() is constructed below. Captured by
+  // the in-process maestro MCP tools (e.g. add_skill_to_project) so a mid-turn skill
+  // install can ask the running CLI to re-scan .claude/skills via reloadSkills().
+  // settingSources discovery is a STARTUP-only scan, so without this a freshly
+  // installed SKILL.md isn't surfaced as a first-class Skill until the next turn.
+  let activeQuery: ReturnType<typeof query> | null = null;
   /* Give Claude a real image capability. Claude Code ships no text→image tool,
      so without this it improvises (hand-written SVG). The in-process MCP tool's
      handler runs in THIS process (so it can call fal/MediaEngine via the injected
@@ -606,28 +747,85 @@ async function runClaude(
     ].filter(Boolean).join(', ');
     return `- ${s.id} — ${s.name}: ${s.description || '(no description)'}${bits ? ` [${bits}]` : ''}`;
   };
-  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || gitCtx || commsCtx) && !plan)
+  const maestroServer = ((imageGen || mediaGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || gitCtx || commsCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
         tools: [
           ...(imageGen ? [tool(
             'generate_image',
-            'Generate a real raster image (PNG) from a text description and save it to the project. ' +
+            'Generate OR edit a real raster image (PNG) and save it to the project. ' +
             'Use this WHENEVER the user asks to create, draw, render, or generate an image, logo, icon, ' +
             'illustration, picture, sprite, mockup, or photo. Do NOT hand-write SVG or ASCII art for these ' +
-            'requests — call this tool. The saved PNG is shown inline in the chat automatically; just ' +
+            'requests — call this tool. Shape the prompt as a structured spec (scene/backdrop → subject → ' +
+            'style/medium → composition → lighting → constraints/avoid; quote any in-image text verbatim) ' +
+            'rather than a bare phrase — it materially improves quality. To EDIT an existing image, pass its ' +
+            'file path as sourceImagePath and write `prompt` as the change to make ("add a balloon in the ' +
+            'sky"); the backend keeps the original and applies only that edit — restate invariants ("change ' +
+            'only X; keep Y unchanged"). The saved PNG is shown inline in the chat automatically; just ' +
             'reference the returned path in your reply.',
-            { prompt: z.string().describe('A detailed description of the image to generate.'),
-              aspect: z.enum(['1:1', '16:9', '9:16']).optional().describe('Aspect ratio. Default 1:1.') },
-            wrap(async (args: { prompt: string; aspect?: '1:1' | '16:9' | '9:16' }) => {
-              const res = await imageGen!(args.prompt, { aspect: args.aspect, projectId });
+            { prompt: z.string().describe('For a new image: a detailed, structured description (scene, subject, style, composition, lighting, constraints). For an edit (sourceImagePath set): the change to apply, with invariants. Quote any in-image text verbatim.'),
+              aspect: z.enum(['1:1', '16:9', '9:16']).optional().describe('Aspect ratio. Default 1:1. Ignored when editing a source image.'),
+              sourceImagePath: z.string().optional().describe('Absolute or project-relative path to an existing image file to EDIT (e.g. a previously generated asset). When set, `prompt` is read as an edit instruction and the original image is preserved except for the requested change.') },
+            wrap(async (args: { prompt: string; aspect?: '1:1' | '16:9' | '9:16'; sourceImagePath?: string }) => {
+              const srcPath = args.sourceImagePath
+                ? (path.isAbsolute(args.sourceImagePath) ? args.sourceImagePath : path.resolve(cwd, args.sourceImagePath))
+                : undefined;
+              const res = await imageGen!(args.prompt, { aspect: args.aspect, projectId, sourceImagePath: srcPath });
               items.push({ kind: 'image', text: args.prompt.slice(0, 200), imagePath: res.path,
                 assetId: res.assetId, alt: res.alt ?? args.prompt.slice(0, 200), width: res.width, height: res.height, ts: Date.now() });
               progress();
               return txt(`Generated and saved the image to ${res.path}. It is now displayed in the chat.`);
             }),
           )] : []),
+          ...(mediaGen ? [
+            tool(
+              'generate_speech',
+              'Synthesize spoken-voice audio (voiceover / narration / TTS) from text and save it to the project as ' +
+              'an audio asset. Use this WHENEVER the user asks for a voiceover, narration, text-to-speech, spoken ' +
+              'audio, or to "read this aloud". Pass the exact words to speak as `text`, written out for natural ' +
+              'narration — expand abbreviations, numbers, and symbols the way they should be read. The audio is ' +
+              "saved locally and added to the project's Media library; reference the returned path in your reply.",
+              { text: z.string().describe('The exact words to speak, written out for natural narration (expand abbreviations, numbers, symbols).'),
+                voice: z.string().optional().describe('Optional voice id (e.g. af_heart). Defaults to a natural English voice.') },
+              wrap(async (args: { text: string; voice?: string }) => {
+                const res = await mediaGen!(args.text, { kind: 'speech', projectId, voice: args.voice });
+                return txt(`Generated voiceover audio and saved it to ${res.path}. It is now in the project's Media library.`);
+              }),
+            ),
+            tool(
+              'generate_music',
+              'Generate instrumental background music / a sound bed from a text description and save it to the ' +
+              'project. Use this for background music, a soundtrack, ambience, or a sound bed. Shape the prompt as a ' +
+              'structured spec (genre/mood → instruments → tempo/energy → intended use) rather than a bare phrase. ' +
+              'Specify the clip length in seconds.',
+              { prompt: z.string().describe('Structured description: genre/mood, instruments, tempo/energy, intended use.'),
+                durationS: z.number().int().min(1).max(180).optional().describe('Clip length in seconds (default 30).') },
+              wrap(async (args: { prompt: string; durationS?: number }) => {
+                const res = await mediaGen!(args.prompt, { kind: 'music', projectId, durationS: args.durationS });
+                return txt(`Generated a ${res.durationS ?? 30}s music clip and saved it to ${res.path}. It is now in the project's Media library.`);
+              }),
+            ),
+            tool(
+              'generate_video',
+              'Generate a short video clip (b-roll / animation) from a text prompt, or animate an existing still ' +
+              'image, and save it to the project. Use this for b-roll, a short animation, or to bring a generated ' +
+              'image to life. Shape the prompt as a structured spec (scene → subject → motion/action → camera → ' +
+              'style). To animate a still, pass its file path as sourceImagePath (image→video). Video generation is ' +
+              'slower (up to a few minutes) and costs more than an image — generate one clip per request.',
+              { prompt: z.string().describe('Structured description: scene, subject, motion/action, camera move, style.'),
+                durationS: z.union([z.literal(5), z.literal(10)]).optional().describe('Clip length in seconds — 5 or 10 only (default 5).'),
+                aspect: z.enum(['16:9', '9:16', '1:1']).optional().describe('Aspect ratio (default 16:9).'),
+                sourceImagePath: z.string().optional().describe('Absolute or project-relative path to a still image to ANIMATE (image→video). When set, the clip starts from that image.') },
+              wrap(async (args: { prompt: string; durationS?: 5 | 10; aspect?: '16:9' | '9:16' | '1:1'; sourceImagePath?: string }) => {
+                const srcPath = args.sourceImagePath
+                  ? (path.isAbsolute(args.sourceImagePath) ? args.sourceImagePath : path.resolve(cwd, args.sourceImagePath))
+                  : undefined;
+                const res = await mediaGen!(args.prompt, { kind: 'video', projectId, durationS: args.durationS, aspect: args.aspect, sourceImagePath: srcPath });
+                return txt(`Generated a ${res.durationS ?? 5}s video and saved it to ${res.path}. It is now in the project's Media library.`);
+              }),
+            ),
+          ] : []),
           ...(skillsCtx ? [
             tool('search_skills',
               'Search the live Maestro skill registry for a specialized SKILL.md. Call this FIRST — at the very start of a substantive task (build/scaffold, edit code, generate a design/content, or any domain-specific work), before you do the work — then add_skill_to_project and follow the best match. Installing and following a dedicated skill beats improvising. Public search excludes disabled skills.',
@@ -653,11 +851,24 @@ async function runClaude(
                 return txt(`# ${c.name}\n\nid=${c.id}\nsha256=${c.sha256 ?? 'unknown'}\n\n${body}`);
               })),
             tool('add_skill_to_project',
-              'Install a skill from the registry into THIS project (writes it to .claude/skills/<slug>/SKILL.md). After installing, READ that SKILL.md and follow it for the task. Use a skillId returned by search_skills.',
+              'Install a skill from the registry into THIS project (writes it to .claude/skills/<slug>/SKILL.md). The install RETURNS the skill\'s instructions inline and activates it as a Skill for this session — follow those instructions for the task. Use a skillId returned by search_skills.',
               { skillId: z.string().describe('The skill id from search_skills, e.g. "anthropics/skills/pdf".') },
               wrap(async (a: { skillId: string }) => {
                 const rec = await skillsCtx.install(a.skillId);
-                return txt(`Installed "${rec.name}" → .claude/skills/${rec.slug}/SKILL.md${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}. Now read that file and follow it.`);
+                // settingSources discovery is a STARTUP-only scan, so this just-written
+                // SKILL.md is invisible to the running CLI's Skill listing until the next
+                // turn. Ask the live session to re-scan now so the Skill tool can invoke it
+                // this session. Detached + best-effort: the inline body below already
+                // delivers the instructions this turn, so a missing/failed reload never
+                // blocks the agent loop (and the detached call can't deadlock the
+                // tool round-trip on the control channel).
+                void Promise.resolve().then(() => activeQuery?.reloadSkills?.()).catch(() => {});
+                // Deliver the skill body inline so the agent follows it immediately rather
+                // than depending on a follow-up Read it sometimes skipped ("dynamically
+                // loaded but not followed").
+                let body: string | null = null;
+                try { body = readFileSync(path.join(cwd, '.claude', 'skills', rec.slug, 'SKILL.md'), 'utf8'); } catch { /* fall back to the read nudge */ }
+                return txt(formatSkillInstallReply(rec, body));
               })),
             tool('list_project_skills',
               'List skills already installed in this project. Use this before searching if the needed capability may already be present.',
@@ -1201,19 +1412,32 @@ async function runClaude(
                 return txt(`PR #${r.number} is open: ${r.url}\nUse git_status to check mergeability, then pr_merge once it\'s clean.`);
               })),
             tool('pr_merge',
-              'Merge the open PR for this chat using the repo\'s preferred merge method (auto-picks merge/squash/rebase from the allowed list). Use only when git_status reports pr-mergeable (not when it reports pr-conflicts or pr-blocked).',
+              'PREPARE a merge of the open PR for this chat (auto-picks merge/squash/rebase from the repo\'s allowed list, or pass method=merge|squash|rebase). The actual merge requires a HUMAN to click "Confirm Merge" in the desktop UI — calling this tool surfaces a confirmation dialog with the PR title, mergeable state, and check rollup. Use only when git_status reports pr-mergeable.',
               { method: z.enum(['merge', 'squash', 'rebase']).optional().describe('Override the auto-picked merge method.') },
               wrap(async (a: { method?: 'merge' | 'squash' | 'rebase' }) => {
                 if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
+                // GATE: the agent NEVER gets to set `confirmed: true` — even if the
+                // model invents the flag, we drop it here so the only caller that can
+                // execute the merge is the renderer (via mergeSessionPR IPC).
                 const r = await gitCtx.mergePr({ method: a.method });
+                if (isNeedsConfirm(r)) {
+                  if (emitConfirm) emitConfirm({ action: 'pr_merge', sessionId: sessionId ?? null, preview: r.preview });
+                  return txt(`Surfaced a merge-confirmation dialog to the user for PR #${r.preview.prNumber} (${r.preview.prTitle}). Method: ${r.preview.mergeMethod}, mergeable state: ${r.preview.mergeableState}. The user must click "Confirm Merge" in the desktop UI — you cannot land it from here. Wait for their decision, then call git_status to see whether the merge landed.`);
+                }
                 return txt(r.ok ? 'Merged. The session\'s work is on the base branch now — you can archive the worktree if you\'re done.' : `Merge failed: ${r.reason ?? 'unknown'}`);
               })),
             tool('pr_resolve_conflicts',
-              'Pull the base branch into this chat\'s branch and merge it. If clean, pushes the resulting branch automatically. If it produces conflict markers, returns the conflicted file paths so you can: (1) Read each one, (2) Edit out the <<<<<<</=======/>>>>>>> markers keeping the intended content, (3) commit via Bash (`git add -A && git commit -m "resolve conflicts"`), (4) call this tool again to confirm clean + push. Use when git_status reports pr-conflicts or when the PR is behind.',
+              'PREPARE conflict resolution: pull the base branch into this chat\'s branch. The actual operation requires a HUMAN to click "Apply Resolution" in the desktop UI — calling this tool surfaces a confirmation dialog listing the files that would change. Use when git_status reports pr-conflicts or when the PR is behind. After the human approves and conflict markers are produced, Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), commit via Bash (`git add -A && git commit -m "resolve conflicts"`), then call this tool again.',
               {},
               wrap(async () => {
                 if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
                 const r = await gitCtx.resolveConflicts();
+                if (isNeedsConfirm(r)) {
+                  if (emitConfirm) emitConfirm({ action: 'pr_resolve_conflicts', sessionId: sessionId ?? null, preview: r.preview });
+                  const cf = r.preview.conflictedFiles;
+                  const cfNote = cf.length ? ` Worktree already has ${cf.length} unmerged file(s).` : '';
+                  return txt(`Surfaced a conflict-resolution dialog to the user for ${r.preview.branch ?? 'this branch'} (base ${r.preview.base ?? '?'}).${cfNote} The user must click "Apply Resolution" in the desktop UI — you cannot pull base in from here. Wait for their decision, then call git_status (and if there are now conflicted files, Read/Edit them and commit).`);
+                }
                 if (r.ok && (!r.conflicts || r.conflicts.length === 0)) {
                   return txt('Conflicts resolved cleanly (or the branch was already up to date) — pushed the merged branch. Call git_status to verify the PR is now mergeable.');
                 }
@@ -1274,6 +1498,7 @@ async function runClaude(
     : null;
   const maestroAllowed = [
     ...(imageGen ? ['generate_image'] : []),
+    ...(mediaGen ? ['generate_speech', 'generate_music', 'generate_video'] : []),
     ...(skillsCtx ? ['search_skills', 'get_skill', 'download_skill', 'add_skill_to_project', 'list_project_skills', 'remove_project_skill'] : []),
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
     ...(browserCtx ? [
@@ -1308,24 +1533,29 @@ async function runClaude(
   const mergedAllowed = [...maestroAllowed, ...(customMcp?.allowedTools ?? [])];
   /* Vision input: when the user attached images, the prompt becomes a streamed
      user message carrying text + base64 image blocks (a plain string can't hold
-     images). Verified the SDK accepts this with resume/abort. Otherwise the
-     simple string prompt path is unchanged. */
+     images). Verified the SDK accepts this with resume/abort. STEERABLE turns ALSO
+     use a streamed user message — fed through a pushable channel — so a STEER can
+     inject a follow-up mid-session (interrupt + next-turn pickup) instead of killing
+     the turn and reseeding. Otherwise the simple string prompt path is unchanged. */
   const VALID_MEDIA = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
-  const promptArg = (images && images.length)
-    ? (async function* () {
-        yield {
-          type: 'user' as const,
-          parent_tool_use_id: null,
-          message: {
-            role: 'user' as const,
-            content: [
-              { type: 'text' as const, text: prompt },
-              ...images.map(im => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: (VALID_MEDIA.has(im.mime) ? im.mime : 'image/png'), data: im.b64 } })),
-            ],
-          },
-        };
-      })() as unknown as Parameters<typeof query>[0]['prompt']
-    : prompt;
+  const imageBlocks = (images ?? []).map(im => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: (VALID_MEDIA.has(im.mime) ? im.mime : 'image/png'), data: im.b64 } }));
+  const userMsg = (text: string, withImages: boolean) => ({
+    type: 'user' as const,
+    parent_tool_use_id: null,
+    message: { role: 'user' as const, content: [{ type: 'text' as const, text }, ...(withImages ? imageBlocks : [])] },
+  });
+  // Live steerable channel (streaming-input turns only). Held so the result handler
+  // can close it on a settled turn and the steer closure can push follow-ups into it.
+  let steerInput: SteerableInput<ReturnType<typeof userMsg>> | null = null;
+  let promptArg: Parameters<typeof query>[0]['prompt'];
+  if (onSteerReady) {
+    steerInput = createSteerableInput(userMsg(prompt, true));
+    promptArg = steerInput.stream as unknown as Parameters<typeof query>[0]['prompt'];
+  } else if (images && images.length) {
+    promptArg = (async function* () { yield userMsg(prompt, true); })() as unknown as Parameters<typeof query>[0]['prompt'];
+  } else {
+    promptArg = prompt;
+  }
   const it = query({
     prompt: promptArg,
     options: {
@@ -1339,6 +1569,12 @@ async function runClaude(
       // Plan mode → propose a plan, no execution. Otherwise run freely on this Mac.
       permissionMode: plan ? 'plan' : 'bypassPermissions',
       includePartialMessages: !!hooks.onProgress,
+      // Forward sub-agent text + thinking blocks (not just tool_use/result)
+      // so the parent chip's expandable children[] shows the dispatched
+      // agent's WHOLE inner conversation — what #72 promised. Without this
+      // SDK flag, the operator only saw the parent chip + summary; the
+      // children array stayed empty for text-heavy sub-agents.
+      forwardSubagentText: true,
       // generate_image: in-process MCP server + auto-allow its fully-qualified name.
       // Under 'bypassPermissions' tools auto-run; allowedTools future-proofs any
       // non-bypass mode. In plan mode imageServer is null so the tool is absent.
@@ -1354,8 +1590,70 @@ async function runClaude(
       ...(apiKey ? { env: { ...process.env, ANTHROPIC_API_KEY: apiKey } as NodeJS.ProcessEnv } : {}),
       ...(hooks.signal ? { abortController: abortControllerFromSignal(hooks.signal) } : {}),
       stderr: (d: string) => { stderrTail = (stderrTail + d).slice(-2000); },
+      /* canUseTool — the SDK's permission hook. Handles two cases the host MUST
+         own, and lets everything else through (the SDK's permissionMode +
+         allowedTools already gate the rest).
+
+         1. ExitPlanMode: in plan mode the SDK suspends the run on this tool
+            until the host approves. Without a canUseTool callback the call
+            never resolves → the agent stays trapped in plan mode forever. We
+            emit a `plan-mode-exit-request` event so the renderer can show a
+            modal, await the operator's decision via the shared planGate, and
+            return allow / deny accordingly.
+
+         2. Bash with `run_in_background: true`: deny + retry hint so the agent
+            re-issues against mcp__maestro__run_in_background. The built-in
+            variant spawns inside the Claude Code CLI subprocess and dies when
+            the operator force-sends (engine.cancel SIGTERMs the CLI), which is
+            the second bug the user reported. The Maestro tool spawns detached
+            off the Electron process tree, so the dev server survives a steer. */
+      canUseTool: async (toolName, input, options) => {
+        if (toolName === 'ExitPlanMode') {
+          if (!planGate || !emitPlanExit) {
+            // The host didn't wire the gate (legacy callsite or test path) —
+            // fall through to allow. Matches the previous behaviour where the
+            // SDK eventually no-op'd the ExitPlanMode call.
+            return { behavior: 'allow' };
+          }
+          const planBody = typeof (input as { plan?: unknown }).plan === 'string'
+            ? (input as { plan: string }).plan
+            : '';
+          const req: PlanModeExitRequest = {
+            toolUseID: options.toolUseID,
+            plan: planBody,
+            sessionId: sessionId ?? null,
+            jobId: jobId ?? null,
+            engine: 'claude',
+          };
+          // Surface the request to the renderer modal. Best-effort: a missing
+          // window simply means no dialog appears, and the gate either resolves
+          // when the operator finally gets to it, or the abort signal fires.
+          try { emitPlanExit(req); } catch { /* renderer gone */ }
+          try {
+            const approved = await planGate.requestExit(req, { signal: options.signal });
+            return approved
+              ? { behavior: 'allow' }
+              : { behavior: 'deny', message: 'Operator wants more planning before any execution. Stay in plan mode, refine the plan based on their notes, and call ExitPlanMode again when ready.', interrupt: false };
+          } catch (e) {
+            // Aborted (run cancelled) — deny without interrupting; the surrounding
+            // for-await loop will see the abort signal and throw CancelledError.
+            return { behavior: 'deny', message: e instanceof Error ? e.message : 'cancelled', interrupt: false };
+          }
+        }
+        if (toolName === 'Bash' && (input as { run_in_background?: unknown }).run_in_background === true) {
+          // Force the agent off the CLI-owned background path — see the BG_*
+          // constant for the full retry hint. interrupt:false → the agent gets
+          // the message back and re-calls with mcp__maestro__run_in_background.
+          return { behavior: 'deny', message: BG_RUN_IN_BACKGROUND_DENY, interrupt: false };
+        }
+        return { behavior: 'allow' };
+      },
     },
   });
+  // Expose the live query handle to the in-process maestro MCP tools (e.g.
+  // add_skill_to_project → reloadSkills). Tools only fire during iteration
+  // below, which is always after this assignment, so the closure capture is safe.
+  activeQuery = it;
   /* Build a STRUCTURED transcript: each assistant message is its own text
      block, each tool/skill call is a chip with status + duration, and the
      final result closes the run. Live deltas stream into the open block;
@@ -1384,47 +1682,22 @@ async function runClaude(
       else hooks.onResumed?.();
     } catch { /* best-effort */ }
   };
-  /* Per-sub-agent transcript writers, keyed by the parent's tool_use_id.
-     Every SDK event carrying `parent_tool_use_id` belongs to a Task/Agent
-     dispatch's INNER turn loop (its tool calls, thinking, prose). Instead of
-     dropping those events on the floor (the old behaviour, which left the UI
-     showing only a one-line chip + checkmark), we route each into the parent
-     chip's `children[]` so the operator can expand the chip and SEE what the
-     sub-agent actually did. Each writer mirrors the top-level open-block /
-     toolById state but writes into the parent's own children array. */
-  interface SubWriter { open: TranscriptItem | null; openThinking: TranscriptItem | null; toolById: Map<string, TranscriptItem>; }
-  const subWriters = new Map<string, SubWriter>();
-  const SUB_CAP = 80; // soft cap per sub-agent so a chatty Plan agent doesn't bloat the transcript
-  const subWriterFor = (parentId: string): { w: SubWriter; out: TranscriptItem[] } | null => {
-    const parent = toolById.get(parentId);
-    if (!parent) return null;
-    if (!parent.children) parent.children = [];
-    let w = subWriters.get(parentId);
-    if (!w) { w = { open: null, openThinking: null, toolById: new Map() }; subWriters.set(parentId, w); }
-    return { w, out: parent.children };
-  };
-  /* Pull the sub-agent's final text response out of a tool_result.content
-     payload (which is either a string OR an array of {type:'text',text:…} blocks
-     per the Anthropic content-block convention). Used to populate `parent.result`
-     so the collapsed chip can preview the answer without forcing the user to
-     expand. */
-  const extractToolResultText = (c: unknown): string => {
-    if (typeof c === 'string') return c.trim();
-    if (Array.isArray(c)) {
-      const parts: string[] = [];
-      for (const b of c) {
-        if (b && typeof b === 'object' && (b as { type?: string }).type === 'text') {
-          const t = (b as { text?: unknown }).text;
-          if (typeof t === 'string') parts.push(t);
-        }
-      }
-      return parts.join('\n').trim();
-    }
-    return '';
-  };
+  /* Sub-agent traffic (Task/Agent dispatch INNER events) routes through a
+     dedicated router so the parent chip's `children[]` accumulates the
+     sub-agent's tool calls, thinking, and prose. Lives in subagent-routing.ts
+     so the contract is unit-tested (#72 regression: events that arrived
+     BEFORE the parent's full assistant message were silently dropped).
+     The router internally BUFFERS those out-of-order frames and replays
+     them when `attachParent(parentId)` is called below. */
+  const subRouter = new SubAgentRouter(
+    toolById,
+    (name, input, c) => toolLabel(name, input, c),
+    (name, input) => toolPreview(name, input),
+    cwd,
+  );
 
   let resultText = '';
-  let usage: { input_tokens?: number; output_tokens?: number } | null = null;
+  let usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | null = null;
   let cost = 0;
   let model = 'claude';
   let sdkSessionId: string | undefined;
@@ -1449,6 +1722,22 @@ async function runClaude(
     return { tokens, cost: Math.round(cost * 1000) / 1000 };
   };
   const progress = () => hooks.onProgress?.(proseOf(items), items, liveUsage());
+  // Steerable turns: hand the host a SteerFn that injects a user message into THIS
+  // live session. It pushes the message into the input channel, surfaces it inline
+  // as a `steer` transcript item, then interrupts the current turn so the agent
+  // abandons what it's doing and picks the steer up at the next boundary — same
+  // subprocess, full context kept (no cancel + resume). Cleared when the run ends.
+  if (onSteerReady && steerInput) {
+    const channel = steerInput;
+    onSteerReady(async (text: string): Promise<boolean> => {
+      if (channel.closed) return false;
+      if (!channel.push(userMsg(text, false))) return false;
+      items.push({ kind: 'steer', text, ts: Date.now() });
+      progress();
+      try { await it.interrupt(); } catch { /* no active turn to interrupt — the queued msg is picked up at the next pull */ }
+      return true;
+    });
+  }
   try {
     for await (const raw of it as AsyncIterable<Record<string, unknown>>) {
       if (hooks.signal?.aborted) throw new CancelledError();
@@ -1460,68 +1749,17 @@ async function runClaude(
         parent_tool_use_id?: string | null;
         message?: { content?: { type: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; is_error?: boolean }[]; model?: string };
         event?: { type?: string; delta?: { type?: string; text?: string; thinking?: string }; usage?: { output_tokens?: number } };
-        usage?: { input_tokens?: number; output_tokens?: number };
+        usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
         total_cost_usd?: number; result?: unknown;
       };
       if (m.session_id) sdkSessionId = m.session_id;
-      // Sub-agent traffic (Task/Agent dispatch INNER events) — route into the
-      // parent chip's `children[]` so the chat can render an expandable
-      // "what the sub-agent did" view instead of staring at a single chip.
+      // Sub-agent traffic (Task/Agent dispatch INNER events) — defer to the
+      // SubAgentRouter so the parent chip's `children[]` accumulates the
+      // sub-agent's tool calls, thinking, and prose. Events that arrive
+      // before the parent's full assistant message lands are buffered by
+      // the router and replayed when `attachParent` is called below.
       if (m.parent_tool_use_id) {
-        const ctx = subWriterFor(m.parent_tool_use_id);
-        if (!ctx) continue; // unknown parent → drop (defensive; shouldn't happen)
-        const { w, out } = ctx;
-        // Soft cap: stop appending new items once we've recorded plenty. Tool
-        // status/result updates are still allowed (they MUTATE existing chips,
-        // not append) so a long sub-agent still shows clean checkmarks.
-        const canAppend = out.length < SUB_CAP;
-        if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'thinking_delta') {
-          if (!w.openThinking) {
-            if (!canAppend) { progress(); continue; }
-            w.openThinking = { kind: 'thinking', text: '', ts: Date.now() }; out.push(w.openThinking);
-          }
-          w.openThinking.text += m.event.delta.thinking ?? '';
-        } else if (m.type === 'stream_event' && m.event?.type === 'content_block_delta' && m.event.delta?.type === 'text_delta') {
-          if (!w.open) {
-            if (!canAppend) { progress(); continue; }
-            w.open = { kind: 'text', text: '', ts: Date.now() }; out.push(w.open);
-          }
-          w.open.text += m.event.delta.text ?? '';
-        } else if (m.type === 'assistant' && m.message?.content) {
-          for (const b of m.message.content) {
-            if (b.type === 'thinking' && typeof b.thinking === 'string') {
-              if (w.openThinking) { w.openThinking.text = b.thinking; w.openThinking = null; }
-              else if (b.thinking.trim() && canAppend) out.push({ kind: 'thinking', text: b.thinking, ts: Date.now() });
-            } else if (b.type === 'text' && typeof b.text === 'string') {
-              w.openThinking = null;
-              if (w.open) { w.open.text = b.text; w.open = null; }
-              else if (b.text.trim() && canAppend) out.push({ kind: 'text', text: b.text, ts: Date.now() });
-            } else if (b.type === 'tool_use') {
-              w.open = null; w.openThinking = null;
-              if (!canAppend) continue;
-              const label = toolLabel(b.name ?? '', b.input, cwd);
-              const t: TranscriptItem = { kind: 'tool', name: b.name ?? 'tool', text: label.text, toolStatus: 'running', ts: Date.now() };
-              if (label.cmd) t.cmd = label.cmd;
-              const preview = toolPreview(b.name ?? '', b.input);
-              if (preview !== undefined) t.preview = preview;
-              if (b.id) {
-                t.id = b.id;
-                w.toolById.set(b.id, t);
-                // ALSO register in the top-level map so a grand-child (a
-                // sub-agent dispatched BY a sub-agent) can find this chip.
-                toolById.set(b.id, t);
-              }
-              out.push(t);
-            }
-          }
-        } else if (m.type === 'user' && m.message?.content) {
-          for (const b of m.message.content) {
-            if (b.type === 'tool_result' && b.tool_use_id) {
-              const t = w.toolById.get(b.tool_use_id);
-              if (t) { t.toolStatus = b.is_error ? 'error' : 'done'; t.durMs = Date.now() - t.ts; }
-            }
-          }
-        }
+        subRouter.route(m);
         progress();
         continue;
       }
@@ -1571,7 +1809,14 @@ async function runClaude(
             const preview = toolPreview(b.name ?? '', b.input);
             if (preview !== undefined) t.preview = preview;
             items.push(t);
-            if (b.id) { t.id = b.id; toolById.set(b.id, t); }
+            if (b.id) {
+              t.id = b.id; toolById.set(b.id, t);
+              // The SDK can stream sub-agent INNER events BEFORE this full
+              // assistant message lands — those frames are buffered by the
+              // router keyed on parent_tool_use_id. Drain the buffer NOW so
+              // the children array reflects every frame the router saw.
+              subRouter.attachParent(b.id);
+            }
             // Remember any ScheduleWakeup so the matching tool_result can flip
             // us to paused (success path). Non-ScheduleWakeup tools no-op.
             wakeup.onToolUse(b.id, b.name, b.input);
@@ -1620,6 +1865,12 @@ async function runClaude(
         // Snap the live counters to the SDK's authoritative totals.
         if (usage?.output_tokens != null) { committedOut = usage.output_tokens; curOut = 0; }
         if (m.total_cost_usd != null) finalCost = m.total_cost_usd;
+        // Streaming-input (steerable) turns keep the SDK session OPEN after a result
+        // so a steer can still be delivered. Close the input when this turn settled
+        // with nothing pending (or it bailed on a turn/usage cap) so the SDK finalises
+        // and this loop ends; leave it open when a steer is mid-flight (an interrupt
+        // just fired) so the agent picks it up as the next turn.
+        if (steerInput && !steerInput.closed && (steerInput.pending() === 0 || hitMaxTurns || hitLimit)) steerInput.close();
       }
     }
   } catch (e) {
@@ -1652,6 +1903,11 @@ async function runClaude(
   // resume" UI must not survive past this point (a terminal status from the
   // caller would otherwise show alongside a stale countdown). Idempotent.
   emitPause(wakeup.reset());
+  // Steerable turn is over: close the input channel (idempotent — the SDK has
+  // already ended the stream by here) and clear the host's SteerFn so a late steer
+  // falls back to a normal send instead of pushing into a finished session.
+  steerInput?.close();
+  onSteerReady?.(null);
   // Any tool left 'running' (no matching tool_result before the stream ended)
   // would otherwise spin forever in the UI — settle it.
   for (const t of items) if (t.kind === 'tool' && t.toolStatus === 'running') { t.toolStatus = 'done'; t.durMs = Date.now() - t.ts; }
@@ -1672,12 +1928,35 @@ async function runClaude(
     hitLimit,
     limitResetsAt,
     limitType,
+    // How full the context window was on the final request: the whole prompt = fresh input +
+    // cache reads + cache writes. (Output isn't counted — it's the answer, not the prompt.)
+    contextTokens: usage
+      ? (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
+      : undefined,
   };
 }
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
 function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
-  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[]; gitCtx?: GitCtx },
+  ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[]; gitCtx?: GitCtx; emitConfirm?: EmitConfirm; sessionId?: string | null;
+    /** Plan mode (the operator turned on the Plan toggle in the composer). Forces
+        sandbox=read-only, disables every MCP bridge that could mutate the
+        workspace, and appends CODEX_PLAN_DIRECTIVE so codex writes a plan
+        instead of executing. After the run completes the engine parks on the
+        shared planGate (the SAME one Claude's canUseTool uses) so the operator
+        sees the SAME ExitPlanModeDialog regardless of which engine ran. */
+    plan?: boolean;
+    /** Shared plan-mode gate (LocalEngine.planGate). When `plan` is true the
+        engine emits `plan-mode-exit-request` and awaits the operator's decision
+        here before resolving the run. */
+    planGate?: PlanModeGate;
+    /** Side channel for emitting the plan-mode-exit-request event so the
+        renderer's ExitPlanModeDialog can show the plan + buttons. */
+    emitPlanExit?: EmitPlanExit;
+    /** Job id (turn). Logged + used to synthesise a deterministic toolUseID
+        for the gate (codex has no SDK-issued id). */
+    jobId?: string | null;
+  },
   imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
   if (!bin) return Promise.reject(Object.assign(new Error('Codex engine not installed — download it first (Settings → Engines).'), { statusCode: 503, code: 'engine-missing', engine: 'codex' }));
@@ -1694,19 +1973,30 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   const env = codexSpawnEnv(enginesRoot(),
     (!codexLoggedIn() && ctx?.openaiKey) ? { OPENAI_API_KEY: ctx.openaiKey } : undefined);
   const outFile = path.join(tmpdir(), `maestro-codex-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
+  // Plan mode hardening: when plan=true we treat the run like a reviewer pass
+  // — no MCP bridge, no custom MCP servers, read-only sandbox — so even if the
+  // agent tries to act despite the prompt directive, the sandbox refuses. The
+  // dialog then surfaces what the agent wrote; on approve the renderer queues
+  // the actual execution turn.
+  const planMode = !!ctx?.plan;
+  const effectiveReadOnly = readOnly || planMode;
   // Native MCP for codex: one stdio bridge forwards the Skill-Broker and
   // background-task tools back into Maestro. Codex's sandbox auto-cancels MCP tool
   // calls unless danger-full-access + approval_policy=never (probe-proven), so a
-  // run with any Maestro MCP tools uses that sandbox. Never on reviewer passes.
-  const bridge = (!readOnly && ctx?.codexBridge && ctx.projectId) ? ctx.codexBridge : undefined;
-  const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId, git: ctx?.gitCtx }) : undefined;
+  // run with any Maestro MCP tools uses that sandbox. Never on reviewer passes
+  // OR on plan-mode passes.
+  const bridge = (!effectiveReadOnly && ctx?.codexBridge && ctx.projectId) ? ctx.codexBridge : undefined;
+  const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId, git: ctx?.gitCtx, emitConfirm: ctx?.emitConfirm, sessionId: ctx?.sessionId ?? null }) : undefined;
   // The operator's custom stdio MCP servers (Settings → MCP servers), as codex
-  // `-c mcp_servers.<name>={…}` TOML fragments. Like the maestro bridge, codex's
-  // sandbox auto-cancels MCP tool calls unless danger-full-access + approval_policy
-  // =never, so any MCP server present forces that sandbox on this (non-reviewer) run.
-  const customCodex = (!readOnly && ctx?.customCodexServers) ? ctx.customCodexServers : [];
+  // `-c mcp_servers.<name>={…}` TOML fragments. Same gating as the maestro bridge
+  // above — no custom MCP in read-only / plan-mode runs.
+  const customCodex = (!effectiveReadOnly && ctx?.customCodexServers) ? ctx.customCodexServers : [];
   const anyMcp = !!codexReg || customCodex.length > 0;
-  const sandbox = anyMcp ? 'danger-full-access' : (readOnly ? 'read-only' : 'workspace-write');
+  const sandbox = anyMcp ? 'danger-full-access' : (effectiveReadOnly ? 'read-only' : 'workspace-write');
+  // Plan-mode directive overlays the user's prompt: codex sees its real request
+  // PLUS instructions to propose a plan and not act. The dialog later surfaces
+  // codex's reply as the plan body for the operator to approve.
+  const effectivePrompt = planMode ? `${prompt}${CODEX_PLAN_DIRECTIVE}` : prompt;
   const args = [
     'exec', '--json', '--ephemeral', '--skip-git-repo-check',
     '-s', sandbox,
@@ -1716,7 +2006,7 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
     ...(model ? ['-m', model] : []),
     ...(imageFiles ?? []).flatMap(f => ['-i', f]), // vision input — codex attaches the image(s)
     '-C', cwd, '-o', outFile,
-    prompt,
+    effectivePrompt,
   ];
   return new Promise<EngineRun>((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env });
@@ -1874,6 +2164,39 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
         }
         images = out.length ? out : undefined;
       }
+      // Codex plan-mode parking: when this was a plan-only run, the agent's
+      // final text IS the plan. Park on the shared planGate (same one
+      // Claude's canUseTool uses) so the renderer's ExitPlanModeDialog
+      // surfaces it with the SAME UI regardless of which engine ran. On
+      // approve we append an approval note and resolve normally — the
+      // renderer auto-queues an "execute the plan now" follow-up message
+      // (codex exec is one-shot; we can't continue the run from inside).
+      // On deny we append a "refine" note and stay in plan mode for the
+      // next message.
+      const planText = text || proseOf(items);
+      if (planMode && ctx?.planGate && ctx?.emitPlanExit && planText && !hooks.signal?.aborted) {
+        // Synthetic id (codex has no SDK toolUseID). Pad with random so two
+        // overlapping codex plan turns can't collide on the gate's Map.
+        const toolUseID = `codex-${ctx.jobId ?? 'job'}-${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`;
+        const req: PlanModeExitRequest = {
+          toolUseID,
+          plan: planText,
+          sessionId: ctx.sessionId ?? null,
+          jobId: ctx.jobId ?? null,
+          engine: 'codex',
+        };
+        try { ctx.emitPlanExit(req); } catch { /* renderer gone */ }
+        ctx.planGate.requestExit(req, { signal: hooks.signal })
+          .then(approved => {
+            const note = approved
+              ? '\n\n— Plan approved. Executing on the next message.'
+              : '\n\n— Plan refinement requested. Stay in plan mode and revise.';
+            items.push({ kind: 'text', text: note, ts: Date.now() });
+            resolve({ text: `${text || planText}${note}`, tokens, cost: 0, model: model ?? 'codex', transcript: items, images });
+          })
+          .catch(() => { reject(new CancelledError()); });
+        return;
+      }
       // Subscription run — Codex doesn't bill per-token, so cost stays 0.
       resolve({ text: text || proseOf(items) || '(no output)', tokens, cost: 0, model: model ?? 'codex', transcript: items, images });
     });
@@ -1884,15 +2207,26 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
 const ENGINE_LABEL: Record<EngineId, string> = { claude: 'Claude Code', codex: 'Codex' };
 
 export class LocalEngine {
-  /** jobId → live cancel handle (abort for claude, child for codex). */
-  private running = new Map<string, { ac: AbortController; child?: ChildProcess }>();
+  /** jobId → live cancel handle (abort for claude, child for codex). `steer` is set
+      while a steerable Claude chat turn is mid-flight (see engine.steer / runClaude). */
+  private running = new Map<string, { ac: AbortController; child?: ChildProcess; steer?: SteerFn }>();
   /** In-flight `codex login` child (browser OAuth), if any. */
   private codexLoginChild?: ChildProcess;
   private githubLoginChild?: ChildProcess;
   /** In-flight engine binary downloads → their abort handle (one per engine). */
   private engineInstalls = new Map<EngineId, AbortController>();
 
-  constructor(private store: Store, private emit: (name: string, data: unknown, opts?: { live?: boolean }) => void, private providers?: Providers) {}
+  /** Plan-mode exit gate: the agent's ExitPlanMode tool call parks here until
+      the operator clicks Approve / Keep Planning in the renderer dialog. Same
+      gate is exposed via getPlanGate() so localApi.ts can resolve the request
+      from the IPC side. See plan-mode-gate.ts for the full contract — this is
+      the Mac-local host side of the Claude Agent SDK's plan-mode protocol
+      which the renderer was previously missing entirely. */
+  private planGate: PlanModeGate = createPlanModeGate();
+  /** Exposed to localApi.ts so the IPC handler can resolve pending requests. */
+  getPlanGate(): PlanModeGate { return this.planGate; }
+
+  constructor(private store: Store, private emit: (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => void, private providers?: Providers) {}
 
   /* Image generation is injected from main.ts AFTER MediaEngine/PublishingEngine
      are built — via setters, so the constructor signature (and the relay dispatch
@@ -1900,6 +2234,10 @@ export class LocalEngine {
      generate_image tool; publishing registers codex-produced PNGs as Assets. */
   private imageGen?: ImageGenFn;
   setImageGen(fn: ImageGenFn) { this.imageGen = fn; }
+  /* Speech/music/video backend for the agent's generate_speech/_music/_video
+     tools — injected from main.ts alongside imageGen, same fal MediaEngine. */
+  private mediaGen?: MediaGenFn;
+  setMediaGen(fn: MediaGenFn) { this.mediaGen = fn; }
   // The cron runner is created after the engine in main.ts; injected so the agent's
   // schedule_* tools can manage + fire schedules through the same runner.
   private cron?: CronRunner;
@@ -1932,6 +2270,10 @@ export class LocalEngine {
       "watcher not available" (a clean degrade, never a crash). */
   private browserWatcher?: import('./browser-watch.js').BrowserWatcher;
   setBrowserWatcher(w: import('./browser-watch.js').BrowserWatcher) { this.browserWatcher = w; }
+  /** Playwright-backed per-project browser (native app / sidecar). When set, it
+      takes precedence over the legacy ExtensionBridge as the browser_* backend. */
+  private browserManager?: import('./browser/manager.js').BrowserManager;
+  setBrowserManager(m: import('./browser/manager.js').BrowserManager) { this.browserManager = m; }
   /** Public entry the UI/dispatch use to (re)generate or edit an image outside a
       coding turn — routes through the SAME backend (Codex/fal) the generate_image
       tool uses, so a one-click "Regenerate" or a "modify this image" instruction
@@ -2356,6 +2698,20 @@ export class LocalEngine {
 
   isRunning(jobId: string): boolean { return this.running.has(jobId); }
 
+  /** STEER a running chat turn: inject a follow-up user message into the LIVE Claude
+      Agent SDK session (streaming input + `interrupt()`) so the agent abandons its
+      current turn and picks the message up at the next boundary — same subprocess,
+      full context, NO cancel-and-reseed. Returns `{ steered:false }` when the job
+      isn't running a steerable turn (already finished, codex, plan mode, or a non-
+      chat run) so the caller can fall back to a normal send. */
+  async steer(jobId: string, text: string): Promise<{ steered: boolean }> {
+    const t = text.trim();
+    const steer = this.running.get(jobId)?.steer;
+    if (!t || !steer) return { steered: false };
+    try { return { steered: await steer(t) }; }
+    catch { return { steered: false }; }
+  }
+
   /** Recent finished turns of a chat session, formatted for prompt stitching
       (codex has no resumable session, so context rides in the prompt). */
   private chatHistory(sessionId: string, excludeJobId: string): string {
@@ -2636,7 +2992,7 @@ export class LocalEngine {
     }
 
     const ac = new AbortController();
-    const handle: { ac: AbortController; child?: ChildProcess } = { ac };
+    const handle: { ac: AbortController; child?: ChildProcess; steer?: SteerFn } = { ac };
     this.running.set(jobId, handle);
 
     let cur = this.store.updateJob(jobId, {
@@ -2735,18 +3091,28 @@ export class LocalEngine {
         }
       }
       const resumeId = isChat && master === 'claude' ? session.sdkSessionId : undefined;
-      const base = project?.instructions ? `${project.instructions}\n\n---\n\n` : '';
+      // NB: project.instructions (the operator's per-project standing directives)
+      // are NO LONGER spliced in here. They used to be prepended as a bare,
+      // unlabelled `base` string — which (a) buried them in the middle once the
+      // skills/memory/mcp blocks prepended on top, and (b) were dropped entirely
+      // on a resumed Claude session (the `resumeId` branch sent only cur.input),
+      // so a long chat silently "forgot" them after the first turn. They're now
+      // re-injected as a labelled, top-priority block on EVERY turn (see below).
       let prompt: string;
       if (resumeId) {
         prompt = cur.input;
       } else if (isChat) {
         const history = this.chatHistory(session.id, cur.id);
         prompt = history
-          ? `${base}Earlier conversation in this chat:\n\n${history}\n\n---\n\nCurrent message:\n${cur.input}`
-          : `${base}${cur.input}`;
+          ? `Earlier conversation in this chat:\n\n${history}\n\n---\n\nCurrent message:\n${cur.input}`
+          : cur.input;
       } else {
-        prompt = `${base}${cur.input}`;
+        prompt = cur.input;
       }
+      // Hidden per-turn context (e.g. browser page-context from the Send-hint
+      // overlay): appended to the model's prompt but NEVER rendered in the chat
+      // (the transcript shows job.input only), so our context format isn't exposed.
+      if (cur.agentContext) prompt += `\n\n${cur.agentContext}`;
       if (goalMode) prompt += GOAL_DIRECTIVE;
       // AskUserQuestion in this app renders as an interactive countdown card; the SDK
       // reports the call as "dismissed" headless, which the model otherwise narrates.
@@ -2758,9 +3124,14 @@ export class LocalEngine {
       if (!opts.plan && (master === 'claude' || (master === 'codex' && job.projectId))) prompt += BG_DIRECTIVE;
       // Design genre: steer the turn toward the live, self-contained design artifact.
       if (project?.kind === 'design') prompt += DESIGN_DIRECTIVE;
-      // Codex ships a native image_gen skill — nudge it to use that (not SVG) and
-      // drop the PNG in the workspace so we can harvest + display it inline.
-      if (master === 'codex' && IMAGE_INTENT_RE.test(cur.input)) prompt += CODEX_IMAGE_NUDGE;
+      // Image intent → inject the imagegen-skill methodology so the agent shapes a
+      // structured, high-quality prompt before generating. Claude routes through the
+      // maestro generate_image tool (mounted when imageGen is configured + not plan);
+      // Codex uses its native built-in image_gen. Both run under autopilot.
+      if (looksLikeImageRequest(cur.input)) {
+        if (master === 'codex') prompt += IMAGE_DIRECTIVE_CODEX;
+        else if (!opts.plan && this.imageGen) prompt += IMAGE_DIRECTIVE_CLAUDE;
+      }
       // Vision input: images the user attached to this message. Read + sniff each
       // ONCE from disk; keep only real png/jpeg/gif/webp (ignore a wrong client
       // mime, and never relabel — a bad type would 400 the whole Claude turn).
@@ -2899,6 +3270,19 @@ export class LocalEngine {
           `Use these servers' tools when relevant to the task:\n${lines}\n</mcp_servers>\n\n${prompt}`;
       }
 
+      // Project standing instructions (Settings → Instructions): the operator's
+      // own per-project directives. Prepended LAST so they sit at the very TOP
+      // of the assembled prompt — ABOVE the skills/memory/mcp framing — and are
+      // re-sent on EVERY turn (including resumed Claude sessions, where they were
+      // previously dropped after the first message). Labelled + marked
+      // authoritative so the model treats them as overriding any conflicting
+      // guidance (e.g. a stale CLAUDE.md), which is what the operator expects
+      // from a setting they typed explicitly for this project.
+      if (project?.instructions?.trim()) {
+        prompt = `<project_instructions note="The operator's standing instructions for THIS project, set in project Settings. This is an AUTHORITATIVE INSTRUCTION: follow it on every turn, and let it OVERRIDE any conflicting guidance (including CLAUDE.md, repo docs, or defaults).">\n` +
+          `${project.instructions.trim()}\n</project_instructions>\n\n${prompt}`;
+      }
+
       const hooks: RunHooks = {
         signal: ac.signal,
         onProgress: flush,
@@ -2918,7 +3302,7 @@ export class LocalEngine {
         },
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
-      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input), codexBridge: this.codexBridgeFor(), openaiKey: this.providers?.getLocalKey('openai') };
+      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: looksLikeImageRequest(cur.input), codexBridge: this.codexBridgeFor(), openaiKey: this.providers?.getLocalKey('openai') };
       // Let the agent discover + self-install registry skills mid-run (Claude MCP).
       const projForSkills = job.projectId;
       const skillsCtx: SkillsCtx | undefined = (projForSkills && !opts.plan) ? {
@@ -2984,10 +3368,15 @@ export class LocalEngine {
       // when asked to use "my browser". Claude turns only (not plan mode); each
       // browser_* tool reports clearly if no profile is connected.
       const bridge = this.extBridge?.() ?? null;
-      const browserCtx: BrowserCtx | undefined = (bridge && !opts.plan) ? {
-        connected: () => bridge.hasActiveBrowser(),
-        profile: () => bridge.activeProfile(),
-        call: (type, params, timeoutMs) => bridge.request(type, params ?? {}, timeoutMs),
+      // Prefer the in-process Playwright manager (native app / sidecar) when it's
+      // wired AND scoped to a project; otherwise fall back to the legacy
+      // ExtensionBridge (Electron). Both expose the same { connected, profile, call }.
+      const mgrPid = job.projectId ?? session?.projectId ?? null;
+      const mgr = (this.browserManager && mgrPid) ? this.browserManager : null;
+      const browserCtx: BrowserCtx | undefined = ((mgr || bridge) && !opts.plan) ? {
+        connected: () => (mgr ? mgr.status(mgrPid!).open : bridge!.hasActiveBrowser()),
+        profile: () => (mgr ? (mgr.status(mgrPid!).open ? `project:${mgrPid}` : null) : bridge!.activeProfile()),
+        call: (type, params, timeoutMs) => (mgr ? mgr.call(mgrPid!, type, params ?? {}, timeoutMs) : bridge!.request(type, params ?? {}, timeoutMs)),
         /* Bind a watcher view scoped to THIS run's project+session: every watch
            the agent creates this turn fires back into the same chat. Listing /
            cancelling stays per-session too so the agent can't see or cancel
@@ -3059,9 +3448,30 @@ export class LocalEngine {
       // resolved by name from the host now); Codex takes stdio TOML fragments only.
       const claudeCustomMcp = buildClaudeCustomMcp(enabledMcpServers, process.env);
       const codexCustomFrags = buildCodexCustomMcp(enabledMcpServers, process.env).fragments;
+      // The pr_merge / pr_resolve_conflicts gate: when the agent calls one of
+      // those tools the GitCtx returns a `needsConfirm` payload (never executes);
+      // the runner emits this event so the renderer can show the hard-button
+      // dialog. The renderer is the only caller that can pass `confirmed: true`
+      // (via the existing mergeSessionPR / resolveSession IPC handlers).
+      const emitConfirm: EmitConfirm = (req) => {
+        try { this.emit('pr-confirm-request', req, { desktopOnly: true }); } catch { /* window gone */ }
+      };
+      // Plan-mode exit gate: emit the same desktop-only event shape so the
+      // renderer's ExitPlanModeDialog can subscribe alongside the PR confirm
+      // one. The planGate (shared instance on LocalEngine) holds the Promise
+      // the canUseTool callback awaits. See plan-mode-gate.ts.
+      const emitPlanExit: EmitPlanExit = (req) => {
+        try { this.emit('plan-mode-exit-request', req, { desktopOnly: true }); } catch { /* window gone */ }
+      };
+      // Steering: only the PRIMARY chat turn is steerable (not plan mode, not a
+      // one-off non-chat job). When that run builds its live query it hands back a
+      // SteerFn, which we park on the job handle so engine.steer(jobId, text) can
+      // reach the live session; it's cleared (null) the moment the run ends.
+      const onSteerReady: ((s: SteerFn | null) => void) | undefined =
+        (isChat && !opts.plan) ? (s) => { handle.steer = s ?? undefined; } : undefined;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx)
-        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx }, codexImageFiles);
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, this.planGate, emitPlanExit, jobId, onSteerReady, this.mediaGen)
+        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx, emitConfirm, sessionId: session?.id ?? null, plan: opts.plan, planGate: this.planGate, emitPlanExit, jobId }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
       // operator has to retry by hand. The retry starts the turn fresh; resumeId is
@@ -3133,7 +3543,10 @@ export class LocalEngine {
           };
           let cont: EngineRun;
           try {
-            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx);
+            // Continuation runs aren't in plan mode (`false` for plan above), so
+            // the gate / emit-event are only used by the BG retry-hint path. Pass
+            // them anyway so the canUseTool deny stays consistent across resumes.
+            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, undefined, session?.id ?? null, this.planGate, emitPlanExit, jobId, undefined, this.mediaGen);
           } catch (ce) { if (ce instanceof CancelledError || ac.signal.aborted) throw ce; break; }
           main = {
             text: cont.text || main.text,
@@ -3144,6 +3557,8 @@ export class LocalEngine {
             transcript: [...main.transcript, ...cont.transcript],
             images: [...(main.images ?? []), ...(cont.images ?? [])],
             hitMaxTurns: cont.hitMaxTurns,
+            // The latest continuation's prompt reflects the freshest, fullest context.
+            contextTokens: cont.contextTokens ?? main.contextTokens,
           };
         }
         // Auto-continue exhausted and STILL not finished → pause gracefully. The work is
@@ -3258,6 +3673,11 @@ export class LocalEngine {
       const done = this.store.updateJob(jobId, {
         status: 'done', phase: 'Done', progress: 100, stage: '',
         output, tokens, cost, model, transcript: allItems.slice(-400),
+        // How full the context window was on the last request — drives the native
+        // "context remaining" gauge. Plus the usage-limit reset time when this turn
+        // was capped, so the gauge can show "Claude limit · resets in …".
+        contextTokens: main.contextTokens,
+        limitResetsAt: main.hitLimit ? (main.limitResetsAt ?? null) : null,
         // Defense in depth: runClaude's terminal markResumed() already cleared
         // this via the hook, but a turn that ends concurrently with an in-flight
         // pause event must not persist a stale countdown alongside 'done'.
@@ -3266,16 +3686,20 @@ export class LocalEngine {
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
       this.emit('job', done);
-      // Auto-rename hook: the first informative turn ripens the title (which is
-      // the user's first prompt). Swap the codename-only branch for one
-      // carrying a task-derived slug. Fires once per session — gated inside.
-      if (isChat && this.gitService) {
-        const fresh = this.store.getSession(session.id);
-        if (fresh && fresh.branch && fresh.codename && !fresh.branchRenamedAt) {
-          // Fire-and-forget; the gitService gates its own no-op cases.
-          void this.gitService.renameSessionBranch(fresh).catch(() => { /* best effort */ });
-        }
-      }
+      // Post-turn git refresh + auto-rename hook.
+      //
+      // The agent may have committed / staged / pushed during this turn. The
+      // chat-header chip + contextual action read live `git-status` events, but
+      // nothing recomputes them when a turn ends — so without an explicit
+      // refresh the chip stays "Uncommitted" and the action never advances to
+      // "Push" until the 30s background poller catches up. Recompute + re-emit
+      // now so the UI reflects the new state the instant the turn finishes.
+      //
+      // The auto-rename hook (first informative turn ripens the title → swap the
+      // codename-only branch for a task-derived slug; fires once per session,
+      // gated inside) runs first when applicable, then we refresh against the
+      // freshest session so the emitted status carries the post-rename branch.
+      if (isChat) this.refreshGitAfterTurn(session.id, { allowRename: true });
       // AskUserQuestion follow-up: if this chat turn ended on a question the user
       // hasn't answered (the SDK auto-dismisses it headless), arm a countdown that
       // auto-sends the recommended option after ASK_BASE_MS. The question card shows
@@ -3347,6 +3771,12 @@ export class LocalEngine {
       // Same tidy-up on cancel/failure: a stopped or crashed browser job shouldn't
       // strand an agent-opened window. The retry path (if any) reopens on its own.
       void this.autoCloseBrowserSession(this.store.getJob(jobId)?.sessionId ?? null);
+      // The turn ended unhappily (cancel / steer-interrupt / failure) but the
+      // agent may have ALREADY committed or pushed before it did. The success
+      // path refreshes git-status; mirror that here so the chip + contextual
+      // action advance instead of staying stuck on "Uncommitted" until the 30s
+      // poller catches up. No auto-rename on a non-success turn. Best-effort.
+      this.refreshGitAfterTurn(this.store.getJob(jobId)?.sessionId);
       if (e instanceof CancelledError || ac.signal.aborted) {
         const existing = this.store.getJob(jobId);
         if (existing && existing.status !== 'cancelled') {
@@ -3397,6 +3827,36 @@ export class LocalEngine {
       this.emit('job', failed);
       this.store.pushEvent({ kind: 'job-failed', title: `Failed: ${failed.title}`, subtitle: failed.error ?? undefined, projectId: failed.projectId, jobId });
       return failed;
+    }
+  }
+
+  /** A chat turn just ended (success, cancel, or failure) — the agent may have
+      committed / staged / pushed mid-turn. Recompute + re-emit `git-status` so
+      the chat-header chip and contextual action advance immediately instead of
+      waiting on the 30s background poller (`main.ts` `gitPoll`). The renderer
+      (`useSessionGitState` → `GitStatusBar`) is purely event-driven, so the chip
+      updates the instant this fires.
+
+      `allowRename` runs the one-shot branch auto-rename first (success path only:
+      the first informative turn ripens the title → swap the codename-only branch
+      for a task-derived slug, gated inside `renameSessionBranch`), then refreshes
+      against the freshest session so the emitted status carries the renamed
+      branch. Fire-and-forget; every git op is best-effort and a no-op for
+      non-chat / non-repo / branch-less sessions. */
+  private refreshGitAfterTurn(sessionId: string | undefined, opts: { allowRename?: boolean } = {}): void {
+    const git = this.gitService;
+    if (!git || !sessionId) return;
+    const fresh = this.store.getSession(sessionId);
+    if (!fresh || !fresh.branch) return;
+    const refresh = () => {
+      const f2 = this.store.getSession(sessionId);
+      if (f2) void git.fullStatus(f2, { withPr: false }).catch(() => { /* best effort */ });
+    };
+    if (opts.allowRename && fresh.codename && !fresh.branchRenamedAt) {
+      // renameSessionBranch gates its own no-op cases; refresh either way.
+      void git.renameSessionBranch(fresh).then(refresh, refresh);
+    } else {
+      refresh();
     }
   }
 }

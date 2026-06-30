@@ -56,8 +56,8 @@ const styles = `
   .sheet-pop { animation: sheetPop 220ms var(--spring); }
   @keyframes sheetPop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
 
-  .tl-scroll::-webkit-scrollbar, .inspector ::-webkit-scrollbar { width: 11px; height: 11px; }
-  .tl-scroll::-webkit-scrollbar-thumb, .inspector ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+  .tl-scroll::-webkit-scrollbar, .inspector ::-webkit-scrollbar { width: 8px; height: 8px; }
+  .tl-scroll::-webkit-scrollbar-thumb, .inspector ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
 `;
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -804,10 +804,17 @@ export default function JobMonitor() {
     return unsubscribe;
   }, [refetch]);
 
-  // real now-line: advance the wall clock so running capsules + elapsed tick
+  // real now-line: advance the wall clock so running capsules + elapsed tick.
+  // Pause when the window is hidden (other tab / minimized) so a stale Jobs
+  // monitor doesn't keep waking the Mac every 5s in the background.
   React.useEffect(() => {
-    const t = setInterval(() => setNowMs(Date.now()), 5000);
-    return () => clearInterval(t);
+    let t: ReturnType<typeof setInterval> | null = null;
+    const start = () => { if (!t && !document.hidden) t = setInterval(() => setNowMs(Date.now()), 5000); };
+    const stop = () => { if (t) { clearInterval(t); t = null; } };
+    const onVis = () => { if (document.hidden) stop(); else { setNowMs(Date.now()); start(); } };
+    start();
+    document.addEventListener('visibilitychange', onVis);
+    return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
   }, []);
 
   React.useEffect(() => {
