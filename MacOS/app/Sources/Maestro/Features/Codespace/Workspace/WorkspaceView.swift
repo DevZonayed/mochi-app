@@ -110,17 +110,18 @@ struct WorkspaceView: View {
         .onTapGesture { store.activeKey = tab.id }
     }
 
-    // MARK: main — chat tabs kept mounted (continuity), project hub, empty state
+    // MARK: main — active chat, project hub, file viewer, empty state
     private func main(_ store: WorkspaceStore) -> some View {
         ZStack {
             Tok.bgElevated
-            ForEach(store.tabs.filter { $0.kind == .chat && $0.projectId == store.activeProjectId }) { tab in
+            // Keep only the active chat mounted. Hidden chat tabs still registered event handlers,
+            // rebound transcripts, and rendered markdown offscreen, which made session switching
+            // and scrolling feel laggy. TranscriptCache preserves warm content for quick remounts.
+            if let tab = store.activeTab, tab.kind == .chat, tab.projectId == store.activeProjectId {
                 ChatThread(projectId: tab.projectId, projectName: store.project(tab.projectId)?.name ?? "",
-                           sessionId: sessionBinding(store, tab), base: tab.base, flush: true, active: store.activeKey == tab.id,
+                           sessionId: sessionBinding(store, tab), base: tab.base, flush: true, active: true,
                            onSessionCreated: { store.bindCreatedSession(tabKey: tab.id, session: $0) },
                            onOpenFile: { store.openFile($0, projectId: tab.projectId) })
-                    .opacity(store.activeKey == tab.id ? 1 : 0)
-                    .allowsHitTesting(store.activeKey == tab.id)
             }
             if let t = store.activeTab, t.kind == .project, let p = store.project(t.projectId) {
                 ProjectPanel(project: p, section: sectionBinding(store, t), onClose: { store.closeTab(t.id) })

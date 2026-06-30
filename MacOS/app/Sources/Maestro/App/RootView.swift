@@ -3,10 +3,12 @@ import SwiftUI
 struct RootView: View {
     @Environment(AppEnv.self) private var env
     @State private var minElapsed = false
+    @State private var hasShownMain = false
 
     /// Ready once the sidecar's first project list has loaded (and a short minimum so the splash
     /// doesn't flash on a warm start).
-    private var ready: Bool { (env.workspace.map { !$0.loading } ?? false) && minElapsed }
+    private var initialReady: Bool { (env.workspace.map { !$0.loading } ?? false) && minElapsed }
+    private var ready: Bool { hasShownMain || initialReady }
 
     var body: some View {
         ZStack {
@@ -36,7 +38,14 @@ struct RootView: View {
         .background(WindowConfigurator(barHeight: 40))
         .animation(.easeOut(duration: 0.4), value: ready)
         .animation(.easeOut(duration: 0.3), value: env.supervisor.engineState)
-        .task { try? await Task.sleep(for: .milliseconds(650)); minElapsed = true }
+        .task {
+            try? await Task.sleep(for: .milliseconds(650))
+            minElapsed = true
+            if initialReady { hasShownMain = true }
+        }
+        .onChange(of: initialReady) { _, ready in
+            if ready { hasShownMain = true }
+        }
     }
 
     @ViewBuilder private var routeContent: some View {

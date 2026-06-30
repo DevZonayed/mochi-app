@@ -80,41 +80,45 @@ struct MarkdownText: View {
     }
     private func tableView(headers: [String], rows: [[String]], aligns: [TextAlignment]) -> some View {
         let cols = headers.count
+        let minTableWidth = max(CGFloat(cols) * 150, 420)
         func a(_ i: Int) -> TextAlignment { i < aligns.count ? aligns[i] : .leading }
-        return VStack(spacing: 0) {
-            Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
-                GridRow {
-                    ForEach(0..<cols, id: \.self) { c in
-                        Text(inline(headers[c]))
-                            .font(.system(size: 12.5, weight: .semibold))
-                            .foregroundStyle(Tok.ink)
-                            .multilineTextAlignment(a(c))
-                            .frame(maxWidth: .infinity, alignment: align(a(c)))
-                            .padding(.horizontal, 12).padding(.vertical, 7)
-                            .background(Tok.fillTertiary)
-                            .overlay(alignment: .leading) { if c > 0 { Tok.separator.frame(width: Tok.hairline) } }
-                    }
-                }
-                ForEach(Array(rows.enumerated()), id: \.offset) { ri, row in
+        return ScrollView(.horizontal, showsIndicators: true) {
+            VStack(spacing: 0) {
+                Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
                     GridRow {
                         ForEach(0..<cols, id: \.self) { c in
-                            Text(inline(c < row.count ? row[c] : ""))
-                                .font(TokFont.text(13)).foregroundStyle(Tok.inkSecondary)
+                            Text(inline(headers[c]))
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(Tok.ink)
                                 .multilineTextAlignment(a(c))
-                                .lineSpacing(2)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: align(a(c)))
-                                .padding(.horizontal, 12).padding(.vertical, 6)
-                                .background(ri.isMultiple(of: 2) ? Color.clear : Tok.fillTertiary.opacity(0.35))
-                                .overlay(alignment: .top) { Tok.separator.frame(height: Tok.hairline) }
+                                .frame(minWidth: 120, maxWidth: .infinity, alignment: align(a(c)))
+                                .padding(.horizontal, 12).padding(.vertical, 7)
+                                .background(Tok.fillTertiary)
                                 .overlay(alignment: .leading) { if c > 0 { Tok.separator.frame(width: Tok.hairline) } }
+                        }
+                    }
+                    ForEach(Array(rows.enumerated()), id: \.offset) { ri, row in
+                        GridRow {
+                            ForEach(0..<cols, id: \.self) { c in
+                                Text(inline(c < row.count ? row[c] : ""))
+                                    .font(TokFont.text(13)).foregroundStyle(Tok.inkSecondary)
+                                    .multilineTextAlignment(a(c))
+                                    .lineSpacing(2)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(minWidth: 120, maxWidth: .infinity, alignment: align(a(c)))
+                                    .padding(.horizontal, 12).padding(.vertical, 6)
+                                    .background(ri.isMultiple(of: 2) ? Color.clear : Tok.fillTertiary.opacity(0.35))
+                                    .overlay(alignment: .top) { Tok.separator.frame(height: Tok.hairline) }
+                                    .overlay(alignment: .leading) { if c > 0 { Tok.separator.frame(width: Tok.hairline) } }
+                            }
                         }
                     }
                 }
             }
+            .frame(minWidth: minTableWidth, alignment: .leading)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
         }
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Tok.separator, lineWidth: Tok.hairline))
         .padding(.vertical, 2)
     }
 
