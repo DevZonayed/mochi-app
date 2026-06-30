@@ -1,5 +1,5 @@
 import React from 'react';
-import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { HashRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { UpdateBanner } from './lib/UpdateBanner';
 import { NotificationCenter } from './lib/notify';
 import { RemotePairGate } from './lib/RemotePairGate';
@@ -73,9 +73,25 @@ function AccountGate({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+/* Bridges native macOS menu commands into the SPA router. The WebKit shell's
+   App menu fires `window.dispatchEvent(new CustomEvent('maestro:open-settings'))`
+   on ⌘, ; here we turn that into a route change so the standard Settings
+   shortcut works like a native app. Must live inside <HashRouter> for
+   useNavigate(). */
+function NativeMenuBridge() {
+  const navigate = useNavigate();
+  React.useEffect(() => {
+    const openSettings = () => navigate('/settings');
+    window.addEventListener('maestro:open-settings', openSettings);
+    return () => window.removeEventListener('maestro:open-settings', openSettings);
+  }, [navigate]);
+  return null;
+}
+
 export function App() {
   return (
     <HashRouter>
+      <NativeMenuBridge />
       <AccountGate>
       <RemotePairGate>
       <ErrorBoundary name="app">

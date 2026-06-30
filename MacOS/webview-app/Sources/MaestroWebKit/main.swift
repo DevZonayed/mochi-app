@@ -274,6 +274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         DebugLog.reset()
         DebugLog.write("[native] application starting")
         NSApp.setActivationPolicy(.regular)
+        installMainMenu()
         makeWindow()
         showLoading("Starting Maestro...")
 
@@ -292,6 +293,154 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Builds the application menu. The window hides its own title bar, but on
+    /// macOS the standard editing shortcuts (⌘C/⌘V/⌘X/⌘A/⌘Z) are ONLY delivered
+    /// to the focused field when an Edit menu wires them to the first-responder
+    /// selectors (`paste:`, `copy:`, …). Without this menu, ⌘V silently does
+    /// nothing inside the WKWebView — which is exactly the paste bug. The items
+    /// keep `target == nil` so each action travels the responder chain into the
+    /// web content, where WKWebView turns `paste:` into a real DOM paste event.
+    private func installMainMenu() {
+        let appName = "Maestro"
+        let mainMenu = NSMenu()
+
+        // ── App menu ───────────────────────────────────────────────────────
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About \(appName)",
+                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
+        let prefs = appMenu.addItem(withTitle: "Settings…",
+                                    action: #selector(openPreferences),
+                                    keyEquivalent: ",")
+        prefs.target = self
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide \(appName)",
+                        action: #selector(NSApplication.hide(_:)),
+                        keyEquivalent: "h")
+        let hideOthers = appMenu.addItem(withTitle: "Hide Others",
+                                         action: #selector(NSApplication.hideOtherApplications(_:)),
+                                         keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(withTitle: "Show All",
+                        action: #selector(NSApplication.unhideAllApplications(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit \(appName)",
+                        action: #selector(NSApplication.terminate(_:)),
+                        keyEquivalent: "q")
+        appItem.submenu = appMenu
+
+        // ── Edit menu (the part that makes ⌘V work) ─────────────────────────
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        let pasteMatch = editMenu.addItem(withTitle: "Paste and Match Style",
+                                          action: #selector(NSTextView.pasteAsPlainText(_:)),
+                                          keyEquivalent: "v")
+        pasteMatch.keyEquivalentModifierMask = [.command, .option, .shift]
+        editMenu.addItem(withTitle: "Delete", action: #selector(NSText.delete(_:)), keyEquivalent: "")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(.separator())
+
+        // Find submenu — WKWebView responds to `performTextFinderAction:`, so the
+        // standard ⌘F / ⌘G / ⇧⌘G / ⌘E chord set drives the native find bar over
+        // the web content (items keep target == nil to ride the responder chain).
+        let findItem = editMenu.addItem(withTitle: "Find", action: nil, keyEquivalent: "")
+        let findMenu = NSMenu(title: "Find")
+        let finderSel = Selector(("performTextFinderAction:"))
+        let find = findMenu.addItem(withTitle: "Find…", action: finderSel, keyEquivalent: "f")
+        find.tag = NSTextFinder.Action.showFindInterface.rawValue
+        let findNext = findMenu.addItem(withTitle: "Find Next", action: finderSel, keyEquivalent: "g")
+        findNext.tag = NSTextFinder.Action.nextMatch.rawValue
+        let findPrev = findMenu.addItem(withTitle: "Find Previous", action: finderSel, keyEquivalent: "g")
+        findPrev.tag = NSTextFinder.Action.previousMatch.rawValue
+        findPrev.keyEquivalentModifierMask = [.command, .shift]
+        let useSel = findMenu.addItem(withTitle: "Use Selection for Find", action: finderSel, keyEquivalent: "e")
+        useSel.tag = NSTextFinder.Action.setSearchString.rawValue
+        findItem.submenu = findMenu
+        editItem.submenu = editMenu
+
+        // ── View menu ───────────────────────────────────────────────────────
+        let viewItem = NSMenuItem()
+        mainMenu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        let reload = viewMenu.addItem(withTitle: "Reload", action: #selector(reloadPage), keyEquivalent: "r")
+        reload.target = self
+        let forceReload = viewMenu.addItem(withTitle: "Reload Ignoring Cache",
+                                           action: #selector(forceReloadPage), keyEquivalent: "r")
+        forceReload.keyEquivalentModifierMask = [.command, .shift]
+        forceReload.target = self
+        viewMenu.addItem(.separator())
+        let actualSize = viewMenu.addItem(withTitle: "Actual Size", action: #selector(zoomActual), keyEquivalent: "0")
+        actualSize.target = self
+        // Bind the physical "=" key (so ⌘= zooms in without needing Shift; the
+        // menu displays ⌘= which is what most users actually press).
+        let zoomIn = viewMenu.addItem(withTitle: "Zoom In", action: #selector(zoomIn), keyEquivalent: "=")
+        zoomIn.target = self
+        let zoomOut = viewMenu.addItem(withTitle: "Zoom Out", action: #selector(zoomOut), keyEquivalent: "-")
+        zoomOut.target = self
+        viewMenu.addItem(.separator())
+        let fullScreen = viewMenu.addItem(withTitle: "Enter Full Screen",
+                                          action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
+        fullScreen.keyEquivalentModifierMask = [.command, .control]
+        viewItem.submenu = viewMenu
+
+        // ── Window menu ─────────────────────────────────────────────────────
+        let windowItem = NSMenuItem()
+        mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(withTitle: "Bring All to Front",
+                           action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowItem.submenu = windowMenu
+
+        NSApp.mainMenu = mainMenu
+        NSApp.windowsMenu = windowMenu
+    }
+
+    // MARK: - View / window menu actions (operate on the WKWebView)
+
+    @objc private func reloadPage() { webView?.reload() }
+    @objc private func forceReloadPage() { webView?.reloadFromOrigin() }
+
+    @objc private func zoomActual() {
+        if #available(macOS 11.0, *) { webView?.pageZoom = 1.0 }
+    }
+    @objc private func zoomIn() {
+        if #available(macOS 11.0, *), let v = webView {
+            v.pageZoom = min(v.pageZoom + 0.1, 3.0)
+        }
+    }
+    @objc private func zoomOut() {
+        if #available(macOS 11.0, *), let v = webView {
+            v.pageZoom = max(v.pageZoom - 0.1, 0.5)
+        }
+    }
+
+    /// ⌘, — best-effort: ask the React UI to open its Settings screen. The web
+    /// app can listen for the `maestro:open-settings` window event; if it isn't
+    /// wired yet this is a harmless no-op (the in-app Settings nav still works).
+    @objc private func openPreferences() {
+        webView?.evaluateJavaScript(
+            "window.dispatchEvent(new CustomEvent('maestro:open-settings'));",
+            completionHandler: nil
+        )
     }
 
     private func makeWindow() {
