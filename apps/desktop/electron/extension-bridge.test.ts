@@ -242,4 +242,64 @@ describe('ExtensionBridge', () => {
     autoReplyBrowser(a.ws, () => ({ ok: false, error: 'tab crashed' }));
     await expect(bridge.request('click', { ref: '.x' })).rejects.toThrow(/tab crashed/);
   });
+
+  // ── browser-session ownership (end-of-turn auto-close vs. manual "keep open") ──
+  it('marks an agent session open after navigate, and closeAgentSession ends it', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    const seen: string[] = [];
+    autoReplyBrowser(a.ws, (type) => { seen.push(type); return { ok: true, result: {} }; });
+
+    expect(bridge.hasAgentSession()).toBe(false);
+    await bridge.request('navigate', { url: 'https://x.test' });
+    expect(bridge.hasAgentSession()).toBe(true);   // agent opened a managed session
+
+    await bridge.closeAgentSession();
+    expect(bridge.hasAgentSession()).toBe(false);  // tidied up
+    expect(seen).toContain('session_end');         // and asked the browser to close tabs
+  });
+
+  it('session_end (agent-driven) clears the open flag', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    autoReplyBrowser(a.ws, () => ({ ok: true, result: {} }));
+    await bridge.request('open_tab', { url: 'https://x.test' });
+    expect(bridge.hasAgentSession()).toBe(true);
+    await bridge.request('session_end', { closeTabs: true });
+    expect(bridge.hasAgentSession()).toBe(false);
+  });
+
+  it('a manual hold suppresses agent-session tracking and no-ops closeAgentSession', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    const seen: string[] = [];
+    autoReplyBrowser(a.ws, (type) => { seen.push(type); return { ok: true, result: {} }; });
+
+    bridge.setBrowserHold(true);
+    expect(bridge.isBrowserHeld()).toBe(true);
+    expect(bridge.status().held).toBe(true);
+
+    await bridge.request('navigate', { url: 'https://x.test' });
+    expect(bridge.hasAgentSession()).toBe(false);  // user pinned it — not the agent's to track
+
+    await bridge.closeAgentSession();              // must be a no-op while held
+    expect(seen).not.toContain('session_end');
+
+    bridge.setBrowserHold(false);
+    expect(bridge.status().held).toBe(false);
+  });
+
+  it('pinning the browser open clears any prior agent-opened flag', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    autoReplyBrowser(a.ws, () => ({ ok: true, result: {} }));
+    await bridge.request('navigate', { url: 'https://x.test' });
+    expect(bridge.hasAgentSession()).toBe(true);
+    bridge.setBrowserHold(true);                    // user takes ownership
+    expect(bridge.hasAgentSession()).toBe(false);   // agent flag cleared → no auto-close
+  });
 });

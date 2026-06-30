@@ -488,7 +488,7 @@ export interface DesignComment {
 }
 /** A connected Chrome profile on the local browser-extension control channel. */
 export interface ExtensionPeer { clientId: string; profile: string; active: boolean }
-export interface ExtensionStatus { running: boolean; port: number; token: string; peers: ExtensionPeer[] }
+export interface ExtensionStatus { running: boolean; port: number; token: string; peers: ExtensionPeer[]; held: boolean }
 export interface CostsData {
   today: number;
   thisMonth: number;
@@ -993,6 +993,15 @@ export const api = {
     call<ExtensionStatus>('extensionStatus', {}, () => Promise.reject(new Error('desktop only'))),
   extensionSetActive: (clientId: string) =>
     call<ExtensionStatus>('extensionSetActive', { clientId }, () => Promise.reject(new Error('desktop only'))),
+  /** Manually open + PIN the user's real Chrome via the extension control channel
+      (Project settings → Open browser): it stays open after a task finishes until
+      the user closes it. Distinct from the Playwright per-project browserOpen above.
+      Desktop-only. */
+  extensionBrowserOpen: (url?: string) =>
+    call<{ ok: boolean; held: boolean }>('extensionBrowserOpen', url ? { url } : {}, () => Promise.reject(new Error('desktop only'))),
+  /** Drop the manual hold + close the extension browser session the user pinned open. Desktop-only. */
+  extensionBrowserClose: () =>
+    call<{ ok: boolean; held: boolean }>('extensionBrowserClose', {}, () => Promise.reject(new Error('desktop only'))),
   /** Where the bundled extension's unpacked folder lives on disk (packaged build, dev tree, or env override). */
   extensionPath: () =>
     call<{ path: string | null; source: 'packaged' | 'dev' | 'env-override' | 'not-found'; manifestPresent: boolean }>(
