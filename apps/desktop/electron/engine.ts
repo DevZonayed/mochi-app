@@ -21,6 +21,7 @@ import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
 import { toolLabel, relPath } from './tool-label.js';
 import { thinkingConfigFor } from './thinking-config.js';
+import { looksLikeImageRequest } from './image-intent.js';
 import { claudeLoggedIn, codexLoggedIn } from './providers.js';
 import { branchSlug, isGitRepo } from './git.js';
 import { pickCityCodename } from './codenames.js';
@@ -202,21 +203,56 @@ const PR_DIRECTIVE =
   `<<<<<<</=======/>>>>>>> markers keeping the intended content, Bash-commit, then call ` +
   `pr_resolve_conflicts again to confirm clean + push.\n` +
   `• "push" / "send to github" without a PR ask: call git_push.\n` +
+  `• "fix the CI" / "the checks are failing" / a PR reports failing checks: inspect GitHub Actions ` +
+  `with read-only Bash — \`gh pr checks\`, then \`gh run view <run-id> --log\` (run id is in the ` +
+  `check's details URL; if a log is still streaming, \`gh api /repos/<owner>/<repo>/actions/jobs/` +
+  `<job-id>/logs\`). Summarize the failing snippet, FIX the code, commit, then call git_push and ` +
+  `re-check. Treat non-GitHub-Actions checks (Buildkite, etc.) as external — report the details URL ` +
+  `only, don't chase them.\n` +
+  `• "address the review comments" / "respond to the PR feedback": fetch the threads with ` +
+  `\`gh api repos/<owner>/<repo>/pulls/<n>/comments\` (and \`.../reviews\`), work through each ` +
+  `actionable thread (edit the files), commit, then call git_push. Briefly note which comments you ` +
+  `addressed.\n` +
   `• Status questions ("what's the state?" / "is the PR ready?"): call git_status.\n\n` +
   `Always run git_status BEFORE the action so you know what step the lifecycle is on. ` +
-  `Bash is still the right tool for commits, diffs, and inspections — just not for the ` +
-  `push/PR/merge/resolve actions themselves.`;
+  `Bash is still the right tool for commits, diffs, and inspections (incl. read-only \`gh\` checks/` +
+  `comments lookups) — just not for the push/PR/merge/resolve actions themselves.`;
 // SP3 — primary↔reviewer loop: how many review→fix→re-review rounds at most.
 const REVIEW_MAX_ROUNDS = 2;
-// Codex already ships a native built-in `image_gen` skill (rides the ChatGPT
-// sign-in, no key). When the message reads like an image request, nudge codex to
-// use it (not SVG) and copy the final PNG into the workspace so we can harvest it.
-const IMAGE_INTENT_RE = /\b(image|picture|photo|logo|icon|illustration|render|drawing|draw|png|jpe?g|graphic|artwork|wallpaper|avatar|sprite|mockup|poster|thumbnail)\b/i;
-const CODEX_IMAGE_NUDGE =
-  `\n\n---\n\n[Image output] If this involves generating or editing an image, use your ` +
-  `built-in image_gen skill (NOT an SVG, NOT ASCII art). After generating, COPY the final ` +
-  `selected image into the current workspace directory with a clear name like ` +
-  `generated-<short>.png so it becomes a project asset, and state the saved path.`;
+// Image generation. When a turn reads like an image request, inject the OpenAI
+// `imagegen` skill methodology (use-case taxonomy + structured prompt spec +
+// augmentation/edit-invariant rules) so BOTH engines shape a high-quality prompt
+// before generating — Claude via the maestro `generate_image` MCP tool (runs under
+// autopilot/bypassPermissions, no approval), Codex via its native built-in image_gen.
+// Image-generation intent detection lives in a pure module (./image-intent) so it is
+// unit-tested without loading this heavy Electron/SDK module. It deliberately avoids a
+// bare keyword match — "render"/"icon"/"logo" appear in ordinary coding asks.
+// Shared prompt-shaping method (adapted from openai/skills .system/imagegen). Keep
+// it tight — it is prepended to the turn, not a full document.
+const IMAGE_METHOD =
+  `\n\n---\n\n[Image generation — follow the imagegen method] This turn involves creating or editing ` +
+  `an image. Produce a REAL raster asset — never SVG, ASCII art, or HTML/CSS placeholders. Before you ` +
+  `call the tool, shape the request into a short structured spec (this materially improves quality):\n` +
+  `  • Use case (pick one): photorealistic-natural | product-mockup | ui-mockup | infographic-diagram | ` +
+  `logo-brand | illustration-story | stylized-concept | historical-scene | text-localization | ` +
+  `identity-preserve | precise-object-edit | lighting-weather | background-extraction | style-transfer | ` +
+  `compositing | sketch-to-render\n` +
+  `  • Asset type · Scene/backdrop · Subject · Style/medium · Composition/framing · Lighting/mood · ` +
+  `Color palette · Materials/textures · Text (verbatim, in quotes) · Constraints · Avoid\n` +
+  `Augmentation rules: if the user's prompt is already specific, NORMALIZE it — do not invent extra ` +
+  `characters, brands, slogans, or palettes. If it is generic, add only composition/lighting/polish cues ` +
+  `that materially help. For EDITS, restate invariants every iteration ("change only X; keep Y unchanged") ` +
+  `and save non-destructively (e.g. hero-v2.png) — never overwrite unless replacement was explicitly asked.`;
+// Claude variant: route through the maestro generate_image tool (auto-runs under autopilot).
+const IMAGE_DIRECTIVE_CLAUDE = IMAGE_METHOD +
+  `\nCall the \`generate_image\` tool with your shaped prompt; it runs automatically (no permission needed) ` +
+  `and the saved PNG is shown inline — just reference the returned path in your reply. Issue one ` +
+  `generate_image call per requested asset/variant.`;
+// Codex variant: use its built-in image_gen skill, then harvest the PNG into the workspace.
+const IMAGE_DIRECTIVE_CODEX = IMAGE_METHOD +
+  `\nUse your built-in image_gen skill (NOT an SVG, NOT ASCII art). After generating, COPY the final ` +
+  `selected image into the current workspace directory with a clear name like generated-<short>.png so it ` +
+  `becomes a project asset, and state the saved path.`;
 // Codex plan mode: codex has no built-in plan-mode protocol like Claude's
 // SDK (no permissionMode:'plan' / ExitPlanMode tool). We emulate it with a
 // prompt directive + a read-only sandbox so the agent CAN'T accidentally
@@ -345,6 +381,25 @@ export interface ImageGenResult { path: string; assetId?: string; alt?: string; 
     that image instead of generating a fresh one. */
 export interface ImageGenOpts { aspect?: string; projectId?: string | null; sourceImagePath?: string; sourceImageUrl?: string }
 export type ImageGenFn = (prompt: string, opts: ImageGenOpts) => Promise<ImageGenResult>;
+
+/** A finished non-image media asset (voiceover, music, or video): a real file on
+    this Mac + the Asset it was saved as. */
+export interface MediaGenResult { path: string; assetId?: string; url?: string; kind: string; durationS?: number }
+/** What the agent asked the media backend to produce. `kind` selects the model
+    family; the rest are per-kind shaping knobs. A `sourceImagePath` on a video
+    request animates that still (image→video) instead of generating from text. */
+export interface MediaGenOpts {
+  kind: 'speech' | 'music' | 'video';
+  projectId?: string | null;
+  voice?: string;
+  durationS?: number;
+  aspect?: string;
+  sourceImagePath?: string;
+}
+/** The pluggable speech/music/video backend the maestro media tools call.
+    Satisfied by fal (MediaEngine) — wired in main.ts, never via the relay
+    dispatch, so no key/bytes touch the server. Mirrors ImageGenFn. */
+export type MediaGenFn = (prompt: string, opts: MediaGenOpts) => Promise<MediaGenResult>;
 
 /** Running totals streamed during a run so the UI counts cost/tokens live. */
 export interface LiveUsage { tokens: number; cost: number }
@@ -646,6 +701,7 @@ async function runClaude(
       (and `null` when the run ends). Only the primary chat turn passes this — sub-runs
       (reviewer, fix, max-turns continuation, plan mode) stay on the one-shot prompt. */
   onSteerReady?: (steer: SteerFn | null) => void,
+  mediaGen?: MediaGenFn,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -685,28 +741,85 @@ async function runClaude(
     ].filter(Boolean).join(', ');
     return `- ${s.id} — ${s.name}: ${s.description || '(no description)'}${bits ? ` [${bits}]` : ''}`;
   };
-  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || gitCtx || commsCtx) && !plan)
+  const maestroServer = ((imageGen || mediaGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || gitCtx || commsCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
         tools: [
           ...(imageGen ? [tool(
             'generate_image',
-            'Generate a real raster image (PNG) from a text description and save it to the project. ' +
+            'Generate OR edit a real raster image (PNG) and save it to the project. ' +
             'Use this WHENEVER the user asks to create, draw, render, or generate an image, logo, icon, ' +
             'illustration, picture, sprite, mockup, or photo. Do NOT hand-write SVG or ASCII art for these ' +
-            'requests — call this tool. The saved PNG is shown inline in the chat automatically; just ' +
+            'requests — call this tool. Shape the prompt as a structured spec (scene/backdrop → subject → ' +
+            'style/medium → composition → lighting → constraints/avoid; quote any in-image text verbatim) ' +
+            'rather than a bare phrase — it materially improves quality. To EDIT an existing image, pass its ' +
+            'file path as sourceImagePath and write `prompt` as the change to make ("add a balloon in the ' +
+            'sky"); the backend keeps the original and applies only that edit — restate invariants ("change ' +
+            'only X; keep Y unchanged"). The saved PNG is shown inline in the chat automatically; just ' +
             'reference the returned path in your reply.',
-            { prompt: z.string().describe('A detailed description of the image to generate.'),
-              aspect: z.enum(['1:1', '16:9', '9:16']).optional().describe('Aspect ratio. Default 1:1.') },
-            wrap(async (args: { prompt: string; aspect?: '1:1' | '16:9' | '9:16' }) => {
-              const res = await imageGen!(args.prompt, { aspect: args.aspect, projectId });
+            { prompt: z.string().describe('For a new image: a detailed, structured description (scene, subject, style, composition, lighting, constraints). For an edit (sourceImagePath set): the change to apply, with invariants. Quote any in-image text verbatim.'),
+              aspect: z.enum(['1:1', '16:9', '9:16']).optional().describe('Aspect ratio. Default 1:1. Ignored when editing a source image.'),
+              sourceImagePath: z.string().optional().describe('Absolute or project-relative path to an existing image file to EDIT (e.g. a previously generated asset). When set, `prompt` is read as an edit instruction and the original image is preserved except for the requested change.') },
+            wrap(async (args: { prompt: string; aspect?: '1:1' | '16:9' | '9:16'; sourceImagePath?: string }) => {
+              const srcPath = args.sourceImagePath
+                ? (path.isAbsolute(args.sourceImagePath) ? args.sourceImagePath : path.resolve(cwd, args.sourceImagePath))
+                : undefined;
+              const res = await imageGen!(args.prompt, { aspect: args.aspect, projectId, sourceImagePath: srcPath });
               items.push({ kind: 'image', text: args.prompt.slice(0, 200), imagePath: res.path,
                 assetId: res.assetId, alt: res.alt ?? args.prompt.slice(0, 200), width: res.width, height: res.height, ts: Date.now() });
               progress();
               return txt(`Generated and saved the image to ${res.path}. It is now displayed in the chat.`);
             }),
           )] : []),
+          ...(mediaGen ? [
+            tool(
+              'generate_speech',
+              'Synthesize spoken-voice audio (voiceover / narration / TTS) from text and save it to the project as ' +
+              'an audio asset. Use this WHENEVER the user asks for a voiceover, narration, text-to-speech, spoken ' +
+              'audio, or to "read this aloud". Pass the exact words to speak as `text`, written out for natural ' +
+              'narration — expand abbreviations, numbers, and symbols the way they should be read. The audio is ' +
+              "saved locally and added to the project's Media library; reference the returned path in your reply.",
+              { text: z.string().describe('The exact words to speak, written out for natural narration (expand abbreviations, numbers, symbols).'),
+                voice: z.string().optional().describe('Optional voice id (e.g. af_heart). Defaults to a natural English voice.') },
+              wrap(async (args: { text: string; voice?: string }) => {
+                const res = await mediaGen!(args.text, { kind: 'speech', projectId, voice: args.voice });
+                return txt(`Generated voiceover audio and saved it to ${res.path}. It is now in the project's Media library.`);
+              }),
+            ),
+            tool(
+              'generate_music',
+              'Generate instrumental background music / a sound bed from a text description and save it to the ' +
+              'project. Use this for background music, a soundtrack, ambience, or a sound bed. Shape the prompt as a ' +
+              'structured spec (genre/mood → instruments → tempo/energy → intended use) rather than a bare phrase. ' +
+              'Specify the clip length in seconds.',
+              { prompt: z.string().describe('Structured description: genre/mood, instruments, tempo/energy, intended use.'),
+                durationS: z.number().int().min(1).max(180).optional().describe('Clip length in seconds (default 30).') },
+              wrap(async (args: { prompt: string; durationS?: number }) => {
+                const res = await mediaGen!(args.prompt, { kind: 'music', projectId, durationS: args.durationS });
+                return txt(`Generated a ${res.durationS ?? 30}s music clip and saved it to ${res.path}. It is now in the project's Media library.`);
+              }),
+            ),
+            tool(
+              'generate_video',
+              'Generate a short video clip (b-roll / animation) from a text prompt, or animate an existing still ' +
+              'image, and save it to the project. Use this for b-roll, a short animation, or to bring a generated ' +
+              'image to life. Shape the prompt as a structured spec (scene → subject → motion/action → camera → ' +
+              'style). To animate a still, pass its file path as sourceImagePath (image→video). Video generation is ' +
+              'slower (up to a few minutes) and costs more than an image — generate one clip per request.',
+              { prompt: z.string().describe('Structured description: scene, subject, motion/action, camera move, style.'),
+                durationS: z.union([z.literal(5), z.literal(10)]).optional().describe('Clip length in seconds — 5 or 10 only (default 5).'),
+                aspect: z.enum(['16:9', '9:16', '1:1']).optional().describe('Aspect ratio (default 16:9).'),
+                sourceImagePath: z.string().optional().describe('Absolute or project-relative path to a still image to ANIMATE (image→video). When set, the clip starts from that image.') },
+              wrap(async (args: { prompt: string; durationS?: 5 | 10; aspect?: '16:9' | '9:16' | '1:1'; sourceImagePath?: string }) => {
+                const srcPath = args.sourceImagePath
+                  ? (path.isAbsolute(args.sourceImagePath) ? args.sourceImagePath : path.resolve(cwd, args.sourceImagePath))
+                  : undefined;
+                const res = await mediaGen!(args.prompt, { kind: 'video', projectId, durationS: args.durationS, aspect: args.aspect, sourceImagePath: srcPath });
+                return txt(`Generated a ${res.durationS ?? 5}s video and saved it to ${res.path}. It is now in the project's Media library.`);
+              }),
+            ),
+          ] : []),
           ...(skillsCtx ? [
             tool('search_skills',
               'Search the live Maestro skill registry for a specialized SKILL.md. Call this FIRST — at the very start of a substantive task (build/scaffold, edit code, generate a design/content, or any domain-specific work), before you do the work — then add_skill_to_project and follow the best match. Installing and following a dedicated skill beats improvising. Public search excludes disabled skills.',
@@ -1379,6 +1492,7 @@ async function runClaude(
     : null;
   const maestroAllowed = [
     ...(imageGen ? ['generate_image'] : []),
+    ...(mediaGen ? ['generate_speech', 'generate_music', 'generate_video'] : []),
     ...(skillsCtx ? ['search_skills', 'get_skill', 'download_skill', 'add_skill_to_project', 'list_project_skills', 'remove_project_skill'] : []),
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
     ...(browserCtx ? [
@@ -2114,6 +2228,10 @@ export class LocalEngine {
      generate_image tool; publishing registers codex-produced PNGs as Assets. */
   private imageGen?: ImageGenFn;
   setImageGen(fn: ImageGenFn) { this.imageGen = fn; }
+  /* Speech/music/video backend for the agent's generate_speech/_music/_video
+     tools — injected from main.ts alongside imageGen, same fal MediaEngine. */
+  private mediaGen?: MediaGenFn;
+  setMediaGen(fn: MediaGenFn) { this.mediaGen = fn; }
   // The cron runner is created after the engine in main.ts; injected so the agent's
   // schedule_* tools can manage + fire schedules through the same runner.
   private cron?: CronRunner;
@@ -2982,9 +3100,14 @@ export class LocalEngine {
       if (!opts.plan && (master === 'claude' || (master === 'codex' && job.projectId))) prompt += BG_DIRECTIVE;
       // Design genre: steer the turn toward the live, self-contained design artifact.
       if (project?.kind === 'design') prompt += DESIGN_DIRECTIVE;
-      // Codex ships a native image_gen skill — nudge it to use that (not SVG) and
-      // drop the PNG in the workspace so we can harvest + display it inline.
-      if (master === 'codex' && IMAGE_INTENT_RE.test(cur.input)) prompt += CODEX_IMAGE_NUDGE;
+      // Image intent → inject the imagegen-skill methodology so the agent shapes a
+      // structured, high-quality prompt before generating. Claude routes through the
+      // maestro generate_image tool (mounted when imageGen is configured + not plan);
+      // Codex uses its native built-in image_gen. Both run under autopilot.
+      if (looksLikeImageRequest(cur.input)) {
+        if (master === 'codex') prompt += IMAGE_DIRECTIVE_CODEX;
+        else if (!opts.plan && this.imageGen) prompt += IMAGE_DIRECTIVE_CLAUDE;
+      }
       // Vision input: images the user attached to this message. Read + sniff each
       // ONCE from disk; keep only real png/jpeg/gif/webp (ignore a wrong client
       // mime, and never relabel — a bad type would 400 the whole Claude turn).
@@ -3142,7 +3265,7 @@ export class LocalEngine {
         },
       };
       // Plan mode only applies to Claude (codex has no read-only planning mode).
-      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: IMAGE_INTENT_RE.test(cur.input), codexBridge: this.codexBridgeFor(), openaiKey: this.providers?.getLocalKey('openai') };
+      const imageCtx = { store: this.store, projectId: job.projectId, publishing: this.publishing, imageIntent: looksLikeImageRequest(cur.input), codexBridge: this.codexBridgeFor(), openaiKey: this.providers?.getLocalKey('openai') };
       // Let the agent discover + self-install registry skills mid-run (Claude MCP).
       const projForSkills = job.projectId;
       const skillsCtx: SkillsCtx | undefined = (projForSkills && !opts.plan) ? {
@@ -3310,7 +3433,7 @@ export class LocalEngine {
       const onSteerReady: ((s: SteerFn | null) => void) | undefined =
         (isChat && !opts.plan) ? (s) => { handle.steer = s ?? undefined; } : undefined;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, this.planGate, emitPlanExit, jobId, onSteerReady)
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, this.planGate, emitPlanExit, jobId, onSteerReady, this.mediaGen)
         : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx, emitConfirm, sessionId: session?.id ?? null, plan: opts.plan, planGate: this.planGate, emitPlanExit, jobId }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
@@ -3386,7 +3509,7 @@ export class LocalEngine {
             // Continuation runs aren't in plan mode (`false` for plan above), so
             // the gate / emit-event are only used by the BG retry-hint path. Pass
             // them anyway so the canUseTool deny stays consistent across resumes.
-            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, undefined, session?.id ?? null, this.planGate, emitPlanExit, jobId);
+            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, undefined, session?.id ?? null, this.planGate, emitPlanExit, jobId, undefined, this.mediaGen);
           } catch (ce) { if (ce instanceof CancelledError || ac.signal.aborted) throw ce; break; }
           main = {
             text: cont.text || main.text,
