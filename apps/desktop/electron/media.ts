@@ -155,7 +155,7 @@ export class MediaEngine {
     if (model.key === 'flux-kontext' && !args.imageUrl) throw Object.assign(new Error('editing needs a source image'), { statusCode: 400 });
 
     const asset = this.store.createAsset({
-      source: 'generated', kind: model.kind, stage: model.stage, prompt: args.prompt.slice(0, 2000), model: model.key,
+      projectId: args.projectId, source: 'generated', kind: model.kind, stage: model.stage, prompt: args.prompt.slice(0, 2000), model: model.key,
       status: 'queued', cost: estimate(model, args), durationS: args.durationS,
     });
     this.emit('asset', asset);

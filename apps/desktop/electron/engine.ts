@@ -723,10 +723,10 @@ async function runClaude(
               'style). To animate a still, pass its file path as sourceImagePath (image→video). Video generation is ' +
               'slower (up to a few minutes) and costs more than an image — generate one clip per request.',
               { prompt: z.string().describe('Structured description: scene, subject, motion/action, camera move, style.'),
-                durationS: z.number().int().min(1).max(10).optional().describe('Clip length in seconds (default 5).'),
+                durationS: z.union([z.literal(5), z.literal(10)]).optional().describe('Clip length in seconds — 5 or 10 only (default 5).'),
                 aspect: z.enum(['16:9', '9:16', '1:1']).optional().describe('Aspect ratio (default 16:9).'),
                 sourceImagePath: z.string().optional().describe('Absolute or project-relative path to a still image to ANIMATE (image→video). When set, the clip starts from that image.') },
-              wrap(async (args: { prompt: string; durationS?: number; aspect?: '16:9' | '9:16' | '1:1'; sourceImagePath?: string }) => {
+              wrap(async (args: { prompt: string; durationS?: 5 | 10; aspect?: '16:9' | '9:16' | '1:1'; sourceImagePath?: string }) => {
                 const srcPath = args.sourceImagePath
                   ? (path.isAbsolute(args.sourceImagePath) ? args.sourceImagePath : path.resolve(cwd, args.sourceImagePath))
                   : undefined;
