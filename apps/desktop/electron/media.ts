@@ -155,7 +155,7 @@ export class MediaEngine {
     if (model.key === 'flux-kontext' && !args.imageUrl) throw Object.assign(new Error('editing needs a source image'), { statusCode: 400 });
 
     const asset = this.store.createAsset({
-      source: 'generated', kind: model.kind, stage: model.stage, prompt: args.prompt.slice(0, 2000), model: model.key,
+      projectId: args.projectId, source: 'generated', kind: model.kind, stage: model.stage, prompt: args.prompt.slice(0, 2000), model: model.key,
       status: 'queued', cost: estimate(model, args), durationS: args.durationS,
     });
     this.emit('asset', asset);
@@ -285,6 +285,15 @@ export class MediaEngine {
     this.emit('asset', done);
     this.store.pushEvent({ kind: 'asset', title: `Media ready: ${model?.label ?? asset.kind}`, projectId: asset.projectId });
   }
+}
+
+/** Map an agent media-tool kind to a fal model key. A video request with a
+    source still animates it (image→video) instead of generating from text.
+    Pure + exported so the mapping is unit-tested against the real MODELS table. */
+export function mediaModelForKind(kind: 'speech' | 'music' | 'video', hasSourceImage = false): string {
+  if (kind === 'speech') return 'kokoro';
+  if (kind === 'music') return 'stable-audio';
+  return hasSourceImage ? 'kling-i2v' : 'kling-t2v';
 }
 
 export { MODELS, MODEL_LIST, assetsDirFor, extFor };
