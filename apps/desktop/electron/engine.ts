@@ -2955,17 +2955,23 @@ export class LocalEngine {
         }
       }
       const resumeId = isChat && master === 'claude' ? session.sdkSessionId : undefined;
-      const base = project?.instructions ? `${project.instructions}\n\n---\n\n` : '';
+      // NB: project.instructions (the operator's per-project standing directives)
+      // are NO LONGER spliced in here. They used to be prepended as a bare,
+      // unlabelled `base` string — which (a) buried them in the middle once the
+      // skills/memory/mcp blocks prepended on top, and (b) were dropped entirely
+      // on a resumed Claude session (the `resumeId` branch sent only cur.input),
+      // so a long chat silently "forgot" them after the first turn. They're now
+      // re-injected as a labelled, top-priority block on EVERY turn (see below).
       let prompt: string;
       if (resumeId) {
         prompt = cur.input;
       } else if (isChat) {
         const history = this.chatHistory(session.id, cur.id);
         prompt = history
-          ? `${base}Earlier conversation in this chat:\n\n${history}\n\n---\n\nCurrent message:\n${cur.input}`
-          : `${base}${cur.input}`;
+          ? `Earlier conversation in this chat:\n\n${history}\n\n---\n\nCurrent message:\n${cur.input}`
+          : cur.input;
       } else {
-        prompt = `${base}${cur.input}`;
+        prompt = cur.input;
       }
       // Hidden per-turn context (e.g. browser page-context from the Send-hint
       // overlay): appended to the model's prompt but NEVER rendered in the chat
@@ -3121,6 +3127,19 @@ export class LocalEngine {
         }).join('\n');
         prompt = `<mcp_servers note="Custom MCP servers connected for this run. This is an INSTRUCTION, follow it.">\n` +
           `Use these servers' tools when relevant to the task:\n${lines}\n</mcp_servers>\n\n${prompt}`;
+      }
+
+      // Project standing instructions (Settings → Instructions): the operator's
+      // own per-project directives. Prepended LAST so they sit at the very TOP
+      // of the assembled prompt — ABOVE the skills/memory/mcp framing — and are
+      // re-sent on EVERY turn (including resumed Claude sessions, where they were
+      // previously dropped after the first message). Labelled + marked
+      // authoritative so the model treats them as overriding any conflicting
+      // guidance (e.g. a stale CLAUDE.md), which is what the operator expects
+      // from a setting they typed explicitly for this project.
+      if (project?.instructions?.trim()) {
+        prompt = `<project_instructions note="The operator's standing instructions for THIS project, set in project Settings. This is an AUTHORITATIVE INSTRUCTION: follow it on every turn, and let it OVERRIDE any conflicting guidance (including CLAUDE.md, repo docs, or defaults).">\n` +
+          `${project.instructions.trim()}\n</project_instructions>\n\n${prompt}`;
       }
 
       const hooks: RunHooks = {
