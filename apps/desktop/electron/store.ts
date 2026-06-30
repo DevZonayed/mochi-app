@@ -193,6 +193,31 @@ export interface Job {
   createdAt: number; updatedAt: number;
 }
 
+interface JobPageCursor {
+  createdAt: number;
+  updatedAt: number;
+  id: string;
+}
+
+function jobPageCursor(job: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>): string {
+  return `${job.createdAt}:${job.updatedAt}:${encodeURIComponent(job.id)}`;
+}
+
+function parseJobPageCursor(raw?: string): JobPageCursor | null {
+  if (!raw) return null;
+  const [createdRaw, updatedRaw, ...idParts] = raw.split(':');
+  const createdAt = Number(createdRaw);
+  const updatedAt = Number(updatedRaw);
+  const encodedId = idParts.join(':');
+  if (!Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || !encodedId) return null;
+  try { return { createdAt, updatedAt, id: decodeURIComponent(encodedId) }; }
+  catch { return null; }
+}
+
+function compareJobsNewestFirst(a: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>, b: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>): number {
+  return (b.createdAt - a.createdAt) || (b.updatedAt - a.updatedAt) || b.id.localeCompare(a.id);
+}
+
 /** A chat thread inside a project. Each turn is a Job (sessionId set), so the
     whole engine stack (streaming, cancel, costs, events) works per message. */
 export interface ChatSession {
@@ -1254,6 +1279,29 @@ export class Store {
     const all = [...this.data.jobs].sort((a, b) => b.updatedAt - a.updatedAt);
     if (sessionId) return all.filter(j => j.sessionId === sessionId);
     return projectId ? all.filter(j => j.projectId === projectId) : all.slice(0, 200);
+  }
+  listJobPage(opts: { projectId?: string; sessionId?: string; before?: number; cursor?: string; limit?: number }): { jobs: Job[]; total: number; hasMore: boolean; nextBefore: number | null; nextCursor: string | null } {
+    const requested = Number.isFinite(opts.limit) ? Math.floor(Number(opts.limit)) : 30;
+    const limit = Math.max(1, Math.min(100, requested));
+    const before = Number.isFinite(opts.before) ? Number(opts.before) : null;
+    const cursor = parseJobPageCursor(opts.cursor);
+    const all = this.data.jobs
+      .filter(j => opts.sessionId ? j.sessionId === opts.sessionId : opts.projectId ? j.projectId === opts.projectId : true)
+      .sort(compareJobsNewestFirst);
+    const pageable = cursor
+      ? all.filter(j => compareJobsNewestFirst(j, cursor) > 0)
+      : before == null ? all : all.filter(j => j.createdAt < before);
+    const slice = pageable.slice(0, limit + 1);
+    const pageSlice = slice.slice(0, limit);
+    const oldest = pageSlice[pageSlice.length - 1] ?? null;
+    const jobs = pageSlice.slice().reverse();
+    return {
+      jobs,
+      total: all.length,
+      hasMore: slice.length > limit,
+      nextBefore: oldest ? oldest.createdAt : null,
+      nextCursor: oldest ? jobPageCursor(oldest) : null,
+    };
   }
   getJob(jobId: string): Job | undefined { return this.data.jobs.find(j => j.id === jobId); }
   createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[], inputFiles?: ChatFile[], agentContext?: string): Job {

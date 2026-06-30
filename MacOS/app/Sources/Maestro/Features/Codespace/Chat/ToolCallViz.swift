@@ -340,7 +340,7 @@ struct ToolCallRow: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 Text("RESPONSE").font(TokFont.text(TokFont.caption, .semibold)).tracking(0.7).foregroundStyle(Tok.purple)
             }
-            MarkdownText(text: text, projectRoot: projectRoot, baseSize: 13, bodyColor: Tok.ink)
+            GuardedMarkdownText(text: text, projectRoot: projectRoot, baseSize: 13, bodyColor: Tok.ink)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 12).padding(.vertical, 10)
                 .background(ZStack { Tok.bgElevated; Tok.purple.opacity(0.04) })

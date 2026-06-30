@@ -8,7 +8,7 @@
 import React from 'react';
 import { Icon } from './icons';
 import { FileTypeIcon } from './fileIcons';
-import { api, type Project, type DirEntry, type CmdOutput } from './api';
+import { api, IS_WEBKIT, type Project, type DirEntry, type CmdOutput } from './api';
 
 export interface CheckItem { id: string; title: string; verdict: 'approved' | 'needs-work'; text: string }
 
@@ -158,6 +158,7 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
 }) {
   const [tab, setTab] = React.useState<TopTab>('files');
   const [root, setRoot] = React.useState<DirEntry[] | null>(null);
+  const [filesDeferred, setFilesDeferred] = React.useState(IS_WEBKIT);
   const [err, setErr] = React.useState('');
   const [q, setQ] = React.useState('');
   const [searching, setSearching] = React.useState(false);
@@ -175,10 +176,18 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
   };
 
   const loadRoot = React.useCallback(() => {
-    setRoot(null); setErr('');
+    setFilesDeferred(false); setRoot(null); setErr('');
     api.listDir(project.id, '').then(r => setRoot(r?.entries ?? [])).catch(e => setErr(e instanceof Error ? e.message : 'Could not read folder'));
   }, [project.id]);
-  React.useEffect(() => { loadRoot(); }, [loadRoot]);
+  React.useEffect(() => {
+    if (IS_WEBKIT) {
+      setFilesDeferred(true);
+      setRoot([]);
+      setErr('');
+      return;
+    }
+    loadRoot();
+  }, [loadRoot, project.id]);
 
   if (collapsed) {
     return (
@@ -238,7 +247,8 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
               </div>
             )}
             <div className="ws-tree" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '6px 4px 12px' }}>
-              {err ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>{err}</div>
+              {filesDeferred ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>Click refresh to load files.</div>
+                : err ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>{err}</div>
                 : rootFiltered === null ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Loading…</div>
                 : rootFiltered.length === 0 ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>{q ? 'No matches.' : 'Empty folder.'}</div>
                 : rootFiltered.map(e => <DirNode key={e.path} projectId={project.id} entry={e} depth={0} onOpenFile={onOpenFile} />)}

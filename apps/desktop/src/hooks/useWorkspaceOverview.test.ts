@@ -35,6 +35,7 @@ vi.mock('../lib/api', () => {
       },
     },
     IS_LOCAL: true,
+    IS_WEBKIT: false,
   };
 });
 

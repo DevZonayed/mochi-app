@@ -206,6 +206,20 @@ export interface Job {
   createdAt: number;
   updatedAt: number;
 }
+export interface JobPage {
+  jobs: Job[];
+  total: number;
+  hasMore: boolean;
+  nextBefore: number | null;
+  nextCursor: string | null;
+}
+export interface JobPageInput {
+  projectId?: string;
+  sessionId?: string;
+  before?: number | null;
+  cursor?: string | null;
+  limit?: number;
+}
 /** A long-lived process the agent started (a dev server, watcher, …) that outlives the
     chat turn. Tracked + stoppable; streamed live over the 'bg' event. */
 export interface BgTask {
@@ -405,6 +419,28 @@ export interface NotificationSettings {
   volume: number;
   onlyWhenUnfocused: boolean;
 }
+export interface BrowserSettings {
+  enabled: boolean;
+  headless: boolean;
+  chromePath?: string;
+  defaultStartUrl?: string;
+  windowWidth?: number;
+  windowHeight?: number;
+}
+export interface BrowserStatus {
+  projectId: string;
+  open: boolean;
+  url: string | null;
+  title: string | null;
+  tabCount: number;
+  lastScreenshotAt: number | null;
+  chromeVersion: string | null;
+  error?: string;
+}
+export interface ChromeProfile { dir: string; name: string }
+export interface ChromeStatus { installed: boolean; path: string | null; version: string | null; running: boolean }
+export interface BrowserSeedInfo { sourceDir: string; sourceName: string; importedAt: number; cookieCount: number }
+export interface BrowserProfilePath { path: string }
 export interface AppSettings {
   defaultEffort: Effort;
   defaultEngine: EngineId | 'auto';
@@ -417,7 +453,10 @@ export interface AppSettings {
   notifications?: NotificationSettings;
   /** Opt-in: try a direct desktop↔phone WebRTC channel before the relay (default off). */
   p2pEnabled?: boolean;
+  /** Playwright-backed per-project Chrome browser. */
+  browser?: BrowserSettings;
 }
+export type AppSettingsPatch = Partial<Omit<AppSettings, 'browser'>> & { browser?: Partial<BrowserSettings> };
 
 export type FeedbackCategory = 'bug' | 'idea' | 'other';
 export type FeedbackStatus = 'new' | 'triaged' | 'done';
@@ -580,6 +619,7 @@ export class ApiError extends Error {
 /* ── Local core bridge (Electron) ─────────────────────────────────────── */
 interface Bridge {
   localEngine?: boolean;
+  nativeWebKit?: boolean;
   call?: (method: string, params?: Record<string, unknown>) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   onEvent?: (cb: (e: { name: string; data: unknown }) => void) => () => void;
   pickFolder?: () => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
@@ -601,6 +641,7 @@ const bridge: Bridge | undefined =
 
 /** True when running inside the desktop app (local core owns everything). */
 export const IS_LOCAL = Boolean(bridge?.call);
+export const IS_WEBKIT = Boolean(bridge?.nativeWebKit);
 
 /* ── Remote pairing token (browser builds only) ───────────────────────
    The relay requires the Mac's pairing token on every /api/* call. Web
@@ -793,6 +834,53 @@ const qp = (params: Record<string, string | undefined>): string => {
   return q ? `?${q}` : '';
 };
 
+interface JobPageCursor {
+  createdAt: number;
+  updatedAt: number;
+  id: string;
+}
+
+const jobPageCursor = (job: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>): string =>
+  `${job.createdAt}:${job.updatedAt}:${encodeURIComponent(job.id)}`;
+
+function parseJobPageCursor(raw?: string | null): JobPageCursor | null {
+  if (!raw) return null;
+  const [createdRaw, updatedRaw, ...idParts] = raw.split(':');
+  const createdAt = Number(createdRaw);
+  const updatedAt = Number(updatedRaw);
+  const encodedId = idParts.join(':');
+  if (!Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || !encodedId) return null;
+  try { return { createdAt, updatedAt, id: decodeURIComponent(encodedId) }; }
+  catch { return null; }
+}
+
+function compareJobsNewestFirst(a: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>, b: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>): number {
+  return (b.createdAt - a.createdAt) || (b.updatedAt - a.updatedAt) || b.id.localeCompare(a.id);
+}
+
+function pageJobs(allJobs: Job[], input: JobPageInput = {}): JobPage {
+  const requested = Number.isFinite(input.limit) ? Math.floor(Number(input.limit)) : 30;
+  const limit = Math.max(1, Math.min(100, requested));
+  const before = Number.isFinite(input.before) ? Number(input.before) : null;
+  const cursor = parseJobPageCursor(input.cursor);
+  const sorted = [...allJobs]
+    .filter(j => input.sessionId ? j.sessionId === input.sessionId : input.projectId ? j.projectId === input.projectId : true)
+    .sort(compareJobsNewestFirst);
+  const pageable = cursor
+    ? sorted.filter(j => compareJobsNewestFirst(j, cursor) > 0)
+    : before == null ? sorted : sorted.filter(j => j.createdAt < before);
+  const slice = pageable.slice(0, limit + 1);
+  const pageSlice = slice.slice(0, limit);
+  const oldest = pageSlice[pageSlice.length - 1] ?? null;
+  return {
+    jobs: pageSlice.slice().reverse(),
+    total: sorted.length,
+    hasMore: slice.length > limit,
+    nextBefore: oldest ? oldest.createdAt : null,
+    nextCursor: oldest ? jobPageCursor(oldest) : null,
+  };
+}
+
 export interface UpdateStatus {
   phase: 'idle' | 'checking' | 'available' | 'none' | 'downloading' | 'ready' | 'error';
   version?: string;
@@ -844,7 +932,7 @@ export const api = {
 
   // Settings
   getSettings: () => call<AppSettings>('getSettings', {}, () => req<AppSettings>('/api/settings')),
-  setSettings: (patch: Partial<AppSettings>) =>
+  setSettings: (patch: AppSettingsPatch) =>
     call<AppSettings>('setSettings', { ...patch }, () =>
       req<AppSettings>('/api/settings', { method: 'POST', body: JSON.stringify(patch) })),
 
@@ -912,6 +1000,27 @@ export const api = {
   /** Open the bundled extension folder in Finder/Explorer (so the user can chrome://extensions → Load Unpacked). */
   extensionRevealFolder: () =>
     call<{ path: string; source: string }>('extensionRevealFolder', {}, () => Promise.reject(new Error('desktop only'))),
+  // Native Playwright-backed Chrome browser (desktop/WebKit only).
+  browserOpen: (projectId: string, startUrl?: string) =>
+    call<BrowserStatus>('browserOpen', { projectId, ...(startUrl ? { startUrl } : {}) }, () => Promise.reject(new Error('desktop only'))),
+  browserClose: (projectId: string) =>
+    call<{ ok: boolean }>('browserClose', { projectId }, () => Promise.reject(new Error('desktop only'))),
+  browserClearData: (projectId: string) =>
+    call<{ ok: boolean }>('browserClearData', { projectId }, () => Promise.reject(new Error('desktop only'))),
+  browserRevealProfile: (projectId: string) =>
+    call<BrowserProfilePath>('browserRevealProfile', { projectId }, () => Promise.reject(new Error('desktop only'))),
+  browserListChromeProfiles: () =>
+    call<{ profiles: ChromeProfile[] }>('browserListChromeProfiles', {}, () => Promise.reject(new Error('desktop only'))),
+  browserChromeStatus: () =>
+    call<ChromeStatus>('browserChromeStatus', {}, () => Promise.reject(new Error('desktop only'))),
+  browserInstallChrome: () =>
+    call<{ ok: boolean }>('browserInstallChrome', {}, () => Promise.reject(new Error('desktop only'))),
+  browserImportSeed: (input: { profileDir: string; sourceName?: string; quitChrome?: boolean }) =>
+    call<BrowserSeedInfo>('browserImportSeed', input, () => Promise.reject(new Error('desktop only'))),
+  browserSeedInfo: () =>
+    call<BrowserSeedInfo>('browserSeedInfo', {}, () => Promise.reject(new Error('desktop only'))),
+  browserClearSeed: () =>
+    call<{ ok: boolean }>('browserClearSeed', {}, () => Promise.reject(new Error('desktop only'))),
   /** Hand off a design to code: copy its folder into a NEW coding project (lives in both tabs). Desktop-only. */
   copyDesignToCode: (id: string, name?: string) =>
     call<Project>('copyDesignToCode', { id, name }, () => Promise.reject(new Error('desktop only'))),
@@ -1189,6 +1298,22 @@ export const api = {
   // Jobs — in the desktop app these EXECUTE on this Mac (Claude Code login)
   listJobs: (projectId?: string, sessionId?: string) =>
     call<Job[]>('listJobs', { projectId, sessionId }, () => req<Job[]>('/api/jobs' + qp({ projectId, sessionId }))),
+  listJobPage: (input: JobPageInput = {}) =>
+    call<JobPage>('listJobPage', { ...input }, async () => {
+      try {
+        return await req<JobPage>('/api/jobs/page' + qp({
+          projectId: input.projectId,
+          sessionId: input.sessionId,
+          before: input.before == null ? undefined : String(input.before),
+          cursor: input.cursor ?? undefined,
+          limit: input.limit == null ? undefined : String(input.limit),
+        }));
+      } catch (e) {
+        if (!(e instanceof ApiError) || (e.status !== 404 && e.status !== 405)) throw e;
+        const all = await req<Job[]>('/api/jobs' + qp({ projectId: input.projectId, sessionId: input.sessionId }));
+        return pageJobs(all, input);
+      }
+    }),
   createJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
     call<Job>('createJob', { ...input }, () =>
       req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) })),
