@@ -356,6 +356,25 @@ export interface ImageGenResult { path: string; assetId?: string; alt?: string; 
 export interface ImageGenOpts { aspect?: string; projectId?: string | null; sourceImagePath?: string; sourceImageUrl?: string }
 export type ImageGenFn = (prompt: string, opts: ImageGenOpts) => Promise<ImageGenResult>;
 
+/** A finished non-image media asset (voiceover, music, or video): a real file on
+    this Mac + the Asset it was saved as. */
+export interface MediaGenResult { path: string; assetId?: string; url?: string; kind: string; durationS?: number }
+/** What the agent asked the media backend to produce. `kind` selects the model
+    family; the rest are per-kind shaping knobs. A `sourceImagePath` on a video
+    request animates that still (image→video) instead of generating from text. */
+export interface MediaGenOpts {
+  kind: 'speech' | 'music' | 'video';
+  projectId?: string | null;
+  voice?: string;
+  durationS?: number;
+  aspect?: string;
+  sourceImagePath?: string;
+}
+/** The pluggable speech/music/video backend the maestro media tools call.
+    Satisfied by fal (MediaEngine) — wired in main.ts, never via the relay
+    dispatch, so no key/bytes touch the server. Mirrors ImageGenFn. */
+export type MediaGenFn = (prompt: string, opts: MediaGenOpts) => Promise<MediaGenResult>;
+
 /** Running totals streamed during a run so the UI counts cost/tokens live. */
 export interface LiveUsage { tokens: number; cost: number }
 
@@ -603,6 +622,7 @@ async function runClaude(
   scheduleCtx?: ScheduleCtx,
   gitCtx?: GitCtx,
   commsCtx?: CommsCtx,
+  mediaGen?: MediaGenFn,
 ): Promise<EngineRun> {
   const { query, tool, createSdkMcpServer } = await import('@anthropic-ai/claude-agent-sdk');
   const binary = resolveClaude();
@@ -636,7 +656,7 @@ async function runClaude(
     ].filter(Boolean).join(', ');
     return `- ${s.id} — ${s.name}: ${s.description || '(no description)'}${bits ? ` [${bits}]` : ''}`;
   };
-  const maestroServer = ((imageGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || gitCtx || commsCtx) && !plan)
+  const maestroServer = ((imageGen || mediaGen || skillsCtx || bgCtx || browserCtx || scheduleCtx || gitCtx || commsCtx) && !plan)
     ? createSdkMcpServer({
         name: 'maestro',
         version: '1.0.0',
@@ -667,6 +687,54 @@ async function runClaude(
               return txt(`Generated and saved the image to ${res.path}. It is now displayed in the chat.`);
             }),
           )] : []),
+          ...(mediaGen ? [
+            tool(
+              'generate_speech',
+              'Synthesize spoken-voice audio (voiceover / narration / TTS) from text and save it to the project as ' +
+              'an audio asset. Use this WHENEVER the user asks for a voiceover, narration, text-to-speech, spoken ' +
+              'audio, or to "read this aloud". Pass the exact words to speak as `text`, written out for natural ' +
+              'narration — expand abbreviations, numbers, and symbols the way they should be read. The audio is ' +
+              "saved locally and added to the project's Media library; reference the returned path in your reply.",
+              { text: z.string().describe('The exact words to speak, written out for natural narration (expand abbreviations, numbers, symbols).'),
+                voice: z.string().optional().describe('Optional voice id (e.g. af_heart). Defaults to a natural English voice.') },
+              wrap(async (args: { text: string; voice?: string }) => {
+                const res = await mediaGen!(args.text, { kind: 'speech', projectId, voice: args.voice });
+                return txt(`Generated voiceover audio and saved it to ${res.path}. It is now in the project's Media library.`);
+              }),
+            ),
+            tool(
+              'generate_music',
+              'Generate instrumental background music / a sound bed from a text description and save it to the ' +
+              'project. Use this for background music, a soundtrack, ambience, or a sound bed. Shape the prompt as a ' +
+              'structured spec (genre/mood → instruments → tempo/energy → intended use) rather than a bare phrase. ' +
+              'Specify the clip length in seconds.',
+              { prompt: z.string().describe('Structured description: genre/mood, instruments, tempo/energy, intended use.'),
+                durationS: z.number().int().min(1).max(180).optional().describe('Clip length in seconds (default 30).') },
+              wrap(async (args: { prompt: string; durationS?: number }) => {
+                const res = await mediaGen!(args.prompt, { kind: 'music', projectId, durationS: args.durationS });
+                return txt(`Generated a ${res.durationS ?? 30}s music clip and saved it to ${res.path}. It is now in the project's Media library.`);
+              }),
+            ),
+            tool(
+              'generate_video',
+              'Generate a short video clip (b-roll / animation) from a text prompt, or animate an existing still ' +
+              'image, and save it to the project. Use this for b-roll, a short animation, or to bring a generated ' +
+              'image to life. Shape the prompt as a structured spec (scene → subject → motion/action → camera → ' +
+              'style). To animate a still, pass its file path as sourceImagePath (image→video). Video generation is ' +
+              'slower (up to a few minutes) and costs more than an image — generate one clip per request.',
+              { prompt: z.string().describe('Structured description: scene, subject, motion/action, camera move, style.'),
+                durationS: z.number().int().min(1).max(10).optional().describe('Clip length in seconds (default 5).'),
+                aspect: z.enum(['16:9', '9:16', '1:1']).optional().describe('Aspect ratio (default 16:9).'),
+                sourceImagePath: z.string().optional().describe('Absolute or project-relative path to a still image to ANIMATE (image→video). When set, the clip starts from that image.') },
+              wrap(async (args: { prompt: string; durationS?: number; aspect?: '16:9' | '9:16' | '1:1'; sourceImagePath?: string }) => {
+                const srcPath = args.sourceImagePath
+                  ? (path.isAbsolute(args.sourceImagePath) ? args.sourceImagePath : path.resolve(cwd, args.sourceImagePath))
+                  : undefined;
+                const res = await mediaGen!(args.prompt, { kind: 'video', projectId, durationS: args.durationS, aspect: args.aspect, sourceImagePath: srcPath });
+                return txt(`Generated a ${res.durationS ?? 5}s video and saved it to ${res.path}. It is now in the project's Media library.`);
+              }),
+            ),
+          ] : []),
           ...(skillsCtx ? [
             tool('search_skills',
               'Search the live Maestro skill registry for a specialized SKILL.md. Call this FIRST — at the very start of a substantive task (build/scaffold, edit code, generate a design/content, or any domain-specific work), before you do the work — then add_skill_to_project and follow the best match. Installing and following a dedicated skill beats improvising. Public search excludes disabled skills.',
@@ -1313,6 +1381,7 @@ async function runClaude(
     : null;
   const maestroAllowed = [
     ...(imageGen ? ['generate_image'] : []),
+    ...(mediaGen ? ['generate_speech', 'generate_music', 'generate_video'] : []),
     ...(skillsCtx ? ['search_skills', 'get_skill', 'download_skill', 'add_skill_to_project', 'list_project_skills', 'remove_project_skill'] : []),
     ...(bgCtx ? ['run_in_background', 'background_output', 'list_background', 'stop_background'] : []),
     ...(browserCtx ? [
@@ -1939,6 +2008,10 @@ export class LocalEngine {
      generate_image tool; publishing registers codex-produced PNGs as Assets. */
   private imageGen?: ImageGenFn;
   setImageGen(fn: ImageGenFn) { this.imageGen = fn; }
+  /* Speech/music/video backend for the agent's generate_speech/_music/_video
+     tools — injected from main.ts alongside imageGen, same fal MediaEngine. */
+  private mediaGen?: MediaGenFn;
+  setMediaGen(fn: MediaGenFn) { this.mediaGen = fn; }
   // The cron runner is created after the engine in main.ts; injected so the agent's
   // schedule_* tools can manage + fire schedules through the same runner.
   private cron?: CronRunner;
@@ -3092,7 +3165,7 @@ export class LocalEngine {
       const claudeCustomMcp = buildClaudeCustomMcp(enabledMcpServers, process.env);
       const codexCustomFrags = buildCodexCustomMcp(enabledMcpServers, process.env).fragments;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx)
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, this.mediaGen)
         : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
@@ -3165,7 +3238,7 @@ export class LocalEngine {
           };
           let cont: EngineRun;
           try {
-            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx);
+            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, this.mediaGen);
           } catch (ce) { if (ce instanceof CancelledError || ac.signal.aborted) throw ce; break; }
           main = {
             text: cont.text || main.text,

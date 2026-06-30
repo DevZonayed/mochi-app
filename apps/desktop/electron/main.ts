@@ -5,7 +5,7 @@ import { existsSync, realpathSync, mkdirSync, promises as fsp } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { Store } from './store.js';
 import { LocalEngine } from './engine.js';
-import { MediaEngine } from './media.js';
+import { MediaEngine, mediaModelForKind } from './media.js';
 import { ResearchEngine } from './research.js';
 import { PublishingEngine } from './publishing.js';
 import { CodexBridge } from './codex-bridge.js';
@@ -392,6 +392,22 @@ app.whenReady().then(() => {
       : await media.generateAndWait({ modelKey: 'flux-schnell', prompt, projectId: opts.projectId ?? null, aspect: opts.aspect });
     if (!asset.localPath) throw new Error(`image was ${editing ? 'edited' : 'generated'} but saving it locally failed — please try again`);
     return { path: asset.localPath, assetId: asset.id, alt: prompt.slice(0, 200), width: asset.width, height: asset.height };
+  });
+  // Speech / music / video for the agent — same fal MediaEngine as images, no
+  // Codex path (Codex has no media skill). Each kind maps to a fal model; the
+  // finished file is streamed to ~/Maestro/<project>/assets/ and shows up in the
+  // Media library via the store's asset events (no chat-transcript renderer needed).
+  engine.setMediaGen(async (prompt, opts) => {
+    const modelKey = mediaModelForKind(opts.kind, !!opts.sourceImagePath);
+    // Video renders take noticeably longer on fal than audio — give it more room.
+    const timeoutMs = opts.kind === 'video' ? 6 * 60 * 1000 : 3 * 60 * 1000;
+    const asset = await media.generateAndWait({
+      modelKey, prompt, projectId: opts.projectId ?? null,
+      voice: opts.voice, durationS: opts.durationS, aspect: opts.aspect,
+      imagePath: opts.sourceImagePath,
+    }, timeoutMs);
+    if (!asset.localPath) throw new Error('media was generated but saving it locally failed — please try again');
+    return { path: asset.localPath, assetId: asset.id, url: asset.url ?? undefined, kind: asset.kind, durationS: asset.durationS ?? undefined };
   });
   telegram = new TelegramBot(store, engine, providers, emit);
   telegram.resumeOnBoot();

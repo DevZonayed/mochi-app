@@ -287,4 +287,13 @@ export class MediaEngine {
   }
 }
 
+/** Map an agent media-tool kind to a fal model key. A video request with a
+    source still animates it (image→video) instead of generating from text.
+    Pure + exported so the mapping is unit-tested against the real MODELS table. */
+export function mediaModelForKind(kind: 'speech' | 'music' | 'video', hasSourceImage = false): string {
+  if (kind === 'speech') return 'kokoro';
+  if (kind === 'music') return 'stable-audio';
+  return hasSourceImage ? 'kling-i2v' : 'kling-t2v';
+}
+
 export { MODELS, MODEL_LIST, assetsDirFor, extFor };
