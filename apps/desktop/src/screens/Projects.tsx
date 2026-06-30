@@ -10,8 +10,9 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, type Project as ApiProject, type Job, type ProjectKind, type FolderInspect, type ChatSession, IS_LOCAL } from '../lib/api';
-import { SessionStateDot } from './SessionStateDot';
+import { SessionStateDot, RunningDot } from './SessionStateDot';
 import { useProjectRollupState } from '../lib/useSessionGitState';
+import { useProjectRunning } from '../lib/useSessionRunning';
 
 /* Page-specific CSS from Projects.html <style> (the app-shell already provides
    the spin/app-wallpaper/nav-item/ws-header/search-field/tb-icon hooks, but we
@@ -32,6 +33,9 @@ const PAGE_CSS = `
   /* the card/row being dragged dims while the rest reflow around it */
   .proj-card.dragging, .proj-row.dragging { opacity: 0.4; }
   .proj-menu:hover { background: var(--fill-secondary); color: var(--ink); }
+  .proj-menu-item:hover { background: var(--fill-secondary); }
+  .hidden-toggle { transition: background 120ms ease, color 120ms ease; }
+  .hidden-toggle:hover { background: var(--fill-secondary); color: var(--ink); }
   .tpl-pick { transition: transform 140ms var(--spring), box-shadow 160ms ease; }
   .tpl-pick:hover { transform: translateY(-2px); box-shadow: var(--card-shadow), 0 8px 22px rgba(15,20,60,0.12); }
 
@@ -77,6 +81,8 @@ interface Project {
   next: string;
   activity: string;
   paused?: boolean;
+  /** Reversible soft-hide — dropped from the default view, revealed via "Hidden (N)". */
+  hidden?: boolean;
   kind?: ProjectKind;
   path?: string;
   repoUrl?: string;
@@ -152,6 +158,7 @@ function toRow(p: ApiProject, jobs: Job[], pendingGates: number, sessions: ChatS
     subs: 0,
     next: '—',
     activity: 'Idle',
+    hidden: p.hidden,
     kind: p.kind,
     path: p.path,
     repoUrl: p.repoUrl,
@@ -185,6 +192,63 @@ function StatusLine({ p }: { p: Project }) {
   );
 }
 
+// ── Per-project ⋯ menu (Hide / Delete) ──────────────────────────────────────
+
+const menuItemStyle = (color: string): React.CSSProperties => ({
+  display: 'flex', alignItems: 'center', gap: 10, height: 34, padding: '0 12px', borderRadius: 8,
+  font: '600 var(--fs-subhead)/1 var(--font-text)', color, cursor: 'pointer', textAlign: 'left',
+});
+
+interface ProjectMenuProps {
+  hidden?: boolean;
+  onHide: () => void;
+  onDelete: () => void;
+}
+
+/* The per-project overflow menu. Rendered in a fixed-position layer (the card
+   clips overflow) anchored to the ⋯ trigger, with a transparent backdrop that
+   catches the outside click. Every click stopPropagation so the card's
+   open-on-click and drag handlers stay dormant. */
+function ProjectMenu({ hidden, onHide, onDelete }: ProjectMenuProps) {
+  const [open, setOpen] = React.useState(false);
+  const [anchor, setAnchor] = React.useState<{ top: number; right: number } | null>(null);
+  const btnRef = React.useRef<HTMLButtonElement>(null);
+
+  const toggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (open) { setOpen(false); return; }
+    const r = btnRef.current?.getBoundingClientRect();
+    if (r) setAnchor({ top: r.bottom + 4, right: window.innerWidth - r.right });
+    setOpen(true);
+  };
+  const pick = (fn: () => void) => (e: React.MouseEvent) => { e.stopPropagation(); setOpen(false); fn(); };
+
+  return (
+    <>
+      <button ref={btnRef} className="proj-menu" title="More" onClick={toggle} style={{
+        width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0,
+      }}><Icon name="more" size={16} /></button>
+      {open && anchor && (
+        <div onClick={e => { e.stopPropagation(); setOpen(false); }} style={{ position: 'fixed', inset: 0, zIndex: 300 }}>
+          <div onClick={e => e.stopPropagation()} role="menu" style={{
+            position: 'fixed', top: anchor.top, right: anchor.right, minWidth: 168,
+            background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12,
+            boxShadow: '0 16px 44px rgba(15,20,60,0.24)', padding: 6, display: 'flex', flexDirection: 'column', gap: 2,
+            animation: 'modalPop 140ms var(--spring)',
+          }}>
+            <button role="menuitem" className="proj-menu-item" onClick={pick(onHide)} style={menuItemStyle('var(--ink)')}>
+              <Icon name={hidden ? 'eye' : 'eyeOff'} size={15} /> {hidden ? 'Unhide' : 'Hide'}
+            </button>
+            <button role="menuitem" className="proj-menu-item" onClick={pick(onDelete)} style={menuItemStyle('var(--red, #ff3b30)')}>
+              <Icon name="trash" size={15} /> Delete
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 // ── Project card ────────────────────────────────────────────────────────────
 
 interface CardProps {
@@ -192,19 +256,22 @@ interface CardProps {
   onMenu: (id: string) => void;
   onOpen?: (id: string) => void;
   dnd?: Dnd;
+  /** Toggle this project's reversible soft-hide. */
+  onHide?: (id: string, hidden: boolean) => void;
   /** Sweep every `pr-merged` session in this project to archived. Callback fires
       after the user confirms; returns the swept count for the toast. */
   onArchiveMerged?: (projectId: string) => void | Promise<void>;
 }
 
-function ProjectCard({ p, onMenu, onOpen, dnd, onArchiveMerged }: CardProps) {
+function ProjectCard({ p, onMenu, onOpen, dnd, onHide, onArchiveMerged }: CardProps) {
   const t = TEMPLATES[p.tpl];
   const rollup = useProjectRollupState(p.id, p.sessionIds);
+  const running = useProjectRunning(p.id, p.sessionIds);
   return (
     <div className={`proj-card${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
       position: 'relative', background: 'var(--bg-elevated)', borderRadius: 20, overflow: 'hidden',
       border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', cursor: 'pointer',
-      display: 'flex', flexDirection: 'column',
+      display: 'flex', flexDirection: 'column', opacity: p.hidden ? 0.5 : undefined,
     }}>
       <div style={{ height: 3, background: t.tint, flexShrink: 0 }} />
       <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 14, flex: 1 }}>
@@ -213,10 +280,10 @@ function ProjectCard({ p, onMenu, onOpen, dnd, onArchiveMerged }: CardProps) {
           <span style={{ position: 'relative', width: 42, height: 42, borderRadius: 12, flexShrink: 0, display: 'grid', placeItems: 'center',
             background: `color-mix(in srgb, ${t.tint} 15%, transparent)`, color: t.tint }}>
             <Icon name={t.icon} size={22} />
-            {rollup && rollup !== 'no-repo' && (
+            {(running || (rollup && rollup !== 'no-repo')) && (
               <span style={{ position: 'absolute', right: -2, bottom: -2, width: 14, height: 14, borderRadius: 7,
                 background: 'var(--bg-elevated)', display: 'grid', placeItems: 'center', boxShadow: '0 0 0 1px var(--separator)' }}>
-                <SessionStateDot state={rollup} size={10} />
+                {running ? <RunningDot size={11} /> : <SessionStateDot state={rollup} size={10} />}
               </span>
             )}
           </span>
@@ -224,11 +291,7 @@ function ProjectCard({ p, onMenu, onOpen, dnd, onArchiveMerged }: CardProps) {
             <span style={{ display: 'block', font: '600 var(--fs-headline)/1.2 var(--font-text)', letterSpacing: '-0.01em', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
             <span style={{ display: 'block', font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{t.label}</span>
           </span>
-          {!p.paused && (
-            <button className="proj-menu" title="Delete project" onClick={e => { e.stopPropagation(); onMenu(p.id); }} style={{
-              width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0,
-            }}><Icon name="trash" size={16} /></button>
-          )}
+          <ProjectMenu hidden={p.hidden} onHide={() => onHide?.(p.id, !p.hidden)} onDelete={() => onMenu(p.id)} />
         </div>
 
         {/* status */}
@@ -281,26 +344,29 @@ interface RowProps {
   p: Project;
   onMenu: (id: string) => void;
   onOpen?: (id: string) => void;
+  onHide?: (id: string, hidden: boolean) => void;
   last: boolean;
   dnd?: Dnd;
 }
 
-function ProjectRow({ p, onMenu, onOpen, last, dnd }: RowProps) {
+function ProjectRow({ p, onMenu, onOpen, onHide, last, dnd }: RowProps) {
   const t = TEMPLATES[p.tpl];
   const rollup = useProjectRollupState(p.id, p.sessionIds);
+  const running = useProjectRunning(p.id, p.sessionIds);
   return (
     <div className={`proj-row${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
       display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.4fr 0.8fr 1fr 36px', alignItems: 'center', gap: 14,
       padding: '13px 16px', borderBottom: last ? 'none' : '0.5px solid var(--separator)', cursor: 'pointer',
+      opacity: p.hidden ? 0.5 : undefined,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
         <span style={{ position: 'relative', width: 32, height: 32, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center',
           background: `color-mix(in srgb, ${t.tint} 15%, transparent)`, color: t.tint }}>
           <Icon name={t.icon} size={17} />
-          {rollup && rollup !== 'no-repo' && (
+          {(running || (rollup && rollup !== 'no-repo')) && (
             <span style={{ position: 'absolute', right: -2, bottom: -2, width: 12, height: 12, borderRadius: 6,
               background: 'var(--bg-elevated)', display: 'grid', placeItems: 'center', boxShadow: '0 0 0 1px var(--separator)' }}>
-              <SessionStateDot state={rollup} size={8} />
+              {running ? <RunningDot size={9} /> : <SessionStateDot state={rollup} size={8} />}
             </span>
           )}
         </span>
@@ -315,10 +381,7 @@ function ProjectRow({ p, onMenu, onOpen, last, dnd }: RowProps) {
       </div>
       <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{p.path ? (p.repoUrl ? 'repo' : 'folder') : '—'}</span>
       <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{p.next === '—' ? p.activity : `Next ${p.next}`}</span>
-      <button className="proj-menu" title="Delete project" onClick={e => { e.stopPropagation(); onMenu(p.id); }} style={{
-        width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}>
-        <Icon name="trash" size={16} />
-      </button>
+      <ProjectMenu hidden={p.hidden} onHide={() => onHide?.(p.id, !p.hidden)} onDelete={() => onMenu(p.id)} />
     </div>
   );
 }
@@ -360,10 +423,11 @@ interface ListTableProps {
   projects: Project[];
   onMenu: (id: string) => void;
   onOpen?: (id: string) => void;
+  onHide?: (id: string, hidden: boolean) => void;
   dnd?: Dnd;
 }
 
-function ListTable({ projects, onMenu, onOpen, dnd }: ListTableProps) {
+function ListTable({ projects, onMenu, onOpen, onHide, dnd }: ListTableProps) {
   const [sort, setSort] = React.useState<string>('activity');
   const sorted = [...projects].sort((a, b) => sort === 'spend' ? b.spent - a.spent : 0);
   const cols: [string, string | null][] = [['Project', null], ['Status', null], ['Spend', 'spend'], ['Source', null], ['Schedule', 'activity'], ['', null]];
@@ -382,7 +446,7 @@ function ListTable({ projects, onMenu, onOpen, dnd }: ListTableProps) {
           </button>
         ))}
       </div>
-      {sorted.map((p, i) => <ProjectRow key={p.id} p={p} onMenu={onMenu} onOpen={onOpen} last={i === sorted.length - 1} dnd={sort === 'spend' ? undefined : dnd} />)}
+      {sorted.map((p, i) => <ProjectRow key={p.id} p={p} onMenu={onMenu} onOpen={onOpen} onHide={onHide} last={i === sorted.length - 1} dnd={sort === 'spend' ? undefined : dnd} />)}
     </div>
   );
 }
@@ -473,11 +537,105 @@ type CodeSource = 'folder' | 'clone';
 
 const baseNameOf = (p: string): string => p.split('/').filter(Boolean).pop() ?? '';
 const repoNameOf = (url: string): string => url.trim().replace(/\/+$/, '').replace(/\.git$/i, '').split(/[/:]/).pop() ?? '';
+/** Local helper — used by the slug-check effect so it doesn't fire on the
+    non-code project types where there's no folder to push. */
+const isCodeType = (type: string): boolean => type === 'code';
+
+/** Live slug-availability chip shown under the project-name input. Three
+    visual states map to the four data states: checking (neutral spinner) /
+    available (green) / taken (amber, with the v2 fallback inline) /
+    unauthenticated or error (muted hint). Pure presentation — the parent
+    owns the debounce + the actual API call. */
+function SlugChip({ state }: { state: SlugProbeState }): React.ReactElement | null {
+  if (state.status === 'checking') {
+    return (
+      <span style={{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 999, background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '500 var(--fs-caption)/1 var(--font-text)' }}>
+        <span className="breathe" style={{ width: 6, height: 6, borderRadius: 4, background: 'var(--ink-secondary)' }} />
+        Checking availability…
+      </span>
+    );
+  }
+  if (state.status === 'available' && state.owner) {
+    return (
+      <span style={{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 999, background: 'color-mix(in srgb, var(--green) 15%, var(--bg-elevated))', color: 'var(--green)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+        <Icon name="check" size={12} stroke={3} />
+        Available — <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)' }}>{state.owner}/{state.slug}</span>
+      </span>
+    );
+  }
+  if (state.status === 'taken' && state.owner) {
+    return (
+      <span style={{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 999, background: 'color-mix(in srgb, var(--orange, #ff9500) 18%, var(--bg-elevated))', color: 'var(--orange, #ff9500)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+        Name taken — will use <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)' }}>{state.owner}/{state.suggestion}</span>
+      </span>
+    );
+  }
+  if (state.status === 'unauthenticated') {
+    return (
+      <span style={{ marginTop: 8, display: 'inline-block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+        Sign in to GitHub in Settings to check availability live.
+      </span>
+    );
+  }
+  if (state.status === 'error') {
+    return (
+      <span style={{ marginTop: 8, display: 'inline-block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+        Couldn't check availability ({state.error ?? 'network error'}). Will retry on create.
+      </span>
+    );
+  }
+  return null;
+}
 
 /* Two-step New-project sheet. Step 1 picks the type. For Code projects, step 2
    has no "blank": you either Open an existing folder (that folder IS the project,
    named from its folder name) or Clone a repo into a destination you choose
    (named from the repo). Names auto-fill and de-dupe to "name v1" on collision. */
+/* Live slug-availability state for the GitHub-first name field. `null` for
+   "haven't checked yet" / "user isn't signed in" — the UI treats those
+   distinctly from a real availability answer. */
+type SlugProbeStatus = 'idle' | 'checking' | 'available' | 'taken' | 'unauthenticated' | 'error';
+interface SlugProbeState {
+  status: SlugProbeStatus;
+  slug: string;             // slugified form of the current name
+  suggestion: string;       // what bootstrap would actually use
+  owner: string | null;
+  existingFullName?: string;
+  error?: string;
+}
+
+/** A row in the new-project owner picker: the authenticated user themselves
+    or one of their orgs. Loaded once when the dialog opens. */
+interface OwnerOption { login: string; kind: 'user' | 'org'; avatarUrl: string | null }
+
+/** The new-project owner picker. Renders the user first, then orgs
+    alphabetically. Defaults to the user. Hidden when only the user is
+    available (no orgs) — there's nothing to pick. */
+function OwnerPicker({ owners, selected, onChange, disabled }: { owners: OwnerOption[]; selected: OwnerOption | null; onChange: (o: OwnerOption) => void; disabled?: boolean }): React.ReactElement | null {
+  if (owners.length <= 1) return null;
+  return (
+    <label style={{ display: 'block', marginBottom: 14 }}>
+      <span style={{ display: 'block', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 7 }}>Code-repo owner</span>
+      <select
+        disabled={disabled}
+        value={selected?.login ?? ''}
+        onChange={e => {
+          const o = owners.find(x => x.login === e.target.value);
+          if (o) onChange(o);
+        }}
+        style={{ width: '100%', height: 42, padding: '0 13px', borderRadius: 11, boxSizing: 'border-box',
+          border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-body)/1 var(--font-text)' }}>
+        {owners.map(o => (
+          <option key={o.login} value={o.login}>{o.login}{o.kind === 'org' ? ' (org)' : ''}</option>
+        ))}
+      </select>
+      <span style={{ display: 'block', marginTop: 6, font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+        Memory repo always lives under your personal account ({owners[0].login}/&lt;slug&gt;-memory) — private, never an org.
+      </span>
+    </label>
+  );
+}
+
 function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: boolean; onClose: () => void; onCreated: (projectId: string) => void; suggestedName?: string }) {
   const [step, setStep] = React.useState<1 | 2>(1);
   const [type, setType] = React.useState('code');
@@ -491,10 +649,61 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
   const [cloneLines, setCloneLines] = React.useState<string[]>([]);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState('');
+  // Push the project to GitHub on create (only meaningful for code/folder source).
+  const [pushToGitHub, setPushToGitHub] = React.useState(true);
+  const [slugProbe, setSlugProbe] = React.useState<SlugProbeState>({ status: 'idle', slug: '', suggestion: '', owner: null });
+  // Owner picker state: full list + the currently selected row (defaults to user).
+  const [owners, setOwners] = React.useState<OwnerOption[]>([]);
+  const [selectedOwner, setSelectedOwner] = React.useState<OwnerOption | null>(null);
+  // The successful bootstrap result, captured so the "Done" step can show
+  // "Created github.com/owner/slug ✓" with a click-through link. Dual-repo
+  // bootstraps populate `memoryRepoUrl` too so we can render BOTH URLs.
+  const [bootstrapped, setBootstrapped] = React.useState<{ fullName: string; htmlUrl: string; slugChanged: boolean; memoryRepoUrl?: string } | null>(null);
 
   React.useEffect(() => {
-    if (open) { setStep(1); setType('code'); setName(suggestedName ?? ''); setNameEdited(!!suggestedName); setSource('folder'); setRepoUrl(''); setPicked(null); setPickedPath(''); setDestPath(''); setCloneLines([]); setBusy(false); setError(''); }
+    if (open) {
+      setStep(1); setType('code'); setName(suggestedName ?? ''); setNameEdited(!!suggestedName); setSource('folder'); setRepoUrl(''); setPicked(null); setPickedPath(''); setDestPath(''); setCloneLines([]); setBusy(false); setError(''); setPushToGitHub(true); setSlugProbe({ status: 'idle', slug: '', suggestion: '', owner: null }); setBootstrapped(null);
+      setOwners([]); setSelectedOwner(null);
+      // Fetch the owner list once; default selection = user (always owners[0]).
+      api.listOwners().then(r => {
+        if (r.ok && r.owners.length > 0) {
+          setOwners(r.owners);
+          setSelectedOwner(r.owners[0]);
+        }
+      }).catch(() => { /* leaves the picker hidden; legacy single-repo flow still works */ });
+    }
   }, [open, suggestedName]);
+
+  /* Live slug-availability check. Debounced 300ms so a fast typist isn't
+     pummelling GitHub. Only runs when the user has typed at least 1 char,
+     is on the Code branch with GitHub-push enabled, AND is on step 2 (the
+     check is meaningless on the type picker). The leading `null` reason
+     ('not-authenticated') short-circuits to a friendly UI hint without an
+     API call. */
+  const trimmedName = name.trim();
+  const slugCheckEnabled = step === 2 && isCodeType(type) && pushToGitHub && trimmedName.length > 0;
+  React.useEffect(() => {
+    if (!slugCheckEnabled) { setSlugProbe({ status: 'idle', slug: '', suggestion: '', owner: null }); return; }
+    setSlugProbe(s => ({ ...s, status: 'checking' }));
+    const timer = setTimeout(async () => {
+      try {
+        const r = await api.checkSlug(trimmedName);
+        if (r.reason === 'not-authenticated') {
+          setSlugProbe({ status: 'unauthenticated', slug: r.slug, suggestion: r.suggestion, owner: null });
+        } else if (r.reason === 'error') {
+          setSlugProbe({ status: 'error', slug: r.slug, suggestion: r.suggestion, owner: null, error: r.error });
+        } else if (r.available === true) {
+          setSlugProbe({ status: 'available', slug: r.slug, suggestion: r.slug, owner: r.owner });
+        } else if (r.available === false) {
+          setSlugProbe({ status: 'taken', slug: r.slug, suggestion: r.suggestion, owner: r.owner, existingFullName: r.existing?.fullName });
+        }
+      } catch (e) {
+        setSlugProbe({ status: 'error', slug: '', suggestion: '', owner: null, error: e instanceof Error ? e.message.slice(0, 160) : 'lookup failed' });
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trimmedName, slugCheckEnabled]);
 
   // Stream clone progress lines while a clone is in flight.
   React.useEffect(() => {
@@ -559,7 +768,85 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
       }
       if (isCode) {
         if (!pickedPath) { setError('Choose a folder to open.'); setBusy(false); return; }
-        const proj = await api.createProject({ name: name.trim() || baseNameOf(pickedPath), template: 'code', kind: 'coding', path: pickedPath });
+        const finalName = name.trim() || baseNameOf(pickedPath);
+
+        // GitHub-first path: inspect the folder first so we know whether to
+        // skip the local `git init` (already a repo) or skip the seed/commit
+        // entirely (already a repo WITH a github remote that we just record).
+        if (pushToGitHub) {
+          let inspect: Awaited<ReturnType<typeof api.adoptFolderInspect>> | null = null;
+          try { inspect = await api.adoptFolderInspect(pickedPath); } catch { /* fall back to plain create below */ }
+          if (inspect?.ok && inspect.kind === 'git-github') {
+            // Folder already has a GitHub remote — record it on the project
+            // without recreating anything. If we ALSO discovered a companion
+            // memory repo (\${user}/\${slug}-memory), persist its slug so the
+            // openProject lifecycle hooks the memory pull + symlinks on
+            // entry. (The actual clone happens on first openProject —
+            // ensureMemoryRepo is idempotent, so it's safe to leave the
+            // clone to the lifecycle path rather than blocking adopt here.)
+            const mem = inspect.memoryRepo;
+            const memorySlug = mem?.state === 'memory-found' || mem?.state === 'memory-missing' ? mem.slug : undefined;
+            const memoryRepoUrl = mem?.state === 'memory-found'
+              ? `https://github.com/${mem.user}/${mem.slug}-memory`
+              : undefined;
+            const proj = await api.createProject({
+              name: finalName, template: 'code', kind: 'coding', path: pickedPath,
+              repoUrl: inspect.remote ?? undefined,
+              memorySlug, memoryRepoUrl,
+            });
+            onCreated(proj.id);
+            return;
+          }
+          // No GitHub remote yet (or no git at all): bootstrap a fresh repo
+          // under the SELECTED owner (Step 9 owner picker), then create the
+          // project. When the owner picker resolved (selectedOwner is set),
+          // we pass `owner` and get the dual-repo shape back (code + memory
+          // URLs). When it didn't (no GitHub auth, or list still loading),
+          // we fall back to the legacy single-repo flow.
+          const result = selectedOwner
+            ? await api.bootstrapProject({
+                name: finalName,
+                localPath: pickedPath,
+                private: true,
+                owner: { login: selectedOwner.login, kind: selectedOwner.kind },
+              })
+            : await api.bootstrapProject({
+                name: finalName,
+                localPath: pickedPath,
+                private: true,
+                adopt: !!inspect?.ok && inspect.kind !== 'no-git',
+              });
+          // Narrow on the presence of `memoryRepoUrl` (dual-repo) vs `cloneUrl`
+          // (legacy single-repo) — the two shapes don't overlap on these keys.
+          const isDual = (r: typeof result): r is Extract<typeof result, { memoryRepoUrl: string }> => 'memoryRepoUrl' in r;
+          let proj;
+          if (isDual(result)) {
+            proj = await api.createProject({
+              name: finalName, template: 'code', kind: 'coding', path: pickedPath,
+              // The dual-repo result doesn't include a clone URL — we look it
+              // up from the chosen owner + slug.
+              repoUrl: `https://github.com/${selectedOwner!.login}/${result.slug}.git`,
+              memorySlug: result.slug,
+              memoryRepoUrl: result.memoryRepoUrl,
+            });
+            setBootstrapped({
+              fullName: `${selectedOwner!.login}/${result.slug}`,
+              htmlUrl: result.codeRepoUrl,
+              slugChanged: result.slugChanged,
+              memoryRepoUrl: result.memoryRepoUrl,
+            });
+          } else {
+            proj = await api.createProject({ name: finalName, template: 'code', kind: 'coding', path: pickedPath, repoUrl: result.cloneUrl });
+            setBootstrapped({ fullName: result.fullName, htmlUrl: result.htmlUrl, slugChanged: result.slugChanged });
+          }
+          // Stay on the dialog briefly so the user sees the confirmation chip;
+          // onCreated still fires so the parent navigates / refreshes the list.
+          setBusy(false);
+          setTimeout(() => onCreated(proj.id), 850);
+          return;
+        }
+
+        const proj = await api.createProject({ name: finalName, template: 'code', kind: 'coding', path: pickedPath });
         onCreated(proj.id);
         return;
       }
@@ -700,12 +987,56 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
               </div>
             ) : null}
 
+            {/* Owner picker: only meaningful on the GitHub-first Code+folder
+                path; org members get a dropdown, solo users see nothing
+                (the picker hides itself when owners.length<=1). */}
+            {isCode && source === 'folder' && pushToGitHub && (
+              <OwnerPicker owners={owners} selected={selectedOwner} onChange={setSelectedOwner} disabled={busy} />
+            )}
             <label style={{ display: 'block' }}>
               <span style={{ display: 'block', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 7 }}>Project name{isCode ? ' · auto-filled, editable' : ''}</span>
               <input value={name} onChange={e => editName(e.target.value)} placeholder={isCode ? (source === 'clone' ? 'from the repo name' : 'from the folder name') : `${meta.label} Project`}
                 style={{ width: '100%', height: 42, padding: '0 13px', borderRadius: 11, boxSizing: 'border-box',
                   border: '1px solid var(--separator-strong)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-body)/1 var(--font-text)' }} />
+              {/* Slug-availability chip — only on Code+folder (where we'll
+                  push to GitHub) and only once the user has typed something.
+                  We render nothing while idle so the UI doesn't flash. */}
+              {isCode && source === 'folder' && pushToGitHub && slugProbe.status !== 'idle' && (
+                <SlugChip state={slugProbe} />
+              )}
             </label>
+
+            {/* GitHub-first toggle. Only Code+folder, because Code+clone
+                already comes from GitHub and the non-code project kinds have
+                no folder to push. */}
+            {isCode && source === 'folder' && (
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer', padding: '12px 14px', borderRadius: 12, background: pushToGitHub ? 'color-mix(in srgb, var(--blue) 7%, var(--bg-elevated))' : 'var(--fill-tertiary)', border: `1px solid ${pushToGitHub ? 'color-mix(in srgb, var(--blue) 40%, transparent)' : 'transparent'}` }}>
+                <input type="checkbox" checked={pushToGitHub} onChange={e => setPushToGitHub(e.target.checked)} style={{ marginTop: 2 }} />
+                <span style={{ minWidth: 0 }}>
+                  <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Create a GitHub repo for this project</span>
+                  <span style={{ display: 'block', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 3 }}>
+                    Initialises git, seeds README + .gitignore + .continuum/STATE.md, and pushes an initial commit to a private repo on your GitHub account.
+                  </span>
+                </span>
+              </label>
+            )}
+
+            {bootstrapped && (
+              <div style={{ padding: '12px 14px', borderRadius: 12, background: 'color-mix(in srgb, var(--green) 12%, var(--bg-elevated))', border: '1px solid color-mix(in srgb, var(--green) 35%, transparent)', display: 'flex', flexDirection: 'column', gap: 6, font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                  <Icon name="check" size={16} stroke={3} style={{ color: 'var(--green)', flexShrink: 0 }} />
+                  <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    Created <a href={bootstrapped.htmlUrl} target="_blank" rel="noreferrer" style={{ color: 'var(--blue)', textDecoration: 'none', font: '600 var(--fs-footnote)/1.4 var(--font-mono)' }}>github.com/{bootstrapped.fullName}</a>
+                    {bootstrapped.slugChanged && <span style={{ marginLeft: 6, color: 'var(--ink-tertiary)' }}>(name was taken — used the v2 form)</span>}
+                  </span>
+                </div>
+                {bootstrapped.memoryRepoUrl && (
+                  <div style={{ paddingLeft: 25, font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                    + memory: <a href={bootstrapped.memoryRepoUrl} target="_blank" rel="noreferrer" style={{ color: 'var(--blue)', textDecoration: 'none', font: '600 var(--fs-caption)/1.4 var(--font-mono)' }}>{bootstrapped.memoryRepoUrl.replace(/^https?:\/\//, '')}</a>
+                  </div>
+                )}
+              </div>
+            )}
 
             {error && <div style={{ padding: '10px 12px', borderRadius: 10, background: 'rgba(255,59,48,0.1)', color: 'var(--red)', font: '500 var(--fs-footnote)/1.4 var(--font-text)' }}>{error}</div>}
             </>
@@ -838,6 +1169,7 @@ export default function Projects() {
   const [suggestedName, setSuggestedName] = React.useState<string | undefined>(undefined);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const [confirmDel, setConfirmDel] = React.useState<string | null>(null);
+  const [showHidden, setShowHidden] = React.useState(false);
 
   // Opened with router state { openNew: true } → open the New-project sheet.
   React.useEffect(() => {
@@ -888,6 +1220,12 @@ export default function Projects() {
     setConfirmDel(null);
     setProjects(ps => ps.filter(p => p.id !== id));
     void api.deleteProject(id).catch(() => { void load(); });
+  };
+  // Toggle a project's reversible soft-hide — optimistic, persisted via the
+  // shared updateProject path (which bumps updatedAt so remotes resync).
+  const setHidden = (id: string, hidden: boolean) => {
+    setProjects(ps => ps.map(p => p.id === id ? { ...p, hidden } : p));
+    void api.updateProject(id, { hidden }).catch(() => { void load(); });
   };
   const open = (id: string) => { navigate(`/project-detail/${id}`); };
 
@@ -946,6 +1284,23 @@ export default function Projects() {
     },
   }), [draggingId, load]);
 
+  // Default view drops hidden projects; the "Hidden (N)" toggle reveals them
+  // (dimmed). Derived from the already-loaded list — no extra fetch.
+  const visible = projects.filter(p => !p.hidden);
+  const hiddenCount = projects.length - visible.length;
+  const shown = showHidden ? projects : visible;
+
+  const hiddenToggle = hiddenCount > 0 && (
+    <button onClick={() => setShowHidden(v => !v)} className="hidden-toggle"
+      title={showHidden ? 'Hide hidden projects' : 'Show hidden projects'} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 7, height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)',
+      background: showHidden ? 'var(--fill-secondary)' : 'transparent', border: '0.5px solid var(--separator)',
+      color: showHidden ? 'var(--ink)' : 'var(--ink-secondary)', font: '600 var(--fs-callout)/1 var(--font-text)',
+    }}>
+      <Icon name={showHidden ? 'eye' : 'eyeOff'} size={15} /> Hidden ({hiddenCount})
+    </button>
+  );
+
   const newBtn = (
     <button onClick={() => setGalleryOpen(true)} className="primary-cta" style={{
       display: 'inline-flex', alignItems: 'center', gap: 7, height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)',
@@ -971,6 +1326,7 @@ export default function Projects() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               <Segmented value={view} onChange={setView}
                 options={[{ key: 'grid', label: 'Grid', icon: 'layers' }, { key: 'list', label: 'List', icon: 'jobs' }]} />
+              {hiddenToggle}
               {newBtn}
             </div>
           </div>
@@ -979,9 +1335,9 @@ export default function Projects() {
             : projects.length === 0 ? <EmptyProjects onPick={() => setGalleryOpen(true)} />
             : view === 'grid'
               ? <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(316px, 1fr))', gap: 18 }}>
-                  {projects.map(p => <ProjectCard key={p.id} p={p} onMenu={requestDelete} onOpen={open} dnd={dnd} onArchiveMerged={archiveMergedFor} />)}
+                  {shown.map(p => <ProjectCard key={p.id} p={p} onMenu={requestDelete} onOpen={open} onHide={setHidden} dnd={dnd} onArchiveMerged={archiveMergedFor} />)}
                 </div>
-              : <ListTable projects={projects} onMenu={requestDelete} onOpen={open} dnd={dnd} />}
+              : <ListTable projects={shown} onMenu={requestDelete} onOpen={open} onHide={setHidden} dnd={dnd} />}
         </div>
       </AppShell>
 

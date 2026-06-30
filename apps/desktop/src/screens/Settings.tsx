@@ -16,7 +16,11 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, usePurpose, setPurpose, TrafficLights, Sidebar, Toolbar,
   type Theme, type Purpose,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type AccountDevice, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, type GithubDevice, IS_LOCAL } from '../lib/api';
+import {
+  api, ApiError, type Workspace, type Project, type ProviderConn, type ProviderId, type Routing, type Roles,
+  type AccountDevice, type EngineStatuses, type AppSettings, type BrowserSettings, type ChromeProfile,
+  type BrowserSeedInfo, type ChromeStatus, type ExtensionStatus, type UpdateStatus, type GithubDevice, IS_LOCAL,
+} from '../lib/api';
 import { signOut } from '../lib/auth';
 import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
 import { WhatsNew } from '../lib/WhatsNew';
@@ -44,8 +48,8 @@ const styles = `
   @keyframes sheetPop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
   @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
   @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
-  *::-webkit-scrollbar { width: 11px; height: 11px; }
-  *::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
   ::selection { background: rgba(0,122,255,0.22); }
 `;
 
@@ -141,21 +145,14 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 interface SetNavItem { key: string; icon: IconName; label: string; tint: string; }
 
 const SET_NAV: SetNavItem[] = [
-  { key: 'general', icon: 'settings', label: 'General', tint: 'var(--ink-secondary)' },
   { key: 'notifications', icon: 'bell', label: 'Notifications', tint: 'var(--orange)' },
   { key: 'engines', icon: 'cpu', label: 'Engines', tint: 'var(--purple)' },
-  // Skills + Costs render as full-bleed panes inside Settings (their full screens,
-  // minus the standalone window chrome) so the Settings sidebar stays put.
   { key: 'skills', icon: 'spark', label: 'Skills & tools', tint: 'var(--indigo)' },
   { key: 'mcp', icon: 'terminal', label: 'MCP servers', tint: 'var(--teal)' },
-  { key: 'costs', icon: 'gauge', label: 'Costs', tint: 'var(--green)' },
   { key: 'accounts', icon: 'key', label: 'Accounts & keys', tint: 'var(--blue)' },
-  { key: 'security', icon: 'shield', label: 'Security', tint: 'var(--green)' },
-  { key: 'devices', icon: 'smartphone', label: 'Devices', tint: 'var(--teal)' },
   { key: 'extension', icon: 'globe', label: 'Browser extension', tint: 'var(--blue)' },
-  { key: 'power', icon: 'bolt', label: 'Power & reliability', tint: 'var(--orange)' },
-  { key: 'updates', icon: 'refresh', label: 'Updates', tint: 'var(--indigo)' },
-  { key: 'danger', icon: 'alert', label: 'Danger zone', tint: 'var(--red)' },
+  { key: 'browser', icon: 'globe', label: 'Browser', tint: 'var(--teal)' },
+  { key: 'devices', icon: 'smartphone', label: 'Devices', tint: 'var(--teal)' },
 ];
 
 /* ───────────────────────── pane primitives ───────────────────────── */
@@ -677,8 +674,16 @@ function ExtensionPane() {
     // The bundled-extension location is static (read once on mount). The dispatch
     // is cheap (no IO beyond an existsSync) so polling adds nothing.
     if (IS_LOCAL) void api.extensionPath().then(setExtPath).catch(() => {});
-    const t = setInterval(refetch, 2000); // live profile/active updates while the pane is open
-    return () => clearInterval(t);
+    // Live profile/active updates while the pane is open. 5s is plenty for a
+    // profile-switcher view; pause entirely when the window is hidden so the
+    // extension dispatch doesn't fire 30×/min in the background. Used to be 2s.
+    let t: ReturnType<typeof setInterval> | null = null;
+    const start = () => { if (!t && !document.hidden) t = setInterval(refetch, 5000); };
+    const stop = () => { if (t) { clearInterval(t); t = null; } };
+    const onVis = () => { if (document.hidden) stop(); else { refetch(); start(); } };
+    start();
+    document.addEventListener('visibilitychange', onVis);
+    return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
   }, [refetch]);
   const copy = () => {
     if (!status?.token) return;
@@ -769,6 +774,252 @@ function ExtensionPane() {
                   : <button onClick={() => makeActive(pe.clientId)} className="ghost-btn" style={{ height: 30, padding: '0 12px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Make active</button>}
               </Row>
             ))}
+        </GroupedList>
+      </div>
+    </div>
+  );
+}
+
+const DEFAULT_BROWSER_SETTINGS: BrowserSettings = { enabled: true, headless: false };
+const browserButtonStyle: React.CSSProperties = {
+  height: 32,
+  padding: '0 13px',
+  borderRadius: 'var(--r-pill)',
+  background: 'var(--fill-secondary)',
+  color: 'var(--ink)',
+  font: '600 var(--fs-footnote)/1 var(--font-text)',
+  whiteSpace: 'nowrap',
+};
+const browserInputStyle: React.CSSProperties = {
+  width: '100%',
+  height: 32,
+  border: '0.5px solid var(--separator-strong)',
+  borderRadius: 8,
+  outline: 'none',
+  background: 'var(--fill-tertiary)',
+  font: '400 var(--fs-footnote)/1 var(--font-text)',
+  color: 'var(--ink)',
+  padding: '0 10px',
+};
+
+function BrowserPane() {
+  const [browser, setBrowser] = React.useState<BrowserSettings>(DEFAULT_BROWSER_SETTINGS);
+  const [chrome, setChrome] = React.useState<ChromeStatus | null>(null);
+  const [projects, setProjects] = React.useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectId] = React.useState<string>(() => {
+    try { return localStorage.getItem('maestro.workspace.activeProject') || ''; } catch { return ''; }
+  });
+  const [chromePath, setChromePath] = React.useState('');
+  const [startUrl, setStartUrl] = React.useState('');
+  const [widthText, setWidthText] = React.useState('');
+  const [heightText, setHeightText] = React.useState('');
+  const [profiles, setProfiles] = React.useState<ChromeProfile[]>([]);
+  const [seed, setSeed] = React.useState<BrowserSeedInfo | null>(null);
+  const [seedSelection, setSeedSelection] = React.useState('');
+  const [seedBusy, setSeedBusy] = React.useState(false);
+  const [seedError, setSeedError] = React.useState('');
+  const [profileToast, setProfileToast] = React.useState('');
+
+  const activeProject = React.useMemo(
+    () => projects.find(p => p.id === activeProjectId) ?? projects[0] ?? null,
+    [projects, activeProjectId],
+  );
+  const selectedProfile = React.useMemo(() => profiles.find(p => p.dir === seedSelection) ?? profiles[0] ?? null, [profiles, seedSelection]);
+
+  const refreshBrowserMeta = React.useCallback(async () => {
+    if (!IS_LOCAL) return;
+    const [chromeStatus, profileList, seedInfo] = await Promise.all([
+      api.browserChromeStatus().catch(() => null),
+      api.browserListChromeProfiles().catch(() => ({ profiles: [] as ChromeProfile[] })),
+      api.browserSeedInfo().catch(() => null),
+    ]);
+    setChrome(chromeStatus);
+    setProfiles(profileList.profiles);
+    setSeed(seedInfo);
+    setSeedSelection(current => current || seedInfo?.sourceDir || profileList.profiles[0]?.dir || '');
+  }, []);
+
+  React.useEffect(() => {
+    if (!IS_LOCAL) return;
+    api.getSettings().then(s => {
+      const b = s.browser ?? DEFAULT_BROWSER_SETTINGS;
+      setBrowser(b);
+      setChromePath(b.chromePath ?? '');
+      setStartUrl(b.defaultStartUrl ?? '');
+      setWidthText(b.windowWidth ? String(Math.round(b.windowWidth)) : '');
+      setHeightText(b.windowHeight ? String(Math.round(b.windowHeight)) : '');
+    }).catch(() => {});
+    api.listProjects().then(rows => {
+      setProjects(rows);
+      setActiveProjectId(cur => cur || rows[0]?.id || '');
+    }).catch(() => {});
+    void refreshBrowserMeta();
+  }, [refreshBrowserMeta]);
+
+  const patchBrowser = React.useCallback((patch: Partial<BrowserSettings>) => {
+    setBrowser(current => ({ ...current, ...patch }));
+    void api.setSettings({ browser: patch }).catch(() => {});
+  }, []);
+
+  const chooseChrome = async () => {
+    const picked = await api.pickFolder().catch(() => null);
+    if (!picked) return;
+    setChromePath(picked.path);
+    patchBrowser({ chromePath: picked.path });
+  };
+
+  const commitChromePath = () => patchBrowser({ chromePath: chromePath.trim() });
+  const commitStartUrl = () => patchBrowser({ defaultStartUrl: startUrl.trim() });
+  const commitSize = () => {
+    const w = Number(widthText);
+    const h = Number(heightText);
+    patchBrowser({
+      ...(Number.isFinite(w) && w > 0 ? { windowWidth: w } : {}),
+      ...(Number.isFinite(h) && h > 0 ? { windowHeight: h } : {}),
+    });
+  };
+
+  const revealProfile = async () => {
+    if (!activeProject) return;
+    const r = await api.browserRevealProfile(activeProject.id).catch(() => null);
+    if (r?.path) await api.revealPath(r.path).catch(() => {});
+  };
+  const clearData = async () => {
+    if (!activeProject) return;
+    await api.browserClearData(activeProject.id).catch(() => {});
+    setProfileToast('Cleared');
+    window.setTimeout(() => setProfileToast(''), 1800);
+  };
+  const startImport = async () => {
+    if (!selectedProfile) return;
+    setSeedBusy(true);
+    setSeedError('');
+    try {
+      const latestChrome = await api.browserChromeStatus().catch(() => chrome);
+      const quitChrome = latestChrome?.running === true
+        ? window.confirm(`Quit Google Chrome to import "${selectedProfile.name}" cleanly? Chrome will reopen after the copy.`)
+        : false;
+      if (latestChrome?.running && !quitChrome) return;
+      const imported = await api.browserImportSeed({ profileDir: selectedProfile.dir, sourceName: selectedProfile.name, quitChrome });
+      setSeed(imported);
+      await refreshBrowserMeta();
+    } catch (e) {
+      setSeedError(e instanceof ApiError ? e.message : 'Could not import this profile.');
+    } finally {
+      setSeedBusy(false);
+    }
+  };
+  const clearSeed = async () => {
+    setSeedError('');
+    await api.browserClearSeed().catch(() => {});
+    await refreshBrowserMeta();
+  };
+
+  if (!IS_LOCAL) {
+    return (
+      <div>
+        <PaneHead>Browser</PaneHead>
+        <GroupedList footer="Browser control is available from the Mac app.">
+          <Row last><span style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>Open Maestro on your Mac to manage browser profiles.</span></Row>
+        </GroupedList>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <PaneHead sub="How the agent's Chrome runs, and where its data lives.">Browser</PaneHead>
+      {chrome && !chrome.installed && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 12, marginBottom: 18, borderRadius: 12, border: '0.5px solid color-mix(in srgb, var(--orange) 34%, transparent)', background: 'color-mix(in srgb, var(--orange) 10%, transparent)' }}>
+          <Icon name="alert" size={17} style={{ color: 'var(--orange)', flexShrink: 0 }} />
+          <span style={{ flex: 1, font: '500 var(--fs-footnote)/1.35 var(--font-text)', color: 'var(--ink)' }}>Google Chrome is not installed.</span>
+          <button onClick={() => void api.browserInstallChrome()} style={{ ...browserButtonStyle, background: 'var(--blue)', color: '#fff' }}>Download Chrome</button>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+        <GroupedList footer="When off, browser tools and the Browser screen are unavailable.">
+          <ToggleRow label="Enable the agent browser" sub="Let agents open Chrome to navigate, screenshot, and act on pages." on={browser.enabled} onChange={enabled => patchBrowser({ enabled })} />
+          <ToggleRow label="Run headless" sub="Hide the Chrome window. Turn off to watch the agent drive." on={browser.headless} onChange={headless => patchBrowser({ headless })} last />
+        </GroupedList>
+
+        <GroupedList header="Chrome" footer="Leave blank to use the bundled or system Chrome.">
+          <Row>
+            <span style={{ width: 112, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Chrome path</span>
+            <input value={chromePath} onChange={e => setChromePath(e.target.value)} onBlur={commitChromePath} onKeyDown={e => { if (e.key === 'Enter') commitChromePath(); }} placeholder="/Applications/Google Chrome.app" style={{ ...browserInputStyle, flex: 1 }} />
+            <button onClick={chooseChrome} className="ghost-btn" style={{ ...browserButtonStyle, width: 34, padding: 0 }} title="Choose Chrome">
+              <Icon name="folder" size={15} />
+            </button>
+          </Row>
+          <Row last>
+            <span style={{ width: 112, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default URL</span>
+            <input value={startUrl} onChange={e => setStartUrl(e.target.value)} onBlur={commitStartUrl} onKeyDown={e => { if (e.key === 'Enter') commitStartUrl(); }} placeholder="https://example.com" style={{ ...browserInputStyle, flex: 1 }} />
+          </Row>
+        </GroupedList>
+
+        <GroupedList header="Window size" footer="The viewport Chrome opens with. Blank uses the default.">
+          <Row>
+            <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Width</span>
+            <input value={widthText} onChange={e => setWidthText(e.target.value)} onBlur={commitSize} onKeyDown={e => { if (e.key === 'Enter') commitSize(); }} placeholder="1280" inputMode="numeric" style={{ ...browserInputStyle, width: 118 }} />
+          </Row>
+          <Row last>
+            <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Height</span>
+            <input value={heightText} onChange={e => setHeightText(e.target.value)} onBlur={commitSize} onKeyDown={e => { if (e.key === 'Enter') commitSize(); }} placeholder="800" inputMode="numeric" style={{ ...browserInputStyle, width: 118 }} />
+          </Row>
+        </GroupedList>
+
+        <GroupedList header="Profile data" footer={activeProject ? `Cookies, logins, and cache for ${activeProject.name}'s browser profile.` : 'Open or create a project to manage browser data.'}>
+          <Row>
+            <span style={{ flex: 1 }}>
+              <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Project profile</span>
+              <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{activeProject?.path ?? activeProject?.name ?? 'No project selected'}</span>
+            </span>
+            <select value={activeProject?.id ?? ''} onChange={e => setActiveProjectId(e.target.value)}
+              style={{ ...browserInputStyle, width: 220, color: activeProject ? 'var(--ink)' : 'var(--ink-tertiary)' }}>
+              {projects.length === 0 && <option value="">No projects</option>}
+              {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </Row>
+          <Row>
+            <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Reveal profile in Finder</span>
+            {profileToast && <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)' }}>{profileToast}</span>}
+            <button onClick={revealProfile} disabled={!activeProject} className="ghost-btn" style={{ ...browserButtonStyle, opacity: activeProject ? 1 : 0.45 }}>Reveal</button>
+          </Row>
+          <Row last>
+            <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Clear browser data</span>
+            <button onClick={clearData} disabled={!activeProject} className="ghost-btn" style={{ ...browserButtonStyle, opacity: activeProject ? 1 : 0.45 }}>Clear data</button>
+          </Row>
+        </GroupedList>
+
+        <GroupedList header="Seed profile" footer="New project browsers start signed in from this Chrome profile. Your real Chrome is only read.">
+          <Row>
+            <span style={{ flex: 1 }}>
+              <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Sign in from</span>
+              <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: chrome?.version ? 'var(--green)' : 'var(--ink-secondary)', marginTop: 2 }}>{chrome?.version ?? 'Chrome profile list'}</span>
+            </span>
+            <select value={seedSelection} onChange={e => setSeedSelection(e.target.value)} disabled={profiles.length === 0}
+              style={{ ...browserInputStyle, width: 220, color: profiles.length ? 'var(--ink)' : 'var(--ink-tertiary)' }}>
+              {profiles.length === 0 && <option value="">No Chrome profiles</option>}
+              {profiles.map(p => <option key={p.dir} value={p.dir}>{p.name}</option>)}
+            </select>
+            <button onClick={startImport} disabled={!selectedProfile || seedBusy || chrome?.installed === false} style={{ ...browserButtonStyle, background: 'var(--blue)', color: '#fff', opacity: selectedProfile && !seedBusy && chrome?.installed !== false ? 1 : 0.45 }}>
+              {seedBusy ? 'Importing...' : 'Import'}
+            </button>
+          </Row>
+          <Row last>
+            <span style={{ flex: 1, minWidth: 0 }}>
+              {seed?.sourceDir ? (
+                <>
+                  <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Seeded from {seed.sourceName || seed.sourceDir} · {seed.cookieCount} cookies</span>
+                  <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{seed.importedAt ? `Imported ${new Date(seed.importedAt).toLocaleString()}` : 'Imported'}</span>
+                </>
+              ) : (
+                <span style={{ display: 'block', font: '400 var(--fs-body)/1.35 var(--font-text)', color: 'var(--ink-secondary)' }}>No seed profile set.</span>
+              )}
+              {seedError && <span style={{ display: 'block', font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)', marginTop: 5 }}>{seedError}</span>}
+            </span>
+            {seed?.sourceDir && <button onClick={clearSeed} className="ghost-btn" style={browserButtonStyle}>Clear</button>}
+          </Row>
         </GroupedList>
       </div>
     </div>
@@ -1017,7 +1268,7 @@ const NAV_ROUTES: Record<string, string> = {
 export default function Settings() {
   const scale = useAppScale();
   const [theme, setTheme] = useTheme('light');
-  const [sec, setSec] = React.useState('general');
+  const [sec, setSec] = React.useState('engines');
   const [reset, setReset] = React.useState(false);
   const [paletteOpen, setPaletteOpen] = React.useState(false);
   const navigate = useNavigate();
@@ -1049,10 +1300,16 @@ export default function Settings() {
     security: <SecurityPane onExportAudit={() => navigate('/audit')} />,
     devices: <DevicesPane />,
     extension: <ExtensionPane />,
+    browser: <BrowserPane />,
     power: <PowerPane />,
     updates: <UpdatesPane />,
     danger: <DangerPane onReset={() => setReset(true)} />,
   };
+  const paneMaxWidth = sec === 'skills' || sec === 'costs'
+    ? undefined
+    : ['mcp', 'accounts', 'extension', 'browser', 'devices'].includes(sec)
+      ? 860
+      : 760;
 
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
@@ -1091,7 +1348,7 @@ export default function Settings() {
               </main>
             ) : (
               <main style={{ flex: 1, overflowY: 'auto', padding: '28px 32px 40px' }}>
-                <div key={sec} className="pane-fade" style={{ maxWidth: 640 }}>{panes[sec]}</div>
+                <div key={sec} className="pane-fade" style={{ maxWidth: paneMaxWidth }}>{panes[sec]}</div>
               </main>
             )}
           </div>

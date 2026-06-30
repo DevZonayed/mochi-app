@@ -199,8 +199,15 @@ function startPendingWatch(): () => void {
   const refresh = () => api.listApprovals('pending').then(a => { if (a.length !== pendingCount) { pendingCount = a.length; notifyPending(); } }).catch(() => {});
   refresh();
   const unsub = api.subscribe({ onApproval: refresh, onJob: refresh });
-  const poll = setInterval(refresh, 20000);
-  return () => { unsub(); clearInterval(poll); };
+  // Slow 20s fallback; pause when the window is hidden so the badge isn't a
+  // background CPU/network drip when the user is in another app.
+  let poll: ReturnType<typeof setInterval> | null = null;
+  const start = () => { if (!poll && !document.hidden) poll = setInterval(refresh, 20000); };
+  const stop = () => { if (poll) { clearInterval(poll); poll = null; } };
+  const onVis = () => { if (document.hidden) stop(); else { refresh(); start(); } };
+  start();
+  document.addEventListener('visibilitychange', onVis);
+  return () => { unsub(); stop(); document.removeEventListener('visibilitychange', onVis); };
 }
 export function usePendingApprovals(): number {
   const [, force] = React.useReducer((x: number) => x + 1, 0);
@@ -508,13 +515,13 @@ function CodingNavButton({ route, on, pending, onNav }: { route: typeof CODING_N
   return (
     <button onClick={() => onNav(route.key)} title={route.label} aria-label={route.label}
       className={`win-no-drag${on ? '' : ' nav-item'}`} style={{
-        display: 'flex', alignItems: 'center', gap: on ? 7 : 0, height: 32, width: on ? 'auto' : 34,
-        padding: on ? '0 12px 0 10px' : 0, justifyContent: 'center', borderRadius: on ? 'var(--r-pill)' : 9,
+        display: 'flex', alignItems: 'center', gap: on ? 6 : 0, height: 28, width: on ? 'auto' : 28,
+        padding: on ? '0 10px' : 0, justifyContent: 'center', borderRadius: on ? 'var(--r-pill)' : 7,
         position: 'relative', background: on ? 'var(--blue)' : 'transparent', color: on ? '#fff' : 'var(--ink-secondary)',
         transition: 'background 160ms ease, color 160ms ease, width 200ms cubic-bezier(.32,.72,0,1)',
       }}>
-      <Icon name={route.icon} size={18} stroke={on ? 2 : 1.85} />
-      {on && <span style={{ font: '600 var(--fs-subhead)/1 var(--font-text)', whiteSpace: 'nowrap' }}>{route.label}</span>}
+      <Icon name={route.icon} size={15} stroke={on ? 2 : 1.85} />
+      {on && <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', whiteSpace: 'nowrap' }}>{route.label}</span>}
       {badge > 0 && <span style={{ position: 'absolute', top: 5, right: 5, minWidth: 7, height: 7, borderRadius: 4, background: on ? '#fff' : 'var(--red)', border: '1.5px solid var(--bg-grouped)' }} />}
     </button>
   );
@@ -523,15 +530,14 @@ function CodingNavButton({ route, on, pending, onNav }: { route: typeof CODING_N
 function CodingTopNav({ active, onNav, onSearch, theme, setTheme, right }: { active?: string; onNav: (k: string) => void; onSearch?: () => void; theme: Theme; setTheme: React.Dispatch<React.SetStateAction<Theme>>; right?: React.ReactNode }) {
   const pending = usePendingApprovals();
   const nav = navForPurpose(usePurpose());
-  const iconBtn = { width: 34, height: 34, borderRadius: 9, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' } as const;
+  const iconBtn = { width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)' } as const;
   return (
     <header className="win-drag" style={{
-      height: 46, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8,
-      padding: '0 14px 0 80px', // left pad clears the macOS traffic lights
+      height: 40, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 8,
+      padding: '0 10px 0 76px', // left pad clears the macOS traffic lights
       background: 'var(--bg-grouped)', backdropFilter: 'blur(40px) saturate(180%)', WebkitBackdropFilter: 'blur(40px) saturate(180%)',
       borderBottom: '0.5px solid var(--separator)', position: 'relative', zIndex: 20,
     }}>
-      <MaestroMark size={22} />
       <nav style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
         {nav.map(r => <CodingNavButton key={r.key} route={r} on={active === r.key} pending={pending} onNav={onNav} />)}
       </nav>
@@ -542,19 +548,19 @@ function CodingTopNav({ active, onNav, onSearch, theme, setTheme, right }: { act
           default, so a normal operator essentially never sees this). */}
       {pending > 0 && (
         <button onClick={() => onNav('approvals')} title={`${pending} approval${pending === 1 ? '' : 's'} waiting`} aria-label="Approvals" className="tb-icon win-no-drag" style={{ ...iconBtn, position: 'relative' }}>
-          <Icon name="bell" size={18} />
+          <Icon name="bell" size={15} />
           <span style={{ position: 'absolute', top: 7, right: 8, width: 7, height: 7, borderRadius: 4, background: 'var(--red)', border: '1.5px solid var(--bg-grouped)' }} />
         </button>
       )}
       <button onClick={onSearch} title="Search (⌘K)" aria-label="Search" className="tb-icon win-no-drag" style={iconBtn}>
-        <Icon name="search" size={18} />
+        <Icon name="search" size={15} />
       </button>
-      <FeedbackButton size={18} />
+      <FeedbackButton size={15} />
       <button onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')} title="Toggle appearance" aria-label="Toggle appearance" className="tb-icon win-no-drag" style={iconBtn}>
-        <Icon name={theme === 'light' ? 'moon' : 'sun'} size={18} />
+        <Icon name={theme === 'light' ? 'moon' : 'sun'} size={15} />
       </button>
       <button onClick={() => onNav('settings')} title="Settings" aria-label="Settings" className={`tb-icon win-no-drag${active === 'settings' ? ' on' : ''}`} style={{ ...iconBtn, color: active === 'settings' ? 'var(--ink)' : 'var(--ink-secondary)' }}>
-        <Icon name="settings" size={18} />
+        <Icon name="settings" size={15} />
       </button>
     </header>
   );

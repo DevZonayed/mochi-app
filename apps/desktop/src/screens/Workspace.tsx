@@ -7,17 +7,23 @@ import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type ChatSession, type ProjectKind, type Job } from '../lib/api';
+import { api, IS_LOCAL, IS_WEBKIT, type Project, type ChatSession, type ProjectKind, type Job } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
 import { FileViewer, ImageViewer } from '../lib/CodeView';
 import { ProjectPanel } from '../lib/ProjectPanel';
 import { RightSidebar, type CheckItem } from '../lib/RightSidebar';
 import { IS_WRITE_TOOL } from '../lib/fileChip';
 import type { IconName } from '../lib/icons';
-import { displayCodename } from '../lib/git-types';
+import { displayCodename, SESSION_STATE_STRIPE, SESSION_STATE_LONG_LABELS, type SessionGitState } from '../lib/git-types';
 import { SessionStateDot } from './SessionStateDot';
+import { ErrorBoundary } from '../lib/ErrorBoundary';
 import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
+import { BranchPicker } from '../components/BranchPicker';
+import { projectColor } from '../lib/project-color';
+import { projectVisibleTabs, lastTabForProject } from '../lib/tab-grouping';
+import { AddProjectModal } from '../components/AddProjectModal';
+import { WorkspaceOverview } from '../components/WorkspaceOverview';
 
 /** A small spinning ring — shown on a session/project that has a job running. */
 function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: string }) {
@@ -26,13 +32,13 @@ function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: s
 
 /** Live per-session state dot for the rail. Subscribes via the shared cache. */
 function SessionStateDotForId({ sessionId }: { sessionId: string }) {
-  const state = useSessionStateOnly(sessionId);
+  const state = useSessionStateOnly(IS_WEBKIT ? null : sessionId);
   return <SessionStateDot state={state} size={7} reserveSpace />;
 }
 
 /** Live worst-state-wins rollup dot for a project's chats. */
 function ProjectRollupDot({ projectId, sessionIds }: { projectId: string; sessionIds: string[] }) {
-  const state = useProjectRollupState(projectId, sessionIds);
+  const state = useProjectRollupState(IS_WEBKIT ? null : projectId, IS_WEBKIT ? [] : sessionIds);
   return <SessionStateDot state={state} size={8} reserveSpace />;
 }
 
@@ -54,15 +60,19 @@ const PAGE_CSS = `
   .ws-row:hover { background: var(--fill-tertiary); }
   .ws-row .ws-act { opacity: 0; transition: opacity 120ms ease; }
   .ws-row:hover .ws-act, .ws-row.ws-active .ws-act { opacity: 1; }
-  .ws-tab { transition: background 120ms ease, color 120ms ease; }
   .ws-tab:hover { background: var(--fill-tertiary); }
   .ws-tab .ws-tab-x { opacity: 0; transition: opacity 120ms ease; }
   .ws-tab:hover .ws-tab-x, .ws-tab.on .ws-tab-x { opacity: 1; }
   .ws-newbtn:hover { background: var(--fill-secondary) !important; }
   .ws-tabs::-webkit-scrollbar { height: 0; }
+  /* 3px colored stripe at the strip's left edge — at-a-glance tint of the
+     active project. Single project per strip now (tabs are project-scoped),
+     so no inter-group dividers are needed. */
+  .ws-tab-group-stripe { width: 3px; flex-shrink: 0; }
+  .ws-tab { transition: background 120ms ease, color 120ms ease; }
   .ws-kinds::-webkit-scrollbar { height: 0; }
-  .ws-tree::-webkit-scrollbar { width: 11px; }
-  .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+  .ws-tree::-webkit-scrollbar { width: 8px; }
+  .ws-tree::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
   .ws-tree:hover::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 40%, transparent); background-clip: padding-box; }
   .ws-proj:hover .ws-newchat { opacity: 1; }
   .ws-newchat { opacity: 0; transition: opacity 120ms ease; }
@@ -77,10 +87,26 @@ const PAGE_CSS = `
 `;
 
 type ProjectSection = 'settings' | 'instructions' | 'jobs' | 'skills';
-interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image' | 'project'; filePath?: string; imageAssetId?: string; imagePath?: string; projectSection?: ProjectSection }
+interface Tab { key: string; projectId: string; sessionId: string | null; title: string; kind?: 'chat' | 'file' | 'image' | 'project'; filePath?: string; imageAssetId?: string; imagePath?: string; projectSection?: ProjectSection;
+  /** Non-default base branch picked via <BranchPicker /> for a not-yet-sent
+      "New chat" tab. Forwarded into sendChat so the session's worktree forks
+      from it on first send. Default-branch picks leave this undefined so the
+      tab title stays clean (no `· master` suffix). */
+  base?: string;
+}
 
 const TABS_KEY = 'maestro.workspace.tabs';
 const EXPANDED_KEY = 'maestro.workspace.expanded';
+// Tab strip: which project is currently focused. The strip shows ONLY this
+// project's open tabs — tabs from other projects stay in storage but are
+// hidden from view (they re-appear when the operator switches projects from
+// the sidebar). Persisted so a relaunch lands on the same project.
+const ACTIVE_PROJECT_KEY = 'maestro.workspace.activeProject';
+// Per-project: the last-focused tab. When the operator switches projects, we
+// restore THAT project's last active tab instead of always jumping to its
+// first tab — preserves the operator's working set per project. Persisted
+// across restarts so multi-project context survives a relaunch.
+const LAST_TAB_BY_PROJECT_KEY = 'maestro.workspace.lastTabByProject';
 
 function relTime(ts: number): string {
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
@@ -89,7 +115,7 @@ function relTime(ts: number): string {
   const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
   const d = Math.floor(h / 24); return d < 7 ? `${d}d ago` : `${Math.floor(d / 7)}w ago`;
 }
-const projColor = (p?: Project): string => (p?.color ? `var(--${p.color})` : 'var(--blue)');
+const projColor = (p?: Project): string => projectColor(p ?? null);
 const projKind = (p?: Project): ProjectKind => (p?.kind ?? 'general');
 const CHAT_PREVIEW = 7; // chats shown per project before "Show all"
 
@@ -134,8 +160,15 @@ export default function Workspace() {
   const [chatsAllOpen, setChatsAllOpen] = React.useState<Set<string>>(new Set());
   // Per-project "⋯" menu (settings / jobs / instructions / reveal …).
   const [menuProj, setMenuProj] = React.useState<string | null>(null);
+  // Which project's "+" button has the <BranchPicker /> popover open (one at a time).
+  const [pickerProj, setPickerProj] = React.useState<string | null>(null);
+  // Anchor for the open picker — attached to the live "+" button so the portaled
+  // popover positions itself against it (escapes the sidebar's overflow clip).
+  const pickerAnchorRef = React.useRef<HTMLButtonElement | null>(null);
   // Project pending a delete confirmation (the destructive modal).
   const [confirmDelProj, setConfirmDelProj] = React.useState<string | null>(null);
+  // Reveal soft-hidden projects in the rail (off by default).
+  const [showHidden, setShowHidden] = React.useState(false);
   // Per-project "Archived" sub-list expanded state.
   const [archivedOpen, setArchivedOpen] = React.useState<Set<string>>(new Set());
   const [kindFilter, setKindFilterState] = React.useState<KindFilter>(() => {
@@ -159,9 +192,30 @@ export default function Workspace() {
   const [turnsByTab, setTurnsByTab] = React.useState<Record<string, Job[]>>({});
   // Sessions with a job running/pending right now — drives the sidebar loading spinners.
   const [runningSessions, setRunningSessions] = React.useState<Set<string>>(new Set());
-  const [addOpen, setAddOpen] = React.useState(false); // add-project menu
+  const [addOpen, setAddOpen] = React.useState(false); // in-workspace add-project modal
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => { try { return localStorage.getItem('maestro.workspace.sidebar') === '0'; } catch { return false; } });
   const toggleSidebar = () => setSidebarCollapsed(c => { const n = !c; try { localStorage.setItem('maestro.workspace.sidebar', n ? '0' : '1'); } catch { /* ignore */ } return n; });
+
+  // Project-scoped tab strip:
+  //   – `activeProjectId` decides WHICH project's tabs the strip renders. Tabs
+  //     from other projects stay in storage but are hidden — re-appear when
+  //     the operator switches projects. Persisted across restarts.
+  //   – `lastActiveByProject` remembers each project's last-active tab key so
+  //     switching projects restores the operator's working position there,
+  //     not "first tab" amnesia. Persisted across restarts.
+  const [activeProjectId, setActiveProjectIdState] = React.useState<string | null>(() => {
+    try { return localStorage.getItem(ACTIVE_PROJECT_KEY); } catch { return null; }
+  });
+  const setActiveProjectId = React.useCallback((pid: string | null) => {
+    setActiveProjectIdState(pid);
+    try { if (pid) localStorage.setItem(ACTIVE_PROJECT_KEY, pid); else localStorage.removeItem(ACTIVE_PROJECT_KEY); } catch { /* ignore */ }
+  }, []);
+  const [lastActiveByProject, setLastActiveByProject] = React.useState<Record<string, string>>(() => {
+    try { return JSON.parse(localStorage.getItem(LAST_TAB_BY_PROJECT_KEY) || '{}'); } catch { return {}; }
+  });
+  React.useEffect(() => {
+    try { localStorage.setItem(LAST_TAB_BY_PROJECT_KEY, JSON.stringify(lastActiveByProject)); } catch { /* ignore */ }
+  }, [lastActiveByProject]);
 
   const projById = React.useMemo(() => { const m: Record<string, Project> = {}; projects.forEach(p => { m[p.id] = p; }); return m; }, [projects]);
 
@@ -208,17 +262,49 @@ export default function Workspace() {
     restored.current = true;
     try {
       const saved = JSON.parse(localStorage.getItem(TABS_KEY) || '{}') as { tabs?: { projectId: string; sessionId: string }[]; active?: string };
+      // DEDUPE saved entries by sessionId — a previous race in openSession/seed
+      // paths could persist the same chat twice, which on restore renders TWO
+      // ChatThreads at `position: absolute; inset: 0` (same key, both matching
+      // activeKey), so they stack on top of each other and the user sees the
+      // "screen breaking" overlap on resume. Keep first wins.
+      const seenSid = new Set<string>();
       const rebuilt: Tab[] = (saved.tabs || [])
-        .map((t): Tab | null => { const s = sessions.find(x => x.id === t.sessionId); return s ? { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title } : null; })
+        .map((t): Tab | null => {
+          if (!t?.sessionId || seenSid.has(t.sessionId)) return null;
+          seenSid.add(t.sessionId);
+          const s = sessions.find(x => x.id === t.sessionId);
+          return s ? { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title } : null;
+        })
         .filter((t): t is Tab => !!t);
-      if (rebuilt.length) { setTabs(rebuilt); setActiveKey(rebuilt.find(t => t.key === saved.active)?.key ?? rebuilt[0].key); }
+      if (rebuilt.length) {
+        setTabs(rebuilt);
+        // Restore the active key for the persisted activeProjectId (or fall
+        // back to the first tab). Importantly, also pin activeProjectId to
+        // the restored tab's project — otherwise a project-only persistence
+        // means we'd land on a project with no visible tab.
+        const pid = (() => { try { return localStorage.getItem(ACTIVE_PROJECT_KEY); } catch { return null; } })();
+        const inProj = pid ? rebuilt.filter(t => t.projectId === pid) : [];
+        const pool = inProj.length ? inProj : rebuilt;
+        const target = pool.find(t => t.key === saved.active) ?? pool[0];
+        setActiveKey(target.key);
+        if (target.projectId !== pid) setActiveProjectId(target.projectId);
+      }
     } catch { /* ignore */ }
-  }, [sessions]);
+  }, [sessions, setActiveProjectId]);
 
   // persist tabs (only the session-backed ones survive a relaunch)
   React.useEffect(() => {
     try {
-      const payload = { tabs: tabs.filter(t => t.sessionId).map(t => ({ projectId: t.projectId, sessionId: t.sessionId })), active: activeKey };
+      // Dedupe by sessionId on the way OUT too, so even if `tabs` state
+      // briefly held a duplicate it can't poison a future cold start.
+      const seenSid = new Set<string>();
+      const payload = {
+        tabs: tabs
+          .filter(t => t.sessionId)
+          .filter(t => { if (seenSid.has(t.sessionId!)) return false; seenSid.add(t.sessionId!); return true; })
+          .map(t => ({ projectId: t.projectId, sessionId: t.sessionId })),
+        active: activeKey,
+      };
       localStorage.setItem(TABS_KEY, JSON.stringify(payload));
     } catch { /* ignore */ }
   }, [tabs, activeKey]);
@@ -268,7 +354,7 @@ export default function Workspace() {
     if (st.expand) setExpanded(e => new Set(e).add(seedProjectId));
     if (seedSessionId) {
       setTabs(ts => ts.some(t => t.sessionId === seedSessionId) ? ts : [...ts, { key: seedSessionId, projectId: seedProjectId, sessionId: seedSessionId, title: 'Building from design…' }]);
-      setActiveKey(seedSessionId);
+      setActiveKey(seedSessionId); setActiveProjectId(seedProjectId);
     }
     navigate('.', { replace: true, state: {} }); // clear so back/refresh doesn't re-seed
   }, [location.state]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -276,21 +362,55 @@ export default function Workspace() {
   const activeTab = tabs.find(t => t.key === activeKey) ?? null;
   const activeProject = activeTab ? projById[activeTab.projectId] : undefined;
 
+  // Keep activeProjectId in lock-step with the active tab's project. Uses
+  // useLayoutEffect so the strip's filter sees the new project on the SAME
+  // paint as the new active tab — no one-frame flash of "active tab not in
+  // visible list". The major open* handlers also set activeProjectId
+  // proactively, so this is a safety net for indirect setActiveKey paths
+  // (keyboard cycling, restore-from-storage, etc.).
+  React.useLayoutEffect(() => {
+    if (activeTab && activeTab.projectId !== activeProjectId) {
+      setActiveProjectId(activeTab.projectId);
+    }
+  }, [activeTab, activeProjectId, setActiveProjectId]);
+
+  // Per-project "last active tab" memory — refreshed any time activeKey changes
+  // while inside a project. Switching to a different project later restores
+  // THIS key (via lastTabForProject) instead of always grabbing the first tab.
+  React.useEffect(() => {
+    if (!activeKey || !activeTab) return;
+    setLastActiveByProject(prev => prev[activeTab.projectId] === activeKey ? prev : { ...prev, [activeTab.projectId]: activeKey });
+  }, [activeKey, activeTab]);
+
+  // Switch the strip to another project's tabs, restoring that project's
+  // last-active tab (or its first tab if we have no memory yet). Called from
+  // the sidebar project-row header so the operator can flip projects without
+  // having to click a chat first.
+  const switchToProject = React.useCallback((pid: string) => {
+    setActiveProjectId(pid);
+    const target = lastTabForProject(tabs, pid, lastActiveByProject);
+    setActiveKey(target?.key ?? null);
+  }, [tabs, lastActiveByProject, setActiveProjectId]);
+
+  // The visible-in-strip tabs (project-scoped). Storage still holds every
+  // open tab across every project — this is just the render filter.
+  const visibleTabs = React.useMemo(() => projectVisibleTabs(tabs, activeProjectId), [tabs, activeProjectId]);
+
   // Open a file as a tab (deduped on its path).
   const openFile = (projectId: string, filePath: string) => {
     const existing = tabs.find(t => t.kind === 'file' && t.filePath === filePath);
-    if (existing) { setActiveKey(existing.key); return; }
+    if (existing) { setActiveKey(existing.key); setActiveProjectId(existing.projectId); return; }
     const key = 'file:' + filePath;
     setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: filePath.split('/').pop() ?? filePath, kind: 'file', filePath }]));
-    setActiveKey(key);
+    setActiveKey(key); setActiveProjectId(projectId);
   };
   // Open a generated/attached image in its own VS Code-style tab (not Finder).
   const openImage = (projectId: string, assetId: string, name: string, imagePath?: string) => {
     const key = 'image:' + assetId;
     const existing = tabs.find(t => t.key === key);
-    if (existing) { setActiveKey(existing.key); return; }
+    if (existing) { setActiveKey(existing.key); setActiveProjectId(existing.projectId); return; }
     setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: name || 'Image', kind: 'image', imageAssetId: assetId, imagePath }]));
-    setActiveKey(key);
+    setActiveKey(key); setActiveProjectId(projectId);
   };
   // Open a project hub tab (settings / instructions+memory / jobs) — deduped.
   const openProject = (projectId: string, section: ProjectSection = 'settings') => {
@@ -298,7 +418,7 @@ export default function Workspace() {
     setTabs(ts => ts.some(t => t.key === key)
       ? ts.map(t => (t.key === key ? { ...t, projectSection: section } : t))
       : [...ts, { key, projectId, sessionId: null, title: projById[projectId]?.name ?? 'Project', kind: 'project', projectSection: section }]);
-    setActiveKey(key);
+    setActiveKey(key); setActiveProjectId(projectId);
   };
   // Files the active chat wrote (from its turns' write-tool steps), newest first.
   const changedFiles = React.useMemo(() => {
@@ -324,19 +444,17 @@ export default function Workspace() {
     return out;
   }, [turnsByTab, activeKey]);
 
-  // Add-project: open a local folder as a coding project (native picker).
-  const openLocalFolder = async () => {
-    setAddOpen(false);
-    try {
-      const r = await api.pickFolder();
-      if (!r || !r.ok || !r.path) return;
-      const name = r.path.split('/').filter(Boolean).pop() ?? 'Project';
-      const proj = await api.createProject({ name, kind: 'coding', path: r.path, instructions: '', color: 'blue' });
-      setProjects(ps => (ps.some(x => x.id === proj.id) ? ps : [proj, ...ps]));
-      setExpanded(e => new Set(e).add(proj.id));
-    } catch { /* cancelled or failed */ }
-  };
-  const recents = projects.filter(p => p.path && projKind(p) !== 'design').slice(0, 5);
+  // Add-project: any of the three modal flows (from folder, new, clone)
+  // reaches us through this callback. We update the in-memory list, auto-
+  // expand the entry so the user sees the new project immediately, and
+  // raise the standard transient toast — no navigation, ever.
+  const onProjectAdded = React.useCallback((proj: Project) => {
+    setProjects(ps => (ps.some(x => x.id === proj.id) ? ps : [proj, ...ps]));
+    setExpanded(e => new Set(e).add(proj.id));
+    setCopyHint(`Project '${proj.name}' added — click to open chat`);
+    if (copyHintTimer.current) window.clearTimeout(copyHintTimer.current);
+    copyHintTimer.current = window.setTimeout(() => setCopyHint(null), 2400);
+  }, []);
 
   // keep the active tab in view + recompute whether the strip overflows
   React.useLayoutEffect(() => {
@@ -352,22 +470,57 @@ export default function Workspace() {
   }, [tabs, activeKey]);
 
   const openSession = (s: ChatSession) => {
-    const existing = tabs.find(t => t.sessionId === s.id);
-    if (existing) { setActiveKey(existing.key); return; }
-    setTabs(ts => [...ts, { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title }]);
-    setActiveKey(s.id);
+    // Dedup INSIDE the functional updater — relying on `tabs` from the closure
+    // is racy: two rapid clicks (or a click+seed) both see the same stale
+    // closure with `existing === undefined`, both append, and we end up with
+    // TWO tabs sharing the same key. They both then satisfy
+    // `t.key === activeKey` in the tab pane render and stack on top of each
+    // other at `position:absolute; inset:0`, which the user sees as the
+    // chat "screen breaking" / overlapping content on resume (PR #84).
+    //
+    // We ALSO pin activeProjectId here so the project-scoped tab strip
+    // switches to the right project the moment the session is opened — for
+    // a deduped existing tab that's the EXISTING tab's project (which may
+    // differ from the session's project in edge cases like cross-project
+    // session moves), otherwise it's the session's project.
+    let nextActiveKey = s.id;
+    let nextProjectId = s.projectId;
+    setTabs(ts => {
+      const existing = ts.find(t => t.sessionId === s.id || t.key === s.id);
+      if (existing) { nextActiveKey = existing.key; nextProjectId = existing.projectId; return ts; }
+      return [...ts, { key: s.id, projectId: s.projectId, sessionId: s.id, title: s.title }];
+    });
+    setActiveKey(nextActiveKey); setActiveProjectId(nextProjectId);
   };
-  const newChat = (projectId: string) => {
+  /** Open a fresh "New chat" tab in `projectId`. Pass `base` to fork its
+      worktree from a specific branch (the picker's path); omit it for the
+      legacy default-branch flow (⌘/Ctrl+click on the "+" button). */
+  const newChat = (projectId: string, base?: string) => {
     const key = `new:${newCounter.current++}`;
-    setTabs(ts => [...ts, { key, projectId, sessionId: null, title: 'New chat' }]);
-    setActiveKey(key);
+    setTabs(ts => [...ts, { key, projectId, sessionId: null, title: 'New chat', ...(base ? { base } : {}) }]);
+    setActiveKey(key); setActiveProjectId(projectId);
     if (!expanded.has(projectId)) setExpanded(e => new Set(e).add(projectId));
   };
+  /** Close a tab. The "next active" pick is scoped to the active project so
+      the strip never silently jumps to a tab in a different project — that
+      would violate the "tabs are project-specific" rule. When the closed
+      tab was the last one in the active project, activeKey becomes null;
+      activeProjectId stays put so the operator's sidebar context is kept. */
   const closeTab = (key: string) => {
     setTabs(ts => {
-      const idx = ts.findIndex(t => t.key === key);
       const next = ts.filter(t => t.key !== key);
-      if (activeKey === key) setActiveKey(next.length ? next[Math.min(idx, next.length - 1)].key : null);
+      if (activeKey === key) {
+        const closed = ts.find(t => t.key === key);
+        const projTabs = closed ? next.filter(t => t.projectId === closed.projectId) : [];
+        if (projTabs.length) {
+          // Pick the tab next to the closed one within the project — same UX
+          // as VS Code: closing the rightmost tab activates the new rightmost.
+          const origIdx = ts.filter(t => t.projectId === closed!.projectId).findIndex(t => t.key === key);
+          setActiveKey(projTabs[Math.min(origIdx, projTabs.length - 1)].key);
+        } else {
+          setActiveKey(null);
+        }
+      }
       return next;
     });
   };
@@ -400,6 +553,18 @@ export default function Workspace() {
     setExpanded(e => { const n = new Set(e); n.delete(id); return n; });
     void api.deleteProject(id).catch(() => {});
   };
+  // Toggle a project's reversible soft-hide — optimistic, persisted via the
+  // shared updateProject path (syncs to the gallery + mobile too).
+  const setHidden = (id: string, hidden: boolean) => {
+    setProjects(ps => ps.map(p => p.id === id ? { ...p, hidden } : p));
+    void api.updateProject(id, { hidden }).catch(() => { api.listProjects().then(setProjects).catch(() => {}); });
+  };
+  const openBrowser = (projectId: string) => {
+    void api.browserOpen(projectId).catch(() => {});
+  };
+  const closeBrowser = (projectId: string) => {
+    void api.browserClose(projectId).catch(() => {});
+  };
   const commitRename = (id: string) => {
     const title = renameVal.trim(); setRenamingId(null);
     if (!title) return;
@@ -417,9 +582,9 @@ export default function Workspace() {
   const copyTranscript = async (tab: Tab, mode: TranscriptMode) => {
     if (!tab.sessionId) { showCopyHint('Send a message first'); return; }
     try {
-      // The active tab's turns are already lifted into turnsByTab (live); fall back to a fetch.
-      const cached = turnsByTab[tab.key];
-      const jobs = cached && cached.length ? cached : await api.listJobs(undefined, tab.sessionId);
+      // ChatThread lazy-loads the visible transcript page; copy is an explicit
+      // user action, so fetch the complete session here.
+      const jobs = await api.listJobs(undefined, tab.sessionId);
       if (!jobs.length) { showCopyHint('Nothing to copy yet'); return; }
       await navigator.clipboard?.writeText(formatTranscript(jobs, { mode, title: tab.title }));
       showCopyHint(mode === 'concise' ? 'Copied concise transcript' : 'Copied full transcript');
@@ -458,7 +623,9 @@ export default function Workspace() {
   // CodeSpace shows coding work only — design projects live in the Design tab.
   const codeProjects = projects.filter(p => projKind(p) !== 'design');
   const kindCount = (k: KindFilter) => (k === 'all' ? codeProjects.length : codeProjects.filter(p => projKind(p) === k).length);
-  const visibleProjects = codeProjects.filter(p => kindMatch(p) && projHit(p));
+  // Soft-hidden projects drop out of the rail unless "Show hidden" is on.
+  const hiddenCount = codeProjects.filter(p => p.hidden && kindMatch(p) && projHit(p)).length;
+  const visibleProjects = codeProjects.filter(p => kindMatch(p) && projHit(p) && (showHidden || !p.hidden));
   const sessionsByProject = (pid: string) => {
     const p = projById[pid];
     return sessions.filter(s => s.projectId === pid && !s.archived && (!q || chatHit(s) || (p && p.name.toLowerCase().includes(q)))).sort((a, b) => b.updatedAt - a.updatedAt);
@@ -475,10 +642,27 @@ export default function Workspace() {
     const open = tabs.some(t => t.sessionId === s.id);
     const isActive = activeTab?.sessionId === s.id;
     const p = projById[s.projectId];
+    // Live git/PR state → left-border stripe colour (gray=clean, amber=
+    // uncommitted, blue=PR open, green=mergeable, red=conflicts, etc.). The
+    // hook subscribes to the shared cache, so this only re-renders when THIS
+    // session's status fires. `no-repo` → transparent stripe (invisible) so
+    // the row layout stays the same and we don't surface a misleading dot.
+    const liveState: SessionGitState | null = useSessionStateOnly(IS_WEBKIT ? null : s.id);
+    const stripeColor = liveState ? SESSION_STATE_STRIPE[liveState] : 'transparent';
+    const stripeLabel = liveState && liveState !== 'no-repo' ? SESSION_STATE_LONG_LABELS[liveState] : null;
     return (
-      <div className={`ws-row${isActive ? ' ws-active' : ''}`} onClick={() => openSession(s)} style={{
-        display: 'flex', alignItems: 'center', gap: 7, padding: `5px 8px 5px ${indent}px`, borderRadius: 8, cursor: 'pointer',
-        background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
+      <div className={`ws-row${isActive ? ' ws-active' : ''}`} onClick={() => openSession(s)}
+        aria-label={stripeLabel ? `${s.title} — ${stripeLabel}` : s.title}
+        title={stripeLabel ?? undefined}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 7,
+          // Internal padding adjusted so the 4px stripe takes the leftmost
+          // pixels and the row content visually starts at the same place.
+          padding: `5px 8px 5px ${Math.max(8, indent - 4)}px`,
+          borderRadius: 8, cursor: 'pointer',
+          borderLeft: `4px solid ${stripeColor}`,
+          background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent',
+        }}>
         {runningSessions.has(s.id)
           ? <Loader size={13} color={projColor(p)} />
           : <Icon name={s.branch ? 'gitMerge' : 'chat'} size={13} style={{ flexShrink: 0, color: open ? projColor(p) : 'var(--ink-tertiary)' }} />}
@@ -528,6 +712,36 @@ export default function Workspace() {
     <div style={{ padding: '10px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{t}</div>
   );
 
+  // Keyboard shortcuts (project-scoped — they walk the VISIBLE tabs, which
+  // are the active project's tabs only):
+  //   ⌥←/→ cycle through the strip in left-to-right order. Stays inside the
+  //         current project — to switch projects the operator clicks a chat
+  //         in another project's sidebar list.
+  //   ⌘1…9 jump to the Nth visible tab.
+  // We avoid the bare ⌘←/→ because Electron / web routing already owns them.
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // ── ⌥←/⌥→: cycle through visible tabs in strip order ──
+      if (e.altKey && !e.metaKey && !e.shiftKey && !e.ctrlKey && (e.code === 'ArrowLeft' || e.code === 'ArrowRight')) {
+        if (!visibleTabs.length) return;
+        const idx = activeKey ? visibleTabs.findIndex(t => t.key === activeKey) : -1;
+        const delta = e.code === 'ArrowRight' ? 1 : -1;
+        const next = visibleTabs[(Math.max(0, idx) + delta + visibleTabs.length) % visibleTabs.length];
+        if (next) { e.preventDefault(); setActiveKey(next.key); }
+        return;
+      }
+      // ── ⌘1…⌘9: jump to the Nth visible tab ──
+      if (e.metaKey && !e.shiftKey && !e.altKey && !e.ctrlKey && /^Digit[1-9]$/.test(e.code)) {
+        const n = parseInt(e.code.slice(5), 10) - 1;
+        const tgt = visibleTabs[n];
+        if (tgt) { e.preventDefault(); setActiveKey(tgt.key); }
+        return;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [visibleTabs, activeKey]);
+
   return (
     <AppShell active="workspace">
       <style>{PAGE_CSS}</style>
@@ -537,42 +751,14 @@ export default function Workspace() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 14px 10px' }}>
             <Icon name="terminal" size={16} style={{ color: 'var(--blue)' }} />
             <span style={{ flex: 1, font: '700 var(--fs-callout)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>CodeSpace</span>
-            <div style={{ position: 'relative' }}>
-              <button onClick={() => setAddOpen(o => !o)} title="Add a project" className="ws-newbtn" style={{ width: 28, height: 28, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'transparent', color: addOpen ? 'var(--ink)' : 'var(--ink-tertiary)' }}>
-                <Icon name="plus" size={16} stroke={2.4} />
-              </button>
-              {addOpen && (
-                <>
-                  <div onClick={() => setAddOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
-                  <div style={{ position: 'absolute', top: '100%', right: 0, zIndex: 41, marginTop: 4, width: 232, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.24))', padding: 5 }}>
-                    {([
-                      { icon: 'folder', label: 'Open project', sub: 'A local folder on this Mac', act: openLocalFolder },
-                      { icon: 'terminal', label: 'Open GitHub project', sub: 'Clone a repository', act: () => { setAddOpen(false); navigate('/projects'); } },
-                      { icon: 'plus', label: 'New project', sub: 'Start from scratch', act: () => { setAddOpen(false); navigate('/projects'); } },
-                    ] as { icon: IconName; label: string; sub: string; act: () => void }[]).map(it => (
-                      <button key={it.label} onClick={it.act} className="ws-ovf-item" style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', textAlign: 'left', padding: '8px 9px', borderRadius: 8, cursor: 'pointer' }}>
-                        <Icon name={it.icon} size={15} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
-                        <span style={{ flex: 1, minWidth: 0 }}>
-                          <span style={{ display: 'block', font: '600 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)' }}>{it.label}</span>
-                          <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 1 }}>{it.sub}</span>
-                        </span>
-                      </button>
-                    ))}
-                    {recents.length > 0 && (
-                      <div style={{ borderTop: '0.5px solid var(--separator)', margin: '5px 0 0', paddingTop: 5 }}>
-                        <div style={{ padding: '2px 9px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Recents</div>
-                        {recents.map(p => (
-                          <button key={p.id} onClick={() => { setAddOpen(false); setExpanded(e => new Set(e).add(p.id)); }} className="ws-ovf-item" title={p.path} style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left', padding: '6px 9px', borderRadius: 8, cursor: 'pointer' }}>
-                            <Icon name="folder" size={13} style={{ flexShrink: 0, color: projColor(p) }} />
-                            <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
+            {/* "+" now opens the in-workspace <AddProjectModal />; no more
+                redirect to /projects (that broke the user's "everything in
+                workspace" expectation). The modal handles all three flows
+                (folder / new / clone) without leaving the page. */}
+            <button onClick={() => setAddOpen(true)} title="Add a project" className="ws-newbtn"
+              style={{ width: 28, height: 28, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'transparent', color: addOpen ? 'var(--ink)' : 'var(--ink-tertiary)' }}>
+              <Icon name="plus" size={16} stroke={2.4} />
+            </button>
           </div>
 
           {/* search + kind filter — narrow to a type, or find a project/chat by name */}
@@ -606,11 +792,23 @@ export default function Workspace() {
             </div>
           )}
 
+          {/* Workspace-wide attention strip — rolls up every project's
+              session git states into "X conflicts, Y mergeable, Z to push"
+              rows so the operator never has to tour each project to know
+              what needs them. Lives ABOVE the projects list, persists open. */}
+          <WorkspaceOverview onOpenSession={(projectId, sessionId) => {
+            const sess = sessions.find(s => s.id === sessionId);
+            if (sess) {
+              openSession(sess);
+              if (!expanded.has(projectId)) setExpanded(e => new Set(e).add(projectId));
+            }
+          }} />
+
           <div className="ws-tree" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '0 8px 12px' }}>
             {projects.length === 0 && (
               <div style={{ padding: '40px 14px', textAlign: 'center', font: '400 var(--fs-footnote)/1.55 var(--font-text)', color: 'var(--ink-tertiary)' }}>
                 No projects yet.
-                <button onClick={() => navigate('/projects')} style={{ display: 'block', margin: '12px auto 0', height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Create a project</button>
+                <button onClick={() => setAddOpen(true)} style={{ display: 'block', margin: '12px auto 0', height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Create a project</button>
               </div>
             )}
 
@@ -622,6 +820,11 @@ export default function Workspace() {
             )}
 
             {visibleProjects.length > 0 && sectionLabel(kindFilter === 'all' ? 'Projects' : `${kindOf(kindFilter).label} projects`)}
+            {hiddenCount > 0 && (
+              <button onClick={() => setShowHidden(v => !v)} style={{ display: 'flex', alignItems: 'center', gap: 7, width: '100%', textAlign: 'left', padding: '4px 8px', margin: '0 0 2px', borderRadius: 7, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>
+                <Icon name={showHidden ? 'eye' : 'eyeOff'} size={13} /> {showHidden ? `Hide ${hiddenCount} hidden` : `Show ${hiddenCount} hidden`}
+              </button>
+            )}
             {projects.length > 0 && visibleProjects.length === 0 && (
               <div style={{ padding: '24px 14px', textAlign: 'center', font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>
                 No {kindFilter === 'all' ? '' : kindOf(kindFilter).label.toLowerCase() + ' '}projects{q ? ' match' : ''}.
@@ -632,13 +835,27 @@ export default function Workspace() {
               const chats = sessionsByProject(p.id);
               const isOpen = expanded.has(p.id) || (!!q && chats.length > 0);
               const projRunning = chats.some(s => runningSessions.has(s.id));
-              const projActive = p.id === activeTab?.projectId;
+              // "Active" is now tracked by activeProjectId — not derived from
+              // the active tab — so a project the operator switched into via
+              // the sidebar (without yet clicking a chat) still highlights.
+              const projActive = p.id === activeProjectId;
+              // Clicking the project header now does TWO things:
+              //   1. Switch the tab strip to this project's tabs (restoring
+              //      that project's last active tab if there is one).
+              //   2. Toggle the in-sidebar chat list open/closed.
+              // Order matters: switch first, so the strip reflects the
+              // project before the operator clicks any chat inside it.
+              const onHeaderClick = () => {
+                if (p.id !== activeProjectId) switchToProject(p.id);
+                setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; });
+              };
               return (
-                // Lift the whole project above sibling rows while its "⋯" menu is open, so the
-                // dropdown isn't painted over by the next project's row (each row otherwise
-                // scopes the menu's z-index to its own stacking context).
-                <div key={p.id} className="ws-proj" style={menuProj === p.id ? { position: 'relative', zIndex: 60 } : undefined}>
-                  <div className="ws-row ws-proj-head" {...dragProps(projDnd, p.id)} onClick={() => setExpanded(e => { const n = new Set(e); n.has(p.id) ? n.delete(p.id) : n.add(p.id); return n; })}
+                // Lift the whole project above sibling rows while its "⋯" menu OR its branch
+                // picker is open, so the popover isn't painted over by the next project's row
+                // (the sticky `.ws-proj-head` is a z-index:2 stacking context that otherwise
+                // traps the popover's z-index, so later sibling headers paint on top of it).
+                <div key={p.id} className="ws-proj" style={(menuProj === p.id || pickerProj === p.id) ? { position: 'relative', zIndex: 60 } : undefined}>
+                  <div className="ws-row ws-proj-head" {...dragProps(projDnd, p.id)} onClick={onHeaderClick}
                     style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 6px', cursor: 'pointer', position: 'relative', userSelect: 'none',
                       opacity: draggingProj === p.id ? 0.45 : undefined,
                       background: projActive ? `color-mix(in srgb, ${projColor(p)} 13%, var(--bg-grouped))` : undefined }}>
@@ -646,8 +863,8 @@ export default function Workspace() {
                     <Icon name="chevronRight" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0, transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
                     {projRunning
                       ? <Loader size={14} color={projColor(p)} />
-                      : <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p) }} />}
-                    <span style={{ flex: 1, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 6, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)' }}>
+                      : <Icon name="folder" size={14} style={{ flexShrink: 0, color: projColor(p), opacity: p.hidden ? 0.5 : undefined }} />}
+                    <span style={{ flex: 1, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 6, font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', opacity: p.hidden ? 0.5 : undefined }}>
                       <span style={{ minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>
                       <ProjectRollupDot projectId={p.id} sessionIds={chats.map(c => c.id)} />
                     </span>
@@ -655,9 +872,40 @@ export default function Workspace() {
                     <button className="ws-newchat" title="Project · settings, jobs, memory" onClick={e => { e.stopPropagation(); setMenuProj(m => m === p.id ? null : p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', flexShrink: 0, position: 'relative' }}>
                       <Icon name="more" size={15} />
                     </button>
-                    <button className="ws-newchat" title="New chat here" onClick={e => { e.stopPropagation(); newChat(p.id); }} style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)', flexShrink: 0 }}>
-                      <Icon name="plus" size={14} stroke={2.4} />
-                    </button>
+                    <div style={{ position: 'relative', flexShrink: 0 }}>
+                      <button ref={pickerProj === p.id ? pickerAnchorRef : null} className="ws-newchat" title="New chat here — pick a base branch (⌘+click to skip)"
+                        onClick={e => {
+                          e.stopPropagation();
+                          // ⌘/Ctrl+click skips the picker → instant chat off the
+                          // default branch (origin/HEAD). Preserves the zero-friction
+                          // path for power users who don't care about the base.
+                          if (e.metaKey || e.ctrlKey) {
+                            setPickerProj(null);
+                            newChat(p.id);
+                            return;
+                          }
+                          setPickerProj(cur => cur === p.id ? null : p.id);
+                          setMenuProj(null); // don't stack two popovers on the same header
+                        }}
+                        style={{ width: 20, height: 20, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--blue)' }}>
+                        <Icon name="plus" size={14} stroke={2.4} />
+                      </button>
+                      {/* Portaled to document.body + self-positioning against the button rect,
+                          so it can't be clipped by the sidebar's overflow. */}
+                      {pickerProj === p.id && (
+                        <BranchPicker
+                          anchorRef={pickerAnchorRef}
+                          projectId={p.id}
+                          onClose={() => setPickerProj(null)}
+                          onPick={(branch, isDefault) => {
+                            setPickerProj(null);
+                            // Default → omit base so the tab title stays clean and the
+                            // engine's resolveBaseBranch path handles it (same as ⌘+click).
+                            newChat(p.id, isDefault ? undefined : branch);
+                          }}
+                        />
+                      )}
+                    </div>
                     {menuProj === p.id && (
                       <>
                         <div onClick={e => { e.stopPropagation(); setMenuProj(null); }} style={{ position: 'fixed', inset: 0, zIndex: 50 }} />
@@ -673,9 +921,12 @@ export default function Workspace() {
                             </button>
                           ))}
                           <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
-                          {p.path && <button className="ws-ovf-item" onClick={() => { setMenuProj(null); void api.revealPath(p.path!); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="folder" size={15} style={{ color: 'var(--ink-secondary)' }} /> Reveal in Finder</button>}
-                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); navigate('/skills-registry'); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="spark" size={15} style={{ color: 'var(--ink-secondary)' }} /> Skills</button>
+                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); openBrowser(p.id); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="globe" size={15} style={{ color: 'var(--ink-secondary)' }} /> Open browser</button>
+                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); closeBrowser(p.id); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="xCircle" size={15} style={{ color: 'var(--ink-secondary)' }} /> Close browser</button>
                           <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
+                          {p.path && <button className="ws-ovf-item" onClick={() => { setMenuProj(null); void api.revealPath(p.path!); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="folder" size={15} style={{ color: 'var(--ink-secondary)' }} /> Reveal in Finder</button>}
+                          <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
+                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); setHidden(p.id, !p.hidden); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name={p.hidden ? 'eye' : 'eyeOff'} size={15} style={{ color: 'var(--ink-secondary)' }} /> {p.hidden ? 'Unhide project' : 'Hide project'}</button>
                           <button className="ws-ovf-item" onClick={() => { setMenuProj(null); setConfirmDelProj(p.id); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--red, #ff3b30)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="trash" size={15} /> Delete project</button>
                         </div>
                       </>
@@ -718,59 +969,86 @@ export default function Workspace() {
           </div>
         </div>
 
-        {/* ── right: tab bar + active chat ── */}
+        {/* ── right: tab bar + active chat ──
+            Tabs are PROJECT-SCOPED: the strip renders `visibleTabs` (only the
+            active project's tabs). Tabs from other projects stay in storage
+            and re-appear when the operator switches projects. No more
+            cross-project grouping / pin / peek ceremony. */}
         <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           {/* tab bar */}
-          <div style={{ display: 'flex', alignItems: 'stretch', height: 42, flexShrink: 0, borderBottom: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
+          <div style={{ display: 'flex', alignItems: 'stretch', height: 36, flexShrink: 0, borderBottom: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
+            {/* 3px project tint at the very start of the strip — the eye's
+                anchor that says "you're in <project>" without needing to read
+                the sidebar. Hidden when no project is focused. */}
+            {activeProjectId && (
+              <span aria-hidden="true" className="ws-tab-group-stripe" style={{ background: projColor(projById[activeProjectId]), flexShrink: 0 }} />
+            )}
             <div ref={tabStripRef} className="ws-tabs"
               onWheel={e => { const el = tabStripRef.current; if (el && Math.abs(e.deltaY) > Math.abs(e.deltaX)) el.scrollLeft += e.deltaY; }}
-              style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'stretch', overflowX: 'auto' }}>
-              {tabs.map(t => {
-                const on = t.key === activeKey;
+              style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'stretch', overflowX: 'auto' }}
+              role="tablist" aria-label={activeProjectId ? `Open tabs in ${projById[activeProjectId]?.name ?? 'project'}` : 'Open tabs'}>
+              {visibleTabs.length === 0 && activeProjectId && (
+                <div style={{ display: 'flex', alignItems: 'center', padding: '0 12px', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+                  No tabs open in {projById[activeProjectId]?.name ?? 'this project'} — click a chat in the sidebar.
+                </div>
+              )}
+              {visibleTabs.map(t => {
                 const p = projById[t.projectId];
-                // A chat tab is session-backed → its title can be renamed inline
-                // (mirrors the rail's double-click → input → commit flow).
+                const on = t.key === activeKey;
                 const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
                 const editing = chatTab && renamingId === t.sessionId;
+                const stripeColor = projColor(p);
+                const tabIcon = t.kind === 'file'
+                  ? <Icon name="file" size={11} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+                  : t.kind === 'image'
+                  ? <Icon name="image" size={11} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
+                  : t.kind === 'project'
+                  ? <Icon name="folder" size={11} style={{ color: stripeColor, flexShrink: 0 }} />
+                  : <Icon name="chat" size={11} style={{ color: stripeColor, flexShrink: 0 }} />;
                 return (
-                  <div key={t.key} data-tabkey={t.key} className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)} onContextMenu={e => openTabMenu(e, t)}
-                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
+                  <div key={t.key} data-tabkey={t.key}
+                    role="tab" aria-selected={on}
+                    className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)} onContextMenu={e => openTabMenu(e, t)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px 0 10px', maxWidth: 190, flexShrink: 0, cursor: 'pointer', position: 'relative',
                       borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
-                    {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: projColor(p) }} />}
-                    {t.kind === 'file'
-                      ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
-                      : t.kind === 'image'
-                      ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
-                      : t.kind === 'project'
-                      ? <Icon name="folder" size={12} style={{ color: projColor(p), flexShrink: 0 }} />
-                      : <Icon name="chat" size={12} style={{ color: projColor(p), flexShrink: 0 }} />}
+                    {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: stripeColor }} />}
+                    {tabIcon}
                     {editing && t.sessionId ? (
                       <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
                         onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}
-                        style={{ minWidth: 0, maxWidth: 150, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
+                        style={{ minWidth: 0, maxWidth: 132, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-caption)/1 var(--font-text)' }} />
                     ) : (
-                      <span title={chatTab ? 'Double-click to rename' : undefined}
+                      <span title={chatTab ? 'Double-click to rename' : (t.base ? `New chat off ${t.base}` : undefined)}
                         onDoubleClick={chatTab ? (e => { e.stopPropagation(); setRenamingId(t.sessionId!); setRenameVal(t.title); }) : undefined}
-                        style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
+                        style={{ minWidth: 0, maxWidth: 132, font: `${on ? 600 : 500} var(--fs-caption)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {t.title}
+                        {t.base && !t.sessionId && (
+                          // Subtle base-branch suffix on un-sent "New chat" tabs only.
+                          // Hidden once the session is real (its title takes over).
+                          <span style={{ marginLeft: 5, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-mono)' }}>· {t.base}</span>
+                        )}
+                      </span>
                     )}
-                    <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
-                      <Icon name="x" size={11} stroke={2.6} />
+                    <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 16, height: 16, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+                      <Icon name="x" size={10} stroke={2.6} />
                     </button>
                   </div>
                 );
               })}
             </div>
-            {tabsOverflow && tabs.length > 0 && (
+            {tabsOverflow && visibleTabs.length > 0 && (
               <div style={{ position: 'relative', flexShrink: 0 }}>
-                <button onClick={() => setOvfOpen(o => !o)} title="All open chats" className="ws-newbtn"
-                  style={{ width: 34, height: '100%', display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: ovfOpen ? 'var(--ink)' : 'var(--ink-secondary)', background: 'transparent', cursor: 'pointer' }}>
-                  <Icon name="chevronDown" size={15} />
+                <button onClick={() => setOvfOpen(o => !o)} title="All open tabs in this project" className="ws-newbtn"
+                  style={{ width: 30, height: '100%', display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: ovfOpen ? 'var(--ink)' : 'var(--ink-secondary)', background: 'transparent', cursor: 'pointer' }}>
+                  <Icon name="chevronDown" size={13} />
                 </button>
                 {ovfOpen && (
                   <>
                     <div onClick={() => setOvfOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
                     <div style={{ position: 'absolute', top: '100%', right: 0, zIndex: 41, marginTop: 4, minWidth: 230, maxHeight: 340, overflowY: 'auto', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--card-shadow)', padding: 5 }}>
-                      {tabs.map(t => {
+                      {/* Overflow menu also scoped to the active project — same
+                          "tabs are project-specific" rule. */}
+                      {visibleTabs.map(t => {
                         const on = t.key === activeKey;
                         const p = projById[t.projectId];
                         const chatTab = (t.kind === 'chat' || !t.kind) && !!t.sessionId;
@@ -779,7 +1057,6 @@ export default function Workspace() {
                             style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 9px', borderRadius: 8, cursor: 'pointer', background: on ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
                             <Icon name={t.kind === 'file' ? 'file' : t.kind === 'image' ? 'image' : 'chat'} size={13} style={{ flexShrink: 0, color: t.kind && t.kind !== 'chat' ? 'var(--ink-secondary)' : projColor(p) }} />
                             <span style={{ flex: 1, minWidth: 0, font: `${on ? 600 : 500} var(--fs-footnote)/1.25 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
-                            {p && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', flexShrink: 0, maxWidth: 70, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</span>}
                             {chatTab && t.sessionId && (
                               <button title="Rename chat" onClick={e => { e.stopPropagation(); setOvfOpen(false); setActiveKey(t.key); setRenamingId(t.sessionId!); setRenameVal(t.title); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
                                 <Icon name="pencil" size={11} stroke={2.4} />
@@ -796,9 +1073,13 @@ export default function Workspace() {
                 )}
               </div>
             )}
-            <button onClick={() => newChat(activeTab?.projectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
-              title="New chat" className="ws-newbtn" style={{ width: 40, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
-              <Icon name="plus" size={16} stroke={2.4} />
+            {/* New-chat "+" — opens the new tab in the active project (so the
+                strip stays project-scoped). Falls back to the first project
+                only when nothing is active yet. */}
+            <button onClick={() => newChat(activeProjectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
+              title={activeProjectId ? `New chat in ${projById[activeProjectId]?.name ?? 'project'}` : 'New chat'} className="ws-newbtn"
+              style={{ width: 36, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
+              <Icon name="plus" size={15} stroke={2.4} />
             </button>
           </div>
 
@@ -851,7 +1132,12 @@ export default function Workspace() {
                   </div>
                 </div>
               )}
-              {tabs.map(t => (
+              {/* Belt-and-braces: if a duplicate-key tab ever slips through any
+                  insertion path, only ONE entry per key is rendered. Without
+                  this, two `position:absolute; inset:0` ChatThreads stack on
+                  top of each other (both satisfy `t.key === activeKey`) and
+                  the operator sees the chat "screen breaking" overlap. */}
+              {Array.from(new Map(tabs.map(t => [t.key, t])).values()).map(t => (
                 <div key={t.key} style={{ position: 'absolute', inset: 0, display: t.key === activeKey ? 'flex' : 'none' }}>
                   {t.kind === 'file' && t.filePath
                     ? <FileViewer projectId={t.projectId} filePath={t.filePath} />
@@ -859,10 +1145,11 @@ export default function Workspace() {
                     ? <ImageViewer assetId={t.imageAssetId} name={t.title} imagePath={t.imagePath} />
                     : t.kind === 'project'
                     ? <ProjectPanel projectId={t.projectId} section={t.projectSection} />
-                    : <ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
-                        sessionId={t.sessionId} onSessionCreated={onSessionCreated(t.key)} onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
+                    : <ErrorBoundary name="chat"><ChatThread flush autoFocus={t.key === activeKey} projectId={t.projectId} project={projById[t.projectId] ?? null}
+                        sessionId={t.sessionId} base={t.base} onSessionCreated={onSessionCreated(t.key)} onOpenSession={openSession}
+                        onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
                         onOpenImage={(assetId, name, imagePath) => openImage(t.projectId, assetId, name, imagePath)}
-                        onOpenFile={(filePath) => openFile(t.projectId, filePath)} />}
+                        onOpenFile={(filePath) => openFile(t.projectId, filePath)} /></ErrorBoundary>}
                 </div>
               ))}
             </div>
@@ -901,6 +1188,11 @@ export default function Workspace() {
           </div>
         );
       })()}
+
+      {/* In-workspace add-project modal — dims the workspace but leaves it
+          visible, so the user knows they did NOT navigate away. The "+"
+          button above opens it; success returns through onProjectAdded. */}
+      <AddProjectModal open={addOpen} onClose={() => setAddOpen(false)} onAdded={onProjectAdded} />
     </AppShell>
   );
 }

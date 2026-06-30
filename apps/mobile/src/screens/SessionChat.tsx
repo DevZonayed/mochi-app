@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, TextInput, KeyboardAvoidingView, Platform, ActivityIndicator, Modal, Alert, Image } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNavigation, useRoute } from '@react-navigation/native';
@@ -587,6 +587,24 @@ function Turn({ job, onAnswer, answered }: { job: Job; onAnswer: (text: string) 
   );
 }
 
+function compareTurns(a: Job, b: Job): number {
+  const created = a.createdAt - b.createdAt;
+  if (created !== 0) return created;
+  const updated = a.updatedAt - b.updatedAt;
+  if (updated !== 0) return updated;
+  return a.id.localeCompare(b.id);
+}
+
+function mergeTurns(current: Job[], incoming: Job[]): Job[] {
+  if (incoming.length === 0) return current;
+  const byId = new Map(current.map((job) => [job.id, job]));
+  for (const job of incoming) {
+    const existing = byId.get(job.id);
+    if (!existing || job.updatedAt >= existing.updatedAt) byId.set(job.id, job);
+  }
+  return [...byId.values()].sort(compareTurns);
+}
+
 export function SessionChatScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
@@ -597,17 +615,21 @@ export function SessionChatScreen() {
   const initialSid: string | undefined = route.params?.sessionId;
   const [sessionId, setSessionId] = useState<string | undefined>(initialSid);
   const [title, setTitle] = useState<string>(route.params?.title ?? 'New chat');
-  // Turns are derived live from the unified SyncStore — every SSE `job` event
-  // for this session is already upserted by App.tsx's global subscriber, so we
-  // just filter + sort. The per-session AsyncStorage cache (turns.{sid}) is
-  // gone: the store IS the cache.
-  const allJobs = useSyncStore((s) => s.jobs);
-  const turns = useMemo(
-    () => (sessionId
-      ? allJobs.filter((j) => j.sessionId === sessionId).slice().sort((a, b) => a.createdAt - b.createdAt)
-      : []),
-    [allJobs, sessionId],
-  );
+  const liveJobs = useSyncStore((s) => (
+    sessionId
+      ? s.jobs
+        .filter((j) => j.sessionId === sessionId)
+        .sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt)
+        .slice(0, 40)
+      : []
+  ));
+  const [turns, setTurns] = useState<Job[]>([]);
+  const [loadingTurns, setLoadingTurns] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [hasOlderTurns, setHasOlderTurns] = useState(false);
+  const [olderBefore, setOlderBefore] = useState<number | null>(null);
+  const [olderCursor, setOlderCursor] = useState<string | null>(null);
+  const pageRequestRef = useRef(0);
   const settled = useSyncStore((s) => s.settled);
 
   const [text, setText] = useState('');
@@ -624,14 +646,84 @@ export function SessionChatScreen() {
   const changeEffort = (e: Effort) => { setEffort(e); if (sessionId) cacheSet(`effort.${sessionId}`, e); };
   const changeModel = (key: string) => { setModelKey(key); if (sessionId) cacheSet(`model.${sessionId}`, key); };
 
-  // Load the Mac's model catalog (cache-then-network) for the picker.
-  useEffect(() => { api.listModels().then((g) => { setModels(g); cacheSet('models', g); }).catch(() => {}); }, []);
+  // Keep the Mac's live model catalog fresh for the picker.
+  useEffect(() => {
+    let alive = true;
+    const load = (refresh = false) => {
+      api.listModels(refresh).then((g) => {
+        if (!alive) return;
+        setModels(g);
+        cacheSet('models', g);
+      }).catch(() => {});
+    };
+    load(true);
+    const timer = setInterval(() => load(), 60_000);
+    return () => { alive = false; clearInterval(timer); };
+  }, []);
+
+  useEffect(() => {
+    const request = ++pageRequestRef.current;
+    if (!sessionId) {
+      setTurns([]);
+      setHasOlderTurns(false);
+      setOlderBefore(null);
+      setOlderCursor(null);
+      setLoadingTurns(false);
+      return;
+    }
+
+    setLoadingTurns(true);
+    setTurns([]);
+    setHasOlderTurns(false);
+    setOlderBefore(null);
+    setOlderCursor(null);
+
+    api.listJobPage({ sessionId, limit: 30 })
+      .then((page) => {
+        if (pageRequestRef.current !== request) return;
+        setTurns(page.jobs.slice().sort(compareTurns));
+        setHasOlderTurns(page.hasMore);
+        setOlderBefore(page.nextBefore ?? null);
+        setOlderCursor(page.nextCursor ?? null);
+      })
+      .catch(() => {
+        if (pageRequestRef.current !== request) return;
+        setTurns((prev) => mergeTurns(prev, liveJobs));
+      })
+      .finally(() => {
+        if (pageRequestRef.current === request) setLoadingTurns(false);
+      });
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || liveJobs.length === 0) return;
+    setTurns((prev) => mergeTurns(prev, liveJobs));
+  }, [sessionId, liveJobs]);
 
   // Top up the store on (re-)open so a chat that's been idle while another
   // tab was in front catches up cleanly.
   useEffect(() => { void pullSync(); }, [sessionId]);
 
-  const loading = !settled && turns.length === 0 && !!sessionId;
+  const loadOlderTurns = useCallback(() => {
+    if (!sessionId || !hasOlderTurns || loadingOlder) return;
+    setLoadingOlder(true);
+    api.listJobPage({
+      sessionId,
+      limit: 30,
+      cursor: olderCursor ?? undefined,
+      before: olderCursor ? undefined : olderBefore ?? undefined,
+    })
+      .then((page) => {
+        setTurns((prev) => mergeTurns(prev, page.jobs));
+        setHasOlderTurns(page.hasMore);
+        setOlderBefore(page.nextBefore ?? null);
+        setOlderCursor(page.nextCursor ?? null);
+      })
+      .catch(() => {})
+      .finally(() => setLoadingOlder(false));
+  }, [sessionId, hasOlderTurns, loadingOlder, olderCursor, olderBefore]);
+
+  const loading = !!sessionId && turns.length === 0 && (loadingTurns || !settled);
   const liveTurn = turns.some((j) => j.status === 'running' || j.status === 'pending');
 
   /* User-intent scroll tracking. The previous implementation snapped back to
@@ -644,6 +736,10 @@ export function SessionChatScreen() {
   const NEAR_BOTTOM_PX = 80;
   const atBottomRef = useRef(true);
   const [pendingNew, setPendingNew] = useState(false);
+  useEffect(() => {
+    atBottomRef.current = true;
+    setPendingNew(false);
+  }, [sessionId]);
   const jumpToBottom = useCallback(() => {
     scrollRef.current?.scrollToEnd({ animated: true });
     atBottomRef.current = true;
@@ -686,6 +782,7 @@ export function SessionChatScreen() {
           setSessionId(res.session.id); setTitle(res.session.title || body.slice(0, 40));
           cacheSet(`effort.${res.session.id}`, effort); cacheSet(`model.${res.session.id}`, modelKey);
         }
+        setTurns((prev) => mergeTurns(prev, [res.job]));
         // The new turn (and any subsequent live updates) flow through the
         // SyncStore via SSE; a one-shot pullSync covers the corner case where
         // the streaming job emits BEFORE we receive the session-creation event.
@@ -847,6 +944,32 @@ export function SessionChatScreen() {
             onScroll={onScroll}
             scrollEventThrottle={16}
           >
+            {turns.length > 0 && hasOlderTurns ? (
+              <Pressable
+                onPress={loadOlderTurns}
+                disabled={loadingOlder}
+                accessibilityRole="button"
+                accessibilityLabel="Load earlier messages"
+                style={({ pressed }) => ({
+                  alignSelf: 'center',
+                  minHeight: 34,
+                  paddingHorizontal: 14,
+                  paddingVertical: 8,
+                  borderRadius: 17,
+                  marginBottom: 14,
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: 8,
+                  backgroundColor: theme.color.fillSecondary,
+                  borderWidth: 0.5,
+                  borderColor: theme.color.separator,
+                  opacity: pressed || loadingOlder ? 0.72 : 1,
+                })}
+              >
+                {loadingOlder ? <ActivityIndicator size="small" color={theme.color.blue} /> : <Icon name="chevronDown" size={14} color={theme.color.inkSecondary} />}
+                <Text style={{ fontSize: 13, fontWeight: '600', color: theme.color.inkSecondary }}>Load earlier</Text>
+              </Pressable>
+            ) : null}
             {turns.length === 0 ? (
               <View style={{ alignItems: 'center', paddingVertical: 70, paddingHorizontal: 30, gap: 12 }}>
                 <View style={{ width: 60, height: 60, borderRadius: 18, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}>
