@@ -41,6 +41,7 @@ import { app, shell } from 'electron';
 import { locateExtension } from './extension-locator.js';
 
 type Params = Record<string, unknown>;
+const NATIVE_WEBKIT = process.env.MAESTRO_NATIVE_WEBKIT === '1';
 
 const bad = (msg: string, statusCode = 400): never => {
   throw Object.assign(new Error(msg), { statusCode });
@@ -671,14 +672,18 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // so live `.git` mutations (commit/push/checkout) push status updates
         // back through the renderer's git-status event channel — without the
         // UI having to poll. Idempotent; no-op once attached.
-        try { gitWatcher?.attach(s.id); } catch { /* best effort */ }
+        if (!NATIVE_WEBKIT) {
+          try { gitWatcher?.attach(s.id); } catch { /* best effort */ }
+        }
         return gitService.fullStatus(s, { withPr: p.withPr !== false });
       }
       case 'refreshSessionGitStatus': {
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? ''));
         if (!s) return bad('session not found', 404);
-        try { gitWatcher?.attach(s.id); } catch { /* best effort */ }
+        if (!NATIVE_WEBKIT) {
+          try { gitWatcher?.attach(s.id); } catch { /* best effort */ }
+        }
         return gitService.fullStatus(s, { withPr: true });
       }
       // ── PR actions (DESKTOP-ONLY, outward — UI confirms before calling) ─
@@ -983,6 +988,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
       // ── Jobs ───────────────────────────────────────────────────
       case 'listJobs': return store.listJobs(p.projectId ? String(p.projectId) : undefined, p.sessionId ? String(p.sessionId) : undefined);
+      case 'listJobPage': return store.listJobPage({
+        projectId: p.projectId ? String(p.projectId) : undefined,
+        sessionId: p.sessionId ? String(p.sessionId) : undefined,
+        before: Number.isFinite(Number(p.before)) ? Number(p.before) : undefined,
+        cursor: typeof p.cursor === 'string' ? p.cursor : undefined,
+        limit: Number.isFinite(Number(p.limit)) ? Number(p.limit) : undefined,
+      });
       case 'getJob': {
         const j = store.getJob(String(p.id ?? ''));
         return j ?? bad('job not found', 404);

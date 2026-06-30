@@ -317,7 +317,15 @@ struct MarkdownText: View {
 struct CodeCardView: View {
     let code: String
     var lang: String?
-    private var tall: Bool { code.components(separatedBy: "\n").count > 18 }
+    private let previewLimit = 16_000
+    @State private var expanded = false
+
+    private var needsGuard: Bool { code.count > previewLimit }
+    private var visibleCode: String {
+        guard needsGuard, !expanded else { return code }
+        return String(code.prefix(previewLimit)) + "\n\n[...]"
+    }
+    private var tall: Bool { visibleCode.components(separatedBy: "\n").count > 18 }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -325,7 +333,22 @@ struct CodeCardView: View {
                 Text((lang ?? "code").uppercased())
                     .font(.system(size: 11, weight: .semibold, design: .monospaced)).tracking(0.4)
                     .foregroundStyle(Tok.inkTertiary)
+                if needsGuard {
+                    Text(expanded ? "FULL" : "\(compactCount(previewLimit)) / \(compactCount(code.count))")
+                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Tok.inkTertiary)
+                }
                 Spacer(minLength: 8)
+                if needsGuard {
+                    Button(expanded ? "Collapse" : "Show full") {
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) { expanded.toggle() }
+                    }
+                    .buttonStyle(.plain)
+                    .font(TokFont.text(TokFont.caption, .semibold))
+                    .foregroundStyle(Tok.blue)
+                }
                 CopyChip(text: code)   // always visible
             }
             .padding(.leading, 12).padding(.trailing, 8).frame(height: 30)
@@ -346,7 +369,13 @@ struct CodeCardView: View {
     }
 
     private var codeBody: some View {
-        SelectableText(attributed: NSMarkdown.code(code), wraps: false)
+        SelectableText(attributed: NSMarkdown.code(visibleCode), wraps: false)
             .padding(.horizontal, 13).padding(.vertical, 11)
+    }
+
+    private func compactCount(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fm", Double(n) / 1_000_000) }
+        if n >= 1_000 { return "\(n / 1_000)k" }
+        return "\(n)"
     }
 }

@@ -43,6 +43,7 @@ release/
 # settings file. Do NOT delete the negation.
 .claude/*
 !.claude/settings.json
+.agents/
 
 # env / secrets
 .env

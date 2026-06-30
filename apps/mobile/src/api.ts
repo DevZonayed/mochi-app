@@ -52,6 +52,20 @@ export interface Job {
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
   engine?: EngineId; model?: string; goal?: boolean; transcript?: TranscriptItem[]; createdAt: number; updatedAt: number;
 }
+export interface JobPage {
+  jobs: Job[];
+  total: number;
+  hasMore: boolean;
+  nextBefore: number | null;
+  nextCursor?: string | null;
+}
+export interface JobPageInput {
+  projectId?: string;
+  sessionId?: string;
+  before?: number;
+  cursor?: string;
+  limit?: number;
+}
 
 /** A chat thread inside a project. Each turn is a Job with this sessionId. */
 export interface ChatSession {
@@ -434,6 +448,7 @@ export const api = {
   deleteProject: (id: string) => cmd<{ ok: boolean }>('deleteProject', { id }),
 
   listJobs: (projectId?: string, sessionId?: string) => cmd<Job[]>('listJobs', { projectId, sessionId }),
+  listJobPage: (input: JobPageInput) => cmd<JobPage>('listJobPage', { ...input }),
 
   /** Chat sessions inside a project (the desktop's project → sessions tree). */
   listSessions: (projectId?: string) => cmd<ChatSession[]>('listSessions', { projectId }),

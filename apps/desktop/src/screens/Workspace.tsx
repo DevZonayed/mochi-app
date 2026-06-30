@@ -7,7 +7,7 @@ import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Icon } from '../lib/icons';
 import { AppShell } from '../lib/appShell';
-import { api, IS_LOCAL, type Project, type ChatSession, type ProjectKind, type Job } from '../lib/api';
+import { api, IS_LOCAL, IS_WEBKIT, type Project, type ChatSession, type ProjectKind, type Job } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
 import { FileViewer, ImageViewer } from '../lib/CodeView';
 import { ProjectPanel } from '../lib/ProjectPanel';
@@ -32,13 +32,13 @@ function Loader({ size = 13, color = 'var(--blue)' }: { size?: number; color?: s
 
 /** Live per-session state dot for the rail. Subscribes via the shared cache. */
 function SessionStateDotForId({ sessionId }: { sessionId: string }) {
-  const state = useSessionStateOnly(sessionId);
+  const state = useSessionStateOnly(IS_WEBKIT ? null : sessionId);
   return <SessionStateDot state={state} size={7} reserveSpace />;
 }
 
 /** Live worst-state-wins rollup dot for a project's chats. */
 function ProjectRollupDot({ projectId, sessionIds }: { projectId: string; sessionIds: string[] }) {
-  const state = useProjectRollupState(projectId, sessionIds);
+  const state = useProjectRollupState(IS_WEBKIT ? null : projectId, IS_WEBKIT ? [] : sessionIds);
   return <SessionStateDot state={state} size={8} reserveSpace />;
 }
 
@@ -559,6 +559,12 @@ export default function Workspace() {
     setProjects(ps => ps.map(p => p.id === id ? { ...p, hidden } : p));
     void api.updateProject(id, { hidden }).catch(() => { api.listProjects().then(setProjects).catch(() => {}); });
   };
+  const openBrowser = (projectId: string) => {
+    void api.browserOpen(projectId).catch(() => {});
+  };
+  const closeBrowser = (projectId: string) => {
+    void api.browserClose(projectId).catch(() => {});
+  };
   const commitRename = (id: string) => {
     const title = renameVal.trim(); setRenamingId(null);
     if (!title) return;
@@ -576,9 +582,9 @@ export default function Workspace() {
   const copyTranscript = async (tab: Tab, mode: TranscriptMode) => {
     if (!tab.sessionId) { showCopyHint('Send a message first'); return; }
     try {
-      // The active tab's turns are already lifted into turnsByTab (live); fall back to a fetch.
-      const cached = turnsByTab[tab.key];
-      const jobs = cached && cached.length ? cached : await api.listJobs(undefined, tab.sessionId);
+      // ChatThread lazy-loads the visible transcript page; copy is an explicit
+      // user action, so fetch the complete session here.
+      const jobs = await api.listJobs(undefined, tab.sessionId);
       if (!jobs.length) { showCopyHint('Nothing to copy yet'); return; }
       await navigator.clipboard?.writeText(formatTranscript(jobs, { mode, title: tab.title }));
       showCopyHint(mode === 'concise' ? 'Copied concise transcript' : 'Copied full transcript');
@@ -641,7 +647,7 @@ export default function Workspace() {
     // hook subscribes to the shared cache, so this only re-renders when THIS
     // session's status fires. `no-repo` → transparent stripe (invisible) so
     // the row layout stays the same and we don't surface a misleading dot.
-    const liveState: SessionGitState | null = useSessionStateOnly(s.id);
+    const liveState: SessionGitState | null = useSessionStateOnly(IS_WEBKIT ? null : s.id);
     const stripeColor = liveState ? SESSION_STATE_STRIPE[liveState] : 'transparent';
     const stripeLabel = liveState && liveState !== 'no-repo' ? SESSION_STATE_LONG_LABELS[liveState] : null;
     return (
@@ -915,8 +921,10 @@ export default function Workspace() {
                             </button>
                           ))}
                           <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
+                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); openBrowser(p.id); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="globe" size={15} style={{ color: 'var(--ink-secondary)' }} /> Open browser</button>
+                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); closeBrowser(p.id); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="xCircle" size={15} style={{ color: 'var(--ink-secondary)' }} /> Close browser</button>
+                          <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
                           {p.path && <button className="ws-ovf-item" onClick={() => { setMenuProj(null); void api.revealPath(p.path!); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="folder" size={15} style={{ color: 'var(--ink-secondary)' }} /> Reveal in Finder</button>}
-                          <button className="ws-ovf-item" onClick={() => { setMenuProj(null); navigate('/skills-registry'); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="spark" size={15} style={{ color: 'var(--ink-secondary)' }} /> Skills</button>
                           <div style={{ height: 1, background: 'var(--separator)', margin: '5px 4px' }} />
                           <button className="ws-ovf-item" onClick={() => { setMenuProj(null); setHidden(p.id, !p.hidden); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name={p.hidden ? 'eye' : 'eyeOff'} size={15} style={{ color: 'var(--ink-secondary)' }} /> {p.hidden ? 'Unhide project' : 'Hide project'}</button>
                           <button className="ws-ovf-item" onClick={() => { setMenuProj(null); setConfirmDelProj(p.id); }} style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, color: 'var(--red, #ff3b30)', font: '500 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}><Icon name="trash" size={15} /> Delete project</button>
@@ -968,7 +976,7 @@ export default function Workspace() {
             cross-project grouping / pin / peek ceremony. */}
         <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           {/* tab bar */}
-          <div style={{ display: 'flex', alignItems: 'stretch', height: 42, flexShrink: 0, borderBottom: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
+          <div style={{ display: 'flex', alignItems: 'stretch', height: 36, flexShrink: 0, borderBottom: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
             {/* 3px project tint at the very start of the strip — the eye's
                 anchor that says "you're in <project>" without needing to read
                 the sidebar. Hidden when no project is focused. */}
@@ -991,28 +999,28 @@ export default function Workspace() {
                 const editing = chatTab && renamingId === t.sessionId;
                 const stripeColor = projColor(p);
                 const tabIcon = t.kind === 'file'
-                  ? <Icon name="file" size={12} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+                  ? <Icon name="file" size={11} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
                   : t.kind === 'image'
-                  ? <Icon name="image" size={12} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
+                  ? <Icon name="image" size={11} style={{ color: 'var(--purple, #8b5cf6)', flexShrink: 0 }} />
                   : t.kind === 'project'
-                  ? <Icon name="folder" size={12} style={{ color: stripeColor, flexShrink: 0 }} />
-                  : <Icon name="chat" size={12} style={{ color: stripeColor, flexShrink: 0 }} />;
+                  ? <Icon name="folder" size={11} style={{ color: stripeColor, flexShrink: 0 }} />
+                  : <Icon name="chat" size={11} style={{ color: stripeColor, flexShrink: 0 }} />;
                 return (
                   <div key={t.key} data-tabkey={t.key}
                     role="tab" aria-selected={on}
                     className={`ws-tab${on ? ' on' : ''}`} onClick={() => setActiveKey(t.key)} onContextMenu={e => openTabMenu(e, t)}
-                    style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '0 10px 0 13px', maxWidth: 220, flexShrink: 0, cursor: 'pointer', position: 'relative',
+                    style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '0 8px 0 10px', maxWidth: 190, flexShrink: 0, cursor: 'pointer', position: 'relative',
                       borderRight: '0.5px solid var(--separator)', background: on ? 'var(--bg-elevated)' : 'transparent' }}>
                     {on && <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 2, background: stripeColor }} />}
                     {tabIcon}
                     {editing && t.sessionId ? (
                       <input autoFocus value={renameVal} onClick={e => e.stopPropagation()} onChange={e => setRenameVal(e.target.value)}
                         onBlur={() => commitRename(t.sessionId!)} onKeyDown={e => { if (e.key === 'Enter') commitRename(t.sessionId!); if (e.key === 'Escape') setRenamingId(null); }}
-                        style={{ minWidth: 0, maxWidth: 150, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' }} />
+                        style={{ minWidth: 0, maxWidth: 132, border: '1px solid var(--blue)', borderRadius: 5, padding: '1px 5px', background: 'var(--bg)', color: 'var(--ink)', font: '500 var(--fs-caption)/1 var(--font-text)' }} />
                     ) : (
                       <span title={chatTab ? 'Double-click to rename' : (t.base ? `New chat off ${t.base}` : undefined)}
                         onDoubleClick={chatTab ? (e => { e.stopPropagation(); setRenamingId(t.sessionId!); setRenameVal(t.title); }) : undefined}
-                        style={{ minWidth: 0, maxWidth: 150, font: `${on ? 600 : 500} var(--fs-footnote)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        style={{ minWidth: 0, maxWidth: 132, font: `${on ? 600 : 500} var(--fs-caption)/1 var(--font-text)`, color: on ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         {t.title}
                         {t.base && !t.sessionId && (
                           // Subtle base-branch suffix on un-sent "New chat" tabs only.
@@ -1021,8 +1029,8 @@ export default function Workspace() {
                         )}
                       </span>
                     )}
-                    <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
-                      <Icon name="x" size={11} stroke={2.6} />
+                    <button className="ws-tab-x" title="Close tab" onClick={e => { e.stopPropagation(); closeTab(t.key); }} style={{ width: 16, height: 16, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+                      <Icon name="x" size={10} stroke={2.6} />
                     </button>
                   </div>
                 );
@@ -1031,8 +1039,8 @@ export default function Workspace() {
             {tabsOverflow && visibleTabs.length > 0 && (
               <div style={{ position: 'relative', flexShrink: 0 }}>
                 <button onClick={() => setOvfOpen(o => !o)} title="All open tabs in this project" className="ws-newbtn"
-                  style={{ width: 34, height: '100%', display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: ovfOpen ? 'var(--ink)' : 'var(--ink-secondary)', background: 'transparent', cursor: 'pointer' }}>
-                  <Icon name="chevronDown" size={15} />
+                  style={{ width: 30, height: '100%', display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: ovfOpen ? 'var(--ink)' : 'var(--ink-secondary)', background: 'transparent', cursor: 'pointer' }}>
+                  <Icon name="chevronDown" size={13} />
                 </button>
                 {ovfOpen && (
                   <>
@@ -1070,8 +1078,8 @@ export default function Workspace() {
                 only when nothing is active yet. */}
             <button onClick={() => newChat(activeProjectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
               title={activeProjectId ? `New chat in ${projById[activeProjectId]?.name ?? 'project'}` : 'New chat'} className="ws-newbtn"
-              style={{ width: 40, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
-              <Icon name="plus" size={16} stroke={2.4} />
+              style={{ width: 36, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
+              <Icon name="plus" size={15} stroke={2.4} />
             </button>
           </div>
 

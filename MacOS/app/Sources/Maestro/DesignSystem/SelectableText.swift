@@ -41,6 +41,10 @@ struct SelectableText: NSViewRepresentable {
     var wraps: Bool = true
     var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
 
+    private static let fallbackWidth: CGFloat = 640
+    private static let maxLayoutWidth: CGFloat = 20_000
+    private static let maxLayoutHeight: CGFloat = 120_000
+
     func makeCoordinator() -> Coord { Coord(onOpenFile: onOpenFile) }
 
     func makeNSView(context: Context) -> SelectableNSTextView {
@@ -59,10 +63,10 @@ struct SelectableText: NSViewRepresentable {
             tv.textContainer?.widthTracksTextView = true
             tv.isHorizontallyResizable = false
             tv.minSize = .zero
-            tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+            tv.maxSize = NSSize(width: Self.maxLayoutWidth, height: Self.maxLayoutHeight)
         } else {
             tv.textContainer?.widthTracksTextView = false
-            tv.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+            tv.textContainer?.containerSize = NSSize(width: Self.maxLayoutWidth, height: Self.maxLayoutHeight)
             tv.isHorizontallyResizable = true
         }
         return tv
@@ -80,18 +84,27 @@ struct SelectableText: NSViewRepresentable {
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView tv: SelectableNSTextView, context: Context) -> CGSize? {
         guard let lm = tv.layoutManager, let tc = tv.textContainer else { return nil }
-        let maxW = max(1, proposal.width ?? 600)
+        let proposedWidth = proposal.width ?? Self.fallbackWidth
+        let maxW = proposedWidth.isFinite
+            ? min(max(1, proposedWidth), Self.maxLayoutWidth)
+            : Self.fallbackWidth
         if wraps {
-            tv.frame = NSRect(x: 0, y: 0, width: maxW, height: CGFloat.greatestFiniteMagnitude)
+            tv.frame = NSRect(x: 0, y: 0, width: maxW, height: Self.maxLayoutHeight)
             tc.widthTracksTextView = true
-            tc.containerSize = NSSize(width: maxW, height: CGFloat.greatestFiniteMagnitude)
+            tc.containerSize = NSSize(width: maxW, height: Self.maxLayoutHeight)
+        } else {
+            tc.widthTracksTextView = false
+            tc.containerSize = NSSize(width: Self.maxLayoutWidth, height: Self.maxLayoutHeight)
         }
         lm.ensureLayout(for: tc)
         let glyphRange = lm.glyphRange(for: tc)
         let used = lm.boundingRect(forGlyphRange: glyphRange, in: tc).integral.size
         let inset = tv.textContainerInset
-        let height = max(1, ceil(used.height + inset.height * 2 + 2))
-        return CGSize(width: wraps ? maxW : ceil(used.width + inset.width * 2 + 2), height: height)
+        let height = min(Self.maxLayoutHeight, max(1, ceil(used.height + inset.height * 2 + 2)))
+        let width = wraps
+            ? maxW
+            : min(Self.maxLayoutWidth, max(1, ceil(used.width + inset.width * 2 + 2)))
+        return CGSize(width: width, height: height)
     }
 
     final class Coord: NSObject, NSTextViewDelegate {

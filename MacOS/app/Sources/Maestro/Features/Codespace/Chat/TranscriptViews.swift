@@ -245,7 +245,7 @@ struct AssistantTurn: View {
                         projectRoot: projectRoot, onOpenFile: onOpenFile)
             }
             if content.isEmpty, let fallback = job.output?.trimmed.nilIfEmpty {
-                MarkdownText(text: fallback, projectRoot: projectRoot, onOpenFile: onOpenFile)
+                GuardedMarkdownText(text: fallback, projectRoot: projectRoot, onOpenFile: onOpenFile)
             } else {
                 renderGroups(groupBlocks(content), live: false)
             }
@@ -446,7 +446,8 @@ struct ThinkingBlock: View {
                     HStack(alignment: .top, spacing: 13) {
                         Tok.purple.opacity(0.42).frame(width: 1.5)
                         VStack(alignment: .leading, spacing: 6) {
-                            MarkdownText(text: text, projectRoot: projectRoot, baseSize: 13, bodyColor: Tok.inkSecondary, nsBodyColor: TokNS.inkSecondary)
+                            GuardedMarkdownText(text: text, projectRoot: projectRoot, baseSize: 13,
+                                                bodyColor: Tok.inkSecondary, nsBodyColor: TokNS.inkSecondary)
                             if live { StreamCaret(height: 14) }
                         }
                     }
@@ -487,14 +488,14 @@ struct TranscriptBlock: View {
 
     var body: some View {
         switch item.kind {
-        case "text", "result": MarkdownText(text: item.text, projectRoot: projectRoot, onOpenFile: onOpenFile)
+        case "text", "result": GuardedMarkdownText(text: item.text, projectRoot: projectRoot, onOpenFile: onOpenFile)
         case "thinking": ThinkingBlock(item: item, projectRoot: projectRoot, live: live)
         case "tool": ToolCallRow(item: item, root: projectRoot, onOpenFile: onOpenFile)
         case "image": imageChip
         case "ask": answerable ? AnyView(questionCard) : AnyView(askCard)
         case "review": reviewCard
         case "steer": steerRow
-        default: MarkdownText(text: item.text, projectRoot: projectRoot, onOpenFile: onOpenFile)
+        default: GuardedMarkdownText(text: item.text, projectRoot: projectRoot, onOpenFile: onOpenFile)
         }
     }
 
@@ -612,6 +613,59 @@ struct TranscriptBlock: View {
             Text(item.text).font(TokFont.text(TokFont.footnote)).foregroundStyle(Tok.inkSecondary)
         }
         .padding(10).background(Tok.fillTertiary).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+/// Protects the transcript from pathological single blocks. Very large markdown strings make
+/// AppKit-backed text layout and SwiftUI scroll hit-testing churn on the main thread; show a stable
+/// preview by default, then let the operator explicitly expand when they need the whole payload.
+struct GuardedMarkdownText: View {
+    let text: String
+    var projectRoot: String? = nil
+    var baseSize: CGFloat = 14
+    var bodyColor: Color = Tok.ink
+    var nsBodyColor: NSColor = TokNS.ink
+    var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
+    var previewLimit = 12_000
+
+    @State private var expanded = false
+
+    private var needsGuard: Bool { text.count > previewLimit }
+    private var shownText: String {
+        guard needsGuard, !expanded else { return text }
+        return String(text.prefix(previewLimit)) + "\n\n[...]"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            MarkdownText(text: shownText, projectRoot: projectRoot, baseSize: baseSize,
+                         bodyColor: bodyColor, nsBodyColor: nsBodyColor, onOpenFile: onOpenFile)
+            if needsGuard {
+                HStack(spacing: 8) {
+                    Text(expanded ? "Full output shown" : "Showing first \(compactCount(previewLimit)) of \(compactCount(text.count)) chars")
+                        .font(TokFont.text(TokFont.caption, .medium))
+                        .foregroundStyle(Tok.inkTertiary)
+                    Button(expanded ? "Collapse" : "Show full output") {
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) { expanded.toggle() }
+                    }
+                    .buttonStyle(.plain)
+                    .font(TokFont.text(TokFont.caption, .semibold))
+                    .foregroundStyle(Tok.blue)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Tok.fillTertiary)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+        }
+    }
+
+    private func compactCount(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fm", Double(n) / 1_000_000) }
+        if n >= 1_000 { return "\(n / 1_000)k" }
+        return "\(n)"
     }
 }
 

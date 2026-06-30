@@ -2503,6 +2503,15 @@ const writeQueue = (sid: string | null, q: string[]): void => {
   try { if (q.length) localStorage.setItem(QUEUE_KEY(sid), JSON.stringify(q)); else localStorage.removeItem(QUEUE_KEY(sid)); }
   catch { /* ignore quota / serialisation */ }
 };
+const CHAT_PAGE_SIZE = 30;
+function compareTurnsOldestFirst(a: Job, b: Job): number {
+  return (a.createdAt - b.createdAt) || (a.updatedAt - b.updatedAt) || a.id.localeCompare(b.id);
+}
+function mergeTurns(...groups: Job[][]): Job[] {
+  const byId = new Map<string, Job>();
+  for (const group of groups) for (const job of group) byId.set(job.id, job);
+  return [...byId.values()].sort(compareTurnsOldestFirst);
+}
 
 // Composer @-mentions — typing `@` suggests a capability; selecting it turns the
 // capability on (shown as its iconed capsule in the toolbar) and tidies the token.
@@ -2713,6 +2722,11 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   autoFocus?: boolean;
 }) {
   const [turns, setTurns] = React.useState<Job[]>([]);
+  const [turnsLoading, setTurnsLoading] = React.useState(false);
+  const [hasOlderTurns, setHasOlderTurns] = React.useState(false);
+  const [olderCursor, setOlderCursor] = React.useState<string | null>(null);
+  const [olderBefore, setOlderBefore] = React.useState<number | null>(null);
+  const [olderLoading, setOlderLoading] = React.useState(false);
   React.useEffect(() => { onTurns?.(turns); }, [turns]); // eslint-disable-line react-hooks/exhaustive-deps
   // Stable wrapper so the image-open context value never changes identity (would
   // otherwise re-render every image chip on each streaming frame).
@@ -2758,13 +2772,6 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     try { await api.setSessionAutopilot(activeId, next); }
     catch { setAutoPilotLocal(!next); /* revert on failure */ }
   }, [activeId, autoPilotEffective]);
-  const toggleReviewer = React.useCallback(async () => {
-    if (!activeId) return;
-    const next = !reviewerEffective;
-    setReviewerLocal(next);
-    try { await api.setSessionReviewer(activeId, next); }
-    catch { setReviewerLocal(!next); /* revert on failure */ }
-  }, [activeId, reviewerEffective]);
   const [text, setText] = React.useState('');
   // Primary (coding) + reviewer model. Remembered across the app via localStorage;
   // seeded from the workspace role defaults when the user hasn't chosen yet.
@@ -2788,6 +2795,23 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
       if (!reviewerKey) setReviewerKeyState(roles.reviewer === 'off' ? 'off' : keyForRoleChoice(modelGroups, roles.reviewer));
     }).catch(() => {});
   }, [modelGroups]); // eslint-disable-line react-hooks/exhaustive-deps
+  const seedReviewerKey = React.useCallback(() => {
+    if (reviewerKey && reviewerKey !== 'off') return reviewerKey;
+    if (primaryKey && primaryKey !== 'off') return primaryKey;
+    const first = modelGroups.find(g => g.runnable && g.models.length > 0)?.models[0]?.key;
+    return first ?? 'claude:claude-opus-4-8';
+  }, [modelGroups, primaryKey, reviewerKey]);
+  const toggleReviewer = React.useCallback(async () => {
+    if (!activeId) return;
+    const next = !reviewerEffective;
+    if (next && (!reviewerKey || reviewerKey === 'off')) setReviewerKey(seedReviewerKey());
+    setReviewerLocal(next);
+    try { await api.setSessionReviewer(activeId, next); }
+    catch { setReviewerLocal(!next); /* revert on failure */ }
+  }, [activeId, reviewerEffective, reviewerKey, seedReviewerKey]);
+  React.useEffect(() => {
+    if (reviewerEffective && (!reviewerKey || reviewerKey === 'off')) setReviewerKey(seedReviewerKey());
+  }, [reviewerEffective, reviewerKey, seedReviewerKey]);
   const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
   // Plan mode: agent proposes a plan first (no execution). Persisted per app.
   const [planMode, setPlanModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.plan') === '1'; } catch { return false; } });
@@ -2860,11 +2884,23 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   // Turns of the open session (ascending — a chat thread). Queue is per-session.
   React.useEffect(() => {
     setQueue(readQueue(activeId)); // restore this session's persisted queue
-    if (!activeId) { setTurns([]); return; }
+    setHasOlderTurns(false);
+    setOlderCursor(null);
+    setOlderBefore(null);
+    setOlderLoading(false);
+    if (!activeId) { setTurns([]); setTurnsLoading(false); return; }
     let alive = true;
-    api.listJobs(undefined, activeId)
-      .then(js => { if (alive) setTurns([...js].sort((a, b) => a.createdAt - b.createdAt)); })
-      .catch(() => {});
+    setTurnsLoading(true);
+    api.listJobPage({ sessionId: activeId, limit: CHAT_PAGE_SIZE })
+      .then(page => {
+        if (!alive) return;
+        setTurns(page.jobs);
+        setHasOlderTurns(page.hasMore);
+        setOlderCursor(page.nextCursor);
+        setOlderBefore(page.nextBefore);
+      })
+      .catch(() => { if (alive) setTurns([]); })
+      .finally(() => { if (alive) setTurnsLoading(false); });
     return () => { alive = false; };
   }, [activeId]);
 
@@ -2875,7 +2911,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
         if (!j.sessionId || j.sessionId !== activeRef.current) return;
         setTurns(ts => {
           const i = ts.findIndex(t => t.id === j.id);
-          if (i === -1) return [...ts, j].sort((a, b) => a.createdAt - b.createdAt);
+          if (i === -1) return [...ts, j].sort(compareTurnsOldestFirst);
           const next = ts.slice(); next[i] = j; return next;
         });
       },
@@ -2940,7 +2976,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     if (!sid || !t) return;
     setSchedules(list => list.filter(s => !(s.kind === 'auto-answer' && s.sessionId === sid))); // drop countdown
     void api.answerQuestion({ sessionId: sid, answer: t })
-      .then(job => setTurns(ts => [...ts.filter(x => x.id !== job.id), job].sort((a, b) => a.createdAt - b.createdAt)))
+      .then(job => setTurns(ts => [...ts.filter(x => x.id !== job.id), job].sort(compareTurnsOldestFirst)))
       .catch(e => setSendError(e instanceof Error ? e.message : 'Could not send your answer — try again.'));
   }, []);
   const extendLiveQuestion = React.useCallback(() => {
@@ -2969,11 +3005,37 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
 
   // Stick to the bottom while streaming unless the user scrolled up.
   const [atBottom, setAtBottom] = React.useState(true);
+  const loadOlderTurns = React.useCallback(async () => {
+    const sid = activeRef.current;
+    if (!sid || !hasOlderTurns || olderLoading) return;
+    const el = scrollRef.current;
+    const prevHeight = el?.scrollHeight ?? 0;
+    stickBottom.current = false;
+    setOlderLoading(true);
+    try {
+      const page = await api.listJobPage({ sessionId: sid, cursor: olderCursor, before: olderCursor ? undefined : olderBefore, limit: CHAT_PAGE_SIZE });
+      if (activeRef.current !== sid) return;
+      setTurns(prev => mergeTurns(page.jobs, prev));
+      setHasOlderTurns(page.hasMore);
+      setOlderCursor(page.nextCursor);
+      setOlderBefore(page.nextBefore);
+      window.requestAnimationFrame(() => {
+        const nextEl = scrollRef.current;
+        if (!nextEl) return;
+        nextEl.scrollTop += nextEl.scrollHeight - prevHeight;
+      });
+    } catch {
+      // Keep the existing page visible; a later scroll/button press can retry.
+    } finally {
+      if (activeRef.current === sid) setOlderLoading(false);
+    }
+  }, [hasOlderTurns, olderBefore, olderCursor, olderLoading]);
   const onScroll = () => {
     const el = scrollRef.current; if (!el) return;
     const bottom = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
     stickBottom.current = bottom;
     setAtBottom(bottom);
+    if (el.scrollTop < 80) void loadOlderTurns();
   };
   const jumpToLatest = () => {
     const el = scrollRef.current; if (!el) return;
@@ -3033,7 +3095,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
         setTurns([resp.job]);
         onSessionCreated?.(resp.session);
       } else {
-        setTurns(ts => [...ts.filter(x => x.id !== resp.job.id), resp.job].sort((a, b) => a.createdAt - b.createdAt));
+        setTurns(ts => [...ts.filter(x => x.id !== resp.job.id), resp.job].sort(compareTurnsOldestFirst));
       }
       return true;
     } catch (e) {
@@ -3406,7 +3468,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
               session. Renders ONCE, above the empty-state prompt, so the agent's
               first context is visible to the operator (and re-readable until they
               type). Vanishes after the first turn lands. */}
-          {turns.length === 0 && continuedFrom && (
+          {!turnsLoading && turns.length === 0 && continuedFrom && (
             <div style={{ padding: '20px 20px 0', maxWidth: 620, margin: '0 auto', width: '100%' }}>
               <div style={{ borderRadius: 12, padding: '12px 14px',
                 background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)',
@@ -3421,7 +3483,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
               </div>
             </div>
           )}
-          {turns.length === 0 && (
+          {!turnsLoading && turns.length === 0 && (
             <div style={{ padding: '52px 20px 20px', textAlign: 'center' }}>
               <span style={{ width: 56, height: 56, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
                 background: 'linear-gradient(160deg, color-mix(in srgb, var(--blue) 18%, transparent), color-mix(in srgb, var(--purple) 16%, transparent))',
@@ -3442,6 +3504,23 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                   </button>
                 ))}
               </div>
+            </div>
+          )}
+          {turnsLoading && turns.length === 0 && (
+            <div style={{ display: 'grid', placeItems: 'center', padding: '56px 0', color: 'var(--ink-tertiary)' }}>
+              <Spinner size={18} />
+            </div>
+          )}
+          {activeId && (hasOlderTurns || olderLoading) && (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '2px 0 4px' }}>
+              <button onClick={loadOlderTurns} disabled={olderLoading} style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6, height: 30, padding: '0 12px', borderRadius: 'var(--r-pill)',
+                background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)', color: 'var(--ink-secondary)',
+                font: '600 var(--fs-caption)/1 var(--font-text)', cursor: olderLoading ? 'default' : 'pointer', opacity: olderLoading ? 0.68 : 1,
+              }}>
+                {olderLoading ? <Spinner size={12} /> : <Icon name="chevronRight" size={13} style={{ transform: 'rotate(-90deg)' }} />}
+                {olderLoading ? 'Loading earlier' : 'Load earlier'}
+              </button>
             </div>
           )}
           <OpenPathContext.Provider value={openPathStable}>
@@ -3645,7 +3724,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                   the silent-skip bug). The reviewer-model popover next to this
                   picks WHICH engine reviews. Off by default. */}
               <button onClick={toggleReviewer} disabled={!activeId}
-                title={!activeId ? 'Send a message to enable reviewer for this chat' : reviewerEffective ? 'Reviewer ON for this chat — every turn gets reviewed. Click to disable.' : 'Reviewer OFF — turn on to review every assistant turn (picks the engine via the sliders popover).'}
+                title={!activeId ? 'Send a message to enable reviewer for this chat' : reviewerEffective ? 'Reviewer ON for this chat — every turn gets reviewed. Click to disable.' : 'Reviewer OFF — turn on to review every assistant turn.'}
                 style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9,
                   cursor: activeId ? 'pointer' : 'default', opacity: activeId ? 1 : 0.5,
                   background: reviewerEffective ? 'color-mix(in srgb, var(--orange) 14%, transparent)' : 'var(--fill-secondary)',
@@ -3653,6 +3732,17 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                   color: reviewerEffective ? 'var(--orange)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                 <Icon name="checkCircle" size={14} /> Review
               </button>
+              {reviewerEffective && (
+                <ModelPicker
+                  compact
+                  direction="up"
+                  value={reviewerKey && reviewerKey !== 'off' ? reviewerKey : seedReviewerKey()}
+                  onChange={setReviewerKey}
+                  favorites={favorites}
+                  onToggleFavorite={toggleFavorite}
+                  triggerLabel="Reviewer"
+                />
+              )}
               <span style={{ width: 1, height: 18, background: 'var(--separator)', margin: '0 1px' }} />
               {/* schedule THIS message — pick a date/time; it fires into the chat then */}
               <div style={{ position: 'relative' }}>
@@ -3666,8 +3756,8 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                 </button>
                 {schedOpen && <SchedulePicker initial={schedEditAt ?? undefined} onPick={scheduleMessage} onRepeat={scheduleRecurring} onClose={() => setSchedOpen(false)} />}
               </div>
-              {/* reviewer model — tucked behind one button to keep the bar clean */}
-              <div style={{ position: 'relative' }}>
+              {/* reviewer model setup while Review is off */}
+              {!reviewerEffective && <div style={{ position: 'relative' }}>
                 <button onClick={() => setOptsOpen(o => !o)} title="Reviewer model"
                   style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 9px', borderRadius: 9, cursor: 'pointer',
                     background: optsOpen ? 'var(--fill-tertiary)' : 'var(--fill-secondary)', border: '1px solid transparent', color: 'var(--ink-secondary)' }}>
@@ -3685,7 +3775,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                     </div>
                   </>
                 )}
-              </div>
+              </div>}
               {schedNote && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)', display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}><Icon name="check" size={12} /> {schedNote}</span>}
               <span style={{ flex: 1, minWidth: 6 }} />
               {streaming

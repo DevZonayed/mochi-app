@@ -16,8 +16,9 @@ struct ChatThread: View {
 
     @State private var store: ChatThreadStore?
     /// Render only the last N turns (messenger-style) — older turns lazy-load on "Load earlier"
-    /// or when the minimap jumps back. Keeps long chats smooth instead of mounting every turn.
-    @State private var visibleCount = 8
+    /// or when the minimap jumps back. Heavy native AppKit text measurement makes even a handful
+    /// of large historical turns expensive, so the default window stays intentionally tight.
+    @State private var visibleCount = 3
     @State private var composerText = ""
     @State private var attachments: [ComposerAttachment] = []
     /// Messages typed while a turn is running — they wait here and drain one-at-a-time when the turn
@@ -372,7 +373,7 @@ struct ChatThread: View {
                             onJump: { id in jump(to: id, proxy: proxy, all: all) })
                     .padding(.trailing, 2)
             }
-            .onChange(of: sessionId) { _, _ in visibleCount = 8 }
+            .onChange(of: sessionId) { _, _ in visibleCount = 3 }
             // LiveStatusBar tap: scroll back down to the live turn (it's always the last one).
             .onChange(of: jumpToken) { _, _ in
                 withAnimation(.smooth(duration: 0.28)) { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -413,11 +414,11 @@ struct ChatThread: View {
         return t.isEmpty ? "Untitled" : t
     }
 
-    /// Reveal +12 older turns while keeping the current top turn in view.
+    /// Reveal a small batch of older turns while keeping the current top turn in view.
     private func loadEarlier(_ proxy: ScrollViewProxy, all: [Job]) {
         let anchorId = Array(all.suffix(visibleCount)).first?.id
         suppressTranscriptBottomPin = true
-        visibleCount = min(all.count, visibleCount + 12)
+        visibleCount = min(all.count, visibleCount + 3)
         if let anchorId {
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 80_000_000)
