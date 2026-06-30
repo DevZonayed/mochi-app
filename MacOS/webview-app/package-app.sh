@@ -25,6 +25,21 @@ resolve_path() {
   printf '%s/%s\n' "$dir" "$(basename "$target")"
 }
 
+# The Maestro dev shell prepends a ~121-byte `node` shim that execs the INSTALLED
+# app's bundled node. That target is unstable during packaging — `rm -rf "$APP"`
+# below deletes the dist app's node mid-build — so every `node` / shebang call
+# (vite, esbuild) would break. Pin a real, standalone node to the FRONT of PATH
+# for the whole build so nothing depends on the shim.
+node_is_real() { [ -x "$1" ] && [ "$(stat -f%z "$1" 2>/dev/null || echo 0)" -gt 1048576 ] && file -b "$1" 2>/dev/null | grep -q "Mach-O"; }
+for cand in /opt/homebrew/bin/node /usr/local/bin/node "/Applications/Maestro WebKit.app/Contents/Resources/sidecar/bin/node"; do
+  rp="$(resolve_path "$cand" 2>/dev/null || true)"
+  if node_is_real "$rp"; then
+    export PATH="$(dirname "$rp"):$PATH"
+    echo "> using real node for build: $rp"
+    break
+  fi
+done
+
 echo "> building React renderer for WebKit"
 if [ ! -x "$REPO_ROOT/node_modules/.bin/vite" ]; then
   echo "Missing node_modules/.bin/vite. Run pnpm install from the repo root first."
@@ -75,15 +90,40 @@ cp "$SIDECAR/dist/send-hint-overlay.js" "$RES_SC/send-hint-overlay.js" 2>/dev/nu
 
 echo "> embedding node runtime"
 REAL_NODE="$(resolve_path "$(command -v node)")"
+# The Maestro dev shell prepends a ~121-byte `node` shim (execs the installed
+# app's bundled node with ELECTRON_RUN_AS_NODE=1). Embedding that shim yields a
+# non-self-contained bundle. Detect a too-small / non-Mach-O node and fall back
+# to a real interpreter (installed app's bundled node, then common locations).
+node_is_real() { [ -x "$1" ] && [ "$(stat -f%z "$1" 2>/dev/null || echo 0)" -gt 1048576 ] && file -b "$1" 2>/dev/null | grep -q "Mach-O"; }
+if ! node_is_real "$REAL_NODE"; then
+  echo "  note: '$REAL_NODE' looks like a shim/non-binary; searching for a real node"
+  for cand in \
+    "/Applications/Maestro WebKit.app/Contents/Resources/sidecar/bin/node" \
+    "/opt/homebrew/bin/node" \
+    "/usr/local/bin/node"; do
+    rp="$(resolve_path "$cand")"
+    if node_is_real "$rp"; then REAL_NODE="$rp"; echo "  using $REAL_NODE"; break; fi
+  done
+fi
 if [ -x "$REAL_NODE" ]; then
   cp "$REAL_NODE" "$RES_SC/bin/node" && chmod +x "$RES_SC/bin/node"
   echo "  embedded $(du -h "$RES_SC/bin/node" | cut -f1) node"
-  NODE_LIB_DIR="$(cd "$(dirname "$REAL_NODE")/../lib" && pwd -P)"
+  # Some node builds dynamically link @rpath/libnode.dylib and need it copied
+  # alongside; a self-contained (statically linked) node has no sibling lib/ dir,
+  # so probe the dependency FIRST and only chase the lib dir when it's actually
+  # referenced (the unconditional `cd ../lib` used to abort the build under -e).
   NODE_LIB="$(otool -L "$REAL_NODE" | sed -n 's#^[[:space:]]*@rpath/\(libnode[^[:space:]]*\).*#\1#p' | head -n 1)"
-  if [ -n "$NODE_LIB" ] && [ -f "$NODE_LIB_DIR/$NODE_LIB" ]; then
-    mkdir -p "$RES_SC/lib"
-    cp "$NODE_LIB_DIR/$NODE_LIB" "$RES_SC/lib/$NODE_LIB"
-    echo "  embedded $(du -h "$RES_SC/lib/$NODE_LIB" | cut -f1) $NODE_LIB"
+  if [ -n "$NODE_LIB" ]; then
+    NODE_LIB_DIR="$(cd "$(dirname "$REAL_NODE")/../lib" 2>/dev/null && pwd -P || true)"
+    if [ -n "$NODE_LIB_DIR" ] && [ -f "$NODE_LIB_DIR/$NODE_LIB" ]; then
+      mkdir -p "$RES_SC/lib"
+      cp "$NODE_LIB_DIR/$NODE_LIB" "$RES_SC/lib/$NODE_LIB"
+      echo "  embedded $(du -h "$RES_SC/lib/$NODE_LIB" | cut -f1) $NODE_LIB"
+    else
+      echo "  warning: node references @rpath/$NODE_LIB but lib not found — bundle may not be self-contained"
+    fi
+  else
+    echo "  node is self-contained (no @rpath/libnode dependency)"
   fi
 else
   NODE_SZ=$(stat -f%z "$REAL_NODE" 2>/dev/null || echo 0)
