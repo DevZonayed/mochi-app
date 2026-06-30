@@ -17,6 +17,7 @@ final class ChatThreadStore {
     let projectId: String
     private let client: MaestroClient
     private var token: Int?
+    private var bindGeneration = 0
 
     init(projectId: String, client: MaestroClient) {
         self.projectId = projectId
@@ -40,22 +41,34 @@ final class ChatThreadStore {
     /// Switch the thread to a session (nil = a fresh, not-yet-created chat). Renders cached turns
     /// instantly (preloaded on hover) and refreshes in the background — so opening a chat feels instant.
     func bind(_ sessionId: String?) async {
+        bindGeneration &+= 1
+        let generation = bindGeneration
+        let previousSession = self.sessionId
         self.sessionId = sessionId
         guard let sid = sessionId else { turns = []; loading = false; return }
-        if let cached = TranscriptCache.shared.cached(sid) { turns = cached; loading = false }
-        else { turns = []; loading = true }
+        if let cached = TranscriptCache.shared.cached(sid) {
+            turns = cached
+            loading = false
+        } else if previousSession != sid || turns.isEmpty {
+            turns = []
+            loading = true
+        } else {
+            // A same-session refresh should never blank the transcript. Keep the existing content
+            // visible while the fresh listJobs result is in flight.
+            loading = false
+        }
         do {
             let fresh = try await client.call("listJobs", ["projectId": projectId, "sessionId": sid], as: [Job].self).sorted { $0.createdAt < $1.createdAt }
             // Only the bind that still owns the session may write turns OR clear loading — a
             // superseded fetch resolving late must not flip a newer bind's loading flag off (that
             // flashed the empty "What should we build?" state on an existing, still-loading chat).
-            if self.sessionId == sid {
+            if generation == bindGeneration, self.sessionId == sid {
                 turns = fresh
                 TranscriptCache.shared.put(sid, fresh)
                 loading = false
             }
         } catch {
-            if self.sessionId == sid { loading = false }   // failed fetch on the current session
+            if generation == bindGeneration, self.sessionId == sid { loading = false }   // failed fetch on the current session
         }
     }
 

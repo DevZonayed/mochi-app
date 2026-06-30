@@ -96,7 +96,11 @@ final class MaestroClient {
     /// Decoded request/response. Throws `RPCError` on failure.
     func call<T: Decodable>(_ method: String, _ params: [String: Any] = [:], as: T.Type = T.self) async throws -> T {
         let data = try await callRaw(method, params)
-        do { return try JSONDecoder().decode(T.self, from: data) }
+        do {
+            return try await Task.detached(priority: .userInitiated) {
+                try JSONDecoder().decode(T.self, from: data)
+            }.value
+        }
         catch { throw RPCError.decode("\(method): \(error)") }
     }
 

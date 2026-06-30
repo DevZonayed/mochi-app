@@ -58,6 +58,8 @@ struct SelectableText: NSViewRepresentable {
         if wraps {
             tv.textContainer?.widthTracksTextView = true
             tv.isHorizontallyResizable = false
+            tv.minSize = .zero
+            tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         } else {
             tv.textContainer?.widthTracksTextView = false
             tv.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
@@ -78,11 +80,18 @@ struct SelectableText: NSViewRepresentable {
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView tv: SelectableNSTextView, context: Context) -> CGSize? {
         guard let lm = tv.layoutManager, let tc = tv.textContainer else { return nil }
-        let maxW = proposal.width ?? 600
-        if wraps { tc.containerSize = NSSize(width: maxW, height: CGFloat.greatestFiniteMagnitude) }
+        let maxW = max(1, proposal.width ?? 600)
+        if wraps {
+            tv.frame = NSRect(x: 0, y: 0, width: maxW, height: CGFloat.greatestFiniteMagnitude)
+            tc.widthTracksTextView = true
+            tc.containerSize = NSSize(width: maxW, height: CGFloat.greatestFiniteMagnitude)
+        }
         lm.ensureLayout(for: tc)
-        let used = lm.usedRect(for: tc).size
-        return CGSize(width: wraps ? maxW : ceil(used.width) + 2, height: ceil(used.height))
+        let glyphRange = lm.glyphRange(for: tc)
+        let used = lm.boundingRect(forGlyphRange: glyphRange, in: tc).integral.size
+        let inset = tv.textContainerInset
+        let height = max(1, ceil(used.height + inset.height * 2 + 2))
+        return CGSize(width: wraps ? maxW : ceil(used.width + inset.width * 2 + 2), height: height)
     }
 
     final class Coord: NSObject, NSTextViewDelegate {
