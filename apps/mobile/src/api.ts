@@ -18,7 +18,7 @@ export interface DirEntry { name: string; path: string; isDir: boolean; isRepo: 
 export interface DirListing { path: string; parent: string | null; home: string; entries: DirEntry[]; error?: string }
 
 export interface Workspace { id: string; name: string; budgetCap: number; createdAt: number }
-export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; kind?: ProjectKind; path?: string; repoUrl?: string; order?: number; createdAt: number; updatedAt: number }
+export interface Project { id: string; workspaceId: string; name: string; template: string; instructions: string; color: string; kind?: ProjectKind; path?: string; repoUrl?: string; order?: number; hidden?: boolean; createdAt: number; updatedAt: number }
 /** One structured block of an agent run (mirrors the desktop, image bytes stripped). */
 export interface TranscriptItem {
   kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image';
@@ -51,6 +51,20 @@ export interface Job {
   id: string; projectId: string; sessionId?: string; title: string; status: JobStatus; phase: string; progress: number;
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
   engine?: EngineId; model?: string; goal?: boolean; transcript?: TranscriptItem[]; createdAt: number; updatedAt: number;
+}
+export interface JobPage {
+  jobs: Job[];
+  total: number;
+  hasMore: boolean;
+  nextBefore: number | null;
+  nextCursor?: string | null;
+}
+export interface JobPageInput {
+  projectId?: string;
+  sessionId?: string;
+  before?: number;
+  cursor?: string;
+  limit?: number;
 }
 
 /** A chat thread inside a project. Each turn is a Job with this sessionId. */
@@ -434,6 +448,7 @@ export const api = {
   deleteProject: (id: string) => cmd<{ ok: boolean }>('deleteProject', { id }),
 
   listJobs: (projectId?: string, sessionId?: string) => cmd<Job[]>('listJobs', { projectId, sessionId }),
+  listJobPage: (input: JobPageInput) => cmd<JobPage>('listJobPage', { ...input }),
 
   /** Chat sessions inside a project (the desktop's project → sessions tree). */
   listSessions: (projectId?: string) => cmd<ChatSession[]>('listSessions', { projectId }),
@@ -477,7 +492,7 @@ export const api = {
 
   listTemplates: () => cmd<Template[]>('listTemplates'),
   /** Grouped, pickable models with per-provider runnable state (from the Mac). */
-  listModels: () => cmd<ModelGroup[]>('listModels'),
+  listModels: (refresh = false) => cmd<ModelGroup[]>('listModels', refresh ? { refresh: true } : {}),
 
   /** Operator defaults, stored on the Mac (effort/engine the new-job composer inherits). */
   getSettings: () => cmd<AppSettings | null>('getSettings'),

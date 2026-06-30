@@ -6,7 +6,10 @@
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, readdirSync, statSync, copyFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
+import { promisify } from 'node:util';
 import path from 'node:path';
+
+const execFileP = promisify(execFile);
 
 let gitPath: string | null | undefined;
 export function resolveGit(): string | null {
@@ -203,6 +206,98 @@ function execGit(args: string[], opts: { timeout?: number } = {}): { ok: boolean
   }
 }
 
+/* ── Async git (off the event loop) ──────────────────────────────────────
+   The status hot path (file-watcher recompute, overview lazy-fetch, the gentle
+   reconcile) runs MANY git reads. Done synchronously (execFileSync) each one
+   freezes the whole Node event loop until git returns — at scale (dozens of
+   worktrees) that's seconds of frozen UI. These async siblings run git via
+   execFile so the loop stays free, and a small semaphore bounds the number of
+   concurrent git processes so a burst of watcher events can't fork a storm.
+   Mutating ops (commit/push/merge/worktree add) stay sync — they run on user
+   action, never in a loop, so they can't jank the idle UI. */
+
+/** Max git child processes in flight from `execGitAsync` at once. */
+const MAX_CONCURRENT_GIT = 8;
+let activeGit = 0;
+const gitQueue: Array<() => void> = [];
+function acquireGitSlot(): Promise<void> {
+  if (activeGit < MAX_CONCURRENT_GIT) { activeGit++; return Promise.resolve(); }
+  return new Promise<void>((resolve) => { gitQueue.push(() => { activeGit++; resolve(); }); });
+}
+function releaseGitSlot(): void {
+  activeGit = Math.max(0, activeGit - 1);
+  const next = gitQueue.shift();
+  if (next) next();
+}
+
+/** Async sibling of `execGit`: never blocks the event loop, capped by the
+    module-level concurrency semaphore. Same `{ ok, out, code }` contract. */
+export async function execGitAsync(args: string[], opts: { timeout?: number } = {}): Promise<{ ok: boolean; out: string; code: number }> {
+  const git = resolveGit();
+  if (!git) return { ok: false, out: '', code: 127 };
+  await acquireGitSlot();
+  try {
+    const { stdout } = await execFileP(git, args, { encoding: 'utf8', timeout: opts.timeout ?? 15_000, maxBuffer: 16 * 1024 * 1024 });
+    return { ok: true, out: stdout.toString().trim(), code: 0 };
+  } catch (e) {
+    const err = e as { code?: number | string; status?: number; stderr?: Buffer | string };
+    const stderr = err.stderr == null ? '' : typeof err.stderr === 'string' ? err.stderr : err.stderr.toString();
+    const code = typeof err.code === 'number' ? err.code : (err.status ?? 1);
+    return { ok: false, out: stderr.trim(), code };
+  } finally {
+    releaseGitSlot();
+  }
+}
+
+/** Async twin of `resolveBaseBranch`. */
+export async function resolveBaseBranchAsync(repoDir: string): Promise<string> {
+  const head = await execGitAsync(['-C', repoDir, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+  if (head.ok && head.out) return head.out.replace(/^origin\//, '');
+  const cur = await execGitAsync(['-C', repoDir, 'rev-parse', '--abbrev-ref', 'HEAD']);
+  if (cur.ok && cur.out && cur.out !== 'HEAD') return cur.out;
+  return 'main';
+}
+
+/** Async twin of `aheadBehind`. */
+export async function aheadBehindAsync(dir: string, base: string): Promise<{ ahead: number; behind: number }> {
+  const r = await execGitAsync(['-C', dir, 'rev-list', '--left-right', '--count', `${base}...HEAD`]);
+  if (!r.ok) return { ahead: 0, behind: 0 };
+  const [left, right] = r.out.split(/\s+/);
+  const behind = Number(left);
+  const ahead = Number(right);
+  return { ahead: Number.isFinite(ahead) ? ahead : 0, behind: Number.isFinite(behind) ? behind : 0 };
+}
+
+/** Async twin of `isDirty`. */
+export async function isDirtyAsync(dir: string): Promise<boolean> {
+  const r = await execGitAsync(['-C', dir, 'status', '--porcelain']);
+  return r.ok && r.out.length > 0;
+}
+
+/** Async twin of `dirtyFileCount`. */
+export async function dirtyFileCountAsync(dir: string): Promise<number> {
+  const r = await execGitAsync(['-C', dir, 'status', '--porcelain']);
+  if (!r.ok || !r.out) return 0;
+  return r.out.split('\n').filter(line => line.length > 0).length;
+}
+
+/** Async twin of `lastCommitInfo`. */
+export async function lastCommitInfoAsync(dir: string): Promise<{ subject: string | null; at: number | null }> {
+  const r = await execGitAsync(['-C', dir, 'log', '-1', '--format=%s%n%at']);
+  if (!r.ok || !r.out) return { subject: null, at: null };
+  const [subject = '', atStr = ''] = r.out.split('\n');
+  const at = Number(atStr) * 1000;
+  return { subject: subject || null, at: Number.isFinite(at) && at > 0 ? at : null };
+}
+
+/** Async twin of `localRefExists`. */
+export async function localRefExistsAsync(dir: string, ref: string): Promise<boolean> {
+  return (await execGitAsync(['-C', dir, 'rev-parse', '--verify', '--quiet', ref])).code === 0;
+}
+
+/** Test seam: current count of in-flight async git processes (semaphore gauge). */
+export function _activeGitCount(): number { return activeGit; }
+
 /** The branch new worktrees fork from: origin/HEAD → current branch → 'main'. */
 export function resolveBaseBranch(repoDir: string): string {
   const head = execGit(['-C', repoDir, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
@@ -289,6 +384,97 @@ export function worktreeExists(repoDir: string, wtPath: string): boolean {
   return listWorktrees(repoDir).some(w => canonicalPath(w.path) === target);
 }
 
+/** ── Branch listing (powers the "new chat from branch" picker) ───────────── */
+
+export interface BranchInfo {
+  /** Plain branch name — no `refs/heads/` and no `origin/` prefix. */
+  name: string;
+  /** True when this matches `origin/HEAD` (the repo's default branch). */
+  isDefault: boolean;
+  /** True when this is the current HEAD of the MAIN repo (not a worktree). */
+  isCurrent: boolean;
+  /** True when a corresponding `origin/<name>` ref exists. */
+  hasRemote: boolean;
+  /** Tip commit metadata (subject + unix timestamp), null on parse failure. */
+  lastCommit: { sha: string; subject: string; date: number } | null;
+}
+
+/** Internal: parse one `for-each-ref` line, NUL-delimited fields. */
+function parseRefLine(line: string): { ref: string; sha: string; subject: string; date: number } | null {
+  // Format: refname\0objectname:short\0contents:subject\0committerdate:unix
+  const parts = line.split('\0');
+  if (parts.length < 4) return null;
+  const [ref, sha, subject, dateStr] = parts;
+  if (!ref) return null;
+  const date = Number(dateStr);
+  return { ref, sha, subject: (subject ?? '').slice(0, 200), date: Number.isFinite(date) ? date : 0 };
+}
+
+/** All local + remote `origin/*` branches (deduped: local wins when both exist).
+    Sort: default first, current next, then alphabetical. Never throws. */
+export function listBranches(repoDir: string): BranchInfo[] {
+  if (!repoDir || !existsSync(repoDir) || !isGitRepo(repoDir)) return [];
+
+  // Default = origin/HEAD (best-effort; missing on fresh clones / file:// remotes).
+  const defHead = execGit(['-C', repoDir, 'symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+  const defaultName = defHead.ok && defHead.out ? defHead.out.replace(/^origin\//, '') : null;
+
+  // Current = the MAIN repo's HEAD, not any session worktree's (worktrees are
+  // children with their OWN HEAD; we want the operator's "real" current branch).
+  const curRef = execGit(['-C', repoDir, 'symbolic-ref', '--quiet', '--short', 'HEAD']);
+  const currentName = curRef.ok && curRef.out ? curRef.out : null;
+
+  // One pass over locals + origin remotes — NUL-delimited so subjects with `|`
+  // or `:` don't break the split.
+  const fmt = '%(refname)%00%(objectname:short)%00%(contents:subject)%00%(committerdate:unix)';
+  const r = execGit(['-C', repoDir, 'for-each-ref', `--format=${fmt}`, 'refs/heads/', 'refs/remotes/origin/']);
+  if (!r.ok) return [];
+
+  const byName = new Map<string, BranchInfo>();
+  for (const raw of r.out.split('\n')) {
+    if (!raw) continue;
+    const parsed = parseRefLine(raw);
+    if (!parsed) continue;
+    const { ref, sha, subject, date } = parsed;
+
+    if (ref.startsWith('refs/heads/')) {
+      const name = ref.slice('refs/heads/'.length);
+      // Local always wins — even if we later see origin/<name>, keep local's commit.
+      byName.set(name, {
+        name,
+        isDefault: name === defaultName,
+        isCurrent: name === currentName,
+        hasRemote: false,            // patched in the remote-pass below
+        lastCommit: { sha, subject, date },
+      });
+    } else if (ref.startsWith('refs/remotes/origin/')) {
+      const name = ref.slice('refs/remotes/origin/'.length);
+      if (name === 'HEAD') continue; // origin/HEAD is a symbolic ref, not a real branch
+      const existing = byName.get(name);
+      if (existing) {
+        existing.hasRemote = true;
+      } else {
+        byName.set(name, {
+          name,
+          isDefault: name === defaultName,
+          isCurrent: false, // remote-only branches aren't checked out anywhere
+          hasRemote: true,
+          lastCommit: { sha, subject, date },
+        });
+      }
+    }
+  }
+
+  const all = [...byName.values()];
+  all.sort((a, b) => {
+    if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
+    // current floats above the rest (but never above default)
+    if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  return all;
+}
+
 /** Best-effort `git fetch origin`. No-op (ok:false) when there's no origin remote. */
 export function fetchOrigin(repoDir: string): { ok: boolean; reason?: string } {
   const remotes = execGit(['-C', repoDir, 'remote']);
@@ -313,6 +499,23 @@ export function aheadBehind(dir: string, base: string): { ahead: number; behind:
 export function isDirty(dir: string): boolean {
   const r = execGit(['-C', dir, 'status', '--porcelain']);
   return r.ok && r.out.length > 0;
+}
+
+/** Count of modified/added/deleted files (porcelain rows). 0 when clean. */
+export function dirtyFileCount(dir: string): number {
+  const r = execGit(['-C', dir, 'status', '--porcelain']);
+  if (!r.ok || !r.out) return 0;
+  return r.out.split('\n').filter(line => line.length > 0).length;
+}
+
+/** First line of `git log -1 --format=%s\\n%at` for the current HEAD. Returns
+    null subject + null time when the branch has no commits. */
+export function lastCommitInfo(dir: string): { subject: string | null; at: number | null } {
+  const r = execGit(['-C', dir, 'log', '-1', '--format=%s%n%at']);
+  if (!r.ok || !r.out) return { subject: null, at: null };
+  const [subject = '', atStr = ''] = r.out.split('\n');
+  const at = Number(atStr) * 1000;
+  return { subject: subject || null, at: Number.isFinite(at) && at > 0 ? at : null };
 }
 
 /** Whether `remote` has `branch` (via ls-remote; works for file:// remotes in tests). */
@@ -396,6 +599,25 @@ export function renameLocalBranch(wtDir: string, from: string, to: string): { ok
   return r.ok ? { ok: true } : { ok: false, reason: r.out.slice(0, 200) };
 }
 
+/** List worktree paths that currently carry unmerged conflict markers (status
+    code U on either side). Read-only: just inspects `git status --porcelain`,
+    so it's safe to call as part of a preview / dialog without touching the
+    worktree. Empty array on a clean worktree or non-repo. */
+export function listConflictedFiles(dir: string): string[] {
+  const r = execGit(['-C', dir, 'status', '--porcelain']);
+  if (!r.ok) return [];
+  const out: string[] = [];
+  for (const line of r.out.split('\n')) {
+    if (line.length < 3) continue;
+    const xy = line.slice(0, 2);
+    // Unmerged paths: "UU", "AA", "DD", "AU", "UA", "DU", "UD" — any 'U' in xy.
+    if (xy.includes('U') || xy === 'AA' || xy === 'DD') {
+      out.push(line.slice(3).trim());
+    }
+  }
+  return out;
+}
+
 /** Merge `base` (preferring origin/<base>) into the current branch in `dir`. A
     clean merge auto-commits; on conflict, returns the conflicted file paths and
     leaves the merge in progress so an agent/operator can resolve them. */
@@ -406,6 +628,116 @@ export function mergeBaseIntoBranch(dir: string, base: string): { ok: boolean; c
   const conf = execGit(['-C', dir, 'diff', '--name-only', '--diff-filter=U']);
   const conflicts = conf.ok ? conf.out.split('\n').filter(Boolean) : [];
   return conflicts.length ? { ok: false, conflicts } : { ok: false, conflicts: [], reason: m.out.slice(0, 200) };
+}
+
+// ── Conflict hunk extraction (T8 AI-resolve UI) ─────────────────────────────
+//
+// `parseConflictHunks` is the pure parser — given a file's content (with the
+// usual git markers), it returns each conflict block with the line ranges and
+// the "ours" / "theirs" payloads. Diff3-style markers (`||||||| base`) are
+// recognized so the base section can be surfaced too. Pure on purpose — the
+// renderer test exercises this directly without touching git/disk.
+
+export interface ConflictHunk {
+  /** 1-based line number of the `<<<<<<<` marker in the conflicted file. */
+  startLine: number;
+  /** 1-based line number of the `>>>>>>>` marker. */
+  endLine: number;
+  /** Label after `<<<<<<<` (typically the current/branch name, e.g. `HEAD`). */
+  oursLabel: string;
+  /** Label after `>>>>>>>` (typically the incoming branch name). */
+  theirsLabel: string;
+  /** Lines between `<<<<<<<` and `|||||||` (diff3) or `=======` (standard). */
+  ours: string[];
+  /** Diff3 only: lines between `|||||||` and `=======`. */
+  base?: string[];
+  /** Lines between `=======` and `>>>>>>>`. */
+  theirs: string[];
+}
+
+export interface ConflictFile {
+  path: string;
+  hunks: ConflictHunk[];
+  /** True if the file couldn't be read (gone, binary, perms). */
+  unreadable?: boolean;
+}
+
+/** Pure: walk a file's text, extract every `<<<<<<< / ======= / >>>>>>>` block.
+    Tolerant of diff3-style (`||||||| base`) and of mid-line whitespace.
+    Skips files with no markers. Bounded by the file size — we don't budget. */
+export function parseConflictHunks(text: string): ConflictHunk[] {
+  // Don't capture EOL chars in the line array — we reuse `n` indices for the
+  // 1-based `startLine` / `endLine` so a `\n`-vs-`\r\n` mismatch can't shift
+  // the reported ranges by one.
+  const lines = text.split(/\r?\n/);
+  const hunks: ConflictHunk[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const ln = lines[i];
+    const mStart = /^<{7}(?:\s+(.*))?$/.exec(ln);
+    if (!mStart) { i++; continue; }
+    const startLine = i + 1;
+    const oursLabel = (mStart[1] ?? '').trim();
+    const ours: string[] = [];
+    const base: string[] = [];
+    const theirs: string[] = [];
+    let sawBase = false;
+    let sawSep = false;
+    let theirsLabel = '';
+    let endLine = -1;
+    i++;
+    while (i < lines.length) {
+      const l = lines[i];
+      if (/^\|{7}(\s|$)/.test(l)) { sawBase = true; i++; continue; }
+      if (/^={7}$/.test(l))        { sawSep  = true; i++; continue; }
+      const mEnd = /^>{7}(?:\s+(.*))?$/.exec(l);
+      if (mEnd) { theirsLabel = (mEnd[1] ?? '').trim(); endLine = i + 1; i++; break; }
+      // Bucket by which separator we've crossed so far.
+      if (!sawSep && !sawBase) ours.push(l);
+      else if (!sawSep && sawBase) base.push(l);
+      else theirs.push(l);
+      i++;
+    }
+    // Drop hunks that never closed (corrupted file mid-conflict).
+    if (endLine === -1 || !sawSep) continue;
+    const hunk: ConflictHunk = { startLine, endLine, oursLabel, theirsLabel, ours, theirs };
+    if (sawBase) hunk.base = base;
+    hunks.push(hunk);
+  }
+  return hunks;
+}
+
+/** Read each file in `files` (paths relative to `dir`) from disk, parse the
+    git conflict markers, return one ConflictFile per input. Files that are
+    unreadable (binary, deleted, perms) are returned with `unreadable:true` so
+    the UI can still list them. Files with zero parsed hunks are still
+    returned (the file may have unresolved marker on a single line, etc.) but
+    keyed empty so the dialog can flag them. */
+export function getConflictHunks(dir: string, files: string[]): ConflictFile[] {
+  // Lazy-import here keeps the helper testable on a tmp dir without booting
+  // the rest of the module's heavy git binding.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { readFileSync } = require('node:fs') as typeof import('node:fs');
+  const out: ConflictFile[] = [];
+  for (const rel of files) {
+    const abs = path.join(dir, rel);
+    try {
+      const text = readFileSync(abs, 'utf8');
+      out.push({ path: rel, hunks: parseConflictHunks(text) });
+    } catch {
+      out.push({ path: rel, hunks: [], unreadable: true });
+    }
+  }
+  return out;
+}
+
+/** Convenience: ask git for the conflicted files in `dir` (during an
+    in-progress merge), then extract their hunks. Returns `{ files: [] }` when
+    there is no merge in progress. */
+export function getActiveConflictHunks(dir: string): { files: ConflictFile[] } {
+  const conf = execGit(['-C', dir, 'diff', '--name-only', '--diff-filter=U']);
+  const list = conf.ok ? conf.out.split('\n').filter(Boolean) : [];
+  return { files: getConflictHunks(dir, list) };
 }
 
 // ── Structured diff (read-only) — feeds the phone's Diff Review screen ──────

@@ -11,7 +11,7 @@ import { Icon, type IconName } from '../lib/icons';
 import { RichComposer, type RichComposerHandle, type ComposerChip } from './RichComposer';
 import { FileTypeIcon } from '../lib/fileIcons';
 import { FileChip, IS_WRITE_TOOL } from '../lib/fileChip';
-import { toolDisplay, isSkillTool, prettySkillName } from '../lib/toolDisplay';
+import { toolDisplay, isSkillTool, prettySkillName, scrubInternalMcp } from '../lib/toolDisplay';
 import {
   GroupedList,
   Row,
@@ -30,9 +30,10 @@ import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
 import { OpenPathContext, pathIsInside, type OpenPathFn } from '../lib/openPath';
 import { displayCodename } from '../lib/git-types';
-import { GitStatusBar } from './GitStatusBar';
-import { SessionStateDot } from './SessionStateDot';
-import { useSession, useSessionStateOnly } from '../lib/useSessionGitState';
+import { GitOpsDock } from '../components/GitOpsDock';
+import { SessionStateDot, SessionActivityDot } from './SessionStateDot';
+import { useSession, useSessionGitState } from '../lib/useSessionGitState';
+import { useSessionLocked } from '../hooks/useSessionLocked';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
 function shortHomePath(p: string): string {
@@ -68,9 +69,9 @@ export const COMPOSER_CSS = `
   .att-card { animation: attIn 130ms cubic-bezier(.32,.72,0,1); }
   @keyframes attIn { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
   .att-scroll { scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: var(--fill-secondary) transparent; overscroll-behavior: contain; }
-  .att-scroll::-webkit-scrollbar { width: 11px; height: 11px; }
+  .att-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
   .att-scroll::-webkit-scrollbar-track { background: transparent; }
-  .att-scroll::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 9px; border: 3px solid transparent; background-clip: padding-box; }
+  .att-scroll::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 9px; border: 2px solid transparent; background-clip: padding-box; }
   .att-scroll::-webkit-scrollbar-thumb:hover { background: var(--ink-quaternary, var(--ink-tertiary)); background-clip: padding-box; }
 `;
 
@@ -216,8 +217,8 @@ const PAGE_CSS = `
   @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
   @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
 
-  main::-webkit-scrollbar { width: 11px; }
-  main::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+  main::-webkit-scrollbar { width: 8px; }
+  main::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
   textarea::placeholder { color: var(--ink-tertiary); }
   ::selection { background: rgba(0,122,255,0.22); }
 `;
@@ -1012,11 +1013,71 @@ function SettingsTab() {
         <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default branch</span>
           <span style={{ font: '400 var(--fs-body)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>main</span></Row>
       </GroupedList>
+      {IS_LOCAL && <BrowserControl />}
       <GroupedList header="Danger zone" footer="Archiving stops all jobs and hides the project. You can restore it within 30 days.">
         <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--red)' }}>Archive project</span>
           <Icon name="chevronRight" size={16} style={{ color: 'var(--ink-tertiary)' }} /></Row>
       </GroupedList>
     </div>
+  );
+}
+
+/* Manual "Open browser" control. Opening here PINS the browser open so a finished
+   agent task won't auto-close it (the agent only tidies up windows IT opened) —
+   the user closes it themselves. Mirrors the held flag from the extension bridge. */
+function BrowserControl() {
+  const [status, setStatus] = React.useState<{ connected: boolean; held: boolean } | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+  const refresh = React.useCallback(() => {
+    api.extensionStatus()
+      .then(s => setStatus({ connected: s.peers.some(p => p.active), held: !!s.held }))
+      .catch(() => setStatus(null));
+  }, []);
+  React.useEffect(() => { refresh(); const t = setInterval(refresh, 4000); return () => clearInterval(t); }, [refresh]);
+
+  const held = !!status?.held;
+  const connected = !!status?.connected;
+  const toggle = () => {
+    setBusy(true); setErr(null);
+    const op = held ? api.extensionBrowserClose() : api.extensionBrowserOpen();
+    op.then(() => refresh())
+      .catch((e: unknown) => setErr(e instanceof Error ? e.message : 'Could not reach the browser.'))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <GroupedList
+      header="Browser"
+      footer={held
+        ? 'The browser is pinned open — it stays open after a task finishes until you close it here.'
+        : 'When the agent drives the browser for a task, it closes the window it opened once the task is done. Open it here to keep it open until you close it yourself.'}
+    >
+      <Row last>
+        <span style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>
+            {held ? 'Browser is open' : 'Open browser'}
+          </span>
+          <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: err ? 'var(--red)' : 'var(--ink-tertiary)' }}>
+            {err ?? (connected ? (held ? 'Pinned open' : 'Chrome connected') : 'No Chrome profile connected — pair the Mochi extension first')}
+          </span>
+        </span>
+        <button
+          onClick={toggle}
+          disabled={busy || (!connected && !held)}
+          style={{
+            height: 30, padding: '0 14px', borderRadius: 8, border: 'none', flexShrink: 0,
+            background: held ? 'var(--fill-secondary)' : 'var(--blue)',
+            color: held ? 'var(--ink)' : '#fff',
+            font: '600 var(--fs-footnote)/1 var(--font-text)',
+            cursor: busy || (!connected && !held) ? 'default' : 'pointer',
+            opacity: busy || (!connected && !held) ? 0.5 : 1,
+          }}
+        >
+          {busy ? '…' : held ? 'Close browser' : 'Open browser'}
+        </button>
+      </Row>
+    </GroupedList>
   );
 }
 
@@ -1274,7 +1335,9 @@ function liveActivity(job: Job, transcript: TranscriptItem[]): string {
   if (last) {
     if (last.kind === 'tool') {
       if (last.toolStatus === 'running') {
-        const what = (last.text || '').replace(/\s+/g, ' ').trim();
+        // Scrub `mcp__maestro__*` so the activity strip ("Running select:mcp__maestro__git_status")
+        // matches the rest of the transcript — our own MCP is a product feature, not plumbing.
+        const what = scrubInternalMcp((last.text || '').replace(/\s+/g, ' ').trim());
         const verb = TOOL_VERB(last.name ?? '');
         return what ? `${verb} ${what.length > 54 ? what.slice(0, 54) + '…' : what}` : `${verb}…`;
       }
@@ -1334,16 +1397,23 @@ function ThinkingNode({ item, live }: { item: TranscriptItem; live?: boolean }) 
     document-like framing as the Thinking block. Reads "[icon] Read SessionChat.tsx":
     a short tool verb + a filename chip (basename) for file tools, the description for
     Bash (raw command as an inline code chip), a pattern for search. */
-function ToolNode({ item }: { item: TranscriptItem }) {
+// Memoized — a streamed turn appends tools rapidly; without this every prior
+// ToolNode re-rendered on every token tick of the parent AssistantTurn.
+const ToolNode = React.memo(function ToolNode({ item }: { item: TranscriptItem }) {
   const running = item.toolStatus === 'running';
   const error = item.toolStatus === 'error';
   const isSkill = isSkillTool(item.name);
   const d = toolDisplay(item.name ?? '');
   const short = isSkill ? 'Skill' : d.short;
   const glyph = isSkill ? 'var(--purple)' : error ? 'var(--red)' : d.tint;
-  const showFile = !!d.file && !!item.text && !isSkill; // file tools → basename chip, not a path
-  const hasCmd = !!item.cmd && !showFile && !isSkill;
-  const detail = isSkill ? prettySkillName(item.text) : item.text;
+  // Scrub `mcp__maestro__*` plumbing from already-persisted transcripts at
+  // display time so historical chats look as native as new ones (electron's
+  // `toolLabel` cleans new tool calls at fire time; this catches the rest).
+  const cleanText = scrubInternalMcp(item.text || '');
+  const cleanCmd = item.cmd ? scrubInternalMcp(item.cmd) : item.cmd;
+  const showFile = !!d.file && !!cleanText && !isSkill; // file tools → basename chip, not a path
+  const hasCmd = !!cleanCmd && !showFile && !isSkill;
+  const detail = isSkill ? prettySkillName(cleanText) : cleanText;
   // A shell tool whose detail IS the raw command (no separate cmd chip) → mono font.
   const detailFont = !isSkill && !!d.mono && !hasCmd ? 'var(--font-mono)' : 'var(--font-text)';
   return (
@@ -1355,10 +1425,10 @@ function ToolNode({ item }: { item: TranscriptItem }) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
           <span style={{ font: '600 var(--fs-footnote)/1.4 var(--font-text)', color: error ? 'var(--red)' : 'var(--ink)', flexShrink: 0 }}>{short}</span>
           {showFile
-            ? <FileChip path={item.text} preview={item.preview} />
+            ? <FileChip path={cleanText} preview={item.preview} />
             : detail && <span style={{ flex: 1, minWidth: 0, font: `400 var(--fs-footnote)/1.4 ${detailFont}`, color: isSkill ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail}</span>}
         </div>
-        {hasCmd && <code style={{ alignSelf: 'flex-start', maxWidth: '100%', boxSizing: 'border-box', font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', background: 'var(--fill-tertiary)', borderRadius: 5, padding: '1px 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.cmd}</code>}
+        {hasCmd && <code style={{ alignSelf: 'flex-start', maxWidth: '100%', boxSizing: 'border-box', font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', background: 'var(--fill-tertiary)', borderRadius: 5, padding: '1px 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{cleanCmd}</code>}
       </div>
       <span style={{ flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
         {running ? <Spinner size={11} color={isSkill ? 'var(--purple)' : d.tint} />
@@ -1370,17 +1440,19 @@ function ToolNode({ item }: { item: TranscriptItem }) {
       </span>
     </div>
   );
-}
+});
 
 /** A run of consecutive tool steps — a calm flat list (no card framing), so the tools
-    read in the same document-like register as the surrounding text and the Thinking. */
-function ToolGroup({ items }: { items: TranscriptItem[] }) {
+    read in the same document-like register as the surrounding text and the Thinking.
+    Memoized + stable keys (SDK id / monotonic ts) so streaming a new tool doesn't
+    remount every prior chip on every token tick. */
+const ToolGroup = React.memo(function ToolGroup({ items }: { items: TranscriptItem[] }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 1, margin: '8px 0' }}>
-      {items.map((it, i) => <ToolNode key={i} item={it} />)}
+      {items.map((it, i) => <ToolNode key={it.id ?? `t-${it.ts ?? i}`} item={it} />)}
     </div>
   );
-}
+});
 
 /* ── Claude asks a question → a real, answerable card ─────────────────── */
 interface AskOption { label: string; description?: string }
@@ -1630,17 +1702,18 @@ function UserImageThumb({ img }: { img: ChatImage }) {
 }
 
 /* Match an `@<path>` inline attachment marker that points into the project's
-   `.continuum/Attachment/` directory. Works on both forms the bubble can see:
-   the desktop's absolute `@/Users/.../proj/.continuum/Attachment/x.png`, and
-   the relay-scrubbed `@.continuum/Attachment/x.png` the phone receives.
+   `.continuum/Attachment/` directory (including a per-branch subfolder). Works
+   on both forms the bubble can see: the desktop's absolute
+   `@/Users/.../proj/.continuum/Attachment/<branch>/x.png`, and the
+   relay-scrubbed `@.continuum/Attachment/<branch>/x.png` the phone receives.
    The prefix uses `[^@\n]+?` (not `\S*`) so a project path with SPACES — eg
    `/Users/me/Desktop/Client Shared GIT/veni0004/.continuum/Attachment/...` —
    still tokenizes into a pill instead of falling through to `linkifyText` and
    rendering as a raw underlined link in the user bubble (image_37flq.png).
-   The basename group also accepts an optional sub-directory chain so legacy
-   per-session attachments (`Attachment/<chat>/foo.png`) tokenize too. The
-   trailing `\.[A-Za-z0-9]+` anchors on the saved file's extension so trailing
-   prose (` , Now…`) is excluded from the match. */
+   Group 2 is the basename; the optional sub-directory chain lets a per-branch
+   or legacy per-session attachment (`Attachment/<chat>/foo.png`) tokenize too,
+   and `basenameOf` stays idempotent on it. The trailing `\.[A-Za-z0-9]+` anchors
+   on the saved file's extension so trailing prose (` , Now…`) is excluded. */
 const ATTACH_INLINE_RE = /@((?:\/[^@\n]+?)?\.continuum\/Attachment\/(?:[A-Za-z0-9._-]+\/)*([A-Za-z0-9._-]+\.[A-Za-z0-9]+))/g;
 /** Basename of a saved attachment path — the lookup key against inputImages /
     inputFiles, since those carry their `.continuum/Attachment/` filename. */
@@ -1686,6 +1759,61 @@ function InlineAttach({ path, images, files }: { path: string; images?: ChatImag
   );
 }
 
+/** Prefix the engine stamps on a turn it auto-sent to keep a goal-mode run
+    going (mirrors KEEP_GOING_PREFIX in electron/keep-going.ts — duplicated here
+    rather than imported so the renderer build doesn't pull in Electron code). */
+const AUTO_CONTINUE_PREFIX = '[Auto-continue]:';
+
+/** Auto-continue turns are machine-generated continuation prompts (a goal echo
+    + a "you outlined these next moves" bullet list + autonomy boilerplate).
+    Rendered through UserBubble they became a giant blue bubble of raw,
+    pre-wrap text — literal `-`/`#` markdown and blank-line bloat (image_yhpsb.png).
+    They aren't something the USER typed, so they shouldn't masquerade as a user
+    message. Render them as a compact, dimmed, collapsible system note instead:
+    one quiet line by default, expandable to the full prompt rendered with the
+    real markdown renderer (bullets become bullets, not a wall of `-`). */
+function AutoContinueBubble({ text }: { text: string }) {
+  const [open, setOpen] = React.useState(false);
+  // Strip the prefix, collapse blank-line bloat / trailing spaces, and pull the
+  // single most informative line for the collapsed preview: prefer the `Goal:`
+  // line, else the first non-empty line.
+  const body = React.useMemo(
+    () => text.slice(AUTO_CONTINUE_PREFIX.length).replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim(),
+    [text],
+  );
+  const preview = React.useMemo(() => {
+    const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
+    const goal = lines.find(l => /^goal:/i.test(l));
+    const pick = (goal ?? lines[0] ?? 'Continuing autonomously').replace(/^goal:\s*/i, '');
+    return pick.length > 96 ? pick.slice(0, 96) + '…' : pick;
+  }, [body]);
+  return (
+    <div className="chat-msg" style={{ display: 'flex', justifyContent: 'flex-end' }}>
+      <div style={{ maxWidth: 'min(78%, 640px)', width: open ? '100%' : 'auto', borderRadius: 12,
+        border: '0.5px solid color-mix(in srgb, var(--purple) 28%, var(--separator))',
+        background: 'color-mix(in srgb, var(--purple) 6%, var(--bg-elevated))', overflow: 'hidden' }}>
+        <button onClick={() => setOpen(o => !o)} title={open ? 'Hide the auto-continue prompt' : 'Show the full auto-continue prompt'}
+          style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '8px 12px', background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left' }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexShrink: 0, height: 17, padding: '0 6px', borderRadius: 5,
+            background: 'color-mix(in srgb, var(--purple) 15%, transparent)', color: 'var(--purple)', font: '700 9px/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+            <Icon name="refresh" size={9} /> Auto-continued
+          </span>
+          {!open && (
+            <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{preview}</span>
+          )}
+          <Icon name="chevronRight" size={13} style={{ flexShrink: 0, color: 'var(--ink-tertiary)', transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+        </button>
+        {open && (
+          <div style={{ padding: '0 14px 12px', borderTop: '0.5px solid color-mix(in srgb, var(--purple) 18%, var(--separator))',
+            font: '400 13.5px/1.6 var(--font-text)', color: 'var(--ink-secondary)' }}>
+            {renderChatBody(body, 'autocont')}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /** Render the user bubble: text with `@<.continuum/Attachment/…>` markers
     tokenized into inline chips/thumbnails at the exact position the user
     dropped them in the composer. Images that aren't referenced inline (legacy
@@ -1695,7 +1823,15 @@ function InlineAttach({ path, images, files }: { path: string; images?: ChatImag
     `**bold**` and `` `code` `` render properly — the user reported that
     auto-continue prompts (and their own typed messages) were showing literal
     `**` stars in the bubble (image_kpijo.png / image_6f4zy.png). */
-function UserBubble({ text, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
+function UserBubble({ text: rawText, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
+  // The bubble renders with `whiteSpace: 'pre-wrap'`, so every blank line in the
+  // payload becomes vertical air. Auto-continue prompts (and pasted goals) carry
+  // runs of blank lines + trailing spaces that bloated the bubble (image_yhpsb.png);
+  // collapse 3+ newlines to one blank line and strip trailing spaces up front.
+  const text = React.useMemo(
+    () => (rawText ? rawText.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trimEnd() : rawText),
+    [rawText],
+  );
   // Split the text into [string, attachment, string, attachment, …] tokens,
   // then run each plain-text segment through the inline-markdown renderer
   // (same one the agent bubble uses, so the formatting is symmetric).
@@ -1721,7 +1857,7 @@ function UserBubble({ text, images, files }: { text: string; images?: ChatImage[
   const referencedBases = React.useMemo(() => {
     const s = new Set<string>(); if (!text) return s;
     const r = new RegExp(ATTACH_INLINE_RE.source, 'g'); let mm: RegExpExecArray | null;
-    while ((mm = r.exec(text)) !== null) s.add(mm[2]);
+    while ((mm = r.exec(text)) !== null) s.add(basenameOf(mm[2]));
     return s;
   }, [text]);
   const orphanImages = (images ?? []).filter(im => !referencedBases.has(basenameOf(im.imagePath ?? '')) && !referencedBases.has(im.name ?? ''));
@@ -2544,8 +2680,17 @@ const readQueue = (sid: string | null): QueueItem[] => {
 const writeQueue = (sid: string | null, q: QueueItem[]): void => {
   if (!sid) return;
   try { if (q.length) localStorage.setItem(QUEUE_KEY(sid), JSON.stringify(q)); else localStorage.removeItem(QUEUE_KEY(sid)); }
-  catch { /* ignore quota / serialisation */ }
+  catch { /* ignore quota / serialisation — large image bytes may exceed it; the in-memory queue still drains */ }
 };
+const CHAT_PAGE_SIZE = 30;
+function compareTurnsOldestFirst(a: Job, b: Job): number {
+  return (a.createdAt - b.createdAt) || (a.updatedAt - b.updatedAt) || a.id.localeCompare(b.id);
+}
+function mergeTurns(...groups: Job[][]): Job[] {
+  const byId = new Map<string, Job>();
+  for (const group of groups) for (const job of group) byId.set(job.id, job);
+  return [...byId.values()].sort(compareTurnsOldestFirst);
+}
 
 // Composer @-mentions — typing `@` suggests a capability; selecting it turns the
 // capability on (shown as its iconed capsule in the toolbar) and tidies the token.
@@ -2658,10 +2803,10 @@ const fmtBytes = (n?: number): string => (n == null ? '' : n < 1024 ? `${n} B` :
 const attachLabel = (a: Attach): string => (a.kind === 'text' && a.name === 'Pasted text.txt' ? 'Pasted text' : a.name);
 
 /* Tiny live state dot for the session rails — subscribes once via the shared
-   cache so a long rail with 20 chats doesn't open 20 sockets. */
+   cache so a long rail with 20 chats doesn't open 20 sockets. Shows a spinning
+   ring while the session's job is running, else the git/PR state dot. */
 function SessionPillDot({ sessionId }: { sessionId: string }) {
-  const state = useSessionStateOnly(sessionId);
-  return <SessionStateDot state={state} size={8} reserveSpace />;
+  return <SessionActivityDot sessionId={sessionId} size={8} />;
 }
 
 /* Chat header bar — sits at the very top of the chat. Conductor-style:
@@ -2670,9 +2815,15 @@ function SessionPillDot({ sessionId }: { sessionId: string }) {
    • the Archive button (or "Restore" pill if the chat is archived) +
    • a quiet branch label so the operator sees what's actually checked out.
    Renders nothing for no session / non-repo. */
-function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projectId: string | null }) {
+function ChatHeader({ sessionId, projectId, onContinue }: {
+  sessionId: string | null;
+  projectId: string | null;
+  /** Forwarded to <GitOpsDock /> as the `pr-merged` → "Continue from here →"
+      handler. ChatThread wires its `continueFromHere` here so the dock's
+      primary action actually spawns the continuation session. */
+  onContinue?: () => void | Promise<void>;
+}) {
   const session = useSession(sessionId, projectId);
-  const state = useSessionStateOnly(sessionId);
   const [busy, setBusy] = React.useState(false);
   if (!sessionId || !session) return null;
 
@@ -2697,7 +2848,7 @@ function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projec
       {code && (
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 'var(--r-pill)',
           background: 'var(--fill-secondary)', font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', letterSpacing: '0.02em' }}>
-          <SessionStateDot state={state} size={8} reserveSpace />
+          <SessionActivityDot sessionId={sessionId} size={8} />
           {displayCodename(code)}
         </span>
       )}
@@ -2712,7 +2863,7 @@ function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projec
           <Icon name="archive" size={11} /> Archived
         </span>
       )}
-      <GitStatusBar sessionId={sessionId} variant="header" codename={code} />
+      <GitOpsDock sessionId={sessionId} codename={code} onContinue={onContinue} />
       <button onClick={archive} disabled={busy} title={archived ? 'Restore chat' : 'Archive chat'}
         style={{ height: 28, padding: '0 11px', borderRadius: 8, border: '0.5px solid var(--separator-strong)',
           background: 'var(--fill-secondary)', color: 'var(--ink)',
@@ -2725,11 +2876,19 @@ function ChatHeader({ sessionId, projectId }: { sessionId: string | null; projec
   );
 }
 
-export function ChatThread({ projectId, project, sessionId, onSessionCreated, onTurns, onOpenImage, onOpenFile, flush, autoFocus }: {
+export function ChatThread({ projectId, project, sessionId, base, onSessionCreated, onOpenSession, onTurns, onOpenImage, onOpenFile, flush, autoFocus }: {
   projectId: string | null;
   project: Project | null;
   sessionId: string | null;
+  /** When opening a fresh "New chat" tab via the <BranchPicker /> popover, the
+      operator's chosen base branch — forwarded into sendChat so the session's
+      worktree forks from it on first send. Ignored once `sessionId` is real. */
+  base?: string;
   onSessionCreated?: (session: ChatSession) => void;
+  /** Open an EXISTING session in the host's tab system (Workspace) or
+      navigate (ProjectDetail). Wired by Track 7's "Continue from here" so the
+      newly-spawned continuation session becomes the active tab. */
+  onOpenSession?: (session: ChatSession) => void;
   /** Lifts this chat's turns (jobs) to the parent — used by the Workspace's
       "Changed files" panel to read the write-tool activity. */
   onTurns?: (jobs: Job[]) => void;
@@ -2742,6 +2901,11 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   autoFocus?: boolean;
 }) {
   const [turns, setTurns] = React.useState<Job[]>([]);
+  const [turnsLoading, setTurnsLoading] = React.useState(false);
+  const [hasOlderTurns, setHasOlderTurns] = React.useState(false);
+  const [olderCursor, setOlderCursor] = React.useState<string | null>(null);
+  const [olderBefore, setOlderBefore] = React.useState<number | null>(null);
+  const [olderLoading, setOlderLoading] = React.useState(false);
   React.useEffect(() => { onTurns?.(turns); }, [turns]); // eslint-disable-line react-hooks/exhaustive-deps
   // Stable wrapper so the image-open context value never changes identity (would
   // otherwise re-render every image chip on each streaming frame).
@@ -2787,13 +2951,6 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     try { await api.setSessionAutopilot(activeId, next); }
     catch { setAutoPilotLocal(!next); /* revert on failure */ }
   }, [activeId, autoPilotEffective]);
-  const toggleReviewer = React.useCallback(async () => {
-    if (!activeId) return;
-    const next = !reviewerEffective;
-    setReviewerLocal(next);
-    try { await api.setSessionReviewer(activeId, next); }
-    catch { setReviewerLocal(!next); /* revert on failure */ }
-  }, [activeId, reviewerEffective]);
   const [text, setText] = React.useState('');
   // Primary (coding) + reviewer model. Remembered across the app via localStorage;
   // seeded from the workspace role defaults when the user hasn't chosen yet.
@@ -2817,6 +2974,23 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       if (!reviewerKey) setReviewerKeyState(roles.reviewer === 'off' ? 'off' : keyForRoleChoice(modelGroups, roles.reviewer));
     }).catch(() => {});
   }, [modelGroups]); // eslint-disable-line react-hooks/exhaustive-deps
+  const seedReviewerKey = React.useCallback(() => {
+    if (reviewerKey && reviewerKey !== 'off') return reviewerKey;
+    if (primaryKey && primaryKey !== 'off') return primaryKey;
+    const first = modelGroups.find(g => g.runnable && g.models.length > 0)?.models[0]?.key;
+    return first ?? 'claude:claude-opus-4-8';
+  }, [modelGroups, primaryKey, reviewerKey]);
+  const toggleReviewer = React.useCallback(async () => {
+    if (!activeId) return;
+    const next = !reviewerEffective;
+    if (next && (!reviewerKey || reviewerKey === 'off')) setReviewerKey(seedReviewerKey());
+    setReviewerLocal(next);
+    try { await api.setSessionReviewer(activeId, next); }
+    catch { setReviewerLocal(!next); /* revert on failure */ }
+  }, [activeId, reviewerEffective, reviewerKey, seedReviewerKey]);
+  React.useEffect(() => {
+    if (reviewerEffective && (!reviewerKey || reviewerKey === 'off')) setReviewerKey(seedReviewerKey());
+  }, [reviewerEffective, reviewerKey, seedReviewerKey]);
   const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
   // Plan mode: agent proposes a plan first (no execution). Persisted per app.
   const [planMode, setPlanModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.plan') === '1'; } catch { return false; } });
@@ -2825,6 +2999,19 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [goalMode, setGoalModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.goal') === '1'; } catch { return false; } });
   const setPlanMode = (on: boolean) => { setPlanModeState(on); try { localStorage.setItem('maestro.chat.plan', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setGoalModeState(false); try { localStorage.setItem('maestro.chat.goal', '0'); } catch { /* ignore */ } } };
   const setGoalMode = (on: boolean) => { setGoalModeState(on); try { localStorage.setItem('maestro.chat.goal', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setPlanModeState(false); try { localStorage.setItem('maestro.chat.plan', '0'); } catch { /* ignore */ } } };
+  // When the operator approves the agent's plan in ExitPlanModeDialog, the
+  // dialog flips the localStorage flag AND dispatches this custom event so our
+  // React state catches up — otherwise the next message would still pass
+  // `plan: true` (stale React state) and the SDK would re-enter plan mode for
+  // the very next turn, completely undoing the approval.
+  React.useEffect(() => {
+    const onChange = (e: Event) => {
+      const detail = (e as CustomEvent<{ on: boolean }>).detail;
+      if (typeof detail?.on === 'boolean') setPlanModeState(detail.on);
+    };
+    window.addEventListener('maestro:plan-mode-changed', onChange);
+    return () => window.removeEventListener('maestro:plan-mode-changed', onChange);
+  }, []);
   // Browser use is driven by an explicit @browser mention in the composer
   // (composerBrowser) — there's no separate toggle button to keep the bar clean.
   const primaryProvider = React.useMemo(() => {
@@ -2876,11 +3063,23 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   // Turns of the open session (ascending — a chat thread). Queue is per-session.
   React.useEffect(() => {
     setQueue(readQueue(activeId)); // restore this session's persisted queue
-    if (!activeId) { setTurns([]); return; }
+    setHasOlderTurns(false);
+    setOlderCursor(null);
+    setOlderBefore(null);
+    setOlderLoading(false);
+    if (!activeId) { setTurns([]); setTurnsLoading(false); return; }
     let alive = true;
-    api.listJobs(undefined, activeId)
-      .then(js => { if (alive) setTurns([...js].sort((a, b) => a.createdAt - b.createdAt)); })
-      .catch(() => {});
+    setTurnsLoading(true);
+    api.listJobPage({ sessionId: activeId, limit: CHAT_PAGE_SIZE })
+      .then(page => {
+        if (!alive) return;
+        setTurns(page.jobs);
+        setHasOlderTurns(page.hasMore);
+        setOlderCursor(page.nextCursor);
+        setOlderBefore(page.nextBefore);
+      })
+      .catch(() => { if (alive) setTurns([]); })
+      .finally(() => { if (alive) setTurnsLoading(false); });
     return () => { alive = false; };
   }, [activeId]);
 
@@ -2891,7 +3090,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
         if (!j.sessionId || j.sessionId !== activeRef.current) return;
         setTurns(ts => {
           const i = ts.findIndex(t => t.id === j.id);
-          if (i === -1) return [...ts, j].sort((a, b) => a.createdAt - b.createdAt);
+          if (i === -1) return [...ts, j].sort(compareTurnsOldestFirst);
           const next = ts.slice(); next[i] = j; return next;
         });
       },
@@ -2956,7 +3155,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     if (!sid || !t) return;
     setSchedules(list => list.filter(s => !(s.kind === 'auto-answer' && s.sessionId === sid))); // drop countdown
     void api.answerQuestion({ sessionId: sid, answer: t })
-      .then(job => setTurns(ts => [...ts.filter(x => x.id !== job.id), job].sort((a, b) => a.createdAt - b.createdAt)))
+      .then(job => setTurns(ts => [...ts.filter(x => x.id !== job.id), job].sort(compareTurnsOldestFirst)))
       .catch(e => setSendError(e instanceof Error ? e.message : 'Could not send your answer — try again.'));
   }, []);
   const extendLiveQuestion = React.useCallback(() => {
@@ -2985,11 +3184,37 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
 
   // Stick to the bottom while streaming unless the user scrolled up.
   const [atBottom, setAtBottom] = React.useState(true);
+  const loadOlderTurns = React.useCallback(async () => {
+    const sid = activeRef.current;
+    if (!sid || !hasOlderTurns || olderLoading) return;
+    const el = scrollRef.current;
+    const prevHeight = el?.scrollHeight ?? 0;
+    stickBottom.current = false;
+    setOlderLoading(true);
+    try {
+      const page = await api.listJobPage({ sessionId: sid, cursor: olderCursor, before: olderCursor ? undefined : olderBefore, limit: CHAT_PAGE_SIZE });
+      if (activeRef.current !== sid) return;
+      setTurns(prev => mergeTurns(page.jobs, prev));
+      setHasOlderTurns(page.hasMore);
+      setOlderCursor(page.nextCursor);
+      setOlderBefore(page.nextBefore);
+      window.requestAnimationFrame(() => {
+        const nextEl = scrollRef.current;
+        if (!nextEl) return;
+        nextEl.scrollTop += nextEl.scrollHeight - prevHeight;
+      });
+    } catch {
+      // Keep the existing page visible; a later scroll/button press can retry.
+    } finally {
+      if (activeRef.current === sid) setOlderLoading(false);
+    }
+  }, [hasOlderTurns, olderBefore, olderCursor, olderLoading]);
   const onScroll = () => {
     const el = scrollRef.current; if (!el) return;
     const bottom = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
     stickBottom.current = bottom;
     setAtBottom(bottom);
+    if (el.scrollTop < 80) void loadOlderTurns();
   };
   const jumpToLatest = () => {
     const el = scrollRef.current; if (!el) return;
@@ -3031,6 +3256,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     setSendError('');
     stickBottom.current = true;
     try {
+      // `base` is the operator's branch pick from <BranchPicker /> for an
+      // un-sent "New chat" tab. The server pins it onto the session at
+      // lazy-create time (sendChat path); ignored once a session already exists.
       const resp = await api.sendChat({
         projectId, text: body, sessionId: activeRef.current ?? undefined,
         effort: EFFORT_TO_API[effort], plan: planMode, goal: goalMode, browser: composerBrowser,
@@ -3038,6 +3266,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
         ...(reviewerKey ? { reviewerKey } : {}),
         ...(imgs.length ? { images: imgs } : {}),
         ...(files.length ? { files } : {}),
+        ...(!activeRef.current && base ? { base } : {}),
       });
       if (activeRef.current !== resp.session.id) {
         activeRef.current = resp.session.id; // match the streamed job immediately
@@ -3045,14 +3274,14 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
         setTurns([resp.job]);
         onSessionCreated?.(resp.session);
       } else {
-        setTurns(ts => [...ts.filter(x => x.id !== resp.job.id), resp.job].sort((a, b) => a.createdAt - b.createdAt));
+        setTurns(ts => [...ts.filter(x => x.id !== resp.job.id), resp.job].sort(compareTurnsOldestFirst));
       }
       return true;
     } catch (e) {
       setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
       return false;
     }
-  }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, composerBrowser, onSessionCreated]);
+  }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, composerBrowser, base, onSessionCreated]);
 
   // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
   // The earlier "steer = interrupt and restart" model was scrapped because it
@@ -3069,6 +3298,34 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     if (streaming) { mutateQueue(q => [...q, { text: t }]); return; }
     void sendRaw(t).then(ok => { if (!ok) composerRef.current?.setText(raw); });
   }, [projectId, streaming, sendRaw, mutateQueue]);
+
+  // sendTextRef mirrors the latest sendText so the window-event listener below
+  // — registered ONCE with no deps — always calls the up-to-date closure (with
+  // the latest sendRaw, which in turn captures the latest planMode/goalMode).
+  // Without this, the listener would freeze the original closure and a Codex
+  // plan-mode approval would re-send into plan-mode by mistake.
+  const sendTextRef = React.useRef(sendText);
+  React.useEffect(() => { sendTextRef.current = sendText; }, [sendText]);
+
+  // Codex plan-mode approval auto-follow-up. Codex's `codex exec` is one-shot
+  // (unlike Claude's SDK which can continue the same run on canUseTool allow),
+  // so when the operator approves a Codex plan we have to queue a new turn
+  // explicitly to make the approval take effect. The dialog dispatches this
+  // event in rAF so React has already committed planMode=false; we ignore
+  // events for a session the operator switched away from. The follow-up
+  // message is short + unambiguous so codex knows it's executing the plan it
+  // just proposed — not re-planning.
+  React.useEffect(() => {
+    const onCodexApproved = (e: Event) => {
+      const detail = (e as CustomEvent<{ sessionId: string | null; plan: string }>).detail;
+      if (!detail) return;
+      if (detail.sessionId && detail.sessionId !== activeRef.current) return; // operator switched sessions
+      sendTextRef.current('Approved the plan above. Execute it now, following the steps you proposed.');
+    };
+    window.addEventListener('maestro:plan-approved-codex', onCodexApproved);
+    return () => window.removeEventListener('maestro:plan-approved-codex', onCodexApproved);
+  }, []);
+
 
   // ── Attachments: paste, drop, or pick — images (vision), text/code (inlined),
   //    or any other file (saved + read by the agent). ─────────────────────────
@@ -3163,35 +3420,34 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   }, []);
   const canSend = !!text.trim() || attachments.length > 0;
 
-  // Compose-and-send (⏎): NEVER cancels the running turn. When idle, sends now.
-  // When streaming, the whole composer payload (text + attachments) is QUEUED to
-  // run when the current turn finishes. The earlier path force-cancelled the
-  // running job whenever images were attached — that's the bug the operator hit
-  // in image_nqm3a.png ("× Stopped" appeared mid-tool-call the instant they sent
-  // a message with an image chip). Now only the explicit red abort button stops.
+  // Compose-and-send (⏎): NEVER cancels the running turn. While the agent is
+  // working → QUEUE the whole composer payload (text + attachments); it drains
+  // the instant the turn finishes. Attachments ride the queue (the queue item
+  // carries `atts`), so a pasted image no longer force-cancels the running turn
+  // — that's the bug the operator hit in image_nqm3a.png ("× Stopped" appeared
+  // mid-tool-call the instant they sent a message with an image chip). When
+  // idle, send straight through. On failure the text + attachments are restored
+  // so nothing is lost. The ONLY stop control is the explicit red abort button.
   const sendComposed = React.useCallback(() => {
-    const t = text.trim(); const atts = attachments;
+    // Read straight from the composer (the DOM is the source of truth) so a
+    // pending rAF-coalesced state update can never make Enter send stale text.
+    const t = (composerRef.current?.getText() ?? text).trim(); const atts = attachments;
     if ((!t && !atts.length) || !projectId) return;
-    composerRef.current?.clear(); setAttachments([]);
-    if (streaming) {
-      mutateQueue(q => [...q, { text: t, ...(atts.length ? { atts } : {}) }]);
-      return;
-    }
-    void sendRaw(t, atts).then(ok => { if (!ok) { composerRef.current?.setText(t); if (atts.length) restoreAtts(atts); } });
+    composerRef.current?.clear(); setAttachments([]); attachmentsRef.current = [];
+    if (streaming) { mutateQueue(q => [...q, { text: t, atts: atts.length ? atts : undefined }]); return; }
+    void sendRaw(t, atts).then(ok => { if (!ok) { composerRef.current?.setText(t); restoreAtts(atts); } });
   }, [text, attachments, projectId, streaming, sendRaw, mutateQueue, restoreAtts]);
-  // ⌘↩ "run next" — same semantics as ⏎ when idle; while streaming it pushes the
-  // composer payload to the FRONT of the queue so it runs the moment the current
-  // turn finishes. Never cancels. (Pre-refactor this called sendNow which DID
-  // cancel — see image_nqm3a.png.)
+  // ⌘↩ "run next" — while streaming, push the message (WITH attachments) to the
+  // FRONT of the queue so it runs the moment the current turn finishes — no
+  // cancel, no lost work, no overlapping run. When idle, ⌘↩ just sends
+  // immediately (no queue to skip). The current turn is never interrupted; the
+  // red abort button is the only stop control.
   const sendComposedNow = React.useCallback(() => {
-    const t = text.trim(); const atts = attachments;
+    const t = (composerRef.current?.getText() ?? text).trim(); const atts = attachments;
     if ((!t && !atts.length) || !projectId) return;
-    composerRef.current?.clear(); setAttachments([]);
-    if (streaming) {
-      mutateQueue(q => [{ text: t, ...(atts.length ? { atts } : {}) }, ...q]);
-      return;
-    }
-    void sendRaw(t, atts).then(ok => { if (!ok) { composerRef.current?.setText(t); if (atts.length) restoreAtts(atts); } });
+    composerRef.current?.clear(); setAttachments([]); attachmentsRef.current = [];
+    if (streaming) { mutateQueue(q => [{ text: t, atts: atts.length ? atts : undefined }, ...q]); return; }
+    void sendRaw(t, atts).then(ok => { if (!ok) { composerRef.current?.setText(t); restoreAtts(atts); } });
   }, [text, attachments, projectId, streaming, sendRaw, mutateQueue, restoreAtts]);
 
   const removeFromQueue = (i: number) => mutateQueue(q => q.filter((_, j) => j !== i));
@@ -3242,7 +3498,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   // time, carrying the run intent (effort/browser/plan/goal). Clears on success.
   const scheduleMessage = (fireAt: number) => {
     if (!projectId) return;
-    const body = text.trim();
+    const body = (composerRef.current?.getText() ?? text).trim();
     if (!body) { setSchedOpen(false); setSendError('Type a message first, then schedule it.'); return; }
     void api.scheduleMessage({
       projectId, sessionId: activeRef.current ?? undefined, prompt: body, fireAt,
@@ -3258,7 +3514,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   // chat, carrying the run intent. Clears the composer on success.
   const scheduleRecurring = (o: { everyMinutes?: number; time?: string; cadence?: string; catchUp: boolean }) => {
     if (!projectId) return;
-    const body = text.trim();
+    const body = (composerRef.current?.getText() ?? text).trim();
     if (!body) { setSchedOpen(false); setSendError('Type a message first, then schedule it.'); return; }
     void api.createSchedule({
       title: body.slice(0, 60), projectId, sessionId: activeRef.current ?? undefined, prompt: body,
@@ -3316,6 +3572,48 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     setMentionQuery(null); setMentionSel(0);
   };
 
+  // ── Track 7: lock-after-merge ───────────────────────────────────────────
+  // The composer is read-only when this session's PR has been merged. The
+  // banner + lock both read from the SAME `pr-merged` state, so they never
+  // disagree (e.g. banner up but composer alive, or vice versa).
+  const locked = useSessionLocked(activeId);
+  const gitStatus = useSessionGitState(activeId);
+  const mergedPr = locked && gitStatus?.pr ? gitStatus.pr : null;
+  const [continuing, setContinuing] = React.useState(false);
+  const continueFromHere = React.useCallback(async () => {
+    if (!activeId || !mergedPr || continuing) return;
+    setContinuing(true);
+    try {
+      const fresh = await api.continueSession({
+        sessionId: activeId,
+        baseRefName: mergedPr.baseRefName,
+        prNumber: mergedPr.number,
+        mergedAt: mergedPr.mergedAt,
+      });
+      // Tell the host (Workspace tabs / ProjectDetail) to OPEN the new session.
+      // We do NOT also auto-close the merged tab — the operator may want to
+      // glance back at the prior conversation while they keep going.
+      onSessionCreated?.(fresh);
+      onOpenSession?.(fresh);
+    } catch (e) {
+      setSendError(e instanceof Error ? e.message : 'Could not create the continuation session.');
+    } finally {
+      setContinuing(false);
+    }
+  }, [activeId, mergedPr, continuing, onSessionCreated, onOpenSession]);
+  // The continued-from link jumps back to the merged ancestor's tab (if the
+  // host wired onOpenSession). Resolves the ChatSession lazily so we don't
+  // hold a stale title; falls back to a no-op when the ancestor was deleted.
+  const continuedFrom = activeSession?.continuedFrom;
+  const openAncestor = React.useCallback(async () => {
+    if (!continuedFrom || !onOpenSession) return;
+    try {
+      const list = await api.listSessions(projectId ?? undefined);
+      const ancestor = list.find(s => s.id === continuedFrom.sessionId);
+      if (ancestor) onOpenSession(ancestor);
+    } catch { /* best-effort — the link goes dead if the ancestor is gone */ }
+  }, [continuedFrom, onOpenSession, projectId]);
+
   return (
     <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)', overflow: 'hidden',
       ...(flush ? {} : { borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)' }) }}>
@@ -3326,11 +3624,48 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
       <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
         background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
       {/* Conductor-style chat header: codename + state chip + Archive. The
-          GitStatusBar gates itself for non-repo / null sessions. */}
-      <ChatHeader sessionId={activeId} projectId={projectId} />
+          GitOpsDock (Track 5) gates itself for non-repo / null sessions.
+          `onContinue` wires the dock's `pr-merged` → "Continue from here →"
+          primary action — there is no second banner surface for it. */}
+      <ChatHeader sessionId={activeId} projectId={projectId} onContinue={mergedPr ? continueFromHere : undefined} />
+      {/* Track 7: "← Continued from …" jump-link for a session forked off a
+          merged ancestor. Sits between the chat header and the transcript so
+          the operator can hop back to the previous chat in one click. */}
+      {continuedFrom && (
+        <div style={{ position: 'relative', zIndex: 1, padding: '4px 24px 0' }}>
+          <button onClick={openAncestor} disabled={!onOpenSession} title={onOpenSession ? 'Open the previous session' : undefined} style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 'var(--r-pill)',
+            background: 'transparent', border: 'none', cursor: onOpenSession ? 'pointer' : 'default',
+            font: '500 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-secondary)',
+          }}>
+            <span aria-hidden="true">←</span>
+            <span>Continued from</span>
+            <span style={{ font: '600 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink)' }}>"{continuedFrom.title}"</span>
+          </button>
+        </div>
+      )}
       <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
         <div style={{ maxWidth: CHAT_W, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
-          {turns.length === 0 && (
+          {/* Track 7: seed system-context card for a freshly-spawned continuation
+              session. Renders ONCE, above the empty-state prompt, so the agent's
+              first context is visible to the operator (and re-readable until they
+              type). Vanishes after the first turn lands. */}
+          {!turnsLoading && turns.length === 0 && continuedFrom && (
+            <div style={{ padding: '20px 20px 0', maxWidth: 620, margin: '0 auto', width: '100%' }}>
+              <div style={{ borderRadius: 12, padding: '12px 14px',
+                background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)',
+                font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)',
+              }}>
+                <div style={{ font: '700 var(--fs-caption)/1.2 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 }}>System context</div>
+                Continued from <strong style={{ color: 'var(--ink)' }}>"{continuedFrom.title}"</strong>
+                {continuedFrom.prNumber ? <> &middot; previous PR #{continuedFrom.prNumber}</> : null}
+                {continuedFrom.mergedAt ? <> merged on {new Date(continuedFrom.mergedAt).toLocaleDateString()}</> : null}
+                {continuedFrom.baseRefName ? <> into <code style={{ font: '600 var(--fs-caption)/1 var(--font-mono)' }}>{continuedFrom.baseRefName}</code></> : null}.
+                <div style={{ marginTop: 4 }}>Full prior transcript is available on the previous session — ask if you want a summary or any specific decisions referenced.</div>
+              </div>
+            </div>
+          )}
+          {!turnsLoading && turns.length === 0 && (
             <div style={{ padding: '52px 20px 20px', textAlign: 'center' }}>
               <span style={{ width: 56, height: 56, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
                 background: 'linear-gradient(160deg, color-mix(in srgb, var(--blue) 18%, transparent), color-mix(in srgb, var(--purple) 16%, transparent))',
@@ -3353,11 +3688,30 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               </div>
             </div>
           )}
+          {turnsLoading && turns.length === 0 && (
+            <div style={{ display: 'grid', placeItems: 'center', padding: '56px 0', color: 'var(--ink-tertiary)' }}>
+              <Spinner size={18} />
+            </div>
+          )}
+          {activeId && (hasOlderTurns || olderLoading) && (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '2px 0 4px' }}>
+              <button onClick={loadOlderTurns} disabled={olderLoading} style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6, height: 30, padding: '0 12px', borderRadius: 'var(--r-pill)',
+                background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)', color: 'var(--ink-secondary)',
+                font: '600 var(--fs-caption)/1 var(--font-text)', cursor: olderLoading ? 'default' : 'pointer', opacity: olderLoading ? 0.68 : 1,
+              }}>
+                {olderLoading ? <Spinner size={12} /> : <Icon name="chevronRight" size={13} style={{ transform: 'rotate(-90deg)' }} />}
+                {olderLoading ? 'Loading earlier' : 'Load earlier'}
+              </button>
+            </div>
+          )}
           <OpenPathContext.Provider value={openPathStable}>
             <ImageOpenContext.Provider value={openImageStable}>
               {turns.map((t, i) => (
                 <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
-                  <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />
+                  {t.input?.startsWith(AUTO_CONTINUE_PREFIX)
+                    ? <AutoContinueBubble text={t.input} />
+                    : <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />}
                   <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText}
                     onAnswer={i === turns.length - 1 ? answerLiveQuestion : sendText}
                     pendingAsk={i === turns.length - 1 ? pendingAsk : null}
@@ -3451,8 +3805,8 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
               <RichComposer
                 ref={composerRef}
-                disabled={!projectId}
-                placeholder={!projectId ? 'Pick a project first' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
+                disabled={!projectId || locked}
+                placeholder={!projectId ? 'Pick a project first' : locked ? 'View only — this PR has been merged' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
                 onTextChange={setText}
                 onChips={info => {
                   setComposerBrowser(info.hasBrowser);
@@ -3488,7 +3842,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               {streaming ? (
                 <>
                   {canSend && (
-                    <button onClick={sendComposed} className="send-fab" title="Queue (Enter) — runs when the agent finishes · ⌘Enter — runs NEXT (jumps to the front of the queue, current turn keeps going). The current turn is never interrupted." style={{
+                    <button onClick={sendComposed} className="send-fab" title={'Queue (Enter) — runs when the agent finishes · ⌘Enter — runs NEXT (jumps to the front of the queue; the current turn keeps going). Attachments ride along — nothing interrupts the running turn.'} style={{
                       width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
                       background: 'var(--blue)', color: '#fff', boxShadow: '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)', cursor: 'pointer' }}>
                       <Icon name="plus" size={18} stroke={2.6} />
@@ -3500,10 +3854,10 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   </button>
                 </>
               ) : (
-                <button onClick={sendComposed} disabled={!canSend || !projectId} className="send-fab" title="Send (Enter)" style={{
+                <button onClick={sendComposed} disabled={!canSend || !projectId || locked} className="send-fab" title={locked ? 'View only — this PR has been merged' : 'Send (Enter)'} style={{
                   width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
-                  background: canSend ? 'var(--blue)' : 'var(--fill-secondary)', color: canSend ? '#fff' : 'var(--ink-secondary)',
-                  boxShadow: canSend ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: canSend ? 'pointer' : 'default' }}>
+                  background: canSend && !locked ? 'var(--blue)' : 'var(--fill-secondary)', color: canSend && !locked ? '#fff' : 'var(--ink-secondary)',
+                  boxShadow: canSend && !locked ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: canSend && !locked ? 'pointer' : 'default' }}>
                   <Icon name="arrowRight" size={18} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
                 </button>
               )}
@@ -3554,7 +3908,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   the silent-skip bug). The reviewer-model popover next to this
                   picks WHICH engine reviews. Off by default. */}
               <button onClick={toggleReviewer} disabled={!activeId}
-                title={!activeId ? 'Send a message to enable reviewer for this chat' : reviewerEffective ? 'Reviewer ON for this chat — every turn gets reviewed. Click to disable.' : 'Reviewer OFF — turn on to review every assistant turn (picks the engine via the sliders popover).'}
+                title={!activeId ? 'Send a message to enable reviewer for this chat' : reviewerEffective ? 'Reviewer ON for this chat — every turn gets reviewed. Click to disable.' : 'Reviewer OFF — turn on to review every assistant turn.'}
                 style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9,
                   cursor: activeId ? 'pointer' : 'default', opacity: activeId ? 1 : 0.5,
                   background: reviewerEffective ? 'color-mix(in srgb, var(--orange) 14%, transparent)' : 'var(--fill-secondary)',
@@ -3562,6 +3916,17 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   color: reviewerEffective ? 'var(--orange)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
                 <Icon name="checkCircle" size={14} /> Review
               </button>
+              {reviewerEffective && (
+                <ModelPicker
+                  compact
+                  direction="up"
+                  value={reviewerKey && reviewerKey !== 'off' ? reviewerKey : seedReviewerKey()}
+                  onChange={setReviewerKey}
+                  favorites={favorites}
+                  onToggleFavorite={toggleFavorite}
+                  triggerLabel="Reviewer"
+                />
+              )}
               <span style={{ width: 1, height: 18, background: 'var(--separator)', margin: '0 1px' }} />
               {/* schedule THIS message — pick a date/time; it fires into the chat then */}
               <div style={{ position: 'relative' }}>
@@ -3575,8 +3940,8 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                 </button>
                 {schedOpen && <SchedulePicker initial={schedEditAt ?? undefined} onPick={scheduleMessage} onRepeat={scheduleRecurring} onClose={() => setSchedOpen(false)} />}
               </div>
-              {/* reviewer model — tucked behind one button to keep the bar clean */}
-              <div style={{ position: 'relative' }}>
+              {/* reviewer model setup while Review is off */}
+              {!reviewerEffective && <div style={{ position: 'relative' }}>
                 <button onClick={() => setOptsOpen(o => !o)} title="Reviewer model"
                   style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 9px', borderRadius: 9, cursor: 'pointer',
                     background: optsOpen ? 'var(--fill-tertiary)' : 'var(--fill-secondary)', border: '1px solid transparent', color: 'var(--ink-secondary)' }}>
@@ -3594,7 +3959,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                     </div>
                   </>
                 )}
-              </div>
+              </div>}
               {schedNote && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)', display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}><Icon name="check" size={12} /> {schedNote}</span>}
               <span style={{ flex: 1, minWidth: 6 }} />
               {streaming
@@ -3958,7 +4323,8 @@ function ChatPane({ projectId, project }: { projectId: string | null; project: P
 
       {/* thread + composer (shared) */}
       <ChatThread projectId={projectId} project={project} sessionId={activeId}
-        onSessionCreated={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }} />
+        onSessionCreated={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }}
+        onOpenSession={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }} />
 
       {syncOpen && projectId && (
         <SyncModal projectId={projectId} onClose={() => setSyncOpen(false)}

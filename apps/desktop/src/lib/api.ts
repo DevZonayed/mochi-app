@@ -6,7 +6,8 @@
    falls back to REST against the relay server, which mirrors the Mac's pushed
    state and forwards commands to it — the web app is a remote control. */
 
-import type { SessionGitStatus, GithubConnection } from './git-types';
+import type { SessionGitStatus, GithubConnection, MergePreviewResult, ResolvePreviewResult, PrConfirmRequest, ConflictFile } from './git-types';
+import type { PlanModeExitRequest } from './plan-mode-types';
 
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
@@ -30,6 +31,10 @@ export interface Project {
   kind?: ProjectKind;
   path?: string;
   repoUrl?: string;
+  /** Dual-repo bootstrap: the slug shared by the code repo + the memory
+      companion ('${user}/${slug}-memory'). Drives the openProject lifecycle. */
+  memorySlug?: string;
+  memoryRepoUrl?: string;
   /** Worktree base branch override (else auto-detected from origin/HEAD). */
   defaultBaseBranch?: string;
   /** Shell script run once in each new session worktree (e.g. install deps). */
@@ -43,7 +48,17 @@ export interface Project {
   runMode?: 'concurrent' | 'nonconcurrent';
   /** Manual display order from drag-and-drop. Lower = earlier. */
   order?: number;
+  /** Reversible soft-hide: true → dropped from the default Projects view. */
+  hidden?: boolean;
   createdAt: number;
+}
+/** A branch usable as a base for a new chat (mirrors electron/git.ts). */
+export interface BranchInfo {
+  name: string;
+  isDefault: boolean;
+  isCurrent: boolean;
+  hasRemote: boolean;
+  lastCommit: { sha: string; subject: string; date: number } | null;
 }
 export interface ChatSession {
   id: string;
@@ -80,6 +95,20 @@ export interface ChatSession {
       whether files changed). The `reviewer` field above still picks the
       engine/model. Off by default. */
   reviewerEnabled?: boolean;
+  /** "Continue from here" provenance — set ONLY on sessions spawned from a
+      merged ancestor. Surfaces as the `← Continued from "<title>"` link in
+      the chat header + a seed context card above the empty transcript. */
+  continuedFrom?: {
+    sessionId: string;
+    title: string;
+    prNumber?: number;
+    mergedAt?: number;
+    baseRefName?: string;
+  };
+  /** T8 — last "additional instructions" the operator typed in the AI
+      conflict-resolve dialog for this chat. Pre-fills the textarea on
+      re-runs. Capped at 2KB by the IPC handler. */
+  conflictResolveHint?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -176,6 +205,20 @@ export interface Job {
   pausedReason?: 'wakeup' | null;
   createdAt: number;
   updatedAt: number;
+}
+export interface JobPage {
+  jobs: Job[];
+  total: number;
+  hasMore: boolean;
+  nextBefore: number | null;
+  nextCursor: string | null;
+}
+export interface JobPageInput {
+  projectId?: string;
+  sessionId?: string;
+  before?: number | null;
+  cursor?: string | null;
+  limit?: number;
 }
 /** A long-lived process the agent started (a dev server, watcher, …) that outlives the
     chat turn. Tracked + stoppable; streamed live over the 'bg' event. */
@@ -376,6 +419,28 @@ export interface NotificationSettings {
   volume: number;
   onlyWhenUnfocused: boolean;
 }
+export interface BrowserSettings {
+  enabled: boolean;
+  headless: boolean;
+  chromePath?: string;
+  defaultStartUrl?: string;
+  windowWidth?: number;
+  windowHeight?: number;
+}
+export interface BrowserStatus {
+  projectId: string;
+  open: boolean;
+  url: string | null;
+  title: string | null;
+  tabCount: number;
+  lastScreenshotAt: number | null;
+  chromeVersion: string | null;
+  error?: string;
+}
+export interface ChromeProfile { dir: string; name: string }
+export interface ChromeStatus { installed: boolean; path: string | null; version: string | null; running: boolean }
+export interface BrowserSeedInfo { sourceDir: string; sourceName: string; importedAt: number; cookieCount: number }
+export interface BrowserProfilePath { path: string }
 export interface AppSettings {
   defaultEffort: Effort;
   defaultEngine: EngineId | 'auto';
@@ -388,7 +453,10 @@ export interface AppSettings {
   notifications?: NotificationSettings;
   /** Opt-in: try a direct desktop↔phone WebRTC channel before the relay (default off). */
   p2pEnabled?: boolean;
+  /** Playwright-backed per-project Chrome browser. */
+  browser?: BrowserSettings;
 }
+export type AppSettingsPatch = Partial<Omit<AppSettings, 'browser'>> & { browser?: Partial<BrowserSettings> };
 
 export type FeedbackCategory = 'bug' | 'idea' | 'other';
 export type FeedbackStatus = 'new' | 'triaged' | 'done';
@@ -420,7 +488,7 @@ export interface DesignComment {
 }
 /** A connected Chrome profile on the local browser-extension control channel. */
 export interface ExtensionPeer { clientId: string; profile: string; active: boolean }
-export interface ExtensionStatus { running: boolean; port: number; token: string; peers: ExtensionPeer[] }
+export interface ExtensionStatus { running: boolean; port: number; token: string; peers: ExtensionPeer[]; held: boolean }
 export interface CostsData {
   today: number;
   thisMonth: number;
@@ -516,6 +584,17 @@ export interface CommsStatus {
   whatsapp: { connected: boolean; jid: string | null; name: string | null; tracked: number; sendApproved: boolean };
 }
 export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
+/** Confirmation-card metadata for the in-workspace add-project "Clone from
+    GitHub" tab. Filled by gh repo view before the user commits to a clone. */
+export interface GithubRepoMetadata {
+  name: string;
+  fullName: string;
+  description: string;
+  defaultBranch: string;
+  isPrivate: boolean;
+  htmlUrl: string;
+  sshUrl: string;
+}
 export interface FolderInspect { ok: boolean; path: string; info: RepoInfo; error?: string }
 export type CloneEvent =
   | { phase: 'start'; url: string }
@@ -540,6 +619,7 @@ export class ApiError extends Error {
 /* ── Local core bridge (Electron) ─────────────────────────────────────── */
 interface Bridge {
   localEngine?: boolean;
+  nativeWebKit?: boolean;
   call?: (method: string, params?: Record<string, unknown>) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   onEvent?: (cb: (e: { name: string; data: unknown }) => void) => () => void;
   pickFolder?: () => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
@@ -561,6 +641,7 @@ const bridge: Bridge | undefined =
 
 /** True when running inside the desktop app (local core owns everything). */
 export const IS_LOCAL = Boolean(bridge?.call);
+export const IS_WEBKIT = Boolean(bridge?.nativeWebKit);
 
 /* ── Remote pairing token (browser builds only) ───────────────────────
    The relay requires the Mac's pairing token on every /api/* call. Web
@@ -753,6 +834,53 @@ const qp = (params: Record<string, string | undefined>): string => {
   return q ? `?${q}` : '';
 };
 
+interface JobPageCursor {
+  createdAt: number;
+  updatedAt: number;
+  id: string;
+}
+
+const jobPageCursor = (job: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>): string =>
+  `${job.createdAt}:${job.updatedAt}:${encodeURIComponent(job.id)}`;
+
+function parseJobPageCursor(raw?: string | null): JobPageCursor | null {
+  if (!raw) return null;
+  const [createdRaw, updatedRaw, ...idParts] = raw.split(':');
+  const createdAt = Number(createdRaw);
+  const updatedAt = Number(updatedRaw);
+  const encodedId = idParts.join(':');
+  if (!Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || !encodedId) return null;
+  try { return { createdAt, updatedAt, id: decodeURIComponent(encodedId) }; }
+  catch { return null; }
+}
+
+function compareJobsNewestFirst(a: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>, b: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>): number {
+  return (b.createdAt - a.createdAt) || (b.updatedAt - a.updatedAt) || b.id.localeCompare(a.id);
+}
+
+function pageJobs(allJobs: Job[], input: JobPageInput = {}): JobPage {
+  const requested = Number.isFinite(input.limit) ? Math.floor(Number(input.limit)) : 30;
+  const limit = Math.max(1, Math.min(100, requested));
+  const before = Number.isFinite(input.before) ? Number(input.before) : null;
+  const cursor = parseJobPageCursor(input.cursor);
+  const sorted = [...allJobs]
+    .filter(j => input.sessionId ? j.sessionId === input.sessionId : input.projectId ? j.projectId === input.projectId : true)
+    .sort(compareJobsNewestFirst);
+  const pageable = cursor
+    ? sorted.filter(j => compareJobsNewestFirst(j, cursor) > 0)
+    : before == null ? sorted : sorted.filter(j => j.createdAt < before);
+  const slice = pageable.slice(0, limit + 1);
+  const pageSlice = slice.slice(0, limit);
+  const oldest = pageSlice[pageSlice.length - 1] ?? null;
+  return {
+    jobs: pageSlice.slice().reverse(),
+    total: sorted.length,
+    hasMore: slice.length > limit,
+    nextBefore: oldest ? oldest.createdAt : null,
+    nextCursor: oldest ? jobPageCursor(oldest) : null,
+  };
+}
+
 export interface UpdateStatus {
   phase: 'idle' | 'checking' | 'available' | 'none' | 'downloading' | 'ready' | 'error';
   version?: string;
@@ -804,7 +932,7 @@ export const api = {
 
   // Settings
   getSettings: () => call<AppSettings>('getSettings', {}, () => req<AppSettings>('/api/settings')),
-  setSettings: (patch: Partial<AppSettings>) =>
+  setSettings: (patch: AppSettingsPatch) =>
     call<AppSettings>('setSettings', { ...patch }, () =>
       req<AppSettings>('/api/settings', { method: 'POST', body: JSON.stringify(patch) })),
 
@@ -820,10 +948,21 @@ export const api = {
   // Projects
   listProjects: (workspaceId?: string) =>
     call<Project[]>('listProjects', { workspaceId }, () => req<Project[]>('/api/projects' + qp({ workspaceId }))),
-  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }) =>
+  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string; memorySlug?: string; memoryRepoUrl?: string }) =>
     call<Project>('createProject', { ...input }, () =>
       req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) })),
-  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode'>>) =>
+  // openProject / closeProject: desktop-only lifecycle hooks for the dual-repo
+  // memory clone. openProject runs `git pull --rebase --autostash` on the
+  // memory repo, re-verifies the four symlinks, and starts a debounced
+  // auto-push watcher on STATE.md. closeProject stops the watcher. Both are
+  // no-ops on legacy projects (no memorySlug set). The renderer SHOULD call
+  // openProject on entry to the project view and closeProject on unmount.
+  openProject: (id: string) =>
+    call<{ ok: boolean; skipped?: true; reason?: string; pulled?: boolean; conflictsResolved?: number; linked?: boolean; watching?: boolean; error?: string }>(
+      'openProject', { id }, () => Promise.resolve({ ok: true, skipped: true as const, reason: 'remote' })),
+  closeProject: (id: string) =>
+    call<{ ok: boolean }>('closeProject', { id }, () => Promise.resolve({ ok: true })),
+  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden'>>) =>
     call<Project>('updateProject', { id, ...patch }, () =>
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   reorderProjects: (ids: string[]) =>
@@ -854,6 +993,15 @@ export const api = {
     call<ExtensionStatus>('extensionStatus', {}, () => Promise.reject(new Error('desktop only'))),
   extensionSetActive: (clientId: string) =>
     call<ExtensionStatus>('extensionSetActive', { clientId }, () => Promise.reject(new Error('desktop only'))),
+  /** Manually open + PIN the user's real Chrome via the extension control channel
+      (Project settings → Open browser): it stays open after a task finishes until
+      the user closes it. Distinct from the Playwright per-project browserOpen above.
+      Desktop-only. */
+  extensionBrowserOpen: (url?: string) =>
+    call<{ ok: boolean; held: boolean }>('extensionBrowserOpen', url ? { url } : {}, () => Promise.reject(new Error('desktop only'))),
+  /** Drop the manual hold + close the extension browser session the user pinned open. Desktop-only. */
+  extensionBrowserClose: () =>
+    call<{ ok: boolean; held: boolean }>('extensionBrowserClose', {}, () => Promise.reject(new Error('desktop only'))),
   /** Where the bundled extension's unpacked folder lives on disk (packaged build, dev tree, or env override). */
   extensionPath: () =>
     call<{ path: string | null; source: 'packaged' | 'dev' | 'env-override' | 'not-found'; manifestPresent: boolean }>(
@@ -861,6 +1009,27 @@ export const api = {
   /** Open the bundled extension folder in Finder/Explorer (so the user can chrome://extensions → Load Unpacked). */
   extensionRevealFolder: () =>
     call<{ path: string; source: string }>('extensionRevealFolder', {}, () => Promise.reject(new Error('desktop only'))),
+  // Native Playwright-backed Chrome browser (desktop/WebKit only).
+  browserOpen: (projectId: string, startUrl?: string) =>
+    call<BrowserStatus>('browserOpen', { projectId, ...(startUrl ? { startUrl } : {}) }, () => Promise.reject(new Error('desktop only'))),
+  browserClose: (projectId: string) =>
+    call<{ ok: boolean }>('browserClose', { projectId }, () => Promise.reject(new Error('desktop only'))),
+  browserClearData: (projectId: string) =>
+    call<{ ok: boolean }>('browserClearData', { projectId }, () => Promise.reject(new Error('desktop only'))),
+  browserRevealProfile: (projectId: string) =>
+    call<BrowserProfilePath>('browserRevealProfile', { projectId }, () => Promise.reject(new Error('desktop only'))),
+  browserListChromeProfiles: () =>
+    call<{ profiles: ChromeProfile[] }>('browserListChromeProfiles', {}, () => Promise.reject(new Error('desktop only'))),
+  browserChromeStatus: () =>
+    call<ChromeStatus>('browserChromeStatus', {}, () => Promise.reject(new Error('desktop only'))),
+  browserInstallChrome: () =>
+    call<{ ok: boolean }>('browserInstallChrome', {}, () => Promise.reject(new Error('desktop only'))),
+  browserImportSeed: (input: { profileDir: string; sourceName?: string; quitChrome?: boolean }) =>
+    call<BrowserSeedInfo>('browserImportSeed', input, () => Promise.reject(new Error('desktop only'))),
+  browserSeedInfo: () =>
+    call<BrowserSeedInfo>('browserSeedInfo', {}, () => Promise.reject(new Error('desktop only'))),
+  browserClearSeed: () =>
+    call<{ ok: boolean }>('browserClearSeed', {}, () => Promise.reject(new Error('desktop only'))),
   /** Hand off a design to code: copy its folder into a NEW coding project (lives in both tabs). Desktop-only. */
   copyDesignToCode: (id: string, name?: string) =>
     call<Project>('copyDesignToCode', { id, name }, () => Promise.reject(new Error('desktop only'))),
@@ -870,8 +1039,55 @@ export const api = {
   cloneRepo: (input: { url: string; dest: string; name?: string; dirName?: string; instructions?: string; color?: string }) =>
     call<Project>('cloneRepo', { ...input }, () =>
       req<Project>('/api/projects/clone', { method: 'POST', body: JSON.stringify(input) })),
+  /** Resolve owner/repo into a confirmation-card payload BEFORE cloning. Uses
+      the bundled `gh` (desktop-only — gh isn't a remote-control concern). */
+  githubRepoMetadata: (input: { owner: string; repo: string }) =>
+    call<GithubRepoMetadata>('githubRepoMetadata', { ...input }, () => Promise.reject(new Error('desktop only'))),
   getProjectRepo: (id: string) =>
     call<RepoInfo>('getProjectRepo', { id }, () => req<RepoInfo>(`/api/projects/${encodeURIComponent(id)}/repo`)),
+  // GitHub-first project bootstrap (desktop-only; the renderer drives the UI).
+  // listOwners populates the new-project owner picker (user + their orgs)
+  // BEFORE the slug probe runs, since the slug-availability query is scoped to
+  // whichever owner is selected.
+  listOwners: () =>
+    call<{ ok: boolean; reason: 'ok' | 'not-authenticated' | 'error'; owners: Array<{ login: string; kind: 'user' | 'org'; avatarUrl: string | null }>; error?: string }>(
+      'listOwners', {}, () => Promise.reject(new Error('desktop only'))),
+  // checkSlug runs while the user types in the name field (debounced 300ms).
+  checkSlug: (name: string) =>
+    call<{ slug: string; available: boolean | null; suggestion: string; owner: string | null; existing?: { fullName: string; private: boolean }; reason: 'ok' | 'taken' | 'not-authenticated' | 'no-login' | 'error'; error?: string }>(
+      'checkSlug', { name }, () => Promise.reject(new Error('desktop only'))),
+  // Create the GitHub repo(s), seed local files, commit, set origin, push.
+  // When `owner` is passed, the dual-repo flow runs: code repo under the
+  // chosen owner + a private \${user}/\${slug}-memory companion clone + four
+  // symlinks. Without `owner`, falls back to the legacy single-repo path
+  // (used by adopt-folder + remoteOnly which haven't been migrated yet).
+  bootstrapProject: (input: { name: string; localPath: string; owner?: { login: string; kind: 'user' | 'org' }; private?: boolean; description?: string; adopt?: boolean; remoteOnly?: boolean }) =>
+    call<
+      // Dual-repo result is a superset of the legacy single-repo result;
+      // callers narrow on the presence of `memoryRepoUrl`.
+      | { slug: string; slugChanged: boolean; owner: string; fullName: string; htmlUrl: string; cloneUrl: string; localPath: string; branchPushed: string }
+      | { slug: string; slugChanged: boolean; codeRepoUrl: string; memoryRepoUrl: string; memoryPath: string; localPath: string; branchPushed: string }
+    >('bootstrapProject', { ...input }, () => Promise.reject(new Error('desktop only'))),
+  // Inspect a candidate folder to decide between "create GitHub repo for this"
+  // / "use existing remote" / "already a non-GitHub repo" in the adopt flow.
+  // Also discovers a companion memory repo (\${user}/\${slug}-memory) so the
+  // renderer can pick the right confirmation chip (clone+link vs create+link
+  // vs no-auth fallback).
+  adoptFolderInspect: (path: string) =>
+    call<{
+      ok: boolean;
+      path: string;
+      info?: RepoInfo;
+      remote?: string | null;
+      kind?: 'no-git' | 'git-no-remote' | 'git-github' | 'git-non-github';
+      memoryRepo?:
+        | { state: 'memory-found'; cloneUrl: string; slug: string; user: string }
+        | { state: 'memory-missing'; slug: string; user: string }
+        | { state: 'no-github-auth' }
+        | { state: 'error'; error: string };
+      error?: string;
+    }>(
+      'adoptFolderInspect', { path }, () => Promise.reject(new Error('desktop only'))),
   /** Native folder picker — desktop only; resolves null in the browser. */
   pickFolder: async (): Promise<FolderInspect | null> => {
     if (!bridge?.pickFolder) return null;
@@ -1038,9 +1254,18 @@ export const api = {
   // Chat sessions — conversations with the agent inside a project
   listSessions: (projectId?: string) =>
     call<ChatSession[]>('listSessions', { projectId }, () => req<ChatSession[]>('/api/sessions' + qp({ projectId }))),
-  sendChat: (input: { projectId: string; text: string; sessionId?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; browser?: boolean; images?: { id?: string; name?: string; mime: string; dataB64: string }[]; files?: { id?: string; name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
+  sendChat: (input: { projectId: string; text: string; sessionId?: string; base?: string; engine?: EngineId; model?: string; modelKey?: string; reviewerKey?: string; effort?: Effort; plan?: boolean; goal?: boolean; browser?: boolean; images?: { id?: string; name?: string; mime: string; dataB64: string }[]; files?: { id?: string; name: string; mime?: string; kind: 'text' | 'file'; content?: string; dataB64?: string }[] }) =>
     call<{ session: ChatSession; job: Job }>('sendChat', { ...input }, () =>
       req<{ session: ChatSession; job: Job }>('/api/chat', { method: 'POST', body: JSON.stringify(input) })),
+  /** Eagerly create a session pinned to a base branch (optional — sendChat will
+      lazy-create with the same base if this isn't called first). */
+  createSession: (input: { projectId: string; title?: string; codename?: string; baseBranch?: string }) =>
+    call<ChatSession>('createSession', { ...input }, () =>
+      req<ChatSession>('/api/sessions/create', { method: 'POST', body: JSON.stringify(input) })),
+  /** All branches (local + origin) usable as a new-chat base. Default flagged first. */
+  listBranches: (projectId: string) =>
+    call<BranchInfo[]>('listBranches', { projectId }, () =>
+      req<BranchInfo[]>(`/api/projects/${encodeURIComponent(projectId)}/branches`)),
   renameSession: (id: string, title: string) =>
     call<ChatSession>('renameSession', { id, title }, () =>
       req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/rename`, { method: 'POST', body: JSON.stringify({ title }) })),
@@ -1062,6 +1287,12 @@ export const api = {
       Off by default. */
   setSessionReviewer: (id: string, enabled: boolean) =>
     call<ChatSession>('setSessionReviewer', { id, enabled }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(id)}/reviewer-enabled`, { method: 'POST', body: JSON.stringify({ enabled }) })),
+  /** Track 7 — "Continue from here": fork a new session off the merged base
+      ref of an ancestor session whose PR has been merged. The ancestor stays
+      open + read-only; the new session carries `continuedFrom` provenance the
+      chat surface renders as a `← Continued from "<title>"` link + seed card. */
+  continueSession: (input: { sessionId: string; baseRefName?: string; prNumber?: number; mergedAt?: number }) =>
+    call<ChatSession>('continueSession', { ...input }, () => req<ChatSession>(`/api/sessions/${encodeURIComponent(input.sessionId)}/continue`, { method: 'POST', body: JSON.stringify(input) })),
   deleteProject: (id: string) =>
     call<{ ok: boolean }>('deleteProject', { id }, () => req<{ ok: boolean }>(`/api/projects/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 
@@ -1076,6 +1307,22 @@ export const api = {
   // Jobs — in the desktop app these EXECUTE on this Mac (Claude Code login)
   listJobs: (projectId?: string, sessionId?: string) =>
     call<Job[]>('listJobs', { projectId, sessionId }, () => req<Job[]>('/api/jobs' + qp({ projectId, sessionId }))),
+  listJobPage: (input: JobPageInput = {}) =>
+    call<JobPage>('listJobPage', { ...input }, async () => {
+      try {
+        return await req<JobPage>('/api/jobs/page' + qp({
+          projectId: input.projectId,
+          sessionId: input.sessionId,
+          before: input.before == null ? undefined : String(input.before),
+          cursor: input.cursor ?? undefined,
+          limit: input.limit == null ? undefined : String(input.limit),
+        }));
+      } catch (e) {
+        if (!(e instanceof ApiError) || (e.status !== 404 && e.status !== 405)) throw e;
+        const all = await req<Job[]>('/api/jobs' + qp({ projectId: input.projectId, sessionId: input.sessionId }));
+        return pageJobs(all, input);
+      }
+    }),
   createJob: (input: { projectId: string; input: string; title?: string; effort?: Effort }) =>
     call<Job>('createJob', { ...input }, () =>
       req<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(input) })),
@@ -1270,6 +1517,32 @@ export const api = {
   resolveSession: (sessionId: string) =>
     call<{ ok: boolean; conflicts: string[]; reason?: string }>('resolveSession', { sessionId }, () =>
       req<{ ok: boolean; conflicts: string[]; reason?: string }>(`/api/sessions/${sessionId}/resolve`, { method: 'POST' })),
+  /** Resolve a parked ExitPlanMode call. The renderer's ExitPlanModeDialog
+      sends this when the operator clicks Approve / Keep Planning; the main
+      process routes the answer to the matching pending request and the
+      agent's run unblocks. Desktop-only: the relay never sees plan mode. */
+  exitPlanModeRespond: (toolUseID: string, approved: boolean) =>
+    call<{ ok: boolean }>('exitPlanModeRespond', { toolUseID, approved }, () =>
+      Promise.resolve({ ok: false })),
+  /** Renderer-only previews — see electron/git-ctx.ts for the gating contract.
+      Used by PrActionConfirmDialog to render the hard-button modal. */
+  previewSessionMerge: (sessionId: string, method?: 'merge' | 'squash' | 'rebase') =>
+    call<MergePreviewResult>('previewSessionMerge', { sessionId, method }, () =>
+      req<MergePreviewResult>(`/api/sessions/${sessionId}/preview-merge`, { method: 'POST', body: JSON.stringify({ method }) })),
+  previewSessionResolve: (sessionId: string) =>
+    call<ResolvePreviewResult>('previewSessionResolve', { sessionId }, () =>
+      req<ResolvePreviewResult>(`/api/sessions/${sessionId}/preview-resolve`, { method: 'POST' })),
+  /** T8 — read-only enumeration of the current worktree's conflict hunks for
+      the AI-resolve dialog's preview. Local-only (no relay route — phones
+      can't drive a manual merge resolve anyway). */
+  getConflictHunks: (sessionId: string) =>
+    call<{ files: ConflictFile[]; reason?: string }>('getConflictHunks', { sessionId },
+      () => Promise.reject(new ApiError(403, 'Conflict resolution is only available in the desktop app'))),
+  /** T8 — persist the operator's "additional instructions" for this chat so
+      re-runs pre-fill the textarea. Empty string clears the hint. */
+  setConflictResolveHint: (sessionId: string, hint: string) =>
+    call<unknown>('setConflictResolveHint', { sessionId, hint },
+      () => Promise.reject(new ApiError(403, 'Conflict resolution is only available in the desktop app'))),
   renameSessionBranch: (sessionId: string) =>
     call<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>('renameSessionBranch', { sessionId }, () =>
       req<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }>(`/api/sessions/${sessionId}/rename-branch`, { method: 'POST' })),
@@ -1284,10 +1557,10 @@ export const api = {
       req<Routing>('/api/routing', { method: 'POST', body: JSON.stringify(patch) })),
 
   // Model registry (provider-owned catalog) + per-role (primary/reviewer) model defaults
-  listModels: () => call<ModelGroup[]>('listModels', {}, () => req<ModelGroup[]>('/api/models')),
+  listModels: (refresh = false) => call<ModelGroup[]>('listModels', refresh ? { refresh: true } : {}, () => req<ModelGroup[]>('/api/models')),
   getRoles: () => call<Roles>('getRoles', {}, async () => {
     const r = await req<Routing>('/api/routing');
-    return r.roles ?? { primary: { engine: 'claude', model: 'opus' }, reviewer: 'off' };
+    return r.roles ?? { primary: { engine: 'claude', model: 'claude-opus-4-8' }, reviewer: 'off' };
   }),
   setRoles: (patch: { primaryKey?: string; reviewerKey?: string }) =>
     call<Roles>('setRoles', { ...patch }, () =>
@@ -1312,7 +1585,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void; onPrConfirmRequest?: (r: PrConfirmRequest) => void; onPlanModeExitRequest?: (r: PlanModeExitRequest) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as RemoteDevice[]);
@@ -1334,6 +1607,8 @@ export const api = {
         if (name === 'wa-message' && handlers.onWaMessage) handlers.onWaMessage(data as WaMessageEvent);
         if (name === 'wa-chats' && handlers.onWaChats) handlers.onWaChats();
         if (name === 'wa-message-update' && handlers.onWaMessageUpdate) handlers.onWaMessageUpdate(data as { chatId: string });
+        if (name === 'pr-confirm-request' && handlers.onPrConfirmRequest) handlers.onPrConfirmRequest(data as PrConfirmRequest);
+        if (name === 'plan-mode-exit-request' && handlers.onPlanModeExitRequest) handlers.onPlanModeExitRequest(data as PlanModeExitRequest);
       });
     }
     if (typeof EventSource === 'undefined') return () => {};

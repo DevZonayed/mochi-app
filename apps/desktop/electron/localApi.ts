@@ -4,7 +4,7 @@
 
 import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem, FeedbackCategory, FeedbackContext, FeedbackSource, CustomMcpServer, McpKv } from './store.js';
 import { answerMessage, nextExtend } from './ask-question.js';
-import { resolveModelKey, buildModelGroups } from './models.js';
+import { resolveModelKey, buildModelGroups, refreshModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
 import type { MediaEngine } from './media.js';
 import type { ResearchEngine } from './research.js';
@@ -13,25 +13,35 @@ import type { TelegramBot } from './telegram.js';
 import type { WhatsAppClient } from './whatsapp.js';
 import { approveWhatsappSend } from './whatsapp-analyze.js';
 import type { Providers, ProviderId } from './providers.js';
-import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, structuredDiff } from './git.js';
+import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, structuredDiff, listBranches } from './git.js';
 import { ensureGitHooks, ensureCommitIdentity } from './git-identity.js';
 import { pickCityCodename } from './codenames.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
-import { ghState } from './gh-cli.js';
+import { ghState, resolveGh } from './gh-cli.js';
+import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
+import { getViewer, listOwners, parseGitHubRemote } from './github.js';
+import { discoverMemoryRepo } from './memory-repo.js';
+import { getClaudeUsage } from './claude-usage.js';
+import { bootstrapNewProject, bootstrapProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
+import { openProjectMemory, closeMemoryWatcher } from './project-lifecycle.js';
+import { fetchRepoMetadata, makeGhRunner } from './repo-metadata.js';
 import type { GitService } from './git-service.js';
+import type { GitWatcher } from './git-watcher.js';
 import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { saveAttachment, substitutePlaceholders } from './attachments.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
 import { scanConversations, parseConversation, type ConvSource } from './conversation-sync.js';
-import { existsSync, mkdirSync, cpSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, cpSync, readdirSync, statSync, realpathSync, promises as fsp } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { app, shell } from 'electron';
 import { locateExtension } from './extension-locator.js';
 
 type Params = Record<string, unknown>;
+const NATIVE_WEBKIT = process.env.MAESTRO_NATIVE_WEBKIT === '1';
 
 const bad = (msg: string, statusCode = 400): never => {
   throw Object.assign(new Error(msg), { statusCode });
@@ -105,7 +115,41 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null) {
+/* ── File/dir/command surface (ported VERBATIM from the Electron-only
+   `ipcMain.handle('maestro:*')` channels in main.ts so the headless macOS
+   sidecar — which serves ONLY dispatch(method, params) — gets identical
+   behavior: same path confinement, caps, filters, sort, and return shapes). */
+
+const IMG_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
+
+/* Resolve `rel` to a canonical path that is provably INSIDE the project root.
+   Defends against `..` escapes and symlinks pointing out of the repo. Accepts
+   either a path relative to the root or an absolute path that lands inside it. */
+const resolveInsideRoot = (rawRoot: string, rel: string): string => {
+  const root = rawRoot.startsWith('~/') || rawRoot === '~' ? nodePath.join(app.getPath('home'), rawRoot.slice(1)) : rawRoot;
+  const rootReal = realpathSync(nodePath.resolve(root));
+  const target = nodePath.resolve(rootReal, String(rel ?? ''));
+  const relToRoot = nodePath.relative(rootReal, target);
+  if (relToRoot.startsWith('..') || nodePath.isAbsolute(relToRoot)) throw new Error('path escapes project');
+  const real = realpathSync(target);
+  const relReal = nodePath.relative(rootReal, real);
+  if (relReal.startsWith('..') || nodePath.isAbsolute(relReal)) throw new Error('symlink escapes project');
+  return real;
+};
+
+/** A project's working root on disk for the file/dir arms (matches the
+    `projectRoot` helper in main.ts). Throws if the project has no folder. */
+const rootOfProject = (store: Store, projectId: unknown): string => {
+  const root = store.getProject(String(projectId))?.path;
+  if (!root) throw new Error('this project has no folder on disk');
+  return root;
+};
+
+/** Module-level map of runId → child process for the `runCommand`/`killCommand`
+    pair (matches the `runningCmds` map in main.ts). */
+const runningCmds = new Map<string, ChildProcess>();
+
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null, gitWatcher?: GitWatcher, browserManager?: import('./browser/manager.js').BrowserManager) {
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -116,6 +160,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'dashboard': return store.dashboard();
       case 'budget': return store.budget();
       case 'costs': return store.costs();
+      case 'claudeUsage': return getClaudeUsage(p.force === true);
       case 'listEvents': return store.listEvents();
 
       // ── Settings ───────────────────────────────────────────────
@@ -131,10 +176,84 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           const v = p.feedbackRepo.trim().slice(0, 140);
           if (v === '' || REPO_RE.test(v)) patch.feedbackRepo = v;
         }
+        if (p.browser && typeof p.browser === 'object') {
+          const cur = store.getSettings().browser ?? { enabled: true, headless: false };
+          const b = p.browser as Record<string, unknown>;
+          patch.browser = {
+            ...cur,
+            ...(typeof b.enabled === 'boolean' ? { enabled: b.enabled } : {}),
+            ...(typeof b.headless === 'boolean' ? { headless: b.headless } : {}),
+            ...(typeof b.chromePath === 'string' ? { chromePath: b.chromePath } : {}),
+            ...(typeof b.defaultStartUrl === 'string' ? { defaultStartUrl: b.defaultStartUrl } : {}),
+            ...(typeof b.windowWidth === 'number' ? { windowWidth: b.windowWidth } : {}),
+            ...(typeof b.windowHeight === 'number' ? { windowHeight: b.windowHeight } : {}),
+          };
+        }
         if (Object.keys(patch).length === 0) bad('no valid settings fields');
         const next = store.setSettings(patch);
         emit('settings', next);
         return next;
+      }
+
+      // ── Browser (Playwright, per-project) ──────────────────────
+      case 'browserOpen': {
+        if (!browserManager) bad('browser unavailable', 503);
+        const pid = String(p.projectId ?? ''); if (!pid) bad('projectId required');
+        return browserManager!.open(pid, typeof p.startUrl === 'string' ? { startUrl: p.startUrl } : undefined);
+      }
+      case 'browserClose': {
+        if (!browserManager) bad('browser unavailable', 503);
+        await browserManager!.close(String(p.projectId ?? '')); return { ok: true };
+      }
+      case 'browserNavigate': {
+        if (!browserManager) bad('browser unavailable', 503);
+        const pid = String(p.projectId ?? ''); if (!pid) bad('projectId required');
+        if (typeof p.url !== 'string') bad('url required');
+        return browserManager!.navigate(pid, p.url as string);
+      }
+      case 'browserStatus': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return p.projectId ? browserManager!.status(String(p.projectId)) : browserManager!.statusAll();
+      }
+      case 'browserScreenshot': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return browserManager!.screenshot(String(p.projectId ?? ''), { fullPage: !!p.fullPage });
+      }
+      case 'browserListComments': // browser comments persist in the project design-comments store
+        return dispatch('listDesignComments', { id: p.projectId });
+      case 'browserClearData': {
+        if (!browserManager) bad('browser unavailable', 503);
+        await browserManager!.clearData(String(p.projectId ?? '')); return { ok: true };
+      }
+      case 'browserRevealProfile': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return { path: browserManager!.profileDir(String(p.projectId ?? '')) };
+      }
+      // Seed profile: pick one real Chrome profile → every project's browser starts from it.
+      case 'browserListChromeProfiles': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return { profiles: browserManager!.listChromeProfiles() };
+      }
+      case 'browserChromeStatus': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return browserManager!.chromeStatus();
+      }
+      case 'browserInstallChrome': {
+        if (!browserManager) bad('browser unavailable', 503);
+        browserManager!.openChromeDownload(); return { ok: true };
+      }
+      case 'browserImportSeed': {
+        if (!browserManager) bad('browser unavailable', 503);
+        const profileDir = String(p.profileDir ?? ''); if (!profileDir) bad('profileDir required');
+        return browserManager!.importSeed(profileDir, typeof p.sourceName === 'string' ? p.sourceName : undefined, p.quitChrome === true);
+      }
+      case 'browserSeedInfo': {
+        if (!browserManager) bad('browser unavailable', 503);
+        return browserManager!.seedInfo() ?? { sourceDir: '', sourceName: '', importedAt: 0, cookieCount: 0 };
+      }
+      case 'browserClearSeed': {
+        if (!browserManager) bad('browser unavailable', 503);
+        browserManager!.clearSeed(); return { ok: true };
       }
 
       // ── Workspace ──────────────────────────────────────────────
@@ -198,12 +317,36 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // ── Browser-extension control channel (local-only; blocked from relay) ──
       case 'extensionStatus': {
         const b = getExtensionBridge?.();
-        return b ? b.status() : { running: false, port: 0, token: store.extensionToken, peers: [] };
+        return b ? b.status() : { running: false, port: 0, token: store.extensionToken, peers: [], held: false };
       }
       case 'extensionSetActive': {
         const b = getExtensionBridge?.();
         if (!b) bad('extension channel unavailable', 503);
         return b!.setActiveFromApp(String(p.clientId ?? ''));
+      }
+      // Manually open the user's real Chrome via the extension channel (Project
+      // settings → Open browser). PINS it open so the agent's end-of-turn tidy-up
+      // leaves it alone — the user owns this window and closes it themselves (via
+      // extensionBrowserClose). Requires a paired, active Chrome profile. Distinct
+      // from the Playwright per-project 'browserOpen' case above.
+      case 'extensionBrowserOpen': {
+        const b = getExtensionBridge?.();
+        if (!b) bad('extension channel unavailable', 503);
+        if (!b!.hasActiveBrowser()) bad('No browser connected. Open the Mochi Chrome extension and activate a profile first.', 503);
+        b!.setBrowserHold(true);
+        const url = typeof p.url === 'string' && p.url ? p.url : 'about:blank';
+        try { await b!.request('navigate', { url }, 45000); }
+        catch { try { await b!.request('session_start', { url, title: 'Maestro', color: 'blue' }, 45000); } catch { /* surfaced as held-but-empty */ } }
+        return { ok: true, held: true };
+      }
+      // Manually close the extension browser the user pinned open: drop the hold +
+      // end the session (closing its tabs).
+      case 'extensionBrowserClose': {
+        const b = getExtensionBridge?.();
+        if (!b) bad('extension channel unavailable', 503);
+        b!.setBrowserHold(false);
+        try { await b!.request('session_end', { closeTabs: true }); } catch { /* already gone */ }
+        return { ok: true, held: false };
       }
       // Where does the bundled Chrome extension live on this machine? Powers the
       // Settings → "Browser extension" panel: shows the path + the "Reveal folder
@@ -270,6 +413,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           color: p.color as string | undefined, kind,
           path: projPath,
           repoUrl: typeof p.repoUrl === 'string' && p.repoUrl ? p.repoUrl : undefined,
+          // memorySlug + memoryRepoUrl come back from bootstrapProject (dual-repo
+          // flow). Renderer passes them through so subsequent openProject can
+          // find the memory clone.
+          memorySlug: typeof p.memorySlug === 'string' && p.memorySlug ? p.memorySlug : undefined,
+          memoryRepoUrl: typeof p.memoryRepoUrl === 'string' && p.memoryRepoUrl ? p.memoryRepoUrl : undefined,
         });
         // If the project points at an existing repo on disk, wire the
         // trailer-stripping hook + align commit identity to the gh user.
@@ -280,15 +428,42 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('project', proj);
         return proj;
       }
+      // openProject: lifecycle hook the renderer calls when entering a project
+      // view. Pulls the memory clone, re-verifies the four symlinks, and starts
+      // a debounced auto-push watcher on STATE.md. Idempotent — re-opening
+      // the same project reuses the watcher. No-op when the project has no
+      // memorySlug (legacy projects pre-dual-repo).
+      case 'openProject': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (!proj) return bad('project not found', 404);
+        if (!proj.memorySlug || !proj.path) return { ok: true, skipped: true as const, reason: 'no-memory-repo' };
+        try {
+          const r = await openProjectMemory({ slug: proj.memorySlug, projectPath: proj.path });
+          return { ok: true, ...r };
+        } catch (e) {
+          // Surface the symlink/clobber errors with a clear message; the UI
+          // will show this so the operator knows to resolve manually.
+          return { ok: false, error: e instanceof Error ? e.message.slice(0, 240) : 'memory lifecycle failed' };
+        }
+      }
+      // closeProject: stop the STATE watcher when the operator leaves a
+      // project view (the renderer calls this on unmount).
+      case 'closeProject': {
+        const proj = store.getProject(String(p.id ?? ''));
+        if (proj?.memorySlug) closeMemoryWatcher(proj.memorySlug);
+        return { ok: true };
+      }
       case 'updateProject': {
         const patch: Record<string, unknown> = {};
-        for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl', 'defaultBaseBranch', 'setupScript'] as const) {
+        for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl', 'defaultBaseBranch', 'setupScript', 'memorySlug', 'memoryRepoUrl'] as const) {
           if (typeof p[k] === 'string') patch[k] = p[k];
         }
         if (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') patch.kind = p.kind;
         // Worktree isolation settings.
         if (Array.isArray(p.copyGlobs)) patch.copyGlobs = (p.copyGlobs as unknown[]).filter((g): g is string => typeof g === 'string');
         if (p.runMode === 'concurrent' || p.runMode === 'nonconcurrent') patch.runMode = p.runMode;
+        // Reversible soft-hide from the Projects view.
+        if (typeof p.hidden === 'boolean') patch.hidden = p.hidden;
         if (Object.keys(patch).length === 0) bad('no valid project fields');
         const proj = store.updateProject(String(p.id ?? ''), patch);
         emit('project', proj);
@@ -341,6 +516,17 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!proj) bad('project not found', 404);
         return proj!.path ? repoInfo(proj!.path) : { branch: null, remote: null, isRepo: false };
       }
+      case 'githubRepoMetadata': {
+        // Preview-card metadata for the "Clone from GitHub" tab — owner/repo
+        // in, gh-resolved repo card out. Lets the UI show a confirmation
+        // (name, description, default branch, private flag) before cloning.
+        const owner = String(p.owner ?? '').trim();
+        const repo = String(p.repo ?? '').trim();
+        if (!owner || !repo) bad('owner and repo are required');
+        const gh = resolveGh();
+        if (!gh) bad('gh CLI not installed — go to Settings → GitHub to set it up.', 503);
+        return fetchRepoMetadata(owner, repo, makeGhRunner(gh!));
+      }
       case 'cloneRepo': {
         const url = String(p.url ?? '').trim();
         if (!url) bad('url required');
@@ -385,6 +571,28 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
       // ── Chat sessions (each turn is a Job with sessionId) ─────
       case 'listSessions': return store.listSessions(p.projectId ? String(p.projectId) : undefined);
+      // Git branches available to a project — feeds the new-chat <BranchPicker />.
+      // Read-only; degrades to [] when the project has no repoDir (non-coding).
+      case 'listBranches': {
+        const proj = store.getProject(String(p.projectId ?? ''));
+        if (!proj?.path) return [];
+        return listBranches(proj.path);
+      }
+      // Eager session-create (operator picked a branch). Optional — `sendChat`
+      // still lazy-creates with the same base when this isn't called first.
+      case 'createSession': {
+        const projectId = String(p.projectId ?? '');
+        if (!store.getProject(projectId)) return bad('project not found', 404);
+        const title = typeof p.title === 'string' ? p.title : 'New chat';
+        const codename = typeof p.codename === 'string' && p.codename
+          ? p.codename
+          : pickCityCodename(store.usedCodenamesIn(projectId));
+        const baseBranch = typeof p.baseBranch === 'string' && p.baseBranch ? p.baseBranch
+          : (typeof p.base === 'string' && p.base ? p.base : undefined);
+        const s = store.createSession(projectId, title, codename, baseBranch ? { baseBranch } : undefined);
+        emit('session', s);
+        return s;
+      }
       case 'renameSession': {
         if (!p.title || typeof p.title !== 'string') bad('title required');
         const s = store.updateSession(String(p.id ?? ''), { title: (p.title as string).slice(0, 60) });
@@ -399,6 +607,9 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
             try { pruneSessionWorktree({ repoDir: proj.path, worktreeRoot: worktreeRootDir(), projectId: proj.id, sessionId: s.id, branch: s.branch, deleteBranch: false }); } catch { /* best effort */ }
           }
         }
+        // Stop the git filesystem watcher BEFORE the row vanishes — the
+        // watcher holds an fd into `.git`, which would dangle on prune.
+        try { gitWatcher?.detach(String(p.id ?? '')); } catch { /* best effort */ }
         store.deleteSession(String(p.id ?? ''));
         emit('session', { id: String(p.id ?? ''), deleted: true });
         return { ok: true };
@@ -412,6 +623,40 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const s = store.setSessionArchived(String(p.id ?? ''), p.archived === true);
         emit('session', s);
         return s;
+      }
+      // Track 7 — "Continue from here": spawn a NEW session forked off the
+      // merged PR's base branch, carrying continued-from provenance so the
+      // chat surface can render the link + seed-context card. We INTENTIONALLY
+      // don't auto-replay the prior transcript into the engine; the operator
+      // asks for what they need (avoids blasting megabytes of history into
+      // every first turn). The old session stays open for read-only reference.
+      case 'continueSession': {
+        const prev = store.getSession(String(p.sessionId ?? ''));
+        if (!prev) return bad('session not found', 404);
+        const project = store.getProject(prev.projectId);
+        if (!project) return bad('project not found', 404);
+        // Picking a NEW codename keeps the new session's branch path distinct
+        // from the merged one (which is heading for cleanup) and gives the
+        // operator a fresh callsign to refer to.
+        const codename = pickCityCodename(store.usedCodenamesIn(prev.projectId));
+        // Title: previous (truncated to 60) + ' (continued)'. The slice in
+        // createSession will hard-cap, but we leave room for the suffix here
+        // so the marker survives.
+        const prevTitle = (prev.title || 'Chat').slice(0, 60);
+        const newTitle = `${prevTitle.slice(0, 46)} (continued)`;
+        const baseBranch = typeof p.baseRefName === 'string' && p.baseRefName ? String(p.baseRefName) : prev.baseBranch;
+        const session = store.createSession(prev.projectId, newTitle, codename, {
+          baseBranch,
+          continuedFrom: {
+            sessionId: prev.id,
+            title: prev.title,
+            prNumber: typeof p.prNumber === 'number' ? p.prNumber : undefined,
+            mergedAt: typeof p.mergedAt === 'number' ? p.mergedAt : undefined,
+            baseRefName: typeof p.baseRefName === 'string' && p.baseRefName ? String(p.baseRefName) : undefined,
+          },
+        });
+        emit('session', session);
+        return session;
       }
       // Per-chat autopilot + reviewer toggles. Independent on/off booleans
       // wired to the composer's two new toggle buttons. Both default OFF —
@@ -435,6 +680,9 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (proj?.path && s.worktreePath) {
           try { pruneSessionWorktree({ repoDir: proj.path, worktreeRoot: worktreeRootDir(), projectId: proj.id, sessionId: s.id, branch: s.branch, deleteBranch: p.deleteBranch === true }); } catch { /* best effort */ }
         }
+        // The worktree is gone — close the watcher BEFORE the directory disappears
+        // so its underlying fds don't dangle and trigger spurious EPERM on macOS.
+        try { gitWatcher?.detach(s.id); } catch { /* best effort */ }
         const updated = store.updateSession(s.id, { archivedAt: Date.now(), worktreePath: undefined });
         emit('session', updated);
         return updated;
@@ -444,12 +692,22 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? ''));
         if (!s) return bad('session not found', 404);
+        // Lazy-attach the filesystem watcher on the first read for this session
+        // so live `.git` mutations (commit/push/checkout) push status updates
+        // back through the renderer's git-status event channel — without the
+        // UI having to poll. Idempotent; no-op once attached.
+        if (!NATIVE_WEBKIT) {
+          try { gitWatcher?.attach(s.id); } catch { /* best effort */ }
+        }
         return gitService.fullStatus(s, { withPr: p.withPr !== false });
       }
       case 'refreshSessionGitStatus': {
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? ''));
         if (!s) return bad('session not found', 404);
+        if (!NATIVE_WEBKIT) {
+          try { gitWatcher?.attach(s.id); } catch { /* best effort */ }
+        }
         return gitService.fullStatus(s, { withPr: true });
       }
       // ── PR actions (DESKTOP-ONLY, outward — UI confirms before calling) ─
@@ -467,16 +725,55 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           base: typeof p.base === 'string' ? p.base : undefined,
         });
       }
+      // pr_merge HUMAN-CONFIRMED path: this dispatch case calls gitService directly,
+      // which executes the merge immediately. It is `desktopOnly` via remote-guard,
+      // so only the renderer (a human clicking "Confirm Merge" in the dialog) can
+      // reach it. The AGENT path (engine.ts pr_merge tool / codex-bridge.ts) goes
+      // through GitCtx.mergePr which ALWAYS previews — it is structurally unable
+      // to land a merge (the `confirmed:true` flag is a tripwire that logs +
+      // strips). The dialog is surfaced via the `pr-confirm-request` event and
+      // the human's click re-enters here. See git-ctx.ts.
       case 'mergeSessionPR': {
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
         const method = p.method === 'merge' || p.method === 'squash' || p.method === 'rebase' ? p.method : undefined;
         return gitService.mergePr(s, { method });
       }
+      // pr_resolve_conflicts HUMAN-CONFIRMED path — same shape as mergeSessionPR.
       case 'resolveSession': {
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
         return gitService.resolveSession(s);
+      }
+      // Renderer-only previews — return what `mergeSessionPR` / `resolveSession` WOULD do,
+      // for the confirm dialog. Read-only: no GitHub merge call, no worktree changes.
+      case 'previewSessionMerge': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        const method = p.method === 'merge' || p.method === 'squash' || p.method === 'rebase' ? p.method : undefined;
+        return gitService.previewMergePr(s, { method });
+      }
+      case 'previewSessionResolve': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.previewResolveSession(s);
+      }
+      // T8 — read-only conflict hunk extraction for the AI-resolve dialog.
+      // Pure: no merge, no commit, no push; just parses the worktree's
+      // current `<<<<<<< / >>>>>>>` blocks. Renderer-facing.
+      case 'getConflictHunks': {
+        if (!gitService) return bad('git service unavailable', 500);
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        return gitService.getConflictHunks(s);
+      }
+      // T8 — persist the "additional instructions" the operator last typed
+      // into the AI-resolve dialog, so re-runs in the same chat pre-fill
+      // the textarea. Empty string clears the hint.
+      case 'setConflictResolveHint': {
+        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        const raw = typeof p.hint === 'string' ? p.hint : '';
+        const trimmed = raw.slice(0, 2000); // 2KB cap, no need for more
+        return store.updateSession(s.id, { conflictResolveHint: trimmed || undefined });
       }
       // Manual one-shot of the auto-rename hook (testing + a future "rename
       // branch now" button in the chat header).
@@ -555,7 +852,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // a half-truncated absolute file path.
         const titleText = text
           .replace(/«attach:[A-Za-z0-9_-]+»/g, '')
-          .replace(/@\S*\.continuum\/Attachment\/[A-Za-z0-9._-]+/g, '')
+          .replace(/@\S*\.continuum\/Attachment\/[A-Za-z0-9._/-]+/g, '')
           .replace(/[ \t]+/g, ' ')
           .replace(/\s*\n\s*/g, ' ')
           .trim();
@@ -569,7 +866,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           // image please" → empty title after strip) still gets a meaningful rail
           // entry — the codename pill is the durable callsign anyway.
           const seedTitle = titleText || (rawImages.length ? 'Image' : rawFiles.length ? 'Attachment' : 'New chat');
-          session = store.createSession(projectId, seedTitle, codename);
+          // Optional base branch from the new-chat picker — pinned onto the
+          // session here so engine.ts's first run forks the worktree from it.
+          const baseBranch = typeof p.baseBranch === 'string' && p.baseBranch.trim() ? p.baseBranch.trim()
+            : (typeof p.base === 'string' && p.base.trim() ? p.base.trim() : undefined);
+          session = store.createSession(projectId, seedTitle, codename, baseBranch ? { baseBranch } : undefined);
           emit('session', session);
         }
         // The project's working root — where `.continuum/Attachment/` lives.
@@ -579,6 +880,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // The agent sees an inline file reference exactly where the user typed
         // it, and can `Read` the file directly with its standard tools.
         const projectCwd = projectRootOf(project!);
+        // Group every attachment for THIS chat under a branch-named subfolder
+        // (`.continuum/Attachment/<branchSlug>/…`) so each chat's pastes/images/
+        // files live together. Prefer the checked-out branch; for a brand-new
+        // session the branch isn't assigned until the engine first runs, so fall
+        // back to the stable per-session codename ("lyon", "porto" …).
+        const attachBranch = session.branch ?? session.codename;
         const idToPath = new Map<string, string>();
         // Resolve the chosen primary + reviewer. A picker key (modelKey /
         // reviewerKey) is resolved provider-side; legacy engine/model still works.
@@ -612,7 +919,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           if (!buf.length || buf.length > 16 * 1024 * 1024) continue;
           const chipId = String(im?.id ?? '') || `img-${seenAssets.size}-${Date.now().toString(36)}`;
           try {
-            const saved = saveAttachment(projectCwd, { id: chipId, kind: 'image', name: String(im?.name ?? 'pasted.png'), bytes: buf, mime: String(im?.mime ?? '') });
+            const saved = saveAttachment(projectCwd, { id: chipId, kind: 'image', name: String(im?.name ?? 'pasted.png'), bytes: buf, mime: String(im?.mime ?? ''), branch: attachBranch });
             const asset = publishing.importAsset(saved.absPath, projectId);
             if (seenAssets.has(asset.id)) continue; // identical bytes attached twice → one entry
             seenAssets.add(asset.id);
@@ -636,7 +943,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
             if (!content.trim()) continue;
             const capped = content.slice(0, 1024 * 1024); // file on disk — looser cap than the old in-prompt one
             try {
-              const saved = saveAttachment(projectCwd, { id: chipId, kind: 'text', name, content: capped });
+              const saved = saveAttachment(projectCwd, { id: chipId, kind: 'text', name, content: capped, branch: attachBranch });
               idToPath.set(chipId, saved.absPath);
               inputFiles.push({ id: chipId, name: saved.name, kind: 'text', bytes: saved.bytes, path: saved.absPath, preview: capped.slice(0, 160).replace(/\s+/g, ' ').trim() });
             } catch { /* skip an unwritable text */ }
@@ -647,7 +954,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
             try { buf = Buffer.from(b64, 'base64'); } catch { continue; }
             if (!buf.length || buf.length > 30 * 1024 * 1024) continue;
             try {
-              const saved = saveAttachment(projectCwd, { id: chipId, kind: 'file', name, bytes: buf, mime: String(f?.mime ?? '') });
+              const saved = saveAttachment(projectCwd, { id: chipId, kind: 'file', name, bytes: buf, mime: String(f?.mime ?? ''), branch: attachBranch });
               idToPath.set(chipId, saved.absPath);
               inputFiles.push({ id: chipId, name: saved.name, kind: 'file', mime: String(f?.mime ?? ''), bytes: saved.bytes, path: saved.absPath, preview: saved.name });
             } catch { /* skip an unwritable file */ }
@@ -664,7 +971,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // none of those leak a `«attach:…»` placeholder or a sliced abs path.
         const jobTitle = (titleText || (rawImages.length ? 'Image' : rawFiles.length ? 'Attachment' : '')).slice(0, 60);
 
-        const job = store.createJob(projectId, finalText, jobTitle, p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined);
+        // `agentContext` (e.g. browser page-context) is delivered to the model in the
+        // prompt but never rendered in the transcript — it stays off the user's screen.
+        const agentContext = typeof p.agentContext === 'string' && p.agentContext.trim() ? p.agentContext.slice(0, 200_000) : undefined;
+        const job = store.createJob(projectId, finalText, jobTitle, p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined, agentContext);
         emit('job', job);
         // A real user-initiated turn lands → the keep-going auto-continue
         // streak for this session resets (image_0ss8f.png: a real reply means
@@ -702,6 +1012,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
       // ── Jobs ───────────────────────────────────────────────────
       case 'listJobs': return store.listJobs(p.projectId ? String(p.projectId) : undefined, p.sessionId ? String(p.sessionId) : undefined);
+      case 'listJobPage': return store.listJobPage({
+        projectId: p.projectId ? String(p.projectId) : undefined,
+        sessionId: p.sessionId ? String(p.sessionId) : undefined,
+        before: Number.isFinite(Number(p.before)) ? Number(p.before) : undefined,
+        cursor: typeof p.cursor === 'string' ? p.cursor : undefined,
+        limit: Number.isFinite(Number(p.limit)) ? Number(p.limit) : undefined,
+      });
       case 'getJob': {
         const j = store.getJob(String(p.id ?? ''));
         return j ?? bad('job not found', 404);
@@ -730,6 +1047,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const c = engine.cancel(String(p.id ?? ''));
         return c ?? bad('job is not running', 409);
       }
+      // Steer a running chat turn: inject a follow-up into the LIVE session instead
+      // of cancelling + reseeding. { steered:false } ⇒ the turn already settled, so
+      // the caller (composer ⌘↩) falls back to a normal send.
+      case 'steerJob': return engine.steer(String(p.id ?? ''), String(p.text ?? ''));
       case 'deleteJob': { store.deleteJob(String(p.id ?? '')); return { ok: true }; }
 
       // ── Background tasks (long-lived processes the agent started) ──
@@ -742,6 +1063,24 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const r = engine.bgStop(String(p.id ?? ''));
         return r ?? bad('background task not found', 404);
       }
+
+      // ── Plan-mode exit gate ────────────────────────────────────
+      // The renderer's ExitPlanModeDialog calls this when the operator clicks
+      // Approve or Keep Planning. The id is the SDK's toolUseID echoed back
+      // from the `plan-mode-exit-request` event so we route the answer to the
+      // correct pending request (parallel runs can each have their own). See
+      // electron/plan-mode-gate.ts for the contract. Idempotent on stale ids
+      // — `respondExit` returns false for an unknown id (already answered or
+      // session switched), which we surface as `{ ok: false }` so the dialog
+      // can quietly close.
+      case 'exitPlanModeRespond': {
+        const id = String(p.toolUseID ?? '');
+        const approved = p.approved === true;
+        if (!id) return bad('toolUseID required');
+        const ok = engine.getPlanGate().respondExit(id, approved);
+        return { ok };
+      }
+
       case 'createAndRunJob': {
         if (!p.projectId || !p.input) bad('projectId and input required');
         if (!store.getProject(String(p.projectId))) bad('project not found', 404);
@@ -1039,6 +1378,143 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'githubLoginCancel': return engine.githubLoginCancel();
       // Whether `gh` is already present (system or managed) — gates the UI hint.
       case 'ghCliState': return ghState();
+
+      // ── GitHub-first project bootstrap ───────────────────────────────
+      // listOwners: the New-project owner picker (user + their orgs). The
+      // picker MUST be populated before checkSlug fires under a different owner;
+      // soft-fails to a single fake user row when no GitHub token is present
+      // (the bootstrap call will surface the real auth error loudly).
+      case 'listOwners': {
+        const token = providers.getLocalKey('github');
+        if (!token) return { ok: false, reason: 'not-authenticated', owners: [] as Array<{ login: string; kind: 'user' | 'org'; avatarUrl: string | null }> };
+        try {
+          const owners = await listOwners(token);
+          return { ok: true, reason: 'ok' as const, owners };
+        } catch (e) {
+          return { ok: false, reason: 'error' as const, owners: [], error: e instanceof Error ? e.message.slice(0, 160) : 'lookup failed' };
+        }
+      }
+      // checkSlug: live availability for the New-project name field. Debounced
+      // by the renderer (300ms). Returns the slugified form + whether it's
+      // free + an alternate suggestion when taken. Cheap (1–5 GitHub calls);
+      // the cascade short-circuits as soon as a free slug is found. Soft-fails
+      // when github isn't connected: the UI still shows the slug + a 'no-auth'
+      // hint, and the actual bootstrap call surfaces the same problem loudly.
+      case 'checkSlug': {
+        const rawName = String(p.name ?? '');
+        const slug = slugify(rawName);
+        const token = providers.getLocalKey('github');
+        if (!token) return { slug, available: null as boolean | null, suggestion: slug, owner: null as string | null, reason: 'not-authenticated' };
+        try {
+          const v = await getViewer(token);
+          const owner = v.login;
+          if (!owner) return { slug, available: null, suggestion: slug, owner: null, reason: 'no-login' };
+          const probe = await checkRepoAvailable(token, owner, slug);
+          if (probe.available) return { slug, available: true, suggestion: slug, owner, reason: 'ok' as const };
+          const suggestion = await suggestAvailableSlug(token, owner, rawName);
+          return { slug, available: false, suggestion, owner, existing: probe.existing, reason: 'taken' as const };
+        } catch (e) {
+          return { slug, available: null, suggestion: slug, owner: null, reason: 'error', error: e instanceof Error ? e.message.slice(0, 160) : 'lookup failed' };
+        }
+      }
+      // bootstrapProject: create BOTH GitHub repos (code + memory), seed the
+      // memory clone, symlink it into the project, commit + push the code
+      // repo. The renderer calls this from the "Create" button with the
+      // chosen owner (user OR org from the picker). Memory repo is always
+      // private + always under the logged-in user's account.
+      // The legacy single-repo path (no `owner` field) routes to the
+      // existing bootstrapNewProject — used by the adopt-folder "no GitHub
+      // remote yet" branch that hasn't been migrated to dual-repo + by the
+      // remoteOnly flow. We auto-fill `user` from the authenticated viewer.
+      case 'bootstrapProject': {
+        const name = String(p.name ?? '').trim();
+        if (!name) bad('name required');
+        const localPath = String(p.localPath ?? '').trim();
+        if (!localPath) bad('localPath required');
+        const token = providers.getLocalKey('github');
+        if (!token) bad('Sign in to GitHub before creating a GitHub-first project.', 401);
+        const isPrivate = p.private === undefined ? true : Boolean(p.private);
+        // Dual-repo branch: caller provided an owner picker selection.
+        const ownerObj = p.owner as { login?: unknown; kind?: unknown } | undefined;
+        if (ownerObj && typeof ownerObj.login === 'string' && (ownerObj.kind === 'user' || ownerObj.kind === 'org')) {
+          // Resolve the logged-in user (memory repo always under their account).
+          const v = await getViewer(token as string);
+          if (!v.login) bad('GitHub auth went stale — sign in again.', 401);
+          return bootstrapProject(token as string, {
+            user: v.login,
+            owner: { login: ownerObj.login, kind: ownerObj.kind },
+            name, localPath, private: isPrivate,
+          }, { fs: realFs, git: realGit });
+        }
+        // Legacy single-repo path.
+        const skipInit = Boolean(p.adopt) || Boolean(p.skipInit);
+        const remoteOnly = Boolean(p.remoteOnly);
+        return bootstrapNewProject(token as string, {
+          name, localPath, private: isPrivate,
+          description: typeof p.description === 'string' ? p.description.slice(0, 350) : undefined,
+          skipInit, remoteOnly,
+        }, { fs: realFs, git: realGit });
+      }
+      // adoptFolderInspect: classify an existing local folder for the adopt
+      // flow — has-git / has-github-remote / has-non-github-remote / no-git.
+      // Renderer uses this to decide whether to offer "create GitHub repo for
+      // this folder" or just record the existing remote and move on.
+      //
+      // ALSO discovers the companion memory repo (\${user}/\${slug}-memory):
+      // when the folder ALREADY has a github remote, we use that remote's
+      // repo name as the slug; otherwise we slugify the folder's basename.
+      // Returns a `memoryRepo` field with one of three states:
+      //   'memory-found'    — \${user}/\${slug}-memory exists; renderer
+      //                        offers "clone + link" on accept.
+      //   'memory-missing'  — same slug, no memory repo yet; renderer offers
+      //                        "create memory repo" on accept.
+      //   'no-github-auth'  — no GitHub token; renderer falls back to the
+      //                        old single-repo flow.
+      case 'adoptFolderInspect': {
+        const dir = String(p.path ?? '').trim();
+        if (!dir) bad('path required');
+        const inspected = inspectFolder(dir);
+        if (!inspected.ok) return { ok: false, path: dir, error: inspected.error };
+        const remote = inspected.info.isRepo ? readOriginRemote(dir) : null;
+        const isGitHub = !!remote && /github\.com[:/]/i.test(remote);
+        const kind = !inspected.info.isRepo ? 'no-git' as const
+          : !remote ? 'git-no-remote' as const
+          : isGitHub ? 'git-github' as const
+          : 'git-non-github' as const;
+
+        // Memory-repo companion discovery. Best-effort — failures here don't
+        // poison the rest of the inspection.
+        let memoryRepo: { state: 'memory-found'; cloneUrl: string; slug: string; user: string }
+                       | { state: 'memory-missing'; slug: string; user: string }
+                       | { state: 'no-github-auth' }
+                       | { state: 'error'; error: string } = { state: 'no-github-auth' };
+        const token = providers.getLocalKey('github');
+        if (token) {
+          try {
+            const v = await getViewer(token);
+            if (v.login) {
+              // Slug source: the existing GitHub remote's repo name when present
+              // (so adopting a clone of an existing project re-attaches to the
+              // SAME memory repo); else slugify the folder basename.
+              let slug = '';
+              if (isGitHub && remote) {
+                const parsed = parseGitHubRemote(remote);
+                if (parsed?.repo) slug = parsed.repo;
+              }
+              if (!slug) slug = slugify(nodePath.basename(dir));
+              const discovered = await discoverMemoryRepo(token, v.login, slug);
+              memoryRepo = discovered.exists && discovered.cloneUrl
+                ? { state: 'memory-found', cloneUrl: discovered.cloneUrl, slug, user: v.login }
+                : { state: 'memory-missing', slug, user: v.login };
+            } else {
+              memoryRepo = { state: 'error', error: 'no login on token' };
+            }
+          } catch (e) {
+            memoryRepo = { state: 'error', error: e instanceof Error ? e.message.slice(0, 160) : 'memory discovery failed' };
+          }
+        }
+        return { ok: true, path: dir, info: inspected.info, remote, kind, memoryRepo };
+      }
 
       // ── Media Studio (real fal generation) ─────────────────────
       case 'mediaRates': return media.rates();
@@ -1340,7 +1816,9 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'engineStatus': return engine.statuses();
 
       // ── Model registry (provider-owned catalog) ───────────────
-      case 'listModels': return buildModelGroups(engine.statuses());
+      case 'listModels':
+        await refreshModelGroups(providers, { force: p.refresh === true });
+        return buildModelGroups(engine.statuses());
 
       // ── Roles (model-level primary / reviewer) ─────────────────
       case 'getRoles': return store.getRoles();
@@ -1389,6 +1867,129 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
       // ── Pairing (desktop-only; never enters relay snapshots) ──
       case 'getPairing': return { token: store.accessToken, relayUrl, devices: store.getRemoteDevices() };
+
+      // ── File / dir / command surface ───────────────────────────
+      // Ported VERBATIM from the Electron-only `maestro:*` IPC channels in
+      // main.ts so the headless macOS sidecar gets identical behavior. These
+      // throw (via plain Error or `bad`) on failure rather than returning the
+      // main.ts `{ ok, error }` envelope — dispatch arms return data directly
+      // and the WS/IPC layer surfaces thrown errors to the caller.
+
+      // Reveal a path in Finder — path-guarded. Expands a leading ~.
+      case 'revealPath': {
+        const pth = p.path;
+        if (typeof pth !== 'string' || !pth) return bad('no path');
+        const abs = pth.startsWith('~/') || pth === '~' ? nodePath.join(app.getPath('home'), pth.slice(1)) : pth;
+        if (existsSync(abs)) { shell.showItemInFolder(abs); return { ok: true }; }
+        return bad('path not found', 404);
+      }
+
+      // Inline image bytes for the chat, keyed by a TRUSTED Asset id (the caller
+      // never supplies a path, so there's no traversal surface).
+      case 'assetImage': {
+        const a = store.getAsset(String(p.assetId ?? ''));
+        if (!a?.localPath || !existsSync(a.localPath)) return bad('no local image', 404);
+        const st = await fsp.stat(a.localPath);
+        if (st.size > 12 * 1024 * 1024) return bad('image too large to preview');
+        const ext = (a.localPath.split('.').pop() ?? 'png').toLowerCase();
+        const mime = IMG_MIME[ext] ?? 'application/octet-stream';
+        const b64 = (await fsp.readFile(a.localPath)).toString('base64');
+        return { dataUrl: `data:${mime};base64,${b64}` };
+      }
+
+      // Read a file's text — confined to the project folder.
+      case 'readFile': {
+        const real = resolveInsideRoot(rootOfProject(store, p.projectId), String(p.path ?? ''));
+        const st = await fsp.stat(real);
+        if (!st.isFile()) return bad('not a file');
+        if (st.size > 2 * 1024 * 1024) {
+          const fd = await fsp.open(real, 'r');
+          try { const buf = Buffer.alloc(512 * 1024); const { bytesRead } = await fd.read(buf, 0, buf.length, 0); return { path: real, text: buf.subarray(0, bytesRead).toString('utf8'), bytes: st.size, truncated: true }; }
+          finally { await fd.close(); }
+        }
+        const text = await fsp.readFile(real, 'utf8');
+        if (text.includes('\u0000')) return bad('binary file');
+        return { path: real, text, bytes: st.size, truncated: false };
+      }
+
+      // Write a file's text — confined to the project folder, ONLY overwrites an
+      // existing regular text file (no creating new files, no overwriting binaries).
+      case 'writeFile': {
+        const text = p.text;
+        if (typeof text !== 'string') return bad('text must be a string');
+        if (text.length > 4 * 1024 * 1024) return bad('file too large to save here (4 MB cap)');
+        if (text.includes('\u0000')) return bad('refused to write NUL byte (binary)');
+        const real = resolveInsideRoot(rootOfProject(store, p.projectId), String(p.path ?? ''));
+        const st = await fsp.stat(real);
+        if (!st.isFile()) return bad('not a file');
+        await fsp.writeFile(real, text, 'utf8');
+        const next = await fsp.stat(real);
+        return { path: real, bytes: next.size, mtime: next.mtimeMs };
+      }
+
+      // List a directory's immediate entries — confined to the project.
+      case 'listDir': {
+        const real = resolveInsideRoot(rootOfProject(store, p.projectId), String(p.path ?? ''));
+        const st = await fsp.stat(real);
+        if (!st.isDirectory()) return bad('not a directory');
+        const dirents = await fsp.readdir(real, { withFileTypes: true });
+        const entries = dirents
+          .filter(d => d.name !== '.git' && d.name !== 'node_modules' && d.name !== '.DS_Store')
+          .slice(0, 5000)
+          .map(d => ({ name: d.name, path: nodePath.join(real, d.name), kind: d.isDirectory() ? 'dir' : d.isFile() ? 'file' : 'other' }))
+          .sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'dir' ? -1 : 1));
+        return { path: real, entries };
+      }
+
+      // Flat list of the project's files (project-relative paths) for fast
+      // @-mention file search. Common build/vendor dirs are skipped and the
+      // walk is capped so even huge repos stay snappy.
+      case 'listProjectFiles': {
+        const root = rootOfProject(store, p.projectId);
+        const IGNORE = new Set(['.git', 'node_modules', '.DS_Store', 'dist', 'build', '.next', 'out', 'coverage', '.turbo', '.cache', 'target', '.venv', 'venv', '__pycache__', '.idea', '.vscode', '.parcel-cache', 'vendor', '.gradle', 'Pods', '.expo']);
+        const CAP = 20000;
+        const files: string[] = [];
+        const walk = async (dir: string, rel: string): Promise<void> => {
+          if (files.length >= CAP) return;
+          let dirents;
+          try { dirents = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+          for (const d of dirents) {
+            if (files.length >= CAP) return;
+            if (IGNORE.has(d.name)) continue;
+            const childRel = rel ? `${rel}/${d.name}` : d.name;
+            if (d.isDirectory()) await walk(nodePath.join(dir, d.name), childRel);
+            else if (d.isFile()) files.push(childRel);
+          }
+        };
+        await walk(root, '');
+        files.sort();
+        return { files, truncated: files.length >= CAP };
+      }
+
+      // Run/Terminal: spawn a shell command in the project folder and stream
+      // output back over the event bus as a `cmd-output` event with payload
+      // { runId, stream:'out'|'err'|'exit', chunk?, code? }.
+      case 'runCommand': {
+        const root = store.getProject(String(p.projectId ?? ''))?.path;
+        if (!root) return bad('this project has no folder');
+        const command = p.command;
+        if (typeof command !== 'string' || !command.trim()) return bad('command required');
+        const runId = `${Date.now().toString(36)}-${process.hrtime.bigint().toString(36)}`;
+        const child = spawn('/bin/zsh', ['-lc', command], { cwd: root, env: { ...process.env } });
+        runningCmds.set(runId, child);
+        const send = (stream: string, chunk: string, code?: number) => { try { emit('cmd-output', { runId, stream, chunk, code }); } catch { /* bus gone */ } };
+        child.stdout?.on('data', (d: Buffer) => send('out', String(d)));
+        child.stderr?.on('data', (d: Buffer) => send('err', String(d)));
+        child.on('close', (code) => { runningCmds.delete(runId); send('exit', '', code ?? 0); });
+        child.on('error', (err) => { runningCmds.delete(runId); send('err', err.message + '\n'); send('exit', '', 1); });
+        return { runId };
+      }
+      case 'killCommand': {
+        const runId = String(p.runId ?? '');
+        const c = runningCmds.get(runId);
+        if (c) { try { c.kill('SIGTERM'); } catch { /* gone */ } runningCmds.delete(runId); return { ok: true }; }
+        return { ok: false };
+      }
 
       default:
         return bad(`unknown method: ${method}`, 404);

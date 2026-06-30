@@ -10,7 +10,7 @@
 
 import React from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { GitStatusBar } from './GitStatusBar';
+// Track 5: GitStatusBar removed from the transcript — the chat header's <GitOpsDock /> is the single source of truth for git actions.
 import { Icon, type IconName } from '../lib/icons';
 import { EffortDial, CountUp } from '../lib/ui';
 import { FileChip } from '../lib/fileChip';
@@ -59,8 +59,8 @@ const PAGE_CSS = `
   @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
   @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
 
-  main::-webkit-scrollbar, aside::-webkit-scrollbar, div::-webkit-scrollbar { width: 11px; height: 11px; }
-  ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 3px solid transparent; background-clip: padding-box; }
+  main::-webkit-scrollbar, aside::-webkit-scrollbar, div::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
   ::selection { background: rgba(0,122,255,0.22); }
 `;
 
@@ -100,7 +100,9 @@ function GoalBlock({ goal }: { goal: string }) {
 const fmtToolDur = (ms?: number): string => (ms == null ? '' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`);
 
 // The agent's extended thinking — calm dimmed prose under a small purple header.
-function ThinkingStep({ item }: { item: TranscriptItem }) {
+// Memoized: parent transcript re-renders on every streamed token; without this
+// every prior Thinking block was rebuilt each frame.
+const ThinkingStep = React.memo(function ThinkingStep({ item }: { item: TranscriptItem }) {
   const text = item.text.trim();
   if (!text) return null;
   return (
@@ -112,7 +114,7 @@ function ThinkingStep({ item }: { item: TranscriptItem }) {
       <div style={{ marginLeft: 8, paddingLeft: 13, borderLeft: '1.5px solid color-mix(in srgb, var(--purple) 24%, var(--separator))', font: '400 var(--fs-footnote)/1.66 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{text}</div>
     </div>
   );
-}
+});
 
 /* Lightweight prose: split out ``` fenced code blocks; render the rest as
    line-break-preserving paragraphs. Good enough for agent text + JSON output
@@ -132,24 +134,31 @@ function renderText(text: string, keyBase: string): React.ReactNode[] {
 }
 
 /* Children of a sub-agent (Task/Agent dispatch) — its own tool calls, thinking
-   blocks, and prose, rendered as a calm flat list under an indent rail. */
-function NestedTranscript({ items }: { items: TranscriptItem[] }) {
+   blocks, and prose, rendered as a calm flat list under an indent rail.
+   Memoized — children arrays change rarely once a sub-agent finishes; without
+   this the whole nested block was rebuilt on every parent stream tick. */
+const NestedTranscript = React.memo(function NestedTranscript({ items }: { items: TranscriptItem[] }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
       {items.map((it, i) => {
-        if (it.kind === 'tool') return <ToolStep key={i} item={it} />;
-        if (it.kind === 'thinking') return <ThinkingStep key={i} item={it} />;
-        if (it.text && it.text.trim()) return <React.Fragment key={i}>{renderText(it.text, `nt${i}`)}</React.Fragment>;
+        // ts is the streamed monotonic timestamp on each item — far more stable
+        // than the array index when items are appended.
+        const k = it.id ?? `${it.kind}-${it.ts ?? i}`;
+        if (it.kind === 'tool') return <ToolStep key={k} item={it} />;
+        if (it.kind === 'thinking') return <ThinkingStep key={k} item={it} />;
+        if (it.text && it.text.trim()) return <React.Fragment key={k}>{renderText(it.text, `nt${i}`)}</React.Fragment>;
         return null;
       })}
     </div>
   );
-}
+});
 
 // One real tool step — a FLAT row (no card), short verb + filename chip / detail.
 // Sub-agent (Task/Agent) chips carry `children[]` + a final `result`: they get a
 // chevron + step count + answer preview, and tap-to-expand into the inner work.
-function ToolStep({ item }: { item: TranscriptItem }) {
+// Memoized: a streaming run can emit dozens of tools; without this every prior
+// ToolStep re-renders on every token tick of the active assistant turn.
+const ToolStep = React.memo(function ToolStep({ item }: { item: TranscriptItem }) {
   const running = item.toolStatus === 'running';
   const error = item.toolStatus === 'error';
   const isSkill = isSkillTool(item.name);
@@ -167,7 +176,11 @@ function ToolStep({ item }: { item: TranscriptItem }) {
   const hasNest = childCount > 0 || !!(item.result && item.result.trim());
   const [expanded, setExpanded] = React.useState(false);
   const isOpen = hasNest && (expanded || running);
-  const resultPreview = item.result ? item.result.replace(/\s+/g, ' ').trim().slice(0, 180) : '';
+  // The result-preview regex was running on every render; cache by result.
+  const resultPreview = React.useMemo(
+    () => (item.result ? item.result.replace(/\s+/g, ' ').trim().slice(0, 180) : ''),
+    [item.result],
+  );
   const stepLabel = childCount > 0 ? `${childCount} step${childCount === 1 ? '' : 's'}` : '';
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: isOpen ? 4 : 0 }}>
@@ -226,16 +239,19 @@ function ToolStep({ item }: { item: TranscriptItem }) {
       )}
     </div>
   );
-}
+});
 
 // A run of consecutive tool steps — a calm flat list (no card framing).
-function ToolGroupCard({ items }: { items: TranscriptItem[] }) {
+// Memoized + stable keys: a streaming chat appends to this list mid-render, and
+// index keys made every prior chip remount on every new tool. Use the SDK
+// tool_use_id when present, falling back to the per-item timestamp.
+const ToolGroupCard = React.memo(function ToolGroupCard({ items }: { items: TranscriptItem[] }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-      {items.map((it, i) => <ToolStep key={i} item={it} />)}
+      {items.map((it, i) => <ToolStep key={it.id ?? `t-${it.ts ?? i}`} item={it} />)}
     </div>
   );
-}
+});
 
 // A question the agent asked during the run (read-only here).
 function AskStep({ text }: { text: string }) {
@@ -259,14 +275,19 @@ function transcriptBlocks(job: Job | null, live: boolean): React.ReactNode[] {
   if (items.length) {
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
+      // Prefer the SDK item id, falling back to its timestamp — both are stable
+      // across appends; the previous index-only keys caused every prior block
+      // to remount on each new item arrival.
+      const k = it.id ?? `${it.kind}-${it.ts ?? i}`;
       if (it.kind === 'tool') {
         const run: TranscriptItem[] = [];
+        const startK = k;
         while (i < items.length && items[i].kind === 'tool') { run.push(items[i]); i++; }
         i--; // the for-loop will advance past the last tool
-        blocks.push(<ToolGroupCard key={`g${i}`} items={run} />);
-      } else if (it.kind === 'thinking') blocks.push(<ThinkingStep key={`it${i}`} item={it} />);
-      else if (it.kind === 'ask') blocks.push(<AskStep key={`it${i}`} text={it.ask || it.text} />);
-      else if (it.text && it.text.trim()) blocks.push(<React.Fragment key={`it${i}`}>{renderText(it.text, `it${i}`)}</React.Fragment>);
+        blocks.push(<ToolGroupCard key={`g-${startK}`} items={run} />);
+      } else if (it.kind === 'thinking') blocks.push(<ThinkingStep key={k} item={it} />);
+      else if (it.kind === 'ask') blocks.push(<AskStep key={k} text={it.ask || it.text} />);
+      else if (it.text && it.text.trim()) blocks.push(<React.Fragment key={k}>{renderText(it.text, k)}</React.Fragment>);
     }
   } else if (job) {
     const body = (job.error ?? job.output ?? '').trim();
@@ -533,11 +554,18 @@ export default function SessionTranscript() {
     return unsub;
   }, [job?.id]);
 
-  // elapsed clock only — cost & tokens are real, streamed from the engine
+  // elapsed clock only — cost & tokens are real, streamed from the engine.
+  // Pause the 1Hz tick whenever the document is hidden (other tab / minimized /
+  // backgrounded) so a stale Session view doesn't keep waking the Mac.
   React.useEffect(() => {
     if (!live) return;
-    const t = setInterval(() => setElapsed(e => e + 1), 1000);
-    return () => clearInterval(t);
+    let t: ReturnType<typeof setInterval> | null = null;
+    const start = () => { if (!t && !document.hidden) t = setInterval(() => setElapsed(e => e + 1), 1000); };
+    const stop = () => { if (t) { clearInterval(t); t = null; } };
+    const onVis = () => { if (document.hidden) stop(); else start(); };
+    start();
+    document.addEventListener('visibilitychange', onVis);
+    return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
   }, [live]);
 
   React.useEffect(() => {
@@ -550,6 +578,10 @@ export default function SessionTranscript() {
   const followStream = () => { const el = scrollRef.current; if (el && atBottom) el.scrollTop = el.scrollHeight; };
 
   const mm = Math.floor(elapsed / 60), ss = String(elapsed % 60).padStart(2, '0');
+  // Recompute the transcript only when its payload actually changes — without
+  // this, the 1Hz elapsed-time tick (or any other parent state change) rebuilt
+  // the entire transcript tree every second.
+  const blocks = React.useMemo(() => transcriptBlocks(job, live), [job?.transcript, job?.input, job?.output, job?.error, live]);
 
   const statusMap = {
     live: { label: 'Running', tint: 'var(--purple)', pulse: true },
@@ -583,7 +615,7 @@ export default function SessionTranscript() {
                 <EffortDial value={job ? EFFORT_TO_PILL[job.effort] : 'DEEP'} compact />
               </div>
             </div>
-            <GitStatusBar sessionId={job?.sessionId ?? null} />
+            {/* Track 5: git actions are now the chat header's <GitOpsDock /> — single source of truth. */}
             {/* real engine · model badge — which engine ran this job, on this Mac */}
             {job?.engine && (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)',
@@ -603,7 +635,7 @@ export default function SessionTranscript() {
             <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column' }}>
               <div ref={scrollRef} onScroll={onScroll} style={{ flex: 1, overflowY: 'auto', padding: '24px 24px 80px' }}>
                 <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
-                  {transcriptBlocks(job, live)}
+                  {blocks}
                 </div>
               </div>
 

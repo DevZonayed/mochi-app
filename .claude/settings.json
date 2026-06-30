@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ./scripts/block-merge-commands.sh",
+            "if": "Bash(gh *) | Bash(git push *) | Bash(* gh *) | Bash(* git push *)",
+            "timeout": 5,
+            "statusMessage": "Checking merge/push policy…"
+          }
+        ]
+      }
+    ]
+  }
+}

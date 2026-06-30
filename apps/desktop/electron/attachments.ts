@@ -39,9 +39,28 @@ function extFromName(name: string, fallback = ''): string {
   return e === 'jpeg' ? 'jpg' : e;
 }
 
-/** The canonical attachments directory for a project. Created if missing. */
-export function attachmentsDirFor(projectCwd: string): string {
-  const dir = path.join(projectCwd, '.continuum', 'Attachment');
+/** Turn a git branch (`mochi/<city>/<slug>`) into ONE safe folder segment so
+    every attachment for a chat lives under its own branch-named subfolder:
+    `.continuum/Attachment/<branchSlug>/<file>`. Empty input → '' (flat layout,
+    backward-compatible with attachments saved before per-branch folders). */
+function branchFolder(branch?: string): string {
+  const raw = (branch ?? '').trim();
+  if (!raw) return '';
+  // Slashes in the branch become dashes (one folder, not a nested tree); then
+  // strip anything that isn't filesystem-boring so the folder is always safe.
+  const slug = raw.replace(/[\/\\]+/g, '-').replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '').toLowerCase().slice(0, 64);
+  return slug;
+}
+
+/** The canonical attachments directory for a project. When `branch` is given,
+    attachments are scoped under a branch-named subfolder
+    (`.continuum/Attachment/<branchSlug>/`) so each chat's pastes/files are
+    grouped together. Created if missing. */
+export function attachmentsDirFor(projectCwd: string, branch?: string): string {
+  const folder = branchFolder(branch);
+  const dir = folder
+    ? path.join(projectCwd, '.continuum', 'Attachment', folder)
+    : path.join(projectCwd, '.continuum', 'Attachment');
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -64,6 +83,10 @@ export interface SaveAttachmentInput {
   srcPath?: string;
   /** Optional mime — only used to fall back on an extension when `name` is bare. */
   mime?: string;
+  /** Optional chat branch (or codename). When set, the file is saved under a
+      branch-named subfolder (`.continuum/Attachment/<branchSlug>/`) so each
+      chat's attachments are grouped together. Omit for the legacy flat layout. */
+  branch?: string;
 }
 
 export interface SavedAttachment {
@@ -102,7 +125,7 @@ function fallbackExtForMime(mime?: string): string {
     from accumulating zombie files. */
 export function saveAttachment(projectCwd: string, input: SaveAttachmentInput): SavedAttachment {
   if (!projectCwd) throw new Error('attachments: projectCwd required');
-  const dir = attachmentsDirFor(projectCwd);
+  const dir = attachmentsDirFor(projectCwd, input.branch);
   const suffix = suffixOf(input.id);
   const baseName = safeBase(path.basename(input.name || '', path.extname(input.name || '')));
   // Pick the extension: prefer the original filename, then the mime, then a
@@ -152,12 +175,12 @@ export function substitutePlaceholders(text: string, map: Map<string, string>): 
 }
 
 /** For the relay snapshot: rewrite every `@<absPath>` that lives under any
-    `.continuum/Attachment/` directory into `@.continuum/Attachment/<basename>`,
+    `.continuum/Attachment/` directory into `@.continuum/Attachment/<subpath>`,
     so the phone/web remote never learns the operator's home directory. Path
     matching uses `[^@\n]+?` (not `[^\s]+`) so a project folder with spaces
     — eg `/Users/me/Desktop/Client Shared GIT/veni0004/` — still scrubs.
-    Sub-directories under `Attachment/` are preserved in the scrubbed form
-    so the relay reference still points at the same file on disk. */
+    Sub-directories under `Attachment/` (incl. a branch subfolder) are preserved
+    in the scrubbed form so the relay reference still points at the same file. */
 export function scrubAbsPathsForRelay(text: string): string {
   if (!text) return text;
   return text.replace(/@(\/[^@\n]+?\/\.continuum\/Attachment\/((?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+))/g,
@@ -167,5 +190,6 @@ export function scrubAbsPathsForRelay(text: string): string {
 /** A standalone path token regex used by the renderer to tokenize a message
     bubble into prose + inline attachment chips. Matches both absolute paths and
     the relay-scrubbed `@.continuum/Attachment/<file>` form. Accepts spaces in
-    the prefix and optional sub-directories under `Attachment/`. */
+    the prefix and optional sub-directories under `Attachment/` (incl. a branch
+    subfolder, `@…/Attachment/<branchSlug>/<file>`). */
 export const ATTACH_PATH_TOKEN = /@((?:\/[^@\n]+?)?\.continuum\/Attachment\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+)/g;
