@@ -327,7 +327,12 @@ struct ChatThread: View {
         let scrollResetKey = sessionId ?? "new"
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 22) {
+                // The transcript already windows turns with `visibleCount`, so laziness buys little
+                // here. `LazyVStack` also reports provisional heights for large dynamic markdown
+                // blocks while AppKit's scroll view is measuring, which makes the scrollbar thumb
+                // grow/shrink and the transcript appear to loop-shift. An eager stack gives the
+                // enclosing NSScrollView one stable document height per render pass.
+                VStack(alignment: .leading, spacing: 22) {
                     if start > 0 {
                         Button { loadEarlier(proxy, all: all) } label: {
                             HStack(spacing: 6) {
