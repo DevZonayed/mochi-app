@@ -1001,11 +1001,71 @@ function SettingsTab() {
         <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default branch</span>
           <span style={{ font: '400 var(--fs-body)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>main</span></Row>
       </GroupedList>
+      {IS_LOCAL && <BrowserControl />}
       <GroupedList header="Danger zone" footer="Archiving stops all jobs and hides the project. You can restore it within 30 days.">
         <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--red)' }}>Archive project</span>
           <Icon name="chevronRight" size={16} style={{ color: 'var(--ink-tertiary)' }} /></Row>
       </GroupedList>
     </div>
+  );
+}
+
+/* Manual "Open browser" control. Opening here PINS the browser open so a finished
+   agent task won't auto-close it (the agent only tidies up windows IT opened) —
+   the user closes it themselves. Mirrors the held flag from the extension bridge. */
+function BrowserControl() {
+  const [status, setStatus] = React.useState<{ connected: boolean; held: boolean } | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+  const refresh = React.useCallback(() => {
+    api.extensionStatus()
+      .then(s => setStatus({ connected: s.peers.some(p => p.active), held: !!s.held }))
+      .catch(() => setStatus(null));
+  }, []);
+  React.useEffect(() => { refresh(); const t = setInterval(refresh, 4000); return () => clearInterval(t); }, [refresh]);
+
+  const held = !!status?.held;
+  const connected = !!status?.connected;
+  const toggle = () => {
+    setBusy(true); setErr(null);
+    const op = held ? api.browserClose() : api.browserOpen();
+    op.then(() => refresh())
+      .catch((e: unknown) => setErr(e instanceof Error ? e.message : 'Could not reach the browser.'))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <GroupedList
+      header="Browser"
+      footer={held
+        ? 'The browser is pinned open — it stays open after a task finishes until you close it here.'
+        : 'When the agent drives the browser for a task, it closes the window it opened once the task is done. Open it here to keep it open until you close it yourself.'}
+    >
+      <Row last>
+        <span style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>
+            {held ? 'Browser is open' : 'Open browser'}
+          </span>
+          <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: err ? 'var(--red)' : 'var(--ink-tertiary)' }}>
+            {err ?? (connected ? (held ? 'Pinned open' : 'Chrome connected') : 'No Chrome profile connected — pair the Mochi extension first')}
+          </span>
+        </span>
+        <button
+          onClick={toggle}
+          disabled={busy || (!connected && !held)}
+          style={{
+            height: 30, padding: '0 14px', borderRadius: 8, border: 'none', flexShrink: 0,
+            background: held ? 'var(--fill-secondary)' : 'var(--blue)',
+            color: held ? 'var(--ink)' : '#fff',
+            font: '600 var(--fs-footnote)/1 var(--font-text)',
+            cursor: busy || (!connected && !held) ? 'default' : 'pointer',
+            opacity: busy || (!connected && !held) ? 0.5 : 1,
+          }}
+        >
+          {busy ? '…' : held ? 'Close browser' : 'Open browser'}
+        </button>
+      </Row>
+    </GroupedList>
   );
 }
 

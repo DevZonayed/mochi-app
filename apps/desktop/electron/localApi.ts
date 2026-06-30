@@ -198,12 +198,35 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // ── Browser-extension control channel (local-only; blocked from relay) ──
       case 'extensionStatus': {
         const b = getExtensionBridge?.();
-        return b ? b.status() : { running: false, port: 0, token: store.extensionToken, peers: [] };
+        return b ? b.status() : { running: false, port: 0, token: store.extensionToken, peers: [], held: false };
       }
       case 'extensionSetActive': {
         const b = getExtensionBridge?.();
         if (!b) bad('extension channel unavailable', 503);
         return b!.setActiveFromApp(String(p.clientId ?? ''));
+      }
+      // Manually open the browser (Project settings → Open browser). PINS it open
+      // so the agent's end-of-turn tidy-up leaves it alone — the user owns this
+      // window and closes it themselves (via browserClose). Requires a paired,
+      // active Chrome profile.
+      case 'browserOpen': {
+        const b = getExtensionBridge?.();
+        if (!b) bad('extension channel unavailable', 503);
+        if (!b!.hasActiveBrowser()) bad('No browser connected. Open the Mochi Chrome extension and activate a profile first.', 503);
+        b!.setBrowserHold(true);
+        const url = typeof p.url === 'string' && p.url ? p.url : 'about:blank';
+        try { await b!.request('navigate', { url }, 45000); }
+        catch { try { await b!.request('session_start', { url, title: 'Maestro', color: 'blue' }, 45000); } catch { /* surfaced as held-but-empty */ } }
+        return { ok: true, held: true };
+      }
+      // Manually close the browser the user pinned open: drop the hold + end the
+      // session (closing its tabs).
+      case 'browserClose': {
+        const b = getExtensionBridge?.();
+        if (!b) bad('extension channel unavailable', 503);
+        b!.setBrowserHold(false);
+        try { await b!.request('session_end', { closeTabs: true }); } catch { /* already gone */ }
+        return { ok: true, held: false };
       }
       // Where does the bundled Chrome extension live on this machine? Powers the
       // Settings → "Browser extension" panel: shows the path + the "Reveal folder
