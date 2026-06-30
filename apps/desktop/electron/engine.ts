@@ -3649,16 +3649,20 @@ export class LocalEngine {
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
       this.emit('job', done);
-      // Auto-rename hook: the first informative turn ripens the title (which is
-      // the user's first prompt). Swap the codename-only branch for one
-      // carrying a task-derived slug. Fires once per session — gated inside.
-      if (isChat && this.gitService) {
-        const fresh = this.store.getSession(session.id);
-        if (fresh && fresh.branch && fresh.codename && !fresh.branchRenamedAt) {
-          // Fire-and-forget; the gitService gates its own no-op cases.
-          void this.gitService.renameSessionBranch(fresh).catch(() => { /* best effort */ });
-        }
-      }
+      // Post-turn git refresh + auto-rename hook.
+      //
+      // The agent may have committed / staged / pushed during this turn. The
+      // chat-header chip + contextual action read live `git-status` events, but
+      // nothing recomputes them when a turn ends — so without an explicit
+      // refresh the chip stays "Uncommitted" and the action never advances to
+      // "Push" until the 30s background poller catches up. Recompute + re-emit
+      // now so the UI reflects the new state the instant the turn finishes.
+      //
+      // The auto-rename hook (first informative turn ripens the title → swap the
+      // codename-only branch for a task-derived slug; fires once per session,
+      // gated inside) runs first when applicable, then we refresh against the
+      // freshest session so the emitted status carries the post-rename branch.
+      if (isChat) this.refreshGitAfterTurn(session.id, { allowRename: true });
       // AskUserQuestion follow-up: if this chat turn ended on a question the user
       // hasn't answered (the SDK auto-dismisses it headless), arm a countdown that
       // auto-sends the recommended option after ASK_BASE_MS. The question card shows
@@ -3723,6 +3727,12 @@ export class LocalEngine {
     } catch (e) {
       settleStream();
       this.running.delete(jobId);
+      // The turn ended unhappily (cancel / steer-interrupt / failure) but the
+      // agent may have ALREADY committed or pushed before it did. The success
+      // path refreshes git-status; mirror that here so the chip + contextual
+      // action advance instead of staying stuck on "Uncommitted" until the 30s
+      // poller catches up. No auto-rename on a non-success turn. Best-effort.
+      this.refreshGitAfterTurn(this.store.getJob(jobId)?.sessionId);
       if (e instanceof CancelledError || ac.signal.aborted) {
         const existing = this.store.getJob(jobId);
         if (existing && existing.status !== 'cancelled') {
@@ -3773,6 +3783,36 @@ export class LocalEngine {
       this.emit('job', failed);
       this.store.pushEvent({ kind: 'job-failed', title: `Failed: ${failed.title}`, subtitle: failed.error ?? undefined, projectId: failed.projectId, jobId });
       return failed;
+    }
+  }
+
+  /** A chat turn just ended (success, cancel, or failure) — the agent may have
+      committed / staged / pushed mid-turn. Recompute + re-emit `git-status` so
+      the chat-header chip and contextual action advance immediately instead of
+      waiting on the 30s background poller (`main.ts` `gitPoll`). The renderer
+      (`useSessionGitState` → `GitStatusBar`) is purely event-driven, so the chip
+      updates the instant this fires.
+
+      `allowRename` runs the one-shot branch auto-rename first (success path only:
+      the first informative turn ripens the title → swap the codename-only branch
+      for a task-derived slug, gated inside `renameSessionBranch`), then refreshes
+      against the freshest session so the emitted status carries the renamed
+      branch. Fire-and-forget; every git op is best-effort and a no-op for
+      non-chat / non-repo / branch-less sessions. */
+  private refreshGitAfterTurn(sessionId: string | undefined, opts: { allowRename?: boolean } = {}): void {
+    const git = this.gitService;
+    if (!git || !sessionId) return;
+    const fresh = this.store.getSession(sessionId);
+    if (!fresh || !fresh.branch) return;
+    const refresh = () => {
+      const f2 = this.store.getSession(sessionId);
+      if (f2) void git.fullStatus(f2, { withPr: false }).catch(() => { /* best effort */ });
+    };
+    if (opts.allowRename && fresh.codename && !fresh.branchRenamedAt) {
+      // renameSessionBranch gates its own no-op cases; refresh either way.
+      void git.renameSessionBranch(fresh).then(refresh, refresh);
+    } else {
+      refresh();
     }
   }
 }
