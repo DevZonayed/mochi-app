@@ -35,6 +35,23 @@ import { buildModelGroups, refreshModelGroups } from '../../../apps/desktop/elec
 import { isRemoteBlocked } from '../../../apps/desktop/electron/remote-guard.js';
 import type { Asset, Job } from '../../../apps/desktop/electron/store.js';
 
+// Tell the Swift supervisor we're alive the moment the entry body runs (before the heavy brain
+// construction below), so it can distinguish "alive and booting" from "hung/dead". And turn any
+// construction failure into a structured {fatal} line instead of a silent exit — the supervisor
+// surfaces that reason in the UI instead of a generic "Not connected". (Handlers registered here
+// catch synchronous throws in the construction that follows, since they run first.)
+process.stdout.write(JSON.stringify({ phase: 'starting' }) + '\n');
+process.on('uncaughtException', (e) => {
+  try { process.stdout.write(JSON.stringify({ fatal: (e as Error)?.message ?? String(e) }) + '\n'); } catch { /* noop */ }
+  process.stderr.write(`[sidecar] uncaughtException: ${(e as Error)?.stack ?? String(e)}\n`);
+  process.exit(1);
+});
+process.on('unhandledRejection', (e) => {
+  try { process.stdout.write(JSON.stringify({ fatal: (e as Error)?.message ?? String(e) }) + '\n'); } catch { /* noop */ }
+  process.stderr.write(`[sidecar] unhandledRejection: ${(e as Error)?.stack ?? String(e)}\n`);
+  process.exit(1);
+});
+
 const RELAY_URL = (process.env.MAESTRO_SERVER_URL || 'https://api.nexalance.cloud').replace(/\/$/, '');
 const ACCOUNT_SESSION_PATH = path.join(shimApp.getPath('userData'), 'account-session.json');
 

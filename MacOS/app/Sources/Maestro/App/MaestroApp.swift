@@ -48,12 +48,12 @@ enum SelfTest {
             let sup = SidecarSupervisor(client: client)
             sup.start()
             var connected = false
-            for _ in 0..<200 {
-                if client.state == .connected { connected = true; break }
-                if case .failed(let m) = sup.status { print("SELFTEST FAIL: sidecar \(m)"); exit(1) }
+            for _ in 0..<400 {   // up to ~20s — cold dev boot transpiles the whole brain
+                if sup.engineState.isReady { connected = true; break }
+                if case .down(let m) = sup.engineState { print("SELFTEST FAIL: sidecar \(m)"); exit(1) }
                 try? await Task.sleep(for: .milliseconds(50))
             }
-            guard connected else { print("SELFTEST FAIL: not connected (\(client.state))"); exit(1) }
+            guard connected else { print("SELFTEST FAIL: engine not ready (\(sup.engineState))"); exit(1) }
             do {
                 let projects = try await client.call("listProjects", as: [Project].self)
                 let health = try await client.callRaw("health", [:])

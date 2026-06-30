@@ -2,7 +2,7 @@
 // uses Node's loader hooks instead). Mirrors hooks.mjs: alias `electron` → the headless shim,
 // rewrite NodeNext `./x.js` specifiers → `./x.ts`. esbuild transpiles the TS + inlines JSON.
 import { build } from 'esbuild';
-import { existsSync, mkdirSync, statSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -50,3 +50,15 @@ const result = await build({
 const kb = (statSync(outfile).size / 1024).toFixed(0);
 console.log(`✓ bundled → dist/maestro-sidecar.mjs (${kb} KB)`);
 if (result.warnings.length) console.log(`  ${result.warnings.length} warning(s)`);
+
+// Sibling runtime assets the brain reads relative to its own dir via `import.meta.url`
+// (esbuild keeps import.meta.url pointing at the bundle, so these must sit BESIDE it — they
+// can't be inlined). `send-hint-overlay.js` is read eagerly at module load (overlay.ts), so a
+// missing copy crashes the sidecar at boot; the `templates/` dir backs project bootstrap. Emit
+// them into dist/ so the bundle is self-contained (CI native-build + package-app.sh both copy it).
+const brain = path.join(here, '..', '..', 'apps', 'desktop', 'electron');
+for (const [src, dst] of [['browser/send-hint-overlay.js', 'send-hint-overlay.js'], ['templates', 'templates']]) {
+  const from = path.join(brain, src);
+  if (existsSync(from)) { cpSync(from, path.join(here, 'dist', dst), { recursive: true }); console.log(`  + ${dst}`); }
+  else console.log(`  ⚠ missing sibling asset ${src}`);
+}
