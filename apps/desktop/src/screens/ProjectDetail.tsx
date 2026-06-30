@@ -1667,6 +1667,61 @@ function InlineAttach({ path, images, files }: { path: string; images?: ChatImag
   );
 }
 
+/** Prefix the engine stamps on a turn it auto-sent to keep a goal-mode run
+    going (mirrors KEEP_GOING_PREFIX in electron/keep-going.ts — duplicated here
+    rather than imported so the renderer build doesn't pull in Electron code). */
+const AUTO_CONTINUE_PREFIX = '[Auto-continue]:';
+
+/** Auto-continue turns are machine-generated continuation prompts (a goal echo
+    + a "you outlined these next moves" bullet list + autonomy boilerplate).
+    Rendered through UserBubble they became a giant blue bubble of raw,
+    pre-wrap text — literal `-`/`#` markdown and blank-line bloat (image_yhpsb.png).
+    They aren't something the USER typed, so they shouldn't masquerade as a user
+    message. Render them as a compact, dimmed, collapsible system note instead:
+    one quiet line by default, expandable to the full prompt rendered with the
+    real markdown renderer (bullets become bullets, not a wall of `-`). */
+function AutoContinueBubble({ text }: { text: string }) {
+  const [open, setOpen] = React.useState(false);
+  // Strip the prefix, collapse blank-line bloat / trailing spaces, and pull the
+  // single most informative line for the collapsed preview: prefer the `Goal:`
+  // line, else the first non-empty line.
+  const body = React.useMemo(
+    () => text.slice(AUTO_CONTINUE_PREFIX.length).replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim(),
+    [text],
+  );
+  const preview = React.useMemo(() => {
+    const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
+    const goal = lines.find(l => /^goal:/i.test(l));
+    const pick = (goal ?? lines[0] ?? 'Continuing autonomously').replace(/^goal:\s*/i, '');
+    return pick.length > 96 ? pick.slice(0, 96) + '…' : pick;
+  }, [body]);
+  return (
+    <div className="chat-msg" style={{ display: 'flex', justifyContent: 'flex-end' }}>
+      <div style={{ maxWidth: 'min(78%, 640px)', width: open ? '100%' : 'auto', borderRadius: 12,
+        border: '0.5px solid color-mix(in srgb, var(--purple) 28%, var(--separator))',
+        background: 'color-mix(in srgb, var(--purple) 6%, var(--bg-elevated))', overflow: 'hidden' }}>
+        <button onClick={() => setOpen(o => !o)} title={open ? 'Hide the auto-continue prompt' : 'Show the full auto-continue prompt'}
+          style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '8px 12px', background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left' }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexShrink: 0, height: 17, padding: '0 6px', borderRadius: 5,
+            background: 'color-mix(in srgb, var(--purple) 15%, transparent)', color: 'var(--purple)', font: '700 9px/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+            <Icon name="refresh" size={9} /> Auto-continued
+          </span>
+          {!open && (
+            <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{preview}</span>
+          )}
+          <Icon name="chevronRight" size={13} style={{ flexShrink: 0, color: 'var(--ink-tertiary)', transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+        </button>
+        {open && (
+          <div style={{ padding: '0 14px 12px', borderTop: '0.5px solid color-mix(in srgb, var(--purple) 18%, var(--separator))',
+            font: '400 13.5px/1.6 var(--font-text)', color: 'var(--ink-secondary)' }}>
+            {renderChatBody(body, 'autocont')}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /** Render the user bubble: text with `@<.continuum/Attachment/…>` markers
     tokenized into inline chips/thumbnails at the exact position the user
     dropped them in the composer. Images that aren't referenced inline (legacy
@@ -1676,7 +1731,15 @@ function InlineAttach({ path, images, files }: { path: string; images?: ChatImag
     `**bold**` and `` `code` `` render properly — the user reported that
     auto-continue prompts (and their own typed messages) were showing literal
     `**` stars in the bubble (image_kpijo.png / image_6f4zy.png). */
-function UserBubble({ text, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
+function UserBubble({ text: rawText, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
+  // The bubble renders with `whiteSpace: 'pre-wrap'`, so every blank line in the
+  // payload becomes vertical air. Auto-continue prompts (and pasted goals) carry
+  // runs of blank lines + trailing spaces that bloated the bubble (image_yhpsb.png);
+  // collapse 3+ newlines to one blank line and strip trailing spaces up front.
+  const text = React.useMemo(
+    () => (rawText ? rawText.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trimEnd() : rawText),
+    [rawText],
+  );
   // Split the text into [string, attachment, string, attachment, …] tokens,
   // then run each plain-text segment through the inline-markdown renderer
   // (same one the agent bubble uses, so the formatting is symmetric).
@@ -3294,7 +3357,9 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
             <ImageOpenContext.Provider value={openImageStable}>
               {turns.map((t, i) => (
                 <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
-                  <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />
+                  {t.input?.startsWith(AUTO_CONTINUE_PREFIX)
+                    ? <AutoContinueBubble text={t.input} />
+                    : <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />}
                   <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText}
                     onAnswer={i === turns.length - 1 ? answerLiveQuestion : sendText}
                     pendingAsk={i === turns.length - 1 ? pendingAsk : null}
