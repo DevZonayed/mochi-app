@@ -12,7 +12,7 @@
    - the prompt always uses the model-prefix the engine looks for */
 import { describe, it, expect } from 'vitest';
 import {
-  detectKeepGoing, extractNextItems, organizedContinuePrompt,
+  detectKeepGoing, extractNextItems, organizedContinuePrompt, sanitizeGoalEcho,
   KEEP_GOING_PREFIX, KEEP_GOING_BASE_MS, KEEP_GOING_MAX_PER_SESSION, KEEP_GOING_CAP_NOTE,
 } from './keep-going.js';
 
@@ -112,6 +112,38 @@ describe('extractNextItems', () => {
     const items = extractNextItems(body);
     expect(items.some(i => i.includes('`pnpm import:questions`'))).toBe(true);
     expect(items.some(i => i.includes('`BILLING_ENABLED=true`'))).toBe(true);
+  });
+
+  // image_yhpsb.png: bullets whose own text started with an enumerator showed
+  // a stray inner number ("- 2. Origin allowlist …"), and a line repeated with
+  // only a trailing-clause difference was listed twice.
+  it('strips a stray leading enumerator inside a captured bullet', () => {
+    const items = extractNextItems('- 2. Origin allowlist + header hygiene\n- 1. Proxy bypass list');
+    expect(items).toContain('Origin allowlist + header hygiene');
+    expect(items).toContain('Proxy bypass list');
+    expect(items.every(i => !/^\d+[.)]/.test(i))).toBe(true);
+  });
+  it('collapses near-duplicates that differ only by a trailing clause', () => {
+    const body = [
+      '- Origin allowlist + header hygiene (no cookie/token leakage) — Added a trusted-host',
+      '- Origin allowlist + header hygiene (no cookie/token leakage)',
+    ].join('\n');
+    const items = extractNextItems(body);
+    expect(items.filter(i => /Origin allowlist \+ header hygiene/.test(i)).length).toBe(1);
+  });
+});
+
+describe('sanitizeGoalEcho', () => {
+  it('collapses an absolute .continuum/Attachment marker into a readable token', () => {
+    const goal = 'get nextjs working directly - @/Users/me/proj/.continuum/Attachment/Pasted_text_zp1ll.txt All';
+    expect(sanitizeGoalEcho(goal)).toBe('get nextjs working directly - [attached: Pasted_text_zp1ll.txt] All');
+  });
+  it('handles the plural Attachments dir + relay-scrubbed marker', () => {
+    expect(sanitizeGoalEcho('see @.continuum/Attachments/shot_xy.png here'))
+      .toBe('see [attached: shot_xy.png] here');
+  });
+  it('squeezes blank-line runs and trailing spaces', () => {
+    expect(sanitizeGoalEcho('line one   \n\n\n\nline two')).toBe('line one\n\nline two');
   });
 });
 
