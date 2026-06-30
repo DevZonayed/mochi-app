@@ -175,8 +175,14 @@ struct AssistantTurn: View {
     var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
 
     private var provider: String { job.engine == "codex" ? "openai" : "anthropic" }
-    private var hasBody: Bool { (job.transcript ?? []).contains { ($0.kind == "text" || $0.kind == "result") && !$0.text.trimmed.isEmpty } }
-    private var replyText: String? { (job.transcript ?? []).last { ($0.kind == "text" || $0.kind == "result") && !$0.text.trimmed.isEmpty }?.text }
+    private var hasBody: Bool {
+        (job.transcript ?? []).contains { ($0.kind == "text" || $0.kind == "result") && !$0.text.trimmed.isEmpty }
+        || !(job.output?.trimmed.isEmpty ?? true)
+    }
+    private var replyText: String? {
+        (job.transcript ?? []).last { ($0.kind == "text" || $0.kind == "result") && !$0.text.trimmed.isEmpty }?.text
+        ?? job.output?.trimmed.nilIfEmpty
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -238,7 +244,11 @@ struct AssistantTurn: View {
                 WorkBar(work: work, elapsedMs: max(0, (job.updatedAt ?? job.createdAt) - job.createdAt),
                         projectRoot: projectRoot, onOpenFile: onOpenFile)
             }
-            renderGroups(groupBlocks(content), live: false)
+            if content.isEmpty, let fallback = job.output?.trimmed.nilIfEmpty {
+                MarkdownText(text: fallback, projectRoot: projectRoot, onOpenFile: onOpenFile)
+            } else {
+                renderGroups(groupBlocks(content), live: false)
+            }
         }
     }
 
@@ -328,12 +338,13 @@ struct WorkBar: View {
     var projectRoot: String? = nil
     var onOpenFile: (String) -> Void = { FilePreviewWindowController.shared.open(path: $0) }
     @State private var expanded = false
+    @State private var visibleWorkCount = 12
 
     var body: some View {
         let tools = work.filter { $0.kind == "tool" }.count
         let thought = work.contains { $0.kind == "thinking" }
         VStack(alignment: .leading, spacing: 8) {
-            Button { withAnimation(.smooth(duration: 0.2)) { expanded.toggle() } } label: {
+            Button { toggleExpanded() } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(Tok.green)
                     Text(summary(tools: tools, thought: thought)).font(TokFont.text(TokFont.caption, .semibold)).foregroundStyle(Tok.inkSecondary)
@@ -346,22 +357,46 @@ struct WorkBar: View {
             if expanded {
                 HStack(alignment: .top, spacing: 11) {
                     Tok.separator.frame(width: 1.5)
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(groupedTight) { g in
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(visibleGroups) { g in
                             switch g {
                             case .tools(let ts): VStack(alignment: .leading, spacing: 1) { ForEach(ts) { ToolCallRow(item: $0, root: projectRoot, onOpenFile: onOpenFile) } }
                             case .single(let it): TranscriptBlock(item: it, projectRoot: projectRoot, onOpenFile: onOpenFile)
                             }
                         }
-                    }.opacity(0.85)
+                        if visibleWorkCount < work.count {
+                            Button { visibleWorkCount = min(work.count, visibleWorkCount + 12) } label: {
+                                Text("Show \(min(12, work.count - visibleWorkCount)) more work item\(min(12, work.count - visibleWorkCount) == 1 ? "" : "s")")
+                                    .font(TokFont.text(TokFont.caption, .semibold))
+                                    .foregroundStyle(Tok.blue)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Tok.fillTertiary)
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.top, 4)
+                        }
+                    }
+                    .opacity(0.85)
                 }
                 .padding(.leading, 2)
-                .transition(.opacity.combined(with: .offset(y: -4)))
             }
         }
     }
 
-    private var groupedTight: [RBlock] { groupBlocks(work) }
+    private var visibleGroups: [RBlock] {
+        groupBlocks(Array(work.prefix(visibleWorkCount)))
+    }
+
+    private func toggleExpanded() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            expanded.toggle()
+            if expanded { visibleWorkCount = min(12, work.count) }
+        }
+    }
 
     private func summary(tools: Int, thought: Bool) -> String {
         var parts: [String] = ["Worked \(fmtDuration(elapsedMs))"]
@@ -578,4 +613,8 @@ struct TranscriptBlock: View {
         }
         .padding(10).background(Tok.fillTertiary).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
