@@ -603,6 +603,12 @@ interface ExtensionBridgeLike {
   hasActiveBrowser: () => boolean;
   activeProfile: () => string | null;
   request: (type: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
+  /** Did the agent open a browser session this run that's still open? */
+  hasAgentSession: () => boolean;
+  /** Has the user pinned the browser open (Project settings → Open browser)? */
+  isBrowserHeld: () => boolean;
+  /** End the agent-opened session + close its tabs (end-of-turn tidy-up). */
+  closeAgentSession: () => Promise<void>;
 }
 
 /** Agent-facing BROWSER capability: drive the user's REAL Chrome (the active Mochi
@@ -2245,6 +2251,18 @@ export class LocalEngine {
       simply report "no browser connected" until a Chrome profile pairs + activates. */
   private extBridge?: () => ExtensionBridgeLike | null;
   setExtensionBridge(fn: () => ExtensionBridgeLike | null) { this.extBridge = fn; }
+  /** End-of-turn browser tidy-up. When a turn drove the user's Chrome and OPENED a
+      Mochi-managed session, close it once the turn settles — a browser job shouldn't
+      leave a window hanging around. Skipped when: the user pinned the browser open
+      (Project settings → Open browser), nothing was opened, or a `browser_watch` is
+      still live for this session (closing the tab would kill the watch's page poll).
+      Best-effort — never fails a run. */
+  private async autoCloseBrowserSession(sessionId: string | null): Promise<void> {
+    const bridge = this.extBridge?.() ?? null;
+    if (!bridge || !bridge.hasAgentSession() || bridge.isBrowserHeld()) return;
+    if (sessionId && this.store.listBrowserWatches({ activeOnly: true, sessionId }).length > 0) return;
+    try { await bridge.closeAgentSession(); } catch { /* best-effort */ }
+  }
   /** Browser watcher — the agent-placed "observe an element / condition" background
       poll that posts a new chat turn when the criteria fire. Injected from main.ts
       so the agent's browser_watch_* tools route through the same persistent watcher
@@ -3742,10 +3760,17 @@ export class LocalEngine {
         this.emit('approval', ap);
         this.store.pushEvent({ kind: 'approval-created', title: ap.title, projectId: done.projectId, jobId });
       }
+      // Tidy up: close the browser the agent opened this turn (unless pinned open
+      // or a watch is still running). Awaited so the window is gone by the time
+      // the user sees the turn finish — best-effort, never blocks the result.
+      await this.autoCloseBrowserSession(session?.id ?? null);
       return done;
     } catch (e) {
       settleStream();
       this.running.delete(jobId);
+      // Same tidy-up on cancel/failure: a stopped or crashed browser job shouldn't
+      // strand an agent-opened window. The retry path (if any) reopens on its own.
+      void this.autoCloseBrowserSession(this.store.getJob(jobId)?.sessionId ?? null);
       // The turn ended unhappily (cancel / steer-interrupt / failure) but the
       // agent may have ALREADY committed or pushed before it did. The success
       // path refreshes git-status; mirror that here so the chip + contextual
