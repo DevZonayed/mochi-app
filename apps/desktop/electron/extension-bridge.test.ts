@@ -124,7 +124,11 @@ describe('ExtensionBridge', () => {
     await waitFor(() => lastLifecycle(b.msgs)?.type === 'promoted');
   });
 
-  it('routes send_message → cancel the running job, then sendChat', async () => {
+  it('routes send_message → refuses delivery when a turn is already running (no cancel, no sendChat)', async () => {
+    // New behaviour (image_nqm3a.png): extension-driven deliveries NEVER cancel
+    // a live turn. The operator's red abort button is the only stop control.
+    // When the session is busy, deliver() rejects so the extension can show
+    // "agent busy" instead of silently stopping the run.
     const calls: { method: string; params: any }[] = [];
     const dispatch = async (method: string, params: any) => {
       calls.push({ method, params });
@@ -137,10 +141,29 @@ describe('ExtensionBridge', () => {
     await waitFor(() => lastOfType(a.msgs, 'welcome'));
     a.ws.send(JSON.stringify({ id: 5, type: 'send_message', params: { projectId: 'p1', sessionId: 's1', text: 'hello' } }));
     const reply = await waitFor(() => a.msgs.find(m => m.id === 5));
+    expect(reply.ok).toBe(false);
+    expect(String(reply.error)).toMatch(/busy/i);
+    // Critically: neither cancelJob NOR sendChat was called — the running turn is untouched.
+    expect(calls.map(c => c.method)).toEqual([]);
+  });
+
+  it('routes send_message → just sendChat when the session is idle (still happy-path)', async () => {
+    const calls: { method: string; params: any }[] = [];
+    const dispatch = async (method: string, params: any) => {
+      calls.push({ method, params });
+      if (method === 'sendChat') return { session: { id: 's1' }, job: { id: 'j9' } };
+      return { ok: true };
+    };
+    // No running jobs for this session.
+    const store = fakeStore({ jobs: [] });
+    const { port } = startBridge(store, dispatch);
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    a.ws.send(JSON.stringify({ id: 5, type: 'send_message', params: { projectId: 'p1', sessionId: 's1', text: 'hello' } }));
+    const reply = await waitFor(() => a.msgs.find(m => m.id === 5));
     expect(reply.ok).toBe(true);
     expect(reply.result).toEqual({ sessionId: 's1', jobId: 'j9' });
-    expect(calls.map(c => c.method)).toEqual(['cancelJob', 'sendChat']);
-    expect(calls[0].params).toEqual({ id: 'jr' });
+    expect(calls.map(c => c.method)).toEqual(['sendChat']);
   });
 
   it('rejects an unknown action', async () => {

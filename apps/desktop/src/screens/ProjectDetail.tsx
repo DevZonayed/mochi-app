@@ -85,6 +85,17 @@ const PAGE_CSS = `
   @keyframes chatRise { from { opacity:0; transform: translateY(7px); } to { opacity:1; transform:none; } }
   .chat-msg { animation: chatRise 320ms cubic-bezier(.32,.72,0,1) both; }
 
+  /* USER bubble palette — the bubble itself is a blue gradient with white text,
+     so any inline accent that defaults to var(--blue) (PathLink, inline code
+     background) disappears into the background. Recolor those accents to a
+     white-on-translucent palette so links remain READABLE on top of the gradient
+     (image_5tx6p.png: the path link blended into the bubble). */
+  .bubble-user button { color: #fff !important;
+    text-decoration-color: color-mix(in srgb, #fff 65%, transparent) !important; }
+  .bubble-user button:hover { background: rgba(255,255,255,0.14) !important; }
+  .bubble-user code { background: rgba(255,255,255,0.18) !important; color: #fff !important; }
+  .bubble-user b, .bubble-user strong { color: #fff !important; }
+
   /* tool node — refined card, lifts on hover, pops on mount */
   @keyframes nodePop { from { opacity:0; transform: translateY(4px) scale(.985); } to { opacity:1; transform:none; } }
   .tool-node { animation: nodePop 240ms cubic-bezier(.32,.72,0,1) both; transition: background 140ms ease; }
@@ -1621,8 +1632,16 @@ function UserImageThumb({ img }: { img: ChatImage }) {
 /* Match an `@<path>` inline attachment marker that points into the project's
    `.continuum/Attachment/` directory. Works on both forms the bubble can see:
    the desktop's absolute `@/Users/.../proj/.continuum/Attachment/x.png`, and
-   the relay-scrubbed `@.continuum/Attachment/x.png` the phone receives. */
-const ATTACH_INLINE_RE = /@(\S*\.continuum\/Attachment\/([A-Za-z0-9._-]+))/g;
+   the relay-scrubbed `@.continuum/Attachment/x.png` the phone receives.
+   The prefix uses `[^@\n]+?` (not `\S*`) so a project path with SPACES — eg
+   `/Users/me/Desktop/Client Shared GIT/veni0004/.continuum/Attachment/...` —
+   still tokenizes into a pill instead of falling through to `linkifyText` and
+   rendering as a raw underlined link in the user bubble (image_37flq.png).
+   The basename group also accepts an optional sub-directory chain so legacy
+   per-session attachments (`Attachment/<chat>/foo.png`) tokenize too. The
+   trailing `\.[A-Za-z0-9]+` anchors on the saved file's extension so trailing
+   prose (` , Now…`) is excluded from the match. */
+const ATTACH_INLINE_RE = /@((?:\/[^@\n]+?)?\.continuum\/Attachment\/(?:[A-Za-z0-9._-]+\/)*([A-Za-z0-9._-]+\.[A-Za-z0-9]+))/g;
 /** Basename of a saved attachment path — the lookup key against inputImages /
     inputFiles, since those carry their `.continuum/Attachment/` filename. */
 const basenameOf = (p: string): string => p.split('/').filter(Boolean).pop() || p;
@@ -1729,7 +1748,12 @@ function UserBubble({ text, images, files }: { text: string; images?: ChatImage[
         </div>
       )}
       {text && (
-        <div style={{ maxWidth: 'min(78%, 640px)', padding: '10px 14px', borderRadius: '18px 18px 5px 18px',
+        // `bubble-user` opts the inline path links + inline `code` capsules
+        // inside this blue gradient bubble into a white-on-translucent palette
+        // (see PAGE_CSS). Without that scoping, `PathLink`'s `color: var(--blue)`
+        // is the same hue as the bubble background, so the link disappeared into
+        // the gradient (image_5tx6p.png).
+        <div className="bubble-user" style={{ maxWidth: 'min(78%, 640px)', padding: '10px 14px', borderRadius: '18px 18px 5px 18px',
           background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
           color: '#fff', font: '400 14px/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
           boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
@@ -2362,7 +2386,7 @@ function SchedulePicker({ initial, onPick, onRepeat, onClose }: { initial?: numb
   );
 }
 
-function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: string[]; onSendNow: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
+function QueuePanel({ queue, onMoveToFront, onRemove, onEdit, onReorder }: { queue: QueueItem[]; onMoveToFront: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
   const [collapsed, setCollapsed] = React.useState(false);
   const [sel, setSel] = React.useState(-1);
   const [dragIdx, setDragIdx] = React.useState(-1);
@@ -2388,7 +2412,7 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: 
     else if (e.altKey && e.key === 'ArrowDown') { e.preventDefault(); if (s >= 0) move(s, s + 1); }
     else if (e.key === 'ArrowDown') { e.preventDefault(); select(Math.min(queue.length - 1, s + 1)); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); select(Math.max(0, (s < 0 ? queue.length : s) - 1)); }
-    else if (e.key === 'Enter') { e.preventDefault(); if (s >= 0) onSendNow(s); }
+    else if (e.key === 'Enter') { e.preventDefault(); if (s > 0) onMoveToFront(s); }
     else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); if (s >= 0) onRemove(s); }
     else if (e.key.toLowerCase() === 'e') { e.preventDefault(); if (s >= 0) onEdit(s); }
     else if (e.key === 'Escape') { e.preventDefault(); select(-1); ref.current?.blur(); }
@@ -2423,8 +2447,9 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: 
       {!collapsed && (
         <>
           <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 168, overflowY: 'auto' }}>
-            {queue.map((q, i) => {
+            {queue.map((item, i) => {
               const dropCls = dropSlot === i ? ' q-drop-above' : (dropSlot === i + 1 && i === queue.length - 1) ? ' q-drop-below' : '';
+              const attCount = item.atts?.length ?? 0;
               return (
                 <div key={i} className={`q-row${sel === i ? ' q-sel' : ''}${dragIdx === i ? ' q-dragging' : ''}${dropCls}`}
                   onClick={() => select(i)} onDoubleClick={() => onEdit(i)}
@@ -2438,13 +2463,26 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: 
                     {Array.from({ length: 6 }, (_, d) => <span key={d} style={{ width: 2.5, height: 2.5, borderRadius: 2, background: 'currentColor' }} />)}
                   </span>
                   <span style={{ width: 18, height: 18, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 13%, transparent)', color: 'var(--purple)', font: '600 10px/1 var(--font-mono)' }}>{i + 1}</span>
-                  <span style={{ flex: 1, minWidth: 0, font: '400 13px/1.35 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{q}</span>
+                  <span style={{ flex: 1, minWidth: 0, font: '400 13px/1.35 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text || (attCount ? `(${attCount} attachment${attCount === 1 ? '' : 's'})` : '')}</span>
+                  {attCount > 0 && (
+                    <span title={`${attCount} attachment${attCount === 1 ? '' : 's'} ride this queued message`}
+                      style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 3, height: 18, padding: '0 6px', borderRadius: 6, background: 'color-mix(in srgb, var(--blue) 12%, transparent)', color: 'var(--blue)', font: '600 10px/1 var(--font-mono)' }}>
+                      <Icon name="paperclip" size={10} />{attCount}
+                    </span>
+                  )}
                   <span className="q-act" style={{ display: 'inline-flex', gap: 2 }}>
                     <QBtn title="Move up — runs sooner" onClick={() => move(i, i - 1)} color="var(--ink-tertiary)"><Icon name="chevronDown" size={13} style={{ transform: 'rotate(180deg)' }} /></QBtn>
                     <QBtn title="Move down — runs later" onClick={() => move(i, i + 1)} color="var(--ink-tertiary)"><Icon name="chevronDown" size={13} /></QBtn>
                     <QBtn title="Edit (move back to the box)" onClick={() => onEdit(i)} color="var(--ink-tertiary)"><Icon name="arrowLeft" size={13} stroke={2.2} /></QBtn>
                     <QBtn title="Remove" onClick={() => onRemove(i)} color="var(--ink-tertiary)"><Icon name="x" size={13} stroke={2.4} /></QBtn>
-                    <QBtn title="Send now — interrupt and steer" onClick={() => onSendNow(i)} color="var(--blue)"><Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} /></QBtn>
+                    {/* Move to FRONT — runs next when the agent finishes. NEVER cancels the
+                        live run (the old "Send now — interrupt and steer" was scrapped
+                        per image_nqm3a.png — the operator's chat said "Stopped" the
+                        moment they sent a message mid-tool-call). The red abort button
+                        in the chat header is the only stop control now. */}
+                    {i > 0 && (
+                      <QBtn title="Move to front — runs next when the current turn finishes" onClick={() => onMoveToFront(i)} color="var(--blue)"><Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} /></QBtn>
+                    )}
                   </span>
                 </div>
               );
@@ -2455,7 +2493,7 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: 
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⌥↑↓</span> reorder</span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">E</span> edit</span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⌫</span> delete</span>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⏎</span> send now</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⏎</span> move to front</span>
             <span style={{ flex: 1 }} />
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">Esc</span> exit</span>
           </div>
@@ -2477,13 +2515,33 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: 
 // Per-session composer queue, persisted to localStorage so the "N queued" box
 // survives the chat unmounting — e.g. navigating to Settings (a sibling route)
 // and back, which otherwise drops the in-memory queue. Keyed by sessionId.
+//
+// Queue items carry both text AND attachments so a message paired with an
+// image/file can ride the queue too — operators repeatedly complained that the
+// previous code's "with images → interrupt + restart" path STOPPED their
+// running turn (image_nqm3a.png). Every send while streaming now queues, never
+// cancels. Only the explicit red abort button cancels.
+type QueueItem = { text: string; atts?: Attach[] };
 const QUEUE_KEY = (sid: string) => `maestro.chat.queue.${sid}`;
-const readQueue = (sid: string | null): string[] => {
+const readQueue = (sid: string | null): QueueItem[] => {
   if (!sid) return [];
-  try { const a = JSON.parse(localStorage.getItem(QUEUE_KEY(sid)) || '[]'); return Array.isArray(a) ? a.filter((x: unknown): x is string => typeof x === 'string') : []; }
-  catch { return []; }
+  try {
+    const a: unknown = JSON.parse(localStorage.getItem(QUEUE_KEY(sid)) || '[]');
+    if (!Array.isArray(a)) return [];
+    // Legacy shape was a plain string[] — upgrade each row to { text }. Newer
+    // rows are already { text, atts? } so we keep them as-is. Anything else is
+    // dropped defensively (a corrupted localStorage shouldn't crash the chat).
+    return a.flatMap((x: unknown): QueueItem[] => {
+      if (typeof x === 'string') return [{ text: x }];
+      if (x && typeof x === 'object' && typeof (x as { text?: unknown }).text === 'string') {
+        const it = x as { text: string; atts?: unknown };
+        return [{ text: it.text, ...(Array.isArray(it.atts) ? { atts: it.atts as Attach[] } : {}) }];
+      }
+      return [];
+    });
+  } catch { return []; }
 };
-const writeQueue = (sid: string | null, q: string[]): void => {
+const writeQueue = (sid: string | null, q: QueueItem[]): void => {
   if (!sid) return;
   try { if (q.length) localStorage.setItem(QUEUE_KEY(sid), JSON.stringify(q)); else localStorage.removeItem(QUEUE_KEY(sid)); }
   catch { /* ignore quota / serialisation */ }
@@ -2782,7 +2840,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const [schedEditAt, setSchedEditAt] = React.useState<number | null>(null); // prefill fireAt when editing
   const [schedules, setSchedules] = React.useState<Schedule[]>([]); // upcoming scheduled messages for this chat
   const [schedNow, setSchedNow] = React.useState(() => Date.now()); // ticks each second to drive countdowns
-  const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
+  const [queue, setQueue] = React.useState<QueueItem[]>([]); // prompts (+ attachments) waiting to run after the current turn
   const [bgTasks, setBgTasks] = React.useState<BgTask[]>([]); // long-lived processes the agent started (dev servers, watchers)
   const [attachments, setAttachments] = React.useState<Attach[]>([]); // images / text / files (shown as inline composer chips)
   const [dragOver, setDragOver] = React.useState(false);
@@ -2793,7 +2851,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   activeRef.current = activeId;
   // Mutate the queue AND persist it for the current session in one step, so the
   // queue box survives navigating away (which unmounts this chat) and back.
-  const mutateQueue = React.useCallback((fn: (prev: string[]) => string[]) => {
+  const mutateQueue = React.useCallback((fn: (prev: QueueItem[]) => QueueItem[]) => {
     setQueue(prev => { const next = fn(prev); writeQueue(activeRef.current, next); return next; });
   }, []);
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -2997,26 +3055,20 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, composerBrowser, onSessionCreated]);
 
   // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
+  // The earlier "steer = interrupt and restart" model was scrapped because it
+  // kept STOPPING running turns (image_nqm3a.png — the operator's session said
+  // "Stopped" the moment their message landed mid-run). Every send-while-streaming
+  // path now goes through the queue with NO cancel. Only the explicit red abort
+  // button (`stop` below) ever cancels the live job.
+  // Kept here for callers that only deal in plain text (currently none, post-
+  // refactor — sendComposed pushes directly to the queue when atts are involved).
   const sendText = React.useCallback((raw: string) => {
     const t = raw.trim();
     if (!t || !projectId) return;
     composerRef.current?.clear();
-    if (streaming) { mutateQueue(q => [...q, t]); return; }
+    if (streaming) { mutateQueue(q => [...q, { text: t }]); return; }
     void sendRaw(t).then(ok => { if (!ok) composerRef.current?.setText(raw); });
   }, [projectId, streaming, sendRaw, mutateQueue]);
-
-  // STEER: interrupt the running turn and send right now (session resumes with context).
-  const sendNow = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
-    const t = raw.trim();
-    if (!t && !(atts?.length)) return false;
-    composerRef.current?.clear();
-    if (lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending')) {
-      try { await api.cancelJob(lastTurn.id); } catch { /* already gone */ }
-    }
-    const ok = await sendRaw(t, atts);
-    if (!ok) composerRef.current?.setText(raw);
-    return ok;
-  }, [lastTurn, sendRaw]);
 
   // ── Attachments: paste, drop, or pick — images (vision), text/code (inlined),
   //    or any other file (saved + read by the agent). ─────────────────────────
@@ -3111,43 +3163,36 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   }, []);
   const canSend = !!text.trim() || attachments.length > 0;
 
-  // Compose-and-send: text-only follows the normal queue/idle path; a message with
-  // images sends now (interrupting a running turn so turns never overlap mid-stream).
-  // On failure the text + images are restored so nothing is lost.
+  // Compose-and-send (⏎): NEVER cancels the running turn. When idle, sends now.
+  // When streaming, the whole composer payload (text + attachments) is QUEUED to
+  // run when the current turn finishes. The earlier path force-cancelled the
+  // running job whenever images were attached — that's the bug the operator hit
+  // in image_nqm3a.png ("× Stopped" appeared mid-tool-call the instant they sent
+  // a message with an image chip). Now only the explicit red abort button stops.
   const sendComposed = React.useCallback(() => {
-    const t = text.trim(); const imgs = attachments;
-    if ((!t && !imgs.length) || !projectId) return;
-    if (!imgs.length) { sendText(text); return; }
+    const t = text.trim(); const atts = attachments;
+    if ((!t && !atts.length) || !projectId) return;
     composerRef.current?.clear(); setAttachments([]);
-    if (streaming) void sendNow(t, imgs).then(ok => { if (!ok) restoreAtts(imgs); });
-    else void sendRaw(t, imgs).then(ok => { if (!ok) { composerRef.current?.setText(t); restoreAtts(imgs); } });
-  }, [text, attachments, projectId, streaming, sendText, sendNow, sendRaw, restoreAtts]);
-  // ⌘↩ "run next" — previously this cancelled the in-flight turn and started a
-  // new run with this prompt (the user-reported bug: their typed-mid-stream
-  // context killed the agent's working answer). NEW SEMANTICS: while streaming,
-  // ⌘↩ pushes the message to the FRONT of the queue so it runs the moment the
-  // current turn finishes — no cancel, no lost work. The explicit interrupt
-  // path (the queue-row "Send now — interrupt and steer" button + the red
-  // stop button) is still available for the rare case someone actually wants
-  // to kill the run. When idle, ⌘↩ just sends immediately (no queue to skip).
-  const sendComposedNow = React.useCallback(() => {
-    const t = text.trim(); const imgs = attachments;
-    if ((!t && !imgs.length) || !projectId) return;
-    composerRef.current?.clear();
-    setAttachments([]);
     if (streaming) {
-      // Images can't ride the queue payload, so a steer with attached images
-      // still uses the explicit interrupt path. Text-only is the common case
-      // and what the bug report covered.
-      if (imgs.length) {
-        void sendNow(t, imgs).then(ok => { if (!ok) restoreAtts(imgs); });
-      } else {
-        mutateQueue(q => [t, ...q]);
-      }
+      mutateQueue(q => [...q, { text: t, ...(atts.length ? { atts } : {}) }]);
       return;
     }
-    void sendNow(t, imgs.length ? imgs : undefined).then(ok => { if (!ok) restoreAtts(imgs); });
-  }, [text, attachments, projectId, streaming, sendNow, mutateQueue, restoreAtts]);
+    void sendRaw(t, atts).then(ok => { if (!ok) { composerRef.current?.setText(t); if (atts.length) restoreAtts(atts); } });
+  }, [text, attachments, projectId, streaming, sendRaw, mutateQueue, restoreAtts]);
+  // ⌘↩ "run next" — same semantics as ⏎ when idle; while streaming it pushes the
+  // composer payload to the FRONT of the queue so it runs the moment the current
+  // turn finishes. Never cancels. (Pre-refactor this called sendNow which DID
+  // cancel — see image_nqm3a.png.)
+  const sendComposedNow = React.useCallback(() => {
+    const t = text.trim(); const atts = attachments;
+    if ((!t && !atts.length) || !projectId) return;
+    composerRef.current?.clear(); setAttachments([]);
+    if (streaming) {
+      mutateQueue(q => [{ text: t, ...(atts.length ? { atts } : {}) }, ...q]);
+      return;
+    }
+    void sendRaw(t, atts).then(ok => { if (!ok) { composerRef.current?.setText(t); if (atts.length) restoreAtts(atts); } });
+  }, [text, attachments, projectId, streaming, sendRaw, mutateQueue, restoreAtts]);
 
   const removeFromQueue = (i: number) => mutateQueue(q => q.filter((_, j) => j !== i));
   // Reorder = reprioritize: the drainer always fires queue[0] next.
@@ -3158,19 +3203,37 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     next.splice(to, 0, item);
     return next;
   });
-  const sendQueuedNow = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); void sendNow(t); };
-  const editQueued = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); composerRef.current?.setText(t); composerRef.current?.focus(); };
+  // Move a row to the FRONT — runs next when the current turn finishes. No cancel.
+  // (Old behaviour: the per-row "Send now" interrupted the live job. Removed —
+  // every send-while-streaming path is queue-only now.)
+  const moveToFront = (i: number) => mutateQueue(q => {
+    if (i <= 0 || i >= q.length) return q;
+    const next = q.slice();
+    const [item] = next.splice(i, 1);
+    next.unshift(item);
+    return next;
+  });
+  // Pop a queued row back into the composer (text + any attachments).
+  const editQueued = (i: number) => {
+    const item = queue[i]; if (item == null) return;
+    removeFromQueue(i);
+    composerRef.current?.setText(item.text);
+    if (item.atts?.length) restoreAtts(item.atts);
+    composerRef.current?.focus();
+  };
 
   // Drain the queue: when the agent goes idle and items are waiting, fire the next.
   const drainingRef = React.useRef(false);
   React.useEffect(() => {
     if (streaming || queue.length === 0 || drainingRef.current) return;
     drainingRef.current = true;
-    const next = queue[0];
+    const head = queue[0];
     mutateQueue(q => q.slice(1));
-    void sendRaw(next).finally(() => { drainingRef.current = false; });
+    void sendRaw(head.text, head.atts).finally(() => { drainingRef.current = false; });
   }, [streaming, queue, sendRaw, mutateQueue]);
 
+  // The ONLY stop-the-chat path: the explicit red abort button. Every other
+  // send/steer route is queue-based — see the comment on `sendComposed`.
   const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
 
   const fillComposer = (v: string) => { composerRef.current?.setText(v); composerRef.current?.focus(); };
@@ -3333,7 +3396,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
             <ScheduledQueue items={upcomingSched} now={schedNow} onCancel={cancelSchedule} onEdit={editSchedule} />
           )}
           {queue.length > 0 && (
-            <QueuePanel queue={queue} onSendNow={sendQueuedNow} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
+            <QueuePanel queue={queue} onMoveToFront={moveToFront} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
           )}
           {slashOpen && (
             <div style={{ marginBottom: 8, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.22))', overflow: 'hidden', padding: 5 }}>
@@ -3389,7 +3452,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               <RichComposer
                 ref={composerRef}
                 disabled={!projectId}
-                placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
+                placeholder={!projectId ? 'Pick a project first' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
                 onTextChange={setText}
                 onChips={info => {
                   setComposerBrowser(info.hasBrowser);
@@ -3425,10 +3488,10 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
               {streaming ? (
                 <>
                   {canSend && (
-                    <button onClick={sendComposed} className="send-fab" title={attachments.length ? 'Send now — interrupts the current run' : 'Queue (Enter) — runs when the agent finishes · ⌘Enter — runs NEXT (jumps to the front of the queue, current turn keeps going)'} style={{
+                    <button onClick={sendComposed} className="send-fab" title="Queue (Enter) — runs when the agent finishes · ⌘Enter — runs NEXT (jumps to the front of the queue, current turn keeps going). The current turn is never interrupted." style={{
                       width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
                       background: 'var(--blue)', color: '#fff', boxShadow: '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)', cursor: 'pointer' }}>
-                      <Icon name={attachments.length ? 'arrowRight' : 'plus'} size={18} stroke={2.6} style={attachments.length ? { transform: 'rotate(-90deg)' } : undefined} />
+                      <Icon name="plus" size={18} stroke={2.6} />
                     </button>
                   )}
                   <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
