@@ -17,7 +17,7 @@
    list of rows downstream by identity — React's diff handles that. */
 
 import React from 'react';
-import { api, type ChatSession, type Project } from '../lib/api';
+import { api, IS_WEBKIT, type ChatSession, type Project } from '../lib/api';
 import {
   aggregateWorkspaceOverview,
   type AggregateResult,
@@ -115,6 +115,7 @@ export function useWorkspaceOverview(): WorkspaceOverviewHook {
   // for some other surface scrolls the same id into view. We don't await —
   // the hook re-renders via the all-listener on each fetch result.
   React.useEffect(() => {
+    if (IS_WEBKIT) return;
     if (sessions.length === 0) return;
     const statuses = getAllSessionGitStatuses();
     for (const s of sessions) {

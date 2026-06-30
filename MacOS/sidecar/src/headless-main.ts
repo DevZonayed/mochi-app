@@ -5,7 +5,7 @@
 // native SwiftUI app gets the full local RPC surface — identical to what `window.maestro.call`
 // reached. Brain logic is unchanged; only the transport differs (WS instead of Electron IPC).
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -285,14 +285,84 @@ async function handleAccountCall(method: string, params: Record<string, unknown>
       stopAccountHost();
       clearAccountToken();
       return { signedIn: false, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: [] };
+    case 'accountSetSession': {
+      const token = typeof params.token === 'string' ? params.token.trim() : '';
+      if (!token) {
+        stopAccountHost();
+        clearAccountToken();
+        return { signedIn: false, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: [] };
+      }
+      writeAccountToken(token);
+      startAccountHost(token);
+      return { signedIn: true, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: await accountDevices().catch(() => []) };
+    }
     default:
       return undefined;
   }
 }
 
-// HTTP handler for the design live-preview route: /design/<projectId>/<rel…>
+const WEB_ROOT = process.env.MAESTRO_WEB_ROOT ? path.resolve(process.env.MAESTRO_WEB_ROOT) : '';
+
+function contentTypeFor(file: string): string {
+  const ext = path.extname(file).toLowerCase();
+  switch (ext) {
+    case '.html': return 'text/html; charset=utf-8';
+    case '.js': return 'text/javascript; charset=utf-8';
+    case '.css': return 'text/css; charset=utf-8';
+    case '.json': return 'application/json; charset=utf-8';
+    case '.svg': return 'image/svg+xml';
+    case '.png': return 'image/png';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.webp': return 'image/webp';
+    case '.woff': return 'font/woff';
+    case '.woff2': return 'font/woff2';
+    default: return 'application/octet-stream';
+  }
+}
+
+async function serveWebApp(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse): Promise<boolean> {
+  const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+  if (url.pathname !== '/app' && !url.pathname.startsWith('/app/')) return false;
+  if (!WEB_ROOT) {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('web bundle not configured');
+    return true;
+  }
+
+  let rel = decodeURIComponent(url.pathname.replace(/^\/app\/?/, '')) || 'index.html';
+  if (rel.endsWith('/')) rel += 'index.html';
+  const target = path.resolve(WEB_ROOT, rel);
+  const relToRoot = path.relative(WEB_ROOT, target);
+  if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('forbidden');
+    return true;
+  }
+
+  try {
+    const st = await fsp.stat(target);
+    if (!st.isFile()) throw new Error('not a file');
+    res.writeHead(200, {
+      'content-type': contentTypeFor(target),
+      'cache-control': target.endsWith('index.html') ? 'no-store' : 'public, max-age=31536000, immutable',
+    });
+    if (req.method === 'HEAD') {
+      res.end();
+    } else {
+      res.end(await fsp.readFile(target));
+    }
+  } catch {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('not found');
+  }
+  return true;
+}
+
+// HTTP handler for the WebKit app bundle and design live-preview routes.
 const httpHandler = async (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse): Promise<boolean> => {
   const url = req.url ?? '';
+  if (await serveWebApp(req, res)) return true;
   const m = url.match(/^\/design\/([^/]+)(\/.*)?$/);
   if (!m) return false;
   const projectId = decodeURIComponent(m[1]);
