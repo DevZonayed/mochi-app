@@ -38,6 +38,13 @@ export interface GhRequestOpts {
 /** One authenticated GitHub REST call. Throws GhError on non-2xx (except 304). */
 export async function ghRequest<T = unknown>(opts: GhRequestOpts): Promise<GhResult<T>> {
   const f = opts.fetchImpl ?? fetch;
+  // A malformed token (non-ASCII — e.g. a corrupted Keychain decrypt yielding
+  // U+FFFD) would otherwise throw the opaque "Cannot convert argument to a
+  // ByteString" deep inside fetch's header coercion, surfacing as a PR/clone
+  // failure with no actionable cause. Reject it here with a clear message.
+  if (!/^[\x20-\x7E]+$/.test(opts.token)) {
+    throw new GhError('GitHub token is malformed — reconnect GitHub in Settings.', 401);
+  }
   const headers: Record<string, string> = {
     authorization: `Bearer ${opts.token}`,
     accept: 'application/vnd.github+json',

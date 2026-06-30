@@ -24,6 +24,18 @@ export interface ProviderConn {
   createdAt: number;
 }
 
+/** A decrypted secret is only usable if it's non-empty and pure printable
+    ASCII. A corrupted Keychain blob (e.g. after an ad-hoc-signing re-key, see
+    the Safe Storage prompt memo) can decrypt WITHOUT throwing yet come back
+    carrying U+FFFD replacement chars. Tokens/keys are always ASCII, so anything
+    outside 0x20–0x7E means the blob is garbage — and feeding it into an HTTP
+    `Authorization` header throws the opaque "Cannot convert argument to a
+    ByteString … value 65533" error (a failed PR/clone with no actionable cause).
+    Rejecting it here lets callers fall back to a CLI-sourced token instead. */
+export function isUsableSecret(s: string | null | undefined): s is string {
+  return typeof s === 'string' && s.length > 0 && /^[\x20-\x7E]+$/.test(s);
+}
+
 export function claudeLoggedIn(): boolean {
   const h = homedir();
   return existsSync(join(h, '.claude.json')) || existsSync(join(h, '.claude'));
@@ -93,14 +105,24 @@ export class Providers {
   getRawKey(provider: string): string | undefined {
     const cipher = this.store.getProviderKeyCipher(provider);
     if (!cipher) return undefined;
-    try { return safeStorage.decryptString(Buffer.from(cipher, 'base64')); } catch { return undefined; }
+    try {
+      const dec = safeStorage.decryptString(Buffer.from(cipher, 'base64'));
+      return isUsableSecret(dec) ? dec : undefined;
+    } catch { return undefined; }
   }
   clearKey(provider: string): void { this.store.deleteProviderKey(provider); }
 
   getLocalKey(provider: ProviderId): string | undefined {
     const cipher = this.store.getProviderKeyCipher(provider);
     if (cipher) {
-      try { return safeStorage.decryptString(Buffer.from(cipher, 'base64')); } catch { /* fall through to CLI */ }
+      try {
+        const dec = safeStorage.decryptString(Buffer.from(cipher, 'base64'));
+        // Only trust a decrypt that yields a sane ASCII secret. A corrupted blob
+        // decrypts to U+FFFD-laced garbage WITHOUT throwing; returning it would
+        // blow up the Authorization header. Fall through to the CLI token (gh
+        // auth) instead — for GitHub that's an equally-valid source.
+        if (isUsableSecret(dec)) return dec;
+      } catch { /* fall through to CLI */ }
     }
     // gh CLI is a valid source of the GitHub token (same as ~/.claude.json
     // for anthropic / ~/.codex for openai). All three callers — GitService
