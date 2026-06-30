@@ -2440,7 +2440,7 @@ function SchedulePicker({ initial, onPick, onRepeat, onClose }: { initial?: numb
   );
 }
 
-function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: string[]; onSendNow: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
+function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: QItem[]; onSendNow: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
   const [collapsed, setCollapsed] = React.useState(false);
   const [sel, setSel] = React.useState(-1);
   const [dragIdx, setDragIdx] = React.useState(-1);
@@ -2516,7 +2516,14 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: 
                     {Array.from({ length: 6 }, (_, d) => <span key={d} style={{ width: 2.5, height: 2.5, borderRadius: 2, background: 'currentColor' }} />)}
                   </span>
                   <span style={{ width: 18, height: 18, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 13%, transparent)', color: 'var(--purple)', font: '600 10px/1 var(--font-mono)' }}>{i + 1}</span>
-                  <span style={{ flex: 1, minWidth: 0, font: '400 13px/1.35 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{q}</span>
+                  <span style={{ flex: 1, minWidth: 0, display: 'inline-flex', alignItems: 'center', gap: 6, font: '400 13px/1.35 var(--font-text)', color: 'var(--ink-secondary)', overflow: 'hidden' }}>
+                    {q.atts && q.atts.length > 0 && (
+                      <span title={`${q.atts.length} attachment${q.atts.length === 1 ? '' : 's'}`} style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 3, height: 17, padding: '0 6px', borderRadius: 5, background: 'color-mix(in srgb, var(--blue) 12%, transparent)', color: 'var(--blue)', font: '600 10px/1 var(--font-text)' }}>
+                        <Icon name="paperclip" size={10} stroke={2.2} />{q.atts.length}
+                      </span>
+                    )}
+                    <span style={{ minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{q.text || (q.atts?.length ? (q.atts.length === 1 ? q.atts[0].name : `${q.atts.length} attachments`) : '')}</span>
+                  </span>
                   <span className="q-act" style={{ display: 'inline-flex', gap: 2 }}>
                     <QBtn title="Move up — runs sooner" onClick={() => move(i, i - 1)} color="var(--ink-tertiary)"><Icon name="chevronDown" size={13} style={{ transform: 'rotate(180deg)' }} /></QBtn>
                     <QBtn title="Move down — runs later" onClick={() => move(i, i + 1)} color="var(--ink-tertiary)"><Icon name="chevronDown" size={13} /></QBtn>
@@ -2556,15 +2563,29 @@ function QueuePanel({ queue, onSendNow, onRemove, onEdit, onReorder }: { queue: 
 // survives the chat unmounting — e.g. navigating to Settings (a sibling route)
 // and back, which otherwise drops the in-memory queue. Keyed by sessionId.
 const QUEUE_KEY = (sid: string) => `maestro.chat.queue.${sid}`;
-const readQueue = (sid: string | null): string[] => {
+const readQueue = (sid: string | null): QItem[] => {
   if (!sid) return [];
-  try { const a = JSON.parse(localStorage.getItem(QUEUE_KEY(sid)) || '[]'); return Array.isArray(a) ? a.filter((x: unknown): x is string => typeof x === 'string') : []; }
-  catch { return []; }
+  try {
+    const a = JSON.parse(localStorage.getItem(QUEUE_KEY(sid)) || '[]');
+    if (!Array.isArray(a)) return [];
+    // Back-compat: the queue used to be a bare string[]; coerce legacy rows to
+    // the {text, atts} shape so an in-flight queue survives the upgrade.
+    return a
+      .map((x: unknown): QItem | null => {
+        if (typeof x === 'string') return { text: x };
+        if (x && typeof x === 'object' && typeof (x as QItem).text === 'string') {
+          const it = x as QItem;
+          return { text: it.text, atts: Array.isArray(it.atts) ? it.atts : undefined };
+        }
+        return null;
+      })
+      .filter((x: QItem | null): x is QItem => x !== null);
+  } catch { return []; }
 };
-const writeQueue = (sid: string | null, q: string[]): void => {
+const writeQueue = (sid: string | null, q: QItem[]): void => {
   if (!sid) return;
   try { if (q.length) localStorage.setItem(QUEUE_KEY(sid), JSON.stringify(q)); else localStorage.removeItem(QUEUE_KEY(sid)); }
-  catch { /* ignore quota / serialisation */ }
+  catch { /* ignore quota / serialisation — large image bytes may exceed it; the in-memory queue still drains */ }
 };
 const CHAT_PAGE_SIZE = 30;
 function compareTurnsOldestFirst(a: Job, b: Job): number {
@@ -2677,6 +2698,11 @@ type Attach =
   | { id: string; kind: 'text'; name: string; content: string }
   | { id: string; kind: 'file'; name: string; mime: string; dataB64: string; size: number }
   | { id: string; kind: 'ref'; name: string; path: string; isDir: boolean };
+// A queued composer message: the prose PLUS the attachments it was composed with
+// (images/text/files/refs). Carrying `atts` is what lets a message-with-image ride
+// the queue instead of force-cancelling the running turn — the whole point of the
+// queue is that nothing sends until the agent is idle.
+type QItem = { text: string; atts?: Attach[] };
 const SUPPORTED_IMG = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 const TEXT_EXT = /\.(txt|md|markdown|mdx|rst|json|jsonc|ya?ml|toml|ini|cfg|conf|csv|tsv|log|xml|html?|svg|css|scss|sass|less|js|jsx|ts|tsx|mjs|cjs|py|rb|go|rs|java|kt|kts|c|h|cc|cpp|hpp|cs|php|swift|m|mm|sh|bash|zsh|fish|sql|graphql|gql|env|gitignore|dockerfile|makefile|gradle|properties|vue|svelte|astro|r|lua|pl|pm|dart|ex|exs|erl|clj|scala|tf|proto)$/i;
 const isTextFile = (f: File): boolean =>
@@ -2911,7 +2937,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   const [schedEditAt, setSchedEditAt] = React.useState<number | null>(null); // prefill fireAt when editing
   const [schedules, setSchedules] = React.useState<Schedule[]>([]); // upcoming scheduled messages for this chat
   const [schedNow, setSchedNow] = React.useState(() => Date.now()); // ticks each second to drive countdowns
-  const [queue, setQueue] = React.useState<string[]>([]); // prompts waiting to run after the current turn
+  const [queue, setQueue] = React.useState<QItem[]>([]); // prompts (+ their attachments) waiting to run after the current turn
   const [bgTasks, setBgTasks] = React.useState<BgTask[]>([]); // long-lived processes the agent started (dev servers, watchers)
   const [attachments, setAttachments] = React.useState<Attach[]>([]); // images / text / files (shown as inline composer chips)
   const [dragOver, setDragOver] = React.useState(false);
@@ -2922,7 +2948,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   activeRef.current = activeId;
   // Mutate the queue AND persist it for the current session in one step, so the
   // queue box survives navigating away (which unmounts this chat) and back.
-  const mutateQueue = React.useCallback((fn: (prev: string[]) => string[]) => {
+  const mutateQueue = React.useCallback((fn: (prev: QItem[]) => QItem[]) => {
     setQueue(prev => { const next = fn(prev); writeQueue(activeRef.current, next); return next; });
   }, []);
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -3172,7 +3198,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     const t = raw.trim();
     if (!t || !projectId) return;
     composerRef.current?.clear();
-    if (streaming) { mutateQueue(q => [...q, t]); return; }
+    if (streaming) { mutateQueue(q => [...q, { text: t }]); return; }
     void sendRaw(t).then(ok => { if (!ok) composerRef.current?.setText(raw); });
   }, [projectId, streaming, sendRaw, mutateQueue]);
 
@@ -3309,45 +3335,36 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   }, []);
   const canSend = !!text.trim() || attachments.length > 0;
 
-  // Compose-and-send: text-only follows the normal queue/idle path; a message with
-  // images sends now (interrupting a running turn so turns never overlap mid-stream).
-  // On failure the text + images are restored so nothing is lost.
+  // Compose-and-send (Enter). While the agent is working → QUEUE the message
+  // WITH its attachments; it drains the instant the turn finishes. Attachments
+  // now ride the queue (the queue item carries `atts`), so a pasted image no
+  // longer force-cancels the running turn — that was the reported bug ("doesn't
+  // queue anymore, sends directly / stops the previous run"). When idle, send
+  // straight through. On failure the text + attachments are restored so nothing
+  // is lost. The ONLY cancel-and-steer path is the explicit "Send now" button
+  // (queue row) and the red stop button.
   const sendComposed = React.useCallback(() => {
     // Read straight from the composer (the DOM is the source of truth) so a
     // pending rAF-coalesced state update can never make Enter send stale text.
-    const t = (composerRef.current?.getText() ?? text).trim(); const imgs = attachments;
-    if ((!t && !imgs.length) || !projectId) return;
-    if (!imgs.length) { sendText(text); return; }
-    composerRef.current?.clear(); setAttachments([]);
-    if (streaming) void sendNow(t, imgs).then(ok => { if (!ok) restoreAtts(imgs); });
-    else void sendRaw(t, imgs).then(ok => { if (!ok) { composerRef.current?.setText(t); restoreAtts(imgs); } });
-  }, [text, attachments, projectId, streaming, sendText, sendNow, sendRaw, restoreAtts]);
-  // ⌘↩ "run next" — previously this cancelled the in-flight turn and started a
-  // new run with this prompt (the user-reported bug: their typed-mid-stream
-  // context killed the agent's working answer). NEW SEMANTICS: while streaming,
-  // ⌘↩ pushes the message to the FRONT of the queue so it runs the moment the
-  // current turn finishes — no cancel, no lost work. The explicit interrupt
-  // path (the queue-row "Send now — interrupt and steer" button + the red
-  // stop button) is still available for the rare case someone actually wants
-  // to kill the run. When idle, ⌘↩ just sends immediately (no queue to skip).
+    const t = (composerRef.current?.getText() ?? text).trim(); const atts = attachments;
+    if ((!t && !atts.length) || !projectId) return;
+    composerRef.current?.clear(); setAttachments([]); attachmentsRef.current = [];
+    if (streaming) { mutateQueue(q => [...q, { text: t, atts: atts.length ? atts : undefined }]); return; }
+    void sendRaw(t, atts).then(ok => { if (!ok) { composerRef.current?.setText(t); restoreAtts(atts); } });
+  }, [text, attachments, projectId, streaming, sendRaw, mutateQueue, restoreAtts]);
+  // ⌘↩ "run next" — while streaming, push the message (WITH attachments) to the
+  // FRONT of the queue so it runs the moment the current turn finishes — no
+  // cancel, no lost work, no overlapping run. When idle, ⌘↩ just sends
+  // immediately (no queue to skip). The explicit interrupt/steer path (the
+  // queue-row "Send now" button + the red stop button) is still available for
+  // the rare case someone actually wants to kill the in-flight run.
   const sendComposedNow = React.useCallback(() => {
-    const t = (composerRef.current?.getText() ?? text).trim(); const imgs = attachments;
-    if ((!t && !imgs.length) || !projectId) return;
-    composerRef.current?.clear();
-    setAttachments([]);
-    if (streaming) {
-      // Images can't ride the queue payload, so a steer with attached images
-      // still uses the explicit interrupt path. Text-only is the common case
-      // and what the bug report covered.
-      if (imgs.length) {
-        void sendNow(t, imgs).then(ok => { if (!ok) restoreAtts(imgs); });
-      } else {
-        mutateQueue(q => [t, ...q]);
-      }
-      return;
-    }
-    void sendNow(t, imgs.length ? imgs : undefined).then(ok => { if (!ok) restoreAtts(imgs); });
-  }, [text, attachments, projectId, streaming, sendNow, mutateQueue, restoreAtts]);
+    const t = (composerRef.current?.getText() ?? text).trim(); const atts = attachments;
+    if ((!t && !atts.length) || !projectId) return;
+    composerRef.current?.clear(); setAttachments([]); attachmentsRef.current = [];
+    if (streaming) { mutateQueue(q => [{ text: t, atts: atts.length ? atts : undefined }, ...q]); return; }
+    void sendRaw(t, atts).then(ok => { if (!ok) { composerRef.current?.setText(t); restoreAtts(atts); } });
+  }, [text, attachments, projectId, streaming, sendRaw, mutateQueue, restoreAtts]);
 
   const removeFromQueue = (i: number) => mutateQueue(q => q.filter((_, j) => j !== i));
   // Reorder = reprioritize: the drainer always fires queue[0] next.
@@ -3358,8 +3375,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     next.splice(to, 0, item);
     return next;
   });
-  const sendQueuedNow = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); void sendNow(t); };
-  const editQueued = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); composerRef.current?.setText(t); composerRef.current?.focus(); };
+  // "Send now" on a queued row = the explicit interrupt+steer path: cancel the
+  // running turn and run this item (with its attachments) right away.
+  const sendQueuedNow = (i: number) => { const it = queue[i]; if (it == null) return; removeFromQueue(i); void sendNow(it.text, it.atts); };
+  const editQueued = (i: number) => { const it = queue[i]; if (it == null) return; removeFromQueue(i); composerRef.current?.setText(it.text); if (it.atts?.length) restoreAtts(it.atts); composerRef.current?.focus(); };
 
   // Drain the queue: when the agent goes idle and items are waiting, fire the next.
   const drainingRef = React.useRef(false);
@@ -3368,7 +3387,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     drainingRef.current = true;
     const next = queue[0];
     mutateQueue(q => q.slice(1));
-    void sendRaw(next).finally(() => { drainingRef.current = false; });
+    void sendRaw(next.text, next.atts).finally(() => { drainingRef.current = false; });
   }, [streaming, queue, sendRaw, mutateQueue]);
 
   const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
@@ -3687,7 +3706,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
               <RichComposer
                 ref={composerRef}
                 disabled={!projectId || locked}
-                placeholder={!projectId ? 'Pick a project first' : locked ? 'View only — this PR has been merged' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
+                placeholder={!projectId ? 'Pick a project first' : locked ? 'View only — this PR has been merged' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
                 onTextChange={setText}
                 onChips={info => {
                   setComposerBrowser(info.hasBrowser);
@@ -3723,10 +3742,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
               {streaming ? (
                 <>
                   {canSend && (
-                    <button onClick={sendComposed} className="send-fab" title={attachments.length ? 'Send now — interrupts the current run' : 'Queue (Enter) — runs when the agent finishes · ⌘Enter — runs NEXT (jumps to the front of the queue, current turn keeps going)'} style={{
+                    <button onClick={sendComposed} className="send-fab" title={'Queue (Enter) — runs when the agent finishes · ⌘Enter — runs NEXT (jumps to the front of the queue; the current turn keeps going). Attachments ride along — nothing interrupts the running turn.'} style={{
                       width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
                       background: 'var(--blue)', color: '#fff', boxShadow: '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)', cursor: 'pointer' }}>
-                      <Icon name={attachments.length ? 'arrowRight' : 'plus'} size={18} stroke={2.6} style={attachments.length ? { transform: 'rotate(-90deg)' } : undefined} />
+                      <Icon name="plus" size={18} stroke={2.6} />
                     </button>
                   )}
                   <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
