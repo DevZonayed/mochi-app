@@ -26,10 +26,16 @@ struct RootView: View {
             .ignoresSafeArea(.container, edges: .top)
 
             if !ready { LaunchScreen().transition(.opacity).zIndex(10) }
+
+            // The one connection-status surface: a self-clearing "Reconnecting…" pill while the
+            // app is up, or a real-reason + Retry card when the engine is terminally down. RPCs
+            // wait for readiness, so this is the only thing the user ever sees — never a dead error.
+            EngineGate(appVisible: ready).zIndex(20)
         }
         .background(Tok.bg)
         .background(WindowConfigurator(barHeight: 40))
         .animation(.easeOut(duration: 0.4), value: ready)
+        .animation(.easeOut(duration: 0.3), value: env.supervisor.engineState)
         .task { try? await Task.sleep(for: .milliseconds(650)); minElapsed = true }
     }
 

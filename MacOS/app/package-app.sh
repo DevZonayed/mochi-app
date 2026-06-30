@@ -65,6 +65,11 @@ node "$SIDECAR/build.mjs" --external-natives
 RES_SC="$APP/Contents/Resources/sidecar"
 mkdir -p "$RES_SC/bin" "$RES_SC/node_modules"
 cp "$SIDECAR/dist/maestro-sidecar.mjs" "$RES_SC/maestro-sidecar.mjs"
+# Sibling runtime assets the bundle reads relative to itself (overlay script + bootstrap
+# templates) — build.mjs emits them into dist/; they must travel into the app beside the bundle
+# or the sidecar crashes at boot (ENOENT send-hint-overlay.js).
+cp "$SIDECAR/dist/send-hint-overlay.js" "$RES_SC/send-hint-overlay.js" 2>/dev/null || echo "  ⚠ send-hint-overlay.js missing from dist"
+[ -d "$SIDECAR/dist/templates" ] && cp -R "$SIDECAR/dist/templates" "$RES_SC/templates" || echo "  ⚠ templates/ missing from dist"
 
 echo "▸ embedding node runtime"
 REAL_NODE="$(resolve_path "$(command -v node)")"
