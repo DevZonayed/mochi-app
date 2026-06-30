@@ -37,6 +37,11 @@ const unknown: SessionGitStatus = {
   lastCheckedAt: 0,
 };
 
+/** Listeners that want EVERY git-status event (e.g. the workspace-wide
+    overview strip). Kept separate from the per-session/per-project maps so
+    each chat pill still re-renders for its own id only. */
+const allListeners = new Set<Listener>();
+
 function ensureLive(): void {
   if (liveStarted) return;
   liveStarted = true;
@@ -53,8 +58,41 @@ function ensureLive(): void {
         const pls = listenersByKey.get(`project:${proj}`);
         if (pls) for (const l of pls) l();
       }
+      // Aggregate consumers (workspace overview).
+      for (const l of allListeners) l();
     },
   });
+}
+
+/** Subscribe to ALL git-status updates regardless of session. Returns the
+    current cache snapshot via `getAllSessionGitStatuses()`; the callback is
+    fired on every incoming event so consumers can re-read. */
+export function subscribeAllGitStatuses(cb: Listener): () => void {
+  ensureLive();
+  allListeners.add(cb);
+  return () => { allListeners.delete(cb); };
+}
+
+/** Snapshot the in-memory cache. Returns a NEW map so callers can't mutate
+    the shared one. Cheap (a few dozen entries at most). */
+export function getAllSessionGitStatuses(): Map<string, SessionGitStatus> {
+  return new Map(cache);
+}
+
+/** Ensure the status for a given session id has been (lazy-)fetched, so a
+    fresh consumer (the overview strip) doesn't have to wait for an arbitrary
+    `git-status` event to know what the session's state is. No-op if cached. */
+export function ensureSessionGitStatusFetched(sessionId: string): void {
+  ensureLive();
+  if (lazyFetched.has(sessionId)) return;
+  lazyFetched.add(sessionId);
+  api.getSessionGitStatus(sessionId, false).then(s => {
+    cache.set(sessionId, s);
+    // Wake everyone who cares.
+    const ls = listenersByKey.get(sessionId);
+    if (ls) for (const l of ls) l();
+    for (const l of allListeners) l();
+  }).catch(() => {});
 }
 
 /** Project id we should treat the status as belonging to — populated by the
@@ -203,6 +241,7 @@ export function _resetGitStateCacheForTests(): void {
   listenersByKey.clear();
   lazyFetched.clear();
   projectByStatus.clear();
+  allListeners.clear();
   liveStarted = false;
 }
 

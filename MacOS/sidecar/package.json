@@ -1,0 +1,12 @@
+{
+  "name": "@maestro/sidecar",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Headless Maestro brain — the existing electron/ logic, run outside Electron and served over a loopback WebSocket to the native macOS app.",
+  "scripts": {
+    "dev": "node --import ./src/register.mjs ./src/headless-main.ts",
+    "start": "node --import ./src/register.mjs ./src/headless-main.ts",
+    "smoke": "node src/smoke-test.mjs"
+  }
+}

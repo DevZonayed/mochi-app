@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildSyncDelta, type Snapshot } from './server.js';
+import { buildJobPage, buildSyncDelta, type Snapshot } from './server.js';
 
 /** Tiny snapshot factory — only fills what each test needs. */
 function snap(p: Partial<Snapshot>): Snapshot { return { at: 1000, ...p }; }
@@ -89,5 +89,40 @@ describe('buildSyncDelta', () => {
     expect(second.changed.projects).toEqual([]);
     expect(second.changed.events).toEqual([]);
     expect(second.deleted.projects).toEqual([]);
+  });
+});
+
+describe('buildJobPage', () => {
+  it('returns newest jobs in chronological display order', () => {
+    const jobs = Array.from({ length: 5 }, (_, idx) => ({
+      id: `j${idx + 1}`,
+      projectId: 'p1',
+      sessionId: 's1',
+      createdAt: 1_700_000_000_000 + idx,
+      updatedAt: 1_700_000_000_000 + idx,
+    }));
+    const page = buildJobPage(jobs, { sessionId: 's1', limit: 2 });
+    expect(page.jobs.map(j => j.id)).toEqual(['j4', 'j5']);
+    expect(page.total).toBe(5);
+    expect(page.hasMore).toBe(true);
+    expect(page.nextCursor).toBeTypeOf('string');
+  });
+
+  it('pages duplicate createdAt jobs without losing the tie group', () => {
+    const jobs = Array.from({ length: 5 }, (_, idx) => ({
+      id: `job-${idx + 1}`,
+      projectId: 'p1',
+      sessionId: 's1',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_000,
+    }));
+    const first = buildJobPage(jobs, { sessionId: 's1', limit: 2 });
+    const second = buildJobPage(jobs, { sessionId: 's1', cursor: first.nextCursor, limit: 2 });
+    const third = buildJobPage(jobs, { sessionId: 's1', cursor: second.nextCursor, limit: 2 });
+
+    expect(first.jobs.map(j => j.id)).toEqual(['job-4', 'job-5']);
+    expect(second.jobs.map(j => j.id)).toEqual(['job-2', 'job-3']);
+    expect(third.jobs.map(j => j.id)).toEqual(['job-1']);
+    expect(third.hasMore).toBe(false);
   });
 });
