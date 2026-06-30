@@ -81,6 +81,31 @@ export function detectKeepGoing(text: string | undefined | null): string | null 
 
 /* ── Organizing the continue prompt ──────────────────────────────────── */
 
+/** The original user goal is echoed verbatim into the auto-continue prompt,
+    which renders in the USER-side chat bubble. Two things made that echo ugly
+    (image_yhpsb.png): (1) an `@/abs/path/.continuum/Attachment(s)/<file>`
+    attachment marker dumped a long, machine-specific path — the bubble can't
+    tokenize it back into a chip (the auto-continue turn carries none of the
+    original attachments), so it linkified into a broken, wrapping URL with the
+    next word ("All") stranded beside it; (2) pasted multi-line goals carry runs
+    of blank lines / trailing spaces that bloat the bubble. Collapse the marker
+    to a readable `[attached: <file>]` token (the agent already consumed the
+    file on the first turn — this is a continuation in the same session) and
+    squeeze the whitespace. */
+export function sanitizeGoalEcho(goal: string): string {
+  return goal
+    // `@…/.continuum/Attachment(s)/<file>` (abs OR relay-scrubbed) → token.
+    // The terminator class deliberately omits a bare `.` so a filename
+    // extension (`shot_xy.png`) survives — only a `.` that ends a sentence
+    // (followed by whitespace / end-of-string) stops the capture.
+    .replace(/@?\S*\.continuum\/Attachments?\/(\S+?)(?=[\s)\]»,;:!?]|\.(?:\s|$)|$)/gi,
+      (_m, p: string) => `[attached: ${p.split('/').filter(Boolean).pop() || p}]`)
+    .replace(/[ \t]+$/gm, '')   // trailing spaces per line
+    .replace(/\n{3,}/g, '\n\n') // 3+ newlines → one blank line
+    .replace(/[ \t]{2,}/g, ' ') // collapse run-on spaces
+    .trim();
+}
+
 /** Strip inline markdown emphasis (bold/italic) from an extracted item so the
     auto-continue prompt — which renders into the USER-SIDE chat bubble (no
     markdown parser there) — doesn't show literal `**Sprint 10b**` stars to
@@ -107,11 +132,23 @@ function stripEmphasis(s: string): string {
 export function extractNextItems(text: string | undefined | null): string[] {
   if (!text) return [];
   const out: string[] = [];
+  const seen = new Set<string>();
   const push = (raw: string) => {
-    const s = stripEmphasis(raw);
+    let s = stripEmphasis(raw);
+    // A captured bullet whose own text starts with an enumerator
+    // ("- 2. Origin allowlist …") keeps the stray "2." — strip ONE leading
+    // list marker / number so the echoed item reads clean (image_yhpsb.png
+    // showed "- 2. Origin allowlist …" bullets with the inner number intact).
+    s = s.replace(/^\s*(?:\d{1,3}[.)]|[-•*])\s+/, '');
     const t = s.replace(/\s+/g, ' ').trim();
     if (!t || t.length < 3 || t.length > 240) return;
-    if (out.includes(t)) return;
+    // Dedup on a normalized prefix so near-duplicates that differ only by a
+    // trailing clause ("… (no cookie/token leakage)" vs the same line plus
+    // "— added a trusted-host") collapse to the FIRST form instead of both
+    // surviving — that double-listing was the noise in image_yhpsb.png.
+    const key = t.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 48);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
     out.push(t);
   };
   // numbered list ("1. X" / "1) X")
@@ -148,8 +185,11 @@ export function organizedContinuePrompt(opts: {
   const lines: string[] = [];
   lines.push('No response in the wait window — proceed autonomously.');
   if (opts.goalMode && opts.originalGoal) {
-    lines.push('');
-    lines.push(`Goal: ${opts.originalGoal.slice(0, 800).trim()}`);
+    const goal = sanitizeGoalEcho(opts.originalGoal).slice(0, 800).trim();
+    if (goal) {
+      lines.push('');
+      lines.push(`Goal: ${goal}`);
+    }
   }
   if (items.length) {
     lines.push('');
