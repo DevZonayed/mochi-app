@@ -19,8 +19,9 @@ import { writeFileSync, chmodSync, unlinkSync, mkdirSync, existsSync } from 'nod
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { Store } from './store.js';
-import type { BgTaskRecord } from './engine.js';
+import type { BgTaskRecord, EmitConfirm } from './engine.js';
 import type { GitCtx } from './git-ctx.js';
+import { isNeedsConfirm } from './git-ctx.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
 import { nextActionFor } from './git-ctx.js';
 
@@ -36,8 +37,8 @@ export interface BridgeBg {
 
 /** A registered codex run: the project its tools target + the optional
     per-session git/PR ctx (only present for chat turns on a GitHub repo). */
-interface RunReg { projectId: string | null; skills: boolean; bg: boolean; git?: GitCtx }
-interface RunOptions { skills?: boolean; bg?: boolean; git?: GitCtx }
+interface RunReg { projectId: string | null; skills: boolean; bg: boolean; git?: GitCtx; emitConfirm?: EmitConfirm; sessionId?: string | null }
+interface RunOptions { skills?: boolean; bg?: boolean; git?: GitCtx; emitConfirm?: EmitConfirm; sessionId?: string | null }
 
 /** Handle returned to runCodex: the codex `-c` config to add. */
 export interface CodexRunRegistration {
@@ -95,7 +96,7 @@ export class CodexBridge {
   /** Register a codex run: returns the `-c mcp_servers` config. */
   register(projectId: string | null, opts: RunOptions = { skills: true, bg: true }): CodexRunRegistration {
     const token = randomBytes(18).toString('hex');
-    const reg: RunReg = { projectId, skills: !!opts.skills, bg: !!opts.bg, git: opts.git };
+    const reg: RunReg = { projectId, skills: !!opts.skills, bg: !!opts.bg, git: opts.git, emitConfirm: opts.emitConfirm, sessionId: opts.sessionId ?? null };
     this.runs.set(token, reg);
     // Run the shim via Electron's own node (always present; no PATH dependency).
     // The per-run token goes in the MCP server's ENV (not the shim's argv) so it
@@ -193,7 +194,15 @@ export class CodexBridge {
           auditStatus: meta?.auditStatus,
           addedBy: 'agent',
         });
-        return txt(`Installed "${rec.name}" -> .claude/skills/${rec.slug}/SKILL.md${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}. Read that file before using the skill.`);
+        // Deliver the skill body INLINE so the agent follows it THIS turn instead of
+        // depending on a follow-up Read it sometimes skipped ("dynamically loaded but not
+        // followed"). Codex surfaces skills via the per-turn project_skills index (no
+        // Agent-SDK startup-scan to refresh), so inline body is the robust same-turn
+        // delivery. Mirrors the download_skill 32k cap above.
+        const installedBody = content.skillMd.length > 32000
+          ? content.skillMd.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]'
+          : content.skillMd;
+        return txt(`Installed "${rec.name}" -> .claude/skills/${rec.slug}/SKILL.md${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}.\n\nFollow these instructions for the task:\n\n---\n${installedBody}\n---`);
       }
       case 'list_project_skills': {
         if (!reg.skills) return errRes('skill tools are not enabled for this run');
@@ -259,12 +268,26 @@ export class CodexBridge {
       case 'pr_merge': {
         if (!reg.git) return errRes('git/PR tools are not available for this run.');
         const method = s(a.method);
+        // GATE: the agent never gets to set `confirmed: true` — we drop it here
+        // so the only caller that can land the merge is the renderer (via the
+        // mergeSessionPR IPC handler, after the user clicks Confirm Merge).
         const r = await reg.git.mergePr({ method: method === 'merge' || method === 'squash' || method === 'rebase' ? method : undefined });
+        if (isNeedsConfirm(r)) {
+          if (reg.emitConfirm) reg.emitConfirm({ action: 'pr_merge', sessionId: reg.sessionId ?? null, preview: r.preview });
+          return txt(`Surfaced a merge-confirmation dialog to the user for PR #${r.preview.prNumber} (${r.preview.prTitle}). Method: ${r.preview.mergeMethod}, mergeable state: ${r.preview.mergeableState}. The user must click "Confirm Merge" in the desktop UI — you cannot land it from here. Wait for their decision, then call git_status to see whether the merge landed.`);
+        }
         return txt(r.ok ? "Merged. The session's work is on the base branch now — you can archive the worktree if you're done." : `Merge failed: ${r.reason ?? 'unknown'}`);
       }
       case 'pr_resolve_conflicts': {
         if (!reg.git) return errRes('git/PR tools are not available for this run.');
+        // GATE: same as pr_merge — preview, surface dialog, never run the pull/merge.
         const r = await reg.git.resolveConflicts();
+        if (isNeedsConfirm(r)) {
+          if (reg.emitConfirm) reg.emitConfirm({ action: 'pr_resolve_conflicts', sessionId: reg.sessionId ?? null, preview: r.preview });
+          const cf = r.preview.conflictedFiles;
+          const cfNote = cf.length ? ` Worktree already has ${cf.length} unmerged file(s).` : '';
+          return txt(`Surfaced a conflict-resolution dialog to the user for ${r.preview.branch ?? 'this branch'} (base ${r.preview.base ?? '?'}).${cfNote} The user must click "Apply Resolution" in the desktop UI — you cannot pull base in from here. Wait for their decision, then call git_status.`);
+        }
         if (r.ok && (!r.conflicts || r.conflicts.length === 0)) {
           return txt('Conflicts resolved cleanly (or the branch was already up to date) — pushed the merged branch. Call git_status to verify the PR is now mergeable.');
         }
@@ -308,8 +331,8 @@ const SHIM_TOOLS = JSON.stringify([
   { name: 'git_status', description: 'Read this chat\'s live git/PR state (branch, ahead/behind, dirty, open PR, next-action hint). Call before push/pr/merge/resolve to confirm the lifecycle position.', inputSchema: { type: 'object', properties: {} } },
   { name: 'git_push', description: 'Push this chat\'s branch to origin using the user\'s saved GitHub token. Use when git_status says ready-to-push.', inputSchema: { type: 'object', properties: {} } },
   { name: 'pr_create', description: 'Open (or resurface) a pull request from this chat\'s branch. Pushes first if needed; idempotent.', inputSchema: { type: 'object', properties: { title: { type: 'string' }, body: { type: 'string' } } } },
-  { name: 'pr_merge', description: 'Merge the open PR for this chat using the repo\'s preferred merge method (or override with method=merge|squash|rebase). Only call when git_status reports pr-mergeable.', inputSchema: { type: 'object', properties: { method: { type: 'string' } } } },
-  { name: 'pr_resolve_conflicts', description: 'Pull the base branch in. If clean, pushes; if conflicts, returns the conflicted files so you can Read/Edit them, commit, and call again.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'pr_merge', description: 'PREPARE a merge of the open PR (auto-picks merge method, or override with method=merge|squash|rebase). Requires HUMAN to click "Confirm Merge" in the desktop UI — calling surfaces a dialog with the PR title, mergeable state, and check rollup. Only call when git_status reports pr-mergeable.', inputSchema: { type: 'object', properties: { method: { type: 'string' } } } },
+  { name: 'pr_resolve_conflicts', description: 'PREPARE pulling the base branch in. Requires HUMAN to click "Apply Resolution" in the desktop UI — calling surfaces a dialog listing the files that would change. After the human approves and conflict markers are produced, Read each file, resolve markers, commit, and call again.', inputSchema: { type: 'object', properties: {} } },
   { name: 'branch_rename', description: 'Force a one-shot of the auto-rename (codename-only → task-derived slug). No-op if the branch is already pushed or a PR exists.', inputSchema: { type: 'object', properties: {} } },
 ]);
 

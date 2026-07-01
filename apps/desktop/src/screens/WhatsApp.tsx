@@ -313,8 +313,15 @@ export default function WhatsAppScreen() {
         }
       },
     });
-    const poll = setInterval(refetchChats, 6000); // fallback while history streams in
-    return () => { unsub(); clearInterval(poll); };
+    // Fallback while history streams in. Pause entirely when the window is
+    // hidden so the WhatsApp tab doesn't keep firing every 6s in the background.
+    let poll: ReturnType<typeof setInterval> | null = null;
+    const start = () => { if (!poll && !document.hidden) poll = setInterval(refetchChats, 6000); };
+    const stop = () => { if (poll) { clearInterval(poll); poll = null; } };
+    const onVis = () => { if (document.hidden) stop(); else { refetchChats(); start(); } };
+    start();
+    document.addEventListener('visibilitychange', onVis);
+    return () => { unsub(); stop(); document.removeEventListener('visibilitychange', onVis); };
   }, [refetchChats]);
 
   const openChat = React.useCallback((chatId: string) => {

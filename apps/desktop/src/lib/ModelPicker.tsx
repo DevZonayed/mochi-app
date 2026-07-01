@@ -13,18 +13,39 @@ import { api, type ModelGroup, type ModelProviderId, type RoleChoice } from './a
 /* one shared fetch of the catalog, shared across every mounted picker */
 let groupsCache: ModelGroup[] | null = null;
 const subs = new Set<(g: ModelGroup[]) => void>();
+let inflight: Promise<void> | null = null;
+const MODEL_REFRESH_MS = 60_000;
+
+function publishGroups(g: ModelGroup[]) {
+  groupsCache = g;
+  subs.forEach(fn => fn(g));
+}
+
+export function refreshModelGroups(force = false): Promise<void> {
+  if (inflight) return inflight;
+  inflight = api.listModels(force)
+    .then(publishGroups)
+    .catch(() => {})
+    .finally(() => { inflight = null; });
+  return inflight;
+}
+
 export function useModelGroups(): ModelGroup[] {
   const [groups, setGroups] = React.useState<ModelGroup[]>(groupsCache ?? []);
   React.useEffect(() => {
     subs.add(setGroups);
     if (groupsCache) setGroups(groupsCache);
-    else api.listModels().then(g => { groupsCache = g; subs.forEach(fn => fn(g)); }).catch(() => {});
-    return () => { subs.delete(setGroups); };
+    void refreshModelGroups(!groupsCache);
+    const onFocus = () => { void refreshModelGroups(true); };
+    window.addEventListener('focus', onFocus);
+    const timer = window.setInterval(() => { void refreshModelGroups(); }, MODEL_REFRESH_MS);
+    return () => {
+      subs.delete(setGroups);
+      window.removeEventListener('focus', onFocus);
+      window.clearInterval(timer);
+    };
   }, []);
   return groups;
-}
-export function refreshModelGroups() {
-  api.listModels().then(g => { groupsCache = g; subs.forEach(fn => fn(g)); }).catch(() => {});
 }
 
 const OFF_KEY = 'off';
@@ -35,7 +56,7 @@ export function keyForRoleChoice(groups: ModelGroup[], rc: RoleChoice | 'off' | 
   if (!rc || rc === 'off') return OFF_KEY;
   for (const g of groups) for (const d of g.models) if (d.provider === rc.engine && (d.id || '') === (rc.model || '')) return d.key;
   for (const g of groups) for (const d of g.models) if (d.provider === rc.engine) return d.key;
-  return 'claude:opus';
+  return groups.find(g => g.provider === 'claude')?.models[0]?.key ?? 'claude:claude-opus-4-8';
 }
 function glyph(p: ModelProviderId, size: number) {
   if (p === 'claude') return <ProviderGlyph provider="anthropic" size={size} />;
@@ -83,6 +104,7 @@ export function ModelPicker({ value, onChange, allowOff, favorites = [], onToggl
 
   React.useEffect(() => {
     if (!open) return;
+    void refreshModelGroups(true);
     const onDown = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') { setOpen(false); return; }

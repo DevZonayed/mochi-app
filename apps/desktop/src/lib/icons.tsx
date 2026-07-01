@@ -66,6 +66,8 @@ export function OpenAIGlyph({ size = 26 }: { size?: number }) {
 // ── Names of every available line icon (keys of the `paths` map below).
 export type IconName =
   | 'check'
+  | 'eye'
+  | 'eyeOff'
   | 'paperclip'
   | 'globe'
   | 'chat'
@@ -111,6 +113,7 @@ export type IconName =
   | 'chevronRight'
   | 'chevronDown'
   | 'gitMerge'
+  | 'gitBranch'
   | 'send'
   | 'alert'
   | 'feedback'
@@ -186,9 +189,13 @@ export function Icon({ name, size = 18, stroke = 1.75, style }: IconProps) {
     checkCircle: <><circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-5"/></>,
     xCircle: <><circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/></>,
     more: <><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></>,
+    eye: <><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></>,
+    eyeOff: <><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-2.4 3.4M6.6 6.6A18 18 0 0 0 2 12s3.5 7 10 7a10.9 10.9 0 0 0 4.1-.8"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><line x1="3" y1="3" x2="21" y2="21"/></>,
     chevronRight: <polyline points="9 6 15 12 9 18"/>,
     chevronDown: <polyline points="6 9 12 15 18 9"/>,
     gitMerge: <><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="9" r="3"/><path d="M6 9v6M15 9a9 9 0 0 1-9 9"/></>,
+    // gitBranch: trunk on the left, branch line peeling off to a node on the right.
+    gitBranch: <><line x1="6" y1="3" x2="6" y2="15"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></>,
     send: <><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7Z"/></>,
     alert: <><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></>,
     // Feedback: a speech bubble carrying an exclamation — "say something".
