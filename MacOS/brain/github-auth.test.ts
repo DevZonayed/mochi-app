@@ -33,6 +33,22 @@ describe('githubConnectionStatus', () => {
     const f = fakeFetch({ status: 401, body: { message: 'Bad credentials' } });
     expect(await githubConnectionStatus('t', f)).toMatchObject({ connected: false });
   });
+  test('401 stays disconnected even when gh is logged in on disk', async () => {
+    const f = fakeFetch({ status: 401, body: { message: 'Bad credentials' } });
+    expect(await githubConnectionStatus('t', f, () => true)).toMatchObject({ connected: false });
+  });
+  test('network error but gh logged in → stays connected (matches Settings)', async () => {
+    const f = (async () => { throw new Error('fetch failed'); }) as unknown as typeof fetch;
+    expect(await githubConnectionStatus('t', f, () => true)).toMatchObject({ connected: true, hasRepoScope: true });
+  });
+  test('network error and gh not logged in → disconnected', async () => {
+    const f = (async () => { throw new Error('fetch failed'); }) as unknown as typeof fetch;
+    expect(await githubConnectionStatus('t', f, () => false)).toMatchObject({ connected: false });
+  });
+  test('5xx but gh logged in → stays connected', async () => {
+    const f = fakeFetch({ status: 503, body: { message: 'Service unavailable' } });
+    expect(await githubConnectionStatus('t', f, () => true)).toMatchObject({ connected: true });
+  });
 });
 
 describe('ghLoggedIn', () => {
