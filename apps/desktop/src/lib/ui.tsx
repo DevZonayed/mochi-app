@@ -229,7 +229,7 @@ export interface EffortDialProps {
 export function EffortDial({ value = 'BALANCED', compact, onChange }: EffortDialProps) {
   const interactive = typeof onChange === 'function';
   const meta = EFFORT_META[value] || EFFORT_META.BALANCED;
-  const h = compact ? 28 : 34;
+  const h = compact ? 24 : 34;
   const cycle = () => { const i = EFFORT_STOPS.indexOf(value); onChange!(EFFORT_STOPS[(i + 1) % 4]); };
   return (
     <button onClick={() => interactive && cycle()} disabled={!interactive}
