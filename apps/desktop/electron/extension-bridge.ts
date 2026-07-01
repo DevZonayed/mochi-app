@@ -31,6 +31,9 @@ export interface ExtensionStatus {
   port: number;
   token: string;
   peers: { clientId: string; profile: string; active: boolean }[];
+  /** True when the user pinned the browser open (Project settings → Open browser),
+      so the agent's end-of-turn auto-close leaves it alone. */
+  held: boolean;
 }
 
 export class ExtensionBridge {
@@ -43,6 +46,15 @@ export class ExtensionBridge {
   // app→extension RPC (browser automation): outstanding requests keyed by id.
   private reqSeq = 1;
   private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  /** True once the AGENT has opened a Mochi-managed browser session this run
+      (navigate / session_start / open_tab) and hasn't ended it. Drives the
+      end-of-turn auto-close: a browser job that opened a tab tidies up after
+      itself instead of leaving the window hanging around. Cleared on session_end. */
+  private agentSessionOpen = false;
+  /** Manual "keep the browser open" pin. Set when the user opens the browser
+      themselves (Project settings → Open browser) so the end-of-turn auto-close
+      LEAVES it alone — they asked for it, they close it. */
+  private browserHold = false;
 
   constructor(
     private store: Store,
@@ -93,7 +105,7 @@ export class ExtensionBridge {
 
   // ── status (for the Settings panel + app-side takeover) ──────────────────
   status(): ExtensionStatus {
-    return { running: this.listening, port: this.port, token: this.store.extensionToken, peers: this.peerList() };
+    return { running: this.listening, port: this.port, token: this.store.extensionToken, peers: this.peerList(), held: this.browserHold };
   }
   /** App-side takeover ("Make active" in Settings). */
   setActiveFromApp(clientId: string): ExtensionStatus {
@@ -243,15 +255,20 @@ export class ExtensionBridge {
     }
   }
 
-  /** Deliver text into a chat as a new turn. If the chat has a job in flight,
-      interrupt it first — the app's steer model (the SDK session resumes with the
-      prior context, so steering and "send next message" are the same operation). */
+  /** Deliver text into a chat as a new turn. NEVER interrupts a live turn —
+      previously this called cancelJob on any running job for the session, which
+      kept STOPPING the operator's run out from under them when they added an
+      element comment / pasted from the extension while the agent was busy
+      (image_nqm3a.png — same root cause as the front-end "send mid-stream
+      cancels the run" bug). Now, when the session is busy, we refuse the
+      delivery cleanly so the caller can choose to retry or store the message
+      for the operator. The red abort button in the chat is the only stop. */
   private async deliver(projectId: string, sessionId: string | null, text: string): Promise<{ sessionId: string; jobId: string }> {
     if (!projectId) throw new Error('projectId required');
     if (!text.trim()) throw new Error('message text required');
     if (sessionId) {
       const running = this.store.listJobs(projectId, sessionId).find(j => j.status === 'running' || j.status === 'pending');
-      if (running) { try { await this.dispatch('cancelJob', { id: running.id }); } catch { /* already gone */ } }
+      if (running) throw new Error('session busy — the agent is mid-turn; try again when it finishes');
     }
     const res = await this.dispatch('sendChat', { projectId, sessionId: sessionId ?? undefined, text }) as { session: { id: string }; job: { id: string } };
     return { sessionId: res.session.id, jobId: res.job.id };
@@ -292,6 +309,24 @@ export class ExtensionBridge {
   /** The active profile's label (for agent/UI context), or null. */
   activeProfile(): string | null { return this.activePeer()?.profile ?? null; }
 
+  // ── browser-session ownership (auto-close vs. manual "keep open") ──────────
+  /** Did the agent open a Mochi-managed session that's still around? */
+  hasAgentSession(): boolean { return this.agentSessionOpen; }
+  /** Has the user pinned the browser open (Project settings → Open browser)? */
+  isBrowserHeld(): boolean { return this.browserHold; }
+  /** Pin / unpin the manual hold. Pinning also clears the agent-opened flag so
+      the very next end-of-turn doesn't try to close a window the user now owns. */
+  setBrowserHold(on: boolean): void { this.browserHold = on; if (on) this.agentSessionOpen = false; }
+  /** End the agent-opened session and close its tabs — the end-of-turn tidy-up.
+      No-op when nothing is open, no profile is connected, or the user pinned it
+      open. Best-effort: a failure here never fails the run. */
+  async closeAgentSession(): Promise<void> {
+    if (this.browserHold || !this.agentSessionOpen) return;
+    this.agentSessionOpen = false;
+    if (!this.activePeer()) return;
+    try { await this.request('session_end', { closeTabs: true }); } catch { /* already gone */ }
+  }
+
   /** Run a browser-automation command (navigate/click/snapshot/type/…) against the
       ACTIVE profile and resolve with its result. The extension already dispatches
       `{id,type,params,clientId}` through its automation switch and replies
@@ -303,9 +338,22 @@ export class ExtensionBridge {
     const id = `a${this.reqSeq++}`;
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => { if (this.pending.delete(id)) reject(new Error(`browser '${type}' timed out after ${Math.round(timeoutMs / 1000)}s`)); }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, {
+        resolve: (v) => { this.trackSessionLifecycle(type); resolve(v); },
+        reject,
+        timer,
+      });
       this.send(peer.ws, { id, type, params, clientId: peer.clientId });
     });
+  }
+
+  /** Note when a browser RPC opened or closed a Mochi-managed session so the
+      end-of-turn auto-close knows whether there's anything to tidy up. A manual
+      hold (user pinned the browser) suppresses the "opened" flag — their tabs
+      aren't the agent's to close. */
+  private trackSessionLifecycle(type: string): void {
+    if (type === 'session_end') this.agentSessionOpen = false;
+    else if ((type === 'navigate' || type === 'session_start' || type === 'open_tab') && !this.browserHold) this.agentSessionOpen = true;
   }
 
   private rejectAllPending(reason: string): void {

@@ -61,6 +61,15 @@ export const RichComposer = React.forwardRef<RichComposerHandle, Props>(function
   const elRef = React.useRef<HTMLDivElement>(null);
   const composing = React.useRef(false);
   const [empty, setEmpty] = React.useState(true);
+  // Latest props live in a ref so the notification `flush` can be a STABLE
+  // callback (no `props` in its dep array). That keeps the rAF scheduler and
+  // the imperative handle from being rebuilt on every parent render, and the
+  // flush always reads the freshest callbacks when it actually fires.
+  const propsRef = React.useRef(props); propsRef.current = props;
+  // Last chips signature — lets `flush` SKIP the (relatively expensive) onChips
+  // parent notification while the user is just typing plain text (no chips
+  // added/removed). Normal typing therefore causes NO attachments reconcile.
+  const lastChipSigRef = React.useRef('');
 
   const serialize = React.useCallback((): string => {
     const root = elRef.current; if (!root) return '';
@@ -75,21 +84,53 @@ export const RichComposer = React.forwardRef<RichComposerHandle, Props>(function
       if (/^(DIV|P)$/.test(e.tagName)) out += '\n';
     };
     for (const c of Array.from(root.childNodes)) walk(c);
-    return out.replace(/ /g, ' ').replace(/\n{3,}/g, '\n\n').replace(/[ \t\n]+$/, '');
+    return out.replace(/ /g, ' ').replace(/\n{3,}/g, '\n\n').replace(/[ \t\n]+$/, '');
   }, []);
 
-  const emit = React.useCallback(() => {
+  // The ONE place that notifies the parent. Reads propsRef so it's stable.
+  // Folds mention-detection in so a single flush covers text + chips + caret.
+  const flush = React.useCallback(() => {
     const root = elRef.current; if (!root) return;
-    props.onTextChange(serialize());
+    const p = propsRef.current;
+    p.onTextChange(serialize());
     setEmpty(!root.textContent && !root.querySelector('[data-chip]'));
-    if (props.onChips) {
-      const chips = Array.from(root.querySelectorAll('[data-chip]')) as HTMLElement[];
+    const chips = Array.from(root.querySelectorAll('[data-chip]')) as HTMLElement[];
+    if (p.onChips) {
       const hasBrowser = chips.some(c => c.dataset.chip === 'mention' && c.dataset.id === 'browser');
       const files = chips.filter(c => c.dataset.chip === 'file').map(c => ({ name: c.dataset.name ?? '', path: c.dataset.path ?? '', isDir: c.dataset.dir === '1' }));
       const attachIds = chips.filter(c => c.dataset.chip === 'attach').map(c => c.dataset.attachId ?? '').filter(Boolean);
-      props.onChips({ hasBrowser, files, attachIds });
+      // Skip the parent notification entirely when the chip set is unchanged —
+      // plain typing no longer churns the parent's attachments state.
+      const sig = `${hasBrowser ? 1 : 0}|${files.map(f => f.path).join(',')}|${attachIds.join(',')}`;
+      if (sig !== lastChipSigRef.current) {
+        lastChipSigRef.current = sig;
+        p.onChips({ hasBrowser, files, attachIds });
+      }
     }
-  }, [serialize, props]);
+    if (p.onMention) {
+      const sel = window.getSelection();
+      if (!sel || !sel.isCollapsed || !sel.anchorNode || sel.anchorNode.nodeType !== Node.TEXT_NODE || !root.contains(sel.anchorNode)) p.onMention(null);
+      else {
+        const before = (sel.anchorNode.nodeValue ?? '').slice(0, sel.anchorOffset);
+        const m = before.match(MENTION_RE);
+        p.onMention(m ? m[2].toLowerCase() : null);
+      }
+    }
+  }, [serialize]);
+
+  // rAF coalescing: input + keyup + mouseup + compositionend in the same frame
+  // collapse into a SINGLE parent notification. Without this, each keystroke
+  // fired `onInput` (one batched render) AND `onKeyUp` (a SECOND render) of the
+  // very large chat component — the cause of the "typing hangs the app" jank.
+  const rafRef = React.useRef<number | null>(null);
+  const scheduleFlush = React.useCallback(() => {
+    if (rafRef.current != null) return;
+    rafRef.current = requestAnimationFrame(() => { rafRef.current = null; flush(); });
+  }, [flush]);
+  const cancelFlush = React.useCallback(() => {
+    if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+  }, []);
+  React.useEffect(() => cancelFlush, [cancelFlush]);
 
   const buildChip = (chip: ComposerChip): HTMLElement => {
     const span = document.createElement('span');
@@ -121,7 +162,11 @@ export const RichComposer = React.forwardRef<RichComposerHandle, Props>(function
     range.insertNode(frag);
     const last = tail ?? nodes[nodes.length - 1];
     if (last) { const nr = document.createRange(); nr.setStartAfter(last); nr.collapse(true); sel?.removeAllRanges(); sel?.addRange(nr); }
-    emit();
+    // Imperative mutations flush SYNCHRONOUSLY (the parent must see the new
+    // chip/text immediately, e.g. right after insertChips/clear). Cancel any
+    // pending coalesced rAF so we never double-notify.
+    cancelFlush();
+    flush();
   };
 
   const placeCaretEnd = () => {
@@ -133,19 +178,20 @@ export const RichComposer = React.forwardRef<RichComposerHandle, Props>(function
   };
 
   // Detect an `@word` token immediately before the caret (anywhere in the text).
+  // Kept for any external caller; mention detection now also runs inside `flush`.
   const checkMention = React.useCallback(() => {
-    if (!props.onMention) return;
+    if (!propsRef.current.onMention) return;
     const root = elRef.current; const sel = window.getSelection();
-    if (!root || !sel || !sel.isCollapsed || !sel.anchorNode || sel.anchorNode.nodeType !== Node.TEXT_NODE || !root.contains(sel.anchorNode)) { props.onMention(null); return; }
+    if (!root || !sel || !sel.isCollapsed || !sel.anchorNode || sel.anchorNode.nodeType !== Node.TEXT_NODE || !root.contains(sel.anchorNode)) { propsRef.current.onMention(null); return; }
     const before = (sel.anchorNode.nodeValue ?? '').slice(0, sel.anchorOffset);
     const m = before.match(MENTION_RE);
-    props.onMention(m ? m[2].toLowerCase() : null);
-  }, [props]);
+    propsRef.current.onMention(m ? m[2].toLowerCase() : null);
+  }, []);
 
   React.useImperativeHandle(ref, (): RichComposerHandle => ({
     focus: () => elRef.current?.focus(),
-    clear: () => { const root = elRef.current; if (root) { root.innerHTML = ''; emit(); } },
-    setText: (plain: string) => { const root = elRef.current; if (root) { root.textContent = plain; placeCaretEnd(); emit(); } },
+    clear: () => { const root = elRef.current; if (root) { root.innerHTML = ''; cancelFlush(); flush(); } },
+    setText: (plain: string) => { const root = elRef.current; if (root) { root.textContent = plain; placeCaretEnd(); cancelFlush(); flush(); } },
     insertChips: (specs: ComposerChip[]) => insertNodes(specs.map(buildChip), true),
     getText: () => serialize(),
     applyMention: (spec: ComposerChip) => {
@@ -161,18 +207,18 @@ export const RichComposer = React.forwardRef<RichComposerHandle, Props>(function
       sel.removeAllRanges(); sel.addRange(r);
       insertNodes([buildChip(spec)], true);
     },
-  }), [emit, serialize, checkMention]);
+  }), [flush, serialize, checkMention, cancelFlush, insertNodes]);
 
   // Remove a chip when its ✕ is clicked.
   const onClick = (e: React.MouseEvent) => {
     const btn = (e.target as HTMLElement).closest('[data-rm]');
-    if (btn) { e.preventDefault(); btn.closest('[data-chip]')?.remove(); emit(); elRef.current?.focus(); }
+    if (btn) { e.preventDefault(); btn.closest('[data-chip]')?.remove(); cancelFlush(); flush(); elRef.current?.focus(); }
   };
 
   // Let the parent claim the paste (images → vision, long text → attachment); if it
   // didn't, insert plain text so the editor never accumulates pasted rich HTML.
   const handlePaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
-    props.onPaste?.(e);
+    propsRef.current.onPaste?.(e);
     if (e.defaultPrevented) return;
     e.preventDefault();
     const text = e.clipboardData.getData('text/plain');
@@ -191,14 +237,14 @@ export const RichComposer = React.forwardRef<RichComposerHandle, Props>(function
         role="textbox"
         aria-multiline="true"
         spellCheck
-        onInput={() => { emit(); checkMention(); }}
-        onKeyUp={checkMention}
-        onMouseUp={checkMention}
+        onInput={scheduleFlush}
+        onKeyUp={scheduleFlush}
+        onMouseUp={scheduleFlush}
         onClick={onClick}
         onKeyDown={props.onKeyDown}
         onPaste={handlePaste}
         onCompositionStart={() => { composing.current = true; }}
-        onCompositionEnd={() => { composing.current = false; emit(); }}
+        onCompositionEnd={() => { composing.current = false; cancelFlush(); flush(); }}
         style={{ outline: 'none', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--ink)', font: '400 var(--fs-body)/1.5 var(--font-text)', padding: '6px 0', minHeight: 24, maxHeight: 150, overflowY: 'auto', ...props.style }}
       />
     </div>

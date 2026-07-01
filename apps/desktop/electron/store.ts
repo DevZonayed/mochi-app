@@ -11,6 +11,7 @@ import { app } from 'electron';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import type { BrowserSettings } from './browser/types.js';
 import { quietDeadline } from './whatsapp-quiet.js';
 import { WaStore, type WaChatMeta, type WaStoredMessage, type WaMessageInput, type WaChatKind } from './wa-store.js';
 import type { RemoteDevice } from './relay.js';
@@ -38,6 +39,14 @@ export interface Workspace { id: string; name: string; budgetCap: number; create
 export interface Project {
   id: string; workspaceId: string; name: string; template: string; instructions: string; color: string;
   kind?: ProjectKind; path?: string; repoUrl?: string;
+  /** GitHub-first dual-repo bootstrap: the slug for both the code repo
+      (under whichever owner was picked) AND the memory repo (always
+      \${user}/\${slug}-memory). When set, openProject pulls the memory clone
+      + watches STATE.md for auto-commit. Absent on legacy projects. */
+  memorySlug?: string;
+  /** The companion memory repo's https url (for the renderer to surface as
+      a "View memory" link). Optional + redundant with memorySlug. */
+  memoryRepoUrl?: string;
   /** Worktree base branch override (else auto-detected from origin/HEAD). */
   defaultBaseBranch?: string;
   /** Shell script run once in each new session worktree (e.g. install deps). */
@@ -52,6 +61,10 @@ export interface Project {
   runMode?: 'concurrent' | 'nonconcurrent';
   /** Manual display order from drag-and-drop. Lower = earlier. Unset → sorts by createdAt. */
   order?: number;
+  /** Reversible soft-hide: true → dropped from the default Projects view (desktop
+      + mobile). Absent/false = visible. Toggled via updateProject; syncs like any
+      other field on the updatedAt delta-sync. */
+  hidden?: boolean;
   createdAt: number;
   /** Set on create + bumped on every mutation (incl. reorder). Drives the
       relay's delta-sync filter (/api/sync?since=ts). */
@@ -60,8 +73,8 @@ export interface Project {
 /** One step of an agent run, in order: prose, a tool/skill invocation, or the
     final result. The chat renders these as separate blocks with timings. */
 export interface TranscriptItem {
-  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image';
-  /** text/result: the content. thinking: the model's reasoning prose. tool: the HUMAN label (Bash description, relative file path, search pattern…). ask: prompt. review: the findings. image: a short caption (the prompt). */
+  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image' | 'steer';
+  /** text/result: the content. thinking: the model's reasoning prose. tool: the HUMAN label (Bash description, relative file path, search pattern…). ask: prompt. review: the findings. image: a short caption (the prompt). steer: a user message injected mid-turn (the agent picks it up at the next boundary without the turn being killed + reseeded). */
   text: string;
   /** tool: tool name. review: the reviewer engine's label. */
   name?: string;
@@ -149,6 +162,10 @@ export interface Job {
   inputImages?: ChatImage[];
   /** Non-image files attached to the user's message (text inlined, files referenced). */
   inputFiles?: ChatFile[];
+  /** Hidden per-turn context (e.g. browser page-context from the Send-hint overlay).
+      Appended to the model's prompt but NEVER rendered in the transcript (which shows
+      `input` only) — so our context-gathering format isn't exposed to the user. */
+  agentContext?: string;
   /** Structured run log (assistant text blocks, tool calls, result) — capped. */
   transcript?: TranscriptItem[];
   /** Epoch ms when the SDK iterator will be woken back up by a session-scoped
@@ -168,7 +185,46 @@ export interface Job {
       terminal-done bucket so the renderer holds its message queue (no burst
       drain) until the session is genuinely ready again. */
   pausedReason?: 'wakeup' | 'limit' | null;
+  /** Latest request's total input size (input + cache-read + cache-creation tokens) — i.e.
+      how full the model's context window was on the most recent turn. Lets the native UI show
+      a "context remaining" gauge against the model's window size. Output-only `tokens` above is
+      unrelated (it counts generated tokens for cost). */
+  contextTokens?: number;
+  /** Epoch ms when the claude.ai usage limit lifts, if this turn was blocked by it — so the UI
+      can surface a "Claude limit · resets in …" hint. null/undefined when not limited. */
+  limitResetsAt?: number | null;
+  /** True when this (terminal 'done') turn was capped by the claude.ai usage limit and
+      an auto-continue is scheduled for reset time. The composer queue drainer HOLDS while
+      set so queued messages don't flush back-to-back against the same wall. Stays true even
+      when the reset time couldn't be parsed (unlike `limitResetsAt`); cleared when a fresher
+      turn supersedes this one. */
+  blockedByLimit?: boolean;
   createdAt: number; updatedAt: number;
+}
+
+interface JobPageCursor {
+  createdAt: number;
+  updatedAt: number;
+  id: string;
+}
+
+function jobPageCursor(job: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>): string {
+  return `${job.createdAt}:${job.updatedAt}:${encodeURIComponent(job.id)}`;
+}
+
+function parseJobPageCursor(raw?: string): JobPageCursor | null {
+  if (!raw) return null;
+  const [createdRaw, updatedRaw, ...idParts] = raw.split(':');
+  const createdAt = Number(createdRaw);
+  const updatedAt = Number(updatedRaw);
+  const encodedId = idParts.join(':');
+  if (!Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || !encodedId) return null;
+  try { return { createdAt, updatedAt, id: decodeURIComponent(encodedId) }; }
+  catch { return null; }
+}
+
+function compareJobsNewestFirst(a: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>, b: Pick<Job, 'createdAt' | 'updatedAt' | 'id'>): number {
+  return (b.createdAt - a.createdAt) || (b.updatedAt - a.updatedAt) || b.id.localeCompare(a.id);
 }
 
 /** A chat thread inside a project. Each turn is a Job (sessionId set), so the
@@ -221,6 +277,25 @@ export interface ChatSession {
       reviews. Default OFF — the silent "only review when files changed"
       heuristic was confusing operators. The toggle lives next to autopilot. */
   reviewerEnabled?: boolean;
+  /** "Continue from here" provenance: set on a session that was forked off a
+      MERGED ancestor session. Drives the chat's `← Continued from "<title>"`
+      link AND the seed system-context card the renderer shows above the empty
+      transcript. The continuation session is otherwise a normal session — the
+      engine doesn't auto-replay the prior transcript; the operator can ask for
+      a summary or specifics if needed. */
+  continuedFrom?: {
+    sessionId: string;
+    title: string;
+    prNumber?: number;
+    mergedAt?: number;
+    baseRefName?: string;
+  };
+  /** T8: last "additional instructions" the operator typed into the AI
+      conflict-resolve dialog for THIS chat. Pre-fills the textarea on
+      re-runs so repeat operators don't have to re-type the same hint
+      ("prefer master's schema migration", etc.). Plain string — verbatim
+      forwarded to the agent, no parsing. Capped at 2KB by the IPC handler. */
+  conflictResolveHint?: string;
   createdAt: number; updatedAt: number;
 }
 export interface Approval {
@@ -355,7 +430,7 @@ export interface Roles {
   /** Reviewer model — reviews it, or 'off'. */
   reviewer: RoleChoice | 'off';
 }
-export const DEFAULT_ROLES: Roles = { primary: { engine: 'claude', model: 'opus' }, reviewer: 'off' };
+export const DEFAULT_ROLES: Roles = { primary: { engine: 'claude', model: 'claude-opus-4-8' }, reviewer: 'off' };
 export interface Routing {
   /** Master agent — runs jobs. Mirrors roles.primary.engine for back-compat. */
   master: EngineId;
@@ -557,8 +632,10 @@ export interface AppSettings {
   notifications?: NotificationSettings;
   /** Opt-in: try a direct desktop↔phone WebRTC channel before the relay (default off). */
   p2pEnabled?: boolean;
+  /** Playwright-backed per-project browser (native app). */
+  browser?: BrowserSettings;
 }
-export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], p2pEnabled: false, notifications: { ...DEFAULT_NOTIFICATIONS } };
+export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], p2pEnabled: false, notifications: { ...DEFAULT_NOTIFICATIONS }, browser: { enabled: true, headless: false } };
 
 export interface BudgetData { cap: number; spent: number; byProject: { projectId: string; name: string; color: string; spent: number }[] }
 export interface CostsData {
@@ -778,7 +855,7 @@ export class Store {
       if (this.data.routing && !this.data.routing.roles) {
         const r = this.data.routing;
         this.data.routing.roles = {
-          primary: { engine: r.master ?? 'claude', model: (r.master ?? 'claude') === 'claude' ? 'opus' : undefined },
+          primary: { engine: r.master ?? 'claude', model: (r.master ?? 'claude') === 'claude' ? 'claude-opus-4-8' : undefined },
           reviewer: r.reviewer && r.reviewer !== 'off' ? { engine: r.reviewer } : 'off',
         };
         dirty = true;
@@ -1044,19 +1121,20 @@ export class Store {
     while (taken.has(`${wanted} v${n}`)) n++;
     return `${wanted} v${n}`;
   }
-  createProject(args: { name: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string }): Project {
+  createProject(args: { name: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string; memorySlug?: string; memoryRepoUrl?: string }): Project {
     const ws = this.data.workspace ?? this.createWorkspace('My Workspace');
     const t = now();
     const p: Project = {
       id: id(), workspaceId: ws.id, name: this.uniqueProjectName(args.name),
       template: args.template ?? 'claude-code', instructions: args.instructions ?? '', color: args.color ?? 'blue',
       kind: args.kind, path: args.path, repoUrl: args.repoUrl,
+      memorySlug: args.memorySlug, memoryRepoUrl: args.memoryRepoUrl,
       createdAt: t, updatedAt: t,
     };
     this.data.projects.push(p); this.save();
     return p;
   }
-  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode'>>): Project {
+  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden'>>): Project {
     const cur = this.getProject(projectId);
     if (!cur) throw Object.assign(new Error('project not found'), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });
@@ -1115,14 +1193,22 @@ export class Store {
     }
     return used;
   }
-  createSession(projectId: string, title: string, codename?: string): ChatSession {
+  /** Create a chat. `opts.baseBranch` pins the branch the session's worktree forks
+      from when the engine first runs (`engine.ts` reads `session.baseBranch`
+      and passes it into `ensureSessionWorktree`). Default behavior — omit baseBranch —
+      keeps the existing `resolveBaseBranch(origin/HEAD → current → 'main')` flow.
+      `opts.continuedFrom` seeds the continued-from link for sessions spawned via
+      the merged-session "Continue from here" affordance (T7). */
+  createSession(projectId: string, title: string, codename?: string, opts?: { baseBranch?: string; continuedFrom?: ChatSession['continuedFrom'] }): ChatSession {
     const t = now();
     const s: ChatSession = { id: id(), projectId, title: (title.trim() || 'New chat').slice(0, 60), createdAt: t, updatedAt: t };
     if (codename) s.codename = codename;
+    if (opts?.baseBranch && opts.baseBranch.trim()) s.baseBranch = opts.baseBranch.trim();
+    if (opts?.continuedFrom) s.continuedFrom = opts.continuedFrom;
     this.data.sessions.push(s); this.save();
     return s;
   }
-  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt' | 'codename' | 'branchRenamedAt' | 'autoPilot' | 'reviewerEnabled'>>): ChatSession {
+  updateSession(sessionId: string, patch: Partial<Pick<ChatSession, 'title' | 'sdkSessionId' | 'primary' | 'reviewer' | 'branch' | 'worktreePath' | 'baseBranch' | 'archivedAt' | 'codename' | 'branchRenamedAt' | 'autoPilot' | 'reviewerEnabled' | 'conflictResolveHint'>>): ChatSession {
     const s = this.getSession(sessionId);
     if (!s) throw Object.assign(new Error('session not found'), { statusCode: 404 });
     Object.assign(s, patch, { updatedAt: now() });
@@ -1203,8 +1289,31 @@ export class Store {
     if (sessionId) return all.filter(j => j.sessionId === sessionId);
     return projectId ? all.filter(j => j.projectId === projectId) : all.slice(0, 200);
   }
+  listJobPage(opts: { projectId?: string; sessionId?: string; before?: number; cursor?: string; limit?: number }): { jobs: Job[]; total: number; hasMore: boolean; nextBefore: number | null; nextCursor: string | null } {
+    const requested = Number.isFinite(opts.limit) ? Math.floor(Number(opts.limit)) : 30;
+    const limit = Math.max(1, Math.min(100, requested));
+    const before = Number.isFinite(opts.before) ? Number(opts.before) : null;
+    const cursor = parseJobPageCursor(opts.cursor);
+    const all = this.data.jobs
+      .filter(j => opts.sessionId ? j.sessionId === opts.sessionId : opts.projectId ? j.projectId === opts.projectId : true)
+      .sort(compareJobsNewestFirst);
+    const pageable = cursor
+      ? all.filter(j => compareJobsNewestFirst(j, cursor) > 0)
+      : before == null ? all : all.filter(j => j.createdAt < before);
+    const slice = pageable.slice(0, limit + 1);
+    const pageSlice = slice.slice(0, limit);
+    const oldest = pageSlice[pageSlice.length - 1] ?? null;
+    const jobs = pageSlice.slice().reverse();
+    return {
+      jobs,
+      total: all.length,
+      hasMore: slice.length > limit,
+      nextBefore: oldest ? oldest.createdAt : null,
+      nextCursor: oldest ? jobPageCursor(oldest) : null,
+    };
+  }
   getJob(jobId: string): Job | undefined { return this.data.jobs.find(j => j.id === jobId); }
-  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[], inputFiles?: ChatFile[]): Job {
+  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[], inputFiles?: ChatFile[], agentContext?: string): Job {
     const t = now();
     const j: Job = {
       id: id(), projectId, title: title || input.slice(0, 60) || (inputImages?.length ? 'Image' : inputFiles?.length ? inputFiles[0].name : 'Message'), status: 'pending', phase: 'Queued', progress: 0,
@@ -1212,6 +1321,7 @@ export class Store {
       sessionId,
       ...(inputImages && inputImages.length ? { inputImages } : {}),
       ...(inputFiles && inputFiles.length ? { inputFiles } : {}),
+      ...(agentContext ? { agentContext } : {}),
       createdAt: t, updatedAt: t,
     };
     this.data.jobs.push(j);
@@ -1258,7 +1368,7 @@ export class Store {
       try { console.log(`[store] job prune: stripped=${stripped} deleted=${deleted} total=${this.data.jobs.length}`); } catch { /* */ }
     }
   }
-  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript' | 'pausedUntil' | 'pausedReason'>>): Job {
+  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript' | 'pausedUntil' | 'pausedReason' | 'contextTokens' | 'limitResetsAt' | 'blockedByLimit'>>): Job {
     const cur = this.getJob(jobId);
     if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });
@@ -1774,7 +1884,13 @@ export class Store {
       so the phone gets the chip's POSITION + name without the operator's home
       directory. */
   slimJobForRelay(j: Job): Job {
-    const scrub = (s: string): string => s.replace(/@(\/[^\s]+\/\.continuum\/Attachment\/([A-Za-z0-9._-]+))/g, (_m, _full: string, base: string) => `@.continuum/Attachment/${base}`);
+    // Path prefix uses `[^@\n]+?` (not `[^\s]+`) so project folders with spaces
+    // — eg `/Users/me/Desktop/Client Shared GIT/veni0004/` — still scrub instead
+    // of leaking the operator's home directory to the phone. Sub-directories
+    // under `Attachment/` (incl. a branch subfolder) are preserved so the relay
+    // still references the same on-disk file. Kept in lockstep with
+    // `scrubAbsPathsForRelay` in attachments.ts.
+    const scrub = (s: string): string => s.replace(/@(\/[^@\n]+?\/\.continuum\/Attachment\/((?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+))/g, (_m, _full: string, base: string) => `@.continuum/Attachment/${base}`);
     const rawOut = j.output && j.output.length > 16384 ? '…' + j.output.slice(-16384) : j.output;
     const out = rawOut ? scrub(rawOut) : rawOut;
     const tr = j.transcript;

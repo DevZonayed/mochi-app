@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { homedir } from 'node:os';
-import { toolLabel, relPath } from './tool-label.js';
+import { toolLabel, relPath, scrubInternalMcp } from './tool-label.js';
 
 const CWD = '/Users/me/proj';
 
@@ -85,5 +85,52 @@ describe('toolLabel', () => {
   it('degrades gracefully on empty / non-object input', () => {
     expect(toolLabel('Bash', null, CWD)).toEqual({ text: '' });
     expect(toolLabel('SomethingNew', { foo: 'bar' }, CWD).text).toBe('bar');
+  });
+
+  it('scrubs our in-app MCP plumbing out of any field we surface', () => {
+    // Bash description that happens to reference the internal tool name.
+    const r1 = toolLabel('Bash', { command: 'echo mcp__maestro__git_status', description: 'Probe mcp__maestro__git_status' }, CWD);
+    expect(r1.text).toBe('Probe Git status');
+    expect(r1.cmd).toBe('echo Git status');
+    // Generic fallback (description path) on a non-Bash tool.
+    expect(toolLabel('Task', { description: 'Call mcp__maestro__wa_send_message for confirmation' }, CWD).text)
+      .toBe('Call Wa send message for confirmation');
+  });
+
+  it('ToolSearch select:<list> renders a clean human-readable tool list (no mcp plumbing)', () => {
+    expect(toolLabel('ToolSearch', { query: 'select:mcp__maestro__git_status', max_results: 1 }, CWD).text)
+      .toBe('Git status');
+    expect(toolLabel('ToolSearch', { query: 'select:mcp__maestro__wa_send_message,mcp__maestro__wa_list_chats' }, CWD).text)
+      .toBe('Wa send message, Wa list chats');
+  });
+
+  it('ToolSearch keyword query falls through (scrubbed) — no special-case hijack', () => {
+    expect(toolLabel('ToolSearch', { query: 'whatsapp send' }, CWD).text).toBe('whatsapp send');
+    expect(toolLabel('ToolSearch', { query: 'find mcp__maestro__git_status helpers' }, CWD).text)
+      .toBe('find Git status helpers');
+  });
+
+  it('THIRD-PARTY mcp namespaces (mcp__github__*, etc.) are left alone — outside integrations stay visible', () => {
+    expect(scrubInternalMcp('mcp__github__create_issue')).toBe('mcp__github__create_issue');
+    expect(scrubInternalMcp('mcp__filesystem__read_file')).toBe('mcp__filesystem__read_file');
+  });
+});
+
+describe('scrubInternalMcp', () => {
+  it('replaces a bare `mcp__maestro__<tool>` with a prettified label', () => {
+    expect(scrubInternalMcp('mcp__maestro__git_status')).toBe('Git status');
+    expect(scrubInternalMcp('mcp__maestro__wa_send_message')).toBe('Wa send message');
+    expect(scrubInternalMcp('mcp__maestro__browser_click_at')).toBe('Browser click at');
+  });
+  it('replaces multiple occurrences inside one string', () => {
+    expect(scrubInternalMcp('first mcp__maestro__pr_create then mcp__maestro__git_push'))
+      .toBe('first Pr create then Git push');
+  });
+  it('is safe on empty / non-string input', () => {
+    expect(scrubInternalMcp('')).toBe('');
+    expect(scrubInternalMcp(undefined as unknown as string)).toBe(undefined as unknown as string);
+  });
+  it('does NOT touch third-party MCP servers (operator wants outside integrations visible)', () => {
+    expect(scrubInternalMcp('mcp__github__create_issue')).toBe('mcp__github__create_issue');
   });
 });

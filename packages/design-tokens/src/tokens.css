@@ -33,6 +33,18 @@
   --teal: #30B0C7;
   --indigo: #5856D6;
 
+  /* status colors — used by the chat-row git-state stripe (see SessionRow in
+     Workspace.tsx). 4 base tones + 4 "soft" variants for milder states. Map to
+     the existing iOS palette by default; theme files can override per surface. */
+  --color-muted:         rgba(60,60,67,0.30); /* matches --ink-tertiary in light */
+  --color-warning:       var(--orange);
+  --color-warning-soft:  color-mix(in srgb, var(--orange) 55%, transparent);
+  --color-info:          var(--blue);
+  --color-success:       var(--green);
+  --color-success-soft:  color-mix(in srgb, var(--green) 50%, transparent);
+  --color-danger:        var(--red);
+  --color-danger-soft:   color-mix(in srgb, var(--red) 55%, transparent);
+
   /* radii / motion */
   --r-card: 20px;
   --r-group: 12px;
@@ -66,6 +78,7 @@
 }
 
 [data-theme="dark"] {
+  --color-muted: rgba(235,235,245,0.30); /* matches --ink-tertiary in dark */
   --bg: #000000;
   --bg-elevated: #1C1C1E;
   --bg-grouped: rgba(44,44,46,0.66);

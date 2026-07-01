@@ -63,28 +63,32 @@ function useEngineMeta(): EngineMetaMap {
   });
   useEffect(() => {
     let alive = true;
-    Promise.all([
-      api.engineStatus().catch(() => null),
-      api.listModels().catch(() => [] as ModelGroup[]),
-    ]).then(([st, groups]) => {
-      if (!alive) return;
-      const e = (st ?? {}) as EngineStatuses;
-      const countFor = (engine: ModelId): number => {
-        if (engine === 'auto') return 0;
-        const ms = groups.flatMap((g) => g.provider?.toLowerCase().includes(engine) ? g.models : []);
-        return ms.length;
-      };
-      setMeta({
-        auto: {
-          available: !!(e.claude?.available || e.codex?.available),
-          reason: e.claude?.available || e.codex?.available ? '' : 'No engine ready on your Mac',
-          modelCount: groups.reduce((n, g) => n + (g.models?.length ?? 0), 0),
-        },
-        claude: { available: !!e.claude?.available, reason: e.claude?.reason ?? '', modelCount: countFor('claude') },
-        codex:  { available: !!e.codex?.available,  reason: e.codex?.reason ?? '',  modelCount: countFor('codex') },
+    const load = (refresh = false) => {
+      Promise.all([
+        api.engineStatus().catch(() => null),
+        api.listModels(refresh).catch(() => [] as ModelGroup[]),
+      ]).then(([st, groups]) => {
+        if (!alive) return;
+        const e = (st ?? {}) as EngineStatuses;
+        const countFor = (engine: ModelId): number => {
+          if (engine === 'auto') return 0;
+          const ms = groups.flatMap((g) => g.provider?.toLowerCase().includes(engine) ? g.models : []);
+          return ms.length;
+        };
+        setMeta({
+          auto: {
+            available: !!(e.claude?.available || e.codex?.available),
+            reason: e.claude?.available || e.codex?.available ? '' : 'No engine ready on your Mac',
+            modelCount: groups.reduce((n, g) => n + (g.models?.length ?? 0), 0),
+          },
+          claude: { available: !!e.claude?.available, reason: e.claude?.reason ?? '', modelCount: countFor('claude') },
+          codex:  { available: !!e.codex?.available,  reason: e.codex?.reason ?? '',  modelCount: countFor('codex') },
+        });
       });
-    });
-    return () => { alive = false; };
+    };
+    load(true);
+    const timer = setInterval(() => load(), 60_000);
+    return () => { alive = false; clearInterval(timer); };
   }, []);
   return meta;
 }

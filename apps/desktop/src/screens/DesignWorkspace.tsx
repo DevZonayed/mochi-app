@@ -16,13 +16,12 @@ import { ImageViewer } from '../lib/CodeView';
 import { api, IS_LOCAL, type Project, type ChatSession, type DesignComment, type InstalledSkill, type RegistrySkillSummary } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
 import { displayCodename } from '../lib/git-types';
-import { SessionStateDot } from './SessionStateDot';
-import { useSessionStateOnly } from '../lib/useSessionGitState';
+import { SessionActivityDot } from './SessionStateDot';
 
-/** Live state dot for the design session strip. */
+/** Live state dot for the design session strip. Shows a spinning ring while
+    the session is running, else the git/PR state dot. */
 function DSessionStateDot({ sessionId }: { sessionId: string }) {
-  const state = useSessionStateOnly(sessionId);
-  return <SessionStateDot state={state} size={7} reserveSpace />;
+  return <SessionActivityDot sessionId={sessionId} size={7} />;
 }
 
 const DEVICES = [
@@ -66,9 +65,9 @@ function HoSeg({ opts, val, onPick }: { opts: { key: string; label: string }[]; 
    scrollbar reads as chunky inside the canvas. Scoped via the .ds-scroll class. */
 const DS_SCROLL_CSS = `
 .ds-scroll { scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: var(--fill-secondary) transparent; }
-.ds-scroll::-webkit-scrollbar { width: 11px; height: 11px; }
+.ds-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
 .ds-scroll::-webkit-scrollbar-track { background: transparent; }
-.ds-scroll::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 9px; border: 3px solid transparent; background-clip: padding-box; }
+.ds-scroll::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 9px; border: 2px solid transparent; background-clip: padding-box; }
 .ds-scroll::-webkit-scrollbar-thumb:hover { background: var(--ink-quaternary, var(--fill-strong, var(--ink-tertiary))); background-clip: padding-box; }
 .ds-splitter { transition: background .12s ease; }
 .ds-splitter:hover, .ds-splitter.dragging { background: var(--blue); }

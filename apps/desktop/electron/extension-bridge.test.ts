@@ -124,7 +124,11 @@ describe('ExtensionBridge', () => {
     await waitFor(() => lastLifecycle(b.msgs)?.type === 'promoted');
   });
 
-  it('routes send_message → cancel the running job, then sendChat', async () => {
+  it('routes send_message → refuses delivery when a turn is already running (no cancel, no sendChat)', async () => {
+    // New behaviour (image_nqm3a.png): extension-driven deliveries NEVER cancel
+    // a live turn. The operator's red abort button is the only stop control.
+    // When the session is busy, deliver() rejects so the extension can show
+    // "agent busy" instead of silently stopping the run.
     const calls: { method: string; params: any }[] = [];
     const dispatch = async (method: string, params: any) => {
       calls.push({ method, params });
@@ -137,10 +141,29 @@ describe('ExtensionBridge', () => {
     await waitFor(() => lastOfType(a.msgs, 'welcome'));
     a.ws.send(JSON.stringify({ id: 5, type: 'send_message', params: { projectId: 'p1', sessionId: 's1', text: 'hello' } }));
     const reply = await waitFor(() => a.msgs.find(m => m.id === 5));
+    expect(reply.ok).toBe(false);
+    expect(String(reply.error)).toMatch(/busy/i);
+    // Critically: neither cancelJob NOR sendChat was called — the running turn is untouched.
+    expect(calls.map(c => c.method)).toEqual([]);
+  });
+
+  it('routes send_message → just sendChat when the session is idle (still happy-path)', async () => {
+    const calls: { method: string; params: any }[] = [];
+    const dispatch = async (method: string, params: any) => {
+      calls.push({ method, params });
+      if (method === 'sendChat') return { session: { id: 's1' }, job: { id: 'j9' } };
+      return { ok: true };
+    };
+    // No running jobs for this session.
+    const store = fakeStore({ jobs: [] });
+    const { port } = startBridge(store, dispatch);
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    a.ws.send(JSON.stringify({ id: 5, type: 'send_message', params: { projectId: 'p1', sessionId: 's1', text: 'hello' } }));
+    const reply = await waitFor(() => a.msgs.find(m => m.id === 5));
     expect(reply.ok).toBe(true);
     expect(reply.result).toEqual({ sessionId: 's1', jobId: 'j9' });
-    expect(calls.map(c => c.method)).toEqual(['cancelJob', 'sendChat']);
-    expect(calls[0].params).toEqual({ id: 'jr' });
+    expect(calls.map(c => c.method)).toEqual(['sendChat']);
   });
 
   it('rejects an unknown action', async () => {
@@ -241,5 +264,65 @@ describe('ExtensionBridge', () => {
     await waitFor(() => lastOfType(a.msgs, 'welcome'));
     autoReplyBrowser(a.ws, () => ({ ok: false, error: 'tab crashed' }));
     await expect(bridge.request('click', { ref: '.x' })).rejects.toThrow(/tab crashed/);
+  });
+
+  // ── browser-session ownership (end-of-turn auto-close vs. manual "keep open") ──
+  it('marks an agent session open after navigate, and closeAgentSession ends it', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    const seen: string[] = [];
+    autoReplyBrowser(a.ws, (type) => { seen.push(type); return { ok: true, result: {} }; });
+
+    expect(bridge.hasAgentSession()).toBe(false);
+    await bridge.request('navigate', { url: 'https://x.test' });
+    expect(bridge.hasAgentSession()).toBe(true);   // agent opened a managed session
+
+    await bridge.closeAgentSession();
+    expect(bridge.hasAgentSession()).toBe(false);  // tidied up
+    expect(seen).toContain('session_end');         // and asked the browser to close tabs
+  });
+
+  it('session_end (agent-driven) clears the open flag', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    autoReplyBrowser(a.ws, () => ({ ok: true, result: {} }));
+    await bridge.request('open_tab', { url: 'https://x.test' });
+    expect(bridge.hasAgentSession()).toBe(true);
+    await bridge.request('session_end', { closeTabs: true });
+    expect(bridge.hasAgentSession()).toBe(false);
+  });
+
+  it('a manual hold suppresses agent-session tracking and no-ops closeAgentSession', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    const seen: string[] = [];
+    autoReplyBrowser(a.ws, (type) => { seen.push(type); return { ok: true, result: {} }; });
+
+    bridge.setBrowserHold(true);
+    expect(bridge.isBrowserHeld()).toBe(true);
+    expect(bridge.status().held).toBe(true);
+
+    await bridge.request('navigate', { url: 'https://x.test' });
+    expect(bridge.hasAgentSession()).toBe(false);  // user pinned it — not the agent's to track
+
+    await bridge.closeAgentSession();              // must be a no-op while held
+    expect(seen).not.toContain('session_end');
+
+    bridge.setBrowserHold(false);
+    expect(bridge.status().held).toBe(false);
+  });
+
+  it('pinning the browser open clears any prior agent-opened flag', async () => {
+    const { bridge, port } = startBridge(fakeStore());
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    autoReplyBrowser(a.ws, () => ({ ok: true, result: {} }));
+    await bridge.request('navigate', { url: 'https://x.test' });
+    expect(bridge.hasAgentSession()).toBe(true);
+    bridge.setBrowserHold(true);                    // user takes ownership
+    expect(bridge.hasAgentSession()).toBe(false);   // agent flag cleared → no auto-close
   });
 });

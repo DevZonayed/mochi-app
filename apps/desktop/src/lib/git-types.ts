@@ -16,6 +16,22 @@ export interface PrStatus {
   mergeable: boolean | null;
   mergeableState: 'clean' | 'dirty' | 'blocked' | 'behind' | 'unstable' | 'draft' | 'unknown';
   checks: PrCheck[];
+  /** Branch this PR targets — populated by getPullStatus from REST `base.ref`.
+      Surfaced to the renderer so the merged banner can show "Merged to <base>"
+      and the Continue handler knows where to fork the next session. */
+  baseRefName?: string;
+  /** Epoch-ms timestamp of the merge. ONLY present when `state === 'merged'`. */
+  mergedAt?: number;
+}
+export interface LocalSnapshot {
+  lastSubject: string | null;
+  lastCommitAt: number | null;
+  dirtyFiles: number;
+}
+export interface LocalSnapshot {
+  lastSubject: string | null;
+  lastCommitAt: number | null;
+  dirtyFiles: number;
 }
 export interface SessionGitStatus {
   sessionId: string;
@@ -25,8 +41,63 @@ export interface SessionGitStatus {
   pr: PrStatus | null;
   state: SessionGitState;
   lastCheckedAt: number;
+  /** Whether GitHub was queried for this session's PR yet (mirror of
+      electron/pr-state.ts). `false` on the cheap local-only path; the workspace
+      overview uses it to avoid surfacing a PR-derivable state it can't yet
+      confirm (see workspace-overview.ts). */
+  prChecked?: boolean;
+  snapshot?: LocalSnapshot;
 }
 export interface GithubConnection { connected: boolean; login: string | null; scopes: string[] | null; hasRepoScope: boolean; }
+
+/* ── PR action human-confirm payloads (mirror electron/pr-state.ts) ──── */
+
+export interface MergePreview {
+  prNumber: number;
+  prTitle: string;
+  prUrl: string;
+  mergeMethod: 'merge' | 'squash' | 'rebase' | 'unknown';
+  headSha: string | null;
+  mergeable: boolean | null;
+  mergeableState: PrStatus['mergeableState'];
+  checks: PrCheck[];
+}
+export interface ResolvePreview {
+  prNumber: number | null;
+  prTitle: string | null;
+  prUrl: string | null;
+  base: string | null;
+  branch: string | null;
+  conflictedFiles: string[];
+}
+export type MergePreviewResult = { ok: true; preview: MergePreview } | { ok: false; reason: string };
+export type ResolvePreviewResult = { ok: true; preview: ResolvePreview } | { ok: false; reason: string };
+
+/** The agent's pr_merge / pr_resolve_conflicts tool surfaces this event so the
+    renderer can show the hard-button confirmation dialog. Only the desktop sees
+    these (Mac-local, never relayed). */
+export interface PrConfirmRequest {
+  action: 'pr_merge' | 'pr_resolve_conflicts';
+  sessionId: string | null;
+  /** MergePreview when action === 'pr_merge'; ResolvePreview otherwise. */
+  preview: MergePreview | ResolvePreview;
+}
+
+/* ── Conflict hunks (T8) — renderer mirror of electron/git.ts ConflictHunk ── */
+export interface ConflictHunk {
+  startLine: number;
+  endLine: number;
+  oursLabel: string;
+  theirsLabel: string;
+  ours: string[];
+  base?: string[];
+  theirs: string[];
+}
+export interface ConflictFile {
+  path: string;
+  hunks: ConflictHunk[];
+  unreadable?: boolean;
+}
 
 /* ── Codename / state helpers — pure, shared by every UI surface ───────── */
 
@@ -70,6 +141,39 @@ export const SESSION_STATE_COLOR: Record<SessionGitState, string> = {
   'pr-blocked': 'var(--orange)',
   'pr-merged': 'var(--purple)',
   'pr-closed': 'var(--ink-tertiary)',
+};
+
+/** Left-border stripe color per state — used on each chat row in the rail so
+    the user can scan their work at a glance: gray=clean, amber=uncommitted,
+    blue=PR open, green=mergeable, red=conflicts/failing. Soft variants are
+    distinguishable from their bold cousins (lighter, lower contrast). The
+    values map to the semantic --color-* tokens in @maestro/design-tokens. */
+export const SESSION_STATE_STRIPE: Record<SessionGitState, string> = {
+  'no-repo':       'transparent',
+  clean:           'var(--color-muted)',
+  uncommitted:    'var(--color-warning)',
+  'ready-to-push': 'var(--color-warning-soft)',
+  'ready-for-pr':  'var(--color-info)',
+  'pr-mergeable':  'var(--color-success)',
+  'pr-conflicts':  'var(--color-danger)',
+  'pr-blocked':    'var(--color-danger-soft)',
+  'pr-merged':     'var(--color-success-soft)',
+  'pr-closed':     'var(--color-muted)',
+};
+
+/** Plain-English label for the tooltip + aria-label on each chat row. Slightly
+    more specific than SESSION_STATE_LABELS (which is a one-word chip label). */
+export const SESSION_STATE_LONG_LABELS: Record<SessionGitState, string> = {
+  'no-repo':       'Not a git repo',
+  clean:           'Clean — no changes',
+  uncommitted:     'Uncommitted changes',
+  'ready-to-push': 'Local commits — ready to push',
+  'ready-for-pr':  'Pushed — ready to open PR',
+  'pr-mergeable':  'Open PR — ready to merge',
+  'pr-conflicts':  'PR conflicts — needs resolution',
+  'pr-blocked':    'PR blocked — checks pending or behind base',
+  'pr-merged':     'PR merged',
+  'pr-closed':     'PR closed without merging',
 };
 
 /** Worst-state-wins priority (higher = more urgent). Used by the project icon
