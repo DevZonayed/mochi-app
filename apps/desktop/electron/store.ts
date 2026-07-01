@@ -190,6 +190,12 @@ export interface Job {
   /** Epoch ms when the claude.ai usage limit lifts, if this turn was blocked by it — so the UI
       can surface a "Claude limit · resets in …" hint. null/undefined when not limited. */
   limitResetsAt?: number | null;
+  /** True when this (terminal 'done') turn was capped by the claude.ai usage limit and
+      an auto-continue is scheduled for reset time. The composer queue drainer HOLDS while
+      set so queued messages don't flush back-to-back against the same wall. Stays true even
+      when the reset time couldn't be parsed (unlike `limitResetsAt`); cleared when a fresher
+      turn supersedes this one. */
+  blockedByLimit?: boolean;
   createdAt: number; updatedAt: number;
 }
 
@@ -1359,7 +1365,7 @@ export class Store {
       try { console.log(`[store] job prune: stripped=${stripped} deleted=${deleted} total=${this.data.jobs.length}`); } catch { /* */ }
     }
   }
-  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript' | 'pausedUntil' | 'pausedReason' | 'contextTokens' | 'limitResetsAt'>>): Job {
+  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript' | 'pausedUntil' | 'pausedReason' | 'contextTokens' | 'limitResetsAt' | 'blockedByLimit'>>): Job {
     const cur = this.getJob(jobId);
     if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });

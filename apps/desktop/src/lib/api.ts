@@ -203,6 +203,13 @@ export interface Job {
   pausedUntil?: number | null;
   /** What's keeping the job paused. Currently only 'wakeup'. */
   pausedReason?: 'wakeup' | null;
+  /** Epoch ms when the claude.ai usage limit lifts, if this turn was capped by it — so the UI
+      can surface a "Claude limit · resets in …" hint. null/undefined when not limited. */
+  limitResetsAt?: number | null;
+  /** True when this (terminal 'done') turn was capped by the claude.ai usage limit and an
+      auto-continue is scheduled for reset time. The composer queue drainer HOLDS while set so
+      queued messages don't flush back-to-back against the same wall. */
+  blockedByLimit?: boolean;
   createdAt: number;
   updatedAt: number;
 }
