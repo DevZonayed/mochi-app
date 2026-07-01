@@ -274,11 +274,9 @@ interface ProvidersStepProps {
   githubDevice: GithubDevice | null;
   onGithubLogin: () => void;
   onGithubCancel: () => void;
-  showGithubPat: boolean;
-  onToggleGithubPat: () => void;
 }
 
-function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect, githubDevice, onGithubLogin, onGithubCancel, showGithubPat, onToggleGithubPat }: ProvidersStepProps) {
+function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect, githubDevice, onGithubLogin, onGithubCancel }: ProvidersStepProps) {
   const rows: { key: ProviderKey; name: string; meta: string; glyph: React.ReactNode; brand: string; hint: string }[] = [
     { key: 'anthropic', name: 'Anthropic', meta: 'Claude · coding & reasoning', glyph: <AnthropicGlyph size={24} />, brand: '#D97757', hint: 'sk-ant-…' },
     { key: 'openai', name: 'OpenAI', meta: 'GPT · media & vision', glyph: <OpenAIGlyph size={22} />, brand: 'var(--ink)', hint: 'sk-…' },
@@ -327,21 +325,9 @@ function ProvidersStep({ providers, keys, errors, onKeyChange, onConnect, github
                       <PillButton kind="plain" onClick={onGithubCancel} style={{ height: 34, padding: '0 12px', fontSize: 14 }}>Cancel</PillButton>
                     </>
                   ) : (
-                    <>
-                      <PillButton kind="primary" onClick={onGithubLogin} style={{ height: 34, padding: '0 14px', fontSize: 14 }}>
-                        {st === 'error' ? 'Try again' : 'Sign in with GitHub'}
-                      </PillButton>
-                      <PillButton kind="quiet" onClick={onToggleGithubPat} style={{ height: 34, padding: '0 10px', fontSize: 13 }}>Token</PillButton>
-                      {showGithubPat && (
-                        <>
-                          <input type="password" value={keys.github} placeholder={r.hint}
-                            onChange={(e: React.ChangeEvent<HTMLInputElement>) => onKeyChange('github', e.target.value)}
-                            onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter' && keys.github.trim()) onConnect('github'); }}
-                            style={{ flexBasis: '100%', minWidth: 0, height: 34, border: '0.5px solid var(--separator-strong)', borderRadius: 8, outline: 'none', background: 'var(--fill-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', padding: '0 10px' }} />
-                          <PillButton kind="plain" disabled={!keys.github.trim()} onClick={() => onConnect('github')} style={{ height: 34, padding: '0 14px', fontSize: 14, background: 'var(--fill-secondary)', color: 'var(--blue)' }}>Connect</PillButton>
-                        </>
-                      )}
-                    </>
+                    <PillButton kind="primary" onClick={onGithubLogin} style={{ height: 34, padding: '0 14px', fontSize: 14 }}>
+                      {st === 'error' ? 'Try again' : 'Sign in with GitHub'}
+                    </PillButton>
                   )}
                 </span>
               ) : (
@@ -646,7 +632,6 @@ export default function Onboarding() {
   // authorization completes; live frames (gh download %, one-time code) arrive on
   // onGithubDevice and surface on the GitHub row.
   const [githubDevice, setGithubDevice] = React.useState<GithubDevice | null>(null);
-  const [showGithubPat, setShowGithubPat] = React.useState(false);
   const githubLogin = async () => {
     setProviders(p => ({ ...p, github: 'waiting' }));
     setProviderErrors(e => ({ ...e, github: '' }));
@@ -693,7 +678,7 @@ export default function Onboarding() {
     <WelcomeStep />,
     <WorkspaceStep value={workspace} onChange={setWorkspace} />,
     <ProvidersStep providers={providers} keys={keys} errors={providerErrors} onKeyChange={(k, v) => setKeys(s => ({ ...s, [k]: v }))} onConnect={connect}
-      githubDevice={githubDevice} onGithubLogin={githubLogin} onGithubCancel={githubCancel} showGithubPat={showGithubPat} onToggleGithubPat={() => setShowGithubPat(s => !s)} />,
+      githubDevice={githubDevice} onGithubLogin={githubLogin} onGithubCancel={githubCancel} />,
     <BudgetStep amount={budget} onAmount={setBudget} />,
     <PairStep secondsLeft={secondsLeft} onRefresh={() => setSecondsLeft(120)} />,
   ];

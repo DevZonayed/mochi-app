@@ -17,7 +17,7 @@ import { cloneRepo, inspectFolder, repoInfo, gitAvailable, snapshotProject, stru
 import { ensureGitHooks, ensureCommitIdentity } from './git-identity.js';
 import { pickCityCodename } from './codenames.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
-import { githubConnectionStatus, ghCliToken } from './github-auth.js';
+import { githubConnectionStatus } from './github-auth.js';
 import { ghState, resolveGh } from './gh-cli.js';
 import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
 import { getViewer, listOwners, parseGitHubRemote } from './github.js';
@@ -1336,12 +1336,15 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'listProviders': return providers.list();
       case 'connectProvider': {
         const prov = String(p.provider ?? '');
-        if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal' && prov !== 'github') bad('unsupported provider');
+        // GitHub is gh-CLI only — no pasted PAT. Use githubLogin instead.
+        if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal') bad('unsupported provider');
         return providers.connect(prov as ProviderId, String(p.apiKey ?? ''));
       }
       case 'disconnectProvider': {
         const prov = String(p.provider ?? '');
-        if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal' && prov !== 'github') bad('unsupported provider');
+        // GitHub disconnect = sign the gh CLI out (there's no stored key to drop).
+        if (prov === 'github') return engine.githubLogout();
+        if (prov !== 'anthropic' && prov !== 'openai' && prov !== 'fal') bad('unsupported provider');
         providers.disconnect(prov as ProviderId);
         return { ok: true };
       }
@@ -1365,17 +1368,14 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
 
       // Live GitHub connection status (login + scopes + repo-scope capability).
+      // The token is borrowed live from the gh CLI — nothing is stored by us.
       case 'githubStatus': return githubConnectionStatus(providers.getLocalKey('github'));
-      // One-click connect by importing a token from an authenticated `gh` CLI.
-      case 'importGithubFromCli': {
-        const token = ghCliToken();
-        if (!token) bad('gh CLI is not authenticated — run `gh auth login`, or paste a token', 400);
-        return providers.connect('github', token as string);
-      }
       // OAuth sign-in via the GitHub CLI device flow (downloads gh on first use,
-      // opens the browser, stores the token). Long-lived; emits 'github-device'.
+      // opens the browser). Long-lived; emits 'github-device'. gh keeps the token.
       case 'githubLogin': return engine.githubLogin();
       case 'githubLoginCancel': return engine.githubLoginCancel();
+      // Sign out = log the gh CLI out (removes gh's on-disk token).
+      case 'githubLogout': return engine.githubLogout();
       // Whether `gh` is already present (system or managed) — gates the UI hint.
       case 'ghCliState': return ghState();
 

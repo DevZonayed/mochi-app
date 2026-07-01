@@ -65,16 +65,12 @@ export class Providers {
     }
     const fal = this.store.providerKeyMeta('fal');
     if (fal) out.push({ provider: 'fal', method: 'apiKey', status: 'connected', detail: `API key ••••${fal.last4}`, keyLast4: fal.last4, createdAt: fal.createdAt });
-    // GitHub: prefer the gh CLI as source-of-truth (mirrors how anthropic/openai
-    // detect their CLI logins). This makes the Accounts row show "Connected"
-    // even when Safe Storage isn't available — e.g. ad-hoc-signed builds whose
-    // Keychain ACL the user dismissed — so users aren't locked out of git/PR
-    // operations by a Mac Keychain quirk they can't be expected to debug.
+    // GitHub is entirely gh-CLI based — there is no stored PAT. `gh auth login`
+    // is the single source of truth (the same offline `~/.config/gh/hosts.yml`
+    // signal Settings and the topbar read), so the Accounts row shows
+    // "Connected" whenever gh is signed in, regardless of the Mac Keychain.
     if (ghLoggedIn()) {
       out.push({ provider: 'github', method: 'subscription', status: 'connected', detail: 'gh CLI login', createdAt: 0 });
-    } else {
-      const gh = this.store.providerKeyMeta('github');
-      if (gh) out.push({ provider: 'github', method: 'apiKey', status: 'connected', detail: `PAT ••••${gh.last4}`, keyLast4: gh.last4, createdAt: gh.createdAt });
     }
     return out;
   }
@@ -112,29 +108,22 @@ export class Providers {
   clearKey(provider: string): void { this.store.deleteProviderKey(provider); }
 
   getLocalKey(provider: ProviderId): string | undefined {
+    // GitHub is ENTIRELY gh-CLI based: `gh` owns the auth and we only ever
+    // borrow the live token from `gh auth token`. We never read a GitHub token
+    // from the Keychain — that stored-cipher path produced wrong-signature
+    // mojibake (U+FFFD) that poisoned the Authorization header. If a legacy
+    // cipher from an older build is still on disk, drop it so nothing reads it
+    // again, then hand back the clean gh token (or nothing if gh isn't authed).
+    if (provider === 'github') {
+      if (this.store.getProviderKeyCipher('github')) {
+        try { this.store.deleteProviderKey('github'); } catch { /* best effort */ }
+      }
+      const t = ghCliToken();
+      return isCleanGithubToken(t) ? t : undefined;
+    }
     const cipher = this.store.getProviderKeyCipher(provider);
     if (cipher) {
-      try {
-        const dec = safeStorage.decryptString(Buffer.from(cipher, 'base64'));
-        // For GitHub, verify the decrypt actually produced a usable token — a
-        // wrong-signature decrypt returns mojibake (U+FFFD) that later poisons
-        // the GitHub Authorization header. If it's garbage, drop the stored
-        // cipher (self-heal) and fall through to the gh CLI token below.
-        if (provider === 'github') {
-          if (isCleanGithubToken(dec)) return dec;
-          try { this.store.deleteProviderKey('github'); } catch { /* best effort */ }
-        } else {
-          return dec;
-        }
-      } catch { /* fall through to CLI */ }
-    }
-    // gh CLI is a valid source of the GitHub token (same as ~/.claude.json
-    // for anthropic / ~/.codex for openai). All three callers — GitService
-    // for PRs, githubStatus, feedbackCreateIssue — get unblocked when Safe
-    // Storage write/read fails but `gh auth login` succeeded on disk.
-    if (provider === 'github') {
-      const t = ghCliToken();
-      if (isCleanGithubToken(t)) return t;
+      try { return safeStorage.decryptString(Buffer.from(cipher, 'base64')); } catch { /* unreadable */ }
     }
     return undefined;
   }

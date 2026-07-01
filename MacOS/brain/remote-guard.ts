@@ -11,7 +11,7 @@ export const REMOTE_BLOCKED_METHODS: ReadonlySet<string> = new Set<string>([
   'getPairing', 'kickDevice', 'regeneratePairingCode',
   // project memory + git/worktree/PR actions read/write local files & run git
   'getProjectMemory', 'setProjectMemory', 'snapshotProject', 'archiveSessionWorktree',
-  'importGithubFromCli', 'getSessionGitStatus', 'refreshSessionGitStatus',
+  'githubLogout', 'getSessionGitStatus', 'refreshSessionGitStatus',
   'pushSession', 'createSessionPR', 'mergeSessionPR', 'resolveSession',
   'previewSessionMerge', 'previewSessionResolve',
   // design comments live in local project files

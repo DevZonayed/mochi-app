@@ -2581,9 +2581,10 @@ export class LocalEngine {
   }
 
   /** Sign in to GitHub via OAuth using the `gh` CLI's device flow — no Personal
-      Access Token, no client secret. Downloads `gh` on first use (like the engines),
-      drives `gh auth login --web` (surfacing the one-time code + opening the browser),
-      then stores the resulting token in the same Keychain slot a PAT used. Emits
+      Access Token, no client secret, nothing stored by Maestro. Downloads `gh`
+      on first use (like the engines), drives `gh auth login --web` (surfacing the
+      one-time code + opening the browser). The token lives only in `gh`'s own
+      on-disk config; every consumer borrows it live via `gh auth token`. Emits
       'github-device' frames so the UI can show the code / download progress. */
   async githubLogin(): Promise<GithubConnection> {
     if (!this.providers) throw Object.assign(new Error('GitHub sign-in unavailable.'), { statusCode: 500 });
@@ -2624,16 +2625,11 @@ export class LocalEngine {
         if (code !== 0) { reject(Object.assign(new Error(buf.trim().slice(-300) || `GitHub sign-in exited ${code ?? 'unknown'}.`), { statusCode: 500 })); return; }
         const token = ghTokenFrom(ghBin);
         if (!token) { reject(Object.assign(new Error('Signed in, but could not read the token back from gh.'), { statusCode: 500 })); return; }
-        // Best-effort encrypt to Keychain — but DON'T fail the whole sign-in
-        // if Safe Storage isn't trusted on this build (ad-hoc-signed apps
-        // whose Keychain ACL the user dismissed). The token lives on disk
-        // in `gh`'s hosts.yml, and `Providers.getLocalKey('github')` reads it
-        // from there as a fallback, so all downstream consumers (git/PR,
-        // githubStatus, feedbackCreateIssue) stay functional.
-        this.providers!.connect('github', token).catch(() => { /* Safe Storage unavailable — fall back to gh CLI as source-of-truth */ })
-          .then(() => githubConnectionStatus(token))
-          .then(resolve)
-          .catch(reject);
+        // GitHub is entirely gh-CLI based — we do NOT store the token anywhere.
+        // `gh` owns it on disk (~/.config/gh/hosts.yml); every consumer borrows
+        // the live token via `Providers.getLocalKey('github')` → `gh auth token`.
+        // This sidesteps the Mac Keychain wrong-signature mojibake entirely.
+        githubConnectionStatus(token).then(resolve).catch(reject);
       });
     });
   }
@@ -2642,6 +2638,21 @@ export class LocalEngine {
   githubLoginCancel(): { ok: true } {
     try { this.githubLoginChild?.kill('SIGTERM'); } catch { /* gone */ }
     this.githubLoginChild = undefined;
+    return { ok: true };
+  }
+
+  /** Sign out of GitHub. Since GitHub is entirely gh-CLI based, this just logs
+      the `gh` CLI out (`gh auth logout`), which removes the token from gh's
+      on-disk config. Also drops any legacy Keychain cipher an older build may
+      have written, so nothing stale lingers. */
+  async githubLogout(): Promise<{ ok: true }> {
+    const gh = resolveGh();
+    if (gh) {
+      try { execFileSync(gh, ['auth', 'logout', '--hostname', 'github.com'], { stdio: 'ignore', timeout: 10000 }); }
+      catch { /* not logged in / gh balked — the state we want anyway */ }
+    }
+    // Belt-and-suspenders: purge any legacy encrypted GitHub key from old builds.
+    try { this.providers?.disconnect('github'); } catch { /* ignore */ }
     return { ok: true };
   }
 

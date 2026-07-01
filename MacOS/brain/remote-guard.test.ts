@@ -7,7 +7,7 @@ describe('remote-guard', () => {
     const mustBlock = [
       'getPairing', 'kickDevice', 'regeneratePairingCode',
       'getProjectMemory', 'setProjectMemory', 'snapshotProject', 'archiveSessionWorktree',
-      'importGithubFromCli', 'getSessionGitStatus', 'refreshSessionGitStatus',
+      'githubLogout', 'getSessionGitStatus', 'refreshSessionGitStatus',
       'pushSession', 'createSessionPR', 'mergeSessionPR', 'resolveSession',
       'previewSessionMerge', 'previewSessionResolve',
       'listDesignComments', 'addDesignComment', 'setDesignCommentStatus', 'deleteDesignComment',
