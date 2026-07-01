@@ -30,6 +30,7 @@ import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
 import { OpenPathContext, pathIsInside, type OpenPathFn } from '../lib/openPath';
 import { displayCodename } from '../lib/git-types';
+import { canDrainQueue } from '../lib/queue-drain';
 import { GitOpsDock } from '../components/GitOpsDock';
 import { SessionStateDot, SessionActivityDot } from './SessionStateDot';
 import { useSession, useSessionGitState } from '../lib/useSessionGitState';
@@ -2522,7 +2523,21 @@ function SchedulePicker({ initial, onPick, onRepeat, onClose }: { initial?: numb
   );
 }
 
-function QueuePanel({ queue, onMoveToFront, onRemove, onEdit, onReorder }: { queue: QueueItem[]; onMoveToFront: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
+function QueuePanel({ queue, hold, onMoveToFront, onRemove, onEdit, onReorder }: { queue: QueueItem[]; hold?: 'limit' | 'paused' | 'failed' | 'cancelled' | null; onMoveToFront: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
+  // When the drainer is holding (the agent isn't at a clean idle), surface WHY so a
+  // paused/limited queue never looks stuck. Send-now / edit / remove stay available.
+  const holdBadge =
+    hold === 'limit' ? 'waiting for limit reset'
+    : hold === 'paused' ? 'paused'
+    : hold === 'failed' ? 'held — last turn failed'
+    : hold === 'cancelled' ? 'held — last turn stopped'
+    : null;
+  const holdHint =
+    hold === 'limit' ? 'The Claude usage limit was hit — the current turn auto-continues when it resets, then queued messages resume one at a time.'
+    : hold === 'paused' ? 'The current turn is parked and resumes on its own — queued messages send once it wakes.'
+    : hold === 'failed' ? 'The last turn failed; queued messages are held until it succeeds (a retry resumes them). Send now to override.'
+    : hold === 'cancelled' ? 'The last turn was stopped; queued messages are held so they aren’t dumped into a stopped session. Send now to override.'
+    : null;
   const [collapsed, setCollapsed] = React.useState(false);
   const [sel, setSel] = React.useState(-1);
   const [dragIdx, setDragIdx] = React.useState(-1);
@@ -2577,11 +2592,23 @@ function QueuePanel({ queue, onMoveToFront, onRemove, onEdit, onReorder }: { que
       <button className="q-head" onClick={() => setCollapsed(c => !c)} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: 'transparent', cursor: 'pointer',
         borderBottom: collapsed ? 'none' : '0.5px solid var(--separator)' }}>
         <Icon name="layers" size={13} style={{ color: 'var(--purple)' }} />
-        <span style={{ flex: 1, textAlign: 'left', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{queue.length} queued message{queue.length === 1 ? '' : 's'}</span>
+        <span style={{ textAlign: 'left', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{queue.length} queued message{queue.length === 1 ? '' : 's'}</span>
+        {holdBadge && (
+          <span title={holdHint ?? undefined} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 17, padding: '0 7px', borderRadius: 5, background: 'color-mix(in srgb, var(--orange) 15%, transparent)', color: 'var(--orange)', font: '600 10px/1 var(--font-text)', whiteSpace: 'nowrap' }}>
+            <Icon name="clock" size={10} stroke={2.2} />{holdBadge}
+          </span>
+        )}
+        <span style={{ flex: 1 }} />
         <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)', transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
       </button>
       {!collapsed && (
         <>
+          {holdHint && (
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, padding: '8px 12px', borderBottom: '0.5px solid var(--separator)', background: 'color-mix(in srgb, var(--orange) 7%, transparent)' }}>
+              <Icon name="clock" size={12} stroke={2.1} style={{ color: 'var(--orange)', flexShrink: 0, marginTop: 1 }} />
+              <span style={{ font: '400 11px/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>{holdHint}</span>
+            </div>
+          )}
           <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 168, overflowY: 'auto' }}>
             {queue.map((item, i) => {
               const dropCls = dropSlot === i ? ' q-drop-above' : (dropSlot === i + 1 && i === queue.length - 1) ? ' q-drop-below' : '';
@@ -3236,6 +3263,19 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   // the wakeup-pending state — the composer doesn't need to also reflect it.
   const lastTurnPaused = !!(lastTurn?.pausedUntil && lastTurn.pausedUntil > Date.now());
   const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending') && !lastTurnPaused;
+  // The last turn ended blocked by a claude.ai usage limit (it ends 'done' with an
+  // auto-continue scheduled for reset). The composer queue must HOLD while set —
+  // otherwise "not streaming" is misread as "ready" and every queued message flushes
+  // back-to-back against the same wall. Cleared when a fresher turn supersedes it.
+  const awaitingLimitReset = !!lastTurn?.blockedByLimit;
+  // Why the drainer is holding the queue (for the QueuePanel badge/hint). null = free
+  // to drain. Order mirrors canDrainQueue's guards.
+  const queueHoldReason: 'limit' | 'paused' | 'failed' | 'cancelled' | null =
+    awaitingLimitReset ? 'limit'
+    : lastTurnPaused ? 'paused'
+    : lastTurn?.status === 'failed' ? 'failed'
+    : lastTurn?.status === 'cancelled' ? 'cancelled'
+    : null;
 
   // The actual send — no guards. Used directly, by the queue drainer, and by steer.
   const sendRaw = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
@@ -3478,15 +3518,27 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     composerRef.current?.focus();
   };
 
-  // Drain the queue: when the agent goes idle and items are waiting, fire the next.
+  // Drain the queue ONE AT A TIME, and only when the agent reaches a genuinely CLEAN
+  // idle. `canDrainQueue` HOLDS when the last turn stopped for a non-clean reason —
+  // blocked by a usage limit (ends 'done'!), failed (incl. auto-retry backoff),
+  // cancelled, or paused/parked — so queued messages are never dumped back-to-back
+  // against the same wall. Self-healing: a drained message that re-hits the limit
+  // re-arms the hold. Manual Send-now / edit / remove always bypass this.
   const drainingRef = React.useRef(false);
   React.useEffect(() => {
-    if (streaming || queue.length === 0 || drainingRef.current) return;
+    if (!canDrainQueue({
+      streaming,
+      queueLength: queue.length,
+      draining: drainingRef.current,
+      awaitingLimitReset,
+      lastTurnPaused,
+      lastStatus: lastTurn?.status ?? null,
+    })) return;
     drainingRef.current = true;
     const head = queue[0];
     mutateQueue(q => q.slice(1));
     void sendRaw(head.text, head.atts).finally(() => { drainingRef.current = false; });
-  }, [streaming, queue, sendRaw, mutateQueue]);
+  }, [streaming, awaitingLimitReset, lastTurnPaused, lastTurn, queue, sendRaw, mutateQueue]);
 
   // The ONLY stop-the-chat path: the explicit red abort button. Every other
   // send/steer route is queue-based — see the comment on `sendComposed`.
@@ -3750,7 +3802,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
             <ScheduledQueue items={upcomingSched} now={schedNow} onCancel={cancelSchedule} onEdit={editSchedule} />
           )}
           {queue.length > 0 && (
-            <QueuePanel queue={queue} onMoveToFront={moveToFront} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
+            <QueuePanel queue={queue} hold={queueHoldReason} onMoveToFront={moveToFront} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
           )}
           {slashOpen && (
             <div style={{ marginBottom: 8, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.22))', overflow: 'hidden', padding: 5 }}>

@@ -2206,6 +2206,21 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
 /* ── The job runner + the single status source ──────────────────────── */
 const ENGINE_LABEL: Record<EngineId, string> = { claude: 'Claude Code', codex: 'Codex' };
 
+/** The autopilot's read on a finished chat turn — computed ONCE (judgeKeepGoing)
+    so it can BOTH gate the reviewer (skip review while the agent is mid-flight)
+    and then arm the auto-continue without a second model call. See the
+    autopilot-first ordering in run() (image_en8e1.png). */
+type KeepGoingDecision = {
+  verdict: 'continue' | 'wait-for-user' | 'paused' | 'done';
+  reason: string;
+  items?: string[];
+  /** The agent's last text block the verdict was drawn from. */
+  lastText: string;
+  /** Another pending schedule (auto-answer / auto-continue / retry / queued
+      message) already owns this session's next move — don't stack a continue. */
+  hasBlocking: boolean;
+};
+
 export class LocalEngine {
   /** jobId → live cancel handle (abort for claude, child for codex). `steer` is set
       while a steerable Claude chat turn is mid-flight (see engine.steer / runClaude). */
@@ -2759,39 +2774,50 @@ export class LocalEngine {
     return true;
   }
 
-  /** Arm a "want me to keep going?" follow-up: when the model's last text
-      offers to continue and nothing else is pending, schedule an organized
-      auto-continue for KEEP_GOING_BASE_MS later. Per-session cap +
-      idempotent upsert keep a stuck agent from spinning forever AND keep a
-      burst of re-emits from spawning duplicate schedules.
+  /** Does this finished turn END on an AskUserQuestion the user hasn't answered?
+      True when the last `ask` item has no tool call after it (the model asked
+      and stopped, rather than asking-then-proceeding) and the question parses.
+      Used two ways: (a) armAskFollowup arms the auto-answer countdown, and
+      (b) run()'s autopilot-first gate SKIPS the reviewer on such a turn — a
+      pending question is a mid-conversation halt, not a finished result, so
+      the reviewer's findings would race the answer (image_en8e1.png). */
+  private endsOnUnansweredAsk(items: TranscriptItem[]): boolean {
+    let askIdx = -1;
+    for (let i = items.length - 1; i >= 0; i--) { if (items[i].kind === 'ask') { askIdx = i; break; } }
+    if (askIdx === -1) return false;
+    // A tool AFTER the ask means the model proceeded on its own — not waiting.
+    for (let i = askIdx + 1; i < items.length; i++) { if (items[i].kind === 'tool') return false; }
+    return parseAsk(items[askIdx].ask).length > 0;
+  }
+
+  /** JUDGE-ONLY half of the keep-going autopilot: read the model's finished
+      turn and decide {continue, wait-for-user, paused, done} WITHOUT arming
+      anything. Split out from the arming so run() can call it BEFORE the
+      reviewer (to gate review on a continuable turn) and reuse the same
+      verdict for arming — never a second Sonnet call for one turn.
 
       DESIGN (post-redesign):
-      1. Gated on session.autoPilot — off by default; the operator opts in
-         per-chat via the composer toggle. Was always-on; that produced too
-         many false positives.
-      2. Sonnet judge (followup-judge.ts) reads the agent's actual last
-         text + a little context and returns one of {continue, wait-for-user,
-         paused, done}. Only 'continue' arms a schedule.
+      1. Gated on session.autoPilot — off by default (returns null); the
+         operator opts in per-chat via the composer toggle.
+      2. Sonnet judge (followup-judge.ts) reads the agent's actual last text +
+         a little context and returns one of {continue, wait-for-user, paused,
+         done}.
       3. Regex (detectKeepGoing) is the FALLBACK when no Anthropic API key
-         exists or the judge call fails — autopilot still works offline,
-         just less smart.
-
-      Returns the schedule (or null when capped / nothing to arm). */
-  private async armKeepGoingFollowup(opts: {
+         exists or the judge call fails — autopilot still works offline. */
+  private async judgeKeepGoing(opts: {
     sessionId: string;
     projectId: string;
     items: TranscriptItem[];
-    effort: Effort;
     goalMode: boolean;
     originalGoal?: string;
     sourceJobId: string;
     outputText: string;
-  }): Promise<void> {
+  }): Promise<KeepGoingDecision | null> {
     // Per-chat opt-in. Off by default; the composer's autopilot button toggles
-    // this. Skipping when off prevents auto-continue noise in chats where the
-    // operator just wants a single answer per turn.
+    // this. When off there's no autopilot judgment at all → null (and run()
+    // treats the turn as complete so the reviewer, if enabled, runs).
     const session = this.store.getSession(opts.sessionId);
-    if (!session?.autoPilot) return;
+    if (!session?.autoPilot) return null;
     // Last text the model emitted (the offer to continue lives there, NOT in
     // a tool chip or thinking block).
     let lastText = '';
@@ -2800,16 +2826,15 @@ export class LocalEngine {
       if (it.kind === 'text' || it.kind === 'result') { lastText = it.text; break; }
     }
     if (!lastText && opts.outputText) lastText = opts.outputText;
-    if (!lastText) return;
-    // Don't auto-continue ON TOP OF other pending actions for the session
-    // (an auto-answer, an auto-continue at limit-reset, a queued message,
-    // or a pending retry-run). Those have priority — once they fire, the
-    // next turn re-evaluates from the new tail.
+    if (!lastText) return null;
+    // Another pending action already owns this session's next move (an
+    // auto-answer, an auto-continue at limit-reset, a queued message, or a
+    // pending retry-run). Surface it so the caller neither stacks a continue
+    // NOR mistakes the turn for "complete + ready to review".
     const blockingKinds = new Set(['auto-answer', 'auto-continue', 'retry-run', 'message']);
     const hasBlocking = this.store.listSchedules().some(s =>
       s.sessionId === opts.sessionId && s.enabled && blockingKinds.has(s.kind ?? ''),
     );
-    if (hasBlocking) return;
 
     // Sonnet judgment — gated by API key. If we get a clean verdict, trust it;
     // if not (no key, network blip, malformed JSON), fall back to the regex.
@@ -2840,18 +2865,31 @@ export class LocalEngine {
     // If the judge spoke, trust it. Else fall back to the regex detector that
     // shipped before — autopilot still works without API access (and the
     // operator can disable the chat-level toggle if it misfires).
-    let verdict: 'continue' | 'wait-for-user' | 'paused' | 'done';
-    let reason = '';
-    let items: string[] | undefined;
     if (judged) {
-      verdict = judged.verdict;
-      reason = judged.reason;
-      items = judged.items;
-    } else {
-      verdict = detectKeepGoing(lastText) ? 'continue' : 'done';
-      reason = 'regex fallback (no API key or judge unavailable)';
+      return { verdict: judged.verdict, reason: judged.reason, items: judged.items, lastText, hasBlocking };
     }
-    if (verdict !== 'continue') return;
+    return {
+      verdict: detectKeepGoing(lastText) ? 'continue' : 'done',
+      reason: 'regex fallback (no API key or judge unavailable)',
+      lastText, hasBlocking,
+    };
+  }
+
+  /** ARM-ONLY half: given a 'continue' decision from judgeKeepGoing, schedule
+      an organized auto-continue for KEEP_GOING_BASE_MS later. Per-session cap +
+      idempotent upsert keep a stuck agent from spinning forever AND keep a
+      burst of re-emits from spawning duplicate schedules. No-op for any verdict
+      other than 'continue', or when another schedule already owns the session. */
+  private armKeepGoingContinue(opts: {
+    sessionId: string;
+    projectId: string;
+    effort: Effort;
+    goalMode: boolean;
+    originalGoal?: string;
+    sourceJobId: string;
+  }, decision: KeepGoingDecision): void {
+    const { verdict, reason, items, lastText, hasBlocking } = decision;
+    if (verdict !== 'continue' || hasBlocking) return;
 
     const fireAt = Date.now() + KEEP_GOING_BASE_MS;
     // If the judge gave us items, prefer them (it saw full context); else
@@ -3597,6 +3635,47 @@ export class LocalEngine {
       foldImages(main.images);
       let primaryResume = main.sdkSessionId; // resume the primary's session for fix rounds
 
+      /* ── Autopilot-first gate (image_en8e1.png) ─────────────────────────
+         The reviewer and the autopilot were racing: a chat turn that ended on
+         an unanswered AskUserQuestion (the user still has to pick) was handed
+         STRAIGHT to the reviewer, which posted NEEDS-WORK findings while the
+         answer was still pending — findings that then raced the auto-answer.
+         Fix the ORDER: decide the turn's disposition FIRST, and only run the
+         reviewer once the session is genuinely COMPLETE.
+
+         The reviewer runs ONLY on a genuinely COMPLETE turn. When autopilot is
+         ON, that means the judge's verdict is 'done' with nothing else pending;
+         'continue' / 'wait-for-user' / 'paused' are all mid-flight and defer
+         review (the autopilot either auto-continues or the turn is blocked on
+         the user). A turn ending on an unanswered AskUserQuestion ALWAYS defers
+         review (autopilot-on or not) — a pending question is not a result.
+         When autopilot is OFF the pre-2026 behaviour stands: review runs unless
+         the turn ends on an unanswered question.
+
+         judgeKeepGoing runs ONCE here; the post-done arming reuses this exact
+         verdict (no second Sonnet call) unless a reviewer fix pass changed the
+         tail, in which case it re-judges the fresh output. */
+      const endsOnAsk = isChat ? this.endsOnUnansweredAsk(allItems) : false;
+      let keepGoingDecision: KeepGoingDecision | null = null;
+      if (isChat && !opts.plan && !main.hitLimit && !ac.signal.aborted && !endsOnAsk) {
+        keepGoingDecision = await this.judgeKeepGoing({
+          sessionId: session.id,
+          projectId: job.projectId,
+          items: allItems,
+          goalMode,
+          originalGoal: goalMode ? cur.input : undefined,
+          sourceJobId: jobId,
+          outputText: output,
+        });
+      }
+      // The turn is not a finished deliverable → the reviewer must stand down.
+      // (keepGoingDecision is null when autopilot is OFF, so review then hinges
+      // only on endsOnAsk — preserving the non-autopilot behaviour.)
+      const autopilotContinuable =
+        endsOnAsk ||
+        (keepGoingDecision != null &&
+          (keepGoingDecision.verdict !== 'done' || keepGoingDecision.hasBlocking));
+
       /* SP3 — primary↔reviewer loop. A reviewer engine (e.g. Codex) checks the
          primary's (e.g. Opus) changes for security/weak code/bugs; if it flags
          problems AND the turn actually changed files, the primary fixes them and
@@ -3620,8 +3699,11 @@ export class LocalEngine {
       // research/publishing pipeline) the existing behavior stays — those
       // aren't chats so there's no per-session toggle.
       const reviewerOn = !isChat || (session != null && session.reviewerEnabled === true);
+      // A reviewer fix pass rewrote the tail → the post-done arming re-judges
+      // on the fresh output instead of reusing the pre-review decision.
+      let reviewFixApplied = false;
 
-      if (reviewer !== 'off' && this.available(reviewer) && reviewerOn && !main.hitLimit && !ac.signal.aborted) {
+      if (reviewer !== 'off' && this.available(reviewer) && reviewerOn && !main.hitLimit && !ac.signal.aborted && !autopilotContinuable) {
         for (let round = 0; round < REVIEW_MAX_ROUNDS; round++) {
           cur = this.store.updateJob(jobId, { progress: 88, stage: `reviewer (${ENGINE_LABEL[reviewer]}) checking…` });
           this.emit('job', cur);
@@ -3660,6 +3742,7 @@ export class LocalEngine {
               : await runCodex(fixPrompt, cwd, fixHooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags });
           } catch (fe) { if (fe instanceof CancelledError) throw fe; break; }
           reviewItem.resolved = true; // the primary went on to address these findings
+          reviewFixApplied = true;    // tail changed → re-judge keep-going below
           allItems.push(...fix.transcript);
           foldImages(fix.images);
           if (fix.sdkSessionId) { primaryResume = fix.sdkSessionId; if (isChat) { try { this.store.updateSession(session.id, { sdkSessionId: fix.sdkSessionId }); } catch { /* gone */ } } }
@@ -3678,6 +3761,14 @@ export class LocalEngine {
         // was capped, so the gauge can show "Claude limit · resets in …".
         contextTokens: main.contextTokens,
         limitResetsAt: main.hitLimit ? (main.limitResetsAt ?? null) : null,
+        // Was this (done) turn actually capped by the claude.ai usage limit? A
+        // limit-blocked chat turn ends 'done' (partial work + sdkSessionId intact)
+        // with an auto-continue scheduled for reset time. The composer queue drainer
+        // reads this to HOLD — otherwise "not streaming" is misread as "ready" and
+        // every queued message flushes back-to-back against the same wall. Unlike
+        // `limitResetsAt`, this stays true even when the reset time couldn't be
+        // parsed, so the hold is robust. It's superseded when a fresher turn lands.
+        blockedByLimit: !!(master === 'claude' && main.hitLimit && isChat && main.sdkSessionId && !opts.plan),
         // Defense in depth: runClaude's terminal markResumed() already cleared
         // this via the hook, but a turn that ends concurrently with an in-flight
         // pause event must not persist a stale countdown alongside 'done'.
@@ -3711,20 +3802,32 @@ export class LocalEngine {
         try {
           const armedAsk = this.armAskFollowup(session.id, job.projectId, allItems, effort);
           if (!armedAsk) {
-            // Awaited so the Sonnet judge has time to land BEFORE we declare
-            // the turn fully done. Cheap (~1s) and the engine has already
-            // emitted the final 'job' update, so the user sees the answer
-            // immediately — only the schedule arming waits on the judge.
-            await this.armKeepGoingFollowup({
-              sessionId: session.id,
-              projectId: job.projectId,
-              items: allItems,
-              effort,
-              goalMode,
-              originalGoal: goalMode ? cur.input : undefined,
-              sourceJobId: jobId,
-              outputText: output,
-            });
+            // Reuse the decision judgeKeepGoing already made BEFORE the reviewer
+            // (autopilot-first gate above) — one Sonnet call per turn. Only
+            // re-judge when a reviewer fix pass rewrote the tail, so the
+            // continue verdict reflects the final output rather than the
+            // pre-fix draft.
+            const decision = reviewFixApplied
+              ? await this.judgeKeepGoing({
+                  sessionId: session.id,
+                  projectId: job.projectId,
+                  items: allItems,
+                  goalMode,
+                  originalGoal: goalMode ? cur.input : undefined,
+                  sourceJobId: jobId,
+                  outputText: output,
+                })
+              : keepGoingDecision;
+            if (decision) {
+              this.armKeepGoingContinue({
+                sessionId: session.id,
+                projectId: job.projectId,
+                effort,
+                goalMode,
+                originalGoal: goalMode ? cur.input : undefined,
+                sourceJobId: jobId,
+              }, decision);
+            }
           }
         } catch { /* best-effort */ }
       }
