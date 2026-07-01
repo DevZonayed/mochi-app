@@ -15,6 +15,20 @@ import { ghCliToken, ghLoggedIn } from './github-auth.js';
 
 export type ProviderId = 'anthropic' | 'openai' | 'fal' | 'github';
 
+/** A decrypted GitHub token must be printable ASCII (all real formats —
+    `ghp_`, `gho_`, `ghs_`, `github_pat_` — are `[A-Za-z0-9_]`). Electron's
+    `safeStorage.decryptString` can "succeed" yet return mojibake with U+FFFD
+    replacement chars when the ciphertext was written under a DIFFERENT app
+    signature (ad-hoc-signed rebuilds whose Keychain ACL changed between
+    builds). Handing that poisoned string to the GitHub API blows up the
+    Authorization header ("Cannot convert argument to a ByteString") and makes
+    push / PR / status all fail while Settings still reads "connected" from the
+    on-disk gh login. This guard rejects such garbage so callers fall back to
+    the clean `gh` CLI token. */
+export function isCleanGithubToken(s: string | undefined | null): s is string {
+  return typeof s === 'string' && s.length >= 20 && /^[\x21-\x7E]+$/.test(s);
+}
+
 export interface ProviderConn {
   provider: ProviderId;
   method: 'subscription' | 'apiKey';
@@ -100,7 +114,19 @@ export class Providers {
   getLocalKey(provider: ProviderId): string | undefined {
     const cipher = this.store.getProviderKeyCipher(provider);
     if (cipher) {
-      try { return safeStorage.decryptString(Buffer.from(cipher, 'base64')); } catch { /* fall through to CLI */ }
+      try {
+        const dec = safeStorage.decryptString(Buffer.from(cipher, 'base64'));
+        // For GitHub, verify the decrypt actually produced a usable token — a
+        // wrong-signature decrypt returns mojibake (U+FFFD) that later poisons
+        // the GitHub Authorization header. If it's garbage, drop the stored
+        // cipher (self-heal) and fall through to the gh CLI token below.
+        if (provider === 'github') {
+          if (isCleanGithubToken(dec)) return dec;
+          try { this.store.deleteProviderKey('github'); } catch { /* best effort */ }
+        } else {
+          return dec;
+        }
+      } catch { /* fall through to CLI */ }
     }
     // gh CLI is a valid source of the GitHub token (same as ~/.claude.json
     // for anthropic / ~/.codex for openai). All three callers — GitService
@@ -108,7 +134,7 @@ export class Providers {
     // Storage write/read fails but `gh auth login` succeeded on disk.
     if (provider === 'github') {
       const t = ghCliToken();
-      if (t) return t;
+      if (isCleanGithubToken(t)) return t;
     }
     return undefined;
   }
