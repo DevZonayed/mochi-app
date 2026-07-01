@@ -26,6 +26,7 @@ import {
   type EffortStop,
 } from '../lib/ui';
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
+import { computeHoldState } from '../lib/queueHold';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
 import { OpenPathContext, pathIsInside, type OpenPathFn } from '../lib/openPath';
@@ -2084,7 +2085,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
             border: '0.5px solid color-mix(in srgb, var(--purple) 28%, transparent)',
             font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)' }}>
             <Icon name="clock" size={12} style={{ color: 'var(--purple)' }} />
-            <span style={{ color: 'var(--ink-secondary)' }}>Auto-resumes in</span>
+            <span style={{ color: 'var(--ink-secondary)' }}>{job.pausedReason === 'limit' ? 'Usage limit — resumes in' : 'Auto-resumes in'}</span>
             <span style={{ fontVariantNumeric: 'tabular-nums', color: 'var(--ink)' }}>{fmtCountdown((job.pausedUntil ?? 0) - Date.now())}</span>
           </div>
         )}
@@ -2946,13 +2947,34 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   React.useEffect(() => { if (autoFocus) composerRef.current?.focus(); }, [autoFocus]);
 
   const lastTurn = turns.length ? turns[turns.length - 1] : null;
-  // Parked-on-wakeup turns are NOT streaming for composer purposes: the session
+  // Parked-on-WAKEUP turns are NOT streaming for composer purposes: the session
   // is closed and the next user message should send straight through (just like
   // after a scheduled message is queued) instead of being queued behind the
   // dormant SDK iterator. The countdown chip on the turn itself communicates
   // the wakeup-pending state — the composer doesn't need to also reflect it.
-  const lastTurnPaused = !!(lastTurn?.pausedUntil && lastTurn.pausedUntil > Date.now());
-  const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending') && !lastTurnPaused;
+  //
+  // A LIMIT pause is the opposite: the run was blocked by Claude's usage cap and
+  // an auto-continue is armed for the reset. New messages must NOT send straight
+  // through (they'd instantly re-hit the cap) — they queue and wait. And the
+  // queue must NOT drain until a fresh turn supersedes this one, otherwise every
+  // typed-ahead message fires at once as a burst of doomed runs (the reported
+  // bug). The hold persists until the armed auto-continue fires (its fresh turn
+  // supersedes this one and re-holds via `streaming`), plus a grace window past
+  // the countdown so the renderer's 1 s tick can't briefly release the hold and
+  // race the cron auto-continue (which ticks every 30 s → can fire slightly
+  // late). The grace also means a CANCELLED auto-continue eventually releases the
+  // hold instead of deadlocking the queue.
+  // Backstop: a pending auto-continue for this session also means we're waiting
+  // on a reset — hold even if the turn object was pruned/replaced client-side.
+  // (schedNow drives the 1 s tick so this re-evaluates as the countdown moves.)
+  const limitScheduled = schedules.some(s => s.kind === 'auto-continue' && s.enabled !== false && (s.fireAt ?? 0) > schedNow);
+  // `streaming` = a turn is live; `held` = "don't send/drain into this session
+  // right now" (streaming OR blocked on a usage-limit reset). New messages queue;
+  // the drainer waits. See queueHold.ts for the full rationale + unit tests.
+  const { streaming, held } = computeHoldState({ lastTurn, hasPendingAutoContinue: limitScheduled, now: schedNow });
+  // Display-only: the last turn is parked on a future countdown (wakeup or limit)
+  // — the composer rail mirrors it so the dormant session doesn't read as "ready".
+  const lastTurnPaused = !!(lastTurn?.pausedUntil && lastTurn.pausedUntil > schedNow);
 
   // The actual send — no guards. Used directly, by the queue drainer, and by steer.
   const sendRaw = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
@@ -2996,14 +3018,16 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
     }
   }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, composerBrowser, onSessionCreated]);
 
-  // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
+  // Send while idle; QUEUE while a turn is running OR the session is blocked on a
+  // usage-limit reset (`held`). A queued message fires when the agent finishes /
+  // the limit lifts and the drainer releases it — one at a time.
   const sendText = React.useCallback((raw: string) => {
     const t = raw.trim();
     if (!t || !projectId) return;
     composerRef.current?.clear();
-    if (streaming) { mutateQueue(q => [...q, t]); return; }
+    if (held) { mutateQueue(q => [...q, t]); return; }
     void sendRaw(t).then(ok => { if (!ok) composerRef.current?.setText(raw); });
-  }, [projectId, streaming, sendRaw, mutateQueue]);
+  }, [projectId, held, sendRaw, mutateQueue]);
 
   // STEER: interrupt the running turn and send right now (session resumes with context).
   const sendNow = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
@@ -3161,15 +3185,21 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
   const sendQueuedNow = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); void sendNow(t); };
   const editQueued = (i: number) => { const t = queue[i]; if (t == null) return; removeFromQueue(i); composerRef.current?.setText(t); composerRef.current?.focus(); };
 
-  // Drain the queue: when the agent goes idle and items are waiting, fire the next.
+  // Drain the queue: when the session is genuinely idle-and-ready (not streaming
+  // AND not blocked on a usage-limit reset) and items are waiting, fire the NEXT
+  // one only. Firing queue[0] starts a turn → `held` flips true → the effect
+  // no-ops until that turn settles, so messages drain strictly one at a time
+  // (never a burst). While `held` (limit reset pending) the queue simply waits;
+  // the armed auto-continue produces the next turn and, once it completes, the
+  // hold releases and draining resumes in order.
   const drainingRef = React.useRef(false);
   React.useEffect(() => {
-    if (streaming || queue.length === 0 || drainingRef.current) return;
+    if (held || queue.length === 0 || drainingRef.current) return;
     drainingRef.current = true;
     const next = queue[0];
     mutateQueue(q => q.slice(1));
     void sendRaw(next).finally(() => { drainingRef.current = false; });
-  }, [streaming, queue, sendRaw, mutateQueue]);
+  }, [held, queue, sendRaw, mutateQueue]);
 
   const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
 
@@ -3544,7 +3574,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                   // user scanning the composer doesn't mistake the dormant
                   // session for "ready to send" without context.
                   ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>
-                      <Icon name="clock" size={12} style={{ color: 'var(--purple)' }} /> Auto-resumes in {fmtCountdown((lastTurn?.pausedUntil ?? 0) - Date.now())}
+                      <Icon name="clock" size={12} style={{ color: 'var(--purple)' }} /> {lastTurn?.pausedReason === 'limit' ? 'Usage limit — resumes in' : 'Auto-resumes in'} {fmtCountdown((lastTurn?.pausedUntil ?? 0) - Date.now())}
                     </span>
                   : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{planMode ? 'Plan · ⏎' : goalMode ? 'Goal · ⏎' : queue.length ? `${queue.length} queued` : '⏎ to send'}</span>}
             </div>

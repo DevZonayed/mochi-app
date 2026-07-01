@@ -172,8 +172,11 @@ export interface Job {
       treats this as "session closed, auto-resumes at this time" (like a
       scheduled message) so it doesn't show "Responding…" for the dormant gap. */
   pausedUntil?: number | null;
-  /** What's keeping the job paused. Currently only 'wakeup'. */
-  pausedReason?: 'wakeup' | null;
+  /** What's keeping the job paused. 'wakeup' = a ScheduleWakeup parked the SDK;
+      'limit' = the run hit Claude's usage cap and an auto-continue is armed for
+      `pausedUntil` (the reset). The renderer holds this session's message queue
+      while limit-paused so typed-ahead messages don't burst out at reset. */
+  pausedReason?: 'wakeup' | 'limit' | null;
   createdAt: number;
   updatedAt: number;
 }

@@ -3065,10 +3065,20 @@ export class LocalEngine {
       // "continue" for when the limit resets (CronRunner fires it into THIS session,
       // resuming the conversation), then pause gracefully with a note. This skips the
       // doomed max-turns/reviewer passes below (they'd just re-hit the same cap).
+      //
+      // `limitPausedUntil` is the reset instant we stamp onto the finalized turn
+      // (pausedReason: 'limit'). It keeps the turn OUT of the plain terminal-done
+      // bucket so the renderer holds this session's typed-ahead message queue
+      // instead of draining every queued message into a burst of doomed runs the
+      // moment the blocked turn settles (the reported bug). When the armed
+      // auto-continue fires at reset, the fresh turn clears this stamp and the
+      // queue drains one message at a time.
+      let limitPausedUntil: number | null = null;
       if (master === 'claude' && main.hitLimit && isChat && main.sdkSessionId && !opts.plan && !ac.signal.aborted) {
         const reset = main.limitResetsAt;
         if (reset != null && reset > Date.now()) {
           const fireAt = reset + LIMIT_RESET_BUFFER_MS;
+          limitPausedUntil = fireAt;
           let created = true;
           try {
             // Dedupe: a queued message + the original run both hit the limit
@@ -3243,7 +3253,10 @@ export class LocalEngine {
         // Defense in depth: runClaude's terminal markResumed() already cleared
         // this via the hook, but a turn that ends concurrently with an in-flight
         // pause event must not persist a stale countdown alongside 'done'.
-        pausedUntil: null, pausedReason: null,
+        // EXCEPTION: a turn blocked by the usage cap carries a 'limit' pause
+        // (pausedUntil = reset) so the renderer holds the message queue until the
+        // armed auto-continue fires — see limitPausedUntil above.
+        pausedUntil: limitPausedUntil, pausedReason: limitPausedUntil ? 'limit' : null,
       });
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
