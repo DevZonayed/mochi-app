@@ -21,7 +21,7 @@
 #
 # An agent path is ANY non-renderer caller. The renderer-side merge button
 # never shells out — it goes via the IPC `mergeSessionPR` handler in
-# `apps/desktop/electron/localApi.ts`, which calls `gitService.mergePr`
+# `MacOS/brain/localApi.ts`, which calls `gitService.mergePr`
 # directly. So if a merge command lands here at all, it's the agent.
 #
 # CONTRACT WITH CLAUDE CODE
