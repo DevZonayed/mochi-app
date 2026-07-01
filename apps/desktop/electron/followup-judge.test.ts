@@ -2,7 +2,8 @@
    whether to arm a [Auto-continue]: 1-min countdown after an assistant turn.
 
    The judge is the brain swap that replaced the brittle regex in
-   armKeepGoingFollowup. These tests guard:
+   the keep-going autopilot (judgeKeepGoing → armKeepGoingContinue). These
+   tests guard:
 
    1. JSON parsing — the model sometimes wraps its reply in ```json fences,
       stray prose, or omits whitespace; we tolerate all three.
