@@ -2245,7 +2245,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
             border: '0.5px solid color-mix(in srgb, var(--purple) 28%, transparent)',
             font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)' }}>
             <Icon name="clock" size={12} style={{ color: 'var(--purple)' }} />
-            <span style={{ color: 'var(--ink-secondary)' }}>Auto-resumes in</span>
+            <span style={{ color: 'var(--ink-secondary)' }}>{job.pausedReason === 'limit' ? 'Usage limit — resumes in' : 'Auto-resumes in'}</span>
             <span style={{ fontVariantNumeric: 'tabular-nums', color: 'var(--ink)' }}>{fmtCountdown((job.pausedUntil ?? 0) - Date.now())}</span>
           </div>
         )}
@@ -3255,7 +3255,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   React.useEffect(() => { if (autoFocus) composerRef.current?.focus(); }, [autoFocus]);
 
   const lastTurn = turns.length ? turns[turns.length - 1] : null;
-  // Parked-on-wakeup turns are NOT streaming for composer purposes: the session
+  // Parked-on-WAKEUP turns are NOT streaming for composer purposes: the session
   // is closed and the next user message should send straight through (just like
   // after a scheduled message is queued) instead of being queued behind the
   // dormant SDK iterator. The countdown chip on the turn itself communicates
@@ -4004,7 +4004,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                   // user scanning the composer doesn't mistake the dormant
                   // session for "ready to send" without context.
                   ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>
-                      <Icon name="clock" size={12} style={{ color: 'var(--purple)' }} /> Auto-resumes in {fmtCountdown((lastTurn?.pausedUntil ?? 0) - Date.now())}
+                      <Icon name="clock" size={12} style={{ color: 'var(--purple)' }} /> {lastTurn?.pausedReason === 'limit' ? 'Usage limit — resumes in' : 'Auto-resumes in'} {fmtCountdown((lastTurn?.pausedUntil ?? 0) - Date.now())}
                     </span>
                   : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{planMode ? 'Plan · ⏎' : goalMode ? 'Goal · ⏎' : queue.length ? `${queue.length} queued` : '⏎ to send'}</span>}
             </div>

@@ -179,9 +179,12 @@ export interface Job {
       this time. Cleared the moment the next assistant message arrives or the
       job transitions to a terminal state (done/failed/cancelled). */
   pausedUntil?: number | null;
-  /** What's keeping the job paused. Currently only 'wakeup' (ScheduleWakeup
-      tool). Reserved for future 'background-task' / 'cron' parking. */
-  pausedReason?: 'wakeup' | null;
+  /** What's keeping the job paused. 'wakeup' = a ScheduleWakeup tool parked the
+      SDK; 'limit' = the run hit the claude.ai usage cap and an auto-continue is
+      armed for `pausedUntil` (the reset time). Both keep the turn out of the
+      terminal-done bucket so the renderer holds its message queue (no burst
+      drain) until the session is genuinely ready again. */
+  pausedReason?: 'wakeup' | 'limit' | null;
   /** Latest request's total input size (input + cache-read + cache-creation tokens) — i.e.
       how full the model's context window was on the most recent turn. Lets the native UI show
       a "context remaining" gauge against the model's window size. Output-only `tokens` above is
