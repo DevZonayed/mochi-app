@@ -40,34 +40,43 @@ describe('isCleanGithubToken', () => {
   });
 });
 
-describe('getLocalKey(github) self-heals a corrupt Keychain entry', () => {
+describe('getLocalKey(github) is entirely gh-CLI based', () => {
   let deleted: string[] = [];
-  const fakeStore = () => ({
-    getProviderKeyCipher: (_p: string) => 'cipher-b64',
+  // `hasCipher` toggles whether a legacy Keychain entry is still on disk.
+  const fakeStore = (hasCipher: boolean) => ({
+    getProviderKeyCipher: (_p: string) => (hasCipher ? 'cipher-b64' : undefined),
     deleteProviderKey: (p: string) => { deleted.push(p); },
   });
   beforeEach(() => { deleted = []; cli.token = null; decrypted.value = ''; });
 
-  test('mojibake decrypt is discarded, cipher deleted, gh CLI token used', () => {
-    decrypted.value = 'gho_���garbage�xxxxxxxxxx';
+  test('borrows the gh CLI token and purges any legacy cipher', () => {
     cli.token = 'gho_' + 'z'.repeat(36);
-    const p = new Providers(fakeStore() as never);
+    const p = new Providers(fakeStore(true) as never);
     expect(p.getLocalKey('github')).toBe(cli.token);
     expect(deleted).toContain('github');
   });
 
-  test('clean decrypt is returned as-is (no delete, no CLI needed)', () => {
+  test('a stored cipher is NEVER decrypted/trusted — gh CLI always wins', () => {
+    // Even a clean-looking stored token must be ignored: the Keychain path is
+    // the exact wrong-signature-mojibake source we removed for GitHub.
     decrypted.value = 'gho_' + 'y'.repeat(36);
-    cli.token = 'gho_should_not_be_used_xxxxxxxxxxxxxx';
-    const p = new Providers(fakeStore() as never);
-    expect(p.getLocalKey('github')).toBe('gho_' + 'y'.repeat(36));
+    cli.token = 'gho_' + 'z'.repeat(36);
+    const p = new Providers(fakeStore(true) as never);
+    expect(p.getLocalKey('github')).toBe(cli.token);
+    expect(deleted).toContain('github');
+  });
+
+  test('no cipher on disk → returns the gh token, deletes nothing', () => {
+    cli.token = 'gho_' + 'z'.repeat(36);
+    const p = new Providers(fakeStore(false) as never);
+    expect(p.getLocalKey('github')).toBe(cli.token);
     expect(deleted).toHaveLength(0);
   });
 
-  test('corrupt cipher AND no gh CLI token → undefined (not the garbage)', () => {
-    decrypted.value = '���������������������';
+  test('gh CLI not authenticated → undefined (never a stored token)', () => {
+    decrypted.value = 'gho_' + 'y'.repeat(36); // present but must be ignored
     cli.token = null;
-    const p = new Providers(fakeStore() as never);
+    const p = new Providers(fakeStore(true) as never);
     expect(p.getLocalKey('github')).toBeUndefined();
   });
 });

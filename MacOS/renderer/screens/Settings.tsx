@@ -470,7 +470,6 @@ function AccountsPane() {
   // browser, no token to paste. `githubDevice` carries the one-time code / progress.
   const [githubBusy, setGithubBusy] = React.useState(false);
   const [githubDevice, setGithubDevice] = React.useState<GithubDevice | null>(null);
-  const [showPat, setShowPat] = React.useState(false);
 
   const refetch = React.useCallback(() => { api.listProviders().then(setConns).catch(() => {}); }, []);
   React.useEffect(() => { refetch(); }, [refetch]);
@@ -500,7 +499,6 @@ function AccountsPane() {
     const unsub = api.subscribe({ onGithubDevice: (d) => setGithubDevice(d) });
     try {
       await api.githubLogin();
-      setShowPat(false);
       refetch();
     } catch (err) {
       setErrors(e => ({ ...e, github: err instanceof ApiError ? err.message : 'GitHub sign-in failed' }));
@@ -509,6 +507,13 @@ function AccountsPane() {
     }
   };
   const githubCancel = () => { api.githubLoginCancel().catch(() => {}); setGithubBusy(false); setGithubDevice(null); };
+  // Sign out of GitHub — logs the gh CLI out (GitHub is entirely gh-based).
+  const githubLogout = async () => {
+    setGithubBusy(true); setErrors(e => ({ ...e, github: '' }));
+    try { await api.githubLogout(); refetch(); }
+    catch (err) { setErrors(e => ({ ...e, github: err instanceof ApiError ? err.message : 'Sign-out failed' })); }
+    finally { setGithubBusy(false); }
+  };
 
   const connect = async (id: ProviderId) => {
     const key = (keys[id] || '').trim();
@@ -562,6 +567,7 @@ function AccountsPane() {
                       <span style={{ height: 32, display: 'inline-flex', alignItems: 'center', padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'rgba(52,199,89,0.12)', color: 'var(--green)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Signed in</span>
                       {isOpenai && chatgptBtn}
                       {isOpenai && <button onClick={codexLogout} disabled={codexBusy} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: codexBusy ? 0.6 : 1 }}>Sign out</button>}
+                      {isGithub && <button onClick={githubLogout} disabled={githubBusy} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: githubBusy ? 0.6 : 1 }}>{githubBusy ? '…' : 'Sign out'}</button>}
                     </>
                   ) : (
                     <>
@@ -584,19 +590,7 @@ function AccountsPane() {
                         <button onClick={githubCancel} className="ghost-btn" style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Cancel</button>
                       </>
                     ) : (
-                      <>
-                        <button onClick={githubLogin} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', whiteSpace: 'nowrap' }}><Icon name="lock" size={12} /> Sign in with GitHub</button>
-                        <button onClick={() => setShowPat(s => !s)} className="ghost-btn" title="Advanced: paste a Personal Access Token instead" style={{ height: 32, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Token</button>
-                        {showPat && (
-                          <>
-                            <input type="password" value={keys[p.id] || ''} placeholder={p.hint}
-                              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setKeys(k => ({ ...k, [p.id]: e.target.value }))}
-                              onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') connect(p.id); }}
-                              style={{ flexBasis: '100%', minWidth: 0, height: 32, border: '0.5px solid var(--separator-strong)', borderRadius: 8, outline: 'none', background: 'var(--fill-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', padding: '0 10px' }} />
-                            <button onClick={() => connect(p.id)} disabled={busy[p.id] || !(keys[p.id] || '').trim()} style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: busy[p.id] || !(keys[p.id] || '').trim() ? 0.5 : 1 }}>{busy[p.id] ? '…' : 'Connect'}</button>
-                          </>
-                        )}
-                      </>
+                      <button onClick={githubLogin} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', whiteSpace: 'nowrap' }}><Icon name="lock" size={12} /> Sign in with GitHub</button>
                     )
                   ) : (
                     <>
