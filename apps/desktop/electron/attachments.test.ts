@@ -110,6 +110,29 @@ describe('attachments', () => {
     expect(scrubAbsPathsForRelay(text)).toBe(text);
   });
 
+  it('scrubAbsPathsForRelay handles project folders with SPACES in the prefix', () => {
+    // Regression: image_37flq.png — the bubble used to render the raw `@<path>`
+    // as an underlined link instead of a pill because the path prefix
+    // contained spaces (`Client Shared GIT/`) and the old `[^\s]+` regex
+    // refused to match. Verified against the relay scrub here, and the same
+    // widened pattern is used by the bubble's `ATTACH_INLINE_RE`.
+    const text = 'here is @/Users/jonayed/Desktop/Projects/Nexalance/Client Shared GIT/veni0004/.continuum/Attachment/Pasted_text_ckxg1.txt , thanks';
+    expect(scrubAbsPathsForRelay(text))
+      .toBe('here is @.continuum/Attachment/Pasted_text_ckxg1.txt , thanks');
+  });
+
+  it('scrubAbsPathsForRelay preserves a sub-directory under Attachment/ (legacy per-session layout)', () => {
+    const text = 'see @/Users/me/proj/.continuum/Attachment/dresden/Pasted_text_ckxg1.txt now';
+    expect(scrubAbsPathsForRelay(text))
+      .toBe('see @.continuum/Attachment/dresden/Pasted_text_ckxg1.txt now');
+  });
+
+  it('scrubAbsPathsForRelay scrubs BOTH a spaced + sub-dir path AND a trailing extra path on one line', () => {
+    const text = 'A @/Users/jonayed/Client Shared GIT/p/.continuum/Attachment/sub/a.png and B @/tmp/q/.continuum/Attachment/b.txt done';
+    expect(scrubAbsPathsForRelay(text))
+      .toBe('A @.continuum/Attachment/sub/a.png and B @.continuum/Attachment/b.txt done');
+  });
+
   it('saveAttachment with the SAME id rewrites the same file (idempotent re-save)', () => {
     const a = saveAttachment(cwd, { id: 'same-id', kind: 'text', name: 'note.txt', content: 'one' });
     const b = saveAttachment(cwd, { id: 'same-id', kind: 'text', name: 'note.txt', content: 'two' });

@@ -175,17 +175,21 @@ export function substitutePlaceholders(text: string, map: Map<string, string>): 
 }
 
 /** For the relay snapshot: rewrite every `@<absPath>` that lives under any
-    `.continuum/Attachment/` directory (including a branch subfolder) into
-    `@.continuum/Attachment/<subpath>`, so the phone/web remote never learns the
-    operator's home directory. */
+    `.continuum/Attachment/` directory into `@.continuum/Attachment/<subpath>`,
+    so the phone/web remote never learns the operator's home directory. Path
+    matching uses `[^@\n]+?` (not `[^\s]+`) so a project folder with spaces
+    — eg `/Users/me/Desktop/Client Shared GIT/veni0004/` — still scrubs.
+    Sub-directories under `Attachment/` (incl. a branch subfolder) are preserved
+    in the scrubbed form so the relay reference still points at the same file. */
 export function scrubAbsPathsForRelay(text: string): string {
   if (!text) return text;
-  return text.replace(/@(\/[^\s]+\/\.continuum\/Attachment\/([A-Za-z0-9._/-]+))/g,
+  return text.replace(/@(\/[^@\n]+?\/\.continuum\/Attachment\/((?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+))/g,
     (_m, _full: string, base: string) => `@.continuum/Attachment/${base}`);
 }
 
 /** A standalone path token regex used by the renderer to tokenize a message
     bubble into prose + inline attachment chips. Matches both absolute paths and
-    the relay-scrubbed `@.continuum/Attachment/<file>` form, and accepts an
-    optional branch subfolder (`@…/Attachment/<branchSlug>/<file>`). */
-export const ATTACH_PATH_TOKEN = /@(\S*\.continuum\/Attachment\/[A-Za-z0-9._/-]+)/g;
+    the relay-scrubbed `@.continuum/Attachment/<file>` form. Accepts spaces in
+    the prefix and optional sub-directories under `Attachment/` (incl. a branch
+    subfolder, `@…/Attachment/<branchSlug>/<file>`). */
+export const ATTACH_PATH_TOKEN = /@((?:\/[^@\n]+?)?\.continuum\/Attachment\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+)/g;

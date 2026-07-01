@@ -255,15 +255,20 @@ export class ExtensionBridge {
     }
   }
 
-  /** Deliver text into a chat as a new turn. If the chat has a job in flight,
-      interrupt it first — the app's steer model (the SDK session resumes with the
-      prior context, so steering and "send next message" are the same operation). */
+  /** Deliver text into a chat as a new turn. NEVER interrupts a live turn —
+      previously this called cancelJob on any running job for the session, which
+      kept STOPPING the operator's run out from under them when they added an
+      element comment / pasted from the extension while the agent was busy
+      (image_nqm3a.png — same root cause as the front-end "send mid-stream
+      cancels the run" bug). Now, when the session is busy, we refuse the
+      delivery cleanly so the caller can choose to retry or store the message
+      for the operator. The red abort button in the chat is the only stop. */
   private async deliver(projectId: string, sessionId: string | null, text: string): Promise<{ sessionId: string; jobId: string }> {
     if (!projectId) throw new Error('projectId required');
     if (!text.trim()) throw new Error('message text required');
     if (sessionId) {
       const running = this.store.listJobs(projectId, sessionId).find(j => j.status === 'running' || j.status === 'pending');
-      if (running) { try { await this.dispatch('cancelJob', { id: running.id }); } catch { /* already gone */ } }
+      if (running) throw new Error('session busy — the agent is mid-turn; try again when it finishes');
     }
     const res = await this.dispatch('sendChat', { projectId, sessionId: sessionId ?? undefined, text }) as { session: { id: string }; job: { id: string } };
     return { sessionId: res.session.id, jobId: res.job.id };

@@ -311,12 +311,15 @@ export class BrowserWatcher {
       `Watch id: \`${w.id}\` (interval=${w.intervalMs}ms${w.repeat ? ', repeating' : ', one-shot'})`,
     ].filter(Boolean).join('\n');
     try {
-      // Same path as extension-bridge.deliver(): if a job is in-flight on the
-      // session, interrupt it first so the new turn picks up cleanly.
+      // Never interrupt a live turn. If the operator's chat already has a job
+      // running, defer this watch firing — a repeating watch will try again on
+      // the next interval; a one-shot reports the deferral so the agent can ask
+      // the operator to re-arm if desired. Previously this called cancelJob
+      // before sendChat which kept STOPPING the operator's running turn out from
+      // under them (image_nqm3a.png — same root cause as the front-end fix).
+      // The red abort button in the chat header is the only stop control now.
       const running = this.store.listJobs(w.projectId, w.sessionId).find(j => j.status === 'running' || j.status === 'pending');
-      if (running) {
-        try { await this.dispatch('cancelJob', { id: running.id }); } catch { /* already gone */ }
-      }
+      if (running) return { ok: false, error: 'session is busy — deferred' };
       const r = await this.dispatch('sendChat', { projectId: w.projectId, sessionId: w.sessionId, text: body }) as { session?: { id: string }; job?: { id: string } };
       const jobId = r?.job?.id ?? '';
       if (!jobId) return { ok: false, error: 'sendChat returned no job' };
