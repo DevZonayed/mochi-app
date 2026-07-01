@@ -2,11 +2,11 @@
 //
 // This workflow uploads artifacts instead of publishing GitHub Releases, so the
 // release-based desktop version helper would repeat when no release tag changes.
-// Use apps/desktop/package.json as the version floor and GitHub's per-workflow
+// Use MacOS/package.json as the version floor and GitHub's per-workflow
 // run number as the automatic patch increment.
 import { appendFileSync, readFileSync } from 'node:fs';
 
-const base = JSON.parse(readFileSync('apps/desktop/package.json', 'utf8')).version;
+const base = JSON.parse(readFileSync('MacOS/package.json', 'utf8')).version;
 const runNumber = Number(process.env.GITHUB_RUN_NUMBER || '0');
 
 if (!Number.isInteger(runNumber) || runNumber < 1) {

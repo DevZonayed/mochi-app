@@ -56,7 +56,7 @@ if (result.warnings.length) console.log(`  ${result.warnings.length} warning(s)`
 // can't be inlined). `send-hint-overlay.js` is read eagerly at module load (overlay.ts), so a
 // missing copy crashes the sidecar at boot; the `templates/` dir backs project bootstrap. Emit
 // them into dist/ so the bundle is self-contained (CI native-build + package-app.sh both copy it).
-const brain = path.join(here, '..', '..', 'apps', 'desktop', 'electron');
+const brain = path.join(here, '..', 'brain');
 for (const [src, dst] of [['browser/send-hint-overlay.js', 'send-hint-overlay.js'], ['templates', 'templates']]) {
   const from = path.join(brain, src);
   if (existsSync(from)) { cpSync(from, path.join(here, 'dist', dst), { recursive: true }); console.log(`  + ${dst}`); }
