@@ -45,7 +45,7 @@ if [ ! -x "$REPO_ROOT/node_modules/.bin/vite" ]; then
   echo "Missing node_modules/.bin/vite. Run pnpm install from the repo root first."
   exit 1
 fi
-(cd "$REPO_ROOT/apps/desktop" && "$REPO_ROOT/node_modules/.bin/vite" build --config vite.web.config.ts --outDir "$ROOT/build/web" --emptyOutDir)
+(cd "$REPO_ROOT/MacOS" && "$REPO_ROOT/node_modules/.bin/vite" build --config vite.web.config.ts --outDir "$ROOT/build/web" --emptyOutDir)
 
 echo "> swift build -c $CONFIG (version $VERSION)"
 swift build -c "$CONFIG" --package-path "$ROOT"

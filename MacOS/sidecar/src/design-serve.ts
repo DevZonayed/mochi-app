@@ -7,7 +7,7 @@
 import { existsSync, realpathSync, promises as fsp } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import type { Store } from '../../../apps/desktop/electron/store.js';
+import type { Store } from '../../brain/store.js';
 
 const DESIGN_MIME: Record<string, string> = {
   '.html': 'text/html', '.htm': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript',
