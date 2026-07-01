@@ -1505,12 +1505,13 @@ export const api = {
 
   // GitHub connection + per-session PR lifecycle (desktop-only on the relay).
   githubStatus: () => call<GithubConnection>('githubStatus', {}, () => req<GithubConnection>('/api/github/status')),
-  importGithubFromCli: () => call<ProviderConn>('importGithubFromCli', {}, () => req<ProviderConn>('/api/github/import-cli', { method: 'POST' })),
   // OAuth sign-in via the gh CLI device flow (downloads gh on first use). Long-lived;
   // resolves with the live connection once authorized. Listen on onGithubDevice for the
-  // one-time code + download progress.
+  // one-time code + download progress. GitHub is entirely gh-based — no PAT is stored.
   githubLogin: () => call<GithubConnection>('githubLogin', {}, () => req<GithubConnection>('/api/github/login', { method: 'POST' })),
   githubLoginCancel: () => call<{ ok: boolean }>('githubLoginCancel', {}, () => req<{ ok: boolean }>('/api/github/login/cancel', { method: 'POST' })),
+  // Sign out of GitHub — logs the gh CLI out (removes gh's on-disk token).
+  githubLogout: () => call<{ ok: boolean }>('githubLogout', {}, () => req<{ ok: boolean }>('/api/github/logout', { method: 'POST' })),
   ghCliState: () => call<GhState>('ghCliState', {}, () => req<GhState>('/api/github/cli-state')),
   getSessionGitStatus: (sessionId: string, withPr = true) =>
     call<SessionGitStatus>('getSessionGitStatus', { sessionId, withPr }, () => req<SessionGitStatus>(`/api/sessions/${sessionId}/git-status`)),
