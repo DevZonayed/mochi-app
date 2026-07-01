@@ -3761,6 +3761,14 @@ export class LocalEngine {
         // was capped, so the gauge can show "Claude limit · resets in …".
         contextTokens: main.contextTokens,
         limitResetsAt: main.hitLimit ? (main.limitResetsAt ?? null) : null,
+        // Was this (done) turn actually capped by the claude.ai usage limit? A
+        // limit-blocked chat turn ends 'done' (partial work + sdkSessionId intact)
+        // with an auto-continue scheduled for reset time. The composer queue drainer
+        // reads this to HOLD — otherwise "not streaming" is misread as "ready" and
+        // every queued message flushes back-to-back against the same wall. Unlike
+        // `limitResetsAt`, this stays true even when the reset time couldn't be
+        // parsed, so the hold is robust. It's superseded when a fresher turn lands.
+        blockedByLimit: !!(master === 'claude' && main.hitLimit && isChat && main.sdkSessionId && !opts.plan),
         // Defense in depth: runClaude's terminal markResumed() already cleared
         // this via the hook, but a turn that ends concurrently with an in-flight
         // pause event must not persist a stale countdown alongside 'done'.
