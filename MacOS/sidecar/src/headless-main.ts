@@ -1,4 +1,4 @@
-// Headless entry for the Maestro brain. Mirrors the construction in apps/desktop/electron/main.ts
+// Headless entry for the Maestro brain. Mirrors the construction in the former Electron main.ts
 // (the `app.whenReady()` block) MINUS the Electron-window pieces (BrowserWindow, protocol handler,
 // relay HostClient, P2P, updater, the windowed ExtensionBridge). It builds the SAME
 // `createDispatch(...)` the renderer talks to and serves it over the loopback WS host, so the
@@ -13,27 +13,27 @@ import { app as shimApp } from './electron-shim.ts';
 import { startWsHost } from './ws-host.ts';
 import { serveDesign } from './design-serve.ts';
 
-import { Store } from '../../../apps/desktop/electron/store.js';
-import { Providers } from '../../../apps/desktop/electron/providers.js';
-import { LocalEngine } from '../../../apps/desktop/electron/engine.js';
-import { BrowserManager } from '../../../apps/desktop/electron/browser/manager.js';
-import { MediaEngine } from '../../../apps/desktop/electron/media.js';
-import { ResearchEngine } from '../../../apps/desktop/electron/research.js';
-import { PublishingEngine } from '../../../apps/desktop/electron/publishing.js';
-import { CodexBridge } from '../../../apps/desktop/electron/codex-bridge.js';
-import { TelegramBot } from '../../../apps/desktop/electron/telegram.js';
-import { WhatsAppClient } from '../../../apps/desktop/electron/whatsapp.js';
-import { GitService } from '../../../apps/desktop/electron/git-service.js';
-import { GitWatcher } from '../../../apps/desktop/electron/git-watcher.js';
-import { CronRunner } from '../../../apps/desktop/electron/cron.js';
-import { makeWhatsappAnalyzer } from '../../../apps/desktop/electron/whatsapp-analyze.js';
-import { createDispatch } from '../../../apps/desktop/electron/localApi.js';
-import { setEnginesRoot } from '../../../apps/desktop/electron/engines.js';
-import { bootstrapNodePath } from '../../../apps/desktop/electron/node-shim.js';
-import { HostClient } from '../../../apps/desktop/electron/hostClient.js';
-import { buildModelGroups, refreshModelGroups } from '../../../apps/desktop/electron/models.js';
-import { isRemoteBlocked } from '../../../apps/desktop/electron/remote-guard.js';
-import type { Asset, Job } from '../../../apps/desktop/electron/store.js';
+import { Store } from '../../brain/store.js';
+import { Providers } from '../../brain/providers.js';
+import { LocalEngine } from '../../brain/engine.js';
+import { BrowserManager } from '../../brain/browser/manager.js';
+import { MediaEngine } from '../../brain/media.js';
+import { ResearchEngine } from '../../brain/research.js';
+import { PublishingEngine } from '../../brain/publishing.js';
+import { CodexBridge } from '../../brain/codex-bridge.js';
+import { TelegramBot } from '../../brain/telegram.js';
+import { WhatsAppClient } from '../../brain/whatsapp.js';
+import { GitService } from '../../brain/git-service.js';
+import { GitWatcher } from '../../brain/git-watcher.js';
+import { CronRunner } from '../../brain/cron.js';
+import { makeWhatsappAnalyzer } from '../../brain/whatsapp-analyze.js';
+import { createDispatch } from '../../brain/localApi.js';
+import { setEnginesRoot } from '../../brain/engines.js';
+import { bootstrapNodePath } from '../../brain/node-shim.js';
+import { HostClient } from '../../brain/hostClient.js';
+import { buildModelGroups, refreshModelGroups } from '../../brain/models.js';
+import { isRemoteBlocked } from '../../brain/remote-guard.js';
+import type { Asset, Job } from '../../brain/store.js';
 
 // Tell the Swift supervisor we're alive the moment the entry body runs (before the heavy brain
 // construction below), so it can distinguish "alive and booting" from "hung/dead". And turn any

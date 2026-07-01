@@ -18,7 +18,7 @@ goal-mode, autonomous — without exception:
   Bash hook denies these and returns the reason to you so you know why.
 - **Never** call the `pr_merge` MCP tool with `{ confirmed: true }`. The IPC
   surface strips the flag and the agent-side tripwire in
-  `apps/desktop/electron/git-ctx.ts` will reject it loudly. State the intent
+  `MacOS/brain/git-ctx.ts` will reject it loudly. State the intent
   in plain English instead.
 - **Never** `git push origin master` (or `main`), and never push with
   `--force`/`--force-with-lease` to `master`. Master is updated **only** via a
@@ -43,7 +43,7 @@ touches the GitHub merge API.
   every commit as a safety net, but the agent must not write them in the first
   place — the user's clients read this commit log.
 - Commit identity is auto-aligned to the **GitHub-logged-in account** via
-  `ensureCommitIdentity` (`apps/desktop/electron/git-identity.ts`) at repo
+  `ensureCommitIdentity` (`MacOS/brain/git-identity.ts`) at repo
   open / clone / adopt. It uses `gh api user` and falls back to
   `<login>@users.noreply.github.com` if the operator's email is private. The
   trailer-stripping hook is wired the same way via `ensureGitHooks`.
@@ -73,7 +73,7 @@ and apply to ALL modes — interactive, goal-mode, autonomous:
 
 ## Repo layout (one-liner)
 
-pnpm + Turborepo monorepo. `apps/desktop` (Electron+React, the brain), `apps/mobile` (Expo, thin remote), `apps/server` (account-scoped relay). Shared: `packages/design-tokens`, `packages/realtime`.
+pnpm + Turborepo monorepo. `MacOS/` (the maintained native **WebKit** macOS app: `webview-app/` Swift shell + `renderer/` React UI + `brain/` Node brain + `sidecar/` headless runner + `extension/`), `apps/mobile` (Expo, thin remote), `apps/server` (account-scoped relay). Shared: `packages/design-tokens`, `packages/realtime`. (The old Electron `apps/desktop` and pure-SwiftUI app are removed — WebKit only.)
 
 ## When in doubt
 

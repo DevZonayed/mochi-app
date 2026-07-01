@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node", "vite/client"],
+    "paths": {
+      "@maestro/design-tokens": ["../packages/design-tokens/index.ts"],
+      "@maestro/design-tokens/theme": ["../packages/design-tokens/src/theme.ts"]
+    }
+  },
+  "include": ["renderer", "brain"],
+  "exclude": ["**/*.test.ts"]
+}
