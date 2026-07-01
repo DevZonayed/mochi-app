@@ -3048,7 +3048,6 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   const [sendError, setSendError] = React.useState('');
   const [slashSel, setSlashSel] = React.useState(0);
   const [mentionSel, setMentionSel] = React.useState(0);
-  const [optsOpen, setOptsOpen] = React.useState(false); // reviewer-model popover
   const [schedNote, setSchedNote] = React.useState('');
   const [schedOpen, setSchedOpen] = React.useState(false); // schedule-this-message date/time picker
   const [schedEditAt, setSchedEditAt] = React.useState<number | null>(null); // prefill fireAt when editing
@@ -3858,6 +3857,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
               <RichComposer
                 ref={composerRef}
                 disabled={!projectId || locked}
+                style={{ minHeight: 58 }}
                 placeholder={!projectId ? 'Pick a project first' : locked ? 'View only — this PR has been merged' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
                 onTextChange={setText}
                 onChips={info => {
@@ -3919,27 +3919,27 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
               <input ref={fileRef} type="file" multiple style={{ display: 'none' }}
                 onChange={e => { addFiles(e.target.files); if (e.target) e.target.value = ''; }} />
               <button onClick={() => fileRef.current?.click()} disabled={!projectId} title="Attach a file — image, text, or any file (or paste / drag-drop)" className="tb-icon" style={{
-                width: 30, height: 30, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+                width: 26, height: 24, borderRadius: 8, flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
                 background: 'transparent', color: 'var(--ink-secondary)', opacity: projectId ? 1 : 0.4, cursor: projectId ? 'pointer' : 'default' }}>
-                <Icon name="paperclip" size={16} />
+                <Icon name="paperclip" size={15} />
               </button>
               {/* core: which model · how hard · the two run modes */}
               <ModelPicker compact direction="up" value={primaryKey} onChange={setPrimaryKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
               <EffortDial compact value={effort} onChange={setEffort} />
-              <span style={{ width: 1, height: 18, background: 'var(--separator)', margin: '0 1px' }} />
+              <span style={{ width: 1, height: 16, background: 'var(--separator)', margin: '0 1px' }} />
               <button onClick={() => setPlanMode(!planMode)} title={planMode ? 'Plan mode on — propose before building' : 'Plan first — propose a plan before doing the work'}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9, cursor: 'pointer',
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 24, padding: '0 8px', borderRadius: 8, cursor: 'pointer',
                   background: planMode ? 'color-mix(in srgb, var(--blue) 13%, transparent)' : 'var(--fill-secondary)',
                   border: planMode ? '1px solid color-mix(in srgb, var(--blue) 45%, transparent)' : '1px solid transparent',
-                  color: planMode ? 'var(--blue)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-                <Icon name="map" size={14} /> Plan
+                  color: planMode ? 'var(--blue)' : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                <Icon name="map" size={13} /> Plan
               </button>
               <button onClick={() => setGoalMode(!goalMode)} title={goalMode ? 'Goal mode on — pursue autonomously to completion' : 'Goal mode — pursue the request autonomously over a long run'}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9, cursor: 'pointer',
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 24, padding: '0 8px', borderRadius: 8, cursor: 'pointer',
                   background: goalMode ? 'color-mix(in srgb, var(--purple) 14%, transparent)' : 'var(--fill-secondary)',
                   border: goalMode ? '1px solid color-mix(in srgb, var(--purple) 45%, transparent)' : '1px solid transparent',
-                  color: goalMode ? 'var(--purple)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-                <Icon name="target" size={14} /> {primaryProvider === 'codex' ? 'Pursue goal' : 'Goal'}
+                  color: goalMode ? 'var(--purple)' : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                <Icon name="target" size={13} /> {primaryProvider === 'codex' ? 'Pursue goal' : 'Goal'}
               </button>
               {/* Autopilot — per-chat opt-in. ON = engine runs a Sonnet judgment after
                   every turn and arms a 1-min [Auto-continue] followup when the agent
@@ -3948,12 +3948,12 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                   Scheduler. Off by default. */}
               <button onClick={toggleAutoPilot} disabled={!activeId}
                 title={!activeId ? 'Send a message to enable autopilot for this chat' : autoPilotEffective ? 'Autopilot ON for this chat — auto-continues in 1 min when the agent offers to keep going. Click to disable.' : 'Autopilot OFF — turn on to auto-continue this chat when the agent ends on "want me to keep going?"'}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9,
-                  cursor: activeId ? 'pointer' : 'default', opacity: activeId ? 1 : 0.5,
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 24, padding: '0 8px', borderRadius: 8,
+                  cursor: activeId ? 'pointer' : 'not-allowed', opacity: activeId ? 1 : 0.4,
                   background: autoPilotEffective ? 'color-mix(in srgb, var(--green) 14%, transparent)' : 'var(--fill-secondary)',
                   border: autoPilotEffective ? '1px solid color-mix(in srgb, var(--green) 45%, transparent)' : '1px solid transparent',
-                  color: autoPilotEffective ? 'var(--green)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-                <Icon name="bolt" size={14} /> Autopilot
+                  color: autoPilotEffective ? 'var(--green)' : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                <Icon name="bolt" size={13} /> Autopilot
               </button>
               {/* Reviewer — per-chat opt-in. ON = the reviewer engine runs after
                   EVERY assistant turn (not only on file-writing turns, which was
@@ -3961,12 +3961,12 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                   picks WHICH engine reviews. Off by default. */}
               <button onClick={toggleReviewer} disabled={!activeId}
                 title={!activeId ? 'Send a message to enable reviewer for this chat' : reviewerEffective ? 'Reviewer ON for this chat — every turn gets reviewed. Click to disable.' : 'Reviewer OFF — turn on to review every assistant turn.'}
-                style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9,
-                  cursor: activeId ? 'pointer' : 'default', opacity: activeId ? 1 : 0.5,
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 24, padding: '0 8px', borderRadius: 8,
+                  cursor: activeId ? 'pointer' : 'not-allowed', opacity: activeId ? 1 : 0.4,
                   background: reviewerEffective ? 'color-mix(in srgb, var(--orange) 14%, transparent)' : 'var(--fill-secondary)',
                   border: reviewerEffective ? '1px solid color-mix(in srgb, var(--orange) 45%, transparent)' : '1px solid transparent',
-                  color: reviewerEffective ? 'var(--orange)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-                <Icon name="checkCircle" size={14} /> Review
+                  color: reviewerEffective ? 'var(--orange)' : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                <Icon name="checkCircle" size={13} /> Review
               </button>
               {reviewerEffective && (
                 <ModelPicker
@@ -3979,39 +3979,19 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                   triggerLabel="Reviewer"
                 />
               )}
-              <span style={{ width: 1, height: 18, background: 'var(--separator)', margin: '0 1px' }} />
+              <span style={{ width: 1, height: 16, background: 'var(--separator)', margin: '0 1px' }} />
               {/* schedule THIS message — pick a date/time; it fires into the chat then */}
               <div style={{ position: 'relative' }}>
                 <button onClick={() => { setSchedEditAt(null); setSchedOpen(o => !o); }} disabled={!canSend || !projectId}
                   title={canSend ? 'Schedule this message to send later' : 'Type a message to schedule it'}
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 10px', borderRadius: 9, cursor: canSend && projectId ? 'pointer' : 'default',
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 24, padding: '0 8px', borderRadius: 8, cursor: canSend && projectId ? 'pointer' : 'default',
                     background: schedOpen ? 'color-mix(in srgb, var(--blue) 13%, transparent)' : 'var(--fill-secondary)',
                     border: schedOpen ? '1px solid color-mix(in srgb, var(--blue) 45%, transparent)' : '1px solid transparent',
-                    color: schedOpen ? 'var(--blue)' : 'var(--ink-secondary)', opacity: canSend && projectId ? 1 : 0.45, font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-                  <Icon name="clock" size={14} /> Schedule
+                    color: schedOpen ? 'var(--blue)' : 'var(--ink-secondary)', opacity: canSend && projectId ? 1 : 0.45, font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                  <Icon name="clock" size={13} /> Schedule
                 </button>
                 {schedOpen && <SchedulePicker initial={schedEditAt ?? undefined} onPick={scheduleMessage} onRepeat={scheduleRecurring} onClose={() => setSchedOpen(false)} />}
               </div>
-              {/* reviewer model setup while Review is off */}
-              {!reviewerEffective && <div style={{ position: 'relative' }}>
-                <button onClick={() => setOptsOpen(o => !o)} title="Reviewer model"
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 9px', borderRadius: 9, cursor: 'pointer',
-                    background: optsOpen ? 'var(--fill-tertiary)' : 'var(--fill-secondary)', border: '1px solid transparent', color: 'var(--ink-secondary)' }}>
-                  <Icon name="sliders" size={14} />
-                  {reviewerKey && reviewerKey !== 'off' && <span title="Reviewer on" style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--green)' }} />}
-                </button>
-                {optsOpen && (
-                  <>
-                    <div onClick={() => setOptsOpen(false)} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
-                    <div style={{ position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 41, width: 266,
-                      background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.26))', padding: 11 }}>
-                      <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 7 }}>Reviewer model</div>
-                      <ModelPicker direction="up" allowOff value={reviewerKey || 'off'} onChange={setReviewerKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
-                      <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 8 }}>A second engine reviews each change and appends its verdict.</div>
-                    </div>
-                  </>
-                )}
-              </div>}
               {schedNote && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)', display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}><Icon name="check" size={12} /> {schedNote}</span>}
               <span style={{ flex: 1, minWidth: 6 }} />
               {streaming

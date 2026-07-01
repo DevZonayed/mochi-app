@@ -119,7 +119,7 @@ export function ModelPicker({ value, onChange, allowOff, favorites = [], onToggl
   }, [open, runnableFlat, onChange]);
 
   const isOff = allowOff && value === OFF_KEY;
-  const h = compact ? 28 : 32;
+  const h = compact ? 24 : 32;
   const fav = new Set(favorites);
   let shortcut = 0;
 
