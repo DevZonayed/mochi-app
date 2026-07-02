@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { saveAttachment, substitutePlaceholders, scrubAbsPathsForRelay, attachmentsDirFor, placeholderFor } from './attachments.js';
+import { saveAttachment, substitutePlaceholders, scrubAbsPathsForRelay, attachmentsDirFor, placeholderFor, attachedFilesBlock } from './attachments.js';
 
 describe('attachments', () => {
   let cwd: string;
@@ -99,6 +99,65 @@ describe('attachments', () => {
     expect(readFileSync(saved.absPath, 'utf8')).toBe('original-bytes');
     // Source is untouched.
     expect(readFileSync(src, 'utf8')).toBe('original-bytes');
+  });
+
+  describe('attachedFilesBlock', () => {
+    // The io stub: a virtual disk keyed by path.
+    const io = (disk: Record<string, string>) => ({
+      exists: (p: string) => p in disk,
+      readText: (p: string) => { if (!(p in disk)) throw new Error('ENOENT'); return disk[p]; },
+    });
+
+    it('INLINES a current-turn pasted-text file by reading it from disk (the core bug fix)', () => {
+      // Regression: the prompt only carried `@<path>`; the SDK never expands that,
+      // so without inlining the model sees the path but not the content.
+      const p = '/proj/.continuum/Attachment/Pasted_text_m9hfl.txt';
+      const block = attachedFilesBlock(
+        [{ name: 'Pasted_text_m9hfl.txt', kind: 'text', path: p }],
+        `here is the log @${p} please explain`,
+        io({ [p]: 'ERROR: boom at line 42' }),
+      );
+      expect(block).toContain('### Attached file: Pasted_text_m9hfl.txt');
+      expect(block).toContain('ERROR: boom at line 42');
+    });
+
+    it('prefers legacy inlined `content` over reading `path` (old persisted jobs)', () => {
+      const block = attachedFilesBlock(
+        [{ name: 'note.txt', kind: 'text', content: 'legacy body', path: '/gone.txt' }],
+        'prompt',
+        io({}),
+      );
+      expect(block).toContain('legacy body');
+    });
+
+    it('gives a Read hint for a binary NOT already referenced by @path in the prompt', () => {
+      const p = '/proj/.continuum/Attachment/spec_ccccc.pdf';
+      const block = attachedFilesBlock([{ name: 'spec.pdf', kind: 'file', path: p }], 'no reference here', io({ [p]: '%PDF' }));
+      expect(block).toContain('saved at ' + p);
+      expect(block).toContain('Read it with your tools');
+    });
+
+    it('does NOT double-hint a binary already referenced inline as @path', () => {
+      const p = '/proj/.continuum/Attachment/spec_ccccc.pdf';
+      const block = attachedFilesBlock([{ name: 'spec.pdf', kind: 'file', path: p }], `look at @${p}`, io({ [p]: '%PDF' }));
+      expect(block).toBe('');
+    });
+
+    it('returns empty string when there are no files (no stray block on plain messages)', () => {
+      expect(attachedFilesBlock([], 'just text', io({}))).toBe('');
+    });
+
+    it('truncates once the byte budget is exhausted', () => {
+      const p = '/proj/.continuum/Attachment/big_x.txt';
+      const block = attachedFilesBlock([{ name: 'big.txt', kind: 'text', path: p }], `@${p}`, io({ [p]: 'x'.repeat(100) }), 10);
+      expect(block).toContain('…(truncated)');
+      expect(block).not.toContain('x'.repeat(100));
+    });
+
+    it('skips a text file whose path is missing/unreadable without throwing', () => {
+      const block = attachedFilesBlock([{ name: 'gone.txt', kind: 'text', path: '/missing.txt' }], 'prompt', io({}));
+      expect(block).toBe('');
+    });
   });
 
   it('sanitizes unsafe characters in the filename', () => {

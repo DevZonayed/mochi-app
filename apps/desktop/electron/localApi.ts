@@ -622,11 +622,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         }
 
         // Ingest non-image attachments. EVERY one (text or binary) is saved on
-        // disk under `.continuum/Attachment/`; text pastes are no longer inlined
-        // into the prompt — the agent reads them from the file via its tools,
-        // and the inline `@<absPath>` marker tells it WHERE in the message to
-        // attend to that file. This keeps a 50k-char paste from re-blasting the
-        // prompt every turn.
+        // disk under `.continuum/Attachment/`, and the inline `@<absPath>` marker
+        // tells the agent WHERE in the message to attend to that file. The engine
+        // then INLINES each text file's content into the prompt for the turn it's
+        // attached (see engine.ts) — because the Agent SDK does not auto-expand
+        // `@path` mentions, a path alone would leave the model with no content.
+        // Inlining only on the attaching turn keeps a big paste from re-blasting
+        // the prompt on every later turn.
         const inputFiles: ChatFile[] = [];
         for (const f of rawFiles.slice(0, 12)) {
           const name = String(f?.name ?? 'file').slice(0, 200);
