@@ -14,7 +14,7 @@ import { GitStatusBar } from './GitStatusBar';
 import { Icon, type IconName } from '../lib/icons';
 import { EffortDial, CountUp } from '../lib/ui';
 import { FileChip } from '../lib/fileChip';
-import { toolDisplay, isSkillTool, prettySkillName } from '../lib/toolDisplay';
+import { toolDisplay, isSkillTool, prettySkillName, skillSlugFromReadPath } from '../lib/toolDisplay';
 import { AppShell } from '../lib/appShell';
 import { api, type Job, type Effort, type TranscriptItem } from '../lib/api';
 
@@ -152,13 +152,16 @@ function NestedTranscript({ items }: { items: TranscriptItem[] }) {
 function ToolStep({ item }: { item: TranscriptItem }) {
   const running = item.toolStatus === 'running';
   const error = item.toolStatus === 'error';
-  const isSkill = isSkillTool(item.name);
+  // A skill activation is either the native `Skill` tool (Claude) OR a read of a
+  // .claude/skills/<slug>/SKILL.md (both engines — this is how Codex "activates" one).
+  const readSkillSlug = skillSlugFromReadPath(item.name, item.text);
+  const isSkill = isSkillTool(item.name) || !!readSkillSlug;
   const d = toolDisplay(item.name ?? '');
   const short = isSkill ? 'Skill' : d.short;
   const glyph = isSkill ? 'var(--purple)' : error ? 'var(--red)' : d.tint;
   const showFile = !!d.file && !!item.text && !isSkill;
   const hasCmd = !!item.cmd && !showFile && !isSkill;
-  const detail = isSkill ? prettySkillName(item.text) : item.text;
+  const detail = isSkill ? prettySkillName(readSkillSlug ?? item.text) : item.text;
   const detailFont = !isSkill && !!d.mono && !hasCmd ? 'var(--font-mono)' : 'var(--font-text)';
   // Sub-agent chip: has captured children OR a final response. We auto-expand
   // while it's RUNNING so the operator sees the live progress without clicking,

@@ -30,6 +30,7 @@ import { normalizeRunMode, canStartBackgroundRun } from './run-mode.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
 import { ensureBrowserSkill } from './browser-skill.js';
+import { ensureNativeSkills, nativeSkillsPromptBlock, nativeSkillSummaries, isNativeSkill } from './native-skills.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
 import { makeGitCtx, type GitCtx } from './git-ctx.js';
@@ -1614,6 +1615,19 @@ async function runClaude(
         // Snap the live counters to the SDK's authoritative totals.
         if (usage?.output_tokens != null) { committedOut = usage.output_tokens; curOut = 0; }
         if (m.total_cost_usd != null) finalCost = m.total_cost_usd;
+        // The `result` message is TERMINAL for this turn — every content/tool/text
+        // block has already streamed. STOP iterating now instead of waiting for the
+        // SDK to close the stream: in *streaming input mode* (which we enter whenever
+        // the prompt is an AsyncIterable — the image-attachment path above), the
+        // Query generator stays OPEN after `result`, awaiting further input on the
+        // stream, so `for await` would never end and runClaude would never return —
+        // pinning the Job on status:'running' for hours after the answer is done
+        // (observed in the wild on image-attachment turns). Breaking here makes
+        // completion driven by the authoritative result, not by the SDK's stream
+        // lifecycle. The `finally` below force-closes the underlying subprocess.
+        // (The ScheduleWakeup dormancy case emits NO result, so this never fires
+        // during a legitimate pause — that path is handled by WakeupPauseTracker.)
+        break;
       }
     }
   } catch (e) {
@@ -1641,6 +1655,14 @@ async function runClaude(
       const detail = stderrTail.trim();
       throw new Error(`${msg}${detail ? `\n${detail}` : ''}`);
     }
+  } finally {
+    // Force-terminate the underlying CLI subprocess + MCP transports on EVERY exit
+    // path (normal break-on-result, cancel, max-turns/limit fall-through, or a
+    // rethrown error). In streaming input mode the Query generator does not
+    // self-close when we break out of the for-await, so without this the subprocess
+    // would leak; in single-shot mode the stream has already ended and close() is a
+    // harmless no-op. Best-effort — never let teardown mask the run's real outcome.
+    try { (it as { close?: () => void }).close?.(); } catch { /* best-effort */ }
   }
   // The run is leaving runClaude — whatever the reason, the "scheduled to
   // resume" UI must not survive past this point (a terminal status from the
@@ -2828,6 +2850,33 @@ export class LocalEngine {
         }
       }
 
+      // Native skills: the always-on catalog bundled with the app (from
+      // github.com/openai/skills). Materialise ALL of them into this project's
+      // .claude/skills/ on EVERY real run so both engines see them with zero setup
+      // (Claude via settingSources, Codex via the prompt index below). Idempotent +
+      // upgrade-aware; never throws. We prepend a dedicated high-priority block so
+      // native skills — imagegen especially — are considered FIRST.
+      let nativeSkillsBlock = '';
+      if (job.projectId && !opts.plan) {
+        try {
+          ensureNativeSkills(cwd);
+          // Mirror them into the store (enabled by default) so the UI lists them and
+          // the operator can toggle any off. Preserves an existing disable.
+          this.store.recordNativeSkills(job.projectId, nativeSkillSummaries().map(s => ({
+            id: s.id, slug: s.slug, name: s.name, description: s.description,
+            source: 'https://github.com/openai/skills', version: 'bundled', sha256: s.sha256,
+            enabled: true, addedBy: 'native' as const,
+          })));
+          // Only inject skills the operator hasn't disabled.
+          const offNative = new Set(
+            this.store.listInstalledSkills(job.projectId)
+              .filter(s => s.addedBy === 'native' && s.enabled === false)
+              .map(s => s.slug),
+          );
+          nativeSkillsBlock = nativeSkillsPromptBlock(offNative);
+        } catch { /* best-effort — a bundled-skill hiccup never fails a run */ }
+      }
+
       // Skills: surface what's installed AND — critically — a standing instruction to
       // DISCOVER + INSTALL a registry skill before improvising. Previously this block
       // was only added when a skill was already installed, so a project with no skills
@@ -2837,8 +2886,10 @@ export class LocalEngine {
       // installed SKILL.md via settingSources; Codex relies on this index + the tools.
       if (job.projectId) {
         // Only enabled skills go into the agent's context — a disabled skill keeps
-        // its files (renamed SKILL.md.disabled) but is hidden from the run.
-        const installed = this.store.listInstalledSkills(job.projectId).filter(s => s.enabled !== false);
+        // its files (renamed SKILL.md.disabled) but is hidden from the run. Native
+        // skills are excluded here — they get their own dedicated block above.
+        const installed = this.store.listInstalledSkills(job.projectId)
+          .filter(s => s.enabled !== false && s.addedBy !== 'native' && !isNativeSkill(s.id));
         const list = installed.map(s => {
           const meta = [
             s.version ? `version=${s.version}` : '',
@@ -2880,6 +2931,11 @@ export class LocalEngine {
         prompt = `<mcp_servers note="Custom MCP servers connected for this run. This is an INSTRUCTION, follow it.">\n` +
           `Use these servers' tools when relevant to the task:\n${lines}\n</mcp_servers>\n\n${prompt}`;
       }
+
+      // Native skills go to the VERY TOP — prepended last so they sit above every
+      // other injected block. This is the "prioritize super early" guarantee, and
+      // it carries the non-negotiable imagegen rule for both engines.
+      if (nativeSkillsBlock) prompt = nativeSkillsBlock + prompt;
 
       const hooks: RunHooks = {
         signal: ac.signal,

@@ -3,6 +3,18 @@ import type { IconName } from './icons';
 /** True when the agent invoked a Skill (rendered with a distinct purple glyph). */
 export const isSkillTool = (name?: string): boolean => (name ?? '').toLowerCase() === 'skill';
 
+/** Both engines "activate" a bundled/registry skill by READING its
+    `.claude/skills/<slug>/SKILL.md`. Claude Code also surfaces a native `Skill`
+    tool, but Codex just reads the file — so we treat that read as an activation
+    too and render it with the same purple skill chip. Returns the slug, or null. */
+const SKILL_MD_RE = /(?:^|[\\/])\.claude[\\/]skills[\\/]([^\\/]+)[\\/]SKILL\.md$/;
+export const skillSlugFromReadPath = (name?: string, text?: string): string | null => {
+  const n = (name ?? '').toLowerCase().replace(/^mcp__[^_]+__/, '');
+  if (!/^read|^view|^cat|open_file/.test(n)) return null;
+  const m = SKILL_MD_RE.exec((text ?? '').trim());
+  return m ? m[1] : null;
+};
+
 /** Skill ids arrive as "superpowers:brainstorming" / "mochi:checkpoint" — show the
     human end ("Brainstorming", "Checkpoint"). */
 export const prettySkillName = (raw: string): string => {
