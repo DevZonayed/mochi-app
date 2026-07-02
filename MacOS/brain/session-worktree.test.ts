@@ -70,6 +70,31 @@ describe('ensureSessionWorktree', () => {
     expect(git(co, 'rev-parse', 'main')).toBe(staleLocalSha);
   });
 
+  test('a pruned + recreated session (branch kept) re-forks from the CURRENT origin base', () => {
+    // The session branch survives a prune (deleteBranch:false). When the session
+    // worktree is recreated later, the untouched branch must not resurrect its
+    // stale fork point — it has no unique commits, so it resets onto the
+    // freshly fetched origin/<base>.
+    const origin = repo(); const clone = tmp(); const worktreeRoot = tmp();
+    git(origin, 'clone', '-q', origin, path.join(clone, 'co'));
+    const co = path.join(clone, 'co');
+    git(co, 'config', 'user.email', 'test@local');
+    git(co, 'config', 'user.name', 'Test');
+    const first = ensureSessionWorktree({ repoDir: co, worktreeRoot, projectId: 'p1', sessionId: 's11', branch: 'mochi/again-aa11', base: 'main', fetch: true });
+    expect(first.ok).toBe(true);
+    pruneSessionWorktree({ repoDir: co, worktreeRoot, projectId: 'p1', sessionId: 's11', branch: 'mochi/again-aa11', deleteBranch: false });
+    // Origin advances AFTER the prune.
+    writeFileSync(path.join(origin, 'LATER.md'), 'newer\n');
+    git(origin, 'add', '-A');
+    git(origin, 'commit', '-q', '-m', 'later on origin');
+    const originSha = git(origin, 'rev-parse', 'HEAD');
+    const second = ensureSessionWorktree({ repoDir: co, worktreeRoot, projectId: 'p1', sessionId: 's11', branch: 'mochi/again-aa11', base: 'main', fetch: true });
+    expect(second.ok).toBe(true);
+    expect(second.created).toBe(true);
+    expect(git(second.cwd, 'rev-parse', 'HEAD')).toBe(originSha);
+    expect(existsSync(path.join(second.cwd, 'LATER.md'))).toBe(true);
+  });
+
   test('falls back to the local base when no origin/<base> ref exists', () => {
     const repoDir = repo(); const worktreeRoot = tmp(); // makeTempRepo has NO remote
     const localSha = git(repoDir, 'rev-parse', 'main');

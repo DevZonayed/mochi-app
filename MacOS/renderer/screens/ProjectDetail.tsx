@@ -3613,13 +3613,17 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     const item = queue[i];
     if (item == null || item.atts?.length) return; // steer channel is text-only
     const turn = lastTurn;
-    removeFromQueue(i); // optimistic — re-queued at the front on hard failure
+    removeFromQueue(i); // optimistic — restored to the FRONT if the steer doesn't land
     if (!streaming || !turn) { void sendRaw(item.text, item.atts); return; }
+    const requeueFront = () => mutateQueue(q => [{ text: item.text, atts: item.atts }, ...q]);
     void api.steerJob(turn.id, item.text, { interrupt: false }).then(r => {
-      // Not steerable (turn settled between click and RPC, codex, plan mode)
-      // → send it as a normal message so nothing is ever lost.
-      if (!r.steered) void sendRaw(item.text, item.atts);
-    }).catch(() => mutateQueue(q => [{ text: item.text, atts: item.atts }, ...q]));
+      // Not steerable (codex, plan mode, REST remote, or the turn settled
+      // mid-RPC) → put it back at the FRONT of the queue. NEVER sendRaw here:
+      // the run may still be live and that would start a SECOND concurrent
+      // job for this session. The drainer fires queue[0] the moment the turn
+      // reaches a clean idle, so nothing is lost and order is preserved.
+      if (!r.steered) requeueFront();
+    }).catch(requeueFront);
   };
   // Pop a queued row back into the composer (text + any attachments).
   const editQueued = (i: number) => {
@@ -3913,8 +3917,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
           {upcomingSched.length > 0 && (
             <ScheduledQueue items={upcomingSched} now={schedNow} onCancel={cancelSchedule} onEdit={editSchedule} />
           )}
+          {/* canSteer: only live CLAUDE turns are steerable (codex/plan runs
+              report steered:false and would just bounce back to the queue). */}
           {queue.length > 0 && (
-            <QueuePanel queue={queue} hold={queueHoldReason} canSteer={streaming} onSteerNow={steerNow} onMoveToFront={moveToFront} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
+            <QueuePanel queue={queue} hold={queueHoldReason} canSteer={streaming && lastTurn?.engine !== 'codex'} onSteerNow={steerNow} onMoveToFront={moveToFront} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
           )}
           {slashOpen && (
             <div style={{ marginBottom: 8, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.22))', overflow: 'hidden', padding: 5 }}>
