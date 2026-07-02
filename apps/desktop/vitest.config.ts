@@ -6,7 +6,9 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     environment: 'node',
-    include: ['electron/**/*.test.ts'],
+    // Renderer unit tests (src/**) are pure-logic modules and run fine under
+    // node — keeping them here means `pnpm test` covers the whole app.
+    include: ['electron/**/*.test.ts', 'src/**/*.test.ts'],
   },
   resolve: {
     extensionAlias: { '.js': ['.ts', '.js'] },
