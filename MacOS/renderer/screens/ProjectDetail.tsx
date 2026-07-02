@@ -1,0 +1,4646 @@
+/* Project Detail — ported from the design prototype
+   (design/project/project-detail/*.jsx + command-center/{cc-zones,cc-palette}.jsx).
+   Header, sticky tab bar, tab router (Overview / Jobs / Instructions / Skills &
+   tools / Budget / Settings), command palette, and gate-arrives micro-interaction.
+   Visual output (inline styles, classNames, var(--…), SVG, animation classes)
+   preserved exactly. Cross-page navigation uses react-router. */
+
+import React from 'react';
+import { useNavigate, useParams, useLocation } from 'react-router-dom';
+import { Icon, type IconName } from '../lib/icons';
+import { RichComposer, type RichComposerHandle, type ComposerChip } from './RichComposer';
+import { FileTypeIcon } from '../lib/fileIcons';
+import { FileChip, IS_WRITE_TOOL } from '../lib/fileChip';
+import { toolDisplay, isSkillTool, prettySkillName, scrubInternalMcp } from '../lib/toolDisplay';
+import {
+  GroupedList,
+  Row,
+  Switch,
+  Spinner,
+  EffortDial,
+  EFFORT_EST,
+  EFFORT_META,
+  ModelSwitcher,
+  ProviderGlyph,
+  CountUp,
+  type EffortStop,
+} from '../lib/ui';
+import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
+import { AppShell, useWorkspaceName } from '../lib/appShell';
+import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
+import { OpenPathContext, pathIsInside, type OpenPathFn } from '../lib/openPath';
+import { displayCodename } from '../lib/git-types';
+import { canDrainQueue } from '../lib/queue-drain';
+import { GitOpsDock } from '../components/GitOpsDock';
+import { SessionStateDot, SessionActivityDot } from './SessionStateDot';
+import { useSession, useSessionGitState } from '../lib/useSessionGitState';
+import { useSessionLocked } from '../hooks/useSessionLocked';
+
+const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
+function shortHomePath(p: string): string {
+  const m = p.match(/^\/Users\/[^/]+\/(.*)$/);
+  return m ? `~/${m[1]}` : p;
+}
+
+/* Composer theming — the prompt box border/glow takes on the current EFFORT's
+   color (--eff-accent), so switching FAST→BALANCED→DEEP→MAX visibly recolors
+   the box; MAX gets an animated rainbow border. Exported as its own block so
+   ChatThread can inject it itself and the theming works wherever the chat
+   renders (the project view AND the multi-project Workspace tabs). */
+export const COMPOSER_CSS = `
+  .composer-card { position: relative; transition: border-color 220ms ease, box-shadow 220ms ease; }
+  .composer-eff { border-color: color-mix(in srgb, var(--eff-accent) 52%, var(--separator-strong)) !important;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--eff-accent) 16%, transparent), 0 6px 22px color-mix(in srgb, var(--eff-accent) 13%, transparent); }
+  .composer-eff:focus-within { border-color: color-mix(in srgb, var(--eff-accent) 82%, var(--separator-strong)) !important;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--eff-accent) 18%, transparent), 0 10px 30px color-mix(in srgb, var(--eff-accent) 17%, transparent), var(--card-shadow); }
+  @keyframes ultraHue { to { filter: hue-rotate(360deg); } }
+  .composer-ultra { border-color: transparent !important; box-shadow: 0 6px 24px color-mix(in srgb, #9b6bff 16%, transparent); }
+  .composer-ultra::before {
+    content: ''; position: absolute; inset: 0; border-radius: inherit; padding: 1.6px; pointer-events: none;
+    background: conic-gradient(from 0deg, #ff5d5d, #ffb44b, #f4e04b, #6bd49a, #41c8d4, #5b8cff, #9b6bff, #ff6b9f, #ff5d5d);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0); -webkit-mask-composite: xor;
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0); mask-composite: exclude;
+    animation: ultraHue 6s linear infinite; }
+  .composer-ultra:focus-within { box-shadow: 0 0 0 4px color-mix(in srgb, #9b6bff 18%, transparent), 0 10px 30px color-mix(in srgb, #9b6bff 18%, transparent), var(--card-shadow); }
+  .send-fab { transition: transform 160ms cubic-bezier(.32,.72,0,1), background 160ms ease, box-shadow 160ms ease; }
+  .send-fab:not(:disabled):hover { transform: scale(1.06); }
+  .send-fab:not(:disabled):active { transform: scale(.94); }
+  .att-chip { transition: border-color 120ms ease, background 120ms ease; }
+  .att-chip:hover { border-color: color-mix(in srgb, var(--blue) 45%, var(--separator-strong)) !important; background: var(--surface) !important; }
+  .att-card { animation: attIn 130ms cubic-bezier(.32,.72,0,1); }
+  @keyframes attIn { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+  .att-scroll { scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: var(--fill-secondary) transparent; overscroll-behavior: contain; }
+  .att-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+  .att-scroll::-webkit-scrollbar-track { background: transparent; }
+  .att-scroll::-webkit-scrollbar-thumb { background: var(--fill-secondary); border-radius: 9px; border: 2px solid transparent; background-clip: padding-box; }
+  .att-scroll::-webkit-scrollbar-thumb:hover { background: var(--ink-quaternary, var(--ink-tertiary)); background-clip: padding-box; }
+`;
+
+/* ───────────────── page-specific CSS (from Project Detail.html <style>) ───────────────── */
+const PAGE_CSS = `
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes caretBlink { 50% { opacity: 0; } }
+  .chat-caret { display:inline-block; width:7px; height:1.05em; margin-left:1px; border-radius:2px;
+    background: var(--purple); vertical-align:-2px; animation: caretBlink 1.05s steps(2) infinite; }
+
+  /* message entry — each turn rises in once */
+  @keyframes chatRise { from { opacity:0; transform: translateY(7px); } to { opacity:1; transform:none; } }
+  .chat-msg { animation: chatRise 320ms cubic-bezier(.32,.72,0,1) both; }
+
+  /* USER bubble palette — the bubble itself is a blue gradient with white text,
+     so any inline accent that defaults to var(--blue) (PathLink, inline code
+     background) disappears into the background. Recolor those accents to a
+     white-on-translucent palette so links remain READABLE on top of the gradient
+     (image_5tx6p.png: the path link blended into the bubble). */
+  .bubble-user button { color: #fff !important;
+    text-decoration-color: color-mix(in srgb, #fff 65%, transparent) !important; }
+  .bubble-user button:hover { background: rgba(255,255,255,0.14) !important; }
+  .bubble-user code { background: rgba(255,255,255,0.18) !important; color: #fff !important; }
+  .bubble-user b, .bubble-user strong { color: #fff !important; }
+
+  /* tool node — refined card, lifts on hover, pops on mount */
+  @keyframes nodePop { from { opacity:0; transform: translateY(4px) scale(.985); } to { opacity:1; transform:none; } }
+  .tool-node { animation: nodePop 240ms cubic-bezier(.32,.72,0,1) both; transition: background 140ms ease; }
+  .tool-node:hover { background: var(--fill-tertiary); }
+
+  /* "thinking" shimmer text before the first token —
+     low stop bumped from --ink-secondary (60% opacity) to ~78% so the dimmest
+     part of the sweep stays clearly readable on dark AND light backgrounds. */
+  @keyframes thinkSweep { to { background-position: -200% 0; } }
+  .think-shimmer { background: linear-gradient(100deg, color-mix(in srgb, var(--ink) 78%, transparent) 32%, var(--ink) 50%, color-mix(in srgb, var(--ink) 78%, transparent) 68%);
+    background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+    animation: thinkSweep 1.5s linear infinite; }
+
+  /* live tool dot — soft glow pulse */
+  @keyframes dotGlow { 0%,100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--purple) 55%, transparent); } 50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--purple) 0%, transparent); } }
+  .dot-live { animation: dotGlow 1.4s ease-in-out infinite; }
+
+  /* code card — copy button reveals on hover */
+  .code-card .code-copy { opacity: 0; transition: opacity 140ms ease; }
+  .code-card:hover .code-copy { opacity: 1; }
+  .code-copy:hover { color: var(--ink) !important; background: var(--fill-secondary) !important; }
+
+  /* assistant turn — copy-the-reply reveals on hover */
+  .turn-copy { opacity: 0; transition: opacity 140ms ease; }
+  .chat-msg:hover .turn-copy { opacity: 1; }
+  .turn-copy:hover { color: var(--ink) !important; }
+
+  /* example prompt chips (empty state) + question options — never hover when disabled */
+  .ex-chip { transition: border-color 150ms ease, background 150ms ease, transform 150ms ease; cursor: pointer; }
+  .ex-chip:not(:disabled):hover { border-color: color-mix(in srgb, var(--blue) 55%, var(--separator)) !important; background: color-mix(in srgb, var(--blue) 7%, var(--bg-elevated)) !important; transform: translateY(-1px); }
+
+  /* collapsible "work" toggle — clearly clickable */
+  .work-bar { transition: background 140ms ease, border-color 140ms ease; }
+  .work-bar:hover { background: var(--fill-secondary) !important; border-color: var(--separator-strong) !important; }
+
+  /* question options — quiet until hovered */
+  .opt-row { transition: background 120ms ease; }
+  .opt-row:not(:disabled):hover { background: var(--fill-tertiary) !important; }
+  .opt-chip { transition: background 120ms ease, border-color 120ms ease, transform 120ms ease; }
+  .opt-chip:not(:disabled):hover { border-color: color-mix(in srgb, var(--blue) 55%, var(--separator-strong)) !important; transform: translateY(-1px); }
+
+  /* code card — keep a slim scrollbar visible so long lines read as scrollable */
+  .code-card pre::-webkit-scrollbar { height: 7px; }
+  .code-card pre::-webkit-scrollbar-thumb { background: var(--separator-strong); border-radius: 4px; }
+  .code-card pre::-webkit-scrollbar-track { background: transparent; }
+
+  /* composer — focus glow ring, tinted by the current EFFORT (--eff-accent) */
+  ${COMPOSER_CSS}
+
+  /* queued-prompts panel */
+  .q-panel { transition: box-shadow 160ms ease; }
+  .q-head { transition: background 140ms ease; }
+  .q-head:hover { background: var(--fill-tertiary) !important; }
+  .q-row { transition: background 120ms ease; }
+  .q-row:hover { background: var(--fill-tertiary) !important; }
+  .q-row .q-act { opacity: 0; transition: opacity 120ms ease; }
+  .q-row:hover .q-act, .q-row.q-sel .q-act { opacity: 1; }
+  .q-row.q-sel { background: color-mix(in srgb, var(--blue) 9%, transparent) !important; }
+  .q-row .q-grip { opacity: 0; transition: opacity 120ms ease; cursor: grab; }
+  .q-row:hover .q-grip, .q-row.q-sel .q-grip { opacity: 1; }
+  .q-row.q-dragging { opacity: 0.35; }
+  .q-row.q-drop-above { box-shadow: inset 0 2px 0 var(--blue); }
+  .q-row.q-drop-below { box-shadow: inset 0 -2px 0 var(--blue); }
+  .kbd { display: inline-flex; align-items: center; height: 16px; padding: 0 5px; border-radius: 5px; background: var(--fill-secondary);
+    border: 0.5px solid var(--separator); font: 600 10px/1 var(--font-mono); color: var(--ink-secondary); }
+
+  .mm-row { transition: background 120ms ease; }
+  .mm-row:hover { background: var(--fill-tertiary); }
+  .sess-row { transition: background 140ms ease; }
+  .sess-row:hover { background: var(--fill-tertiary); }
+  .sess-row .sess-x { opacity: 0; transition: opacity 120ms ease; }
+  .sess-row:hover .sess-x { opacity: 1; }
+  .sess-x:hover { color: var(--red); }
+  .newchat-btn { transition: background 140ms ease, transform 140ms ease; }
+  .newchat-btn:hover { background: var(--fill-tertiary); transform: translateY(-1px); }
+
+  .app-wallpaper {
+    position: absolute; inset: 0; z-index: 0; pointer-events: none;
+    background:
+      radial-gradient(60% 50% at 16% 0%, color-mix(in srgb, var(--blob-a) 30%, transparent), transparent 70%),
+      radial-gradient(55% 50% at 100% 100%, color-mix(in srgb, var(--blob-b) 26%, transparent), transparent 70%),
+      var(--bg);
+  }
+
+  .nav-item:hover { background: var(--fill-tertiary); color: var(--ink); }
+  .ws-header:hover { background: var(--fill-tertiary); }
+  .search-field:hover { background: var(--fill-secondary); }
+  .tb-icon:hover { background: var(--fill-secondary); color: var(--ink); }
+  .crumb:hover { color: var(--blue) !important; }
+  .link-btn:hover { text-decoration: underline; }
+  .primary-cta { transition: transform 120ms var(--spring), box-shadow 160ms ease, background 140ms ease; }
+  .primary-cta:hover { box-shadow: 0 8px 22px rgba(0,122,255,0.4); }
+  .primary-cta:active { transform: translateY(1px); }
+  .split-quiet:hover { background: color-mix(in srgb, var(--fill-secondary) 60%, var(--ink) 6%); }
+  .step-btn:hover { background: color-mix(in srgb, var(--fill-secondary) 55%, var(--ink) 8%); }
+  .send-btn:not(:disabled):hover { transform: scale(1.06); }
+  .send-btn:not(:disabled):active { transform: scale(0.95); }
+
+  .breathe { animation: breathe 1.8s ease-in-out infinite; }
+  @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+  .sub-card, .recent-row, .filter-chip { transition: background 120ms ease, transform 140ms var(--spring), box-shadow 140ms ease, border-color 140ms ease; }
+  .sub-card:hover { transform: translateY(-2px); box-shadow: var(--card-shadow), 0 8px 22px rgba(15,20,60,0.12); border-color: var(--separator-strong); }
+  .recent-row:hover { background: var(--fill-tertiary); }
+  .filter-chip:hover { filter: brightness(0.97); }
+
+  /* estimate count + cost chip — frozen-clock-safe (no opacity-0 starts) */
+  .estimate { animation: estPulse 360ms var(--spring); }
+  @keyframes estPulse { 0% { transform: translateY(-2px); } 100% { transform: none; } }
+  .cost-chip { animation: chipIn 320ms var(--spring); }
+  @keyframes chipIn { 0% { transform: scale(0.9); } 60% { transform: scale(1.04); } 100% { transform: scale(1); } }
+
+  /* gate banner arrival */
+  .gate-banner { animation: gateSlide 360ms var(--spring); }
+  @keyframes gateSlide { 0% { transform: translateY(-10px); } 100% { transform: none; } }
+
+  /* palette — frozen-clock-safe */
+  @keyframes paletteFade { from { opacity: 0.3; } to { opacity: 1; } }
+  @keyframes palettePop { from { transform: translateY(-12px) scale(0.985); } to { transform: none; } }
+
+  main::-webkit-scrollbar { width: 8px; }
+  main::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--ink) 22%, transparent); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+  textarea::placeholder { color: var(--ink-tertiary); }
+  ::selection { background: rgba(0,122,255,0.22); }
+`;
+
+/* ───────────────── shared atom: ZoneLabel (from cc-zones.jsx) ───────────────── */
+function ZoneLabel({ icon, tint, children }: { icon: IconName; tint: string; children?: React.ReactNode }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 11 }}>
+      <Icon name={icon} size={15} style={{ color: tint }} />
+      <span style={{ font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-secondary)' }}>{children}</span>
+    </div>
+  );
+}
+
+/* ───────────────── command palette (from cc-palette.jsx) ───────────────── */
+interface PaletteItem {
+  group: string;
+  icon: IconName;
+  label: string;
+  hint: string;
+}
+
+const PALETTE_ITEMS: PaletteItem[] = [
+  { group: 'Jump to', icon: 'layers', label: 'Projects', hint: '⌘2' },
+  { group: 'Jump to', icon: 'jobs', label: 'Jobs', hint: '⌘3' },
+  { group: 'Jump to', icon: 'shield', label: 'Approvals', hint: '⌘4' },
+  { group: 'Jump to', icon: 'clapper', label: 'Studio', hint: '' },
+  { group: 'Jump to', icon: 'telescope', label: 'Trends', hint: '' },
+  { group: 'Jump to', icon: 'send', label: 'Publishing', hint: '' },
+  { group: 'Jump to', icon: 'gauge', label: 'Costs', hint: '' },
+];
+
+function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [q, setQ] = React.useState('');
+  const [sel, setSel] = React.useState(0);
+  const inputRef = React.useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    if (open) { setQ(''); setSel(0); setTimeout(() => inputRef.current && inputRef.current.focus(), 60); }
+  }, [open]);
+
+  const filtered = PALETTE_ITEMS.filter(it => it.label.toLowerCase().includes(q.toLowerCase()) || it.hint.toLowerCase().includes(q.toLowerCase()));
+  const groups = filtered.reduce<Record<string, PaletteItem[]>>((acc, it) => { (acc[it.group] = acc[it.group] || []).push(it); return acc; }, {});
+  const flat = filtered;
+
+  const onKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => Math.min(flat.length - 1, s + 1)); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => Math.max(0, s - 1)); }
+    else if (e.key === 'Escape') { onClose(); }
+    else if (e.key === 'Enter') { onClose(); }
+  };
+
+  if (!open) return null;
+  let idx = -1;
+  return (
+    <div onMouseDown={onClose} style={{
+      position: 'absolute', inset: 0, zIndex: 80, display: 'flex', justifyContent: 'center', paddingTop: 132,
+      background: 'rgba(10,12,24,0.28)', backdropFilter: 'blur(3px)', WebkitBackdropFilter: 'blur(3px)',
+    }}>
+      <div onMouseDown={e => e.stopPropagation()} style={{
+        width: 640, maxHeight: 460, alignSelf: 'flex-start', display: 'flex', flexDirection: 'column',
+        background: 'var(--bg-elevated)', borderRadius: 16, border: '0.5px solid var(--glass-border)',
+        backdropFilter: 'blur(40px) saturate(180%)', WebkitBackdropFilter: 'blur(40px) saturate(180%)',
+        boxShadow: '0 30px 80px rgba(10,15,40,0.45), var(--glass-inner)', overflow: 'hidden',
+        animation: 'palettePop 200ms var(--spring)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '16px 18px', borderBottom: '0.5px solid var(--separator)' }}>
+          <Icon name="search" size={19} style={{ color: 'var(--ink-tertiary)' }} />
+          <input ref={inputRef} value={q} onChange={e => { setQ(e.target.value); setSel(0); }} onKeyDown={onKey}
+            placeholder="Search commands, projects, jobs…"
+            style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent',
+              font: '400 var(--fs-title2)/1 var(--font-text)', color: 'var(--ink)' }} />
+          <span style={{ padding: '3px 7px', borderRadius: 5, background: 'var(--fill-secondary)', font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>esc</span>
+        </div>
+
+        <div style={{ overflowY: 'auto', padding: 8 }}>
+          {flat.length === 0 && (
+            <div style={{ padding: '28px 0', textAlign: 'center', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No matches</div>
+          )}
+          {Object.entries(groups).map(([group, items]) => (
+            <div key={group} style={{ marginBottom: 6 }}>
+              <div style={{ padding: '6px 10px 4px', font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{group}</div>
+              {items.map(it => {
+                idx++; const active = idx === sel; const myIdx = idx;
+                return (
+                  <div key={it.label} onMouseEnter={() => setSel(myIdx)} onMouseDown={onClose} style={{
+                    display: 'flex', alignItems: 'center', gap: 11, height: 42, padding: '0 10px', borderRadius: 9, cursor: 'pointer',
+                    background: active ? 'var(--blue)' : 'transparent',
+                  }}>
+                    <span style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', flexShrink: 0,
+                      background: active ? 'rgba(255,255,255,0.2)' : 'var(--fill-secondary)', color: active ? '#fff' : 'var(--ink-secondary)' }}>
+                      <Icon name={it.icon} size={16} />
+                    </span>
+                    <span style={{ flex: 1, font: '500 var(--fs-callout)/1.1 var(--font-text)', color: active ? '#fff' : 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{it.label}</span>
+                    <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: active ? 'rgba(255,255,255,0.8)' : 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{it.hint}</span>
+                    {active && <Icon name="enter" size={15} style={{ color: 'rgba(255,255,255,0.9)' }} />}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────── shared job atoms (from pd-jobs.jsx) ───────────────── */
+type JobStatus = 'running' | 'gated' | 'scheduled' | 'done' | 'failed';
+
+const TRIGGER_ICON: Record<string, IconName> = { hand: 'play', clock: 'clock', chat: 'command', webhook: 'bolt' };
+const TRIGGER_LABEL: Record<string, string> = { hand: 'Manual', clock: 'Scheduled', chat: 'From chat', webhook: 'Webhook' };
+
+function JobStatusIcon({ status }: { status: JobStatus }) {
+  const map: Record<JobStatus, { tint: string; node: React.ReactNode }> = {
+    running:   { tint: 'var(--purple)', node: <Spinner size={13} color="var(--purple)" /> },
+    gated:     { tint: 'var(--orange)', node: <Icon name="enter" size={15} /> },
+    scheduled: { tint: 'var(--teal)',   node: <Icon name="clock" size={15} /> },
+    done:      { tint: 'var(--green)',  node: <Icon name="check" size={14} stroke={2.6} /> },
+    failed:    { tint: 'var(--red)',    node: <Icon name="x" size={14} stroke={2.6} /> },
+  };
+  const s = map[status] || map.done;
+  return (
+    <span style={{ width: 26, height: 26, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
+      background: `color-mix(in srgb, ${s.tint} 15%, transparent)`, color: s.tint }}>{s.node}</span>
+  );
+}
+
+const SHAPES: Record<string, { label: string; tint: string }> = {
+  single:   { label: 'Single',      tint: 'var(--ink-secondary)' },
+  pbr:      { label: 'Plan→Build→Review', tint: 'var(--blue)' },
+  fanout:   { label: 'Fan-out',     tint: 'var(--purple)' },
+  pipeline: { label: 'Pipeline',    tint: 'var(--teal)' },
+};
+function ShapeChip({ shape }: { shape: string }) {
+  const s = SHAPES[shape] || SHAPES.single;
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)',
+      background: `color-mix(in srgb, ${s.tint} 13%, transparent)`, color: s.tint,
+      font: '600 var(--fs-caption)/1 var(--font-text)', whiteSpace: 'nowrap', flexShrink: 0 }}>
+      <span style={{ width: 5, height: 5, borderRadius: 3, background: s.tint }} />{s.label}
+    </span>
+  );
+}
+
+interface ProjectJob {
+  id: string;
+  trigger: string;
+  name: string;
+  shape: string;
+  status: JobStatus;
+  cost: string;
+  started: string;
+  duration: string;
+}
+
+/* ── live-data adapters: map api.Job → the ProjectJob shape the render expects ── */
+const EFFORT_TO_API: Record<EffortStop, Effort> = { FAST: 'fast', BALANCED: 'balanced', DEEP: 'deep', MAX: 'max' };
+// Chat content width. The transcript + composer share this so they stay aligned;
+// wide enough to fill the pane (no wasted side gutters) but capped so prose stays
+// readable on ultra-wide monitors. Bump toward 100% for fully edge-to-edge.
+const CHAT_W = 1180;
+
+const API_STATUS_TO_LOCAL: Record<Job['status'], JobStatus> = {
+  pending: 'scheduled',
+  running: 'running',
+  done: 'done',
+  failed: 'failed',
+  cancelled: 'failed',
+};
+
+function relativeTime(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 0) return 'just now';
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr} hr ago`;
+  const day = Math.floor(hr / 24);
+  return day === 1 ? 'Yesterday' : `${day} days ago`;
+}
+
+function jobDuration(j: Job): string {
+  const totalSec = Math.max(0, Math.floor((j.updatedAt - j.createdAt) / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function toProjectJob(j: Job): ProjectJob {
+  return {
+    id: j.id,
+    trigger: 'hand',
+    name: j.title || j.input || 'Untitled job',
+    shape: 'single',
+    status: API_STATUS_TO_LOCAL[j.status],
+    cost: j.cost > 0 ? j.cost.toFixed(2) : '—',
+    started: relativeTime(j.createdAt),
+    duration: j.status === 'pending' ? '—' : jobDuration(j),
+  };
+}
+
+const JOB_FILTERS: { key: string; label: string }[] = [
+  { key: 'all', label: 'All' },
+  { key: 'running', label: 'Running' },
+  { key: 'scheduled', label: 'Scheduled' },
+  { key: 'gated', label: 'Gated' },
+  { key: 'failed', label: 'Failed' },
+];
+
+function JobsTab({ jobs }: { jobs: ProjectJob[] }) {
+  const [filter, setFilter] = React.useState('all');
+  const rows = jobs.filter(j => filter === 'all' || j.status === filter);
+  const count = (k: string) => k === 'all' ? jobs.length : jobs.filter(j => j.status === k).length;
+
+  return (
+    <div>
+      {/* filter chips */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        {JOB_FILTERS.map(f => {
+          const on = filter === f.key;
+          return (
+            <button key={f.key} onClick={() => setFilter(f.key)} className="filter-chip" style={{
+              display: 'inline-flex', alignItems: 'center', gap: 7, height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)',
+              background: on ? 'var(--blue)' : 'var(--fill-secondary)', color: on ? '#fff' : 'var(--ink-secondary)',
+              font: '600 var(--fs-subhead)/1 var(--font-text)', transition: 'background 140ms ease, color 140ms ease',
+            }}>
+              {f.label}
+              <span style={{ minWidth: 18, height: 18, padding: '0 5px', borderRadius: 'var(--r-pill)',
+                background: on ? 'rgba(255,255,255,0.25)' : 'var(--fill-secondary)', color: on ? '#fff' : 'var(--ink-tertiary)',
+                font: '700 var(--fs-caption)/18px var(--font-mono)', textAlign: 'center' }}>{count(f.key)}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* table */}
+      <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden',
+        backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '24px 2fr 1.3fr 1fr 0.8fr 1fr 0.8fr', alignItems: 'center', gap: 14,
+          padding: '11px 18px', borderBottom: '0.5px solid var(--separator)', background: 'var(--fill-tertiary)' }}>
+          {['', 'Job', 'Shape', 'Status', 'Cost', 'Started', 'Duration'].map((h, i) => (
+            <span key={i} style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)',
+              textAlign: i >= 4 ? 'right' : 'left' }}>{h}</span>
+          ))}
+        </div>
+        {rows.map((j, i) => (
+          <div key={j.id} className="recent-row" style={{ display: 'grid', gridTemplateColumns: '24px 2fr 1.3fr 1fr 0.8fr 1fr 0.8fr', alignItems: 'center', gap: 14,
+            padding: '12px 18px', borderBottom: i < rows.length - 1 ? '0.5px solid var(--separator)' : 'none', cursor: 'pointer' }}>
+            <span title={TRIGGER_LABEL[j.trigger]} style={{ color: 'var(--ink-tertiary)', display: 'grid', placeItems: 'center' }}>
+              <Icon name={TRIGGER_ICON[j.trigger]} size={15} />
+            </span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+              <JobStatusIcon status={j.status} />
+              <span style={{ font: '500 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{j.name}</span>
+            </span>
+            <span><ShapeChip shape={j.shape} /></span>
+            <span style={{ font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: j.status === 'failed' ? 'var(--red)' : j.status === 'gated' ? 'var(--orange)' : 'var(--ink-secondary)', textTransform: 'capitalize' }}>{j.status}</span>
+            <span style={{ textAlign: 'right', font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)' }}>{j.cost === '—' ? '—' : '$' + j.cost}</span>
+            <span style={{ textAlign: 'right', font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{j.started}</span>
+            <span style={{ textAlign: 'right', font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{j.duration}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────── Overview tab (from pd-overview.jsx) ───────────────── */
+interface AutonomyMode { key: string; label: string; hint: string }
+const AUTONOMY: AutonomyMode[] = [
+  { key: 'plan',   label: 'Plan first', hint: 'Agent proposes a plan; you approve before it runs.' },
+  { key: 'gated',  label: 'Gated',      hint: 'Runs freely but stops at merge / publish / spend gates.' },
+  { key: 'unatt',  label: 'Unattended', hint: 'Runs end-to-end. Only hard guardrails can stop it.' },
+];
+
+function GoalComposer({ projectId, onRun }: { projectId: string | null; onRun: () => void }) {
+  const [goal, setGoal] = React.useState('');
+  const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
+  const [engine, setEngine] = React.useState('auto');
+  const [autonomy, setAutonomy] = React.useState('gated');
+  const [running, setRunning] = React.useState(false);
+  const est = EFFORT_EST[effort];
+  const ai = AUTONOMY.findIndex(a => a.key === autonomy);
+
+  const run = async () => {
+    const text = goal.trim();
+    if (!text || !projectId || running) return;
+    setRunning(true);
+    try {
+      await api.createAndRunJob({
+        projectId, input: text || 'New job', effort: EFFORT_TO_API[effort],
+        ...(engine === 'claude' || engine === 'codex' ? { engine } : {}),
+      });
+      setGoal('');
+      onRun();
+    } catch {
+      /* fail soft */
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="composer" style={{
+      background: 'var(--bg-elevated)', borderRadius: 20, border: '0.5px solid var(--separator)',
+      boxShadow: 'var(--card-shadow)', padding: 20,
+    }}>
+      {/* text surface */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
+        <textarea
+          value={goal} onChange={e => setGoal(e.target.value)} rows={2}
+          placeholder="Hand this project a goal…"
+          style={{
+            flex: 1, border: 'none', outline: 'none', background: 'transparent', resize: 'none',
+            font: '400 var(--fs-title2)/1.4 var(--font-text)', color: 'var(--ink)', letterSpacing: '-0.01em',
+            minHeight: 62, paddingTop: 4,
+          }} />
+        <button className="send-btn" onClick={run} disabled={!goal.trim() || running} style={{
+          width: 44, height: 44, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
+          background: goal.trim() ? 'var(--blue)' : 'var(--fill-secondary)',
+          color: goal.trim() ? '#fff' : 'var(--ink-tertiary)',
+          boxShadow: goal.trim() ? '0 6px 16px rgba(0,122,255,0.34)' : 'none',
+          transition: 'all 180ms var(--spring)', marginTop: 6,
+        }}>
+          <Icon name="arrowRight" size={20} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} />
+        </button>
+      </div>
+
+      {/* controls */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginTop: 16, paddingTop: 16, borderTop: '0.5px solid var(--separator)', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+          <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Effort</span>
+          <EffortDial value={effort} onChange={setEffort} />
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+          <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Engine</span>
+          <ModelSwitcher value={engine} onChange={setEngine} compact />
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+          <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Autonomy</span>
+          <div style={{ position: 'relative', display: 'inline-flex', padding: 2, background: 'var(--fill-secondary)', borderRadius: 9 }}>
+            <div style={{ position: 'absolute', top: 2, bottom: 2, left: `calc(${ai * 33.333}% + 2px)`, width: `calc(33.333% - 4px)`,
+              background: 'var(--bg-elevated)', borderRadius: 7, boxShadow: '0 1px 3px rgba(0,0,0,0.14)', transition: 'left 280ms var(--spring)' }} />
+            {AUTONOMY.map(a => (
+              <button key={a.key} onClick={() => setAutonomy(a.key)} title={a.hint} style={{
+                position: 'relative', zIndex: 1, padding: '6px 13px', font: '700 11px/1 var(--font-text)', letterSpacing: '0.03em',
+                color: autonomy === a.key ? 'var(--ink)' : 'var(--ink-secondary)', cursor: 'pointer', whiteSpace: 'nowrap',
+              }}>{a.label}</button>
+            ))}
+          </div>
+        </div>
+
+        <span style={{ flex: 1 }} />
+
+        {/* effort guide — runs on your subscription, so no per-run dollar estimate */}
+        <div style={{ textAlign: 'right' }}>
+          <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 5 }}>Depth</div>
+          <div key={effort} className="estimate" style={{ font: '600 var(--fs-callout)/1 var(--font-mono)', color: 'var(--ink)' }}>
+            ~{est.mins} min <span style={{ color: 'var(--ink-tertiary)', fontWeight: 400 }}>at {effort}</span>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 12, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+        {AUTONOMY[ai].hint}
+      </div>
+    </div>
+  );
+}
+
+interface SubProject { id: string; name: string; branch: string; tint: string; spent: number; cap: number; jobs: number }
+const SUBPROJECTS: SubProject[] = [
+  { id: 's1', name: 'Auth service', branch: 'auth-refactor', tint: 'var(--blue)', spent: 8.20, cap: 20, jobs: 1 },
+  { id: 's2', name: 'Rate limiter', branch: 'ratelimit',     tint: 'var(--purple)', spent: 2.10, cap: 15, jobs: 1 },
+  { id: 's3', name: 'API docs',     branch: 'docs-site',     tint: 'var(--teal)', spent: 4.60, cap: 10, jobs: 0 },
+  { id: 's4', name: 'CI pipeline',  branch: 'ci-hardening',  tint: 'var(--indigo)', spent: 3.50, cap: 12, jobs: 0 },
+];
+
+function SubProjects() {
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 12 }}>
+        <ZoneLabel icon="gitMerge" tint="var(--blue)">Sub-projects · {SUBPROJECTS.length}</ZoneLabel>
+        <span style={{ flex: 1 }} />
+        <button className="link-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--blue)' }}>
+          <Icon name="plus" size={14} stroke={2.4} /> New branch
+        </button>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(208px, 1fr))', gap: 12 }}>
+        {SUBPROJECTS.map(s => {
+          const pct = Math.min(100, (s.spent / s.cap) * 100);
+          return (
+            <div key={s.id} className="sub-card" style={{
+              background: 'var(--bg-elevated)', borderRadius: 14, border: '0.5px solid var(--separator)',
+              boxShadow: 'var(--card-shadow)', padding: 14, cursor: 'pointer',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                <span style={{ width: 8, height: 8, borderRadius: 4, background: s.tint, flexShrink: 0 }} />
+                <span style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
+                {s.jobs > 0 && <span className="breathe" style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--purple)' }} />}
+              </div>
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', marginBottom: 12 }}>
+                <Icon name="gitMerge" size={12} /> {s.branch}
+              </div>
+              <div style={{ height: 4, borderRadius: 2, background: 'var(--fill-secondary)', overflow: 'hidden', marginBottom: 6 }}>
+                <div style={{ width: `${pct}%`, height: '100%', borderRadius: 2, background: s.tint }} />
+              </div>
+              <div style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>
+                <b style={{ color: 'var(--ink)', fontWeight: 600 }}>${s.spent.toFixed(2)}</b> / ${s.cap}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function RecentJobs({ jobs }: { jobs: ProjectJob[] }) {
+  return (
+    <div>
+      <ZoneLabel icon="jobs" tint="var(--purple)">Recent jobs</ZoneLabel>
+      <div style={{ background: 'var(--bg-grouped)', borderRadius: 14, border: '0.5px solid var(--separator)', overflow: 'hidden',
+        backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
+        {jobs.map((j, i) => (
+          <div key={j.id} className="recent-row" style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px',
+            borderBottom: i < jobs.length - 1 ? '0.5px solid var(--separator)' : 'none', cursor: 'pointer' }}>
+            <JobStatusIcon status={j.status} />
+            <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{j.name}</span>
+            <ShapeChip shape={j.shape} />
+            <span style={{ width: 56, textAlign: 'right', font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)' }}>${j.cost}</span>
+            <span style={{ width: 52, textAlign: 'right', font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{j.duration}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────── Instructions tab (from pd-tabs.jsx) ───────────────── */
+const INSTRUCTION_DOC = `You maintain the Atlas API — a TypeScript service on Fastify + Postgres.
+
+Architecture
+Keep handlers thin. Business logic lives in services/, data access in repositories/. Never import a repository directly from a route.
+
+Style
+Match the existing code. Prefer composition over inheritance. No new dependencies without noting why in the PR description.
+
+Testing
+Every behavioral change ships with a test. Run the suite before opening a PR; a red suite never reaches review.
+
+Pull requests
+One concern per PR. Write a plain-language summary a reviewer can skim in 30 seconds. Link the issue.`;
+
+const RESOLVED: { origin: string; tint: string; text: string }[] = [
+  { origin: 'Workspace', tint: 'var(--indigo)', text: 'Write plainly. No emoji in code, comments, or PRs. Cite sources for any external claim.' },
+  { origin: 'Project', tint: 'var(--blue)', text: 'Maintain the Atlas API — TypeScript, Fastify, Postgres. Thin handlers; logic in services/.' },
+  { origin: 'Sub-project', tint: 'var(--purple)', text: 'auth-refactor: migrating sessions to short-lived JWTs. Keep the legacy cookie path until v2 ships.' },
+];
+
+const GUARDRAILS: { text: string; origin: string }[] = [
+  { text: 'Never publish or deploy without a gate', origin: 'Workspace rule' },
+  { text: 'Hard budget cap — stop at $50, no exceptions', origin: 'Project rule' },
+  { text: 'Never force-push to main', origin: 'Workspace rule' },
+];
+
+function InstructionsTab({ projectId, project, onSaved }: { projectId: string | null; project: Project | null; onSaved: (instructions: string) => void }) {
+  const [text, setText] = React.useState(project?.instructions ?? '');
+  const [state, setState] = React.useState<'idle' | 'saving' | 'saved'>('idle');
+  const timer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSaved = React.useRef(project?.instructions ?? '');
+
+  // Re-seed when the project loads/changes.
+  React.useEffect(() => {
+    setText(project?.instructions ?? '');
+    lastSaved.current = project?.instructions ?? '';
+    setState('idle');
+  }, [project?.id]);
+
+  // Debounced persistence: 700ms after the last keystroke, save via updateProject.
+  const onChange = (v: string) => {
+    setText(v);
+    if (!projectId) return;
+    setState('saving');
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(async () => {
+      if (v === lastSaved.current) { setState('saved'); return; }
+      try {
+        await api.updateProject(projectId, { instructions: v });
+        lastSaved.current = v;
+        setState('saved');
+        onSaved(v);
+      } catch { setState('idle'); }
+    }, 700);
+  };
+  React.useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+
+  // The exact prompt the engine builds (engine.ts): instructions, a separator,
+  // then the goal you type for each job.
+  const resolvedPreview = (text.trim() ? `${text.trim()}\n\n---\n\n` : '') + '<your goal for the job>';
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 360px', gap: 20, alignItems: 'start' }}>
+      {/* editor */}
+      <div style={{ background: 'var(--bg-elevated)', borderRadius: 16, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', overflow: 'hidden' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderBottom: '0.5px solid var(--separator)' }}>
+          <Icon name="terminal" size={16} style={{ color: 'var(--ink-secondary)' }} />
+          <span style={{ font: '600 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink)' }}>instructions.md</span>
+          <span style={{ flex: 1 }} />
+          {state === 'saving'
+            ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}><Spinner size={11} /> Saving…</span>
+            : state === 'saved'
+              ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)' }}><span style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--green)' }} /> Saved</span>
+              : <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Auto-saves</span>}
+        </div>
+        <textarea value={text} onChange={e => onChange(e.target.value)} spellCheck={false}
+          placeholder="Standing instructions for this project — the agent reads these before every job. e.g. the stack, conventions, what to never touch, how to open PRs…"
+          style={{
+            width: '100%', maxWidth: 680, display: 'block', margin: '0 auto', border: 'none', outline: 'none', background: 'transparent', resize: 'none',
+            font: '400 var(--fs-body)/1.7 var(--font-text)', color: 'var(--ink)', padding: '24px 28px', minHeight: 520, boxSizing: 'border-box',
+          }} />
+      </div>
+
+      {/* resolved rail — honest: exactly what the engine concatenates */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', padding: 16,
+          backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
+          <div style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 4 }}>Resolved view</div>
+          <div style={{ font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 14 }}>What the agent actually sees, in order, on every run.</div>
+          <pre style={{ margin: 0, font: '400 var(--fs-caption)/1.55 var(--font-mono)', color: 'var(--ink)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{resolvedPreview}</pre>
+        </div>
+
+        {project?.path && (
+          <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', padding: 16,
+            backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10 }}>
+              <Icon name={project.repoUrl ? 'gitMerge' : 'folder'} size={14} style={{ color: 'var(--ink-secondary)' }} />
+              <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Workspace folder</span>
+            </div>
+            <div style={{ font: '400 var(--fs-footnote)/1.5 var(--font-mono)', color: 'var(--ink)', wordBreak: 'break-all' }}>{project.path}</div>
+            <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 8 }}>Jobs in this project run inside this folder on your Mac.</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────── Skills & tools tab (live) ─────────────────
+   Built-in capabilities + connected MCP servers come from the real host skill
+   catalog (api.listSkills) and toggle through api.toggleSkill — no mock data. */
+function CapabilityRow({ s, icon, last, onToggle }: { s: ApiSkill; icon: IconName; last?: boolean; onToggle: (s: ApiSkill) => void }) {
+  return (
+    <Row last={last}>
+      <span style={{ width: 34, height: 34, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center',
+        background: 'var(--fill-tertiary)', color: 'var(--blue)', border: '0.5px solid var(--separator)' }}>
+        <Icon name={icon} size={18} />
+      </span>
+      <span style={{ flex: 1, minWidth: 0 }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
+          <span style={{ height: 18, padding: '0 7px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)',
+            font: '600 var(--fs-caption)/18px var(--font-mono)', color: 'var(--ink-secondary)' }}>v{s.version}</span>
+          {s.category && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{s.category}</span>}
+        </span>
+        {s.description && <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.description}</span>}
+      </span>
+      <Switch on={s.enabled} onChange={() => onToggle(s)} />
+    </Row>
+  );
+}
+
+function SkillsTab({ projectId }: { projectId: string | null }) {
+  const navigate = useNavigate();
+  const [installed, setInstalled] = React.useState<InstalledSkill[]>([]);
+  const [q, setQ] = React.useState('');
+  const [results, setResults] = React.useState<RegistrySkillSummary[]>([]);
+  const [searching, setSearching] = React.useState(false);
+  const [busy, setBusy] = React.useState<string | null>(null);
+  const [meta, setMeta] = React.useState<{ count: number } | null>(null);
+  const [caps, setCaps] = React.useState<ApiSkill[]>([]);
+  const reload = React.useCallback(() => {
+    if (!projectId) return;
+    api.listProjectSkills(projectId).then(r => setInstalled(r.skills)).catch(() => {});
+  }, [projectId]);
+  const loadCaps = React.useCallback(() => { api.listSkills().then(setCaps).catch(() => {}); }, []);
+  React.useEffect(() => { reload(); loadCaps(); api.skillRegistryMeta().then(m => setMeta({ count: m.count })).catch(() => {}); }, [reload, loadCaps]);
+  // Enable/disable a host capability (optimistic; reconcile with the returned record).
+  const toggleCap = async (s: ApiSkill) => {
+    setCaps(list => list.map(x => (x.id === s.id ? { ...x, enabled: !x.enabled } : x)));
+    try { const u = await api.toggleSkill(s.id); setCaps(list => list.map(x => (x.id === u.id ? u : x))); }
+    catch { loadCaps(); }
+  };
+  const builtins = caps.filter(c => c.kind !== 'mcp');
+  const mcps = caps.filter(c => c.kind === 'mcp');
+  const installedIds = new Set(installed.map(s => s.id));
+  // Built-in (native) skills ship with the app: their own collapsible group with
+  // a toggle — no Remove (they re-materialise on the next run by design).
+  const nativeSkills = installed.filter(s => s.addedBy === 'native');
+  const userInstalled = installed.filter(s => s.addedBy !== 'native');
+  const nativeOn = nativeSkills.filter(s => s.enabled !== false).length;
+  const [nativesOpen, setNativesOpen] = React.useState(false);
+  const toggleNative = async (s: InstalledSkill) => {
+    if (!projectId) return;
+    const next = s.enabled === false;
+    setInstalled(list => list.map(x => (x.id === s.id ? { ...x, enabled: next } : x)));
+    try { await api.setProjectSkillEnabled(projectId, s.id, next); } catch { reload(); }
+  };
+  const runSearch = async (term: string) => {
+    setSearching(true);
+    try { const r = await api.searchSkills(term, 24); setResults(r.results); } catch { setResults([]); }
+    setSearching(false);
+  };
+  const add = async (s: RegistrySkillSummary) => {
+    if (!projectId) return;
+    setBusy(s.id);
+    try {
+      await api.addSkillToProject(projectId, {
+        skillId: s.id, name: s.name, description: s.description, risk: s.risk, source: s.source,
+        version: s.version, disabledReason: s.disabledReason, mirrorRepo: s.sourceRepo || s.mirrorRepo, auditStatus: s.auditStatus,
+      });
+      reload();
+    }
+    catch { /* surfaced by absence */ }
+    setBusy(null);
+  };
+  const remove = async (s: InstalledSkill) => {
+    if (!projectId) return;
+    setInstalled(list => list.filter(x => x.id !== s.id));
+    try { await api.removeSkillFromProject(projectId, s.id); } catch { reload(); }
+  };
+  const riskTint = (r?: string) => r === 'MEDIUM' ? 'var(--orange)' : r === 'LOW' || r === 'SAFE' || r === 'NONE' ? 'var(--green)' : 'var(--ink-tertiary)';
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 22, maxWidth: 720 }}>
+      {/* Registry search → add to this project */}
+      <div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 10 }}>
+          <div style={{ font: '700 var(--fs-headline)/1 var(--font-display)', color: 'var(--ink)' }}>Add a skill</div>
+          {meta && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{meta.count} secure skills in the registry</span>}
+        </div>
+        <div style={{ position: 'relative', marginBottom: 10 }}>
+          <Icon name="search" size={15} style={{ position: 'absolute', left: 12, top: 11, color: 'var(--ink-tertiary)' }} />
+          <input value={q} onChange={e => { setQ(e.target.value); }} onKeyDown={e => { if (e.key === 'Enter') void runSearch(q); }}
+            placeholder="Search skills — e.g. pdf, google sheets, stripe, next.js…"
+            style={{ width: '100%', height: 38, padding: '0 12px 0 34px', borderRadius: 10, border: '0.5px solid var(--separator)', background: 'var(--surface)', color: 'var(--ink)', font: '400 var(--fs-subhead)/1 var(--font-text)', outline: 'none', boxSizing: 'border-box' }} />
+        </div>
+        {searching && <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', padding: '4px 2px' }}>Searching…</div>}
+        {!searching && results.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {results.map(s => {
+              const has = installedIds.has(s.id);
+              return (
+                <div key={s.id} style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '10px 12px', borderRadius: 11, background: 'var(--surface)', border: '0.5px solid var(--separator)' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
+                      <span style={{ width: 6, height: 6, borderRadius: 3, background: riskTint(s.risk), flexShrink: 0 }} title={`audit risk: ${s.risk}`} />
+                      <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.sourceRepo || s.mirrorRepo || s.id.split('/').slice(0, 2).join('/')}</span>
+                    </div>
+                    <div style={{ font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 3 }}>{s.description}</div>
+                  </div>
+                  <button onClick={() => has ? undefined : void add(s)} disabled={has || busy === s.id}
+                    style={{ flexShrink: 0, height: 30, padding: '0 13px', borderRadius: 8, border: 'none', background: has ? 'var(--fill-tertiary)' : 'var(--blue)', color: has ? 'var(--ink-tertiary)' : '#fff', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: has ? 'default' : 'pointer' }}>
+                    {has ? 'Added' : busy === s.id ? 'Adding…' : 'Add'}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {!searching && q && results.length === 0 && <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', padding: '6px 2px' }}>No skills match “{q}”. The agent can also add skills itself during a run.</div>}
+      </div>
+
+      {/* Installed in this project (operator/agent-added — built-ins live below) */}
+      {userInstalled.length > 0 && (
+        <GroupedList header="Installed in this project">
+          {userInstalled.map((s, i) => (
+            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px', borderBottom: i === userInstalled.length - 1 ? 'none' : '0.5px solid var(--separator)' }}>
+              <Icon name="spark" size={16} style={{ color: 'var(--indigo)', flexShrink: 0 }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</div>
+                {s.description && <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.description}</div>}
+              </div>
+              {s.sha256 && <span title={s.sha256} style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{s.sha256.slice(0, 8)}</span>}
+              <code style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>.claude/skills/{s.slug}</code>
+              <button onClick={() => void remove(s)} className="link-btn" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Remove</button>
+            </div>
+          ))}
+        </GroupedList>
+      )}
+
+      {/* Built-in skills — bundled with the app, toggle only */}
+      {nativeSkills.length > 0 && (
+        <GroupedList header="Built-in skills">
+          <button onClick={() => setNativesOpen(o => !o)}
+            style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', border: 'none', background: 'color-mix(in srgb, var(--purple) 5%, transparent)', cursor: 'pointer', textAlign: 'left' }}>
+            <Icon name="spark" size={16} style={{ color: 'var(--purple)', flexShrink: 0 }} />
+            <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>
+              Ship with the app and stay up to date automatically — image generation, office documents (docx/pdf/pptx/xlsx), deploys, Figma, security and more. The agent activates one only when a task matches.
+            </span>
+            <span style={{ flexShrink: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)', background: 'color-mix(in srgb, var(--purple) 12%, transparent)', borderRadius: 999, padding: '3px 8px' }}>{nativeOn}/{nativeSkills.length} on</span>
+            <Icon name={nativesOpen ? 'chevronDown' : 'chevronRight'} size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} />
+          </button>
+          {nativesOpen && nativeSkills.slice().sort((a, b) => a.name.localeCompare(b.name)).map(s => {
+            const on = s.enabled !== false;
+            return (
+              <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '9px 14px', borderTop: '0.5px solid var(--separator)', opacity: on ? 1 : 0.6 }}>
+                <Icon name="spark" size={15} style={{ color: on ? 'var(--purple)' : 'var(--ink-tertiary)', flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                    <span style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
+                    <span title="Ships with the app — can be turned off, not removed" style={{ flexShrink: 0, height: 16, padding: '0 6px', borderRadius: 999, background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)', font: '600 var(--fs-caption)/16px var(--font-text)' }}>built-in</span>
+                  </div>
+                  {s.description && <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.description}</div>}
+                </div>
+                <Switch on={on} onChange={() => void toggleNative(s)} />
+              </div>
+            );
+          })}
+        </GroupedList>
+      )}
+
+      {builtins.length > 0 && (
+        <GroupedList header="Built-in capabilities">
+          {builtins.map((s, i) => <CapabilityRow key={s.id} s={s} icon="spark" last={i === builtins.length - 1} onToggle={toggleCap} />)}
+        </GroupedList>
+      )}
+
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', borderRadius: 12, marginBottom: 12,
+          background: 'rgba(255,149,0,0.10)', border: '0.5px solid rgba(255,149,0,0.3)' }}>
+          <Icon name="shield" size={18} style={{ color: 'var(--orange)', flexShrink: 0 }} />
+          <span style={{ font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink)' }}>
+            <b style={{ fontWeight: 600 }}>Deny by default.</b> Agents can only reach the MCP servers you enable here, with the scopes shown.
+          </span>
+        </div>
+        <GroupedList header="Allowed MCP servers" footer={
+          <button onClick={() => navigate('/mcp-gateway')} className="link-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--blue)' }}>
+            <Icon name="cpu" size={14} stroke={2.4} /> Manage in Tools &amp; Gateway
+          </button>}>
+          {mcps.length > 0
+            ? mcps.map((m, i) => <CapabilityRow key={m.id} s={m} icon="cpu" last={i === mcps.length - 1} onToggle={toggleCap} />)
+            : <div style={{ padding: '14px 16px', font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>No MCP servers connected yet. Connect and scope servers in Tools &amp; Gateway — agents reach only what you allow.</div>}
+        </GroupedList>
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────── Budget tab (from pd-tabs.jsx) ───────────────── */
+interface BudgetBar { name: string; cost: number; tint: string }
+const BUDGET_BARS: BudgetBar[] = [
+  { name: 'Refactor auth service', cost: 8.40, tint: 'var(--purple)' },
+  { name: 'Nightly test suite', cost: 6.10, tint: 'var(--teal)' },
+  { name: 'Dependency audit', cost: 4.20, tint: 'var(--blue)' },
+  { name: 'OG image generation', cost: 2.90, tint: 'var(--indigo)' },
+  { name: 'Misc / chat', cost: 1.30, tint: 'var(--ink-tertiary)' },
+];
+
+function BudgetTab() {
+  const [cap, setCap] = React.useState(50);
+  const spent = 22.90;
+  const ring = 2 * Math.PI * 52;
+  const frac = Math.min(1, spent / cap);
+  const maxBar = Math.max(...BUDGET_BARS.map(b => b.cost));
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '300px minmax(0,1fr)', gap: 20, alignItems: 'start' }}>
+      {/* gauge card */}
+      <div style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)',
+        padding: 22, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+        <div style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', alignSelf: 'flex-start' }}>This month</div>
+        <svg width="180" height="180" viewBox="0 0 128 128" style={{ transform: 'rotate(-90deg)', margin: '14px 0 6px' }}>
+          <circle cx="64" cy="64" r="52" fill="none" stroke="var(--fill-secondary)" strokeWidth="11" />
+          <circle cx="64" cy="64" r="52" fill="none" stroke={frac >= 0.9 ? 'var(--red)' : frac >= 0.75 ? 'var(--orange)' : 'var(--green)'} strokeWidth="11" strokeLinecap="round"
+            strokeDasharray={ring} strokeDashoffset={ring * (1 - frac)} />
+        </svg>
+        <div style={{ font: '600 var(--fs-title1)/1 var(--font-mono)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>${spent.toFixed(2)}</div>
+        <div style={{ font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 4 }}>of ${cap}.00 cap · {Math.round(frac * 100)}%</div>
+
+        {/* hard cap stepper */}
+        <div style={{ width: '100%', marginTop: 20, paddingTop: 18, borderTop: '0.5px solid var(--separator)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10 }}>
+            <Icon name="lock" size={14} style={{ color: 'var(--red)' }} />
+            <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Hard cap</span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 4, borderRadius: 12, border: '1.5px solid var(--red)',
+            background: 'rgba(255,59,48,0.05)' }}>
+            <button onClick={() => setCap(c => Math.max(10, c - 5))} className="step-btn" style={{ width: 38, height: 38, borderRadius: 9, display: 'grid', placeItems: 'center',
+              background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 20px/1 var(--font-text)' }}>−</button>
+            <span style={{ flex: 1, textAlign: 'center', font: '600 var(--fs-title2)/1 var(--font-mono)', color: 'var(--ink)' }}>${cap}</span>
+            <button onClick={() => setCap(c => Math.min(500, c + 5))} className="step-btn" style={{ width: 38, height: 38, borderRadius: 9, display: 'grid', placeItems: 'center',
+              background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 20px/1 var(--font-text)' }}>+</button>
+          </div>
+          <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 9 }}>
+            Jobs stop the moment spend would cross this line. Raising it asks for confirmation.
+          </div>
+        </div>
+      </div>
+
+      {/* per-job bars */}
+      <div style={{ background: 'var(--bg-grouped)', borderRadius: 18, border: '0.5px solid var(--separator)', padding: 20,
+        backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
+        <div style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 18 }}>Spend by job</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {BUDGET_BARS.map((b, i) => (
+            <div key={i}>
+              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 7 }}>
+                <span style={{ flex: 1, font: '500 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink)' }}>{b.name}</span>
+                <span style={{ font: '600 var(--fs-subhead)/1 var(--font-mono)', color: 'var(--ink)' }}>${b.cost.toFixed(2)}</span>
+              </div>
+              <div style={{ height: 8, borderRadius: 4, background: 'var(--fill-secondary)', overflow: 'hidden' }}>
+                <div style={{ width: `${(b.cost / maxBar) * 100}%`, height: '100%', borderRadius: 4, background: b.tint }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────── Settings tab (from pd-tabs.jsx) ───────────────── */
+function SettingsTab() {
+  return (
+    <div style={{ maxWidth: 680, display: 'flex', flexDirection: 'column', gap: 22 }}>
+      <GroupedList header="Project">
+        <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Name</span>
+          <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Atlas API</span></Row>
+        <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Template</span>
+          <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Code</span></Row>
+        <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default branch</span>
+          <span style={{ font: '400 var(--fs-body)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>main</span></Row>
+      </GroupedList>
+      {IS_LOCAL && <BrowserControl />}
+      <GroupedList header="Danger zone" footer="Archiving stops all jobs and hides the project. You can restore it within 30 days.">
+        <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--red)' }}>Archive project</span>
+          <Icon name="chevronRight" size={16} style={{ color: 'var(--ink-tertiary)' }} /></Row>
+      </GroupedList>
+    </div>
+  );
+}
+
+/* Manual "Open browser" control. Opening here PINS the browser open so a finished
+   agent task won't auto-close it (the agent only tidies up windows IT opened) —
+   the user closes it themselves. Mirrors the held flag from the extension bridge. */
+function BrowserControl() {
+  const [status, setStatus] = React.useState<{ connected: boolean; held: boolean } | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+  const refresh = React.useCallback(() => {
+    api.extensionStatus()
+      .then(s => setStatus({ connected: s.peers.some(p => p.active), held: !!s.held }))
+      .catch(() => setStatus(null));
+  }, []);
+  React.useEffect(() => { refresh(); const t = setInterval(refresh, 4000); return () => clearInterval(t); }, [refresh]);
+
+  const held = !!status?.held;
+  const connected = !!status?.connected;
+  const toggle = () => {
+    setBusy(true); setErr(null);
+    const op = held ? api.extensionBrowserClose() : api.extensionBrowserOpen();
+    op.then(() => refresh())
+      .catch((e: unknown) => setErr(e instanceof Error ? e.message : 'Could not reach the browser.'))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <GroupedList
+      header="Browser"
+      footer={held
+        ? 'The browser is pinned open — it stays open after a task finishes until you close it here.'
+        : 'When the agent drives the browser for a task, it closes the window it opened once the task is done. Open it here to keep it open until you close it yourself.'}
+    >
+      <Row last>
+        <span style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>
+            {held ? 'Browser is open' : 'Open browser'}
+          </span>
+          <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: err ? 'var(--red)' : 'var(--ink-tertiary)' }}>
+            {err ?? (connected ? (held ? 'Pinned open' : 'Chrome connected') : 'No Chrome profile connected — pair the Mochi extension first')}
+          </span>
+        </span>
+        <button
+          onClick={toggle}
+          disabled={busy || (!connected && !held)}
+          style={{
+            height: 30, padding: '0 14px', borderRadius: 8, border: 'none', flexShrink: 0,
+            background: held ? 'var(--fill-secondary)' : 'var(--blue)',
+            color: held ? 'var(--ink)' : '#fff',
+            font: '600 var(--fs-footnote)/1 var(--font-text)',
+            cursor: busy || (!connected && !held) ? 'default' : 'pointer',
+            opacity: busy || (!connected && !held) ? 0.5 : 1,
+          }}
+        >
+          {busy ? '…' : held ? 'Close browser' : 'Open browser'}
+        </button>
+      </Row>
+    </GroupedList>
+  );
+}
+
+/* ───────────────── page assembly (from pd-app.jsx) ───────────────── */
+/* ───────────────── Chat tab — converse with the agent like a chat app ─────────────────
+   Each turn is a real Job (sessionId set): the engine streams partial output into
+   job.output, so replies render live. Sessions are first-class: rail on the left,
+   thread + composer on the right. Claude turns resume their SDK session (full
+   context); codex turns carry stitched history. */
+
+/** Tiny copy-to-clipboard control with a momentary ✓ confirmation. */
+function CopyButton({ text, className, label = 'Copy' }: { text: string; className?: string; label?: string }) {
+  const [copied, setCopied] = React.useState(false);
+  const copy = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try { void navigator.clipboard?.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1300); } catch { /* clipboard blocked */ }
+  };
+  return (
+    <button onClick={copy} title={label} className={className} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4, height: 22, padding: '0 7px', borderRadius: 7,
+      background: 'transparent', color: copied ? 'var(--green)' : 'var(--ink-tertiary)', cursor: 'pointer',
+      font: '600 var(--fs-caption)/1 var(--font-text)', flexShrink: 0 }}>
+      <Icon name={copied ? 'check' : 'command'} size={12} stroke={copied ? 2.6 : 2} />
+      {copied ? 'Copied' : label}
+    </button>
+  );
+}
+
+/** A code block with a header (language + copy) and a monospace body. */
+function CodeCard({ code, lang, keyId }: { code: string; lang?: string; keyId: string }) {
+  return (
+    <div key={keyId} className="code-card" style={{ margin: '10px 0', borderRadius: 12, overflow: 'hidden',
+      border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', height: 30, padding: '0 8px 0 12px',
+        background: 'color-mix(in srgb, var(--ink) 4%, var(--bg-grouped))', borderBottom: '0.5px solid var(--separator)' }}>
+        <span style={{ flex: 1, font: '600 var(--fs-caption)/1 var(--font-mono)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{lang || 'code'}</span>
+        <CopyButton text={code} className="code-copy" />
+      </div>
+      <pre style={{ margin: 0, padding: '11px 13px', overflowX: 'auto', font: '400 12.5px/1.6 var(--font-mono)', color: 'var(--ink)' }}>{code}</pre>
+    </div>
+  );
+}
+
+/* Path detection — absolute mac paths, ~ paths, and dotted relative files.
+   Returned paths are clickable. When the chat is inside a host that can open
+   files as tabs (Workspace), the click opens an in-app FileViewer tab so the
+   markdown can be previewed / edited / copied. Otherwise it reveals in Finder. */
+const PATH_RE = /(~\/[^\s`'"()<>]+|\/(?:Users|private|tmp|var|opt|usr|home|Applications|System|Library)\/[^\s`'"()<>]+|\b[\w.-]+\/[\w./-]+\.[A-Za-z0-9]{1,6})/g;
+const looksLikePath = (s: string): boolean => { PATH_RE.lastIndex = 0; const m = PATH_RE.exec(s.trim()); return !!m && m[0] === s.trim(); };
+
+function PathLink({ path, mono = true }: { path: string; mono?: boolean }) {
+  const openInTab = React.useContext(OpenPathContext);
+  const action = openInTab ? 'Open in editor' : 'Reveal in Finder';
+  const onClick = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // ⌘/Ctrl-click always falls back to Finder, even when an opener is present —
+    // matches the "reveal" reflex from VS Code / Cursor.
+    if (openInTab && !(e.metaKey || e.ctrlKey)) { openInTab(path); return; }
+    void api.revealPath(path);
+  };
+  return (
+    <button onClick={onClick} title={action} style={{
+      display: 'inline', padding: '0 2px', margin: '0 -2px', borderRadius: 4, background: 'transparent', cursor: 'pointer',
+      color: 'var(--blue)', font: mono ? '500 0.92em var(--font-mono)' : 'inherit', textDecorationLine: 'underline',
+      textDecorationColor: 'color-mix(in srgb, var(--blue) 68%, transparent)', textUnderlineOffset: 2, wordBreak: 'break-all' }}>
+      {path}
+    </button>
+  );
+}
+
+/** Split a plain text run, linkifying any file paths inside it. */
+function linkifyText(text: string, keyBase: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  let last = 0, key = 0;
+  PATH_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PATH_RE.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(<PathLink key={`${keyBase}-pl${key++}`} path={m[0]} mono={false} />);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out.length ? out : [text];
+}
+
+/** Inline markdown: **bold**, `code`, and clickable paths. */
+function renderInline(text: string, keyBase: string): React.ReactNode[] {
+  return text.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/g).flatMap((seg, i): React.ReactNode[] => {
+    if (seg.startsWith('`') && seg.endsWith('`')) {
+      const inner = seg.slice(1, -1);
+      if (looksLikePath(inner)) return [<PathLink key={`${keyBase}-${i}`} path={inner} />];
+      return [<code key={`${keyBase}-${i}`} style={{ padding: '1px 5px', borderRadius: 5, background: 'var(--fill-tertiary)', font: '500 0.92em var(--font-mono)' }}>{inner}</code>];
+    }
+    if (seg.startsWith('**') && seg.endsWith('**')) {
+      return [<b key={`${keyBase}-${i}`} style={{ fontWeight: 650 }}>{seg.slice(2, -2)}</b>];
+    }
+    return linkifyText(seg, `${keyBase}-${i}`);
+  });
+}
+
+/* Markdown table helpers. A GFM table is a header row, a `|---|:--:|` separator,
+   then body rows — all pipe-delimited. */
+function splitRow(line: string): string[] {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|')) s = s.slice(0, -1);
+  return s.split('|').map(c => c.trim());
+}
+function isSeparatorRow(line: string): boolean {
+  if (!line.includes('-')) return false;
+  const cells = splitRow(line);
+  return cells.length > 0 && cells.every(c => /^:?-{1,}:?$/.test(c.replace(/\s/g, '')));
+}
+function colAligns(line: string): ('left' | 'center' | 'right')[] {
+  return splitRow(line).map(c => { const t = c.replace(/\s/g, ''); const l = t.startsWith(':'), r = t.endsWith(':'); return l && r ? 'center' : r ? 'right' : 'left'; });
+}
+function MdTable({ header, aligns, rows, kb }: { header: string[]; aligns: ('left' | 'center' | 'right')[]; rows: string[][]; kb: string }) {
+  const cols = header.length;
+  const cell = (c: string | undefined, ci: number, k: string): React.ReactNode => c == null ? '' : renderInline(c, `${k}-${ci}`);
+  return (
+    <div style={{ margin: '10px 0 12px', overflowX: 'auto', borderRadius: 10, border: '0.5px solid var(--separator)' }}>
+      <table style={{ borderCollapse: 'collapse', width: '100%', font: '400 13px/1.5 var(--font-text)' }}>
+        <thead>
+          <tr>
+            {header.map((c, ci) => (
+              <th key={ci} style={{ textAlign: aligns[ci] ?? 'left', padding: '7px 12px', background: 'var(--fill-tertiary)', color: 'var(--ink)',
+                font: '650 12.5px/1.4 var(--font-text)', borderBottom: '0.5px solid var(--separator-strong)', whiteSpace: 'nowrap', ...(ci ? { borderLeft: '0.5px solid var(--separator)' } : {}) }}>
+                {cell(c, ci, `${kb}-h`)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, ri) => (
+            <tr key={ri} style={{ background: ri % 2 ? 'color-mix(in srgb, var(--fill-tertiary) 35%, transparent)' : 'transparent' }}>
+              {Array.from({ length: cols }, (_, ci) => (
+                <td key={ci} style={{ textAlign: aligns[ci] ?? 'left', padding: '6px 12px', color: 'var(--ink-secondary)', verticalAlign: 'top',
+                  borderTop: '0.5px solid var(--separator)', ...(ci ? { borderLeft: '0.5px solid var(--separator)' } : {}) }}>
+                  {cell(r[ci], ci, `${kb}-r${ri}`)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Block markdown: headings, tables, bullet + numbered lists, paragraphs. */
+function renderProse(text: string, keyBase: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  const lines = text.split('\n');
+  let para: string[] = [];
+  let key = 0;
+  const flushPara = () => {
+    if (!para.length) return;
+    const t = para.join('\n');
+    out.push(<p key={`${keyBase}-p${key++}`} style={{ margin: '0 0 10px', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{renderInline(t, `${keyBase}-p${key}`)}</p>);
+    para = [];
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    // table: a pipe row immediately followed by a |---|---| separator
+    if (line.includes('|') && i + 1 < lines.length && isSeparatorRow(lines[i + 1])) {
+      flushPara();
+      const header = splitRow(line);
+      const aligns = colAligns(lines[i + 1]);
+      const rows: string[][] = [];
+      let j = i + 2;
+      while (j < lines.length && lines[j].includes('|') && lines[j].trim() && !isSeparatorRow(lines[j])) { rows.push(splitRow(lines[j])); j++; }
+      out.push(<MdTable key={`${keyBase}-tb${key++}`} header={header} aligns={aligns} rows={rows} kb={`${keyBase}-tb${key}`} />);
+      i = j;
+      continue;
+    }
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    const ol = line.match(/^\s*(\d{1,3})[.)]\s+(.*)$/);
+    const li = line.match(/^\s*[-*]\s+(.*)$/);
+    if (h) {
+      flushPara();
+      const lvl = h[1].length;
+      out.push(<div key={`${keyBase}-h${key++}`} style={{ margin: lvl <= 2 ? '14px 0 6px' : '11px 0 5px', font: `700 ${lvl <= 2 ? '15px' : '13.5px'}/1.35 var(--font-display)`, letterSpacing: '-0.01em', color: 'var(--ink)' }}>{renderInline(h[2], `${keyBase}-h${key}`)}</div>);
+    } else if (ol) {
+      flushPara();
+      out.push(
+        <div key={`${keyBase}-o${key++}`} style={{ display: 'flex', gap: 8, margin: '0 0 5px', paddingLeft: 4 }}>
+          <span style={{ color: 'var(--ink-tertiary)', flexShrink: 0, minWidth: 17, textAlign: 'right', font: '600 var(--fs-footnote)/1.55 var(--font-mono)' }}>{ol[1]}.</span>
+          <span style={{ minWidth: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{renderInline(ol[2], `${keyBase}-o${key}`)}</span>
+        </div>
+      );
+    } else if (li) {
+      flushPara();
+      out.push(
+        <div key={`${keyBase}-l${key++}`} style={{ display: 'flex', gap: 8, margin: '0 0 5px', paddingLeft: 4 }}>
+          <span style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }}>•</span>
+          <span style={{ minWidth: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{renderInline(li[1], `${keyBase}-l${key}`)}</span>
+        </div>
+      );
+    } else if (!line.trim()) {
+      flushPara();
+    } else {
+      para.push(line);
+    }
+    i++;
+  }
+  flushPara();
+  return out;
+}
+
+/** Chat body: ``` fences become code cards; everything else renders as markdown prose. */
+function renderChatBody(text: string, keyBase = 'b'): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  const fence = /```([a-zA-Z0-9_+-]*)\n?/g;
+  let idx = 0, inCode = false, key = 0, lang = '';
+  let m: RegExpExecArray | null;
+  while ((m = fence.exec(text))) {
+    const chunk = text.slice(idx, m.index);
+    if (chunk.trim()) out.push(inCode
+      ? <CodeCard key={`${keyBase}-c${key++}`} keyId={`${keyBase}-c${key}`} code={chunk.replace(/\n$/, '')} lang={lang} />
+      : <React.Fragment key={`${keyBase}-f${key++}`}>{renderProse(chunk, `${keyBase}-${key}`)}</React.Fragment>);
+    if (!inCode) lang = m[1] || '';
+    inCode = !inCode;
+    idx = m.index + m[0].length;
+  }
+  const tail = text.slice(idx);
+  if (tail.trim()) out.push(inCode
+    ? <CodeCard key={`${keyBase}-c${key++}`} keyId={`${keyBase}-c${key}`} code={tail.replace(/\n$/, '')} lang={lang} />
+    : <React.Fragment key={`${keyBase}-f${key++}`}>{renderProse(tail, `${keyBase}-${key}`)}</React.Fragment>);
+  return out;
+}
+
+const fmtToolDur = (ms?: number): string => (ms == null ? '' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`);
+
+/** A human verb for the tool the agent is running right now. */
+const TOOL_VERB = (name: string): string => {
+  const n = name.toLowerCase();
+  if (/generate_image|imagegen/.test(n)) return 'Generating image';
+  if (/bash|shell|command|exec|terminal|run/.test(n)) return 'Running';
+  if (/write|edit|create|patch|notebook|apply|multiedit/.test(n)) return 'Editing';
+  if (/read|view|cat|glob|ls|open/.test(n)) return 'Reading';
+  if (/grep|search/.test(n)) return 'Searching';
+  if (/web|fetch|browser/.test(n)) return 'Browsing';
+  if (/skill|task|agent|subagent/.test(n)) return 'Working';
+  return 'Running';
+};
+/** What the agent is doing RIGHT NOW — derived live from the streamed transcript
+    and the engine's phase, so a run never feels frozen or "blank" between steps. */
+function liveActivity(job: Job, transcript: TranscriptItem[]): string {
+  const stage = (job.stage || '').trim();
+  // The engine's review-loop phases are the most informative — surface them verbatim.
+  if (/review|fixing|reviewer/i.test(stage)) return stage.replace(/…+$/, '') + '…';
+  const last = transcript.length ? transcript[transcript.length - 1] : null;
+  if (last) {
+    if (last.kind === 'tool') {
+      if (last.toolStatus === 'running') {
+        // Scrub `mcp__maestro__*` so the activity strip ("Running select:mcp__maestro__git_status")
+        // matches the rest of the transcript — our own MCP is a product feature, not plumbing.
+        const what = scrubInternalMcp((last.text || '').replace(/\s+/g, ' ').trim());
+        const verb = TOOL_VERB(last.name ?? '');
+        return what ? `${verb} ${what.length > 54 ? what.slice(0, 54) + '…' : what}` : `${verb}…`;
+      }
+      return 'Thinking…'; // tool finished — the model is deciding the next step
+    }
+    if (last.kind === 'thinking') return 'Thinking…';
+    if (last.kind === 'image') return 'Saving image…';
+    if (last.kind === 'ask') return 'Waiting for your answer…';
+    if ((last.kind === 'text' || last.kind === 'result') && last.text.trim()) return 'Responding…';
+  }
+  return 'Thinking…';
+}
+
+/** The agent's extended-thinking, rendered as calm dimmed prose (the model's inner
+    voice) under a small purple "Thinking" header. Live = auto-expanded + streaming
+    caret; settled = collapsed to a one-line preview you can open. This is the block
+    Maestro used to throw away — the whole reason the transcript felt mechanical. */
+function ThinkingNode({ item, live }: { item: TranscriptItem; live?: boolean }) {
+  // `open` is DERIVED from `live` (expanded while this is the block streaming,
+  // collapsed the moment the model moves on) — so a long reasoning block doesn't
+  // sit open above the tools and answer for the rest of a live turn. A manual
+  // toggle records an override that wins, so we never snap shut a node the user
+  // deliberately opened (or force open one they closed).
+  const [override, setOverride] = React.useState<boolean | null>(null);
+  const text = item.text.trim();
+  if (!text) return null; // an empty thinking block shouldn't leave a dangling header
+  const open = override ?? !!live;
+  const preview = text.replace(/\s+/g, ' ').slice(0, 96);
+  return (
+    <div style={{ margin: '9px 0' }}>
+      <button onClick={() => setOverride(!open)} title={open ? 'Hide reasoning' : 'Show reasoning'}
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: 0, background: 'none', border: 'none', cursor: 'pointer', maxWidth: '100%' }}>
+        <span style={{ width: 18, height: 18, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center',
+          background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)' }}>
+          <Icon name="spark" size={11} />
+        </span>
+        <span className={live ? 'breathe' : undefined} style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--purple)', flexShrink: 0 }}>
+          Thinking{live ? '…' : ''}
+        </span>
+        <Icon name="chevronRight" size={12} style={{ flexShrink: 0, color: 'var(--ink-tertiary)', transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+        {!open && preview && (
+          <span style={{ minWidth: 0, font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{preview}…</span>
+        )}
+      </button>
+      {open && (
+        <div style={{ marginTop: 6, marginLeft: 8, paddingLeft: 13, borderLeft: '1.5px solid color-mix(in srgb, var(--purple) 24%, var(--separator))',
+          font: '400 13px/1.66 var(--font-text)', color: 'var(--ink-secondary)' }}>
+          {renderProse(text, 'think')}
+          {live && <span className="chat-caret" style={{ background: 'var(--purple)' }} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One step in the agent's tool sequence — a FLAT row (no card), the same calm,
+    document-like framing as the Thinking block. Reads "[icon] Read SessionChat.tsx":
+    a short tool verb + a filename chip (basename) for file tools, the description for
+    Bash (raw command as an inline code chip), a pattern for search. */
+// Memoized — a streamed turn appends tools rapidly; without this every prior
+// ToolNode re-rendered on every token tick of the parent AssistantTurn.
+const ToolNode = React.memo(function ToolNode({ item }: { item: TranscriptItem }) {
+  const running = item.toolStatus === 'running';
+  const error = item.toolStatus === 'error';
+  const isSkill = isSkillTool(item.name);
+  const d = toolDisplay(item.name ?? '');
+  const short = isSkill ? 'Skill' : d.short;
+  const glyph = isSkill ? 'var(--purple)' : error ? 'var(--red)' : d.tint;
+  // Scrub `mcp__maestro__*` plumbing from already-persisted transcripts at
+  // display time so historical chats look as native as new ones (electron's
+  // `toolLabel` cleans new tool calls at fire time; this catches the rest).
+  const cleanText = scrubInternalMcp(item.text || '');
+  const cleanCmd = item.cmd ? scrubInternalMcp(item.cmd) : item.cmd;
+  const showFile = !!d.file && !!cleanText && !isSkill; // file tools → basename chip, not a path
+  const hasCmd = !!cleanCmd && !showFile && !isSkill;
+  const detail = isSkill ? prettySkillName(cleanText) : cleanText;
+  // A shell tool whose detail IS the raw command (no separate cmd chip) → mono font.
+  const detailFont = !isSkill && !!d.mono && !hasCmd ? 'var(--font-mono)' : 'var(--font-text)';
+  return (
+    <div className="tool-node" style={{ display: 'flex', alignItems: hasCmd ? 'flex-start' : 'center', gap: 9, padding: '4px 7px', borderRadius: 8 }}>
+      <span style={{ width: 16, flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'grid', placeItems: 'center', color: glyph }}>
+        <Icon name={isSkill ? 'spark' : d.icon} size={15} />
+      </span>
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+          <span style={{ font: '600 var(--fs-footnote)/1.4 var(--font-text)', color: error ? 'var(--red)' : 'var(--ink)', flexShrink: 0 }}>{short}</span>
+          {showFile
+            ? <FileChip path={cleanText} preview={item.preview} />
+            : detail && <span style={{ flex: 1, minWidth: 0, font: `400 var(--fs-footnote)/1.4 ${detailFont}`, color: isSkill ? 'var(--ink)' : 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail}</span>}
+        </div>
+        {hasCmd && <code style={{ alignSelf: 'flex-start', maxWidth: '100%', boxSizing: 'border-box', font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-secondary)', background: 'var(--fill-tertiary)', borderRadius: 5, padding: '1px 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{cleanCmd}</code>}
+      </div>
+      <span style={{ flexShrink: 0, marginTop: hasCmd ? 2 : 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        {running ? <Spinner size={11} color={isSkill ? 'var(--purple)' : d.tint} />
+          : error ? <Icon name="x" size={12} stroke={2.6} style={{ color: 'var(--red)' }} />
+          : <>
+              {item.durMs != null && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{fmtToolDur(item.durMs)}</span>}
+              <Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)' }} />
+            </>}
+      </span>
+    </div>
+  );
+});
+
+/** A run of consecutive tool steps — a calm flat list (no card framing), so the tools
+    read in the same document-like register as the surrounding text and the Thinking.
+    Memoized + stable keys (SDK id / monotonic ts) so streaming a new tool doesn't
+    remount every prior chip on every token tick. */
+const ToolGroup = React.memo(function ToolGroup({ items }: { items: TranscriptItem[] }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 1, margin: '8px 0' }}>
+      {items.map((it, i) => <ToolNode key={it.id ?? `t-${it.ts ?? i}`} item={it} />)}
+    </div>
+  );
+});
+
+/* ── Claude asks a question → a real, answerable card ─────────────────── */
+interface AskOption { label: string; description?: string }
+interface AskQuestion { question: string; header?: string; multiSelect?: boolean; options: AskOption[] }
+
+function parseAsk(json?: string): AskQuestion[] {
+  if (!json) return [];
+  try {
+    const raw = JSON.parse(json) as Record<string, unknown>;
+    const list = Array.isArray(raw.questions) ? raw.questions
+      : raw.question ? [raw] : [];
+    return (list as Record<string, unknown>[]).map(q => ({
+      question: String(q.question ?? q.header ?? 'Pick an option'),
+      header: typeof q.header === 'string' ? q.header : undefined,
+      multiSelect: q.multiSelect === true || q.allowMultiple === true,
+      options: (Array.isArray(q.options) ? q.options : []).map((o): AskOption =>
+        typeof o === 'string' ? { label: o } : { label: String((o as AskOption).label ?? ''), description: (o as AskOption).description }),
+    })).filter(q => q.options.length > 0);
+  } catch { return []; }
+}
+
+/* AskUserQuestion auto-answer: which option is the recommended one (mirrors the
+   engine's pick so the highlighted option matches what fires on timeout), the next
+   escalating-extend step, and the graceful-pause note shown past the 30-min cap. */
+const ASK_RECO_RE = /\b(recommend|recommended|default|suggested|suggest|preferred)\b/i;
+const isRecommendedOpt = (o: { label: string; description?: string }) => ASK_RECO_RE.test(o.label) || (!!o.description && ASK_RECO_RE.test(o.description));
+const ASK_GRACEFUL_NOTE = '⏸ Paused — reply whenever you get a moment and I’ll pick up right from here.';
+/** Next extend increment in minutes (+5, +10, +15…), and whether it would hit the 30-min cap. */
+const nextExtendStep = (extendsSoFar: number) => 5 * (extendsSoFar + 1);
+const extendWouldCap = (extendsSoFar: number) => {
+  const k = extendsSoFar + 1; // base 5 + 5*(1+2+…+k); cap 30 min
+  return 5 * (1 + (k * (k + 1)) / 2) > 30;
+};
+
+/** Self-ticking countdown for the auto-answer deadline — owns its 1s timer so the
+    surrounding turn isn't re-rendered every second. */
+function AskCountdown({ deadline }: { deadline: number }) {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => { const t = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(t); }, []);
+  return <>{fmtCountdown(deadline - now)}</>;
+}
+
+/** One option as a compact selectable row (used when options carry descriptions). */
+function OptionRow({ label, description, on, multi, answered, onPick, recommended }: { label: string; description?: string; on: boolean; multi: boolean; answered: boolean; onPick: () => void; recommended?: boolean }) {
+  return (
+    <button disabled={answered} onClick={onPick} className="opt-row" style={{
+      display: 'flex', alignItems: description ? 'flex-start' : 'center', gap: 9, width: '100%', padding: '6px 9px', borderRadius: 9, textAlign: 'left',
+      background: on ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent', border: '1px solid transparent', cursor: answered ? 'default' : 'pointer' }}>
+      <span style={{ width: 15, height: 15, borderRadius: multi ? 4 : 8, flexShrink: 0, marginTop: description ? 2 : 0, display: 'grid', placeItems: 'center',
+        border: `1.5px solid ${on ? 'var(--blue)' : 'var(--separator-strong)'}`, background: on ? 'var(--blue)' : 'transparent', color: '#fff', transition: 'all 120ms ease' }}>
+        {on && <Icon name="check" size={9} stroke={3.2} />}
+      </span>
+      <span style={{ minWidth: 0, flex: 1 }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6, font: '500 13.5px/1.3 var(--font-text)', color: 'var(--ink)' }}>
+          {label}
+          {recommended && <span style={{ flexShrink: 0, height: 15, padding: '0 6px', borderRadius: 5, display: 'inline-flex', alignItems: 'center', background: 'color-mix(in srgb, var(--blue) 15%, transparent)', color: 'var(--blue)', font: '700 8.5px/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase' }}>Recommended</span>}
+        </span>
+        {description && <span style={{ display: 'block', font: '400 12px/1.4 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 1 }}>{description}</span>}
+      </span>
+    </button>
+  );
+}
+
+function QuestionCard({ ask, onAnswer, answered, pending, onExtend, onCancel }: { ask?: string; onAnswer: (text: string) => void; answered: boolean; pending?: Schedule | null; onExtend?: () => void; onCancel?: () => void }) {
+  const questions = parseAsk(ask);
+  const [picked, setPicked] = React.useState<Record<number, Set<string>>>({});
+  const [custom, setCustom] = React.useState('');
+  // Live auto-answer countdown state (only on the active, unanswered card).
+  const counting = !answered && !!pending && !pending.paused && !!pending.fireAt;
+  const paused = !answered && !!pending?.paused;
+  const extendsSoFar = pending?.extends ?? 0;
+  const willCap = extendWouldCap(extendsSoFar);
+  // Highlight the option that will fire on timeout, per question (first one only matters).
+  const recoLabels = counting ? questions.map(q => (q.options.find(isRecommendedOpt) ?? q.options[0])?.label) : [];
+  if (questions.length === 0) return null;
+  const sendCustom = () => { const v = custom.trim(); if (v) { setCustom(''); onAnswer(v); } };
+
+  const toggle = (qi: number, label: string, multi: boolean) => {
+    setPicked(p => {
+      const cur = new Set(p[qi] ?? []);
+      if (multi) { cur.has(label) ? cur.delete(label) : cur.add(label); }
+      else { cur.clear(); cur.add(label); }
+      return { ...p, [qi]: cur };
+    });
+  };
+  const submit = () => {
+    const parts = questions.map((q, qi) => {
+      const sel = [...(picked[qi] ?? [])];
+      return sel.length ? `${q.header ?? q.question}: ${sel.join(', ')}` : '';
+    }).filter(Boolean);
+    if (parts.length) onAnswer(parts.join('\n'));
+  };
+  const anyPicked = Object.values(picked).some(s => s.size > 0);
+  const needsSubmit = questions.some(q => q.multiSelect) || questions.length > 1;
+
+  return (
+    <div style={{ margin: '8px 0', borderRadius: 13, padding: '11px 13px', position: 'relative',
+      border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', opacity: answered ? 0.6 : 1 }}>
+      <span style={{ position: 'absolute', left: 0, top: 11, bottom: 11, width: 2.5, borderRadius: 2, background: answered ? 'var(--green)' : 'var(--blue)' }} />
+      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, marginBottom: 7, font: '600 var(--fs-caption)/1 var(--font-text)', color: answered ? 'var(--green)' : 'var(--ink-tertiary)' }}>
+        <Icon name={answered ? 'check' : 'enter'} size={11} stroke={answered ? 2.6 : 2} /> {answered ? 'Answered' : 'Claude is asking'}
+      </div>
+      {/* Auto-answer countdown — fires the recommended option on timeout; extend to buy time. */}
+      {counting && pending?.fireAt && (
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 10, padding: '7px 10px', borderRadius: 9,
+          background: 'color-mix(in srgb, var(--blue) 8%, transparent)', border: '0.5px solid color-mix(in srgb, var(--blue) 28%, transparent)' }}>
+          <Icon name="clock" size={13} style={{ color: 'var(--blue)' }} />
+          <span style={{ font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
+            Going with the recommended option in <span style={{ fontWeight: 700, color: 'var(--blue)', fontFamily: 'var(--font-mono)' }}><AskCountdown deadline={pending.fireAt} /></span>
+          </span>
+          <span style={{ flex: 1, minWidth: 4 }} />
+          <button onClick={onExtend} title={willCap ? 'Max wait reached — this pauses it for a manual reply' : `Add ${nextExtendStep(extendsSoFar)} more minutes`}
+            style={{ height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)', cursor: 'pointer', border: '1px solid color-mix(in srgb, var(--blue) 40%, transparent)',
+              background: 'var(--bg-elevated)', color: 'var(--blue)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+            {willCap ? 'Pause — I’ll wait' : `Extend +${nextExtendStep(extendsSoFar)}m`}
+          </button>
+          <button onClick={onCancel} title="Stop the countdown (the question stays — answer whenever)"
+            style={{ height: 26, width: 26, borderRadius: 7, display: 'grid', placeItems: 'center', cursor: 'pointer', border: 'none', background: 'transparent', color: 'var(--ink-tertiary)' }}>
+            <Icon name="x" size={13} />
+          </button>
+        </div>
+      )}
+      {paused && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10, padding: '7px 10px', borderRadius: 9,
+          background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>
+          <Icon name="pause" size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} /> {ASK_GRACEFUL_NOTE}
+        </div>
+      )}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
+        {questions.map((q, qi) => {
+          const hasDesc = q.options.some(o => o.description);
+          const sel = picked[qi] ?? new Set<string>();
+          const reco = recoLabels[qi];
+          const onPick = (label: string) => { if (q.multiSelect) toggle(qi, label, true); else { toggle(qi, label, false); if (!needsSubmit) onAnswer(label); } };
+          return (
+            <div key={qi}>
+              <div style={{ font: '600 14px/1.35 var(--font-text)', color: 'var(--ink)', marginBottom: 8 }}>{q.question}</div>
+              {hasDesc ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  {q.options.map((o, oi) => <OptionRow key={oi} label={o.label} description={o.description} on={sel.has(o.label)} multi={!!q.multiSelect} answered={answered} onPick={() => onPick(o.label)} recommended={o.label === reco} />)}
+                </div>
+              ) : (
+                // No descriptions → efficient quick-reply chips.
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {q.options.map((o, oi) => {
+                    const on = sel.has(o.label);
+                    const isReco = o.label === reco;
+                    return (
+                      <button key={oi} disabled={answered} onClick={() => onPick(o.label)} className="opt-chip" style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 6, height: 30, padding: '0 12px', borderRadius: 'var(--r-pill)', cursor: answered ? 'default' : 'pointer',
+                        background: on ? 'var(--blue)' : 'var(--bg-elevated)', color: on ? '#fff' : 'var(--ink)',
+                        border: `1px solid ${on ? 'var(--blue)' : isReco ? 'color-mix(in srgb, var(--blue) 50%, transparent)' : 'var(--separator-strong)'}`,
+                        boxShadow: isReco && !on ? '0 0 0 2px color-mix(in srgb, var(--blue) 14%, transparent)' : 'none', font: '600 13px/1 var(--font-text)' }}>
+                        {q.multiSelect && on && <Icon name="check" size={12} stroke={3} />}{o.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {answered ? (
+        <div style={{ marginTop: 10, font: '400 11.5px/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>Send another message to change your answer.</div>
+      ) : (
+        <div style={{ marginTop: 11, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {needsSubmit && (
+            <button onClick={submit} disabled={!anyPicked} className="send-fab" style={{ alignSelf: 'flex-start', height: 30, padding: '0 15px', borderRadius: 'var(--r-pill)', border: 'none',
+              background: anyPicked ? 'var(--blue)' : 'var(--fill-secondary)', color: anyPicked ? '#fff' : 'var(--ink-tertiary)', font: '600 13px/1 var(--font-text)', cursor: anyPicked ? 'pointer' : 'default' }}>
+              Send {[...Object.values(picked)].reduce((n, s) => n + s.size, 0) || ''} answer{[...Object.values(picked)].reduce((n, s) => n + s.size, 0) === 1 ? '' : 's'}
+            </button>
+          )}
+          {/* real, inline "type your own answer" — answers the question directly */}
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <input value={custom} onChange={e => setCustom(e.target.value)} placeholder="Or type your own answer…"
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); sendCustom(); } }}
+              style={{ flex: 1, height: 34, padding: '0 12px', borderRadius: 9, boxSizing: 'border-box',
+                border: '1px solid var(--separator-strong)', background: 'var(--bg-elevated)', color: 'var(--ink)', font: '400 13px/1 var(--font-text)' }} />
+            <button onClick={sendCustom} disabled={!custom.trim()} className="send-fab" title="Send your answer" style={{
+              width: 34, height: 34, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+              background: custom.trim() ? 'var(--blue)' : 'var(--fill-secondary)', color: custom.trim() ? '#fff' : 'var(--ink-tertiary)', cursor: custom.trim() ? 'pointer' : 'default' }}>
+              <Icon name="arrowRight" size={16} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Collapsible "work" summary shown once a turn is done ──────────────── */
+function WorkBar({ toolCount, thought, elapsed, expanded, onToggle, children }: { toolCount: number; thought?: boolean; elapsed: string; expanded: boolean; onToggle: () => void; children: React.ReactNode }) {
+  const parts = [`Worked ${elapsed}`];
+  if (thought) parts.push('thought');
+  if (toolCount > 0) parts.push(`${toolCount} ${toolCount === 1 ? 'tool' : 'tools'}`);
+  return (
+    <div style={{ margin: '2px 0 4px' }}>
+      <button onClick={onToggle} className="work-bar" title={expanded ? 'Hide the steps' : 'Show the steps'} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 26, padding: '0 11px 0 8px', borderRadius: 'var(--r-pill)',
+        background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', cursor: 'pointer', color: 'var(--ink-secondary)',
+        font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+        <Icon name="chevronRight" size={13} style={{ transform: expanded ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)', color: 'var(--ink-tertiary)' }} />
+        <Icon name="check" size={12} stroke={2.6} style={{ color: 'var(--green)' }} />
+        {parts.join(' · ')}
+      </button>
+      {expanded && <div style={{ marginTop: 8, paddingLeft: 11, borderLeft: '1.5px solid var(--separator)', opacity: 0.7 }}>{children}</div>}
+    </div>
+  );
+}
+
+const fmtDuration = (ms: number): string => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+};
+/* Live variant: tenths of a second so the running clock feels realtime. */
+const fmtDurationLive = (ms: number): string => {
+  const s = Math.max(0, ms / 1000);
+  return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${(s % 60).toFixed(1)}s`;
+};
+
+/** Lets a generated/attached image open in an in-app viewer tab (provided by the
+    Workspace). Null when the chat is used standalone — then we reveal in Finder. */
+const ImageOpenContext = React.createContext<((assetId: string, name: string, imagePath?: string) => void) | null>(null);
+
+/** A small thumbnail of an image the user attached — loaded on-device by assetId. */
+function UserImageThumb({ img }: { img: ChatImage }) {
+  const [src, setSrc] = React.useState<string | null>(null);
+  const onOpenImage = React.useContext(ImageOpenContext);
+  React.useEffect(() => {
+    let alive = true;
+    if (IS_LOCAL && img.assetId) api.assetImage(img.assetId).then(d => { if (alive) setSrc(d); }).catch(() => {});
+    return () => { alive = false; };
+  }, [img.assetId]);
+  const clickable = IS_LOCAL && !!img.assetId;
+  const open = () => {
+    if (onOpenImage && img.assetId) onOpenImage(img.assetId, img.name || 'Image', img.imagePath);
+    else if (img.imagePath) void api.revealPath(img.imagePath);
+  };
+  return (
+    <div onClick={open} title={clickable ? (img.name || 'Open image') : (img.name || 'image')}
+      style={{ width: 158, maxWidth: '100%', borderRadius: 12, overflow: 'hidden', border: '0.5px solid var(--separator-strong)', background: 'var(--bg-grouped)', cursor: clickable ? 'pointer' : 'default' }}>
+      {src
+        ? <img src={src} alt={img.name || 'attached image'} style={{ display: 'block', width: '100%', maxHeight: 200, objectFit: 'cover' }} />
+        : <div style={{ height: 92, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}><Icon name="image" size={18} /></div>}
+    </div>
+  );
+}
+
+/* Match an `@<path>` inline attachment marker that points into the project's
+   `.continuum/Attachment/` directory (including a per-branch subfolder). Works
+   on both forms the bubble can see: the desktop's absolute
+   `@/Users/.../proj/.continuum/Attachment/<branch>/x.png`, and the
+   relay-scrubbed `@.continuum/Attachment/<branch>/x.png` the phone receives.
+   The prefix uses `[^@\n]+?` (not `\S*`) so a project path with SPACES — eg
+   `/Users/me/Desktop/Client Shared GIT/veni0004/.continuum/Attachment/...` —
+   still tokenizes into a pill instead of falling through to `linkifyText` and
+   rendering as a raw underlined link in the user bubble (image_37flq.png).
+   Group 2 is the basename; the optional sub-directory chain lets a per-branch
+   or legacy per-session attachment (`Attachment/<chat>/foo.png`) tokenize too,
+   and `basenameOf` stays idempotent on it. The trailing `\.[A-Za-z0-9]+` anchors
+   on the saved file's extension so trailing prose (` , Now…`) is excluded. */
+const ATTACH_INLINE_RE = /@((?:\/[^@\n]+?)?\.continuum\/Attachment\/(?:[A-Za-z0-9._-]+\/)*([A-Za-z0-9._-]+\.[A-Za-z0-9]+))/g;
+/** Basename of a saved attachment path — the lookup key against inputImages /
+    inputFiles, since those carry their `.continuum/Attachment/` filename. */
+const basenameOf = (p: string): string => p.split('/').filter(Boolean).pop() || p;
+/** A small inline attachment CAPSULE rendered AT the position the user dropped
+    the chip in the composer. Images render as a small clickable chip (icon +
+    filename) — NOT a thumbnail — so the bubble reads like prose with capsules
+    inline, matching the composer chip. Click on an image chip opens the
+    in-app viewer. Files show the same chip with their kind + size as subtitle. */
+function InlineAttach({ path, images, files }: { path: string; images?: ChatImage[]; files?: ChatFile[] }) {
+  const onOpenImage = React.useContext(ImageOpenContext);
+  const base = basenameOf(path);
+  const img = images?.find(im => basenameOf(im.imagePath ?? '') === base || im.name === base);
+  if (img) {
+    const clickable = IS_LOCAL && !!img.assetId;
+    const open = () => {
+      if (onOpenImage && img.assetId) onOpenImage(img.assetId, img.name || 'Image', img.imagePath);
+      else if (img.imagePath) void api.revealPath(img.imagePath);
+    };
+    const dims = (img.width && img.height) ? `${img.width}×${img.height}` : 'image';
+    return (
+      <span onClick={clickable ? open : undefined} title={img.name || 'Open image'}
+        style={{ display: 'inline-flex', verticalAlign: 'middle', alignItems: 'center', gap: 6, maxWidth: 240, margin: '0 2px', padding: '2px 8px 2px 6px', borderRadius: 9, border: '0.5px solid rgba(255,255,255,0.32)', background: 'rgba(255,255,255,0.14)', color: '#fff', font: '600 12px/1.25 var(--font-text)', cursor: clickable ? 'pointer' : 'default' }}>
+        <Icon name="image" size={12} />
+        <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+          <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{img.name || base}</span>
+          <span style={{ font: '500 9px/1.1 var(--font-text)', opacity: 0.72 }}>{dims}</span>
+        </span>
+      </span>
+    );
+  }
+  const f = files?.find(fl => (fl.path && basenameOf(fl.path) === base) || fl.name === base);
+  const label = f ? (f.name === 'Pasted text.txt' ? 'Pasted text' : f.name) : base;
+  const sub = f ? `${f.kind === 'text' ? 'text' : (f.mime || 'file')}${f.bytes ? ' · ' + fmtBytes(f.bytes) : ''}` : 'attachment';
+  return (
+    <span title={f?.name ?? path} style={{ display: 'inline-flex', verticalAlign: 'middle', alignItems: 'center', gap: 6, maxWidth: 240, margin: '0 2px', padding: '2px 8px 2px 6px', borderRadius: 9, border: '0.5px solid rgba(255,255,255,0.32)', background: 'rgba(255,255,255,0.14)', color: '#fff', font: '600 12px/1.25 var(--font-text)' }}>
+      <Icon name="file" size={12} />
+      <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+        <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+        <span style={{ font: '500 9px/1.1 var(--font-text)', opacity: 0.72 }}>{sub}</span>
+      </span>
+    </span>
+  );
+}
+
+/** Prefix the engine stamps on a turn it auto-sent to keep a goal-mode run
+    going (mirrors KEEP_GOING_PREFIX in electron/keep-going.ts — duplicated here
+    rather than imported so the renderer build doesn't pull in Electron code). */
+const AUTO_CONTINUE_PREFIX = '[Auto-continue]:';
+
+/** Auto-continue turns are machine-generated continuation prompts (a goal echo
+    + a "you outlined these next moves" bullet list + autonomy boilerplate).
+    Rendered through UserBubble they became a giant blue bubble of raw,
+    pre-wrap text — literal `-`/`#` markdown and blank-line bloat (image_yhpsb.png).
+    They aren't something the USER typed, so they shouldn't masquerade as a user
+    message. Render them as a compact, dimmed, collapsible system note instead:
+    one quiet line by default, expandable to the full prompt rendered with the
+    real markdown renderer (bullets become bullets, not a wall of `-`). */
+function AutoContinueBubble({ text }: { text: string }) {
+  const [open, setOpen] = React.useState(false);
+  // Strip the prefix, collapse blank-line bloat / trailing spaces, and pull the
+  // single most informative line for the collapsed preview: prefer the `Goal:`
+  // line, else the first non-empty line.
+  const body = React.useMemo(
+    () => text.slice(AUTO_CONTINUE_PREFIX.length).replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim(),
+    [text],
+  );
+  const preview = React.useMemo(() => {
+    const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
+    const goal = lines.find(l => /^goal:/i.test(l));
+    const pick = (goal ?? lines[0] ?? 'Continuing autonomously').replace(/^goal:\s*/i, '');
+    return pick.length > 96 ? pick.slice(0, 96) + '…' : pick;
+  }, [body]);
+  return (
+    <div className="chat-msg" style={{ display: 'flex', justifyContent: 'flex-end' }}>
+      <div style={{ maxWidth: 'min(78%, 640px)', width: open ? '100%' : 'auto', borderRadius: 12,
+        border: '0.5px solid color-mix(in srgb, var(--purple) 28%, var(--separator))',
+        background: 'color-mix(in srgb, var(--purple) 6%, var(--bg-elevated))', overflow: 'hidden' }}>
+        <button onClick={() => setOpen(o => !o)} title={open ? 'Hide the auto-continue prompt' : 'Show the full auto-continue prompt'}
+          style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '8px 12px', background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left' }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexShrink: 0, height: 17, padding: '0 6px', borderRadius: 5,
+            background: 'color-mix(in srgb, var(--purple) 15%, transparent)', color: 'var(--purple)', font: '700 9px/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+            <Icon name="refresh" size={9} /> Auto-continued
+          </span>
+          {!open && (
+            <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{preview}</span>
+          )}
+          <Icon name="chevronRight" size={13} style={{ flexShrink: 0, color: 'var(--ink-tertiary)', transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+        </button>
+        {open && (
+          <div style={{ padding: '0 14px 12px', borderTop: '0.5px solid color-mix(in srgb, var(--purple) 18%, var(--separator))',
+            font: '400 13.5px/1.6 var(--font-text)', color: 'var(--ink-secondary)' }}>
+            {renderChatBody(body, 'autocont')}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Render the user bubble: text with `@<.continuum/Attachment/…>` markers
+    tokenized into inline chips/thumbnails at the exact position the user
+    dropped them in the composer. Images that aren't referenced inline (legacy
+    jobs before this change persisted markers in the input) fall back to a row
+    above the bubble so nothing disappears.
+    Each string segment between chips is run through `renderInline` so
+    `**bold**` and `` `code` `` render properly — the user reported that
+    auto-continue prompts (and their own typed messages) were showing literal
+    `**` stars in the bubble (image_kpijo.png / image_6f4zy.png). */
+function UserBubble({ text: rawText, images, files }: { text: string; images?: ChatImage[]; files?: ChatFile[] }) {
+  // The bubble renders with `whiteSpace: 'pre-wrap'`, so every blank line in the
+  // payload becomes vertical air. Auto-continue prompts (and pasted goals) carry
+  // runs of blank lines + trailing spaces that bloated the bubble (image_yhpsb.png);
+  // collapse 3+ newlines to one blank line and strip trailing spaces up front.
+  const text = React.useMemo(
+    () => (rawText ? rawText.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trimEnd() : rawText),
+    [rawText],
+  );
+  // Split the text into [string, attachment, string, attachment, …] tokens,
+  // then run each plain-text segment through the inline-markdown renderer
+  // (same one the agent bubble uses, so the formatting is symmetric).
+  const nodes = React.useMemo(() => {
+    if (!text) return [] as React.ReactNode[];
+    const out: React.ReactNode[] = [];
+    let last = 0; let i = 0;
+    ATTACH_INLINE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    const pushString = (s: string) => { if (s) out.push(...renderInline(s, `ub${i++}`)); };
+    while ((m = ATTACH_INLINE_RE.exec(text)) !== null) {
+      if (m.index > last) pushString(text.slice(last, m.index));
+      out.push(<InlineAttach key={`a${i++}`} path={m[1]} images={images} files={files} />);
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) pushString(text.slice(last));
+    return out;
+  }, [text, images, files]);
+
+  // Anything that DIDN'T appear inline (legacy persisted jobs, or a chip the
+  // user removed before sending while leaving the payload) shows above so the
+  // user still sees what's attached.
+  const referencedBases = React.useMemo(() => {
+    const s = new Set<string>(); if (!text) return s;
+    const r = new RegExp(ATTACH_INLINE_RE.source, 'g'); let mm: RegExpExecArray | null;
+    while ((mm = r.exec(text)) !== null) s.add(basenameOf(mm[2]));
+    return s;
+  }, [text]);
+  const orphanImages = (images ?? []).filter(im => !referencedBases.has(basenameOf(im.imagePath ?? '')) && !referencedBases.has(im.name ?? ''));
+  const orphanFiles = (files ?? []).filter(f => !referencedBases.has(f.path ? basenameOf(f.path) : '') && !referencedBases.has(f.name));
+
+  return (
+    <div className="chat-msg" style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+      {orphanImages.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: 'min(78%, 640px)' }}>
+          {orphanImages.map((im, i) => <UserImageThumb key={`${im.assetId}-${i}`} img={im} />)}
+        </div>
+      )}
+      {orphanFiles.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: 'min(78%, 640px)' }}>
+          {orphanFiles.map((f, i) => (
+            <div key={i} title={f.name} style={{ display: 'flex', alignItems: 'center', gap: 8, maxWidth: 240, height: 42, padding: '0 12px 0 9px', borderRadius: 11, border: '0.5px solid var(--separator-strong)', background: 'var(--bg-elevated)' }}>
+              <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 16%, transparent)', color: 'var(--blue)' }}><Icon name="file" size={14} /></span>
+              <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 }}>
+                <span style={{ font: '600 var(--fs-caption)/1.15 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{f.name === 'Pasted text.txt' ? 'Pasted text' : f.name}</span>
+                <span style={{ font: '400 9px/1.1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{f.kind === 'text' ? 'text' : (f.mime || 'file')} · {fmtBytes(f.bytes)}</span>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {text && (
+        // `bubble-user` opts the inline path links + inline `code` capsules
+        // inside this blue gradient bubble into a white-on-translucent palette
+        // (see PAGE_CSS). Without that scoping, `PathLink`'s `color: var(--blue)`
+        // is the same hue as the bubble background, so the link disappeared into
+        // the gradient (image_5tx6p.png).
+        <div className="bubble-user" style={{ maxWidth: 'min(78%, 640px)', padding: '10px 14px', borderRadius: '18px 18px 5px 18px',
+          background: 'linear-gradient(180deg, color-mix(in srgb, var(--blue) 94%, #fff) 0%, var(--blue) 100%)',
+          color: '#fff', font: '400 14px/1.5 var(--font-text)', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+          boxShadow: '0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent)' }}>
+          {nodes}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+/* One compact, FIXED stat line for a turn. It lives in the message header so it
+   stays put (top-right of the message) as the body streams, instead of drifting
+   at the bottom. Live numbers roll via CountUp; tinted purple while running. */
+function TurnMeta({ job, elapsed, toolCount, live }: { job: Job; elapsed: string; toolCount: number; live: boolean }) {
+  const dot = <span style={{ opacity: 0.45 }}>·</span>;
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, flexShrink: 0, whiteSpace: 'nowrap',
+      font: '500 var(--fs-caption)/1 var(--font-mono)', color: live ? 'var(--purple)' : 'var(--ink-tertiary)' }}>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}><Icon name="clock" size={10} /> {elapsed}</span>
+      {job.tokens > 0 && <>{dot}<span><CountUp value={job.tokens} /> tok</span></>}
+      {job.cost > 0 && <>{dot}<span>{live ? '~' : ''}$<CountUp value={job.cost} format={n => n.toFixed(job.cost < 1 ? 3 : 2)} /></span></>}
+      {toolCount > 0 && <>{dot}<span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}><Icon name="command" size={10} /> <CountUp value={toolCount} /></span></>}
+    </span>
+  );
+}
+
+/** Render a slice of transcript items into blocks (text→prose, tool runs→group,
+    ask→question card). Used both live (full) and collapsed (work only). */
+/* A reviewer's verdict block (SP3): the second engine's findings + APPROVED /
+   NEEDS WORK, tinted green/orange. Fix rounds stream in as normal turns after. */
+function ReviewCard({ item }: { item: TranscriptItem }) {
+  // The primary addressed a needs-work review → show it as RESOLVED (green), not a
+  // lingering "needs work", so the finished thread reads as solved.
+  const resolved = !!item.resolved;
+  const needsWork = item.verdict === 'needs-work' && !resolved;
+  const tint = needsWork ? 'var(--orange)' : 'var(--green)';
+  const label = resolved ? 'Resolved' : needsWork ? 'Needs work' : 'Approved';
+  return (
+    <div style={{ margin: '8px 0 2px', border: `0.5px solid color-mix(in srgb, ${tint} 38%, var(--separator))`, borderRadius: 12, background: `color-mix(in srgb, ${tint} 6%, var(--bg-elevated))`, overflow: 'hidden' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: '0.5px solid var(--separator)' }}>
+        <Icon name={resolved ? 'checkCircle' : 'shield'} size={14} style={{ color: tint, flexShrink: 0 }} />
+        <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Reviewer · {item.name ?? 'review'}</span>
+        {resolved && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>· addressed by the agent</span>}
+        <span style={{ flex: 1 }} />
+        <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: tint, textTransform: 'uppercase' }}>{label}</span>
+      </div>
+      <div style={{ padding: '6px 12px 8px' }}>{renderChatBody(item.text, 'rvb')}</div>
+    </div>
+  );
+}
+
+/* A generated image, shown inline as a COMPACT, collapsed chip (thumbnail +
+   caption) so it sits with the tool flow instead of dumping a huge picture into
+   the chat. Click → opens the full image in its own in-app viewer tab (Workspace);
+   standalone, it falls back to reveal-in-Finder. Bytes load on-device by Asset id
+   via a desktop-only IPC (never the relay) — phone/web shows a placeholder. */
+function InlineImage({ item, jobId }: { item: TranscriptItem; jobId?: string }) {
+  const [src, setSrc] = React.useState<string | null>(null);
+  const [failed, setFailed] = React.useState(false);
+  const [editing, setEditing] = React.useState(false);
+  const [instruction, setInstruction] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState('');
+  const onOpenImage = React.useContext(ImageOpenContext);
+  React.useEffect(() => {
+    let alive = true;
+    if (IS_LOCAL && item.assetId) {
+      api.assetImage(item.assetId)
+        .then(d => { if (alive) { d ? setSrc(d) : setFailed(true); } })
+        .catch(() => { if (alive) setFailed(true); });
+    }
+    return () => { alive = false; };
+  }, [item.assetId]);
+  const caption = item.alt || item.text || '';
+  const openable = IS_LOCAL && !!item.assetId;
+  const open = () => {
+    if (!openable) return;
+    if (onOpenImage && item.assetId) onOpenImage(item.assetId, caption || 'Generated image', item.imagePath);
+    else if (item.imagePath) void api.revealPath(item.imagePath);
+  };
+  // Regenerate: no instruction → re-roll the same prompt; with one → edit this
+  // image, keeping the rest. The result arrives as a NEW chip in this turn (the
+  // job's transcript is appended, so it streams in via the job subscription).
+  const regen = async (withInstruction: boolean) => {
+    if (!item.assetId || busy) return;
+    const instr = instruction.trim();
+    if (withInstruction && !instr) return;
+    setBusy(true); setErr('');
+    try {
+      await api.regenerateImage({ assetId: item.assetId, jobId, instruction: withInstruction ? instr : undefined });
+      setInstruction(''); setEditing(false);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not regenerate the image');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const accent = 'var(--purple)';
+  return (
+    <div style={{ width: '100%', maxWidth: 440, margin: '7px 0 2px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '7px 9px 7px 7px', borderRadius: 12,
+        background: 'color-mix(in srgb, var(--purple) 8%, var(--bg-elevated))',
+        border: '0.5px solid color-mix(in srgb, var(--purple) 26%, var(--separator))' }}>
+        <button onClick={open} disabled={!openable} title={openable ? 'Open image' : caption}
+          style={{ display: 'flex', alignItems: 'center', gap: 11, flex: 1, minWidth: 0, padding: 0, background: 'none', border: 0,
+            textAlign: 'left', cursor: openable ? 'pointer' : 'default' }}>
+          <span style={{ width: 46, height: 46, borderRadius: 9, overflow: 'hidden', flexShrink: 0, background: 'var(--bg-grouped)', display: 'grid', placeItems: 'center' }}>
+            {src ? <img src={src} alt={caption} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+              : (failed || !IS_LOCAL) ? <Icon name="image" size={18} style={{ color: accent }} />
+              : <Spinner size={14} color={accent} />}
+          </span>
+          <span style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1, gap: 2 }}>
+            <span style={{ font: '600 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)' }}>Generated image</span>
+            {caption && <span style={{ font: '400 var(--fs-caption)/1.25 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{caption}</span>}
+          </span>
+        </button>
+        {IS_LOCAL && !!item.assetId && (
+          <button onClick={() => setEditing(e => !e)} disabled={busy} title="Regenerate or modify this image"
+            style={{ width: 30, height: 30, borderRadius: 8, flexShrink: 0, display: 'grid', placeItems: 'center', border: 0, color: accent,
+              cursor: busy ? 'default' : 'pointer', background: editing ? 'color-mix(in srgb, var(--purple) 16%, transparent)' : 'transparent' }}>
+            {busy ? <Spinner size={13} color={accent} /> : <Icon name="refresh" size={15} stroke={2.2} />}
+          </button>
+        )}
+        {openable && <Icon name="arrowRight" size={14} stroke={2.2} style={{ color: accent, flexShrink: 0, transform: 'rotate(-45deg)', marginRight: 2 }} />}
+      </div>
+      {editing && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '6px 0 0', padding: '0 2px' }}>
+          <input value={instruction} autoFocus disabled={busy} onChange={e => setInstruction(e.target.value)}
+            placeholder="Describe a change — or leave empty to re-roll"
+            onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); void regen(instruction.trim().length > 0); } }}
+            style={{ flex: 1, minWidth: 0, height: 32, padding: '0 11px', borderRadius: 9, font: '400 var(--fs-footnote)/1 var(--font-text)',
+              color: 'var(--ink)', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)' }} />
+          <button onClick={() => void regen(false)} disabled={busy} title="Generate a fresh version of the same prompt"
+            style={{ height: 32, padding: '0 12px', borderRadius: 9, flexShrink: 0, border: 0, font: '600 var(--fs-caption)/1 var(--font-text)',
+              color: 'var(--ink-secondary)', background: 'var(--fill-secondary)', cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.5 : 1 }}>Re-roll</button>
+          <button onClick={() => void regen(true)} disabled={busy || !instruction.trim()} className="send-btn"
+            style={{ height: 32, padding: '0 13px', borderRadius: 9, flexShrink: 0, border: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: '#fff',
+              background: 'var(--purple)', opacity: (busy || !instruction.trim()) ? 0.5 : 1, cursor: (busy || !instruction.trim()) ? 'default' : 'pointer' }}>Modify</button>
+        </div>
+      )}
+      {err && <div style={{ margin: '5px 0 0', padding: '0 2px', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--red)' }}>{err}</div>}
+    </div>
+  );
+}
+
+/* Smooth streaming. The Claude Agent SDK (and Codex even more so) hands us text
+   in coarse ~70-char bursts every ~0.4–0.7s, not token-by-token — so a faithful
+   render steps in half-second jumps that read as "updates every second", not a
+   stream. This types the buffered text out at a steady, adaptive cadence: each
+   frame we reveal a few more chars, draining the backlog over ~0.45s, with a
+   lively floor and a bound on how far behind we ever fall (so a big Codex block
+   shows quickly instead of crawling). Settled turns render full text directly —
+   this component is only mounted for the one live, growing block. */
+const STREAM_MIN_CPS = 80;     // chars/sec floor — keep it alive on a trickle
+const STREAM_MAX_CPS = 1400;   // ceiling so big blocks don't machine-gun
+const STREAM_DRAIN_S = 0.45;   // aim to empty the current backlog this fast
+const STREAM_MAX_LAG = 1800;   // never trail the buffer by more than this (chars)
+function StreamingBody({ text, keyBase }: { text: string; keyBase: string }): React.ReactElement {
+  const [shownLen, setShownLen] = React.useState(text.length);
+  const shownRef = React.useRef(text.length);
+  const targetRef = React.useRef(text.length);
+  targetRef.current = text.length; // picked up by the rAF loop without re-subscribing
+  React.useEffect(() => {
+    let raf = 0;
+    let last = performance.now();
+    const tick = (now: number) => {
+      const dt = Math.min(64, now - last); last = now;
+      const target = targetRef.current;
+      let cur = shownRef.current;
+      if (cur > target) cur = target; // text replaced with something shorter — resync
+      if (cur < target) {
+        let backlog = target - cur;
+        if (backlog > STREAM_MAX_LAG) { cur = target - STREAM_MAX_LAG; backlog = STREAM_MAX_LAG; }
+        const cps = Math.min(STREAM_MAX_CPS, Math.max(STREAM_MIN_CPS, backlog / STREAM_DRAIN_S));
+        const add = Math.max(1, Math.ceil((cps * dt) / 1000));
+        cur = Math.min(target, cur + add);
+        shownRef.current = cur;
+        setShownLen(cur);
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+  return <>{renderChatBody(text.slice(0, shownLen), keyBase)}</>;
+}
+
+function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { caretAt?: number; onAnswer?: (t: string) => void; answered?: boolean; jobId?: string; pendingAsk?: Schedule | null; onExtendAsk?: () => void; onCancelAsk?: () => void }): React.ReactNode[] {
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+  while (i < items.length) {
+    const it = items[i];
+    if (it.kind === 'tool') {
+      const run: TranscriptItem[] = [];
+      while (i < items.length && items[i].kind === 'tool') { run.push(items[i]); i++; }
+      blocks.push(<ToolGroup key={`${keyPrefix}g${i}`} items={run} />);
+    } else if (it.kind === 'thinking') {
+      blocks.push(<ThinkingNode key={`${keyPrefix}think${i}`} item={it} live={opts.caretAt === i} />);
+      i++;
+    } else if (it.kind === 'ask') {
+      blocks.push(<QuestionCard key={`${keyPrefix}q${i}`} ask={it.ask} onAnswer={opts.onAnswer ?? (() => {})} answered={!!opts.answered} pending={opts.pendingAsk ?? null} onExtend={opts.onExtendAsk} onCancel={opts.onCancelAsk} />);
+      i++;
+    } else if (it.kind === 'review') {
+      blocks.push(<ReviewCard key={`${keyPrefix}rv${i}`} item={it} />);
+      i++;
+    } else if (it.kind === 'image') {
+      blocks.push(<InlineImage key={`${keyPrefix}im${i}`} item={it} jobId={opts.jobId} />);
+      i++;
+    } else {
+      const idx = i;
+      blocks.push(
+        <div key={`${keyPrefix}b${idx}`} style={{ margin: idx > 0 ? '4px 0 0' : 0 }}>
+          {opts.caretAt === idx
+            ? <StreamingBody text={it.text} keyBase={`${keyPrefix}t${idx}`} />
+            : renderChatBody(it.text, `${keyPrefix}${it.kind === 'result' ? 'r' : 't'}${idx}`)}
+          {opts.caretAt === idx && <span className="chat-caret" />}
+        </div>
+      );
+      i++;
+    }
+  }
+  return blocks;
+}
+
+/* React.memo so a ChatPane re-render (typing in the composer, a job event for
+   ANOTHER turn) doesn't re-parse the markdown of every settled turn. Only turns
+   whose job object actually changed re-render; onRetry/onAnswer are stable. */
+const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer, isLast, pendingAsk, onExtendAsk, onCancelAsk }: { job: Job; onRetry: (input: string) => void; onAnswer: (text: string) => void; isLast: boolean; pendingAsk?: Schedule | null; onExtendAsk?: () => void; onCancelAsk?: () => void }) {
+  // ScheduleWakeup parking: while the SDK iterator is dormant waiting for a
+  // wakeup, the job stays status:'running' (the stream truly is still open)
+  // but `pausedUntil` is set. The user-facing semantics requested are "session
+  // closed, auto-resumes at X" — like a scheduled message — so the spinner,
+  // "streaming/thinking" badge, and live activity all step aside. The pause
+  // chip rendered below takes their place with a live countdown.
+  const paused = !!(job.pausedUntil && job.pausedUntil > Date.now());
+  const live = (job.status === 'running' || job.status === 'pending') && !paused;
+  const engineLabel = job.engine === 'codex' ? 'Codex' : 'Claude Code';
+  const provider = job.engine === 'codex' ? 'openai' as const : 'anthropic' as const;
+  const transcript = job.transcript ?? [];
+  const hasBody = transcript.length > 0 || !!(job.output && job.output.length > 0);
+
+  const [, tick] = React.useReducer((x: number) => x + 1, 0);
+  React.useEffect(() => {
+    if (!live) return;
+    const t = setInterval(tick, 100); // tenth-of-a-second clock while running
+    return () => clearInterval(t);
+  }, [live]);
+  // Separate, slower tick that runs ONLY while the turn is parked on a wakeup,
+  // so the "Scheduled to resume in N" countdown advances and auto-collapses
+  // the moment `pausedUntil` slips into the past. Once per second is plenty
+  // (the chip renders minutes/seconds, not 1/10ths) and it doesn't churn
+  // through every settled turn the way the 100ms live tick would.
+  React.useEffect(() => {
+    if (!paused) return;
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, [paused]);
+  const elapsedMs = (live ? Date.now() : job.updatedAt) - job.createdAt;
+  const elapsed = live ? fmtDurationLive(elapsedMs) : fmtDuration(elapsedMs);
+
+  // The final answer = last text/result block. Everything before it is "work"
+  // (narration + tools) that collapses once the turn is done. A turn that ends
+  // in a question stays fully expanded — questions are never hidden.
+  const hasAsk = transcript.some(t => t.kind === 'ask');
+  // A generated image is never "work" to be collapsed away — keep image turns fully
+  // expanded so the picture (and anything after it) always renders.
+  const hasImage = transcript.some(t => t.kind === 'image');
+  let finalIdx = -1;
+  for (let k = transcript.length - 1; k >= 0; k--) { if (transcript[k].kind === 'text' || transcript[k].kind === 'result') { finalIdx = k; break; } }
+  const collapsible = !live && !hasAsk && !hasImage && finalIdx > 0 && transcript.slice(0, finalIdx).some(t => t.kind === 'tool' || t.kind === 'text' || t.kind === 'thinking');
+  const [expanded, setExpanded] = React.useState(false);
+
+  const toolCount = transcript.filter(t => t.kind === 'tool').length;
+  const replyText = (finalIdx >= 0 ? transcript[finalIdx].text : '') || job.output || '';
+  const lastIdx = transcript.length - 1;
+
+  let body: React.ReactNode = null;
+  if (transcript.length > 0) {
+    if (collapsible) {
+      const work = transcript.slice(0, finalIdx);
+      const workTools = work.filter(t => t.kind === 'tool').length;
+      const workThought = work.some(t => t.kind === 'thinking');
+      body = (
+        <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
+          <WorkBar toolCount={workTools} thought={workThought} elapsed={elapsed} expanded={expanded} onToggle={() => setExpanded(e => !e)}>
+            <div style={{ font: '400 13px/1.55 var(--font-text)' }}>{renderTranscript(work, 'w', { answered: true, jobId: job.id })}</div>
+          </WorkBar>
+          <div style={{ marginTop: 6 }}>{renderChatBody(transcript[finalIdx].text, 'fa')}</div>
+        </div>
+      );
+    } else {
+      body = (
+        <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
+          {renderTranscript(transcript, 'a', { caretAt: live ? lastIdx : undefined, onAnswer, answered: !isLast, jobId: job.id, pendingAsk, onExtendAsk, onCancelAsk })}
+        </div>
+      );
+    }
+  } else if (hasBody) {
+    body = (
+      <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
+        {live ? <StreamingBody text={job.output ?? ''} keyBase="b" /> : renderChatBody(job.output ?? '')}
+        {live && <span className="chat-caret" />}
+      </div>
+    );
+  }
+
+  return (
+    <div className="chat-msg" style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+      <span style={{ width: 30, height: 30, borderRadius: 10, flexShrink: 0, display: 'grid', placeItems: 'center', marginTop: 1,
+        background: 'var(--bg-elevated)', color: 'var(--ink)', border: '0.5px solid var(--separator)', boxShadow: '0 1px 3px rgba(15,20,50,.06)' }}>
+        {live && !hasBody ? <Spinner size={14} color="var(--purple)" /> : <ProviderGlyph provider={provider} size={16} />}
+      </span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5 }}>
+          <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{engineLabel}</span>
+          {job.model && job.model !== job.engine && (
+            <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{job.model}</span>
+          )}
+          {job.goal && (
+            <span title="Ran in goal mode — pursued the request autonomously" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, font: '700 9px/1 var(--font-text)', letterSpacing: '0.04em', color: 'var(--purple)', background: 'color-mix(in srgb, var(--purple) 14%, transparent)', padding: '2px 6px', borderRadius: 5 }}>
+              <Icon name="target" size={10} /> GOAL
+            </span>
+          )}
+          {live && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)' }}>
+              <span className="breathe" style={{ width: 6, height: 6, borderRadius: 3, background: 'var(--purple)' }} />
+              {hasBody ? 'streaming' : 'thinking'}
+            </span>
+          )}
+          <span style={{ flex: 1 }} />
+          {job.status === 'done' && replyText && <CopyButton text={replyText} className="turn-copy" />}
+        </div>
+        {body}
+        {/* Always-on "what it's doing right now" heartbeat while the turn runs —
+           a spinner + the live activity (current tool / thinking / responding /
+           reviewing), so the run never feels blank between steps. */}
+        {live && (
+          <div style={{ marginTop: hasBody ? 9 : 1, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Spinner size={12} color="var(--purple)" />
+            <span className="think-shimmer" style={{ font: '500 13.5px/1.4 var(--font-text)' }}>{liveActivity(job, transcript)}</span>
+          </div>
+        )}
+        {/* Parked on a ScheduleWakeup: the SDK is dormant until `pausedUntil`.
+           Treat as "closed, scheduled" — like a scheduled message — instead of
+           the stuck "Responding…" the user saw before. The 1 s tick in the
+           effect above keeps the remaining-time string fresh and auto-collapses
+           the chip the instant the wakeup fires (which clears `pausedUntil`). */}
+        {paused && (
+          <div style={{ marginTop: hasBody ? 9 : 1, display: 'inline-flex', alignItems: 'center', gap: 7, padding: '6px 11px', borderRadius: 'var(--r-pill)',
+            background: 'color-mix(in srgb, var(--purple) 9%, var(--bg-elevated))',
+            border: '0.5px solid color-mix(in srgb, var(--purple) 28%, transparent)',
+            font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)' }}>
+            <Icon name="clock" size={12} style={{ color: 'var(--purple)' }} />
+            <span style={{ color: 'var(--ink-secondary)' }}>{job.pausedReason === 'limit' ? 'Usage limit — resumes in' : 'Auto-resumes in'}</span>
+            <span style={{ fontVariantNumeric: 'tabular-nums', color: 'var(--ink)' }}>{fmtCountdown((job.pausedUntil ?? 0) - Date.now())}</span>
+          </div>
+        )}
+        {job.status === 'failed' && (
+          <div style={{ marginTop: 8, padding: '11px 13px', borderRadius: 11, background: 'color-mix(in srgb, var(--red) 8%, var(--bg-elevated))',
+            border: '0.5px solid color-mix(in srgb, var(--red) 32%, transparent)', font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink)' }}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--red)', fontWeight: 600, marginBottom: 4 }}>
+              <Icon name="alert" size={13} /> Run failed
+            </span>
+            <div style={{ color: 'var(--ink-secondary)' }}>{job.error ?? 'Something went wrong.'}</div>
+            <button onClick={() => onRetry(job.input)} style={{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)',
+              background: 'var(--fill-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', cursor: 'pointer' }}>
+              <Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-45deg)' }} /> Retry
+            </button>
+          </div>
+        )}
+        {job.status === 'cancelled' && (
+          <div style={{ marginTop: 5, display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+            <Icon name="x" size={11} stroke={2.4} /> Stopped
+          </div>
+        )}
+        {/* Timing / tokens / cost at the BOTTOM of the message so it stays visible
+            no matter how long the reply scrolls. */}
+        {(live || job.tokens > 0 || job.cost > 0) && (
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: hasBody ? 8 : 4 }}>
+            <TurnMeta job={job} elapsed={elapsed} toolCount={toolCount} live={live} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+});
+
+/* Running background tasks (dev servers, watchers the agent started). They persist
+   across turns and SURVIVE steering / cancel / the next message — this panel lets the
+   operator SEE them, peek at their logs (e.g. to grab the dev URL), and stop them. */
+function BgTasksPanel({ tasks, onStop }: { tasks: BgTask[]; onStop: (id: string) => void }) {
+  const [collapsed, setCollapsed] = React.useState(false);
+  const [open, setOpen] = React.useState<string | null>(null); // task id whose logs are expanded
+  const [logs, setLogs] = React.useState<Record<string, string>>({});
+  const shown = tasks.filter(t => t.status === 'running' || (t.endedAt != null && Date.now() - t.endedAt < 60_000)); // running + just-ended
+  const running = shown.filter(t => t.status === 'running').length;
+
+  // While a task's logs are expanded, poll its recent output (tail) live.
+  React.useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    const pull = () => { void api.bgOutput(open, 64).then(r => { if (alive) setLogs(m => ({ ...m, [open]: r.output })); }).catch(() => {}); };
+    pull();
+    const id = window.setInterval(pull, 1500);
+    return () => { alive = false; window.clearInterval(id); };
+  }, [open]);
+
+  if (!shown.length) return null;
+  const dot = (s: BgTask['status']) => s === 'running' ? 'var(--green, #34c759)' : s === 'failed' ? 'var(--red)' : 'var(--ink-tertiary)';
+
+  return (
+    <div className="q-panel" style={{ marginBottom: 8, borderRadius: 14, overflow: 'hidden', border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', boxShadow: 'var(--card-shadow)' }}>
+      <button onClick={() => setCollapsed(c => !c)} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: 'transparent', cursor: 'pointer', borderBottom: collapsed ? 'none' : '0.5px solid var(--separator)' }}>
+        <span className={running ? 'breathe' : undefined} style={{ width: 8, height: 8, borderRadius: 4, background: dot(running ? 'running' : 'exited'), flexShrink: 0 }} />
+        <span style={{ flex: 1, textAlign: 'left', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>
+          {running ? `${running} background task${running === 1 ? '' : 's'} running` : 'Background tasks'}
+        </span>
+        <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)', transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+      </button>
+      {!collapsed && (
+        <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 300, overflowY: 'auto' }}>
+          {shown.map(t => (
+            <div key={t.id} style={{ borderBottom: '0.5px solid var(--separator)' }}>
+              {/* minWidth:0 on the row + overflow:hidden on the middle button ensure the long command
+                  text truncates with an ellipsis instead of pushing the Stop button off the right edge. */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 12px', minWidth: 0 }}>
+                <span className={t.status === 'running' ? 'breathe' : undefined} style={{ width: 7, height: 7, borderRadius: 4, background: dot(t.status), flexShrink: 0 }} />
+                <button onClick={() => setOpen(o => o === t.id ? null : t.id)} title="Show logs" style={{ flex: '1 1 0', minWidth: 0, width: 0, overflow: 'hidden', textAlign: 'left', background: 'transparent', cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ display: 'block', width: '100%', font: '600 var(--fs-caption)/1.2 var(--font-mono, ui-monospace)', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.command}</span>
+                  <span style={{ display: 'block', width: '100%', font: '500 11px/1 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.status}{t.pid != null ? ` · pid ${t.pid}` : ''}{t.exitCode != null ? ` · exit ${t.exitCode}` : ''}</span>
+                </button>
+                {t.status === 'running' && (
+                  <button onClick={() => onStop(t.id)} title="Stop this task" style={{ height: 26, padding: '0 11px', borderRadius: 7, border: '0.5px solid var(--separator)', background: 'var(--fill-secondary)', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer', flexShrink: 0 }}>Stop</button>
+                )}
+              </div>
+              {open === t.id && (
+                <pre style={{ margin: 0, padding: '8px 12px 12px', maxHeight: 200, overflow: 'auto', font: '500 11px/1.5 var(--font-mono, ui-monospace)', color: 'var(--ink-secondary)', background: 'var(--bg-elevated)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{logs[t.id] ?? '…'}</pre>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* Collapsible "N queued messages" panel — keyboard-navigable, with row actions.
+   Rows are drag-and-droppable (and ⌥↑/⌥↓ move the selected one) so the operator
+   can prioritize which task runs next: the drainer always fires queue[0]. */
+/* ───────────────── Scheduled messages ─────────────────
+   A message the user scheduled to fire into THIS chat at a chosen time. The
+   record lives in the schedules queue (survives restart); CronRunner turns it
+   into a real job at fireAt. Below: a live-countdown queue + the date/time
+   picker that sits in the composer toolbar. */
+
+const pad2 = (n: number) => String(n).padStart(2, '0');
+const toDateInput = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const toTimeInput = (d: Date) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+function parseDateTime(date: string, time: string): number | null {
+  const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date.trim());
+  const tm = /^(\d{1,2}):(\d{2})$/.exec(time.trim());
+  if (!dm || !tm) return null;
+  const d = new Date(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3]), Number(tm[1]), Number(tm[2]), 0, 0);
+  return Number.isNaN(d.getTime()) ? null : d.getTime();
+}
+const atToday = (h: number, m: number) => { const d = new Date(); d.setHours(h, m, 0, 0); return d.getTime(); };
+const atTomorrow = (h: number, m: number) => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(h, m, 0, 0); return d.getTime(); };
+
+/** "2d 3h 12m" / "1h 04m 09s" / "9m 05s" / "45s" / "now" — leading zero-units dropped. */
+function fmtCountdown(ms: number): string {
+  if (ms <= 0) return 'now';
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${pad2(m)}m ${pad2(sec)}s`;
+  if (m > 0) return `${m}m ${pad2(sec)}s`;
+  return `${sec}s`;
+}
+
+/** Friendly absolute time: "Today 3:00 PM" / "Tomorrow 9:00 AM" / "Fri Jun 19, 9:00 AM". */
+function fmtWhen(ts: number): string {
+  const d = new Date(ts), now = new Date();
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const sameDay = (a: Date, b: Date) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
+  if (sameDay(d, now)) return `Today ${time}`;
+  if (sameDay(d, tomorrow)) return `Tomorrow ${time}`;
+  return `${d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}, ${time}`;
+}
+
+const upsertSchedule = (list: Schedule[], s: Schedule): Schedule[] => {
+  const i = list.findIndex(x => x.id === s.id);
+  if (i === -1) return [...list, s];
+  const next = list.slice(); next[i] = s; return next;
+};
+
+/** The upcoming scheduled messages for this chat, each ticking down to its fire time. */
+function ScheduledQueue({ items, now, onCancel, onEdit }: { items: Schedule[]; now: number; onCancel: (id: string) => void; onEdit: (s: Schedule) => void }) {
+  const [collapsed, setCollapsed] = React.useState(false);
+  return (
+    <div className="q-panel" style={{ marginBottom: 8, borderRadius: 14, overflow: 'hidden', border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', boxShadow: 'var(--card-shadow)' }}>
+      <button onClick={() => setCollapsed(c => !c)} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: 'transparent', cursor: 'pointer', borderBottom: collapsed ? 'none' : '0.5px solid var(--separator)' }}>
+        <Icon name="clock" size={13} style={{ color: 'var(--blue)' }} />
+        <span style={{ flex: 1, textAlign: 'left', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{items.length} scheduled message{items.length === 1 ? '' : 's'}</span>
+        <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)', transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+      </button>
+      {!collapsed && items.map(s => {
+        const left = (s.fireAt ?? 0) - now;
+        const soon = left <= 60_000;
+        const auto = s.kind === 'auto-continue';
+        const accent = auto ? 'var(--purple)' : 'var(--blue)';
+        return (
+          <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderTop: '0.5px solid var(--separator)' }}>
+            <span className={soon ? 'breathe' : undefined} style={{ width: 7, height: 7, borderRadius: 4, flexShrink: 0, background: soon ? 'var(--orange)' : accent }} />
+            <span style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                {auto && (
+                  <span title="Auto-queued because Claude's usage limit was reached" style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexShrink: 0, height: 16, padding: '0 6px', borderRadius: 5,
+                    background: 'color-mix(in srgb, var(--purple) 15%, transparent)', color: 'var(--purple)', font: '700 9px/1 var(--font-text)', letterSpacing: '0.02em', textTransform: 'uppercase' }}>
+                    <Icon name="refresh" size={9} /> Auto-continue
+                  </span>
+                )}
+                <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{auto ? 'Continues this chat when the limit resets' : (s.prompt || s.title)}</span>
+              </span>
+              <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{fmtWhen(s.fireAt ?? 0)}</span>
+            </span>
+            <span title="Fires in" style={{ flexShrink: 0, minWidth: 74, textAlign: 'right', font: '600 var(--fs-footnote)/1 var(--font-mono)', color: soon ? 'var(--orange)' : accent }}>{fmtCountdown(left)}</span>
+            {!auto && (
+              <button title="Edit — bring it back to the composer to change the text or time" onClick={() => onEdit(s)} className="tb-icon" style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', cursor: 'pointer', flexShrink: 0, background: 'transparent', border: 'none' }}><Icon name="calendar" size={14} /></button>
+            )}
+            <button title={auto ? 'Cancel auto-continue' : 'Cancel'} onClick={() => onCancel(s.id)} className="tb-icon" style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-secondary)', cursor: 'pointer', flexShrink: 0, background: 'transparent', border: 'none' }}><Icon name="x" size={14} /></button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Composer popover: one-tap presets or a precise date + time to schedule the message. */
+interface RepeatOpts { everyMinutes?: number; time?: string; cadence?: string; catchUp: boolean }
+function SchedulePicker({ initial, onPick, onRepeat, onClose }: { initial?: number; onPick: (ts: number) => void; onRepeat: (o: RepeatOpts) => void; onClose: () => void }) {
+  const base = initial && initial > Date.now() ? initial : Date.now() + 60 * 60_000;
+  const [mode, setMode] = React.useState<'once' | 'repeat'>('once');
+  const [date, setDate] = React.useState(() => toDateInput(new Date(base)));
+  const [time, setTime] = React.useState(() => toTimeInput(new Date(base)));
+  // Repeat state: either an interval (every N hours) or a daily clock time.
+  const [repeatKind, setRepeatKind] = React.useState<'interval' | 'daily'>('daily');
+  const [everyHours, setEveryHours] = React.useState('3');
+  const [dailyTime, setDailyTime] = React.useState('09:00');
+  const [catchUp, setCatchUp] = React.useState(true);
+  const composed = parseDateTime(date, time);
+  const valid = composed != null && composed > Date.now() + 30_000;
+  const hoursNum = Number(everyHours);
+  const repeatValid = repeatKind === 'interval' ? Number.isFinite(hoursNum) && hoursNum > 0 : /^\d{1,2}:\d{2}$/.test(dailyTime);
+  const presets = [
+    { label: 'In 15 min', get: () => Date.now() + 15 * 60_000 },
+    { label: 'In 1 hour', get: () => Date.now() + 60 * 60_000 },
+    { label: 'Tonight 8 PM', get: () => atToday(20, 0) },
+    { label: 'Tomorrow 9 AM', get: () => atTomorrow(9, 0) },
+  ].filter(o => o.get() > Date.now() + 30_000);
+  const inputStyle: React.CSSProperties = { height: 32, padding: '0 8px', borderRadius: 8, border: '1px solid var(--separator-strong)', background: 'var(--bg-grouped)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)' };
+  const tab = (k: 'once' | 'repeat', label: string) => (
+    <button onClick={() => setMode(k)} style={{ flex: 1, height: 26, borderRadius: 7, border: 'none', cursor: 'pointer',
+      background: mode === k ? 'var(--bg-elevated)' : 'transparent', color: mode === k ? 'var(--ink)' : 'var(--ink-secondary)',
+      boxShadow: mode === k ? '0 1px 3px rgba(0,0,0,0.14)' : 'none', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>{label}</button>
+  );
+  const confirmRepeat = () => {
+    if (!repeatValid) return;
+    if (repeatKind === 'interval') onRepeat({ everyMinutes: Math.round(hoursNum * 60), catchUp });
+    else onRepeat({ time: dailyTime, cadence: 'daily', catchUp });
+  };
+  return (
+    <>
+      <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 40 }} />
+      <div style={{ position: 'absolute', bottom: 'calc(100% + 8px)', right: 0, zIndex: 41, width: 284,
+        background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.26))', padding: 12 }}>
+        <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 9 }}>Schedule this message</div>
+        <div style={{ display: 'flex', gap: 3, padding: 2, marginBottom: 11, background: 'var(--fill-secondary)', borderRadius: 9 }}>{tab('once', 'Once')}{tab('repeat', 'Repeat')}</div>
+        {mode === 'once' ? (
+          <>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 11 }}>
+              {presets.map(o => (
+                <button key={o.label} onClick={() => onPick(o.get())} className="mm-row"
+                  style={{ height: 28, padding: '0 11px', borderRadius: 'var(--r-pill)', cursor: 'pointer', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '500 var(--fs-footnote)/1 var(--font-text)', border: 'none' }}>
+                  {o.label}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: 'flex', gap: 7, marginBottom: 10 }}>
+              <input type="date" value={date} min={toDateInput(new Date())} onChange={e => setDate(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
+              <input type="time" value={time} onChange={e => setTime(e.target.value)} style={{ ...inputStyle, width: 100 }} />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1.25 var(--font-text)', color: composed != null && !valid ? 'var(--red)' : 'var(--ink-secondary)' }}>
+                {composed == null ? 'Pick a date & time' : valid ? `Fires ${fmtWhen(composed)} · in ${fmtCountdown(composed - Date.now())}` : 'Pick a time at least 30s ahead'}
+              </span>
+              <button disabled={!valid} onClick={() => { if (valid && composed != null) onPick(composed); }}
+                style={{ height: 30, padding: '0 14px', borderRadius: 9, border: 'none', cursor: valid ? 'pointer' : 'default', flexShrink: 0,
+                  background: valid ? 'var(--blue)' : 'var(--fill-secondary)', color: valid ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                Schedule
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div style={{ display: 'flex', gap: 3, padding: 2, marginBottom: 10, background: 'var(--fill-secondary)', borderRadius: 9 }}>
+              <button onClick={() => setRepeatKind('daily')} style={{ flex: 1, height: 26, borderRadius: 7, border: 'none', cursor: 'pointer', background: repeatKind === 'daily' ? 'var(--bg-elevated)' : 'transparent', color: repeatKind === 'daily' ? 'var(--ink)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Daily at</button>
+              <button onClick={() => setRepeatKind('interval')} style={{ flex: 1, height: 26, borderRadius: 7, border: 'none', cursor: 'pointer', background: repeatKind === 'interval' ? 'var(--bg-elevated)' : 'transparent', color: repeatKind === 'interval' ? 'var(--ink)' : 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Every N hours</button>
+            </div>
+            {repeatKind === 'daily'
+              ? <input type="time" value={dailyTime} onChange={e => setDailyTime(e.target.value)} style={{ ...inputStyle, width: '100%', marginBottom: 10 }} />
+              : <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10 }}>
+                  <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Every</span>
+                  <input type="number" min={1} value={everyHours} onChange={e => setEveryHours(e.target.value)} style={{ ...inputStyle, width: 64 }} />
+                  <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>hours</span>
+                </div>}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 11, cursor: 'pointer', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
+              <input type="checkbox" checked={catchUp} onChange={e => setCatchUp(e.target.checked)} /> Catch up if missed (same day)
+            </label>
+            <button disabled={!repeatValid} onClick={confirmRepeat}
+              style={{ width: '100%', height: 30, borderRadius: 9, border: 'none', cursor: repeatValid ? 'pointer' : 'default',
+                background: repeatValid ? 'var(--blue)' : 'var(--fill-secondary)', color: repeatValid ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+              Schedule repeating
+            </button>
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
+function QueuePanel({ queue, hold, onMoveToFront, onRemove, onEdit, onReorder }: { queue: QueueItem[]; hold?: 'limit' | 'paused' | 'failed' | 'cancelled' | null; onMoveToFront: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
+  // When the drainer is holding (the agent isn't at a clean idle), surface WHY so a
+  // paused/limited queue never looks stuck. Send-now / edit / remove stay available.
+  const holdBadge =
+    hold === 'limit' ? 'waiting for limit reset'
+    : hold === 'paused' ? 'paused'
+    : hold === 'failed' ? 'held — last turn failed'
+    : hold === 'cancelled' ? 'held — last turn stopped'
+    : null;
+  const holdHint =
+    hold === 'limit' ? 'The Claude usage limit was hit — the current turn auto-continues when it resets, then queued messages resume one at a time.'
+    : hold === 'paused' ? 'The current turn is parked and resumes on its own — queued messages send once it wakes.'
+    : hold === 'failed' ? 'The last turn failed; queued messages are held until it succeeds (a retry resumes them). Send now to override.'
+    : hold === 'cancelled' ? 'The last turn was stopped; queued messages are held so they aren’t dumped into a stopped session. Send now to override.'
+    : null;
+  const [collapsed, setCollapsed] = React.useState(false);
+  const [sel, setSel] = React.useState(-1);
+  const [dragIdx, setDragIdx] = React.useState(-1);
+  const [dropSlot, setDropSlot] = React.useState(-1); // insertion slot 0..queue.length
+  // Refs mirror the drag/selection state for the event logic: dragover/drop can
+  // fire before React commits the dragstart state, so guards must not lag.
+  const dragRef = React.useRef(-1);
+  const slotRef = React.useRef(-1);
+  const selRef = React.useRef(-1);
+  const ref = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => { if (sel >= queue.length) { setSel(queue.length - 1); selRef.current = queue.length - 1; } }, [queue.length, sel]);
+
+  const select = (i: number) => { selRef.current = i; setSel(i); };
+  const move = (from: number, to: number) => {
+    if (from < 0 || to < 0 || to >= queue.length || from === to) return;
+    onReorder(from, to);
+    select(to);
+  };
+
+  const onKey = (e: React.KeyboardEvent) => {
+    const s = selRef.current;
+    if (e.altKey && e.key === 'ArrowUp') { e.preventDefault(); if (s > 0) move(s, s - 1); }
+    else if (e.altKey && e.key === 'ArrowDown') { e.preventDefault(); if (s >= 0) move(s, s + 1); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); select(Math.min(queue.length - 1, s + 1)); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); select(Math.max(0, (s < 0 ? queue.length : s) - 1)); }
+    else if (e.key === 'Enter') { e.preventDefault(); if (s > 0) onMoveToFront(s); }
+    else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); if (s >= 0) onRemove(s); }
+    else if (e.key.toLowerCase() === 'e') { e.preventDefault(); if (s >= 0) onEdit(s); }
+    else if (e.key === 'Escape') { e.preventDefault(); select(-1); ref.current?.blur(); }
+  };
+
+  const startDrag = (i: number) => { dragRef.current = i; setDragIdx(i); select(i); };
+  const overSlot = (slot: number) => { slotRef.current = slot; setDropSlot(slot); };
+  const endDrag = () => { dragRef.current = -1; slotRef.current = -1; setDragIdx(-1); setDropSlot(-1); };
+  const doDrop = () => {
+    const from = dragRef.current, slot = slotRef.current;
+    if (from >= 0 && slot >= 0) {
+      let to = slot;
+      if (to > from) to -= 1; // removing the dragged row shifts later slots left
+      move(from, to);
+    }
+    endDrag();
+  };
+
+  const QBtn = ({ title, onClick, color, children }: { title: string; onClick: () => void; color: string; children: React.ReactNode }) => (
+    <button title={title} onClick={e => { e.stopPropagation(); onClick(); }} style={{ width: 24, height: 24, borderRadius: 7, display: 'grid', placeItems: 'center', color, cursor: 'pointer', flexShrink: 0 }}>{children}</button>
+  );
+
+  return (
+    <div ref={ref} tabIndex={0} onKeyDown={onKey} className="q-panel" style={{ marginBottom: 8, borderRadius: 14, outline: 'none', overflow: 'hidden',
+      border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', boxShadow: 'var(--card-shadow)' }}>
+      <button className="q-head" onClick={() => setCollapsed(c => !c)} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px', background: 'transparent', cursor: 'pointer',
+        borderBottom: collapsed ? 'none' : '0.5px solid var(--separator)' }}>
+        <Icon name="layers" size={13} style={{ color: 'var(--purple)' }} />
+        <span style={{ textAlign: 'left', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{queue.length} queued message{queue.length === 1 ? '' : 's'}</span>
+        {holdBadge && (
+          <span title={holdHint ?? undefined} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 17, padding: '0 7px', borderRadius: 5, background: 'color-mix(in srgb, var(--orange) 15%, transparent)', color: 'var(--orange)', font: '600 10px/1 var(--font-text)', whiteSpace: 'nowrap' }}>
+            <Icon name="clock" size={10} stroke={2.2} />{holdBadge}
+          </span>
+        )}
+        <span style={{ flex: 1 }} />
+        <Icon name="chevronDown" size={15} style={{ color: 'var(--ink-tertiary)', transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform 180ms var(--spring)' }} />
+      </button>
+      {!collapsed && (
+        <>
+          {holdHint && (
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, padding: '8px 12px', borderBottom: '0.5px solid var(--separator)', background: 'color-mix(in srgb, var(--orange) 7%, transparent)' }}>
+              <Icon name="clock" size={12} stroke={2.1} style={{ color: 'var(--orange)', flexShrink: 0, marginTop: 1 }} />
+              <span style={{ font: '400 11px/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>{holdHint}</span>
+            </div>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 168, overflowY: 'auto' }}>
+            {queue.map((item, i) => {
+              const dropCls = dropSlot === i ? ' q-drop-above' : (dropSlot === i + 1 && i === queue.length - 1) ? ' q-drop-below' : '';
+              const attCount = item.atts?.length ?? 0;
+              return (
+                <div key={i} className={`q-row${sel === i ? ' q-sel' : ''}${dragIdx === i ? ' q-dragging' : ''}${dropCls}`}
+                  onClick={() => select(i)} onDoubleClick={() => onEdit(i)}
+                  draggable
+                  onDragStart={e => { startDrag(i); if (e.dataTransfer) { e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', String(i)); } catch { /* sandbox */ } } }}
+                  onDragEnd={endDrag}
+                  onDragOver={e => { if (dragRef.current < 0) return; e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'; const r = e.currentTarget.getBoundingClientRect(); overSlot(e.clientY < r.top + r.height / 2 ? i : i + 1); }}
+                  onDrop={e => { e.preventDefault(); doDrop(); }}
+                  style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '8px 10px 8px 8px', cursor: 'default' }}>
+                  <span className="q-grip" title="Drag to reorder" style={{ flexShrink: 0, display: 'grid', gridTemplateColumns: 'repeat(2, 3px)', gap: '2.5px 2px', padding: '3px 1px', color: 'var(--ink-tertiary)' }}>
+                    {Array.from({ length: 6 }, (_, d) => <span key={d} style={{ width: 2.5, height: 2.5, borderRadius: 2, background: 'currentColor' }} />)}
+                  </span>
+                  <span style={{ width: 18, height: 18, borderRadius: 6, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 13%, transparent)', color: 'var(--purple)', font: '600 10px/1 var(--font-mono)' }}>{i + 1}</span>
+                  <span style={{ flex: 1, minWidth: 0, font: '400 13px/1.35 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.text || (attCount ? `(${attCount} attachment${attCount === 1 ? '' : 's'})` : '')}</span>
+                  {attCount > 0 && (
+                    <span title={`${attCount} attachment${attCount === 1 ? '' : 's'} ride this queued message`}
+                      style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 3, height: 18, padding: '0 6px', borderRadius: 6, background: 'color-mix(in srgb, var(--blue) 12%, transparent)', color: 'var(--blue)', font: '600 10px/1 var(--font-mono)' }}>
+                      <Icon name="paperclip" size={10} />{attCount}
+                    </span>
+                  )}
+                  <span className="q-act" style={{ display: 'inline-flex', gap: 2 }}>
+                    <QBtn title="Move up — runs sooner" onClick={() => move(i, i - 1)} color="var(--ink-tertiary)"><Icon name="chevronDown" size={13} style={{ transform: 'rotate(180deg)' }} /></QBtn>
+                    <QBtn title="Move down — runs later" onClick={() => move(i, i + 1)} color="var(--ink-tertiary)"><Icon name="chevronDown" size={13} /></QBtn>
+                    <QBtn title="Edit (move back to the box)" onClick={() => onEdit(i)} color="var(--ink-tertiary)"><Icon name="arrowLeft" size={13} stroke={2.2} /></QBtn>
+                    <QBtn title="Remove" onClick={() => onRemove(i)} color="var(--ink-tertiary)"><Icon name="x" size={13} stroke={2.4} /></QBtn>
+                    {/* Move to FRONT — runs next when the agent finishes. NEVER cancels the
+                        live run (the old "Send now — interrupt and steer" was scrapped
+                        per image_nqm3a.png — the operator's chat said "Stopped" the
+                        moment they sent a message mid-tool-call). The red abort button
+                        in the chat header is the only stop control now. */}
+                    {i > 0 && (
+                      <QBtn title="Move to front — runs next when the current turn finishes" onClick={() => onMoveToFront(i)} color="var(--blue)"><Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} /></QBtn>
+                    )}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '7px 12px', borderTop: '0.5px solid var(--separator)', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">↑↓</span> navigate</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⌥↑↓</span> reorder</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">E</span> edit</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⌫</span> delete</span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⏎</span> move to front</span>
+            <span style={{ flex: 1 }} />
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">Esc</span> exit</span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* The chat itself for ONE {project, session}: streamed thread + composer +
+   queue + steer. `sessionId` is the controlled active session (null = a fresh
+   chat); on the first send we create a session and report it via
+   onSessionCreated so the parent (the project view OR the multi-project
+   Workspace tabs) can adopt it. Fills its parent — only the thread scrolls. */
+
+/* Composer slash-commands — type `/` to scaffold a coding instruction. These are
+   Maestro's own prompt commands (they work the same whichever engine runs the
+   chat), shown in a menu like Claude Code's. */
+// Per-session composer queue, persisted to localStorage so the "N queued" box
+// survives the chat unmounting — e.g. navigating to Settings (a sibling route)
+// and back, which otherwise drops the in-memory queue. Keyed by sessionId.
+//
+// Queue items carry both text AND attachments so a message paired with an
+// image/file can ride the queue too — operators repeatedly complained that the
+// previous code's "with images → interrupt + restart" path STOPPED their
+// running turn (image_nqm3a.png). Every send while streaming now queues, never
+// cancels. Only the explicit red abort button cancels.
+type QueueItem = { text: string; atts?: Attach[] };
+const QUEUE_KEY = (sid: string) => `maestro.chat.queue.${sid}`;
+const readQueue = (sid: string | null): QueueItem[] => {
+  if (!sid) return [];
+  try {
+    const a: unknown = JSON.parse(localStorage.getItem(QUEUE_KEY(sid)) || '[]');
+    if (!Array.isArray(a)) return [];
+    // Legacy shape was a plain string[] — upgrade each row to { text }. Newer
+    // rows are already { text, atts? } so we keep them as-is. Anything else is
+    // dropped defensively (a corrupted localStorage shouldn't crash the chat).
+    return a.flatMap((x: unknown): QueueItem[] => {
+      if (typeof x === 'string') return [{ text: x }];
+      if (x && typeof x === 'object' && typeof (x as { text?: unknown }).text === 'string') {
+        const it = x as { text: string; atts?: unknown };
+        return [{ text: it.text, ...(Array.isArray(it.atts) ? { atts: it.atts as Attach[] } : {}) }];
+      }
+      return [];
+    });
+  } catch { return []; }
+};
+const writeQueue = (sid: string | null, q: QueueItem[]): void => {
+  if (!sid) return;
+  try { if (q.length) localStorage.setItem(QUEUE_KEY(sid), JSON.stringify(q)); else localStorage.removeItem(QUEUE_KEY(sid)); }
+  catch { /* ignore quota / serialisation — large image bytes may exceed it; the in-memory queue still drains */ }
+};
+const CHAT_PAGE_SIZE = 30;
+function compareTurnsOldestFirst(a: Job, b: Job): number {
+  return (a.createdAt - b.createdAt) || (a.updatedAt - b.updatedAt) || a.id.localeCompare(b.id);
+}
+function mergeTurns(...groups: Job[][]): Job[] {
+  const byId = new Map<string, Job>();
+  for (const group of groups) for (const job of group) byId.set(job.id, job);
+  return [...byId.values()].sort(compareTurnsOldestFirst);
+}
+
+// Per-chat composer draft, persisted to localStorage so a typed-but-unsent
+// prompt survives navigating away and back. A NEW chat (no session yet) keys
+// by project — click "New chat" in the same project anywhere and the drafted
+// prompt is right there; existing chats key by session. The draft is removed
+// automatically on send because RichComposer's clear() fires onTextChange('').
+const DRAFT_KEY = (projectId: string | null | undefined, sid: string | null) =>
+  sid ? `maestro.chat.draft.${sid}` : `maestro.chat.draft.new.${projectId ?? ''}`;
+const readDraft = (projectId: string | null | undefined, sid: string | null): string => {
+  try { return localStorage.getItem(DRAFT_KEY(projectId, sid)) || ''; } catch { return ''; }
+};
+const writeDraft = (projectId: string | null | undefined, sid: string | null, v: string): void => {
+  try {
+    if (v.trim()) localStorage.setItem(DRAFT_KEY(projectId, sid), v);
+    else localStorage.removeItem(DRAFT_KEY(projectId, sid));
+  } catch { /* ignore quota / serialisation */ }
+};
+
+// Composer @-mentions — typing `@` suggests a capability; selecting it turns the
+// capability on (shown as its iconed capsule in the toolbar) and tidies the token.
+const MENTIONS: { id: string; label: string; icon: IconName; desc: string }[] = [
+  { id: 'browser', label: 'Browser', icon: 'globe', desc: 'Drive your real connected Chrome for this message' },
+];
+
+// Fast client-side fuzzy match over the project's flat file index (for @-file search).
+function isSubseq(hay: string, needle: string): boolean {
+  let i = 0;
+  for (let j = 0; j < hay.length && i < needle.length; j++) if (hay[j] === needle[i]) i++;
+  return i === needle.length;
+}
+function fuzzyFiles(files: string[], q: string, limit: number): string[] {
+  const ql = q.toLowerCase();
+  const out: { p: string; s: number }[] = [];
+  for (const p of files) {
+    const pl = p.toLowerCase();
+    const base = pl.slice(pl.lastIndexOf('/') + 1);
+    let s: number;
+    if (base === ql) s = 0;
+    else if (base.startsWith(ql)) s = 1;
+    else if (base.includes(ql)) s = 2;
+    else if (pl.includes(ql)) s = 3;
+    else if (isSubseq(pl, ql)) s = 4;
+    else continue;
+    out.push({ p, s });
+  }
+  out.sort((a, b) => a.s - b.s || a.p.length - b.p.length || a.p.localeCompare(b.p));
+  return out.slice(0, limit).map(x => x.p);
+}
+
+const SLASH_COMMANDS: { cmd: string; desc: string; template: string }[] = [
+  { cmd: 'plan', desc: 'Plan the work before building', template: 'Make a step-by-step plan for: ' },
+  { cmd: 'explain', desc: 'Explain how something works', template: 'Explain how this works: ' },
+  { cmd: 'fix', desc: 'Find and fix a bug', template: 'Find and fix this bug: ' },
+  { cmd: 'test', desc: 'Write tests', template: 'Write tests for: ' },
+  { cmd: 'refactor', desc: 'Clean up code, no behavior change', template: 'Refactor this for clarity (no behavior change): ' },
+  { cmd: 'review', desc: 'Review code for issues', template: 'Review this code for bugs, security, and clarity: ' },
+  { cmd: 'document', desc: 'Write documentation', template: 'Write clear documentation for: ' },
+  { cmd: 'optimize', desc: 'Improve performance', template: 'Profile and optimize the performance of: ' },
+];
+
+/* Conversation minimap — a slim right-edge rail with one tick per user message.
+   Hover reveals a fly-over listing every prompt + the files it touched; clicking
+   a tick or a row jumps to that turn. Makes a long chat navigable at a glance. */
+function ChatMinimap({ turns, scrollRef }: { turns: Job[]; scrollRef: React.RefObject<HTMLDivElement | null> }) {
+  const [hover, setHover] = React.useState(false);
+  if (turns.length < 2) return null;
+  const scrollTo = (id: string) => { scrollRef.current?.querySelector(`[data-turn="${id}"]`)?.scrollIntoView({ block: 'start', behavior: 'smooth' }); };
+  const fileRefs = (t: Job): string[] => {
+    const out: string[] = [];
+    for (const it of t.transcript ?? []) {
+      if (it.kind === 'tool' && IS_WRITE_TOOL(it.name ?? '') && it.text) {
+        const base = (it.text.split('/').pop() ?? '').split(/\s/)[0];
+        if (base && !out.includes(base)) out.push(base);
+      }
+    }
+    return out.slice(0, 6);
+  };
+  return (
+    <div onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
+      style={{ position: 'absolute', left: 2, top: 86, bottom: 124, zIndex: 4, display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-start' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5, alignItems: 'flex-start', padding: '2px 5px' }}>
+        {turns.map(t => (
+          <button key={t.id} onClick={() => scrollTo(t.id)} title={t.input.slice(0, 90)}
+            style={{ width: hover ? 20 : 14, height: 2.5, borderRadius: 2, background: 'var(--separator-strong)', cursor: 'pointer', transition: 'width 140ms ease, background 140ms ease' }} />
+        ))}
+      </div>
+      {hover && (
+        <div style={{ position: 'absolute', left: 24, top: 0, width: 290, maxHeight: '100%', overflowY: 'auto',
+          background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.26))', padding: 6 }}>
+          {turns.map((t, i) => {
+            const files = fileRefs(t);
+            return (
+              <button key={t.id} onClick={() => scrollTo(t.id)} className="mm-row"
+                style={{ display: 'block', width: '100%', textAlign: 'left', padding: '7px 9px', borderRadius: 8, cursor: 'pointer' }}>
+                <span style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
+                  <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', flexShrink: 0 }}>{i + 1}</span>
+                  <span style={{ font: '500 var(--fs-footnote)/1.35 var(--font-text)', color: 'var(--ink)', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{t.input}</span>
+                </span>
+                {files.length > 0 && (
+                  <span style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 5, paddingLeft: 18 }}>
+                    {files.map(f => <span key={f} style={{ font: '500 10px/1 var(--font-mono)', color: 'var(--blue)', background: 'color-mix(in srgb, var(--blue) 10%, transparent)', padding: '2px 5px', borderRadius: 4 }}>{f}</span>)}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* A composer attachment before send: an image (vision), a text blob (pasted text
+   or a code/text file — inlined for the agent), or any other file (saved + read). */
+type Attach =
+  | { id: string; kind: 'image'; name: string; mime: string; dataUrl: string }
+  | { id: string; kind: 'text'; name: string; content: string }
+  | { id: string; kind: 'file'; name: string; mime: string; dataB64: string; size: number }
+  | { id: string; kind: 'ref'; name: string; path: string; isDir: boolean };
+const SUPPORTED_IMG = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+const TEXT_EXT = /\.(txt|md|markdown|mdx|rst|json|jsonc|ya?ml|toml|ini|cfg|conf|csv|tsv|log|xml|html?|svg|css|scss|sass|less|js|jsx|ts|tsx|mjs|cjs|py|rb|go|rs|java|kt|kts|c|h|cc|cpp|hpp|cs|php|swift|m|mm|sh|bash|zsh|fish|sql|graphql|gql|env|gitignore|dockerfile|makefile|gradle|properties|vue|svelte|astro|r|lua|pl|pm|dart|ex|exs|erl|clj|scala|tf|proto)$/i;
+const isTextFile = (f: File): boolean =>
+  f.type.startsWith('text/') || /json|xml|javascript|typescript|ecmascript|csv|yaml|x-sh|x-python|x-ruby|toml|markdown/.test(f.type) || TEXT_EXT.test(f.name) || (!f.type && f.size <= 512 * 1024);
+const fmtBytes = (n?: number): string => (n == null ? '' : n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
+// Label shown on an attachment's inline composer chip (the sentinel pasted-text
+// name reads nicer as "Pasted text"; everything else uses its filename).
+const attachLabel = (a: Attach): string => (a.kind === 'text' && a.name === 'Pasted text.txt' ? 'Pasted text' : a.name);
+
+/* Tiny live state dot for the session rails — subscribes once via the shared
+   cache so a long rail with 20 chats doesn't open 20 sockets. Shows a spinning
+   ring while the session's job is running, else the git/PR state dot. */
+function SessionPillDot({ sessionId }: { sessionId: string }) {
+  return <SessionActivityDot sessionId={sessionId} size={8} />;
+}
+
+/* Chat header bar — sits at the very top of the chat. Conductor-style:
+   • the session's stable codename (lowercase, kebab-safe city) +
+   • the live git/PR state chip with one contextual action button +
+   • the Archive button (or "Restore" pill if the chat is archived) +
+   • a quiet branch label so the operator sees what's actually checked out.
+   Renders nothing for no session / non-repo. */
+function ChatHeader({ sessionId, projectId, onContinue }: {
+  sessionId: string | null;
+  projectId: string | null;
+  /** Forwarded to <GitOpsDock /> as the `pr-merged` → "Continue from here →"
+      handler. ChatThread wires its `continueFromHere` here so the dock's
+      primary action actually spawns the continuation session. */
+  onContinue?: () => void | Promise<void>;
+}) {
+  const session = useSession(sessionId, projectId);
+  const [busy, setBusy] = React.useState(false);
+  if (!sessionId || !session) return null;
+
+  const code = session.codename;
+  const archived = !!session.archived;
+
+  const archive = async () => {
+    if (busy) return;
+    if (!archived && !window.confirm(`Archive “${session.title}”? You can restore it from the rail.`)) return;
+    setBusy(true);
+    try { await api.archiveSession(sessionId, !archived); } catch { /* best-effort */ } finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{
+      position: 'relative', zIndex: 2,
+      display: 'flex', alignItems: 'center', gap: 10,
+      padding: '10px 16px 8px', borderBottom: '0.5px solid var(--separator)',
+      background: 'color-mix(in srgb, var(--bg-elevated) 92%, transparent)',
+      backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+    }}>
+      {code && (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 9px', borderRadius: 'var(--r-pill)',
+          background: 'var(--fill-secondary)', font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', letterSpacing: '0.02em' }}>
+          <SessionActivityDot sessionId={sessionId} size={8} />
+          {displayCodename(code)}
+        </span>
+      )}
+      <span style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        font: '600 var(--fs-headline)/1.2 var(--font-text)', color: archived ? 'var(--ink-tertiary)' : 'var(--ink)' }}>
+        {session.title}
+      </span>
+      {archived && (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 8px', borderRadius: 'var(--r-pill)',
+          background: 'color-mix(in srgb, var(--ink-tertiary) 15%, transparent)', color: 'var(--ink-secondary)',
+          font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+          <Icon name="archive" size={11} /> Archived
+        </span>
+      )}
+      <GitOpsDock sessionId={sessionId} codename={code} onContinue={onContinue} />
+      <button onClick={archive} disabled={busy} title={archived ? 'Restore chat' : 'Archive chat'}
+        style={{ height: 28, padding: '0 11px', borderRadius: 8, border: '0.5px solid var(--separator-strong)',
+          background: 'var(--fill-secondary)', color: 'var(--ink)',
+          font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer',
+          display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        <Icon name={archived ? 'enter' : 'archive'} size={12} />
+        {archived ? 'Restore' : 'Archive'}
+      </button>
+    </div>
+  );
+}
+
+export function ChatThread({ projectId, project, sessionId, base, onSessionCreated, onOpenSession, onTurns, onOpenImage, onOpenFile, flush, autoFocus }: {
+  projectId: string | null;
+  project: Project | null;
+  sessionId: string | null;
+  /** When opening a fresh "New chat" tab via the <BranchPicker /> popover, the
+      operator's chosen base branch — forwarded into sendChat so the session's
+      worktree forks from it on first send. Ignored once `sessionId` is real. */
+  base?: string;
+  onSessionCreated?: (session: ChatSession) => void;
+  /** Open an EXISTING session in the host's tab system (Workspace) or
+      navigate (ProjectDetail). Wired by Track 7's "Continue from here" so the
+      newly-spawned continuation session becomes the active tab. */
+  onOpenSession?: (session: ChatSession) => void;
+  /** Lifts this chat's turns (jobs) to the parent — used by the Workspace's
+      "Changed files" panel to read the write-tool activity. */
+  onTurns?: (jobs: Job[]) => void;
+  /** Open a generated/attached image in an in-app viewer tab (Workspace only). */
+  onOpenImage?: (assetId: string, name: string, imagePath?: string) => void;
+  /** Open a file referenced in the transcript as an in-app FileViewer tab
+      (Workspace only). The path may be absolute or relative to the project. */
+  onOpenFile?: (filePath: string) => void;
+  flush?: boolean;
+  autoFocus?: boolean;
+}) {
+  const [turns, setTurns] = React.useState<Job[]>([]);
+  const [turnsLoading, setTurnsLoading] = React.useState(false);
+  const [hasOlderTurns, setHasOlderTurns] = React.useState(false);
+  const [olderCursor, setOlderCursor] = React.useState<string | null>(null);
+  const [olderBefore, setOlderBefore] = React.useState<number | null>(null);
+  const [olderLoading, setOlderLoading] = React.useState(false);
+  React.useEffect(() => { onTurns?.(turns); }, [turns]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Stable wrapper so the image-open context value never changes identity (would
+  // otherwise re-render every image chip on each streaming frame).
+  const onOpenImageRef = React.useRef(onOpenImage);
+  onOpenImageRef.current = onOpenImage;
+  const openImageStable = React.useMemo(() => (a: string, n: string, p?: string) => onOpenImageRef.current?.(a, n, p), []);
+  // Same pattern for opening a chat-referenced file path in an in-app tab.
+  // The smart wrapper falls back to reveal-in-Finder when there's no host
+  // tab system (standalone ProjectDetail) or when the path lives outside
+  // this project's folder (FileViewer is path-confined to the project).
+  const onOpenFileRef = React.useRef(onOpenFile);
+  onOpenFileRef.current = onOpenFile;
+  const projectPathRef = React.useRef(project?.path);
+  projectPathRef.current = project?.path;
+  const openPathStable = React.useMemo<OpenPathFn | null>(() => (p: string) => {
+    const handler = onOpenFileRef.current;
+    const root = projectPathRef.current;
+    if (handler && (!p.startsWith('/') || (root && pathIsInside(p, root)))) {
+      handler(p);
+    } else {
+      void api.revealPath(p);
+    }
+  }, []);
+  const [activeId, setActiveId] = React.useState<string | null>(sessionId);
+  // Active ChatSession (autopilot / reviewer-enabled toggles read off this).
+  // useSession live-syncs via the 'session' event emitter, so a setSessionAutopilot
+  // call from another window updates the button state here too.
+  const activeSession = useSession(activeId, projectId);
+  const autoPilotOn = activeSession?.autoPilot === true;
+  const reviewerToggleOn = activeSession?.reviewerEnabled === true;
+  // Local optimistic state so the button flips instantly when clicked, even
+  // before the api.setSession* round-trip lands. Reconciles with the session
+  // hook on the next emit.
+  const [autoPilotLocal, setAutoPilotLocal] = React.useState<boolean | null>(null);
+  const [reviewerLocal, setReviewerLocal] = React.useState<boolean | null>(null);
+  React.useEffect(() => { setAutoPilotLocal(null); setReviewerLocal(null); }, [activeId]);
+  const autoPilotEffective = autoPilotLocal ?? autoPilotOn;
+  const reviewerEffective = reviewerLocal ?? reviewerToggleOn;
+  const toggleAutoPilot = React.useCallback(async () => {
+    if (!activeId) return;
+    const next = !autoPilotEffective;
+    setAutoPilotLocal(next);
+    try { await api.setSessionAutopilot(activeId, next); }
+    catch { setAutoPilotLocal(!next); /* revert on failure */ }
+  }, [activeId, autoPilotEffective]);
+  const [text, setText] = React.useState('');
+  // Primary (coding) + reviewer model. Remembered across the app via localStorage;
+  // seeded from the workspace role defaults when the user hasn't chosen yet.
+  const modelGroups = useModelGroups();
+  const [primaryKey, setPrimaryKeyState] = React.useState<string>(() => { try { return localStorage.getItem('maestro.chat.primary') || ''; } catch { return ''; } });
+  const [reviewerKey, setReviewerKeyState] = React.useState<string>(() => { try { return localStorage.getItem('maestro.chat.reviewer') || ''; } catch { return ''; } });
+  const setPrimaryKey = (k: string) => { setPrimaryKeyState(k); try { localStorage.setItem('maestro.chat.primary', k); } catch { /* storage unavailable */ } };
+  const setReviewerKey = (k: string) => { setReviewerKeyState(k); try { localStorage.setItem('maestro.chat.reviewer', k); } catch { /* storage unavailable */ } };
+  const [favorites, setFavorites] = React.useState<string[]>([]);
+  React.useEffect(() => { api.getSettings().then(s => setFavorites(s.favoriteModels ?? [])).catch(() => {}); }, []);
+  const toggleFavorite = (key: string) => setFavorites(prev => {
+    const next = prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key];
+    api.setSettings({ favoriteModels: next }).catch(() => {});
+    return next;
+  });
+  // Seed from the workspace defaults once the catalog is known (if unset).
+  React.useEffect(() => {
+    if (!modelGroups.length || (primaryKey && reviewerKey)) return;
+    api.getRoles().then(roles => {
+      if (!primaryKey) setPrimaryKeyState(keyForRoleChoice(modelGroups, roles.primary));
+      if (!reviewerKey) setReviewerKeyState(roles.reviewer === 'off' ? 'off' : keyForRoleChoice(modelGroups, roles.reviewer));
+    }).catch(() => {});
+  }, [modelGroups]); // eslint-disable-line react-hooks/exhaustive-deps
+  const seedReviewerKey = React.useCallback(() => {
+    if (reviewerKey && reviewerKey !== 'off') return reviewerKey;
+    if (primaryKey && primaryKey !== 'off') return primaryKey;
+    const first = modelGroups.find(g => g.runnable && g.models.length > 0)?.models[0]?.key;
+    return first ?? 'claude:claude-opus-4-8';
+  }, [modelGroups, primaryKey, reviewerKey]);
+  const toggleReviewer = React.useCallback(async () => {
+    if (!activeId) return;
+    const next = !reviewerEffective;
+    if (next && (!reviewerKey || reviewerKey === 'off')) setReviewerKey(seedReviewerKey());
+    setReviewerLocal(next);
+    try { await api.setSessionReviewer(activeId, next); }
+    catch { setReviewerLocal(!next); /* revert on failure */ }
+  }, [activeId, reviewerEffective, reviewerKey, seedReviewerKey]);
+  React.useEffect(() => {
+    if (reviewerEffective && (!reviewerKey || reviewerKey === 'off')) setReviewerKey(seedReviewerKey());
+  }, [reviewerEffective, reviewerKey, seedReviewerKey]);
+  const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
+  // Plan mode: agent proposes a plan first (no execution). Persisted per app.
+  const [planMode, setPlanModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.plan') === '1'; } catch { return false; } });
+  // Goal mode: pursue the request autonomously over a long horizon. Mutually
+  // exclusive with Plan. Label depends on the primary engine (Codex = "Pursue goal").
+  const [goalMode, setGoalModeState] = React.useState(() => { try { return localStorage.getItem('maestro.chat.goal') === '1'; } catch { return false; } });
+  const setPlanMode = (on: boolean) => { setPlanModeState(on); try { localStorage.setItem('maestro.chat.plan', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setGoalModeState(false); try { localStorage.setItem('maestro.chat.goal', '0'); } catch { /* ignore */ } } };
+  const setGoalMode = (on: boolean) => { setGoalModeState(on); try { localStorage.setItem('maestro.chat.goal', on ? '1' : '0'); } catch { /* ignore */ } if (on) { setPlanModeState(false); try { localStorage.setItem('maestro.chat.plan', '0'); } catch { /* ignore */ } } };
+  // When the operator approves the agent's plan in ExitPlanModeDialog, the
+  // dialog flips the localStorage flag AND dispatches this custom event so our
+  // React state catches up — otherwise the next message would still pass
+  // `plan: true` (stale React state) and the SDK would re-enter plan mode for
+  // the very next turn, completely undoing the approval.
+  React.useEffect(() => {
+    const onChange = (e: Event) => {
+      const detail = (e as CustomEvent<{ on: boolean }>).detail;
+      if (typeof detail?.on === 'boolean') setPlanModeState(detail.on);
+    };
+    window.addEventListener('maestro:plan-mode-changed', onChange);
+    return () => window.removeEventListener('maestro:plan-mode-changed', onChange);
+  }, []);
+  // Browser use is driven by an explicit @browser mention in the composer
+  // (composerBrowser) — there's no separate toggle button to keep the bar clean.
+  const primaryProvider = React.useMemo(() => {
+    for (const g of modelGroups) { const d = g.models.find(m => m.key === primaryKey); if (d) return d.provider; }
+    return 'claude';
+  }, [modelGroups, primaryKey]);
+  const [sendError, setSendError] = React.useState('');
+  const [slashSel, setSlashSel] = React.useState(0);
+  const [mentionSel, setMentionSel] = React.useState(0);
+  const [schedNote, setSchedNote] = React.useState('');
+  const [schedOpen, setSchedOpen] = React.useState(false); // schedule-this-message date/time picker
+  const [schedEditAt, setSchedEditAt] = React.useState<number | null>(null); // prefill fireAt when editing
+  const [schedules, setSchedules] = React.useState<Schedule[]>([]); // upcoming scheduled messages for this chat
+  const [schedNow, setSchedNow] = React.useState(() => Date.now()); // ticks each second to drive countdowns
+  const [queue, setQueue] = React.useState<QueueItem[]>([]); // prompts (+ attachments) waiting to run after the current turn
+  const [bgTasks, setBgTasks] = React.useState<BgTask[]>([]); // long-lived processes the agent started (dev servers, watchers)
+  const [attachments, setAttachments] = React.useState<Attach[]>([]); // images / text / files (shown as inline composer chips)
+  const [dragOver, setDragOver] = React.useState(false);
+  const fileRef = React.useRef<HTMLInputElement>(null);
+  const attachmentsRef = React.useRef(attachments);
+  attachmentsRef.current = attachments; // fresh count for addFiles' over-cap notice
+  const activeRef = React.useRef<string | null>(activeId);
+  activeRef.current = activeId;
+  // Mutate the queue AND persist it for the current session in one step, so the
+  // queue box survives navigating away (which unmounts this chat) and back.
+  const mutateQueue = React.useCallback((fn: (prev: QueueItem[]) => QueueItem[]) => {
+    setQueue(prev => { const next = fn(prev); writeQueue(activeRef.current, next); return next; });
+  }, []);
+  const scrollRef = React.useRef<HTMLDivElement>(null);
+  const stickBottom = React.useRef(true);
+  const composerRef = React.useRef<RichComposerHandle>(null);
+  const [mentionQuery, setMentionQuery] = React.useState<string | null>(null);
+  const [composerBrowser, setComposerBrowser] = React.useState(false);
+  // @-mention file search: a flat project file index, fetched once (cached ~15s) the
+  // first time the menu opens, then fuzzy-filtered client-side for instant results.
+  const [fileIndex, setFileIndex] = React.useState<{ projectId: string; files: string[]; at: number } | null>(null);
+  React.useEffect(() => {
+    if (mentionQuery === null || !projectId) return;
+    if (fileIndex && fileIndex.projectId === projectId && Date.now() - fileIndex.at < 15000) return;
+    let alive = true;
+    void api.listProjectFiles(projectId).then(files => { if (alive) setFileIndex({ projectId, files, at: Date.now() }); });
+    return () => { alive = false; };
+  }, [mentionQuery, projectId, fileIndex]);
+
+  // Controlled active session: follow the parent (tab switch / rail pick / new chat).
+  React.useEffect(() => { setActiveId(sessionId); }, [sessionId]);
+
+  // Restore a persisted composer draft when the chat mounts or switches — only
+  // into an EMPTY composer, so text the user is mid-typing is never clobbered.
+  // setText() fires onTextChange, which syncs the `text` state + re-persists.
+  React.useEffect(() => {
+    const draft = readDraft(projectId, activeId);
+    if (draft && !(composerRef.current?.getText() ?? '').trim()) composerRef.current?.setText(draft);
+  }, [activeId, projectId]);
+
+  // Turns of the open session (ascending — a chat thread). Queue is per-session.
+  React.useEffect(() => {
+    setQueue(readQueue(activeId)); // restore this session's persisted queue
+    setHasOlderTurns(false);
+    setOlderCursor(null);
+    setOlderBefore(null);
+    setOlderLoading(false);
+    if (!activeId) { setTurns([]); setTurnsLoading(false); return; }
+    let alive = true;
+    setTurnsLoading(true);
+    api.listJobPage({ sessionId: activeId, limit: CHAT_PAGE_SIZE })
+      .then(page => {
+        if (!alive) return;
+        setTurns(page.jobs);
+        setHasOlderTurns(page.hasMore);
+        setOlderCursor(page.nextCursor);
+        setOlderBefore(page.nextBefore);
+      })
+      .catch(() => { if (alive) setTurns([]); })
+      .finally(() => { if (alive) setTurnsLoading(false); });
+    return () => { alive = false; };
+  }, [activeId]);
+
+  // LIVE: streamed job updates for this session land directly in the thread.
+  React.useEffect(() => {
+    const unsub = api.subscribe({
+      onJob: (j) => {
+        if (!j.sessionId || j.sessionId !== activeRef.current) return;
+        setTurns(ts => {
+          const i = ts.findIndex(t => t.id === j.id);
+          if (i === -1) return [...ts, j].sort(compareTurnsOldestFirst);
+          const next = ts.slice(); next[i] = j; return next;
+        });
+      },
+      // Background tasks (dev servers/watchers) the agent started for THIS project —
+      // tracked live so the user can see + stop them. They persist across turns.
+      onBg: (t) => {
+        if (t.projectId && projectId && t.projectId !== projectId) return;
+        setBgTasks(list => { const i = list.findIndex(x => x.id === t.id); if (i === -1) return [t, ...list]; const next = list.slice(); next[i] = t; return next; });
+      },
+      // Scheduled messages + auto-answer countdowns for THIS chat: add on create,
+      // drop on fire/cancel. auto-answer is kept while enabled (incl. paused) so the
+      // question card can show its countdown / paused note; messages need fireAt>now.
+      onSchedule: (s) => {
+        const ss = s as Schedule & { deleted?: boolean };
+        if (ss.deleted) { setSchedules(list => list.filter(x => x.id !== ss.id)); return; }
+        if (ss.kind !== 'message' && ss.kind !== 'auto-continue' && ss.kind !== 'auto-answer') return;
+        setSchedules(list => {
+          const without = list.filter(x => x.id !== ss.id);
+          const keep = ss.sessionId === activeRef.current && ss.enabled && (ss.kind === 'auto-answer' || (ss.fireAt ?? 0) > Date.now());
+          return keep ? [...without, ss] : without;
+        });
+      },
+    });
+    return unsub;
+  }, [projectId]);
+
+  // Seed this chat's upcoming schedules (persist across restart): messages with a
+  // future fire time, plus any live auto-answer countdown.
+  React.useEffect(() => {
+    if (!activeId) { setSchedules([]); return; }
+    let alive = true;
+    void api.listSchedules()
+      .then(rows => { if (alive) setSchedules(rows.filter(s => s.sessionId === activeId && s.enabled && (s.kind === 'auto-answer' || ((s.kind === 'message' || s.kind === 'auto-continue') && (s.fireAt ?? 0) > Date.now())))); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [activeId]);
+
+  // Tick the countdown once a second — only while messages are actually waiting.
+  React.useEffect(() => {
+    if (schedules.length === 0) return;
+    const t = window.setInterval(() => setSchedNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [schedules.length]);
+
+  // Visible queue: future messages, soonest first; a fired item lingers ≤35s as a
+  // fallback in case the prune event is missed, then drops on its own.
+  const upcomingSched = React.useMemo(
+    () => schedules.filter(s => (s.kind === 'message' || s.kind === 'auto-continue') && (s.fireAt ?? 0) > schedNow - 35_000).sort((a, b) => (a.fireAt ?? 0) - (b.fireAt ?? 0)),
+    [schedules, schedNow],
+  );
+  // The live AskUserQuestion auto-answer countdown for this chat (at most one).
+  const pendingAsk = React.useMemo(
+    () => schedules.find(s => s.kind === 'auto-answer' && s.sessionId === activeId && s.enabled) ?? null,
+    [schedules, activeId],
+  );
+  const schedulesRef = React.useRef(schedules);
+  schedulesRef.current = schedules;
+  // Answer a surfaced question: cancels the countdown and resumes the session with the
+  // choice tagged `[User answered AskUserQuestion]:` so the agent treats it as the answer.
+  const answerLiveQuestion = React.useCallback((text: string) => {
+    const sid = activeRef.current; const t = text.trim();
+    if (!sid || !t) return;
+    setSchedules(list => list.filter(s => !(s.kind === 'auto-answer' && s.sessionId === sid))); // drop countdown
+    void api.answerQuestion({ sessionId: sid, answer: t })
+      .then(job => setTurns(ts => [...ts.filter(x => x.id !== job.id), job].sort(compareTurnsOldestFirst)))
+      .catch(e => setSendError(e instanceof Error ? e.message : 'Could not send your answer — try again.'));
+  }, []);
+  const extendLiveQuestion = React.useCallback(() => {
+    const sid = activeRef.current; if (!sid) return;
+    void api.extendQuestion(sid).then(s => setSchedules(list => upsertSchedule(list, s))).catch(() => {});
+  }, []);
+  const cancelLiveQuestion = React.useCallback(() => {
+    const sid = activeRef.current; if (!sid) return;
+    const pend = schedulesRef.current.find(s => s.kind === 'auto-answer' && s.sessionId === sid);
+    if (!pend) return;
+    setSchedules(list => list.filter(s => s.id !== pend.id));
+    void api.deleteSchedule(pend.id).catch(() => {});
+  }, []);
+
+  // Seed the background-task list for this project (records persist across turns).
+  React.useEffect(() => {
+    if (!projectId) { setBgTasks([]); return; }
+    let alive = true;
+    void api.listBgTasks(projectId).then(rows => { if (alive) setBgTasks(rows); }).catch(() => {});
+    return () => { alive = false; };
+  }, [projectId]);
+  const stopBg = React.useCallback((id: string) => {
+    setBgTasks(list => list.map(t => t.id === id ? { ...t, status: 'stopped' as const } : t)); // optimistic
+    void api.stopBgTask(id).then(rec => setBgTasks(list => list.map(t => t.id === rec.id ? rec : t))).catch(() => {});
+  }, []);
+
+  // Stick to the bottom while streaming unless the user scrolled up.
+  const [atBottom, setAtBottom] = React.useState(true);
+  const loadOlderTurns = React.useCallback(async () => {
+    const sid = activeRef.current;
+    if (!sid || !hasOlderTurns || olderLoading) return;
+    const el = scrollRef.current;
+    const prevHeight = el?.scrollHeight ?? 0;
+    stickBottom.current = false;
+    setOlderLoading(true);
+    try {
+      const page = await api.listJobPage({ sessionId: sid, cursor: olderCursor, before: olderCursor ? undefined : olderBefore, limit: CHAT_PAGE_SIZE });
+      if (activeRef.current !== sid) return;
+      setTurns(prev => mergeTurns(page.jobs, prev));
+      setHasOlderTurns(page.hasMore);
+      setOlderCursor(page.nextCursor);
+      setOlderBefore(page.nextBefore);
+      window.requestAnimationFrame(() => {
+        const nextEl = scrollRef.current;
+        if (!nextEl) return;
+        nextEl.scrollTop += nextEl.scrollHeight - prevHeight;
+      });
+    } catch {
+      // Keep the existing page visible; a later scroll/button press can retry.
+    } finally {
+      if (activeRef.current === sid) setOlderLoading(false);
+    }
+  }, [hasOlderTurns, olderBefore, olderCursor, olderLoading]);
+  const onScroll = () => {
+    const el = scrollRef.current; if (!el) return;
+    const bottom = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+    stickBottom.current = bottom;
+    setAtBottom(bottom);
+    if (el.scrollTop < 80) void loadOlderTurns();
+  };
+  const jumpToLatest = () => {
+    const el = scrollRef.current; if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    stickBottom.current = true; setAtBottom(true);
+  };
+  React.useEffect(() => {
+    const el = scrollRef.current;
+    if (el && stickBottom.current) el.scrollTop = el.scrollHeight;
+  }, [turns]);
+
+  React.useEffect(() => { if (autoFocus) composerRef.current?.focus(); }, [autoFocus]);
+
+  const lastTurn = turns.length ? turns[turns.length - 1] : null;
+  // Parked-on-WAKEUP turns are NOT streaming for composer purposes: the session
+  // is closed and the next user message should send straight through (just like
+  // after a scheduled message is queued) instead of being queued behind the
+  // dormant SDK iterator. The countdown chip on the turn itself communicates
+  // the wakeup-pending state — the composer doesn't need to also reflect it.
+  const lastTurnPaused = !!(lastTurn?.pausedUntil && lastTurn.pausedUntil > Date.now());
+  const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending') && !lastTurnPaused;
+  // The last turn ended blocked by a claude.ai usage limit (it ends 'done' with an
+  // auto-continue scheduled for reset). The composer queue must HOLD while set —
+  // otherwise "not streaming" is misread as "ready" and every queued message flushes
+  // back-to-back against the same wall. Cleared when a fresher turn supersedes it.
+  const awaitingLimitReset = !!lastTurn?.blockedByLimit;
+  // Why the drainer is holding the queue (for the QueuePanel badge/hint). null = free
+  // to drain. Order mirrors canDrainQueue's guards.
+  const queueHoldReason: 'limit' | 'paused' | 'failed' | 'cancelled' | null =
+    awaitingLimitReset ? 'limit'
+    : lastTurnPaused ? 'paused'
+    : lastTurn?.status === 'failed' ? 'failed'
+    : lastTurn?.status === 'cancelled' ? 'cancelled'
+    : null;
+
+  // The actual send — no guards. Used directly, by the queue drainer, and by steer.
+  const sendRaw = React.useCallback(async (raw: string, atts?: Attach[]): Promise<boolean> => {
+    const t = raw.trim();
+    const list = atts ?? [];
+    const imgs = list.filter((a): a is Extract<Attach, { kind: 'image' }> => a.kind === 'image')
+      .map(a => ({ id: a.id, name: a.name, mime: a.mime, dataB64: a.dataUrl.includes(',') ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : a.dataUrl }));
+    const files = list.filter(a => a.kind !== 'image' && a.kind !== 'ref').map(a => a.kind === 'text'
+      ? { id: a.id, name: a.name, kind: 'text' as const, content: a.content }
+      : { id: a.id, name: a.name, kind: 'file' as const, mime: (a as Extract<Attach, { kind: 'file' }>).mime, dataB64: (a as Extract<Attach, { kind: 'file' }>).dataB64 });
+    // File/folder reference capsules: passed to the local agent as on-disk paths
+    // (it reads them with its own tools — no bytes uploaded; folders work too).
+    const refs = list.filter((a): a is Extract<Attach, { kind: 'ref' }> => a.kind === 'ref');
+    if ((!t && !imgs.length && !files.length && !refs.length) || !projectId) return false;
+    const body = refs.length
+      ? `${t ? t + '\n\n' : ''}Attached ${refs.length === 1 ? 'path' : 'paths'} (on this Mac — read directly from disk):\n${refs.map(r => `- ${r.isDir ? 'folder' : 'file'}: \`${r.path}\``).join('\n')}`
+      : t;
+    setSendError('');
+    stickBottom.current = true;
+    try {
+      // `base` is the operator's branch pick from <BranchPicker /> for an
+      // un-sent "New chat" tab. The server pins it onto the session at
+      // lazy-create time (sendChat path); ignored once a session already exists.
+      const resp = await api.sendChat({
+        projectId, text: body, sessionId: activeRef.current ?? undefined,
+        effort: EFFORT_TO_API[effort], plan: planMode, goal: goalMode, browser: composerBrowser,
+        ...(primaryKey ? { modelKey: primaryKey } : {}),
+        ...(reviewerKey ? { reviewerKey } : {}),
+        ...(imgs.length ? { images: imgs } : {}),
+        ...(files.length ? { files } : {}),
+        ...(!activeRef.current && base ? { base } : {}),
+      });
+      if (activeRef.current !== resp.session.id) {
+        activeRef.current = resp.session.id; // match the streamed job immediately
+        setActiveId(resp.session.id);
+        setTurns([resp.job]);
+        onSessionCreated?.(resp.session);
+      } else {
+        setTurns(ts => [...ts.filter(x => x.id !== resp.job.id), resp.job].sort(compareTurnsOldestFirst));
+      }
+      return true;
+    } catch (e) {
+      setSendError(e instanceof Error ? e.message : 'Could not send — try again.');
+      return false;
+    }
+  }, [projectId, primaryKey, reviewerKey, effort, planMode, goalMode, composerBrowser, base, onSessionCreated]);
+
+  // Send while idle; QUEUE while a turn is running (it fires when the agent finishes).
+  // The earlier "steer = interrupt and restart" model was scrapped because it
+  // kept STOPPING running turns (image_nqm3a.png — the operator's session said
+  // "Stopped" the moment their message landed mid-run). Every send-while-streaming
+  // path now goes through the queue with NO cancel. Only the explicit red abort
+  // button (`stop` below) ever cancels the live job.
+  // Kept here for callers that only deal in plain text (currently none, post-
+  // refactor — sendComposed pushes directly to the queue when atts are involved).
+  const sendText = React.useCallback((raw: string) => {
+    const t = raw.trim();
+    if (!t || !projectId) return;
+    composerRef.current?.clear();
+    if (streaming) { mutateQueue(q => [...q, { text: t }]); return; }
+    void sendRaw(t).then(ok => { if (!ok) composerRef.current?.setText(raw); });
+  }, [projectId, streaming, sendRaw, mutateQueue]);
+
+  // sendTextRef mirrors the latest sendText so the window-event listener below
+  // — registered ONCE with no deps — always calls the up-to-date closure (with
+  // the latest sendRaw, which in turn captures the latest planMode/goalMode).
+  // Without this, the listener would freeze the original closure and a Codex
+  // plan-mode approval would re-send into plan-mode by mistake.
+  const sendTextRef = React.useRef(sendText);
+  React.useEffect(() => { sendTextRef.current = sendText; }, [sendText]);
+
+  // Codex plan-mode approval auto-follow-up. Codex's `codex exec` is one-shot
+  // (unlike Claude's SDK which can continue the same run on canUseTool allow),
+  // so when the operator approves a Codex plan we have to queue a new turn
+  // explicitly to make the approval take effect. The dialog dispatches this
+  // event in rAF so React has already committed planMode=false; we ignore
+  // events for a session the operator switched away from. The follow-up
+  // message is short + unambiguous so codex knows it's executing the plan it
+  // just proposed — not re-planning.
+  React.useEffect(() => {
+    const onCodexApproved = (e: Event) => {
+      const detail = (e as CustomEvent<{ sessionId: string | null; plan: string }>).detail;
+      if (!detail) return;
+      if (detail.sessionId && detail.sessionId !== activeRef.current) return; // operator switched sessions
+      sendTextRef.current('Approved the plan above. Execute it now, following the steps you proposed.');
+    };
+    window.addEventListener('maestro:plan-approved-codex', onCodexApproved);
+    return () => window.removeEventListener('maestro:plan-approved-codex', onCodexApproved);
+  }, []);
+
+
+  // ── Attachments: paste, drop, or pick — images (vision), text/code (inlined),
+  //    or any other file (saved + read by the agent). ─────────────────────────
+  const MAX_ATTACH = 8;
+  const newId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  // Add an attachment: keep the bytes/content in `attachments` (the send payload's
+  // source of truth) AND drop an inline capsule into the composer for it. Removing
+  // the chip (✕ or backspace) syncs back via the composer's onChips → reconcile.
+  const pushAttach = React.useCallback((a: Attach) => {
+    if (attachmentsRef.current.length >= MAX_ATTACH) return;
+    setSendError('');
+    attachmentsRef.current = [...attachmentsRef.current, a]; // advance now so rapid async pushes respect the cap
+    setAttachments(arr => (arr.length >= MAX_ATTACH ? arr : [...arr, a]));
+    composerRef.current?.insertChips([{ kind: 'attach', id: a.id, name: a.name, label: attachLabel(a) }]);
+  }, []);
+  const addFiles = React.useCallback((files: FileList | File[] | null) => {
+    if (!files) return;
+    const all = Array.from(files);
+    const remaining = Math.max(0, MAX_ATTACH - attachmentsRef.current.length);
+    if (all.length > remaining) setSendError(`Up to ${MAX_ATTACH} attachments per message — ${all.length - remaining} skipped.`);
+    for (const f of all.slice(0, remaining)) {
+      if (f.size > 30 * 1024 * 1024) { setSendError(`"${f.name || 'file'}" is too large (max 30 MB).`); continue; }
+      const reader = new FileReader();
+      if (f.type.startsWith('image/') && SUPPORTED_IMG.includes(f.type)) {
+        reader.onload = () => { const dataUrl = String(reader.result || ''); if (dataUrl.startsWith('data:image/')) pushAttach({ id: newId(), kind: 'image', name: f.name || 'pasted.png', mime: f.type || 'image/png', dataUrl }); };
+        reader.readAsDataURL(f);
+      } else if (isTextFile(f)) {
+        reader.onload = () => { const content = String(reader.result || ''); if (content) pushAttach({ id: newId(), kind: 'text', name: f.name || 'pasted.txt', content }); };
+        reader.readAsText(f);
+      } else {
+        reader.onload = () => { const du = String(reader.result || ''); const b64 = du.includes(',') ? du.slice(du.indexOf(',') + 1) : ''; if (b64) pushAttach({ id: newId(), kind: 'file', name: f.name || 'file', mime: f.type || '', dataB64: b64, size: f.size }); };
+        reader.readAsDataURL(f);
+      }
+    }
+  }, [pushAttach]);
+  // Drag-drop of real files/folders → reference capsules carrying the absolute path
+  // (the local agent reads them straight from disk). Folders are supported — bytes
+  // can't represent a directory. Falls back to a byte-attachment when no path is
+  // available (e.g. a web/phone remote, or a file dragged from a browser).
+  const onDropItems = React.useCallback((e: React.DragEvent) => {
+    e.preventDefault(); setDragOver(false);
+    const dt = e.dataTransfer; if (!dt) return;
+    // In-app drag from the Files panel → reference chip(s) by project-relative path.
+    const inApp = dt.getData('application/x-maestro-path');
+    if (inApp) {
+      try {
+        const refs = JSON.parse(inApp) as { name?: string; path: string; isDir?: boolean }[];
+        const chips: ComposerChip[] = (Array.isArray(refs) ? refs : []).filter(r => r && r.path)
+          .map(r => ({ kind: 'file', name: r.name || r.path.split('/').filter(Boolean).pop() || r.path, path: r.path, isDir: !!r.isDir }));
+        if (chips.length) { setSendError(''); composerRef.current?.insertChips(chips); }
+      } catch { /* malformed payload — ignore */ }
+      return;
+    }
+    const getPath = (window as unknown as { maestro?: { getPathForFile?: (f: File) => string } }).maestro?.getPathForFile;
+    const items = Array.from(dt.items || []).filter(it => it.kind === 'file');
+    const chips: ComposerChip[] = [];
+    const bytes: File[] = [];
+    if (items.length && getPath) {
+      for (const it of items) {
+        const entry = it.webkitGetAsEntry?.();
+        const file = it.getAsFile?.();
+        if (!file) continue;
+        let path = ''; try { path = getPath(file) || ''; } catch { path = ''; }
+        if (path) chips.push({ kind: 'file', name: entry?.name || file.name || path.split('/').filter(Boolean).pop() || path, path, isDir: !!entry?.isDirectory });
+        else bytes.push(file);
+      }
+    } else {
+      for (const f of Array.from(dt.files || [])) bytes.push(f);
+    }
+    if (chips.length) { setSendError(''); composerRef.current?.insertChips(chips); }
+    if (bytes.length) addFiles(bytes);
+  }, [addFiles]);
+  const onPaste = React.useCallback((e: React.ClipboardEvent<HTMLDivElement>) => {
+    const items = e.clipboardData?.items;
+    const imgs: File[] = [];
+    if (items) for (const it of Array.from(items)) if (it.kind === 'file' && it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) imgs.push(f); }
+    if (imgs.length) { e.preventDefault(); addFiles(imgs); return; }
+    // A long paste becomes a "Pasted text" attachment instead of flooding the box.
+    const txt = e.clipboardData?.getData('text/plain') ?? '';
+    if (txt.length > 1500 || txt.split('\n').length > 28) {
+      e.preventDefault();
+      pushAttach({ id: newId(), kind: 'text', name: 'Pasted text.txt', content: txt });
+    }
+  }, [addFiles, pushAttach]);
+  // Restore attachments after a failed send: put the data back AND re-insert the
+  // inline chips (a bare setAttachments would leave the array without its capsules,
+  // which the next onChips reconcile would then immediately prune away).
+  const restoreAtts = React.useCallback((atts: Attach[]) => {
+    attachmentsRef.current = atts;
+    setAttachments(atts);
+    composerRef.current?.insertChips(atts.map(a => ({ kind: 'attach', id: a.id, name: a.name, label: attachLabel(a) })));
+  }, []);
+  const canSend = !!text.trim() || attachments.length > 0;
+
+  // Compose-and-send (⏎): NEVER cancels the running turn. While the agent is
+  // working → QUEUE the whole composer payload (text + attachments); it drains
+  // the instant the turn finishes. Attachments ride the queue (the queue item
+  // carries `atts`), so a pasted image no longer force-cancels the running turn
+  // — that's the bug the operator hit in image_nqm3a.png ("× Stopped" appeared
+  // mid-tool-call the instant they sent a message with an image chip). When
+  // idle, send straight through. On failure the text + attachments are restored
+  // so nothing is lost. The ONLY stop control is the explicit red abort button.
+  const sendComposed = React.useCallback(() => {
+    // Read straight from the composer (the DOM is the source of truth) so a
+    // pending rAF-coalesced state update can never make Enter send stale text.
+    const t = (composerRef.current?.getText() ?? text).trim(); const atts = attachments;
+    if ((!t && !atts.length) || !projectId) return;
+    composerRef.current?.clear(); setAttachments([]); attachmentsRef.current = [];
+    if (streaming) { mutateQueue(q => [...q, { text: t, atts: atts.length ? atts : undefined }]); return; }
+    void sendRaw(t, atts).then(ok => { if (!ok) { composerRef.current?.setText(t); restoreAtts(atts); } });
+  }, [text, attachments, projectId, streaming, sendRaw, mutateQueue, restoreAtts]);
+  // ⌘↩ "run next" — while streaming, push the message (WITH attachments) to the
+  // FRONT of the queue so it runs the moment the current turn finishes — no
+  // cancel, no lost work, no overlapping run. When idle, ⌘↩ just sends
+  // immediately (no queue to skip). The current turn is never interrupted; the
+  // red abort button is the only stop control.
+  const sendComposedNow = React.useCallback(() => {
+    const t = (composerRef.current?.getText() ?? text).trim(); const atts = attachments;
+    if ((!t && !atts.length) || !projectId) return;
+    composerRef.current?.clear(); setAttachments([]); attachmentsRef.current = [];
+    if (streaming) { mutateQueue(q => [{ text: t, atts: atts.length ? atts : undefined }, ...q]); return; }
+    void sendRaw(t, atts).then(ok => { if (!ok) { composerRef.current?.setText(t); restoreAtts(atts); } });
+  }, [text, attachments, projectId, streaming, sendRaw, mutateQueue, restoreAtts]);
+
+  const removeFromQueue = (i: number) => mutateQueue(q => q.filter((_, j) => j !== i));
+  // Reorder = reprioritize: the drainer always fires queue[0] next.
+  const moveInQueue = (from: number, to: number) => mutateQueue(q => {
+    if (from === to || from < 0 || to < 0 || from >= q.length || to >= q.length) return q;
+    const next = q.slice();
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    return next;
+  });
+  // Move a row to the FRONT — runs next when the current turn finishes. No cancel.
+  // (Old behaviour: the per-row "Send now" interrupted the live job. Removed —
+  // every send-while-streaming path is queue-only now.)
+  const moveToFront = (i: number) => mutateQueue(q => {
+    if (i <= 0 || i >= q.length) return q;
+    const next = q.slice();
+    const [item] = next.splice(i, 1);
+    next.unshift(item);
+    return next;
+  });
+  // Pop a queued row back into the composer (text + any attachments).
+  const editQueued = (i: number) => {
+    const item = queue[i]; if (item == null) return;
+    removeFromQueue(i);
+    composerRef.current?.setText(item.text);
+    if (item.atts?.length) restoreAtts(item.atts);
+    composerRef.current?.focus();
+  };
+
+  // Drain the queue ONE AT A TIME, and only when the agent reaches a genuinely CLEAN
+  // idle. `canDrainQueue` HOLDS when the last turn stopped for a non-clean reason —
+  // blocked by a usage limit (ends 'done'!), failed (incl. auto-retry backoff),
+  // cancelled, or paused/parked — so queued messages are never dumped back-to-back
+  // against the same wall. Self-healing: a drained message that re-hits the limit
+  // re-arms the hold. Manual Send-now / edit / remove always bypass this.
+  const drainingRef = React.useRef(false);
+  React.useEffect(() => {
+    if (!canDrainQueue({
+      streaming,
+      queueLength: queue.length,
+      draining: drainingRef.current,
+      awaitingLimitReset,
+      lastTurnPaused,
+      lastStatus: lastTurn?.status ?? null,
+    })) return;
+    drainingRef.current = true;
+    const head = queue[0];
+    mutateQueue(q => q.slice(1));
+    void sendRaw(head.text, head.atts).finally(() => { drainingRef.current = false; });
+  }, [streaming, awaitingLimitReset, lastTurnPaused, lastTurn, queue, sendRaw, mutateQueue]);
+
+  // The ONLY stop-the-chat path: the explicit red abort button. Every other
+  // send/steer route is queue-based — see the comment on `sendComposed`.
+  const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
+
+  const fillComposer = (v: string) => { composerRef.current?.setText(v); composerRef.current?.focus(); };
+
+  // Schedule the CURRENT composer message to fire into this chat at an absolute
+  // time, carrying the run intent (effort/browser/plan/goal). Clears on success.
+  const scheduleMessage = (fireAt: number) => {
+    if (!projectId) return;
+    const body = (composerRef.current?.getText() ?? text).trim();
+    if (!body) { setSchedOpen(false); setSendError('Type a message first, then schedule it.'); return; }
+    void api.scheduleMessage({
+      projectId, sessionId: activeRef.current ?? undefined, prompt: body, fireAt,
+      effort: EFFORT_TO_API[effort], browser: composerBrowser, plan: planMode, goal: goalMode,
+    }).then(s => {
+      composerRef.current?.clear(); setText('');
+      setSchedules(list => upsertSchedule(list, s));
+      setSchedOpen(false); setSchedEditAt(null);
+      setSchedNote(`Scheduled · ${fmtWhen(fireAt)}`); setTimeout(() => setSchedNote(''), 4000);
+    }).catch(e => { setSchedOpen(false); setSendError(e instanceof Error ? e.message : 'Could not schedule — try again.'); });
+  };
+  // Schedule the CURRENT composer message to RECUR (interval or daily) into this
+  // chat, carrying the run intent. Clears the composer on success.
+  const scheduleRecurring = (o: { everyMinutes?: number; time?: string; cadence?: string; catchUp: boolean }) => {
+    if (!projectId) return;
+    const body = (composerRef.current?.getText() ?? text).trim();
+    if (!body) { setSchedOpen(false); setSendError('Type a message first, then schedule it.'); return; }
+    void api.createSchedule({
+      title: body.slice(0, 60), projectId, sessionId: activeRef.current ?? undefined, prompt: body,
+      everyMinutes: o.everyMinutes, time: o.time, cadence: o.cadence, catchUp: o.catchUp,
+      effort: EFFORT_TO_API[effort], browser: composerBrowser,
+    }).then(s => {
+      composerRef.current?.clear(); setText('');
+      setSchedules(list => upsertSchedule(list, s));
+      setSchedOpen(false); setSchedEditAt(null);
+      setSchedNote(o.everyMinutes ? `Repeats every ${o.everyMinutes >= 60 ? `${Math.round(o.everyMinutes / 60)}h` : `${o.everyMinutes}m`}` : `Repeats daily at ${o.time}`);
+      setTimeout(() => setSchedNote(''), 4000);
+    }).catch(e => { setSchedOpen(false); setSendError(e instanceof Error ? e.message : 'Could not schedule — try again.'); });
+  };
+  const cancelSchedule = (id: string) => {
+    setSchedules(list => list.filter(s => s.id !== id)); // optimistic
+    void api.deleteSchedule(id).catch(() => {});
+  };
+  // Edit: pull the message back into the composer (with its time) to change and reschedule.
+  const editSchedule = (s: Schedule) => {
+    cancelSchedule(s.id);
+    setSchedEditAt(s.fireAt ?? null);
+    composerRef.current?.setText(s.prompt || s.title);
+    composerRef.current?.focus();
+    setSchedOpen(true);
+  };
+
+  // current effort's accent — themes the composer border/glow (MAX = gradient)
+  const effAccent = effort === 'MAX' ? '#9b6bff' : EFFORT_META[effort].tint;
+
+  // Slash-command menu: open while the composer holds just a `/word` token.
+  const slashMatch = text.match(/^\/([a-zA-Z]*)$/);
+  const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : null;
+  const slashList = slashQuery !== null ? SLASH_COMMANDS.filter(c => c.cmd.startsWith(slashQuery)) : [];
+  const slashOpen = slashQuery !== null && slashList.length > 0;
+  const slashIdx = Math.min(slashSel, Math.max(0, slashList.length - 1));
+  const applySlash = (c: { template: string }) => { composerRef.current?.setText(c.template); composerRef.current?.focus(); };
+
+  // @-mention menu: capability mentions (Browser) + fast project-file search. The
+  // query is set by RichComposer (DOM caret detection), so it works anywhere mid-line.
+  const mentionFiles = (() => {
+    const q = (mentionQuery ?? '').trim();
+    if (!q || !fileIndex || fileIndex.projectId !== projectId) return [] as string[];
+    return fuzzyFiles(fileIndex.files, q, 7);
+  })();
+  type MentionItem = { t: 'cap'; m: typeof MENTIONS[number] } | { t: 'file'; path: string };
+  const mentionItems: MentionItem[] = [
+    ...(mentionQuery !== null ? MENTIONS.filter(m => m.id.startsWith(mentionQuery) || m.label.toLowerCase().startsWith(mentionQuery)).map((m): MentionItem => ({ t: 'cap', m })) : []),
+    ...mentionFiles.map((p): MentionItem => ({ t: 'file', path: p })),
+  ];
+  const mentionOpen = mentionQuery !== null && mentionItems.length > 0 && !slashOpen;
+  const mentionIdx = Math.min(mentionSel, Math.max(0, mentionItems.length - 1));
+  const applyMentionItem = (it: MentionItem) => {
+    if (it.t === 'cap') composerRef.current?.applyMention({ kind: 'mention', id: it.m.id, label: it.m.label, icon: it.m.icon });
+    else composerRef.current?.applyMention({ kind: 'file', name: it.path.split('/').pop() || it.path, path: it.path, isDir: false });
+    setMentionQuery(null); setMentionSel(0);
+  };
+
+  // ── Track 7: lock-after-merge ───────────────────────────────────────────
+  // The composer is read-only when this session's PR has been merged. The
+  // banner + lock both read from the SAME `pr-merged` state, so they never
+  // disagree (e.g. banner up but composer alive, or vice versa).
+  const locked = useSessionLocked(activeId);
+  const gitStatus = useSessionGitState(activeId);
+  const mergedPr = locked && gitStatus?.pr ? gitStatus.pr : null;
+  const [continuing, setContinuing] = React.useState(false);
+  const continueFromHere = React.useCallback(async () => {
+    if (!activeId || !mergedPr || continuing) return;
+    setContinuing(true);
+    try {
+      const fresh = await api.continueSession({
+        sessionId: activeId,
+        baseRefName: mergedPr.baseRefName,
+        prNumber: mergedPr.number,
+        mergedAt: mergedPr.mergedAt,
+      });
+      // Tell the host (Workspace tabs / ProjectDetail) to OPEN the new session.
+      // We do NOT also auto-close the merged tab — the operator may want to
+      // glance back at the prior conversation while they keep going.
+      onSessionCreated?.(fresh);
+      onOpenSession?.(fresh);
+    } catch (e) {
+      setSendError(e instanceof Error ? e.message : 'Could not create the continuation session.');
+    } finally {
+      setContinuing(false);
+    }
+  }, [activeId, mergedPr, continuing, onSessionCreated, onOpenSession]);
+  // The continued-from link jumps back to the merged ancestor's tab (if the
+  // host wired onOpenSession). Resolves the ChatSession lazily so we don't
+  // hold a stale title; falls back to a no-op when the ancestor was deleted.
+  const continuedFrom = activeSession?.continuedFrom;
+  const openAncestor = React.useCallback(async () => {
+    if (!continuedFrom || !onOpenSession) return;
+    try {
+      const list = await api.listSessions(projectId ?? undefined);
+      const ancestor = list.find(s => s.id === continuedFrom.sessionId);
+      if (ancestor) onOpenSession(ancestor);
+    } catch { /* best-effort — the link goes dead if the ancestor is gone */ }
+  }, [continuedFrom, onOpenSession, projectId]);
+
+  return (
+    <div style={{ flex: 1, minWidth: 0, position: 'relative', display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)', overflow: 'hidden',
+      ...(flush ? {} : { borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)' }) }}>
+      {/* composer theming travels with the chat so the per-effort border vibes
+          everywhere ChatThread renders (project view + Workspace tabs) */}
+      <style>{COMPOSER_CSS}</style>
+      {/* faint top atmosphere */}
+      <div style={{ position: 'absolute', inset: '0 0 auto 0', height: 120, pointerEvents: 'none', zIndex: 0,
+        background: 'radial-gradient(80% 100% at 50% 0%, color-mix(in srgb, var(--blue) 6%, transparent), transparent 70%)' }} />
+      {/* Conductor-style chat header: codename + state chip + Archive. The
+          GitOpsDock (Track 5) gates itself for non-repo / null sessions.
+          `onContinue` wires the dock's `pr-merged` → "Continue from here →"
+          primary action — there is no second banner surface for it. */}
+      <ChatHeader sessionId={activeId} projectId={projectId} onContinue={mergedPr ? continueFromHere : undefined} />
+      {/* Track 7: "← Continued from …" jump-link for a session forked off a
+          merged ancestor. Sits between the chat header and the transcript so
+          the operator can hop back to the previous chat in one click. */}
+      {continuedFrom && (
+        <div style={{ position: 'relative', zIndex: 1, padding: '4px 24px 0' }}>
+          <button onClick={openAncestor} disabled={!onOpenSession} title={onOpenSession ? 'Open the previous session' : undefined} style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 'var(--r-pill)',
+            background: 'transparent', border: 'none', cursor: onOpenSession ? 'pointer' : 'default',
+            font: '500 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-secondary)',
+          }}>
+            <span aria-hidden="true">←</span>
+            <span>Continued from</span>
+            <span style={{ font: '600 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink)' }}>"{continuedFrom.title}"</span>
+          </button>
+        </div>
+      )}
+      <div ref={scrollRef} onScroll={onScroll} style={{ position: 'relative', zIndex: 1, flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '22px 24px' }}>
+        <div style={{ maxWidth: CHAT_W, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 22 }}>
+          {/* Track 7: seed system-context card for a freshly-spawned continuation
+              session. Renders ONCE, above the empty-state prompt, so the agent's
+              first context is visible to the operator (and re-readable until they
+              type). Vanishes after the first turn lands. */}
+          {!turnsLoading && turns.length === 0 && continuedFrom && (
+            <div style={{ padding: '20px 20px 0', maxWidth: 620, margin: '0 auto', width: '100%' }}>
+              <div style={{ borderRadius: 12, padding: '12px 14px',
+                background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)',
+                font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)',
+              }}>
+                <div style={{ font: '700 var(--fs-caption)/1.2 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 6 }}>System context</div>
+                Continued from <strong style={{ color: 'var(--ink)' }}>"{continuedFrom.title}"</strong>
+                {continuedFrom.prNumber ? <> &middot; previous PR #{continuedFrom.prNumber}</> : null}
+                {continuedFrom.mergedAt ? <> merged on {new Date(continuedFrom.mergedAt).toLocaleDateString()}</> : null}
+                {continuedFrom.baseRefName ? <> into <code style={{ font: '600 var(--fs-caption)/1 var(--font-mono)' }}>{continuedFrom.baseRefName}</code></> : null}.
+                <div style={{ marginTop: 4 }}>Full prior transcript is available on the previous session — ask if you want a summary or any specific decisions referenced.</div>
+              </div>
+            </div>
+          )}
+          {!turnsLoading && turns.length === 0 && (
+            <div style={{ padding: '52px 20px 20px', textAlign: 'center' }}>
+              <span style={{ width: 56, height: 56, borderRadius: 18, display: 'inline-grid', placeItems: 'center', marginBottom: 16,
+                background: 'linear-gradient(160deg, color-mix(in srgb, var(--blue) 18%, transparent), color-mix(in srgb, var(--purple) 16%, transparent))',
+                color: 'var(--blue)', boxShadow: '0 8px 22px color-mix(in srgb, var(--blue) 18%, transparent)' }}>
+                <Icon name="terminal" size={27} />
+              </span>
+              <div style={{ font: '700 var(--fs-title1)/1.2 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)', marginBottom: 7 }}>
+                What should we build{project?.name ? ` in ${project.name}` : ''}?
+              </div>
+              <div style={{ font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)', maxWidth: 420, margin: '0 auto 22px' }}>
+                Describe it like you'd tell a teammate. The agent works in this project's folder and streams every step here.
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center', maxWidth: 520, margin: '0 auto' }}>
+                {['Make a simple todo app with a JS frontend + backend', 'Explain how this repo is structured', 'Add tests for the core logic', 'Find and fix any bugs'].map(ex => (
+                  <button key={ex} className="ex-chip" onClick={() => fillComposer(ex)} style={{ padding: '8px 13px', borderRadius: 'var(--r-pill)',
+                    background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', textAlign: 'left' }}>
+                    {ex}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {turnsLoading && turns.length === 0 && (
+            <div style={{ display: 'grid', placeItems: 'center', padding: '56px 0', color: 'var(--ink-tertiary)' }}>
+              <Spinner size={18} />
+            </div>
+          )}
+          {activeId && (hasOlderTurns || olderLoading) && (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '2px 0 4px' }}>
+              <button onClick={loadOlderTurns} disabled={olderLoading} style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6, height: 30, padding: '0 12px', borderRadius: 'var(--r-pill)',
+                background: 'var(--fill-secondary)', border: '0.5px solid var(--separator)', color: 'var(--ink-secondary)',
+                font: '600 var(--fs-caption)/1 var(--font-text)', cursor: olderLoading ? 'default' : 'pointer', opacity: olderLoading ? 0.68 : 1,
+              }}>
+                {olderLoading ? <Spinner size={12} /> : <Icon name="chevronRight" size={13} style={{ transform: 'rotate(-90deg)' }} />}
+                {olderLoading ? 'Loading earlier' : 'Load earlier'}
+              </button>
+            </div>
+          )}
+          <OpenPathContext.Provider value={openPathStable}>
+            <ImageOpenContext.Provider value={openImageStable}>
+              {turns.map((t, i) => (
+                <div key={t.id} data-turn={t.id} style={{ display: 'flex', flexDirection: 'column', gap: 22, scrollMarginTop: 14 }}>
+                  {t.input?.startsWith(AUTO_CONTINUE_PREFIX)
+                    ? <AutoContinueBubble text={t.input} />
+                    : <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />}
+                  <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText}
+                    onAnswer={i === turns.length - 1 ? answerLiveQuestion : sendText}
+                    pendingAsk={i === turns.length - 1 ? pendingAsk : null}
+                    onExtendAsk={extendLiveQuestion} onCancelAsk={cancelLiveQuestion} />
+                </div>
+              ))}
+            </ImageOpenContext.Provider>
+          </OpenPathContext.Provider>
+        </div>
+      </div>
+
+      {/* conversation minimap — one tick per message; hover for the prompt + file list, click to jump */}
+      <ChatMinimap turns={turns} scrollRef={scrollRef} />
+
+      {/* jump-to-latest — appears when scrolled up so new replies aren't missed */}
+      {!atBottom && turns.length > 0 && (
+        <button onClick={jumpToLatest} className="chat-msg" style={{ position: 'absolute', left: '50%', bottom: 92, transform: 'translateX(-50%)', zIndex: 3,
+          display: 'inline-flex', alignItems: 'center', gap: 6, height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', cursor: 'pointer',
+          background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 6px 18px rgba(15,20,50,.16)',
+          font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>
+          {streaming ? 'Jump to latest' : 'Latest'} <Icon name="chevronDown" size={14} />
+        </button>
+      )}
+
+      {/* composer — one floating card */}
+      <div style={{ position: 'relative', zIndex: 2, padding: '0 20px 16px' }}>
+        <div style={{ maxWidth: CHAT_W, margin: '0 auto' }}>
+          {sendError && (
+            <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 7, padding: '8px 11px', borderRadius: 10, background: 'color-mix(in srgb, var(--red) 9%, var(--bg-elevated))',
+              font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)' }}><Icon name="alert" size={13} /> {sendError}</div>
+          )}
+          {bgTasks.some(t => t.status === 'running') && (
+            <BgTasksPanel tasks={bgTasks} onStop={stopBg} />
+          )}
+          {upcomingSched.length > 0 && (
+            <ScheduledQueue items={upcomingSched} now={schedNow} onCancel={cancelSchedule} onEdit={editSchedule} />
+          )}
+          {queue.length > 0 && (
+            <QueuePanel queue={queue} hold={queueHoldReason} onMoveToFront={moveToFront} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
+          )}
+          {slashOpen && (
+            <div style={{ marginBottom: 8, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.22))', overflow: 'hidden', padding: 5 }}>
+              <div style={{ padding: '4px 9px 5px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: 'var(--ink-tertiary)', textTransform: 'uppercase' }}>Commands</div>
+              {slashList.map((c, i) => (
+                <button key={c.cmd} onMouseEnter={() => setSlashSel(i)} onClick={() => applySlash(c)}
+                  style={{ display: 'flex', alignItems: 'baseline', gap: 9, width: '100%', textAlign: 'left', padding: '7px 10px', borderRadius: 8, cursor: 'pointer',
+                    background: i === slashIdx ? 'var(--fill-tertiary)' : 'transparent' }}>
+                  <span style={{ font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--blue)', flexShrink: 0 }}>/{c.cmd}</span>
+                  <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>{c.desc}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {mentionOpen && (
+            <div style={{ marginBottom: 8, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.22))', overflow: 'hidden', padding: 5 }}>
+              <div style={{ padding: '4px 9px 5px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: 'var(--ink-tertiary)', textTransform: 'uppercase' }}>Mention</div>
+              {mentionItems.map((it, i) => (
+                <button key={it.t === 'cap' ? 'c:' + it.m.id : 'f:' + it.path} onMouseEnter={() => setMentionSel(i)} onClick={() => applyMentionItem(it)}
+                  style={{ display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left', padding: '7px 10px', borderRadius: 8, cursor: 'pointer',
+                    background: i === mentionIdx ? 'var(--fill-tertiary)' : 'transparent' }}>
+                  {it.t === 'cap' ? (
+                    <>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 9px', borderRadius: 999, flexShrink: 0,
+                        background: 'color-mix(in srgb, var(--green) 14%, transparent)', border: '1px solid color-mix(in srgb, var(--green) 40%, transparent)',
+                        color: 'var(--green)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                        <Icon name={it.m.icon} size={13} /> @{it.m.label.toLowerCase()}
+                      </span>
+                      <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>{it.m.desc}</span>
+                    </>
+                  ) : (
+                    <>
+                      <FileTypeIcon name={it.path.split('/').pop() || it.path} size={15} />
+                      <span style={{ font: '600 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{it.path.split('/').pop()}</span>
+                      <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1.2 var(--font-mono)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'right' }}>{it.path.split('/').slice(0, -1).join('/')}</span>
+                    </>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className={`composer-card composer-eff${effort === 'MAX' ? ' composer-ultra' : ''}`}
+            onDragOver={e => { const types = Array.from(e.dataTransfer?.types ?? []); if (types.includes('Files') || types.includes('application/x-maestro-path')) { e.preventDefault(); setDragOver(true); } }}
+            onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false); }}
+            onDrop={onDropItems}
+            style={{ borderRadius: 18, border: `1px solid ${dragOver ? 'var(--blue)' : 'var(--separator-strong)'}`, background: 'var(--bg-elevated)',
+            boxShadow: dragOver ? '0 0 0 3px color-mix(in srgb, var(--blue) 22%, transparent)' : 'var(--card-shadow)', padding: '10px 10px 8px 14px',
+            transition: 'border-color 120ms ease, box-shadow 120ms ease', ['--eff-accent' as string]: effAccent } as React.CSSProperties}>
+            {/* Attachments (pasted images, pasted text, picked files) render as inline
+                capsule chips INSIDE the composer — see pushAttach → RichComposer 'attach'
+                chips — so there are no separate preview cards or hover popovers here. */}
+            <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+              <RichComposer
+                ref={composerRef}
+                disabled={!projectId || locked}
+                style={{ minHeight: 58 }}
+                placeholder={!projectId ? 'Pick a project first' : locked ? 'View only — this PR has been merged' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
+                onTextChange={v => { setText(v); writeDraft(projectId, activeRef.current, v); }}
+                onChips={info => {
+                  setComposerBrowser(info.hasBrowser);
+                  // Keep `attachments` in lockstep with the inline chips: when a chip is
+                  // removed (✕ or backspace) its data drops out of the send payload too.
+                  const ids = new Set(info.attachIds);
+                  setAttachments(prev => {
+                    const next = prev.filter(a => a.kind === 'ref' || ids.has(a.id));
+                    return next.length === prev.length ? prev : next;
+                  });
+                }}
+                onMention={q => { setMentionQuery(q); if (q === null) setMentionSel(0); }}
+                onPaste={onPaste}
+                onKeyDown={e => {
+                  if (e.nativeEvent.isComposing) return;
+                  if (mentionOpen) {
+                    if (e.key === 'ArrowDown') { e.preventDefault(); setMentionSel((mentionIdx + 1) % mentionItems.length); return; }
+                    if (e.key === 'ArrowUp') { e.preventDefault(); setMentionSel((mentionIdx - 1 + mentionItems.length) % mentionItems.length); return; }
+                    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); applyMentionItem(mentionItems[mentionIdx]); return; }
+                    // Space confirms the highlighted item (so "@browser " becomes the chip).
+                    if (e.key === ' ' && mentionQuery) { e.preventDefault(); applyMentionItem(mentionItems[mentionIdx]); return; }
+                    if (e.key === 'Escape') { e.preventDefault(); setMentionQuery(null); return; }
+                  }
+                  if (slashOpen) {
+                    if (e.key === 'ArrowDown') { e.preventDefault(); setSlashSel((slashIdx + 1) % slashList.length); return; }
+                    if (e.key === 'ArrowUp') { e.preventDefault(); setSlashSel((slashIdx - 1 + slashList.length) % slashList.length); return; }
+                    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); applySlash(slashList[slashIdx]); return; }
+                    if (e.key === 'Escape') { e.preventDefault(); composerRef.current?.clear(); return; }
+                  }
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (streaming && (e.metaKey || e.ctrlKey)) sendComposedNow(); else sendComposed(); }
+                }}
+              />
+              {streaming ? (
+                <>
+                  {canSend && (
+                    <button onClick={sendComposed} className="send-fab" title={'Queue (Enter) — runs when the agent finishes · ⌘Enter — runs NEXT (jumps to the front of the queue; the current turn keeps going). Attachments ride along — nothing interrupts the running turn.'} style={{
+                      width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+                      background: 'var(--blue)', color: '#fff', boxShadow: '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)', cursor: 'pointer' }}>
+                      <Icon name="plus" size={18} stroke={2.6} />
+                    </button>
+                  )}
+                  <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
+                    background: 'color-mix(in srgb, var(--red) 14%, transparent)', color: 'var(--red)', cursor: 'pointer' }}>
+                    <span style={{ width: 12, height: 12, borderRadius: 3.5, background: 'currentColor' }} />
+                  </button>
+                </>
+              ) : (
+                <button onClick={sendComposed} disabled={!canSend || !projectId || locked} className="send-fab" title={locked ? 'View only — this PR has been merged' : 'Send (Enter)'} style={{
+                  width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+                  background: canSend && !locked ? 'var(--blue)' : 'var(--fill-secondary)', color: canSend && !locked ? '#fff' : 'var(--ink-secondary)',
+                  boxShadow: canSend && !locked ? '0 5px 14px color-mix(in srgb, var(--blue) 34%, transparent)' : 'none', cursor: canSend && !locked ? 'pointer' : 'default' }}>
+                  <Icon name="arrowRight" size={18} stroke={2.6} style={{ transform: 'rotate(-90deg)' }} />
+                </button>
+              )}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, rowGap: 6, marginTop: 6 }}>
+              {/* attach a file — image, text/code, or any file (also: paste or drag-drop) */}
+              <input ref={fileRef} type="file" multiple style={{ display: 'none' }}
+                onChange={e => { addFiles(e.target.files); if (e.target) e.target.value = ''; }} />
+              <button onClick={() => fileRef.current?.click()} disabled={!projectId} title="Attach a file — image, text, or any file (or paste / drag-drop)" className="tb-icon" style={{
+                width: 26, height: 24, borderRadius: 8, flexShrink: 0, display: 'grid', placeItems: 'center', border: 'none',
+                background: 'transparent', color: 'var(--ink-secondary)', opacity: projectId ? 1 : 0.4, cursor: projectId ? 'pointer' : 'default' }}>
+                <Icon name="paperclip" size={15} />
+              </button>
+              {/* core: which model · how hard · the two run modes */}
+              <ModelPicker compact direction="up" value={primaryKey} onChange={setPrimaryKey} favorites={favorites} onToggleFavorite={toggleFavorite} />
+              <EffortDial compact value={effort} onChange={setEffort} />
+              <span style={{ width: 1, height: 16, background: 'var(--separator)', margin: '0 1px' }} />
+              <button onClick={() => setPlanMode(!planMode)} title={planMode ? 'Plan mode on — propose before building' : 'Plan first — propose a plan before doing the work'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 24, padding: '0 8px', borderRadius: 8, cursor: 'pointer',
+                  background: planMode ? 'color-mix(in srgb, var(--blue) 13%, transparent)' : 'var(--fill-secondary)',
+                  border: planMode ? '1px solid color-mix(in srgb, var(--blue) 45%, transparent)' : '1px solid transparent',
+                  color: planMode ? 'var(--blue)' : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                <Icon name="map" size={13} /> Plan
+              </button>
+              <button onClick={() => setGoalMode(!goalMode)} title={goalMode ? 'Goal mode on — pursue autonomously to completion' : 'Goal mode — pursue the request autonomously over a long run'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 24, padding: '0 8px', borderRadius: 8, cursor: 'pointer',
+                  background: goalMode ? 'color-mix(in srgb, var(--purple) 14%, transparent)' : 'var(--fill-secondary)',
+                  border: goalMode ? '1px solid color-mix(in srgb, var(--purple) 45%, transparent)' : '1px solid transparent',
+                  color: goalMode ? 'var(--purple)' : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                <Icon name="target" size={13} /> {primaryProvider === 'codex' ? 'Pursue goal' : 'Goal'}
+              </button>
+              {/* Autopilot — per-chat opt-in. ON = engine runs a Sonnet judgment after
+                  every turn and arms a 1-min [Auto-continue] followup when the agent
+                  ended on a continuation cue. A genuine user reply cancels any pending
+                  followup. The pending countdown is visible + cancellable in the
+                  Scheduler. Off by default. */}
+              <button onClick={toggleAutoPilot} disabled={!activeId}
+                title={!activeId ? 'Send a message to enable autopilot for this chat' : autoPilotEffective ? 'Autopilot ON for this chat — auto-continues in 1 min when the agent offers to keep going. Click to disable.' : 'Autopilot OFF — turn on to auto-continue this chat when the agent ends on "want me to keep going?"'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 24, padding: '0 8px', borderRadius: 8,
+                  cursor: activeId ? 'pointer' : 'not-allowed', opacity: activeId ? 1 : 0.4,
+                  background: autoPilotEffective ? 'color-mix(in srgb, var(--green) 14%, transparent)' : 'var(--fill-secondary)',
+                  border: autoPilotEffective ? '1px solid color-mix(in srgb, var(--green) 45%, transparent)' : '1px solid transparent',
+                  color: autoPilotEffective ? 'var(--green)' : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                <Icon name="bolt" size={13} /> Autopilot
+              </button>
+              {/* Reviewer — per-chat opt-in. ON = the reviewer engine runs after
+                  EVERY assistant turn (not only on file-writing turns, which was
+                  the silent-skip bug). The reviewer-model popover next to this
+                  picks WHICH engine reviews. Off by default. */}
+              <button onClick={toggleReviewer} disabled={!activeId}
+                title={!activeId ? 'Send a message to enable reviewer for this chat' : reviewerEffective ? 'Reviewer ON for this chat — every turn gets reviewed. Click to disable.' : 'Reviewer OFF — turn on to review every assistant turn.'}
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 24, padding: '0 8px', borderRadius: 8,
+                  cursor: activeId ? 'pointer' : 'not-allowed', opacity: activeId ? 1 : 0.4,
+                  background: reviewerEffective ? 'color-mix(in srgb, var(--orange) 14%, transparent)' : 'var(--fill-secondary)',
+                  border: reviewerEffective ? '1px solid color-mix(in srgb, var(--orange) 45%, transparent)' : '1px solid transparent',
+                  color: reviewerEffective ? 'var(--orange)' : 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                <Icon name="checkCircle" size={13} /> Review
+              </button>
+              {reviewerEffective && (
+                <ModelPicker
+                  compact
+                  direction="up"
+                  value={reviewerKey && reviewerKey !== 'off' ? reviewerKey : seedReviewerKey()}
+                  onChange={setReviewerKey}
+                  favorites={favorites}
+                  onToggleFavorite={toggleFavorite}
+                  triggerLabel="Reviewer"
+                />
+              )}
+              <span style={{ width: 1, height: 16, background: 'var(--separator)', margin: '0 1px' }} />
+              {/* schedule THIS message — pick a date/time; it fires into the chat then */}
+              <div style={{ position: 'relative' }}>
+                <button onClick={() => { setSchedEditAt(null); setSchedOpen(o => !o); }} disabled={!canSend || !projectId}
+                  title={canSend ? 'Schedule this message to send later' : 'Type a message to schedule it'}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 24, padding: '0 8px', borderRadius: 8, cursor: canSend && projectId ? 'pointer' : 'default',
+                    background: schedOpen ? 'color-mix(in srgb, var(--blue) 13%, transparent)' : 'var(--fill-secondary)',
+                    border: schedOpen ? '1px solid color-mix(in srgb, var(--blue) 45%, transparent)' : '1px solid transparent',
+                    color: schedOpen ? 'var(--blue)' : 'var(--ink-secondary)', opacity: canSend && projectId ? 1 : 0.45, font: '600 var(--fs-caption)/1 var(--font-text)' }}>
+                  <Icon name="clock" size={13} /> Schedule
+                </button>
+                {schedOpen && <SchedulePicker initial={schedEditAt ?? undefined} onPick={scheduleMessage} onRepeat={scheduleRecurring} onClose={() => setSchedOpen(false)} />}
+              </div>
+              {schedNote && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--green)', display: 'inline-flex', alignItems: 'center', gap: 5, whiteSpace: 'nowrap' }}><Icon name="check" size={12} /> {schedNote}</span>}
+              <span style={{ flex: 1, minWidth: 6 }} />
+              {streaming
+                ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap' }}>
+                    <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn ? liveActivity(lastTurn, lastTurn.transcript ?? []) : 'Working…'}
+                  </span>
+                : lastTurnPaused
+                  // Parked on a ScheduleWakeup — the per-turn chip carries the
+                  // full countdown; the rail mirrors the state in one line so a
+                  // user scanning the composer doesn't mistake the dormant
+                  // session for "ready to send" without context.
+                  ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>
+                      <Icon name="clock" size={12} style={{ color: 'var(--purple)' }} /> {lastTurn?.pausedReason === 'limit' ? 'Usage limit — resumes in' : 'Auto-resumes in'} {fmtCountdown((lastTurn?.pausedUntil ?? 0) - Date.now())}
+                    </span>
+                  : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{planMode ? 'Plan · ⏎' : goalMode ? 'Goal · ⏎' : queue.length ? `${queue.length} queued` : '⏎ to send'}</span>}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────── Conversation sync ─────────────────
+   "Let's sync" — scan the project's folder on this Mac for past conversations
+   from the tools the operator already uses (Claude Code, Codex) and Conductor,
+   then import the chosen ones as read-only chats. The Mac is the brain: this all
+   reads local agent stores; nothing leaves the machine. */
+const SOURCE_META: Record<ConvSource, { label: string; tint: string; icon: IconName }> = {
+  claude: { label: 'Claude', tint: 'var(--orange)', icon: 'spark' },
+  codex: { label: 'Codex', tint: 'var(--green)', icon: 'command' },
+  conductor: { label: 'Conductor', tint: 'var(--purple)', icon: 'layers' },
+};
+const convKey = (c: { source: ConvSource; externalId: string }) => `${c.source}:${c.externalId}`;
+
+/** Small source chip shown on imported chats in the rail (the "prefix"). */
+function SourceChip({ source }: { source: ConvSource }) {
+  const m = SOURCE_META[source];
+  return (
+    <span title={`Imported from ${m.label}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 3, height: 15, padding: '0 5px', borderRadius: 5, flexShrink: 0,
+      background: `color-mix(in srgb, ${m.tint} 16%, transparent)`, color: m.tint, font: '700 9px/1 var(--font-text)', letterSpacing: '0.02em', textTransform: 'uppercase' }}>
+      <Icon name={m.icon} size={9} />{m.label}
+    </span>
+  );
+}
+
+function SyncModal({ projectId, onClose, onImported }: { projectId: string; onClose: () => void; onImported: (sessions: ChatSession[]) => void }) {
+  const [phase, setPhase] = React.useState<'scanning' | 'ready' | 'importing' | 'error'>('scanning');
+  const [scan, setScan] = React.useState<ConversationScan | null>(null);
+  const [sel, setSel] = React.useState<Set<string>>(new Set());
+  const [err, setErr] = React.useState('');
+  const [done, setDone] = React.useState(0);
+
+  const runScan = React.useCallback(() => {
+    setPhase('scanning'); setErr('');
+    api.scanConversations(projectId)
+      .then(r => {
+        setScan(r);
+        setSel(new Set(r.conversations.filter(c => !c.imported).map(convKey)));
+        setPhase('ready');
+      })
+      .catch(e => { setErr(e?.message || 'Scan failed'); setPhase('error'); });
+  }, [projectId]);
+  React.useEffect(() => { runScan(); }, [runScan]);
+
+  const groups = React.useMemo(() => {
+    const g: Record<ConvSource, ScannedConversation[]> = { claude: [], codex: [], conductor: [] };
+    for (const c of scan?.conversations ?? []) g[c.source].push(c);
+    return g;
+  }, [scan]);
+
+  const selectable = (scan?.conversations ?? []).filter(c => !c.imported);
+  const selectedCount = sel.size;
+  const toggle = (c: ScannedConversation) => setSel(prev => { const n = new Set(prev); const k = convKey(c); n.has(k) ? n.delete(k) : n.add(k); return n; });
+  const toggleGroup = (src: ConvSource) => setSel(prev => {
+    const n = new Set(prev);
+    const rows = groups[src].filter(c => !c.imported);
+    const allOn = rows.length > 0 && rows.every(c => n.has(convKey(c)));
+    for (const c of rows) { if (allOn) n.delete(convKey(c)); else n.add(convKey(c)); }
+    return n;
+  });
+
+  const doImport = async () => {
+    if (!scan || !selectedCount) return;
+    const items = scan.conversations.filter(c => sel.has(convKey(c))).map(c => ({
+      source: c.source, externalId: c.externalId, filePath: c.filePath, title: c.title, createdAt: c.createdAt, updatedAt: c.updatedAt,
+    }));
+    setPhase('importing');
+    try {
+      const r = await api.importConversations(projectId, items);
+      setDone(r.imported);
+      onImported(r.sessions);
+      onClose();
+    } catch (e) {
+      setErr((e as { message?: string })?.message || 'Import failed');
+      setPhase('error');
+    }
+  };
+
+  return (
+    <div onMouseDown={onClose} style={{ position: 'absolute', inset: 0, zIndex: 90, display: 'flex', justifyContent: 'center', alignItems: 'flex-start', paddingTop: 84,
+      background: 'rgba(10,12,24,0.32)', backdropFilter: 'blur(3px)', WebkitBackdropFilter: 'blur(3px)' }}>
+      <div onMouseDown={e => e.stopPropagation()} style={{ width: 600, maxHeight: 'calc(100vh - 168px)', display: 'flex', flexDirection: 'column',
+        background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--glass-border)',
+        boxShadow: '0 30px 80px rgba(10,15,40,0.45), var(--glass-inner)', overflow: 'hidden', animation: 'palettePop 200ms var(--spring)' }}>
+        {/* header */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '16px 18px', borderBottom: '0.5px solid var(--separator)' }}>
+          <span style={{ width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue) 14%, transparent)', color: 'var(--blue)', flexShrink: 0 }}>
+            <Icon name="refresh" size={17} />
+          </span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Sync past conversations</div>
+            <div style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {scan?.path ? shortHomePath(scan.path) : 'Scanning this project’s folder on your Mac…'}
+            </div>
+          </div>
+          <button onClick={onClose} className="tb-icon" style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+            <Icon name="x" size={15} stroke={2.4} />
+          </button>
+        </div>
+
+        {/* body */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: 12 }}>
+          {(phase === 'scanning') && (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '48px 0', color: 'var(--ink-tertiary)' }}>
+              <Spinner size={22} /><span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)' }}>Scanning Claude, Codex &amp; Conductor…</span>
+            </div>
+          )}
+          {phase === 'error' && (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '40px 18px', textAlign: 'center' }}>
+              <Icon name="alert" size={22} style={{ color: 'var(--red)' }} />
+              <span style={{ font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>{err}</span>
+              <button onClick={runScan} className="filter-chip" style={{ height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-subhead)/1 var(--font-text)', cursor: 'pointer' }}>Try again</button>
+            </div>
+          )}
+          {(phase === 'ready' || phase === 'importing') && scan && (
+            scan.conversations.length === 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10, padding: '40px 24px', textAlign: 'center' }}>
+                <Icon name="search" size={22} style={{ color: 'var(--ink-tertiary)' }} />
+                <span style={{ font: '500 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                  No past conversations found for this folder.<br />
+                  Claude, Codex, and Conductor chats that ran here will appear automatically.
+                </span>
+                <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                  {(['claude', 'codex', 'conductor'] as ConvSource[]).map(s => (
+                    <span key={s} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, font: '500 var(--fs-caption)/1 var(--font-text)', color: scan.available[s] ? 'var(--green)' : 'var(--ink-tertiary)' }}>
+                      <Icon name={scan.available[s] ? 'check' : 'x'} size={11} stroke={2.4} />{SOURCE_META[s].label}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              (['claude', 'codex', 'conductor'] as ConvSource[]).filter(s => groups[s].length).map(src => {
+                const m = SOURCE_META[src];
+                const rows = groups[src];
+                const free = rows.filter(c => !c.imported);
+                const allOn = free.length > 0 && free.every(c => sel.has(convKey(c)));
+                return (
+                  <div key={src} style={{ marginBottom: 14 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px 8px' }}>
+                      <Icon name={m.icon} size={14} style={{ color: m.tint }} />
+                      <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-secondary)' }}>{m.label}</span>
+                      <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{rows.length}</span>
+                      <span style={{ flex: 1 }} />
+                      {free.length > 0 && (
+                        <button onClick={() => toggleGroup(src)} className="link-btn" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--blue)', cursor: 'pointer' }}>
+                          {allOn ? 'Deselect all' : 'Select all'}
+                        </button>
+                      )}
+                    </div>
+                    <div style={{ background: 'var(--bg-grouped)', borderRadius: 12, border: '0.5px solid var(--separator)', overflow: 'hidden' }}>
+                      {rows.map((c, i) => {
+                        const on = sel.has(convKey(c));
+                        return (
+                          <div key={convKey(c)} onClick={() => !c.imported && toggle(c)} className="mm-row" style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '10px 12px',
+                            borderBottom: i < rows.length - 1 ? '0.5px solid var(--separator)' : 'none', cursor: c.imported ? 'default' : 'pointer', opacity: c.imported ? 0.55 : 1 }}>
+                            <span style={{ width: 18, height: 18, borderRadius: 5, flexShrink: 0, display: 'grid', placeItems: 'center',
+                              border: `1.5px solid ${c.imported ? 'var(--separator-strong)' : on ? m.tint : 'var(--separator-strong)'}`,
+                              background: c.imported ? 'var(--fill-secondary)' : on ? m.tint : 'transparent' }}>
+                              {(on || c.imported) && <Icon name="check" size={12} stroke={3} style={{ color: c.imported ? 'var(--ink-tertiary)' : '#fff' }} />}
+                            </span>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ font: '500 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{c.title}</div>
+                              <div style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>
+                                {c.messageCount} message{c.messageCount === 1 ? '' : 's'} · {relativeTime(c.updatedAt)}
+                              </div>
+                            </div>
+                            {c.imported && <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', flexShrink: 0 }}>Imported</span>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })
+            )
+          )}
+        </div>
+
+        {/* footer */}
+        {(phase === 'ready' || phase === 'importing') && scan && scan.conversations.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderTop: '0.5px solid var(--separator)' }}>
+            <span style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', flex: 1 }}>
+              {selectable.length === 0 ? 'All conversations already imported.' : `${selectedCount} of ${selectable.length} selected`}
+            </span>
+            <button onClick={onClose} className="filter-chip" style={{ height: 34, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '600 var(--fs-subhead)/1 var(--font-text)', cursor: 'pointer' }}>Cancel</button>
+            <button onClick={doImport} disabled={!selectedCount || phase === 'importing'} className="primary-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 34, padding: '0 16px', borderRadius: 'var(--r-pill)',
+              background: selectedCount ? 'var(--blue)' : 'var(--fill-secondary)', color: selectedCount ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-subhead)/1 var(--font-text)', cursor: selectedCount ? 'pointer' : 'default', border: 'none' }}>
+              {phase === 'importing' ? <><Spinner size={13} color="#fff" /> Importing…</> : <>Import{selectedCount ? ` ${selectedCount}` : ''}</>}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* Per-project chat: a sessions rail + the shared ChatThread. (The multi-project
+   Workspace screen wires ChatThread into tabs instead.) */
+function ChatPane({ projectId, project }: { projectId: string | null; project: Project | null }) {
+  const location = useLocation();
+  const [sessions, setSessions] = React.useState<ChatSession[]>([]);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [renamingId, setRenamingId] = React.useState<string | null>(null);
+  const [renameVal, setRenameVal] = React.useState('');
+  const [syncOpen, setSyncOpen] = React.useState(false);
+  const [showArchived, setShowArchived] = React.useState(false);
+  const activeRef = React.useRef<string | null>(null);
+  activeRef.current = activeId;
+
+  // Sessions for this project (most recent first; open the latest by default).
+  React.useEffect(() => {
+    setActiveId(null);
+    if (!projectId) { setSessions([]); return; }
+    let alive = true;
+    const want = new URLSearchParams(location.search).get('s');
+    api.listSessions(projectId)
+      .then(ss => { if (alive) { setSessions(ss); setActiveId((want && ss.some(x => x.id === want)) ? want : (ss.find(x => !x.archived)?.id ?? null)); } })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [projectId, location.search]);
+
+  // LIVE: keep the rail's session list current.
+  React.useEffect(() => {
+    const unsub = api.subscribe({
+      onSession: (s) => {
+        if (s.deleted) { setSessions(ss => ss.filter(x => x.id !== s.id)); if (activeRef.current === s.id) setActiveId(null); return; }
+        if (projectId && s.projectId !== projectId) return;
+        setSessions(ss => {
+          const i = ss.findIndex(x => x.id === s.id);
+          const next = i === -1 ? [s, ...ss] : ss.map(x => (x.id === s.id ? s : x));
+          return [...next].sort((a, b) => b.updatedAt - a.updatedAt);
+        });
+      },
+    });
+    return unsub;
+  }, [projectId]);
+
+  const removeSession = (id: string) => {
+    void api.deleteSession(id).catch(() => {});
+    setSessions(ss => ss.filter(s => s.id !== id));
+    if (activeRef.current === id) setActiveId(null);
+  };
+  const archiveSession = (s: ChatSession, archived: boolean) => {
+    setSessions(ss => ss.map(x => (x.id === s.id ? { ...x, archived: archived ? Date.now() : undefined } : x)));
+    if (archived && activeRef.current === s.id) setActiveId(null);
+    void api.archiveSession(s.id, archived).catch(() => {});
+  };
+  const commitRename = (id: string) => {
+    const title = renameVal.trim();
+    setRenamingId(null);
+    if (!title) return;
+    setSessions(ss => ss.map(s => (s.id === id ? { ...s, title } : s)));
+    void api.renameSession(id, title).catch(() => {});
+  };
+
+  return (
+    <div style={{ display: 'flex', gap: 14, height: 'calc(100vh - 252px)', minHeight: 440 }}>
+      {/* sessions rail */}
+      <div style={{ width: 236, flexShrink: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-grouped)',
+        borderRadius: 18, border: '0.5px solid var(--separator)', overflow: 'hidden', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
+        <div style={{ padding: '11px 10px 9px', display: 'flex', gap: 6 }}>
+          <button onClick={() => setActiveId(null)} className="newchat-btn" title="New chat" style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, height: 36, padding: '0 11px', borderRadius: 11,
+            background: 'var(--fill-secondary)', color: 'var(--ink)', cursor: 'pointer', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+            <Icon name="plus" size={15} stroke={2.4} style={{ color: 'var(--blue)' }} /> New chat
+          </button>
+          <button onClick={() => setSyncOpen(true)} disabled={!projectId} className="newchat-btn" title="Sync past conversations from Claude, Codex & Conductor" style={{ width: 36, flexShrink: 0, display: 'grid', placeItems: 'center', height: 36, borderRadius: 11,
+            background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', cursor: projectId ? 'pointer' : 'default' }}>
+            <Icon name="refresh" size={15} stroke={2.2} />
+          </button>
+        </div>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px 10px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+          {(() => {
+            const activeSessions = sessions.filter(s => !s.archived);
+            const archivedSessions = sessions.filter(s => s.archived).sort((a, b) => (b.archived ?? 0) - (a.archived ?? 0));
+            const renderRow = (s: ChatSession) => {
+              const active = s.id === activeId;
+              return (
+                <div key={s.id} className="sess-row" onClick={() => setActiveId(s.id)} style={{
+                  position: 'relative', display: 'flex', alignItems: 'center', gap: 6, padding: '8px 10px', borderRadius: 10, cursor: 'pointer',
+                  background: active ? 'var(--fill-secondary)' : 'transparent' }}>
+                  {active && <span style={{ position: 'absolute', left: 0, top: 9, bottom: 9, width: 2.5, borderRadius: 2, background: 'var(--blue)' }} />}
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    {renamingId === s.id ? (
+                      <input autoFocus value={renameVal} onChange={e => setRenameVal(e.target.value)} onClick={e => e.stopPropagation()}
+                        onBlur={() => commitRename(s.id)} onKeyDown={e => { if (e.key === 'Enter') commitRename(s.id); if (e.key === 'Escape') setRenamingId(null); }}
+                        style={{ width: '100%', border: '1px solid var(--blue)', borderRadius: 6, padding: '2px 6px', background: 'var(--bg)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1.3 var(--font-text)' }} />
+                    ) : (
+                      <span title="Double-click to rename" onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
+                        style={{ display: 'flex', alignItems: 'center', gap: 5, font: `${active ? 600 : 500} var(--fs-footnote)/1.3 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (active ? 'var(--ink)' : 'var(--ink-secondary)'), whiteSpace: 'nowrap', overflow: 'hidden' }}>
+                        <SessionPillDot sessionId={s.id} />
+                        {s.importedFrom && <SourceChip source={s.importedFrom} />}
+                        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.title}</span>
+                      </span>
+                    )}
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 6, font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 3 }}>
+                      {s.codename && <span title="Session codename" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', letterSpacing: '0.02em' }}>{displayCodename(s.codename)}</span>}
+                      {s.codename && <span>·</span>}
+                      {relativeTime(s.updatedAt)}
+                    </span>
+                  </span>
+                  <button className="sess-x" title="Rename chat" onClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title); }}
+                    style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+                    <Icon name="pencil" size={12} />
+                  </button>
+                  <button className="sess-x" title={s.archived ? 'Unarchive' : 'Archive chat'} onClick={e => { e.stopPropagation(); archiveSession(s, !s.archived); }}
+                    style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: s.archived ? 'var(--blue)' : 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+                    <Icon name="archive" size={12} />
+                  </button>
+                  <button className="sess-x" title="Delete chat" onClick={e => { e.stopPropagation(); removeSession(s.id); }}
+                    style={{ width: 20, height: 20, borderRadius: 6, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}>
+                    <Icon name="trash" size={12} />
+                  </button>
+                </div>
+              );
+            };
+            return (
+              <>
+                {activeSessions.length > 0 && <div style={{ padding: '6px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Recent</div>}
+                {sessions.length === 0 && (
+                  <div style={{ padding: '22px 12px', font: '400 var(--fs-footnote)/1.55 var(--font-text)', color: 'var(--ink-tertiary)', textAlign: 'center' }}>
+                    No chats yet.<br />Start one on the right.
+                  </div>
+                )}
+                {activeSessions.map(renderRow)}
+                {archivedSessions.length > 0 && (
+                  <>
+                    <button onClick={() => setShowArchived(v => !v)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 8px 4px', font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', cursor: 'pointer', background: 'transparent' }}>
+                      <Icon name="chevronRight" size={11} style={{ transform: showArchived ? 'rotate(90deg)' : 'none', transition: 'transform 160ms var(--spring)' }} />
+                      Archived ({archivedSessions.length})
+                    </button>
+                    {showArchived && archivedSessions.map(renderRow)}
+                  </>
+                )}
+              </>
+            );
+          })()}
+        </div>
+      </div>
+
+      {/* thread + composer (shared) */}
+      <ChatThread projectId={projectId} project={project} sessionId={activeId}
+        onSessionCreated={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }}
+        onOpenSession={(s) => { setSessions(ss => (ss.some(x => x.id === s.id) ? ss : [s, ...ss])); setActiveId(s.id); }} />
+
+      {syncOpen && projectId && (
+        <SyncModal projectId={projectId} onClose={() => setSyncOpen(false)}
+          onImported={(imported) => {
+            if (!imported.length) return;
+            setSessions(ss => {
+              const byId = new Map(ss.map(s => [s.id, s] as const));
+              for (const s of imported) byId.set(s.id, s);
+              return [...byId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+            });
+            setActiveId(imported[0].id);
+          }} />
+      )}
+    </div>
+  );
+}
+
+const TABS: { key: string; label: string }[] = [
+  { key: 'chat', label: 'Chat' },
+  { key: 'jobs', label: 'Jobs' },
+  { key: 'instructions', label: 'Instructions' },
+  { key: 'skills', label: 'Skills & tools' },
+  { key: 'budget', label: 'Budget' },
+  { key: 'settings', label: 'Settings' },
+];
+
+function Breadcrumb({ name }: { name: string }) {
+  const navigate = useNavigate();
+  const workspaceName = useWorkspaceName();
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10, font: '500 var(--fs-subhead)/1 var(--font-text)' }}>
+      <a onClick={() => navigate('/projects')} className="crumb" style={{ color: 'var(--ink-secondary)', textDecoration: 'none', cursor: 'pointer' }}>{workspaceName}</a>
+      <Icon name="chevronRight" size={14} style={{ color: 'var(--ink-tertiary)' }} />
+      <a onClick={() => navigate('/projects')} className="crumb" style={{ color: 'var(--ink-secondary)', textDecoration: 'none', cursor: 'pointer' }}>Projects</a>
+      <Icon name="chevronRight" size={14} style={{ color: 'var(--ink-tertiary)' }} />
+      <span style={{ color: 'var(--ink)', fontWeight: 600 }}>{name}</span>
+    </div>
+  );
+}
+
+function GateBanner({ gate, onApprove, onDismiss }: { gate: boolean; onApprove: () => void; onDismiss: () => void }) {
+  if (!gate) return null;
+  return (
+    <div className="gate-banner" style={{
+      display: 'flex', alignItems: 'center', gap: 14, padding: '14px 18px', marginBottom: 20,
+      background: 'var(--bg-elevated)', borderRadius: 14, border: '1px solid rgba(255,149,0,0.4)',
+      boxShadow: '0 0 0 4px rgba(255,149,0,0.12), var(--card-shadow)',
+    }}>
+      <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center',
+        background: 'rgba(255,149,0,0.15)', color: 'var(--orange)' }}>
+        <Icon name="enter" size={19} />
+      </span>
+      <span style={{ flex: 1, minWidth: 0 }}>
+        <span style={{ display: 'block', font: '600 var(--fs-callout)/1.25 var(--font-text)', color: 'var(--ink)' }}>A job is waiting at a gate</span>
+        <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Review it in Approvals to let the run continue.</span>
+      </span>
+      <button onClick={onDismiss} style={{ height: 34, padding: '0 14px', borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Dismiss</button>
+      <button onClick={onApprove} className="primary-cta" style={{ height: 34, padding: '0 16px', borderRadius: 8, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>Open Approvals</button>
+    </div>
+  );
+}
+
+export default function ProjectDetail() {
+  const { id: routeId } = useParams<{ id: string }>();
+  const [tab, setTab] = React.useState('chat');
+  const [paletteOpen, setPaletteOpen] = React.useState(false);
+
+  // live data
+  const [projectId, setProjectId] = React.useState<string | null>(routeId ?? null);
+  const [project, setProject] = React.useState<Project | null>(null);
+  const [repo, setRepo] = React.useState<RepoInfo | null>(null);
+  const [jobs, setJobs] = React.useState<Job[]>([]);
+
+  // Resolve the project id: route param wins, else first project in the workspace.
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (routeId) { if (!cancelled) setProjectId(routeId); return; }
+      try {
+        const projects = await api.listProjects();
+        if (!cancelled && projects[0]) setProjectId(projects[0].id);
+      } catch { /* fail soft */ }
+    })();
+    return () => { cancelled = true; };
+  }, [routeId]);
+
+  const refetchJobs = React.useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const next = await api.listJobs(projectId);
+      setJobs(next);
+    } catch { /* fail soft */ }
+  }, [projectId]);
+
+  // Load project header + jobs when the id resolves.
+  React.useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const [p, js] = await Promise.all([api.getProject(projectId), api.listJobs(projectId)]);
+        if (cancelled) return;
+        setProject(p);
+        setJobs(js);
+        if (p.path) { api.getProjectRepo(projectId).then(r => { if (!cancelled) setRepo(r); }).catch(() => {}); }
+        else setRepo(null);
+      } catch { /* fail soft — render empty */ }
+    })();
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  // LIVE: refetch this project's jobs on any job update.
+  React.useEffect(() => {
+    if (!projectId) return;
+    const unsub = api.subscribe({ onJob: () => { void refetchJobs(); } });
+    return unsub;
+  }, [projectId, refetchJobs]);
+
+  // ⌘K
+  React.useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); }
+    };
+    window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
+  }, []);
+
+  const tabIdx = TABS.findIndex(t => t.key === tab);
+
+  const projectJobs = jobs.map(toProjectJob);
+  const projectName = project?.name ?? 'Project';
+  const projectColor = project?.color ? `var(--${project.color})` : 'var(--blue)';
+  const runningCount = jobs.filter(j => j.status === 'running').length;
+
+  return (
+    <AppShell active="projects" onSearch={() => setPaletteOpen(true)}>
+      <style>{PAGE_CSS}</style>
+
+      {/* header block */}
+      <div style={{ padding: '24px 28px 0' }}>
+        <Breadcrumb name={projectName} />
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 16 }}>
+          <span style={{ width: 52, height: 52, borderRadius: 15, flexShrink: 0, display: 'grid', placeItems: 'center',
+            background: `color-mix(in srgb, ${projectColor} 15%, transparent)`, color: projectColor }}>
+            <Icon name="terminal" size={28} />
+          </span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>{projectName}</h1>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)',
+                background: 'rgba(52,199,89,0.16)', color: 'var(--green)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
+                <span className="breathe" style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--green)' }} /> Active · {runningCount} running
+              </span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+              <span style={{ font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{KIND_LABEL[project?.kind ?? ''] ?? 'Project'}</span>
+              {project?.path && (
+                <>
+                  <span style={{ color: 'var(--ink-tertiary)' }}>·</span>
+                  <span title={project.path} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)', maxWidth: 280,
+                    background: 'var(--fill-tertiary)', font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>
+                    <Icon name={project.repoUrl ? 'gitMerge' : 'folder'} size={12} />
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shortHomePath(project.path)}</span>
+                  </span>
+                  {repo?.branch && (
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 22, padding: '0 9px', borderRadius: 'var(--r-pill)',
+                      background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)', font: '600 var(--fs-caption)/1 var(--font-mono)' }}>
+                      <Icon name="gitMerge" size={11} /> {repo.branch}
+                    </span>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+            {project?.path && IS_LOCAL && (
+              <button onClick={() => { if (project?.path) void api.revealPath(project.path); }} className="split-quiet" title="Reveal in Finder" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 40, padding: '0 15px', borderRadius: 'var(--r-pill)',
+                background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>
+                <Icon name="folder" size={16} /> Reveal
+              </button>
+            )}
+            <button onClick={() => setPaletteOpen(true)} className="primary-cta" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 40, padding: '0 18px', borderRadius: 'var(--r-pill)',
+              background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.30)' }}>
+              <Icon name="plus" size={16} stroke={2.4} /> New job
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* sticky tab bar */}
+      <div style={{ position: 'sticky', top: 0, zIndex: 10, padding: '14px 28px 12px', marginTop: 18,
+        background: 'color-mix(in srgb, var(--bg) 86%, transparent)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)',
+        borderBottom: '0.5px solid var(--separator)' }}>
+        <div style={{ position: 'relative', display: 'inline-flex', padding: 3, background: 'var(--fill-secondary)', borderRadius: 11 }}>
+          <div className="tab-pill" style={{ position: 'absolute', top: 3, bottom: 3, left: `${tabIdx * 116 + 3}px`, width: 116,
+            background: 'var(--bg-elevated)', borderRadius: 8, boxShadow: '0 1px 3px rgba(0,0,0,0.14)', transition: 'left 280ms var(--spring)' }} />
+          {TABS.map(t => (
+            <button key={t.key} onClick={() => setTab(t.key)} style={{
+              position: 'relative', zIndex: 1, width: 116, padding: '8px 0', textAlign: 'center',
+              font: `${tab === t.key ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`,
+              color: tab === t.key ? 'var(--ink)' : 'var(--ink-secondary)', transition: 'color 160ms ease',
+            }}>{t.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* tab content — chat pins to the viewport; other tabs scroll the page */}
+      <div style={{ padding: tab === 'chat' ? '16px 28px 18px' : '22px 28px 36px' }}>
+        {tab === 'chat' && <ChatPane projectId={projectId} project={project} />}
+        {tab === 'jobs' && <JobsTab jobs={projectJobs} />}
+        {tab === 'instructions' && <InstructionsTab projectId={projectId} project={project} onSaved={(ins) => setProject(p => p ? { ...p, instructions: ins } : p)} />}
+        {tab === 'skills' && <SkillsTab projectId={projectId} />}
+        {tab === 'budget' && <BudgetTab />}
+        {tab === 'settings' && <SettingsTab />}
+      </div>
+
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
+    </AppShell>
+  );
+}
