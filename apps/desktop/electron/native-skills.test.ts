@@ -6,6 +6,7 @@ import {
   NATIVE_SKILLS, ensureNativeSkills, nativeSkillsPromptBlock, nativeSkillSummaries,
   nativeSkillSlugs, isNativeSkill, nativeSkillsVersion,
 } from './native-skills.js';
+import { installSkillFiles } from './skills-registry.js';
 
 let root: string;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'native-skills-')); });
@@ -107,6 +108,39 @@ describe('ensureNativeSkills', () => {
     expect(res.find(r => r.slug === 'migrate-to-codex')?.status).toBe('removed');
     expect(existsSync(stale)).toBe(false);
     expect(existsSync(join(own, 'SKILL.md'))).toBe(true);
+  });
+
+  it('honors a store-level disable made BEFORE first materialisation (fresh install lands disabled)', () => {
+    // The UI lists bundled natives pre-materialisation, so the operator can turn
+    // one off before any run. The first real run must NOT resurrect it.
+    const res = ensureNativeSkills(root, new Set(['pdf']));
+    expect(res.find(r => r.slug === 'pdf')!.status).toBe('installed');
+    const dir = skillDir('pdf');
+    expect(existsSync(join(dir, 'SKILL.md'))).toBe(false);
+    expect(existsSync(join(dir, 'SKILL.md.disabled'))).toBe(true);
+    expect(existsSync(join(dir, '.mochi-native'))).toBe(true);
+    // The parked body is the CURRENT bundled one — re-enabling (rename) restores it.
+    const pdf = NATIVE_SKILLS.find(s => s.slug === 'pdf')!;
+    expect(readFileSync(join(dir, 'SKILL.md.disabled'), 'utf8')).toBe(pdf.files['SKILL.md']);
+    // Idempotent: a second run leaves it disabled.
+    const res2 = ensureNativeSkills(root, new Set(['pdf']));
+    expect(res2.find(r => r.slug === 'pdf')!.status).toBe('unchanged');
+    expect(existsSync(join(dir, 'SKILL.md'))).toBe(false);
+    // An ACTIVE SKILL.md on disk wins over a stale store flag (disk-wins).
+    const other = skillDir('imagegen');
+    expect(existsSync(join(other, 'SKILL.md'))).toBe(true);
+  });
+
+  it('a registry install over a native slug takes ownership (marker cleared → never pruned/clobbered)', () => {
+    ensureNativeSkills(root);
+    // Operator/agent installs their own pdf skill from the registry over ours.
+    installSkillFiles(root, 'some-registry/pdf', '# operator pdf');
+    const dir = skillDir('pdf');
+    expect(existsSync(join(dir, '.mochi-native'))).toBe(false);
+    // Later runs keep their folder — no upgrade-clobber, no stale-prune.
+    const res = ensureNativeSkills(root);
+    expect(res.find(r => r.slug === 'pdf')!.status).toBe('kept');
+    expect(readFileSync(join(dir, 'SKILL.md'), 'utf8')).toBe('# operator pdf');
   });
 
   it('respects a soft-disabled native skill (SKILL.md.disabled present)', () => {

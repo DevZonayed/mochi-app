@@ -983,6 +983,12 @@ export class Store {
       const i = list.findIndex(x => x.id === r.id || x.slug === r.slug);
       if (i >= 0) {
         const prev = list[i];
+        // A same-slug record the OPERATOR/AGENT installed (a registry skill over
+        // a native slug) is theirs — do NOT convert it to addedBy:'native' (that
+        // would misattribute it in the UI and make it eligible for the native
+        // prune below). The on-disk folder is equally theirs (ensureNativeSkills
+        // returns 'kept'), so leave the record untouched.
+        if (prev.addedBy !== 'native') continue;
         const merged: InstalledSkill = { ...prev, ...r, enabled: prev.enabled, installedAt: prev.installedAt };
         if (JSON.stringify(prev) !== JSON.stringify(merged)) { list[i] = merged; changed = true; }
       } else {

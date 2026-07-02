@@ -2859,7 +2859,18 @@ export class LocalEngine {
       let nativeSkillsBlock = '';
       if (job.projectId && !opts.plan) {
         try {
-          ensureNativeSkills(cwd);
+          // Read the operator's disables FIRST and pass them into materialisation:
+          // a native can be toggled off in the UI BEFORE its first run (the Skills
+          // list shows bundled natives pre-materialisation), and that disable must
+          // land on disk as SKILL.md.disabled — otherwise the fresh install writes
+          // an active SKILL.md, Claude auto-discovers it, and the UI (disk-wins)
+          // silently flips it back on.
+          const offNative = new Set(
+            this.store.listInstalledSkills(job.projectId)
+              .filter(s => s.addedBy === 'native' && s.enabled === false)
+              .map(s => s.slug),
+          );
+          ensureNativeSkills(cwd, offNative);
           // Mirror them into the store (enabled by default) so the UI lists them and
           // the operator can toggle any off. Preserves an existing disable.
           this.store.recordNativeSkills(job.projectId, nativeSkillSummaries().map(s => ({
@@ -2867,12 +2878,6 @@ export class LocalEngine {
             source: 'https://github.com/openai/skills', version: 'bundled', sha256: s.sha256,
             enabled: true, addedBy: 'native' as const,
           })));
-          // Only inject skills the operator hasn't disabled.
-          const offNative = new Set(
-            this.store.listInstalledSkills(job.projectId)
-              .filter(s => s.addedBy === 'native' && s.enabled === false)
-              .map(s => s.slug),
-          );
           // Claude auto-discovers every SKILL.md via settingSources:['project'], so
           // sending it the full 40+ line catalog index would DOUBLE-LIST every skill
           // (~2.5K wasted tokens per turn). Claude gets the lean block (imagegen rule

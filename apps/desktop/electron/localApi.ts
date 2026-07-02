@@ -967,7 +967,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const enabled = Boolean(p.enabled);
         // Move the SKILL.md on disk so Claude's settingSources actually stops/starts
         // loading it, then mirror the flag in the store record.
-        const ok = setSkillFilesEnabled(projectRootOf(proj), idOrSlug, enabled);
+        const fileOk = setSkillFilesEnabled(projectRootOf(proj), idOrSlug, enabled);
         let rec = store.setInstalledSkillEnabled(proj.id, idOrSlug, enabled);
         if (!rec) { // no record yet — create one so the flag sticks (a bundled
           // native toggled BEFORE its first-run materialisation must be recorded
@@ -979,7 +979,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
             : { id: idOrSlug, slug, name: slug, enabled, addedBy: 'agent' });
           store.setInstalledSkillEnabled(proj.id, idOrSlug, enabled);
         }
-        return { ok, skill: rec };
+        // A native toggled pre-materialisation has no folder to rename yet — the
+        // store flag alone is authoritative there (ensureNativeSkills honors it
+        // on first install), so that still counts as success.
+        return { ok: fileOk || rec?.addedBy === 'native', skill: rec };
       }
       case 'removeSkillFromProject': {
         const proj = store.getProject(String(p.projectId ?? p.id ?? ''));

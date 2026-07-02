@@ -184,7 +184,7 @@ function ToolStep({ item }: { item: TranscriptItem }) {
         <span style={{ font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail}</span>
         {running ? <span className="breathe" style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--purple)', flexShrink: 0 }} />
           : error ? <Icon name="x" size={11} stroke={2.6} style={{ color: 'var(--red)', flexShrink: 0 }} />
-          : <Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)', flexShrink: 0 }} />}
+          : <>{item.durMs != null && <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', flexShrink: 0 }}>{fmtToolDur(item.durMs)}</span>}<Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)', flexShrink: 0 }} /></>}
       </div>
     );
   }

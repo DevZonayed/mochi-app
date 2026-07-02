@@ -68,10 +68,10 @@ export interface EnsureResult { slug: string; status: 'installed' | 'upgraded' |
     longer in the bundled catalog — so dropping a skill from the bundle actually
     removes it from projects on the next run. Human/registry folders (no marker)
     are never touched. */
-export function ensureNativeSkills(projectRoot: string): EnsureResult[] {
+export function ensureNativeSkills(projectRoot: string, disabledSlugs?: ReadonlySet<string>): EnsureResult[] {
   const out: EnsureResult[] = [];
   for (const s of NATIVE_SKILLS) {
-    try { out.push(ensureOne(projectRoot, s)); }
+    try { out.push(ensureOne(projectRoot, s, disabledSlugs)); }
     catch { out.push({ slug: s.slug, status: 'kept' }); }
   }
   try { out.push(...pruneStaleNative(projectRoot)); } catch { /* best-effort */ }
@@ -117,23 +117,27 @@ export function writeNativeGitignore(projectRoot: string): void {
   if (next !== existing) writeFileSync(gi, next, 'utf8');
 }
 
-function ensureOne(projectRoot: string, s: NativeSkill): EnsureResult {
+function ensureOne(projectRoot: string, s: NativeSkill, disabledSlugs?: ReadonlySet<string>): EnsureResult {
   const dir = join(projectRoot, '.claude', 'skills', s.slug);
   const markerPath = join(dir, MARKER);
   const skillMdPath = join(dir, 'SKILL.md');
   const disabledPath = join(dir, 'SKILL.md.disabled');
   const hash = skillHash(s);
 
-  // Respect a soft-disabled native skill (operator turned it off via the UI):
-  // keep it disabled, don't resurrect the active SKILL.md.
-  const disabled = existsSync(disabledPath) && !existsSync(skillMdPath);
+  // Respect a soft-disabled native skill: on disk (SKILL.md.disabled left by
+  // setSkillFilesEnabled) OR in the store BEFORE first materialisation (the UI
+  // lists bundled natives before any run, so the operator can disable one that
+  // has no folder yet — that disable must not be resurrected here). An ACTIVE
+  // SKILL.md on disk wins over a stale store flag (disk-wins, same precedence
+  // as listProjectSkills).
+  const disabled = !existsSync(skillMdPath) && (existsSync(disabledPath) || !!disabledSlugs?.has(s.slug));
 
   if (existsSync(dir)) {
     if (existsSync(markerPath)) {
       const prev = safeRead(markerPath).trim();
       if (prev === hash) return { slug: s.slug, status: 'unchanged' };
       // Ours, but stale → upgrade in place.
-      writeFiles(dir, s, { skipActiveSkillMd: disabled });
+      writeFiles(dir, s, { disableSkillMd: disabled });
       writeFileSync(markerPath, hash, 'utf8');
       return { slug: s.slug, status: 'upgraded' };
     }
@@ -141,17 +145,19 @@ function ensureOne(projectRoot: string, s: NativeSkill): EnsureResult {
     if (existsSync(skillMdPath) || existsSync(disabledPath)) return { slug: s.slug, status: 'kept' };
   }
 
-  writeFiles(dir, s, { skipActiveSkillMd: disabled });
+  writeFiles(dir, s, { disableSkillMd: disabled });
   mkdirSync(dir, { recursive: true });
   writeFileSync(markerPath, hash, 'utf8');
   return { slug: s.slug, status: 'installed' };
 }
 
-function writeFiles(dir: string, s: NativeSkill, opts: { skipActiveSkillMd: boolean }) {
+function writeFiles(dir: string, s: NativeSkill, opts: { disableSkillMd: boolean }) {
   mkdirSync(dir, { recursive: true });
   for (const [rel, content] of Object.entries(s.files)) {
-    if (opts.skipActiveSkillMd && rel === 'SKILL.md') continue; // keep it disabled
-    const target = join(dir, rel);
+    // A disabled skill gets its body parked at SKILL.md.disabled — stays hidden
+    // from the engines, and a later re-enable (rename) restores the CURRENT
+    // bundled version instead of a stale one.
+    const target = join(dir, opts.disableSkillMd && rel === 'SKILL.md' ? 'SKILL.md.disabled' : rel);
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, content, 'utf8');
   }
