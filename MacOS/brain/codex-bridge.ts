@@ -35,20 +35,36 @@ export interface BridgeBg {
   stop(id: string): BgTaskRecord | null;
 }
 
+/** Image-generation hook injected from main.ts — routes Codex's `generate_image`
+    tool to the SAME backend chain Claude uses (engine.generateImage → native codex
+    image_gen / OpenAI key / fal). Codex-as-master normally uses its built-in
+    image_gen in-session (harvested from the rollout, see codex-rollout.ts); this
+    MCP tool is the explicit/backup path and keeps parity with Claude's toolset. */
+export interface BridgeImage {
+  generate(prompt: string, opts: { aspect?: string; projectId: string | null; sourceImagePath?: string }):
+    Promise<{ path: string; assetId?: string; alt?: string; width?: number; height?: number }>;
+}
+/** A codex-produced image, shaped to merge straight into EngineRun.images. */
+export interface CollectedImage { assetId: string; imagePath: string; width?: number; height?: number }
+
 /** A registered codex run: the project its tools target + the optional
     per-session git/PR ctx (only present for chat turns on a GitHub repo). */
-interface RunReg { projectId: string | null; skills: boolean; bg: boolean; git?: GitCtx; emitConfirm?: EmitConfirm; sessionId?: string | null }
-interface RunOptions { skills?: boolean; bg?: boolean; git?: GitCtx; emitConfirm?: EmitConfirm; sessionId?: string | null }
+interface RunReg { projectId: string | null; skills: boolean; bg: boolean; img: boolean; git?: GitCtx; images: CollectedImage[]; emitConfirm?: EmitConfirm; sessionId?: string | null }
+interface RunOptions { skills?: boolean; bg?: boolean; img?: boolean; git?: GitCtx; emitConfirm?: EmitConfirm; sessionId?: string | null }
 
 /** Handle returned to runCodex: the codex `-c` config to add. */
 export interface CodexRunRegistration {
   /** The `mcp_servers.maestro={…}` TOML value to pass via `-c`. */
   mcpServerConfig: string;
+  /** Images Codex produced via the `generate_image` tool during this run — merge
+      into EngineRun.images so foldImages renders them inline. */
+  collectedImages(): CollectedImage[];
   /** Invalidate the run token (call once the codex run finishes). */
   release(): void;
 }
 
 const TOOL_NAMES = [
+  'generate_image',
   'search_skills', 'get_skill', 'download_skill', 'add_skill_to_project',
   'list_project_skills', 'remove_project_skill',
   'run_in_background', 'background_output', 'list_background', 'stop_background',
@@ -68,6 +84,9 @@ export class CodexBridge {
   private bgHooks?: BridgeBg;
   /** Wire the engine's background-task manager (from main.ts, after both exist). */
   setBg(bg: BridgeBg) { this.bgHooks = bg; }
+  private imgHook?: BridgeImage;
+  /** Wire the engine's image generator (from main.ts, after MediaEngine exists). */
+  setImage(img: BridgeImage) { this.imgHook = img; }
 
   constructor(private store: Store) {
     // Socket lives in a 0700 dir we own (not world-traversable /tmp), so it's never
@@ -96,7 +115,7 @@ export class CodexBridge {
   /** Register a codex run: returns the `-c mcp_servers` config. */
   register(projectId: string | null, opts: RunOptions = { skills: true, bg: true }): CodexRunRegistration {
     const token = randomBytes(18).toString('hex');
-    const reg: RunReg = { projectId, skills: !!opts.skills, bg: !!opts.bg, git: opts.git, emitConfirm: opts.emitConfirm, sessionId: opts.sessionId ?? null };
+    const reg: RunReg = { projectId, skills: !!opts.skills, bg: !!opts.bg, img: !!opts.img, git: opts.git, images: [], emitConfirm: opts.emitConfirm, sessionId: opts.sessionId ?? null };
     this.runs.set(token, reg);
     // Run the shim via Electron's own node (always present; no PATH dependency).
     // The per-run token goes in the MCP server's ENV (not the shim's argv) so it
@@ -105,7 +124,7 @@ export class CodexBridge {
     const args = `[${tomlStr(this.shimPath)}, ${tomlStr(this.sockPath)}]`;
     const mcpServerConfig =
       `mcp_servers.maestro={ command = ${tomlStr(process.execPath)}, args = ${args}, env = { ELECTRON_RUN_AS_NODE = "1", MAESTRO_TOKEN = ${tomlStr(token)} } }`;
-    return { mcpServerConfig, release: () => { this.runs.delete(token); } };
+    return { mcpServerConfig, collectedImages: () => reg.images.slice(), release: () => { this.runs.delete(token); } };
   }
 
   private onConnection(conn: net.Socket): void {
@@ -150,6 +169,20 @@ export class CodexBridge {
       return path.join(homedir(), 'Maestro', safe);
     };
     switch (tool) {
+      case 'generate_image': {
+        if (!reg.img || !this.imgHook) return errRes('image generation is not enabled for this run');
+        const prompt = s(a.prompt);
+        if (!prompt || !prompt.trim()) return errRes('generate_image requires a non-empty "prompt".');
+        const aspect = s(a.aspect);
+        // `source_image` lets codex edit an existing asset (absolute path or one
+        // relative to the project root); absent = fresh generation.
+        let sourceImagePath: string | undefined;
+        const src = s(a.source_image);
+        if (src) sourceImagePath = path.isAbsolute(src) ? src : path.join(projectRoot(), src);
+        const r = await this.imgHook.generate(prompt, { aspect, projectId: pid, sourceImagePath });
+        if (r.assetId) reg.images.push({ assetId: r.assetId, imagePath: r.path, width: r.width, height: r.height });
+        return txt(`Generated image saved to ${r.path}. It is now a project asset and is shown inline in the chat — do NOT also write an SVG/placeholder or re-encode it.`);
+      }
       case 'search_skills': {
         if (!reg.skills) return errRes('skill tools are not enabled for this run');
         const r = await searchRegistry(registryBase(), String(a.query ?? ''), n(a.limit) ?? 8);
@@ -318,6 +351,7 @@ export class CodexBridge {
    unix socket; returns the bridge's MCP-shaped result verbatim. Kept dependency-
    free and defensive (the socket may drop). */
 const SHIM_TOOLS = JSON.stringify([
+  { name: 'generate_image', description: 'Generate (or edit) a REAL raster image from a text prompt and save it as a project asset shown inline in the chat. ALWAYS use this for any image/logo/icon/illustration/render request — never draw an SVG, ASCII art, or an HTML/CSS placeholder, and never use your built-in image tool (it produces no saved file here). To edit an existing image, pass its path as source_image. aspect may be "1:1" (default), "16:9", or "9:16".', inputSchema: { type: 'object', properties: { prompt: { type: 'string' }, aspect: { type: 'string' }, source_image: { type: 'string' } }, required: ['prompt'] } },
   { name: 'search_skills', description: 'Search the live Maestro skill registry for specialized SKILL.md instructions. Public search excludes disabled skills.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number' } }, required: ['query'] } },
   { name: 'get_skill', description: 'Fetch metadata for one registry skill by id, including audit, version, and original source state.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },
   { name: 'download_skill', description: 'Download a registry skill SKILL.md without installing it into the project.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },

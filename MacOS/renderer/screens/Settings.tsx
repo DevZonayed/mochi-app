@@ -326,7 +326,7 @@ function NotificationsPane() {
 
 /* ── Engines pane — which engine plays which role ───────────────────── */
 const STUDIO_ROLE_ROWS: { key: 'image' | 'video'; label: string; sub: string }[] = [
-  { key: 'image', label: 'Image generation', sub: 'In chat: Codex = free, built-in · Claude = fal.ai (uses your fal credits).' },
+  { key: 'image', label: 'Image generation', sub: 'Codex = native image_gen on your ChatGPT sign-in (no API key) · Claude = fal.ai. Codex falls back to an OpenAI key / fal if set.' },
   { key: 'video', label: 'Video generation', sub: 'Used by Media Studio (fal.ai).' },
 ];
 const ENGINE_OPTIONS = ['Claude Code', 'Codex'] as const;
@@ -398,7 +398,7 @@ function EnginesPane() {
           </Row>
         </GroupedList>
 
-        <GroupedList header="Media (preview)" footer="Image & video routing applies to Media Studio when the pipeline ships.">
+        <GroupedList header="Image & media" footer="Image generation applies to chat right now: pick which engine handles a generate-image request. Video routing is used by Media Studio.">
           {STUDIO_ROLE_ROWS.map((r, i) => (
             <Row key={r.key} last={i === STUDIO_ROLE_ROWS.length - 1}>
               <span style={{ flex: 1 }}>
