@@ -44,6 +44,7 @@ import {
 } from './engines.js';
 import { codexSpawnEnv } from './node-shim.js';
 import { harvestCodexRolloutImages } from './codex-rollout.js';
+import { coreSkillDirective } from './core-skills.js';
 import { resetFromRateLimitInfo, isUsageLimitMessage, parseUsageLimitReset, type RateLimitInfo } from './limit-reset.js';
 import { parseAsk, timeoutAnswer, ASK_BASE_MS } from './ask-question.js';
 import {
@@ -2823,7 +2824,12 @@ export class LocalEngine {
       if (project?.kind === 'design') prompt += DESIGN_DIRECTIVE;
       // Codex ships a native image_gen skill — nudge it to use that (not SVG) and
       // drop the PNG in the workspace so we can harvest + display it inline.
-      if (master === 'codex' && IMAGE_INTENT_RE.test(cur.input)) prompt += CODEX_IMAGE_NUDGE;
+      const imageTurn = IMAGE_INTENT_RE.test(cur.input);
+      if (master === 'codex' && imageTurn) prompt += CODEX_IMAGE_NUDGE;
+      // Core skills (operator-private, Mac-local — see core-skills.ts): forcefully
+      // injected on matching turns for BOTH engines. Image-intent turns carry the
+      // operator's design DNA so generated visuals follow the proven client style.
+      if (imageTurn) prompt += coreSkillDirective('image');
       // Vision input: images the user attached to this message. Read + sniff each
       // ONCE from disk; keep only real png/jpeg/gif/webp (ignore a wrong client
       // mime, and never relabel — a bad type would 400 the whole Claude turn).
