@@ -102,15 +102,28 @@ try { engine.setPublishing(publishing); } catch (e) { warn('setPublishing', e); 
 try {
   engine.setImageGen(async (prompt, opts) => {
     const editing = !!(opts.sourceImagePath || opts.sourceImageUrl);
-    const codexCanEdit = !editing || !!(opts.sourceImagePath && existsSync(opts.sourceImagePath));
-    const codexReady = store.routing().image === 'codex' && engine.status('codex').available;
-    if (codexReady && codexCanEdit) {
+    // The "Codex" image route: NATIVE first — Codex's built-in image_gen tool on
+    // the operator's ChatGPT sign-in, NO API key (one-shot non-ephemeral `codex
+    // exec`; the PNG is decoded from the session rollout, the only place exec mode
+    // surfaces the bytes). Fallbacks, in order: gpt-image-2 via a stored OpenAI key,
+    // then fal. Codex/OpenAI edits need a LOCAL source file; a url-only source → fal.
+    const localEditOk = !editing || !!(opts.sourceImagePath && existsSync(opts.sourceImagePath));
+    if (store.routing().image === 'codex' && localEditOk && engine.status('codex').available) {
+      const falReady = providers.list().some(c => c.provider === 'fal');
+      const hasOpenaiKey = !!providers.getLocalKey('openai');
       try {
         return await engine.imageViaCodex(prompt, { aspect: opts.aspect, projectId: opts.projectId, sourceImagePath: opts.sourceImagePath });
       } catch (e) {
-        const falReady = providers.list().some(c => c.provider === 'fal');
-        if (!falReady) throw e; // no fal to fall back to — surface codex's error
+        if (!hasOpenaiKey && !falReady) throw e; // nothing to fall back to — surface codex's error
       }
+      if (hasOpenaiKey) {
+        try {
+          return await engine.imageViaOpenAI(prompt, { aspect: opts.aspect, projectId: opts.projectId, sourceImagePath: opts.sourceImagePath });
+        } catch (e) {
+          if (!falReady) throw e; // no fal to fall back to — surface OpenAI's error
+        }
+      }
+      // else fall through to fal below
     }
     const asset = editing
       ? await media.generateAndWait({ modelKey: 'flux-kontext', prompt, projectId: opts.projectId ?? null, imageUrl: opts.sourceImageUrl, imagePath: opts.sourceImagePath, aspect: opts.aspect })

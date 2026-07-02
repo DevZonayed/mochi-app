@@ -11,7 +11,7 @@
    UI can never claim "signed in" in one place and "not signed in" in another. */
 
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, readdirSync, statSync, lstatSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, statSync, lstatSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
@@ -55,6 +55,8 @@ import {
   type EngineState, type DownloadProgress,
 } from './engines.js';
 import { codexSpawnEnv } from './node-shim.js';
+import { harvestCodexRolloutImages } from './codex-rollout.js';
+import { coreSkillDirective } from './core-skills.js';
 import { resetFromRateLimitInfo, isUsageLimitMessage, parseUsageLimitReset, type RateLimitInfo } from './limit-reset.js';
 import { parseAsk, timeoutAnswer, ASK_BASE_MS } from './ask-question.js';
 import {
@@ -2061,19 +2063,24 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   // run with any Maestro MCP tools uses that sandbox. Never on reviewer passes
   // OR on plan-mode passes.
   const bridge = (!effectiveReadOnly && ctx?.codexBridge && ctx.projectId) ? ctx.codexBridge : undefined;
-  const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId, git: ctx?.gitCtx, emitConfirm: ctx?.emitConfirm, sessionId: ctx?.sessionId ?? null }) : undefined;
+  const codexReg = bridge ? bridge.register(ctx!.projectId ?? null, { skills: !!ctx?.projectId, bg: !!ctx?.projectId, img: !!ctx?.projectId, git: ctx?.gitCtx, emitConfirm: ctx?.emitConfirm, sessionId: ctx?.sessionId ?? null }) : undefined;
   // The operator's custom stdio MCP servers (Settings → MCP servers), as codex
   // `-c mcp_servers.<name>={…}` TOML fragments. Same gating as the maestro bridge
   // above — no custom MCP in read-only / plan-mode runs.
   const customCodex = (!effectiveReadOnly && ctx?.customCodexServers) ? ctx.customCodexServers : [];
   const anyMcp = !!codexReg || customCodex.length > 0;
   const sandbox = anyMcp ? 'danger-full-access' : (effectiveReadOnly ? 'read-only' : 'workspace-write');
+  // Image turns must NOT be --ephemeral: the built-in image_gen tool's PNG bytes
+  // exist ONLY in the session rollout file (see harvestCodexRolloutImages above),
+  // and ephemeral sessions write no rollout. Every other turn stays ephemeral so
+  // Maestro runs don't pollute ~/.codex/sessions or the `codex resume` picker.
+  const keepRollout = !readOnly && !!ctx?.imageIntent && !!ctx?.publishing;
   // Plan-mode directive overlays the user's prompt: codex sees its real request
   // PLUS instructions to propose a plan and not act. The dialog later surfaces
   // codex's reply as the plan body for the operator to approve.
   const effectivePrompt = planMode ? `${prompt}${CODEX_PLAN_DIRECTIVE}` : prompt;
   const args = [
-    'exec', '--json', '--ephemeral', '--skip-git-repo-check',
+    'exec', '--json', ...(keepRollout ? [] : ['--ephemeral']), '--skip-git-repo-check',
     '-s', sandbox,
     ...(anyMcp ? ['-c', 'approval_policy=never'] : []),
     ...(codexReg ? ['-c', codexReg.mcpServerConfig] : []),
@@ -2101,6 +2108,7 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
     // workspace this run so we can harvest + display them inline (see harvest below).
     const runStart = Date.now();
     const imgCandidates = new Set<string>();
+    let threadId: string | undefined; // from thread.started — keys the rollout harvest
     const progress = () => hooks.onProgress?.(proseOf(items), items, { tokens: liveTokens, cost: 0 });
     const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 30 * 60 * 1000);
     const onAbort = () => { try { child.kill('SIGTERM'); } catch { /* gone */ } };
@@ -2112,7 +2120,8 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
       const t = line.trim();
       if (!t) return;
       try {
-        const ev = JSON.parse(t) as { type?: string; usage?: { input_tokens?: number; output_tokens?: number }; item?: { id?: string; type?: string; text?: string; content?: string; command?: string; path?: string; status?: string } };
+        const ev = JSON.parse(t) as { type?: string; thread_id?: string; usage?: { input_tokens?: number; output_tokens?: number }; item?: { id?: string; type?: string; text?: string; content?: string; command?: string; path?: string; status?: string } };
+        if (ev.type === 'thread.started' && ev.thread_id) threadId = ev.thread_id;
         if (ev.type === 'turn.completed' && ev.usage) { liveTokens += (ev.usage.input_tokens ?? 0) + (ev.usage.output_tokens ?? 0); progress(); }
         const item = ev.item;
         if (!item) return;
@@ -2197,6 +2206,10 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
       // Gated to image-intent primary turns (never the read-only reviewer) so a
       // normal coding turn that touches images isn't mistaken for a generation.
       let images: EngineRun['images'];
+      // (0) Images Codex produced via the real `generate_image` MCP tool — already
+      //     registered as Assets by the bridge's image hook. These are authoritative
+      //     (no path-sniffing needed) and are collected regardless of imageIntent.
+      const viaTool = codexReg?.collectedImages() ?? [];
       if (ctx?.imageIntent && !readOnly && ctx.publishing) {
         const out: NonNullable<EngineRun['images']> = [];
         const seenSize = new Set<number>(); // dedup the same image arriving via two paths
@@ -2209,6 +2222,23 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
           try { const a = ctx.publishing!.importAsset(abs, ctx.projectId); out.push({ assetId: a.id, imagePath: a.localPath ?? abs, width: a.width, height: a.height }); }
           catch { seenSize.delete(size); /* unreadable — let another candidate try */ }
         };
+        // (0) AUTHORITATIVE: PNG bytes decoded from the session rollout — the
+        //     built-in image_gen tool's actual output (see harvestCodexRolloutImages).
+        //     keepRollout dropped --ephemeral for exactly this. Bytes are written
+        //     into the project's assets dir and flow through the same take() dedup,
+        //     so a workspace copy of the same image can't double-register below.
+        if (keepRollout && threadId) {
+          const rollImgs = harvestCodexRolloutImages(threadId, /*cleanup*/ true);
+          if (rollImgs.length) {
+            const project = ctx.projectId ? ctx.store.getProject(ctx.projectId) : undefined;
+            const dir = assetsDirFor(project?.name);
+            try { mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
+            for (let i = 0; i < rollImgs.length; i++) {
+              const fp = path.join(dir, `generated-${Date.now().toString(36)}${i ? `-${i}` : ''}.png`);
+              try { writeFileSync(fp, rollImgs[i]); take(fp); } catch { /* skip this one */ }
+            }
+          }
+        }
         // (a) image paths parsed from codex's file events + shell commands. Take only
         //     in-workspace copies that match the nudge's generated-* naming (so a
         //     mere reference to a pre-existing repo image, e.g. `cat assets/hero.png`,
@@ -2239,6 +2269,9 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
         }
         images = out.length ? out : undefined;
       }
+      // The tool path is trusted even outside imageIntent (codex may generate on a
+      // turn our heuristic didn't flag); prepend so tool-made assets come first.
+      if (viaTool.length) images = [...viaTool, ...(images ?? [])].slice(0, 6);
       // Codex plan-mode parking: when this was a plan-only run, the agent's
       // final text IS the plan. Park on the shared planGate (same one
       // Claude's canUseTool uses) so the renderer's ExitPlanModeDialog
@@ -2544,55 +2577,102 @@ export class LocalEngine {
     setTimeout(() => send('SIGKILL'), 4000); // escalate if it ignores SIGTERM
   }
 
-  /** Generate an image via Codex's FREE native image_gen skill (no fal credits).
-      Backs the generate_image tool when Settings → Image generation = Codex. Runs
-      a one-shot `codex exec` in the project's assets dir and harvests the PNG. */
+  /** Generate/edit an image via Codex's NATIVE built-in image_gen tool — rides
+      the ChatGPT sign-in, NO API key. Runs a one-shot NON-ephemeral `codex exec`
+      (imageIntent:true) and lets runCodex decode the finished PNG out of the
+      session rollout file (see harvestCodexRolloutImages — the only place the
+      bytes land in exec mode). Primary backend for Settings → Image = Codex. */
   async imageViaCodex(prompt: string, opts: { aspect?: string; projectId?: string | null; sourceImagePath?: string }): Promise<ImageGenResult> {
     const st = this.status('codex');
-    if (!st.available) throw Object.assign(new Error(`Codex isn’t ready for image generation — ${st.reason || 'sign into Codex'}. Or set Image generation to Claude (fal) in Settings.`), { statusCode: 503 });
+    if (!st.available) throw Object.assign(new Error(`Codex isn’t ready for image generation — ${st.reason || 'sign into Codex'}. Or set Image generation to Claude (fal) in Settings.`), { statusCode: 503, code: 'codex-unavailable' });
     if (!this.publishing) throw Object.assign(new Error('image pipeline not initialised'), { statusCode: 500 });
-    const project = opts.projectId ? this.store.getProject(opts.projectId) : undefined;
-    const assetsDir = assetsDirFor(project?.name); // stable ~/Maestro/<project>/assets — not the repo
     const orient = opts.aspect === '9:16' ? ' Portrait orientation.' : opts.aspect === '16:9' ? ' Landscape orientation.' : '';
-    // Edit mode: a source image is attached via `-i` so codex SEES the original;
-    // we instruct image_gen to apply only the change and keep the rest identical.
     const editing = !!opts.sourceImagePath && existsSync(opts.sourceImagePath);
-    // Edits run in an isolated, hidden work dir UNDER the assets dir. The source
-    // image lives in the PARENT dir, so it can never be in cwd → the harvest can't
-    // mistake the unchanged original for the new output, and the dir holds only
-    // this run's file (no stale-image / dir-budget confusion). The `.`-prefix makes
-    // recentImagesUnder skip it on normal runs; importAsset references files in
-    // place, so a sub-dir of the assets tree keeps them persistent.
-    const dir = editing ? path.join(assetsDir, `.edit-${Date.now().toString(36)}`) : assetsDir;
-    if (editing) { try { mkdirSync(dir, { recursive: true }); } catch { /* exists */ } }
-    const outName = `generated-${Date.now().toString(36)}.png`;
+    const guard = `\n\nDo NOT write any files, do NOT run scripts/image_gen.py or ask for an API key, and do NOT produce an SVG/ASCII/HTML placeholder — one built-in image_gen call is the entire task. The result is collected automatically.`;
     const imgPrompt = editing
-      ? `Use your built-in image_gen skill to EDIT the attached image. Apply ONLY this change and keep the rest of the image as close to the original as possible (same subject, composition, and style):\n${prompt}${orient}\n\n` +
-        `Do NOT return an SVG, a placeholder, or a stock-photo download. After editing, COPY the final image into the current working directory named ${outName} and state the saved path. Do not create any other files.`
-      : `Use your built-in image_gen skill to generate this image (NOT an SVG, NOT a placeholder, NOT a stock-photo download):\n${prompt}${orient}\n\n` +
-        `After generating, COPY the final selected image into the current working directory named ${outName} and state the saved path. Do not create any other files.`;
-    // Default model (no -m): the configured codex model has image_gen; a codex-
-    // specialized model may not. imageIntent:true turns on the harvest.
+      ? `Use your built-in image_gen tool to EDIT the attached image. Apply ONLY this change and keep everything else as close to the original as possible (same subject, composition, and style):\n${prompt}${orient}${guard}`
+      : `Use your built-in image_gen tool to generate this image:\n${prompt}${orient}${guard}`;
     const t0 = Date.now();
-    const run = await runCodex(imgPrompt, dir, {}, false, undefined,
-      { store: this.store, projectId: opts.projectId ?? null, publishing: this.publishing, imageIntent: true },
-      editing ? [opts.sourceImagePath!] : undefined);
+    // Isolated scratch cwd: the run needs no workspace access — the PNG comes
+    // from the rollout, and runCodex registers it as an Asset itself.
+    const dir = path.join(tmpdir(), `maestro-imagegen-${t0.toString(36)}`);
+    try { mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
+    let run: EngineRun;
+    try {
+      run = await runCodex(imgPrompt, dir, {}, false, undefined,
+        { store: this.store, projectId: opts.projectId ?? null, publishing: this.publishing, imageIntent: true },
+        editing ? [opts.sourceImagePath!] : undefined);
+    } finally {
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
     const img = run.images?.[0];
-    if (!img) throw Object.assign(new Error(`Codex did not ${editing ? 'edit the' : 'return an'} image — try again, or switch Image generation to Claude (fal) in Settings.`), { statusCode: 502 });
-    // No-op guard: if image_gen returned bytes identical to an existing image,
-    // importAsset's content-dedup hands back that PRE-EXISTING asset (e.g. the
-    // unchanged source) instead of a fresh one. Detect via createdAt < t0 and
-    // reject — never return or re-stamp a pre-existing asset.
+    if (!img) throw Object.assign(new Error(`Codex did not ${editing ? 'edit the' : 'return an'} image — try again, or switch Image generation to Claude (fal) in Settings.`), { statusCode: 502, code: 'codex-no-image' });
+    // Freshness guard: content-dedup can hand back a PRE-EXISTING asset (e.g. the
+    // unchanged source on an edit) — never return or re-stamp a stale asset.
     const harvested = this.store.getAsset(img.assetId);
     if (editing && harvested && harvested.createdAt < t0) {
-      throw Object.assign(new Error('Codex returned the image unchanged — try again, or describe the change differently.'), { statusCode: 502 });
+      throw Object.assign(new Error('Codex returned the image unchanged — try again, or describe the change differently.'), { statusCode: 502, code: 'codex-no-image' });
     }
-    // Codex PNGs import as plain assets (source 'import', no prompt). Stamp the
-    // prompt + model so Media Studio can regenerate them too — but keep source
-    // 'import': it was a free Codex image, not a fal spend, so it must stay out of
-    // the fal cost ledger.
     try { this.store.updateAsset(img.assetId, { model: 'codex', prompt: prompt.slice(0, 2000) }); } catch { /* best effort */ }
     return { path: img.imagePath, assetId: img.assetId, alt: prompt.slice(0, 200), width: img.width, height: img.height };
+  }
+
+  /** OPTIONAL second-tier backend for Settings → Image = Codex: gpt-image-2 via
+      the OpenAI Images API. Only reached when the native imageViaCodex path above
+      fails AND the operator has stored an OpenAI API key (the ChatGPT subscription
+      login can't drive the Images API — most operators won't have this). Without a
+      key this throws `openai-key-missing` and the caller (main.ts) falls back to
+      fal. Never required: the native rollout-harvest path is the primary. */
+  async imageViaOpenAI(prompt: string, opts: { aspect?: string; projectId?: string | null; sourceImagePath?: string }): Promise<ImageGenResult> {
+    const key = this.providers?.getLocalKey('openai');
+    if (!key) throw Object.assign(new Error('OpenAI image generation needs an OpenAI API key (Settings → Accounts) — the ChatGPT subscription can’t drive the Images API. Or set Image generation to Claude (fal) in Settings.'), { statusCode: 503, code: 'openai-key-missing' });
+    if (!this.publishing) throw Object.assign(new Error('image pipeline not initialised'), { statusCode: 500 });
+    // gpt-image-2 sizes: portrait / landscape / square (no free-form aspect).
+    const size = opts.aspect === '9:16' ? '1024x1536' : opts.aspect === '16:9' ? '1536x1024' : '1024x1024';
+    const editing = !!opts.sourceImagePath && existsSync(opts.sourceImagePath);
+    let b64: string | undefined; let apiErr: string | undefined;
+    try {
+      if (editing) {
+        // /v1/images/edits — multipart; input_fidelity:high keeps the source close.
+        const srcPath = opts.sourceImagePath!;
+        const buf = readFileSync(srcPath);
+        const ext = (srcPath.split('?')[0].match(/\.([a-zA-Z0-9]{2,4})$/)?.[1] ?? 'png').toLowerCase();
+        const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : 'image/png';
+        const form = new FormData();
+        form.set('model', 'gpt-image-2');
+        form.set('prompt', prompt);
+        form.set('size', size);
+        form.set('input_fidelity', 'high');
+        form.set('image', new Blob([buf], { type: mime }), path.basename(srcPath));
+        const res = await fetch('https://api.openai.com/v1/images/edits', { method: 'POST', headers: { authorization: `Bearer ${key}` }, body: form });
+        if (!res.ok) { apiErr = `OpenAI ${res.status}: ${(await res.text()).slice(0, 200)}`; }
+        else b64 = ((await res.json()) as { data?: { b64_json?: string }[] }).data?.[0]?.b64_json;
+      } else {
+        const res = await fetch('https://api.openai.com/v1/images/generations', {
+          method: 'POST',
+          headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'gpt-image-2', prompt, size, quality: 'medium', n: 1 }),
+        });
+        if (!res.ok) { apiErr = `OpenAI ${res.status}: ${(await res.text()).slice(0, 200)}`; }
+        else b64 = ((await res.json()) as { data?: { b64_json?: string }[] }).data?.[0]?.b64_json;
+      }
+    } catch (e) {
+      apiErr = e instanceof Error ? e.message : String(e);
+    }
+    if (apiErr) throw Object.assign(new Error(`OpenAI image generation failed — ${apiErr}. Or switch Image generation to Claude (fal) in Settings.`), { statusCode: 502 });
+    if (!b64) throw Object.assign(new Error(`OpenAI returned no image — try again, or switch Image generation to Claude (fal) in Settings.`), { statusCode: 502 });
+    // Write the bytes into the project's assets dir and register as an Asset. Keep
+    // source 'import' (importAsset) — it wasn't a fal spend, so it stays out of the
+    // fal cost ledger — but stamp model + prompt so Media Studio can regenerate it.
+    const imgBuf = Buffer.from(b64, 'base64');
+    const project = opts.projectId ? this.store.getProject(opts.projectId) : undefined;
+    const dir = assetsDirFor(project?.name);
+    try { mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
+    const file = path.join(dir, `generated-${Date.now().toString(36)}.png`);
+    writeFileSync(file, imgBuf);
+    const asset = this.publishing.importAsset(file, opts.projectId ?? null);
+    try { this.store.updateAsset(asset.id, { model: 'gpt-image-2', prompt: prompt.slice(0, 2000) }); } catch { /* best effort */ }
+    return { path: asset.localPath ?? file, assetId: asset.id, alt: prompt.slice(0, 200), width: asset.width, height: asset.height };
   }
 
   /** Is this engine actually runnable right now, and if not, exactly why. */
@@ -3253,11 +3333,17 @@ export class LocalEngine {
       // Image intent → inject the imagegen-skill methodology so the agent shapes a
       // structured, high-quality prompt before generating. Claude routes through the
       // maestro generate_image tool (mounted when imageGen is configured + not plan);
-      // Codex uses its native built-in image_gen. Both run under autopilot.
-      if (looksLikeImageRequest(cur.input)) {
+      // Codex uses its native built-in image_gen (harvested from the session rollout).
+      // Both run under autopilot.
+      const imageTurn = looksLikeImageRequest(cur.input);
+      if (imageTurn) {
         if (master === 'codex') prompt += IMAGE_DIRECTIVE_CODEX;
         else if (!opts.plan && this.imageGen) prompt += IMAGE_DIRECTIVE_CLAUDE;
       }
+      // Core skills (operator-private, Mac-local — see core-skills.ts): forcefully
+      // injected on matching turns for BOTH engines. Image-intent turns carry the
+      // operator's design DNA so generated visuals follow the proven client style.
+      if (imageTurn) prompt += coreSkillDirective('image');
       // Vision input: images the user attached to this message. Read + sniff each
       // ONCE from disk; keep only real png/jpeg/gif/webp (ignore a wrong client
       // mime, and never relabel — a bad type would 400 the whole Claude turn).
