@@ -19,6 +19,8 @@ import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice, ChatSess
 import type { PublishingEngine } from './publishing.js';
 import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
+import { attachedFilesBlock } from './attachments.js';
+import { contextWindowFor, historyCharBudget, handoffBrief } from './chat-history.js';
 import { toolLabel, relPath } from './tool-label.js';
 import { thinkingConfigFor } from './thinking-config.js';
 import { looksLikeImageRequest } from './image-intent.js';
@@ -2762,22 +2764,17 @@ export class LocalEngine {
     catch { return { steered: false }; }
   }
 
-  /** Recent finished turns of a chat session, formatted for prompt stitching
-      (codex has no resumable session, so context rides in the prompt). */
-  private chatHistory(sessionId: string, excludeJobId: string): string {
+  /** Stitch prior chat turns into a text recap for a fresh (non-resumed) run —
+      Codex always, or Claude on a first/reset turn. Sized to the TARGET model's
+      context window (not a flat cap) and built from each turn's STRUCTURED
+      transcript (tool calls + decisions), so the switch loses far less than a
+      truncated prose stitch. See chat-history.ts. */
+  private chatHistory(sessionId: string, excludeJobId: string, engine?: EngineId, model?: string): string {
     const turns = this.store.listJobs(undefined, sessionId)
       .filter(j => j.id !== excludeJobId && j.status === 'done' && j.output)
-      .sort((a, b) => a.createdAt - b.createdAt)
-      .slice(-8);
-    let total = 0;
-    const parts: string[] = [];
-    for (const t of turns) {
-      const block = `[User]: ${t.input.slice(0, 1500)}\n[Assistant]: ${(t.output ?? '').slice(0, 2500)}`;
-      total += block.length;
-      if (total > 12000) break;
-      parts.push(block);
-    }
-    return parts.join('\n\n');
+      .map(j => ({ input: j.input, output: j.output, transcript: j.transcript, createdAt: j.createdAt }));
+    const budget = historyCharBudget(contextWindowFor(engine, model));
+    return handoffBrief(turns, budget);
   }
 
   /** Arm an auto-answer countdown for an unanswered AskUserQuestion at the tail of a
@@ -3175,7 +3172,7 @@ export class LocalEngine {
       if (resumeId) {
         prompt = cur.input;
       } else if (isChat) {
-        const history = this.chatHistory(session.id, cur.id);
+        const history = this.chatHistory(session.id, cur.id, master, masterModel);
         prompt = history
           ? `Earlier conversation in this chat:\n\n${history}\n\n---\n\nCurrent message:\n${cur.input}`
           : cur.input;
@@ -3218,28 +3215,22 @@ export class LocalEngine {
       const claudeImages = isClaudeMaster ? resolvedImages.map(r => ({ mime: r.mime, b64: r.b64 })) : [];
       const codexImageFiles = master === 'codex' ? resolvedImages.map(r => r.path) : [];
 
-      // Attached non-image files: the composer's chip POSITION is preserved as
-      // `@<absPath>` inline in the user's prompt (substituted in localApi from
-      // each chip's `«attach:id»` placeholder), so the agent reads them with its
-      // `Read` tool at the spot the user typed the chip. We only need a small
-      // back-compat path for jobs persisted BEFORE this change, where text was
-      // inlined into `f.content` and binaries had a trailing "saved at $PATH"
-      // hint — surface those as a trailing block so old jobs still resume.
-      const legacy = (cur.inputFiles ?? []).filter(f => (f.kind === 'text' && f.content) || (f.kind === 'file' && f.path && !cur.input.includes(`@${f.path}`)));
-      if (legacy.length) {
-        const fileParts: string[] = [];
-        let fileBudget = 400 * 1024;
-        for (const f of legacy) {
-          if (f.kind === 'text' && f.content) {
-            const body = f.content.length > fileBudget ? f.content.slice(0, fileBudget) + '\n…(truncated)' : f.content;
-            fileBudget -= Math.min(f.content.length, fileBudget);
-            fileParts.push(`### Attached file: ${f.name}\n\`\`\`\n${body}\n\`\`\``);
-          } else if (f.kind === 'file' && f.path && existsSync(f.path)) {
-            fileParts.push(`The user attached the file \`${f.name}\` (saved at ${f.path}). Read it with your tools if it's relevant.`);
-          }
-        }
-        if (fileParts.length) prompt += `\n\n---\n\nThe user attached the following file(s):\n\n${fileParts.join('\n\n')}`;
-      }
+      // Attached non-image files. The composer preserves each chip's POSITION as
+      // `@<absPath>` inline in the user's prompt (substituted in localApi from the
+      // chip's `«attach:id»` placeholder). BUT the Agent SDK does NOT expand
+      // `@path` mentions the way the Claude Code CLI does — the path is sent as
+      // plain literal text, so on its own it leaves the model with ZERO content:
+      // it would just echo the path back ("look at @…/Pasted_text_xxx.txt") without
+      // ever seeing what was pasted. So we INLINE the actual text of every attached
+      // TEXT file for THIS turn as a trailing block, guaranteeing the model has it.
+      // This runs only for the CURRENT job's attachments — follow-up turns are
+      // separate jobs with no `inputFiles`, so a big paste is never re-blasted on
+      // later turns, and the stored/relayed message keeps the clean `@path` form.
+      // Binary files can't be inlined; they keep the inline `@path` + a Read hint.
+      prompt += attachedFilesBlock(cur.inputFiles ?? [], cur.input, {
+        exists: existsSync,
+        readText: (p) => readFileSync(p, 'utf8'),
+      });
 
       // Project memory (.continuum): on a FRESH turn (no resumed Claude session
       // that already holds it), inject the durable STATE + recent checkpoints as
