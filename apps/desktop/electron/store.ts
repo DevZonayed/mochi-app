@@ -421,6 +421,8 @@ export type AppEventKind =
   | 'job-done' | 'job-failed' | 'job-cancelled'
   | 'approval-created' | 'approval-resolved'
   | 'schedule-fired' | 'clone-done' | 'clone-failed'
+  | 'repo-created' | 'repo-create-failed'
+  | 'memory-repo-created' | 'memory-sync-failed'
   | 'research' | 'publish' | 'comm' | 'asset';
 export interface AppEvent {
   id: string; ts: number; kind: AppEventKind; title: string; subtitle?: string;
@@ -554,8 +556,18 @@ export interface AppSettings {
   notifications?: NotificationSettings;
   /** Opt-in: try a direct desktop↔phone WebRTC channel before the relay (default off). */
   p2pEnabled?: boolean;
+  /** Auto-create a private GitHub repo when a project is created with a folder (default ON). */
+  autoCreateRepo?: boolean;
+  /** Auto-push session commits to the GitHub remote after every turn (default ON). */
+  autoPushCommits?: boolean;
+  /** Mirror every project's .continuum memory into the memory repository (default ON). */
+  memorySyncEnabled?: boolean;
+  /** Where memory repos live: '' = the personal profile, else an org login. */
+  memoryRepoOwner?: string;
+  /** Memory repository name (default 'maestro-memory'). */
+  memoryRepoName?: string;
 }
-export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], p2pEnabled: false, notifications: { ...DEFAULT_NOTIFICATIONS } };
+export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], p2pEnabled: false, notifications: { ...DEFAULT_NOTIFICATIONS }, autoCreateRepo: true, autoPushCommits: true, memorySyncEnabled: true, memoryRepoOwner: '', memoryRepoName: 'maestro-memory' };
 
 export interface BudgetData { cap: number; spent: number; byProject: { projectId: string; name: string; color: string; spent: number }[] }
 export interface CostsData {

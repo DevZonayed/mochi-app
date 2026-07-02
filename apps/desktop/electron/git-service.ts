@@ -166,14 +166,18 @@ export class GitService {
       the caller can fire-and-forget without branching on the reason.
 
       Safe to call multiple times; only the first call where conditions allow
-      will actually run `git branch -m`. */
-  async renameSessionBranch(session: ChatSession): Promise<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }> {
+      will actually run `git branch -m`.
+
+      `slugOverride` (from the AI session namer) wins over the deterministic
+      title-derived slug — it's re-normalized through branchSlug so a bad model
+      reply can never produce an unsafe ref name. */
+  async renameSessionBranch(session: ChatSession, slugOverride?: string): Promise<{ ok: boolean; from?: string; to?: string; unchanged?: boolean; reason?: string }> {
     if (session.branchRenamedAt) return { ok: true, unchanged: true, reason: 'already renamed' };
     if (!session.branch || !session.codename || !session.worktreePath) return { ok: true, unchanged: true, reason: 'no worktree branch' };
     const project = this.store.getProject(session.projectId);
     if (!project?.path) return { ok: true, unchanged: true, reason: 'no project path' };
 
-    const slug = branchSlug(session.title);
+    const slug = slugOverride?.trim() ? branchSlug(slugOverride) : branchSlug(session.title);
     // If the slug is still the codename or empty, the title hasn't ripened.
     if (!slug || slug === session.codename || slug === 'chat') return { ok: true, unchanged: true, reason: 'title not informative yet' };
 
@@ -203,6 +207,42 @@ export class GitService {
     // Re-emit status with the new branch name.
     try { await this.fullStatus({ ...session, branch: to, branchRenamedAt: Date.now() }, { withPr: false }); } catch { /* best effort */ }
     return { ok: true, from: session.branch, to, unchanged: res.unchanged };
+  }
+
+  /** Auto-push: send the session branch to GitHub whenever local commits exist
+      that the remote doesn't have — "no code stays local once a portion of work
+      is done". Gated by Settings.autoPushCommits (default ON). Quietly no-ops
+      when there's no token / no GitHub remote / nothing new, so the turn-end
+      caller can fire-and-forget. */
+  async autoPushSession(session: ChatSession): Promise<{ ok: boolean; pushed?: boolean; reason?: string }> {
+    if (this.store.getSettings().autoPushCommits === false) return { ok: true, pushed: false, reason: 'auto-push disabled' };
+    const token = this.token();
+    if (!token) return { ok: true, pushed: false, reason: 'connect GitHub first' };
+    const project = this.store.getProject(session.projectId);
+    const dir = project ? this.dirFor(session, project) : null;
+    if (!dir || !session.branch || !project?.path) return { ok: true, pushed: false, reason: 'no worktree or branch' };
+    if (!parseGitHubRemote(repoInfo(project.path).remote)) return { ok: true, pushed: false, reason: 'no GitHub remote' };
+    // Anything to push? Compare against origin/<branch> when it exists (normal
+    // incremental push), otherwise against the base (first push of the branch).
+    const originRef = `origin/${session.branch}`;
+    const ref = localRefExists(dir, originRef) ? originRef : (session.baseBranch ?? resolveBaseBranch(dir));
+    if (aheadBehind(dir, ref).ahead === 0) return { ok: true, pushed: false, reason: 'nothing to push' };
+    const res = pushBranch(dir, session.branch, { token });
+    await this.fullStatus(session, { withPr: false }).catch(() => { /* status is best effort */ });
+    return { ok: res.ok, pushed: res.ok, reason: res.reason };
+  }
+
+  /** Post-turn pipeline, in the only order that works: rename FIRST (rename
+      refuses once the branch is on GitHub), THEN push. `slugOverride` carries
+      the AI-generated branch slug so branch + session title stay in sync. */
+  async syncAfterTurn(sessionId: string, slugOverride?: string): Promise<void> {
+    const session = this.store.getSession(sessionId);
+    if (!session) return;
+    if (!session.branchRenamedAt) {
+      try { await this.renameSessionBranch(session, slugOverride); } catch { /* best effort */ }
+    }
+    const fresh = this.store.getSession(sessionId) ?? session;
+    try { await this.autoPushSession(fresh); } catch { /* best effort */ }
   }
 
   /** Sessions worth polling for PR state (have a branch + live worktree, not archived). */

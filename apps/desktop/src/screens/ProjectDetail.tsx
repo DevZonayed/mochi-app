@@ -2489,6 +2489,23 @@ const writeQueue = (sid: string | null, q: string[]): void => {
   catch { /* ignore quota / serialisation */ }
 };
 
+// Per-chat composer draft, persisted to localStorage so a typed-but-unsent
+// prompt survives navigating away and back. A NEW chat (no session yet) keys
+// by project — click "New chat" in the same project anywhere and the drafted
+// prompt is right there; existing chats key by session. The draft is removed
+// automatically on send because RichComposer's clear() fires onTextChange('').
+const DRAFT_KEY = (projectId: string | null | undefined, sid: string | null) =>
+  sid ? `maestro.chat.draft.${sid}` : `maestro.chat.draft.new.${projectId ?? ''}`;
+const readDraft = (projectId: string | null | undefined, sid: string | null): string => {
+  try { return localStorage.getItem(DRAFT_KEY(projectId, sid)) || ''; } catch { return ''; }
+};
+const writeDraft = (projectId: string | null | undefined, sid: string | null, v: string): void => {
+  try {
+    if (v.trim()) localStorage.setItem(DRAFT_KEY(projectId, sid), v);
+    else localStorage.removeItem(DRAFT_KEY(projectId, sid));
+  } catch { /* ignore quota / serialisation */ }
+};
+
 // Composer @-mentions — typing `@` suggests a capability; selecting it turns the
 // capability on (shown as its iconed capsule in the toolbar) and tidies the token.
 const MENTIONS: { id: string; label: string; icon: IconName; desc: string }[] = [
@@ -2814,6 +2831,14 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
 
   // Controlled active session: follow the parent (tab switch / rail pick / new chat).
   React.useEffect(() => { setActiveId(sessionId); }, [sessionId]);
+
+  // Restore a persisted composer draft when the chat mounts or switches — only
+  // into an EMPTY composer, so text the user is mid-typing is never clobbered.
+  // setText() fires onTextChange, which syncs the `text` state + re-persists.
+  React.useEffect(() => {
+    const draft = readDraft(projectId, activeId);
+    if (draft && !(composerRef.current?.getText() ?? '').trim()) composerRef.current?.setText(draft);
+  }, [activeId, projectId]);
 
   // Turns of the open session (ascending — a chat thread). Queue is per-session.
   React.useEffect(() => {
@@ -3390,7 +3415,7 @@ export function ChatThread({ projectId, project, sessionId, onSessionCreated, on
                 ref={composerRef}
                 disabled={!projectId}
                 placeholder={!projectId ? 'Pick a project first' : (streaming && attachments.length) ? 'Send image — interrupts the current run (⏎)' : streaming ? 'Queue a message… (⏎ queue · ⌘⏎ run next)' : planMode ? 'Describe a goal — I\'ll plan it first…' : turns.length > 0 ? 'Add a follow up…' : 'Message the agent… (type @ to mention · drop a file or folder)'}
-                onTextChange={setText}
+                onTextChange={v => { setText(v); writeDraft(projectId, activeRef.current, v); }}
                 onChips={info => {
                   setComposerBrowser(info.hasBrowser);
                   // Keep `attachments` in lockstep with the inline chips: when a chip is

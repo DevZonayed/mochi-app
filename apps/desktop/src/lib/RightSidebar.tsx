@@ -8,12 +8,12 @@
 import React from 'react';
 import { Icon } from './icons';
 import { FileTypeIcon } from './fileIcons';
-import { api, type Project, type DirEntry, type CmdOutput } from './api';
+import { api, type Project, type ChatSession, type DirEntry, type CmdOutput } from './api';
 
 export interface CheckItem { id: string; title: string; verdict: 'approved' | 'needs-work'; text: string }
 
 /* ── lazy file tree node ──────────────────────────────────────────────── */
-function DirNode({ projectId, entry, depth, onOpenFile }: { projectId: string; entry: DirEntry; depth: number; onOpenFile: (path: string) => void }) {
+function DirNode({ projectId, sessionId, entry, depth, onOpenFile }: { projectId: string; sessionId?: string; entry: DirEntry; depth: number; onOpenFile: (path: string) => void }) {
   const [open, setOpen] = React.useState(false);
   const [children, setChildren] = React.useState<DirEntry[] | null>(null);
   const [loading, setLoading] = React.useState(false);
@@ -22,7 +22,7 @@ function DirNode({ projectId, entry, depth, onOpenFile }: { projectId: string; e
     const next = !open; setOpen(next);
     if (next && children === null) {
       setLoading(true);
-      api.listDir(projectId, entry.path).then(r => setChildren(r?.entries ?? [])).catch(() => setChildren([])).finally(() => setLoading(false));
+      api.listDir(projectId, entry.path, sessionId).then(r => setChildren(r?.entries ?? [])).catch(() => setChildren([])).finally(() => setLoading(false));
     }
   };
   return (
@@ -43,7 +43,7 @@ function DirNode({ projectId, entry, depth, onOpenFile }: { projectId: string; e
       {open && (
         <div>
           {loading && <div style={{ padding: `2px 8px 2px ${10 + (depth + 1) * 12}px`, font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>…</div>}
-          {children?.map(c => <DirNode key={c.path} projectId={projectId} entry={c} depth={depth + 1} onOpenFile={onOpenFile} />)}
+          {children?.map(c => <DirNode key={c.path} projectId={projectId} sessionId={sessionId} entry={c} depth={depth + 1} onOpenFile={onOpenFile} />)}
         </div>
       )}
     </div>
@@ -153,10 +153,18 @@ function CommandDock({ projectId, open, onToggle }: { projectId: string; open: b
 /* ── the sidebar ──────────────────────────────────────────────────────── */
 type TopTab = 'files' | 'changes' | 'checks';
 
-export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, onToggleCollapse }: {
-  project: Project; changed: string[]; checks: CheckItem[]; onOpenFile: (path: string) => void; collapsed: boolean; onToggleCollapse: () => void;
+export function RightSidebar({ project, session, changed, checks, onOpenFile, collapsed, onToggleCollapse }: {
+  project: Project;
+  /** The active chat session. When it has a worktree, the file tree shows THAT
+      session's branch checkout (each chat works on its own branch) instead of
+      the project root. */
+  session?: ChatSession | null;
+  changed: string[]; checks: CheckItem[]; onOpenFile: (path: string) => void; collapsed: boolean; onToggleCollapse: () => void;
 }) {
   const [tab, setTab] = React.useState<TopTab>('files');
+  // Session-worktree scope: only pass the sessionId once the session actually
+  // HAS a worktree — a brand-new chat (no branch yet) shows the project root.
+  const scopeSessionId = session?.worktreePath ? session.id : undefined;
   const [root, setRoot] = React.useState<DirEntry[] | null>(null);
   const [err, setErr] = React.useState('');
   const [q, setQ] = React.useState('');
@@ -176,8 +184,10 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
 
   const loadRoot = React.useCallback(() => {
     setRoot(null); setErr('');
-    api.listDir(project.id, '').then(r => setRoot(r?.entries ?? [])).catch(e => setErr(e instanceof Error ? e.message : 'Could not read folder'));
-  }, [project.id]);
+    api.listDir(project.id, '', scopeSessionId).then(r => setRoot(r?.entries ?? [])).catch(e => setErr(e instanceof Error ? e.message : 'Could not read folder'));
+  }, [project.id, scopeSessionId]);
+  // Auto-(re)load whenever the project OR the active session's worktree scope
+  // changes — switching chats swaps the tree to that chat's branch checkout.
   React.useEffect(() => { loadRoot(); }, [loadRoot]);
 
   if (collapsed) {
@@ -228,6 +238,16 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
       <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         {tab === 'files' && (
           <>
+            {/* Location indicator: exactly WHERE this tree points — the active
+                session's branch worktree, or the project root on its branch. */}
+            <div title={scopeSessionId ? `Session worktree · ${session?.worktreePath ?? ''}\nBranch · ${session?.branch ?? ''}` : `Project folder · ${project.path ?? ''}`}
+              style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', borderBottom: '0.5px solid var(--separator)', overflow: 'hidden' }}>
+              <Icon name="gitMerge" size={11} style={{ color: scopeSessionId ? 'var(--blue)' : 'var(--ink-tertiary)', flexShrink: 0 }} />
+              <span style={{ flex: 1, minWidth: 0, font: '600 10px/1.3 var(--font-mono)', color: scopeSessionId ? 'var(--blue)' : 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', direction: 'rtl', textAlign: 'left' }}>
+                {scopeSessionId ? (session?.branch ?? 'session worktree') : (project.name || 'project root')}
+              </span>
+              {scopeSessionId && <span style={{ flexShrink: 0, font: '700 8px/1 var(--font-text)', letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>worktree</span>}
+            </div>
             {searching && (
               <div style={{ flexShrink: 0, padding: '8px 10px', borderBottom: '0.5px solid var(--separator)' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 7, height: 30, padding: '0 9px', borderRadius: 8, background: 'var(--fill-secondary)' }}>
@@ -241,7 +261,7 @@ export function RightSidebar({ project, changed, checks, onOpenFile, collapsed, 
               {err ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>{err}</div>
                 : rootFiltered === null ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Loading…</div>
                 : rootFiltered.length === 0 ? <div style={{ padding: '10px 12px', font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>{q ? 'No matches.' : 'Empty folder.'}</div>
-                : rootFiltered.map(e => <DirNode key={e.path} projectId={project.id} entry={e} depth={0} onOpenFile={onOpenFile} />)}
+                : rootFiltered.map(e => <DirNode key={e.path} projectId={project.id} sessionId={scopeSessionId} entry={e} depth={0} onOpenFile={onOpenFile} />)}
             </div>
           </>
         )}

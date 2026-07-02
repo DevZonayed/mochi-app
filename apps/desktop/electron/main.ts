@@ -17,6 +17,7 @@ import { Providers } from './providers.js';
 import type { Approval, Job } from './store.js';
 import { createDispatch } from './localApi.js';
 import { GitService } from './git-service.js';
+import { MemorySync } from './memory-sync.js';
 import { buildModelGroups } from './models.js';
 import { HostClient } from './hostClient.js';
 import { DesktopP2PHost } from './p2p.js';
@@ -402,10 +403,16 @@ app.whenReady().then(() => {
   engine.setComms(whatsapp);
   whatsapp.resumeOnBoot();
   const gitService = new GitService(store, emit, providers);
-  // Hand the gitService to the engine so the post-turn auto-rename hook can
-  // run (otherwise it's a no-op — the engine treats gitService as optional).
+  // Hand the gitService to the engine so the post-turn name→rename→push
+  // pipeline can run (otherwise it's a no-op — gitService is optional).
   engine.setGitService(gitService);
-  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge);
+  // Memory repository: mirrors every project's .continuum into ONE private
+  // GitHub repo (Settings picks the owner). The engine schedules a debounced
+  // sync after each checkpoint; a boot sweep catches anything missed offline.
+  const memorySync = new MemorySync(store, providers, emit);
+  engine.setMemorySync(memorySync);
+  setTimeout(() => { void memorySync.syncAll().catch(() => { /* status carries errors */ }); }, 20_000);
+  const dispatch = createDispatch(store, engine, media, research, publishing, telegram, whatsapp, providers, emit, RELAY_URL, gitService, () => extensionBridge, memorySync);
   // Local control channel for the native browser extension (one app-owned port).
   extensionBridge = new ExtensionBridge(store, dispatch, (status) => emit('extension', status, { desktopOnly: true }));
   extensionBridge.start();
@@ -613,12 +620,44 @@ app.whenReady().then(() => {
     if (!root) throw new Error('this project has no folder on disk');
     return root;
   };
+  /* Candidate roots for a file RPC, in priority order:
+       1. the ACTIVE session's worktree (when a sessionId is passed) — the Files
+          panel is session-scoped: each chat works on its own branch/worktree,
+          so the tree must show THAT checkout, not the project root,
+       2. the project root,
+       3. every other session worktree of the project — chat path links carry
+          absolute worktree paths that must stay openable after switching chats.
+     Everything still funnels through resolveInsideRoot, so the escape/symlink
+     defenses hold for each candidate. */
+  const rootsFor = (projectId: unknown, sessionId?: unknown): string[] => {
+    const pid = String(projectId);
+    const roots: string[] = [];
+    const sid = sessionId == null ? '' : String(sessionId);
+    if (sid) {
+      const s = store.getSession(sid);
+      if (s && s.projectId === pid && s.worktreePath && existsSync(s.worktreePath)) roots.push(s.worktreePath);
+    }
+    const proj = store.getProject(pid)?.path;
+    if (proj && !roots.includes(proj)) roots.push(proj);
+    for (const s of store.listSessions()) {
+      if (s.projectId === pid && s.worktreePath && existsSync(s.worktreePath) && !roots.includes(s.worktreePath)) roots.push(s.worktreePath);
+    }
+    if (!roots.length) throw new Error('this project has no folder on disk');
+    return roots;
+  };
+  const resolveInRoots = (roots: string[], rel: string): string => {
+    let lastErr: unknown;
+    for (const r of roots) {
+      try { return resolveInsideRoot(r, rel); } catch (e) { lastErr = e; }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error('path escapes project');
+  };
 
   // Read a file's text — DESKTOP-ONLY, confined to the project folder. Never
   // added to the relay dispatch, so remotes can't read local files.
-  ipcMain.handle('maestro:readFile', async (_e, projectId: string, rel: string) => {
+  ipcMain.handle('maestro:readFile', async (_e, projectId: string, rel: string, sessionId?: string) => {
     try {
-      const real = resolveInsideRoot(projectRoot(projectId), rel);
+      const real = resolveInRoots(rootsFor(projectId, sessionId), rel);
       const st = await fsp.stat(real);
       if (!st.isFile()) return { ok: false, error: 'not a file' };
       if (st.size > 2 * 1024 * 1024) {
@@ -637,12 +676,12 @@ app.whenReady().then(() => {
   // overwriting binaries). Backs the in-app "edit + save" on the FileViewer
   // tab opened from a chat path link. Never added to the relay dispatch, so
   // remotes can't mutate local files.
-  ipcMain.handle('maestro:writeFile', async (_e, projectId: string, rel: string, text: string) => {
+  ipcMain.handle('maestro:writeFile', async (_e, projectId: string, rel: string, text: string, sessionId?: string) => {
     try {
       if (typeof text !== 'string') return { ok: false, error: 'text must be a string' };
       if (text.length > 4 * 1024 * 1024) return { ok: false, error: 'file too large to save here (4 MB cap)' };
       if (text.includes('\u0000')) return { ok: false, error: 'refused to write NUL byte (binary)' };
-      const real = resolveInsideRoot(projectRoot(projectId), rel);
+      const real = resolveInRoots(rootsFor(projectId, sessionId), rel);
       const st = await fsp.stat(real);
       if (!st.isFile()) return { ok: false, error: 'not a file' };
       await fsp.writeFile(real, text, 'utf8');
@@ -652,9 +691,11 @@ app.whenReady().then(() => {
   });
 
   // List a directory's immediate entries — DESKTOP-ONLY, confined to the project.
-  ipcMain.handle('maestro:listDir', async (_e, projectId: string, rel: string) => {
+  // With a sessionId, the listing is scoped to THAT session's worktree (the
+  // session's own branch checkout), not the project root.
+  ipcMain.handle('maestro:listDir', async (_e, projectId: string, rel: string, sessionId?: string) => {
     try {
-      const real = resolveInsideRoot(projectRoot(projectId), rel);
+      const real = resolveInRoots(rootsFor(projectId, sessionId), rel);
       const st = await fsp.stat(real);
       if (!st.isDirectory()) return { ok: false, error: 'not a directory' };
       const dirents = await fsp.readdir(real, { withFileTypes: true });

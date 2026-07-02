@@ -388,6 +388,25 @@ export interface AppSettings {
   notifications?: NotificationSettings;
   /** Opt-in: try a direct desktop↔phone WebRTC channel before the relay (default off). */
   p2pEnabled?: boolean;
+  /** Auto-create a private GitHub repo when a project is created with a folder (default ON). */
+  autoCreateRepo?: boolean;
+  /** Auto-push session commits to the GitHub remote after every turn (default ON). */
+  autoPushCommits?: boolean;
+  /** Mirror every project's .continuum memory into the memory repository (default ON). */
+  memorySyncEnabled?: boolean;
+  /** Where memory repos live: '' = the personal profile, else an org login. */
+  memoryRepoOwner?: string;
+  /** Memory repository name (default 'maestro-memory'). */
+  memoryRepoName?: string;
+}
+
+/** Live status of the .continuum → GitHub memory-repository sync. */
+export interface MemorySyncStatus {
+  enabled: boolean;
+  fullName?: string;
+  lastSyncAt?: number;
+  lastError?: string;
+  syncing?: boolean;
 }
 
 export type FeedbackCategory = 'bug' | 'idea' | 'other';
@@ -546,9 +565,9 @@ interface Bridge {
   revealPath?: (p: string) => Promise<{ ok: boolean; error?: string }>;
   importAsset?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   assetImage?: (assetId: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
-  readFile?: (projectId: string, p: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
-  writeFile?: (projectId: string, p: string, text: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
-  listDir?: (projectId: string, p?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  readFile?: (projectId: string, p: string, sessionId?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  writeFile?: (projectId: string, p: string, text: string, sessionId?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  listDir?: (projectId: string, p?: string, sessionId?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   listProjectFiles?: (projectId: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   runCommand?: (projectId: string, command: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   killCommand?: (runId: string) => Promise<{ ok: boolean }>;
@@ -888,10 +907,11 @@ export const api = {
     if (!r.ok) return null;
     return (r.data as { dataUrl?: string })?.dataUrl ?? null;
   },
-  /** Read a file's text — desktop only, confined to the project folder; null in the browser. */
-  readFile: async (projectId: string, p: string): Promise<{ path: string; text: string; bytes: number; truncated: boolean } | null> => {
+  /** Read a file's text — desktop only, confined to the project folder (or a
+      session worktree of the project); null in the browser. */
+  readFile: async (projectId: string, p: string, sessionId?: string): Promise<{ path: string; text: string; bytes: number; truncated: boolean } | null> => {
     if (!bridge?.readFile) return null;
-    const r = await bridge.readFile(projectId, p);
+    const r = await bridge.readFile(projectId, p, sessionId);
     if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'read failed');
     return r.data as { path: string; text: string; bytes: number; truncated: boolean };
   },
@@ -899,16 +919,17 @@ export const api = {
       to the project folder. Backs in-app file edits made from a chat link.
       Returns null on web/phone (no bridge); throws on the desktop only when
       the main-side validation rejects the write. */
-  writeFile: async (projectId: string, p: string, text: string): Promise<{ path: string; bytes: number; mtime: number } | null> => {
+  writeFile: async (projectId: string, p: string, text: string, sessionId?: string): Promise<{ path: string; bytes: number; mtime: number } | null> => {
     if (!bridge?.writeFile) return null;
-    const r = await bridge.writeFile(projectId, p, text);
+    const r = await bridge.writeFile(projectId, p, text, sessionId);
     if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'write failed');
     return r.data as { path: string; bytes: number; mtime: number };
   },
-  /** List a directory inside the project — desktop only; null in the browser. */
-  listDir: async (projectId: string, p?: string): Promise<{ path: string; entries: DirEntry[] } | null> => {
+  /** List a directory inside the project — desktop only; null in the browser.
+      With a sessionId, the listing is scoped to that session's branch worktree. */
+  listDir: async (projectId: string, p?: string, sessionId?: string): Promise<{ path: string; entries: DirEntry[] } | null> => {
     if (!bridge?.listDir) return null;
-    const r = await bridge.listDir(projectId, p);
+    const r = await bridge.listDir(projectId, p, sessionId);
     if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'list failed');
     return r.data as { path: string; entries: DirEntry[] };
   },
@@ -1248,6 +1269,11 @@ export const api = {
 
   // GitHub connection + per-session PR lifecycle (desktop-only on the relay).
   githubStatus: () => call<GithubConnection>('githubStatus', {}, () => req<GithubConnection>('/api/github/status')),
+  /** Owners repos can be created under: the personal login + org logins. */
+  listGithubOwners: () => call<{ personal: string; orgs: string[] }>('listGithubOwners', {}, () => Promise.resolve({ personal: '', orgs: [] })),
+  /** Memory repository sync — live status + manual "sync now" (one project or all). */
+  memorySyncStatus: () => call<MemorySyncStatus>('memorySyncStatus', {}, () => Promise.resolve({ enabled: false })),
+  memorySyncNow: (projectId?: string) => call<{ ok: boolean; reason?: string }>('memorySyncNow', { projectId }, () => Promise.resolve({ ok: false, reason: 'desktop only' })),
   importGithubFromCli: () => call<ProviderConn>('importGithubFromCli', {}, () => req<ProviderConn>('/api/github/import-cli', { method: 'POST' })),
   // OAuth sign-in via the gh CLI device flow (downloads gh on first use). Long-lived;
   // resolves with the live connection once authorized. Listen on onGithubDevice for the
@@ -1312,7 +1338,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onMemorySync?: (s: MemorySyncStatus) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as RemoteDevice[]);
@@ -1331,6 +1357,7 @@ export const api = {
         if (name === 'git-status' && handlers.onGitStatus) handlers.onGitStatus(data as SessionGitStatus);
         if (name === 'schedule' && handlers.onSchedule) handlers.onSchedule(data as Schedule);
         if (name === 'github-device' && handlers.onGithubDevice) handlers.onGithubDevice(data as GithubDevice);
+        if (name === 'memory-sync' && handlers.onMemorySync) handlers.onMemorySync(data as MemorySyncStatus);
         if (name === 'wa-message' && handlers.onWaMessage) handlers.onWaMessage(data as WaMessageEvent);
         if (name === 'wa-chats' && handlers.onWaChats) handlers.onWaChats();
         if (name === 'wa-message-update' && handlers.onWaMessageUpdate) handlers.onWaMessageUpdate(data as { chatId: string });

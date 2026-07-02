@@ -475,8 +475,10 @@ export default function Workspace() {
     const open = tabs.some(t => t.sessionId === s.id);
     const isActive = activeTab?.sessionId === s.id;
     const p = projById[s.projectId];
+    // Hovering a session row shows the FULL branch name (rows truncate it).
+    const rowTitle = s.branch ? `${s.title}\nbranch · ${s.branch}` : s.title;
     return (
-      <div className={`ws-row${isActive ? ' ws-active' : ''}`} onClick={() => openSession(s)} style={{
+      <div className={`ws-row${isActive ? ' ws-active' : ''}`} title={rowTitle} onClick={() => openSession(s)} style={{
         display: 'flex', alignItems: 'center', gap: 7, padding: `5px 8px 5px ${indent}px`, borderRadius: 8, cursor: 'pointer',
         background: isActive ? 'color-mix(in srgb, var(--blue) 11%, transparent)' : 'transparent' }}>
         {runningSessions.has(s.id)
@@ -492,7 +494,7 @@ export default function Workspace() {
             style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'baseline', gap: 6, font: `${isActive ? 600 : 500} var(--fs-footnote)/1.35 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (isActive ? 'var(--ink)' : 'var(--ink-secondary)') }}>
             <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
             {s.codename && (
-              <span title={`Session codename · ${displayCodename(s.codename)}`} style={{ flexShrink: 0, font: '600 9px/1 var(--font-mono)', letterSpacing: '0.05em', color: 'var(--ink-tertiary)', textTransform: 'uppercase' }}>
+              <span title={s.branch ? `Branch · ${s.branch}` : `Session codename · ${displayCodename(s.codename)}`} style={{ flexShrink: 0, font: '600 9px/1 var(--font-mono)', letterSpacing: '0.05em', color: 'var(--ink-tertiary)', textTransform: 'uppercase' }}>
                 {s.codename}
               </span>
             )}
@@ -868,6 +870,7 @@ export default function Workspace() {
             </div>
             {IS_LOCAL && activeProject?.path && (
               <RightSidebar project={activeProject} changed={changedFiles} checks={checks}
+                session={sessions.find(s => s.id === activeTab?.sessionId) ?? null}
                 onOpenFile={p => openFile(activeProject.id, p)}
                 collapsed={sidebarCollapsed} onToggleCollapse={toggleSidebar} />
             )}

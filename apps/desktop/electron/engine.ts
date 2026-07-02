@@ -34,6 +34,8 @@ import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assign
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
 import { makeGitCtx, type GitCtx } from './git-ctx.js';
 import type { GitService } from './git-service.js';
+import type { MemorySync } from './memory-sync.js';
+import { generateSessionName } from './session-naming.js';
 import { waSendAllowed } from './whatsapp.js';
 import type { CronRunner } from './cron.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
@@ -1938,6 +1940,10 @@ export class LocalEngine {
       don't need a GitService at all). */
   private gitService?: GitService;
   setGitService(g: GitService) { this.gitService = g; }
+  /** MemorySync — mirrors .continuum into the central memory repository after
+      every checkpoint. Injected from main.ts; optional so tests skip it. */
+  private memorySync?: MemorySync;
+  setMemorySync(m: MemorySync) { this.memorySync = m; }
 
   /* ── Background tasks ────────────────────────────────────────────────
      Long-lived processes the agent starts (dev servers, watchers) that must
@@ -3248,14 +3254,38 @@ export class LocalEngine {
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
       this.emit('job', done);
-      // Auto-rename hook: the first informative turn ripens the title (which is
-      // the user's first prompt). Swap the codename-only branch for one
-      // carrying a task-derived slug. Fires once per session — gated inside.
+      // Post-turn git pipeline. Order matters and is the ONLY order that works:
+      //   1. AI-name the session (title + branch slug from the first exchange),
+      //   2. rename the branch (renameSessionBranch refuses once pushed/PR'd),
+      //   3. auto-push so no completed work ever stays local-only.
+      // Naming/rename fire once per session (gated by branchRenamedAt); the
+      // push runs after EVERY chat turn. All fire-and-forget — a git or model
+      // hiccup never breaks the finished turn.
       if (isChat && this.gitService) {
+        const gs = this.gitService;
         const fresh = this.store.getSession(session.id);
         if (fresh && fresh.branch && fresh.codename && !fresh.branchRenamedAt) {
-          // Fire-and-forget; the gitService gates its own no-op cases.
-          void this.gitService.renameSessionBranch(fresh).catch(() => { /* best effort */ });
+          const userMessage = cur.input;
+          const assistantText = output;
+          const key = anthropicKey ?? this.providers?.getLocalKey('anthropic');
+          void (async () => {
+            let slugOverride: string | undefined;
+            if (key) {
+              const named = await generateSessionName({ userMessage, assistantText, apiKey: key });
+              if (named) {
+                slugOverride = named.slug;
+                try {
+                  const s2 = this.store.updateSession(session.id, { title: named.title.slice(0, 60) });
+                  this.emit('session', s2);
+                } catch { /* session gone mid-flight */ }
+              }
+            }
+            // Falls back to the deterministic branchSlug(title) path when the
+            // model was unavailable — the pre-existing behavior, never worse.
+            await gs.syncAfterTurn(session.id, slugOverride);
+          })().catch(() => { /* best effort */ });
+        } else if (fresh) {
+          void gs.autoPushSession(fresh).catch(() => { /* best effort */ });
         }
       }
       // AskUserQuestion follow-up: if this chat turn ended on a question the user
@@ -3303,6 +3333,8 @@ export class LocalEngine {
       // any design turn) so the chain reflects real deltas, not chatter.
       if ((wroteFiles || project?.kind === 'design') && !opts.plan) {
         try { appendCheckpoint(cwd, { summary: `${cur.input.slice(0, 200).trim()}${output ? `\n→ ${output.slice(0, 300).trim()}` : ''}`, tags: project?.kind ? [project.kind] : [] }, Date.now()); } catch { /* memory is best-effort */ }
+        // Mirror the fresh checkpoint into the memory repository (debounced).
+        try { this.memorySync?.scheduleSync(job.projectId); } catch { /* best-effort */ }
       }
       // Chat replies don't ping the events feed — per-message noise; failures still do.
       if (!isChat) this.store.pushEvent({ kind: 'job-done', title: `Done: ${done.title}`, projectId: done.projectId, jobId });

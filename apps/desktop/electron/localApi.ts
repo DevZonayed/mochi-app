@@ -19,6 +19,9 @@ import { pickCityCodename } from './codenames.js';
 import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus, ghCliToken } from './github-auth.js';
 import { ghState } from './gh-cli.js';
+import { provisionGitHubRemote, ensureContinuumExcluded } from './repo-provision.js';
+import { getViewer, listOrgs } from './github.js';
+import type { MemorySync } from './memory-sync.js';
 import type { GitService } from './git-service.js';
 import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
@@ -105,7 +108,34 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null) {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null, memorySync?: MemorySync) {
+  /** Fire-and-forget GitHub provisioning for a NEW project folder: create the
+      private remote repo, wire origin, push. Gated by Settings.autoCreateRepo
+      (default ON) + a connected GitHub account. Never blocks project creation. */
+  const provisionProject = (projectId: string, dir: string, name: string): void => {
+    const settings = store.getSettings();
+    if (settings.autoCreateRepo === false) return;
+    const token = providers.getLocalKey('github');
+    if (!token) return;
+    ensureContinuumExcluded(dir); // memory never enters the shared repo
+    void provisionGitHubRemote({ dir, name, token, owner: undefined, private: true })
+      .then((res) => {
+        const proj = store.getProject(projectId);
+        if (!proj) return;
+        if (res.ok && res.created) {
+          try {
+            const updated = store.updateProject(projectId, { repoUrl: res.remoteUrl ?? '' });
+            emit('project', updated);
+          } catch { /* project gone */ }
+          store.pushEvent({ kind: 'repo-created', title: `GitHub repository created: ${res.fullName}`, subtitle: res.pushed ? 'initial push done' : res.reason, projectId });
+        } else if (!res.ok) {
+          store.pushEvent({ kind: 'repo-create-failed', title: `GitHub repo setup failed for ${name}`, subtitle: res.reason, projectId });
+        }
+      })
+      .catch((e: unknown) => {
+        store.pushEvent({ kind: 'repo-create-failed', title: `GitHub repo setup failed for ${name}`, subtitle: e instanceof Error ? e.message.slice(0, 200) : undefined, projectId });
+      });
+  };
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -130,6 +160,18 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (typeof p.feedbackRepo === 'string') { // '' clears it; otherwise must look like owner/repo
           const v = p.feedbackRepo.trim().slice(0, 140);
           if (v === '' || REPO_RE.test(v)) patch.feedbackRepo = v;
+        }
+        // GitHub automation + memory-repo settings.
+        if (typeof p.autoCreateRepo === 'boolean') patch.autoCreateRepo = p.autoCreateRepo;
+        if (typeof p.autoPushCommits === 'boolean') patch.autoPushCommits = p.autoPushCommits;
+        if (typeof p.memorySyncEnabled === 'boolean') patch.memorySyncEnabled = p.memorySyncEnabled;
+        if (typeof p.memoryRepoOwner === 'string') { // '' = personal profile; else an org login
+          const v = p.memoryRepoOwner.trim().slice(0, 60);
+          if (v === '' || /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(v)) patch.memoryRepoOwner = v;
+        }
+        if (typeof p.memoryRepoName === 'string') {
+          const v = p.memoryRepoName.trim().slice(0, 90);
+          if (v === '' || /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(v)) patch.memoryRepoName = v;
         }
         if (Object.keys(patch).length === 0) bad('no valid settings fields');
         const next = store.setSettings(patch);
@@ -167,6 +209,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const proj = store.getProject(String(p.id ?? ''));
         if (!proj) return bad('project not found', 404);
         writeProjectState(projectRootOf(proj), typeof p.state === 'string' ? p.state : '');
+        memorySync?.scheduleSync(proj.id); // mirror the edit to the memory repo
         return { ok: true };
       }
       // Commit a referable snapshot of the project (design + attachments).
@@ -276,6 +319,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (projPath) {
           void ensureGitHooks(projPath).catch(() => { /* best-effort */ });
           void ensureCommitIdentity(projPath).catch(() => { /* best-effort */ });
+          // Tight GitHub coupling: a new project with a folder gets its private
+          // remote repo created + pushed immediately (unless one already exists).
+          if (existsSync(projPath) && !(typeof p.repoUrl === 'string' && p.repoUrl)) {
+            provisionProject(proj.id, projPath, proj.name);
+          }
         }
         emit('project', proj);
         return proj;
@@ -333,6 +381,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (result.ok && result.info.isRepo) {
           void ensureGitHooks(dir).catch(() => { /* lifecycle side-effects never block */ });
           void ensureCommitIdentity(dir).catch(() => { /* gh CLI may be absent */ });
+          ensureContinuumExcluded(dir); // adopted repos: memory stays out of git too
         }
         return result;
       }
@@ -361,6 +410,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           // before the first commit in this repo can happen.
           void ensureGitHooks(result.dir).catch(() => { /* best-effort */ });
           void ensureCommitIdentity(result.dir).catch(() => { /* best-effort */ });
+          ensureContinuumExcluded(result.dir); // memory never enters the shared repo
           emit('clone', { phase: 'done', projectId: proj.id, dir: result.dir, branch: result.branch });
           emit('project', proj);
           store.pushEvent({ kind: 'clone-done', title: `Cloned ${proj.name}`, subtitle: result.branch ? `branch ${result.branch}` : undefined, projectId: proj.id });
@@ -1027,6 +1077,25 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
 
       // Live GitHub connection status (login + scopes + repo-scope capability).
       case 'githubStatus': return githubConnectionStatus(providers.getLocalKey('github'));
+      // Owners where repos (project + memory) can be created: personal + orgs.
+      case 'listGithubOwners': {
+        const token = providers.getLocalKey('github');
+        if (!token) bad('connect GitHub first', 400);
+        const [viewer, orgs] = await Promise.all([
+          getViewer(token as string),
+          listOrgs(token as string).catch(() => [] as string[]),
+        ]);
+        return { personal: viewer.login, orgs };
+      }
+      // Memory repository: status + manual "sync now" (per project or ALL).
+      case 'memorySyncStatus': return memorySync ? memorySync.getStatus() : { enabled: false };
+      case 'memorySyncNow': {
+        if (!memorySync) bad('memory sync is not available', 500);
+        const id = typeof p.projectId === 'string' && p.projectId ? p.projectId : undefined;
+        if (id) return await memorySync!.syncProject(id);
+        await memorySync!.syncAll();
+        return { ok: true };
+      }
       // One-click connect by importing a token from an authenticated `gh` CLI.
       case 'importGithubFromCli': {
         const token = ghCliToken();

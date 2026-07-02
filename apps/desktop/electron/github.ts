@@ -168,9 +168,24 @@ export async function mergePull(token: string, owner: string, repo: string, num:
   return { merged: !!r.data.merged, sha: r.data.sha };
 }
 
-export async function createRepo(token: string, name: string, opts: { private?: boolean } = {}, fetchImpl?: FetchImpl): Promise<{ cloneUrl: string; sshUrl: string; fullName: string }> {
-  const r = await ghRequest<{ clone_url: string; ssh_url: string; full_name: string }>({ token, method: 'POST', path: '/user/repos', body: { name, private: opts.private ?? true, auto_init: false }, fetchImpl });
+export async function createRepo(token: string, name: string, opts: { private?: boolean; org?: string; autoInit?: boolean; description?: string } = {}, fetchImpl?: FetchImpl): Promise<{ cloneUrl: string; sshUrl: string; fullName: string }> {
+  // Personal repos go through POST /user/repos; org repos through POST /orgs/{org}/repos.
+  const path = opts.org ? `/orgs/${encodeURIComponent(opts.org)}/repos` : '/user/repos';
+  const r = await ghRequest<{ clone_url: string; ssh_url: string; full_name: string }>({ token, method: 'POST', path, body: { name, private: opts.private ?? true, auto_init: opts.autoInit ?? false, ...(opts.description ? { description: opts.description } : {}) }, fetchImpl });
   return { cloneUrl: r.data.clone_url, sshUrl: r.data.ssh_url, fullName: r.data.full_name };
+}
+
+/** Whether `owner/repo` exists AND the token can see it. */
+export async function repoExists(token: string, owner: string, repo: string, fetchImpl?: FetchImpl): Promise<boolean> {
+  try { await ghRequest({ token, path: `/repos/${owner}/${repo}`, fetchImpl }); return true; }
+  catch (e) { if (e instanceof GhError && e.status === 404) return false; throw e; }
+}
+
+/** Organizations the authenticated user belongs to (logins). Used by the
+    Settings "where do memory repos live" picker: personal profile vs an org. */
+export async function listOrgs(token: string, fetchImpl?: FetchImpl): Promise<string[]> {
+  const r = await ghRequest<Array<{ login: string }>>({ token, path: '/user/orgs?per_page=100', fetchImpl });
+  return (r.data ?? []).map(o => o.login).filter(Boolean);
 }
 
 /** Pick a merge method the repo actually allows (prefer squash → merge → rebase). */

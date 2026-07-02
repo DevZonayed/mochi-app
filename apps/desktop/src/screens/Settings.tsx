@@ -16,7 +16,7 @@ import {
   APP_W, APP_H, useAppScale, useTheme, getThemePref, setThemePref, usePurpose, setPurpose, TrafficLights, Sidebar, Toolbar,
   type Theme, type Purpose,
 } from '../lib/appShell';
-import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type AccountDevice, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, type GithubDevice, IS_LOCAL } from '../lib/api';
+import { api, ApiError, type Workspace, type ProviderConn, type ProviderId, type Routing, type Roles, type AccountDevice, type EngineStatuses, type AppSettings, type ExtensionStatus, type UpdateStatus, type GithubDevice, type MemorySyncStatus, IS_LOCAL } from '../lib/api';
 import { signOut } from '../lib/auth';
 import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
 import { WhatsNew } from '../lib/WhatsNew';
@@ -449,6 +449,80 @@ function EnginesPane() {
   );
 }
 
+/* ── GitHub automation + memory repository (desktop-only) ──────────────────
+   The auto-repo-create / auto-push switches, plus the private memory repo the
+   projects' .continuum state syncs to: pick the owner (personal account or any
+   org the token can see), name the repo, and sync on demand. Live status rides
+   the 'memory-sync' event. */
+function GitHubAutomationSection() {
+  const [settings, setSettings] = React.useState<AppSettings | null>(null);
+  const [owners, setOwners] = React.useState<{ personal: string; orgs: string[] } | null>(null);
+  const [status, setStatus] = React.useState<MemorySyncStatus | null>(null);
+  const [syncBusy, setSyncBusy] = React.useState(false);
+  const [syncNote, setSyncNote] = React.useState('');
+
+  React.useEffect(() => {
+    api.getSettings().then(setSettings).catch(() => {});
+    api.listGithubOwners().then(setOwners).catch(() => {});
+    api.memorySyncStatus().then(setStatus).catch(() => {});
+    return api.subscribe({ onMemorySync: setStatus });
+  }, []);
+
+  const patch = (p: Partial<AppSettings>) => { setSettings(s => (s ? { ...s, ...p } : s)); void api.setSettings(p).catch(() => {}); };
+  const syncNow = () => {
+    setSyncBusy(true); setSyncNote('');
+    void api.memorySyncNow()
+      .then(r => {
+        setSyncNote(r.ok ? 'Synced ✓' : (r.reason || 'Sync failed'));
+        api.memorySyncStatus().then(setStatus).catch(() => {});
+      })
+      .catch(e => setSyncNote(e instanceof ApiError ? e.message : 'Sync failed'))
+      .finally(() => { setSyncBusy(false); setTimeout(() => setSyncNote(''), 6000); });
+  };
+
+  const owner = settings?.memoryRepoOwner || '';
+  const repoName = settings?.memoryRepoName || 'maestro-memory';
+  const fullName = status?.fullName || `${owner || owners?.personal || '…'}/${repoName}`;
+  const lastSync = status?.lastSyncAt ? new Date(status.lastSyncAt).toLocaleString() : null;
+
+  return (
+    <>
+      <GroupedList header="GitHub automation" footer="New projects get a private repo on your GitHub the moment they're created, and each finished agent turn pushes the session branch — nothing stays only on this Mac.">
+        <ToggleRow label="Create a GitHub repo for new projects" sub="Private by default, under the owner picked below." on={settings?.autoCreateRepo !== false} onChange={v => patch({ autoCreateRepo: v })} />
+        <ToggleRow label="Push every commit automatically" sub="After each agent turn the session branch is pushed to origin." on={settings?.autoPushCommits !== false} onChange={v => patch({ autoPushCommits: v })} last />
+      </GroupedList>
+      <div style={{ height: 18 }} />
+      <GroupedList header="Memory repository"
+        footer={`Project memory (.continuum state + decision chain) syncs to a private repo — ${fullName} — namespaced per project AND per developer, so teammates on the same project never conflict.${status?.lastError ? ` Last error: ${status.lastError}` : ''}`}>
+        <ToggleRow label="Sync project memory to GitHub" sub="Keeps every project's agent memory backed up and shared across your Macs." on={settings?.memorySyncEnabled !== false} onChange={v => patch({ memorySyncEnabled: v })} />
+        <Row>
+          <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Create under</span>
+          <select value={owner} onChange={e => patch({ memoryRepoOwner: e.target.value })} style={selectStyle}>
+            <option value="">{owners?.personal ? `Personal — ${owners.personal}` : 'Personal account'}</option>
+            {(owners?.orgs ?? []).map(o => <option key={o} value={o}>{o}</option>)}
+          </select>
+        </Row>
+        <Row>
+          <span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Repository name</span>
+          <input key={repoName} defaultValue={repoName}
+            onBlur={e => { const v = e.target.value.trim(); if (v && v !== repoName) patch({ memoryRepoName: v }); }}
+            onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+            style={{ width: 200, height: 32, border: '0.5px solid var(--separator-strong)', borderRadius: 8, outline: 'none', background: 'var(--fill-tertiary)', font: '400 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', padding: '0 10px' }} />
+        </Row>
+        <Row last>
+          <span style={{ flex: 1, font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: syncNote.startsWith('Synced') ? 'var(--green)' : status?.lastError && !syncNote ? 'var(--red)' : 'var(--ink-secondary)' }}>
+            {syncNote || (status?.syncing ? 'Syncing…' : status?.lastError ? 'Last sync failed' : lastSync ? `Last sync ${lastSync}` : 'Not synced yet')}
+          </span>
+          <button onClick={syncNow} disabled={syncBusy || settings?.memorySyncEnabled === false} className="ghost-btn"
+            style={{ height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', opacity: syncBusy || settings?.memorySyncEnabled === false ? 0.5 : 1 }}>
+            {syncBusy ? 'Syncing…' : 'Sync now'}
+          </button>
+        </Row>
+      </GroupedList>
+    </>
+  );
+}
+
 const REAL_PROVIDERS: { id: ProviderId; name: string; tint: string; glyph: string; meta: string; hint: string }[] = [
   { id: 'anthropic', name: 'Anthropic', tint: '#D97757', glyph: 'A', meta: 'Claude · coding & reasoning', hint: 'sk-ant-…' },
   { id: 'openai', name: 'OpenAI', tint: 'var(--ink)', glyph: 'O', meta: 'GPT · media & vision', hint: 'sk-…' },
@@ -617,6 +691,9 @@ function AccountsPane() {
         })}
       </GroupedList>
       <div style={{ height: 18 }} />
+      {/* GitHub automation + the private memory repository (desktop-only). */}
+      {IS_LOCAL && <GitHubAutomationSection />}
+      {IS_LOCAL && <div style={{ height: 18 }} />}
       {/* Engine runtimes — native binaries downloaded on demand (not bundled). */}
       {IS_LOCAL && <EngineSetup />}
       {IS_LOCAL && <div style={{ height: 18 }} />}
