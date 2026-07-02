@@ -35,6 +35,7 @@ import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
 import { makeGitCtx, type GitCtx } from './git-ctx.js';
 import type { GitService } from './git-service.js';
 import { waSendAllowed } from './whatsapp.js';
+import { classifyBashCommand, bgRedirectReason } from './bg-command-guard.js';
 import type { CronRunner } from './cron.js';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import type { Providers } from './providers.js';
@@ -176,7 +177,9 @@ const BG_DIRECTIVE =
   `session they can stop. After starting one, poll background_output briefly to confirm it ` +
   `came up, tell the user the URL and how to stop it, then finish your reply — do NOT sit and ` +
   `wait on it. Use the normal shell only for commands that finish quickly (install, build, ` +
-  `test, git, file ops).`;
+  `test, git, file ops). This is ENFORCED: a long-lived or backgrounded (\`&\`, nohup) Bash ` +
+  `command is blocked and you'll be told to re-issue it via run_in_background — don't fight ` +
+  `the block, just switch tools.`;
 /* PR lifecycle — appended when the chat has a live worktree + branch on a
    GitHub repo. This is the Conductor-style recipe: ONE chat owns ONE branch
    for its whole life; the agent uses the maestro PR/git tools to drive the
@@ -1347,6 +1350,38 @@ async function runClaude(
       ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
       ...(apiKey ? { env: { ...process.env, ANTHROPIC_API_KEY: apiKey } as NodeJS.ProcessEnv } : {}),
       ...(hooks.signal ? { abortController: abortControllerFromSignal(hooks.signal) } : {}),
+      // Force long-lived shell commands (dev servers, watchers, backgrounded `&`
+      // commands, or Bash's own run_in_background) OFF the built-in Bash tool and
+      // ONTO Maestro's run_in_background — otherwise they're bound to this turn's
+      // subprocess and die when the run is cancelled/steered (the reported
+      // "stop the turn and the local run stops working" bug). Only mounted when the
+      // bg tools are (real, non-plan runs). See bg-command-guard.ts.
+      ...(bgCtx
+        ? {
+            hooks: {
+              PreToolUse: [
+                {
+                  matcher: 'Bash',
+                  hooks: [
+                    async (input) => {
+                      if (input.hook_event_name !== 'PreToolUse' || input.tool_name !== 'Bash') return {};
+                      const ti = (input.tool_input ?? {}) as { command?: string; run_in_background?: boolean };
+                      const verdict = classifyBashCommand(ti.command ?? '', ti.run_in_background);
+                      if (!verdict.redirect) return {};
+                      return {
+                        hookSpecificOutput: {
+                          hookEventName: 'PreToolUse' as const,
+                          permissionDecision: 'deny' as const,
+                          permissionDecisionReason: bgRedirectReason(ti.command ?? '', verdict.rule),
+                        },
+                      };
+                    },
+                  ],
+                },
+              ],
+            },
+          }
+        : {}),
       stderr: (d: string) => { stderrTail = (stderrTail + d).slice(-2000); },
     },
   });
