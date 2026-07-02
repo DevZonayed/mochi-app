@@ -172,6 +172,22 @@ function ToolStep({ item }: { item: TranscriptItem }) {
   const isOpen = hasNest && (expanded || running);
   const resultPreview = item.result ? item.result.replace(/\s+/g, ' ').trim().slice(0, 180) : '';
   const stepLabel = childCount > 0 ? `${childCount} step${childCount === 1 ? '' : 's'}` : '';
+  // Skill activations get their OWN visual — a distinct purple pill ("⚡ SKILL
+  // <Name>") instead of a plain tool row — so the operator can see at a glance
+  // that the agent is following a skill, on BOTH engines (Claude's native Skill
+  // tool AND the SKILL.md read that is how Codex activates one).
+  if (isSkill && !hasNest) {
+    return (
+      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, alignSelf: 'flex-start', maxWidth: 720, margin: '2px 0', padding: '4px 12px 4px 6px', borderRadius: 999, background: 'color-mix(in srgb, var(--purple) 9%, var(--bg-elevated))', border: '0.5px solid color-mix(in srgb, var(--purple) 32%, var(--separator))' }}>
+        <span style={{ width: 20, height: 20, borderRadius: 999, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--purple) 16%, transparent)', color: 'var(--purple)' }}><Icon name="spark" size={12} stroke={2.2} /></span>
+        <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--purple)', flexShrink: 0 }}>Skill</span>
+        <span style={{ font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)', minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{detail}</span>
+        {running ? <span className="breathe" style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--purple)', flexShrink: 0 }} />
+          : error ? <Icon name="x" size={11} stroke={2.6} style={{ color: 'var(--red)', flexShrink: 0 }} />
+          : <Icon name="check" size={11} stroke={2.6} style={{ color: 'var(--green)', flexShrink: 0 }} />}
+      </div>
+    );
+  }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: isOpen ? 4 : 0 }}>
       <div

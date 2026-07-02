@@ -24,6 +24,7 @@ import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { saveAttachment, substitutePlaceholders } from './attachments.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
+import { nativeSkillSummaries } from './native-skills.js';
 import { scanConversations, parseConversation, type ConvSource } from './conversation-sync.js';
 import { existsSync, mkdirSync, cpSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -911,6 +912,23 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           diskBySlug.delete(r.slug);
           return d ? { ...r, enabled: d.enabled } : r;
         });
+        // Built-in (native) skills ship with the app and are materialised on the
+        // FIRST real run — but the operator must see them in the Skills UI even
+        // before that run (otherwise "where is imagegen?"). Merge any bundled
+        // native not already recorded; if its folder happens to exist on disk,
+        // trust the real enabled state.
+        const have = new Set(skills.map(s => s.slug));
+        for (const n of nativeSkillSummaries()) {
+          if (have.has(n.slug)) continue;
+          const d = diskBySlug.get(n.slug);
+          diskBySlug.delete(n.slug);
+          skills.push({
+            id: n.id, slug: n.slug, name: n.name, description: n.description,
+            source: `https://github.com/${n.id.split('/').slice(0, 2).join('/')}`,
+            version: 'bundled', sha256: n.sha256,
+            enabled: d ? d.enabled : true, addedBy: 'native', installedAt: 0,
+          });
+        }
         // Folders on disk with no record (e.g. dropped in manually / by another tool).
         for (const d of diskBySlug.values()) {
           skills.push({ id: d.slug, slug: d.slug, name: d.slug, enabled: d.enabled, addedBy: 'agent', installedAt: 0 });
@@ -951,9 +969,14 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // loading it, then mirror the flag in the store record.
         const ok = setSkillFilesEnabled(projectRootOf(proj), idOrSlug, enabled);
         let rec = store.setInstalledSkillEnabled(proj.id, idOrSlug, enabled);
-        if (!rec) { // disk-only skill with no record yet — create one so the flag sticks
+        if (!rec) { // no record yet — create one so the flag sticks (a bundled
+          // native toggled BEFORE its first-run materialisation must be recorded
+          // as native, so the disable survives ensureNativeSkills/recordNativeSkills)
           const slug = skillSlug(idOrSlug);
-          rec = store.ensureInstalledSkill(proj.id, { id: idOrSlug, slug, name: slug, enabled, addedBy: 'agent' });
+          const native = nativeSkillSummaries().find(n => n.slug === slug || n.id === idOrSlug);
+          rec = store.ensureInstalledSkill(proj.id, native
+            ? { id: native.id, slug: native.slug, name: native.name, description: native.description, version: 'bundled', sha256: native.sha256, enabled, addedBy: 'native' }
+            : { id: idOrSlug, slug, name: slug, enabled, addedBy: 'agent' });
           store.setInstalledSkillEnabled(proj.id, idOrSlug, enabled);
         }
         return { ok, skill: rec };

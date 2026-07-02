@@ -972,7 +972,9 @@ export class Store {
   }
   /** Batch-upsert the always-on native skills for a project in ONE save. Preserves
       an existing record's `enabled` flag (so an operator's disable sticks across
-      upgrades) and only writes when something actually changed. */
+      upgrades), PRUNES native records that left the bundled catalog (mirrors the
+      on-disk prune in ensureNativeSkills), and only writes when something actually
+      changed. */
   recordNativeSkills(projectId: string, recs: Omit<InstalledSkill, 'installedAt'>[]): void {
     if (!this.data.installedSkills) this.data.installedSkills = {};
     const list = this.data.installedSkills[projectId] ?? (this.data.installedSkills[projectId] = []);
@@ -988,6 +990,11 @@ export class Store {
         changed = true;
       }
     }
+    // A native record whose slug is no longer bundled = the app dropped that
+    // skill — remove the mirror too (operator/agent-installed records are kept).
+    const current = new Set(recs.map(r => r.slug));
+    const pruned = list.filter(x => x.addedBy !== 'native' || current.has(x.slug));
+    if (pruned.length !== list.length) { this.data.installedSkills[projectId] = pruned; changed = true; }
     if (changed) this.save();
   }
   /** Upsert a bare record for a skill found on disk but not yet tracked (e.g. dropped in manually). */

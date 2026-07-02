@@ -655,7 +655,11 @@ function DesignSkillsSheet({ open, project, onClose }: { open: boolean; project:
     setInstalled(xs => xs.map(x => (x.id === s.id ? { ...x, enabled: next } : x)));
     try { await api.setProjectSkillEnabled(project.id, s.id, next); } catch { load(); }
   };
-  const activeCount = installed.filter(s => s.enabled !== false).length;
+  // Built-ins (native, app-bundled) are managed on the project's Skills tab —
+  // this quick panel shows only operator/agent-added skills, plus a count line.
+  const userInstalled = installed.filter(s => s.addedBy !== 'native');
+  const nativeCount = installed.length - userInstalled.length;
+  const activeCount = userInstalled.filter(s => s.enabled !== false).length;
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 90, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,.22)' }} onClick={onClose}>
       <div onClick={e => e.stopPropagation()} style={{ width: 520, maxHeight: 'min(680px, calc(100vh - 64px))', display: 'flex', flexDirection: 'column', borderRadius: 16, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 24px 70px rgba(0,0,0,.28)', overflow: 'hidden' }}>
@@ -670,11 +674,11 @@ function DesignSkillsSheet({ open, project, onClose }: { open: boolean; project:
           <button onClick={() => void search()} style={{ height: 34, padding: '0 12px', borderRadius: 9, border: 'none', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>{busy === '__search' ? 'Searching' : 'Search'}</button>
         </div>
         <div className="ds-scroll" style={{ overflow: 'auto', padding: 14, display: 'flex', flexDirection: 'column', gap: 14 }}>
-          {installed.length > 0 && (
+          {userInstalled.length > 0 && (
             <div>
-              <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 8 }}>Active on this project · {activeCount}</div>
+              <div style={{ font: '700 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 8 }}>Active on this project · {activeCount}{nativeCount > 0 ? ` (+${nativeCount} built-in)` : ''}</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {installed.slice().sort((a, b) => Number(b.enabled !== false) - Number(a.enabled !== false)).map(s => {
+                {userInstalled.slice().sort((a, b) => Number(b.enabled !== false) - Number(a.enabled !== false)).map(s => {
                   const on = s.enabled !== false;
                   return (
                     <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '9px 10px', borderRadius: 10, background: 'var(--surface)', border: '0.5px solid var(--separator)', opacity: on ? 1 : 0.6 }}>

@@ -263,7 +263,7 @@ export interface RegistrySkillSummary {
 export interface InstalledSkill {
   id: string; slug: string; name: string; description?: string; risk?: string; source?: string;
   version?: string; sha256?: string; enabled?: boolean; disabledReason?: string | null;
-  mirrorRepo?: string | null; auditStatus?: string | null; addedBy?: 'operator' | 'agent'; installedAt: number;
+  mirrorRepo?: string | null; auditStatus?: string | null; addedBy?: 'operator' | 'agent' | 'native'; installedAt: number;
 }
 export interface Template {
   id: string;

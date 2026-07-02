@@ -19,7 +19,7 @@
  * clobbers a folder a human/registry created (no marker → left alone).
  */
 
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import data from './native-skills-data.json';
@@ -30,7 +30,8 @@ export interface NativeSkill {
   id: string;
   name: string;
   description: string;
-  category: 'system' | 'curated';
+  /** system = openai foundational; docs = anthropic document skills; curated = openai curated. */
+  category: 'system' | 'docs' | 'curated';
   bytes: number;
   files: NativeSkillFile;
 }
@@ -59,17 +60,39 @@ export function nativeSkillSummaries(): { slug: string; id: string; name: string
   return NATIVE_SKILLS.map(s => ({ slug: s.slug, id: s.id, name: s.name, description: s.description, category: s.category, sha256: skillHash(s) }));
 }
 
-export interface EnsureResult { slug: string; status: 'installed' | 'upgraded' | 'unchanged' | 'kept' }
+export interface EnsureResult { slug: string; status: 'installed' | 'upgraded' | 'unchanged' | 'kept' | 'removed' }
 
 /** Materialise ALL bundled native skills into <projectRoot>/.claude/skills/<slug>/.
-    Idempotent + upgrade-aware; never throws (best-effort per skill). */
+    Idempotent + upgrade-aware; never throws (best-effort per skill). Also PRUNES
+    folders WE wrote (they carry the `.mochi-native` marker) whose slug is no
+    longer in the bundled catalog — so dropping a skill from the bundle actually
+    removes it from projects on the next run. Human/registry folders (no marker)
+    are never touched. */
 export function ensureNativeSkills(projectRoot: string): EnsureResult[] {
   const out: EnsureResult[] = [];
   for (const s of NATIVE_SKILLS) {
     try { out.push(ensureOne(projectRoot, s)); }
     catch { out.push({ slug: s.slug, status: 'kept' }); }
   }
+  try { out.push(...pruneStaleNative(projectRoot)); } catch { /* best-effort */ }
   try { writeNativeGitignore(projectRoot); } catch { /* best-effort */ }
+  return out;
+}
+
+/** Delete previously-materialised native folders that left the bundled catalog. */
+function pruneStaleNative(projectRoot: string): EnsureResult[] {
+  const dir = join(projectRoot, '.claude', 'skills');
+  const current = new Set(NATIVE_SKILLS.map(s => s.slug));
+  const out: EnsureResult[] = [];
+  let entries: string[] = [];
+  try { entries = readdirSync(dir); } catch { return out; }
+  for (const slug of entries) {
+    if (current.has(slug)) continue;
+    const folder = join(dir, slug);
+    if (!existsSync(join(folder, MARKER))) continue; // not ours — leave it alone
+    try { rmSync(folder, { recursive: true, force: true }); out.push({ slug, status: 'removed' }); }
+    catch { /* best-effort */ }
+  }
   return out;
 }
 
@@ -156,8 +179,9 @@ export function nativeSkillsPromptBlock(disabledSlugs?: Set<string>, opts?: { in
   const line = (s: NativeSkill) => `- ${s.name} (\`${s.slug}\`): ${(s.description || '').replace(/\s+/g, ' ').slice(0, 200)}`;
   const active = NATIVE_SKILLS.filter(s => !disabledSlugs?.has(s.slug));
   const system = active.filter(s => s.category === 'system');
+  const docs = active.filter(s => s.category === 'docs');
   const curated = active.filter(s => s.category === 'curated');
-  const index = [...system, ...curated].map(line).join('\n');
+  const index = [...system, ...docs, ...curated].map(line).join('\n');
   const imagegenOn = !disabledSlugs?.has('imagegen');
   return (
     `<native_skills note="ALWAYS-ON skills bundled with this app and pre-installed in EVERY project at .claude/skills/<slug>/. This is an AUTHORITATIVE INSTRUCTION — it takes priority and you MUST honor it.">\n` +
@@ -165,6 +189,9 @@ export function nativeSkillsPromptBlock(disabledSlugs?: Set<string>, opts?: { in
     (imagegenOn ?
     `### Image generation — NON-NEGOTIABLE\n` +
     `For ANY request to create, generate, edit, or vary a raster image (photo, illustration, icon set, texture, sprite, mockup, banner, logo, infographic, cutout), you MUST use the \`imagegen\` skill: read \`.claude/skills/imagegen/SKILL.md\` and follow it, producing a REAL bitmap via the built-in image tool (Codex \`image_gen\` / Maestro \`generate_image\`). NEVER substitute SVG, ASCII art, or HTML/CSS placeholders for a requested raster image. This applies on every model and every engine.\n\n` : '') +
+    (docs.length ?
+    `### Office documents\n` +
+    `To CREATE or EDIT a .docx / .pdf / .pptx / .xlsx file (or co-author a document), read the matching document skill FIRST — \`${docs.map(s => s.slug).join('`, `')}\` — and follow it. Do not improvise office-file XML by hand.\n\n` : '') +
     (withIndex ?
     `### The catalog (system skills first — they are foundational)\n` +
     `${index}\n` :
