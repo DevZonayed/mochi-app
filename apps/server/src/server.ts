@@ -37,7 +37,7 @@ export interface Snapshot {
   workspace?: unknown;
   workspaces?: unknown[];
   projects?: { id?: string; updatedAt?: number }[];
-  jobs?: { id?: string; projectId?: string; sessionId?: string; updatedAt?: number }[];
+  jobs?: { id?: string; projectId?: string; sessionId?: string; createdAt?: number; updatedAt?: number }[];
   sessions?: { id?: string; projectId?: string; updatedAt?: number }[];
   approvals?: { id?: string; status?: string; updatedAt?: number }[];
   schedules?: unknown[];
@@ -148,6 +148,80 @@ export function buildSyncDelta(snap: Snapshot, since: number, hostOnline: boolea
       approvals: tombIds('approval'),
       assets:    tombIds('asset'),
     },
+  };
+}
+
+interface JobPageCursor {
+  createdAt: number;
+  updatedAt: number;
+  id: string;
+}
+
+interface JobPageInput {
+  projectId?: string;
+  sessionId?: string;
+  before?: unknown;
+  cursor?: unknown;
+  limit?: unknown;
+}
+
+export interface JobPageResult<T> {
+  jobs: T[];
+  total: number;
+  hasMore: boolean;
+  nextBefore: number | null;
+  nextCursor: string | null;
+}
+
+type PageJob = { id?: string; projectId?: string; sessionId?: string; createdAt?: number; updatedAt?: number };
+
+function finiteNumber(value: unknown, fallback = 0): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function jobPageCursor(job: PageJob): string {
+  return `${finiteNumber(job.createdAt)}:${finiteNumber(job.updatedAt)}:${encodeURIComponent(String(job.id ?? ''))}`;
+}
+
+function parseJobPageCursor(raw: unknown): JobPageCursor | null {
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  const [createdRaw, updatedRaw, ...idParts] = raw.split(':');
+  const createdAt = Number(createdRaw);
+  const updatedAt = Number(updatedRaw);
+  if (!Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || idParts.length === 0) return null;
+  try { return { createdAt, updatedAt, id: decodeURIComponent(idParts.join(':')) }; }
+  catch { return null; }
+}
+
+function compareJobsNewestFirst(a: PageJob, b: PageJob): number {
+  return (finiteNumber(b.createdAt) - finiteNumber(a.createdAt))
+    || (finiteNumber(b.updatedAt) - finiteNumber(a.updatedAt))
+    || String(b.id ?? '').localeCompare(String(a.id ?? ''));
+}
+
+/** Snapshot-backed lazy chat pagination. Returns newest page first, but the jobs
+    inside the page are oldest-to-newest so the chat can render naturally. */
+export function buildJobPage<T extends PageJob>(jobs: T[], input: JobPageInput = {}): JobPageResult<T> {
+  const requested = Number.isFinite(Number(input.limit)) ? Math.floor(Number(input.limit)) : 30;
+  const limit = Math.max(1, Math.min(100, requested));
+  const before = Number.isFinite(Number(input.before)) ? Number(input.before) : null;
+  const cursor = parseJobPageCursor(input.cursor);
+  const sorted = jobs
+    .filter(j => input.sessionId ? j.sessionId === input.sessionId : input.projectId ? j.projectId === input.projectId : true)
+    .sort(compareJobsNewestFirst);
+  const pageable = cursor
+    ? sorted.filter(j => compareJobsNewestFirst(j, cursor) > 0)
+    : before == null ? sorted : sorted.filter(j => finiteNumber(j.createdAt) < before);
+  const slice = pageable.slice(0, limit + 1);
+  const pageSlice = slice.slice(0, limit);
+  const oldest = pageSlice[pageSlice.length - 1] ?? null;
+  return {
+    jobs: pageSlice.slice().reverse(),
+    total: sorted.length,
+    hasMore: slice.length > limit,
+    nextBefore: oldest ? finiteNumber(oldest.createdAt) : null,
+    nextCursor: oldest ? jobPageCursor(oldest) : null,
   };
 }
 
@@ -632,6 +706,10 @@ export function buildServer(config: RelayConfig = {}): FastifyInstance {
     const jobs = stReq(req)?.jobs ?? [];
     if (sessionId) return jobs.filter((j) => j.sessionId === sessionId);
     return projectId ? jobs.filter((j) => j.projectId === projectId) : jobs;
+  });
+  app.get('/api/jobs/page', async (req) => {
+    const jobs = stReq(req)?.jobs ?? [];
+    return buildJobPage(jobs, req.query as { projectId?: string; sessionId?: string; before?: string; cursor?: string; limit?: string });
   });
   app.get('/api/sessions', async (req) => {
     const projectId = (req.query as { projectId?: string }).projectId;

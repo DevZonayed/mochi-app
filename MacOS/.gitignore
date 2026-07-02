@@ -1,0 +1,12 @@
+# Swift / SwiftPM
+app/.build/
+app/dist/
+app/.swiftpm/
+*.xcodeproj/xcuserdata/
+
+# Sidecar build output
+sidecar/dist/
+sidecar/node_modules/
+
+# macOS
+.DS_Store
