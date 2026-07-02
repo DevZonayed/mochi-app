@@ -350,8 +350,9 @@ app.whenReady().then(() => {
   // This is the ONLY place MediaEngine/publishing meet the coding engine; the relay
   // dispatch (createDispatch below) never receives them, so no key/bytes hit the server.
   // The generate_image tool honours Settings → Image generation: 'codex' uses the
-  // FREE native image_gen skill (no fal credits); otherwise fal flux-schnell (fast,
-  // ~$0.003, uses your fal balance). The Codex *engine* always uses its own skill.
+  // NATIVE built-in image_gen on the ChatGPT sign-in (no API key; rollout harvest),
+  // falling back to a stored OpenAI key then fal; 'claude' uses fal flux-schnell
+  // (fast, ~$0.003, uses your fal balance).
   engine.setPublishing(publishing);
   // Codex parity: a local stdio-MCP bridge codex connects to, forwarding the
   // skill-registry + background-task tools Claude reaches via its in-process MCP.
@@ -369,23 +370,29 @@ app.whenReady().then(() => {
     // Edit mode: a source image is supplied → keep that image and apply `prompt`
     // as the change ("add a balloon in the sky"). Otherwise generate fresh.
     const editing = !!(opts.sourceImagePath || opts.sourceImageUrl);
-    // Codex edits by attaching a LOCAL file (`-i`) — it can't fetch a url. If an
-    // edit was requested but there's no usable local source (url-only asset, or a
-    // stale/missing localPath), DON'T let Codex run: it would silently ignore the
-    // source and re-roll the instruction as a fresh text→image. Route those to fal
-    // Kontext (which accepts the url / a data-URI) instead.
-    const codexCanEdit = !editing || !!(opts.sourceImagePath && existsSync(opts.sourceImagePath));
-    const codexReady = store.routing().image === 'codex' && engine.status('codex').available;
-    if (codexReady && codexCanEdit) {
+    // The "Codex" image route: NATIVE first — Codex's built-in image_gen tool on
+    // the operator's ChatGPT sign-in, NO API key. It runs a one-shot
+    // non-ephemeral `codex exec`; the finished PNG is decoded from the session
+    // rollout file, the only place exec mode surfaces the bytes (proven live).
+    // Fallbacks, in order: gpt-image-2 via a stored OpenAI key, then fal.
+    // Codex/OpenAI edits need a LOCAL source file; a url-only source → fal Kontext.
+    const localEditOk = !editing || !!(opts.sourceImagePath && existsSync(opts.sourceImagePath));
+    if (store.routing().image === 'codex' && localEditOk) {
+      const falReady = providers.list().some(c => c.provider === 'fal');
+      const hasOpenaiKey = !!providers.getLocalKey('openai');
       try {
-        // Codex (free, native image_gen) is prioritised. It edits by attaching the
-        // source image via `-i`; falls back to fal Kontext only if codex can't.
         return await engine.imageViaCodex(prompt, { aspect: opts.aspect, projectId: opts.projectId, sourceImagePath: opts.sourceImagePath });
       } catch (e) {
-        const falReady = providers.list().some(c => c.provider === 'fal');
-        if (!falReady) throw e; // no fal to fall back to — surface codex's error
-        // else fall through to fal below
+        if (!hasOpenaiKey && !falReady) throw e; // nothing to fall back to — surface codex's error
       }
+      if (hasOpenaiKey) {
+        try {
+          return await engine.imageViaOpenAI(prompt, { aspect: opts.aspect, projectId: opts.projectId, sourceImagePath: opts.sourceImagePath });
+        } catch (e) {
+          if (!falReady) throw e; // no fal to fall back to — surface OpenAI's error
+        }
+      }
+      // else fall through to fal below
     }
     const asset = editing
       ? await media.generateAndWait({ modelKey: 'flux-kontext', prompt, projectId: opts.projectId ?? null, imageUrl: opts.sourceImageUrl, imagePath: opts.sourceImagePath, aspect: opts.aspect })
@@ -393,6 +400,10 @@ app.whenReady().then(() => {
     if (!asset.localPath) throw new Error(`image was ${editing ? 'edited' : 'generated'} but saving it locally failed — please try again`);
     return { path: asset.localPath, assetId: asset.id, alt: prompt.slice(0, 200), width: asset.width, height: asset.height };
   });
+  // Codex-as-master normally uses its built-in image_gen in-session (harvested
+  // from its own rollout), but its `generate_image` MCP tool stays wired to the
+  // same closure above so an explicit tool call also lands on native-codex→fal.
+  codexBridge.setImage({ generate: (prompt, opts) => engine.generateImage(prompt, opts) });
   telegram = new TelegramBot(store, engine, providers, emit);
   telegram.resumeOnBoot();
   // WhatsApp: the Mac owns one Baileys socket for the operator's own number.
