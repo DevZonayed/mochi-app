@@ -35,6 +35,9 @@ const overlayStyle: React.CSSProperties = {
 };
 const cardStyle: React.CSSProperties = {
   width: 'min(440px, 92vw)',
+  // Never let a long PR title / body push the card past the viewport — the
+  // buttons must stay reachable. Scroll instead of clip.
+  maxHeight: 'calc(100vh - 48px)', overflowY: 'auto',
   background: 'var(--bg-elevated)',
   color: 'var(--ink)',
   borderRadius: 14,

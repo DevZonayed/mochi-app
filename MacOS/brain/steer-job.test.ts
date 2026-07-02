@@ -10,7 +10,7 @@ import { Store } from './store.js';
 import { createDispatch } from './localApi.js';
 import type { LocalEngine } from './engine.js';
 
-function setup(steerImpl: (jobId: string, text: string) => Promise<{ steered: boolean }>) {
+function setup(steerImpl: (jobId: string, text: string, opts?: { interrupt?: boolean }) => Promise<{ steered: boolean }>) {
   const s = new Store();
   const steer = vi.fn(steerImpl);
   const engine = { steer } as unknown as LocalEngine;
@@ -27,7 +27,15 @@ describe('steerJob dispatch', () => {
   it('routes id + text to engine.steer and returns its result (delivered)', async () => {
     const { dispatch, steer } = setup(async () => ({ steered: true }));
     const r = await dispatch('steerJob', { id: 'job-1', text: 'use postgres instead' });
-    expect(steer).toHaveBeenCalledWith('job-1', 'use postgres instead');
+    // Default = interrupt:true — the composer ⌘↩ steer abandons the current work.
+    expect(steer).toHaveBeenCalledWith('job-1', 'use postgres instead', { interrupt: true });
+    expect(r).toEqual({ steered: true });
+  });
+
+  it('passes interrupt:false through (queue-steer — deliver at the next tool-call boundary)', async () => {
+    const { dispatch, steer } = setup(async () => ({ steered: true }));
+    const r = await dispatch('steerJob', { id: 'job-1', text: 'also add tests', interrupt: false });
+    expect(steer).toHaveBeenCalledWith('job-1', 'also add tests', { interrupt: false });
     expect(r).toEqual({ steered: true });
   });
 
@@ -40,6 +48,6 @@ describe('steerJob dispatch', () => {
   it('coerces missing params to empty strings instead of throwing', async () => {
     const { dispatch, steer } = setup(async () => ({ steered: false }));
     await dispatch('steerJob', {});
-    expect(steer).toHaveBeenCalledWith('', '');
+    expect(steer).toHaveBeenCalledWith('', '', { interrupt: true });
   });
 });

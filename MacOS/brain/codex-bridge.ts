@@ -293,7 +293,7 @@ export class CodexBridge {
         }
         if (r.conflicts && r.conflicts.length > 0) {
           const list = r.conflicts.map(f => `  - ${f}`).join('\n');
-          return txt(`Pulled base; ${r.conflicts.length} file(s) need conflict markers resolved:\n${list}\n\nNext: Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers, then commit (\`git add -A && git commit -m "resolve merge conflicts"\`), then call pr_resolve_conflicts again.`);
+          return txt(`Pulled base; ${r.conflicts.length} file(s) need conflict markers resolved:\n${list}\n\nNext: Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers, then stage everything and commit (e.g. "fix: resolve merge conflicts"), then call pr_resolve_conflicts again.`);
         }
         return txt(`pr_resolve_conflicts failed: ${r.reason ?? 'unknown'}`);
       }

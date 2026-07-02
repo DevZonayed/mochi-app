@@ -25,6 +25,7 @@ import { TelegramBot } from '../../brain/telegram.js';
 import { WhatsAppClient } from '../../brain/whatsapp.js';
 import { GitService } from '../../brain/git-service.js';
 import { GitWatcher } from '../../brain/git-watcher.js';
+import { MemorySync } from '../../brain/memory-sync.js';
 import { CronRunner } from '../../brain/cron.js';
 import { makeWhatsappAnalyzer } from '../../brain/whatsapp-analyze.js';
 import { createDispatch } from '../../brain/localApi.js';
@@ -141,6 +142,13 @@ const gitService = new GitService(store, emit, providers);
 try { engine.setGitService(gitService); } catch (e) { warn('setGitService', e); }
 const gitWatcher = new GitWatcher(store, gitService);
 
+// Memory repository: mirrors every project's .continuum into ONE private
+// GitHub repo (Settings picks the owner). The engine schedules a debounced
+// sync after each checkpoint; a boot sweep catches anything missed offline.
+const memorySync = new MemorySync(store, providers, emit);
+try { engine.setMemorySync(memorySync); } catch (e) { warn('setMemorySync', e); }
+setTimeout(() => { void memorySync.syncAll().catch(() => { /* status carries errors */ }); }, 20_000);
+
 // Cron runner: fires scheduled messages + recurring jobs + due publishes, and backs the agent's
 // `schedule_*` MCP tools (gated on `engine.setCron`). Without this, the operator's Schedule queue
 // would never fire. Started in boot() once the WS host is up so fired events reach the client.
@@ -164,7 +172,7 @@ try { engine.setBrowserManager(browserManager); } catch (e) { warn('setBrowserMa
 // getExtensionBridge → null (the native app uses Playwright, not the Chrome extension).
 const dispatch = createDispatch(
   store, engine, media, research, publishing, telegram, whatsapp, providers,
-  emit, RELAY_URL, gitService, () => null, gitWatcher, browserManager,
+  emit, RELAY_URL, gitService, () => null, gitWatcher, browserManager, memorySync,
 );
 
 function isJob(x: unknown): x is Job {

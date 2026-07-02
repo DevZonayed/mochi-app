@@ -27,6 +27,7 @@
        or PR ("Merge PR #42", "Push branch foo/bar"). */
 
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { api } from '../lib/api';
 import { displayCodename, codenameFromBranch, SESSION_STATE_COLOR } from '../lib/git-types';
 import type { GithubConnection } from '../lib/git-types';
@@ -57,16 +58,22 @@ function ConfirmDialog({ open, title, body, okText, danger, onCancel, onOk, busy
     return () => { clearTimeout(t); window.removeEventListener('keydown', onKey, true); };
   }, [open, onCancel]);
   if (!open) return null;
-  return (
+  // Portal to <body>: the dock lives inside the chat header, whose
+  // `backdrop-filter: blur()` makes it the containing block for
+  // position:fixed descendants (WebKit). Rendered in place, `inset: 0`
+  // would resolve against the ~46px header box and the card's top half
+  // disappears under the tab strip. The portal restores viewport centring.
+  return createPortal(
     <div role="presentation" onClick={onCancel} style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.32)', zIndex: 9000,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
       backdropFilter: 'blur(2px)', WebkitBackdropFilter: 'blur(2px)',
     }}>
       <div role="alertdialog" aria-modal="true" aria-labelledby="git-confirm-title"
         onClick={(e) => e.stopPropagation()}
         style={{
           width: 440, maxWidth: 'calc(100vw - 32px)', padding: 20,
+          maxHeight: 'calc(100vh - 48px)', overflowY: 'auto',
           borderRadius: 14, background: 'var(--bg-elevated)',
           boxShadow: '0 30px 60px rgba(0,0,0,0.25), 0 0 0 0.5px var(--separator-strong)',
           font: '500 var(--fs-body)/1.45 var(--font-text)', color: 'var(--ink)',
@@ -87,7 +94,8 @@ function ConfirmDialog({ open, title, body, okText, danger, onCancel, onOk, busy
           }}>{busy ? 'Working…' : okText}</button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -119,16 +127,18 @@ function CommitComposer({ open, onCancel, onSubmit, busy }: {
   const ok = subjectValid;
   const submit = () => { if (ok && !busy) onSubmit(trimmed, body.trim()); };
 
-  return (
+  // Portal to <body> — same containing-block trap as ConfirmDialog above.
+  return createPortal(
     <div role="presentation" onClick={onCancel} style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.32)', zIndex: 9000,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
       backdropFilter: 'blur(2px)', WebkitBackdropFilter: 'blur(2px)',
     }}>
       <div role="dialog" aria-modal="true" aria-labelledby="git-commit-title"
         onClick={(e) => e.stopPropagation()}
         style={{
           width: 540, maxWidth: 'calc(100vw - 32px)', padding: 20, borderRadius: 14,
+          maxHeight: 'calc(100vh - 48px)', overflowY: 'auto',
           background: 'var(--bg-elevated)',
           boxShadow: '0 30px 60px rgba(0,0,0,0.25), 0 0 0 0.5px var(--separator-strong)',
           color: 'var(--ink)',
@@ -173,7 +183,8 @@ function CommitComposer({ open, onCancel, onSubmit, busy }: {
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -328,8 +339,10 @@ export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps)
     setComposerOpen(false);
     // No direct IPC for `git commit` from the renderer; the safe path is to
     // ask the agent in this chat to make the commit with this exact message.
-    // The agent already has Bash; this stays consistent with how every other
-    // git op (push/PR/merge/resolve) flows on master.
+    // The prompt speaks the app's own lifecycle (git_status tool → commit →
+    // dock handles push/PR) instead of prescribing raw git CLI incantations —
+    // the agent picks its own mechanics, and the operator-visible text stays
+    // inline with the gh-based flow everywhere else in the app.
     if (!session?.projectId) { setFeedback({ kind: 'err', text: 'Session has no project.' }); return; }
     setBusy(true); setFeedback(null);
     try {
@@ -339,11 +352,10 @@ export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps)
         // Conventional-Commits message. Any body the user did type is passed as
         // intent ("why") for the agent to fold in.
         const why = body ? `\n\nContext to fold into the message (the "why"):\n${body}` : '';
-        text = `Please review the pending changes (\`git status\` / \`git diff\`), then commit them with a clear Conventional-Commits message you compose yourself (e.g. \`feat(desktop): …\` or \`fix: …\`). Run \`git add -A\` then \`git commit\`. Do not push.${why}`;
+        text = `Please review the pending changes with your git_status tool, then stage everything and commit with a clear Conventional-Commits message you compose yourself (e.g. \`feat(desktop): …\` or \`fix: …\`). Do not push — the operator pushes from the Git dock. Never add AI-attribution trailers.${why}`;
       } else {
         const msg = body ? `${subject}\n\n${body}` : subject;
-        const safeSubject = subject.replace(/"/g, '\\"');
-        text = `Please commit the pending changes with this exact message:\n\n${msg}\n\nRun \`git add -A\` then \`git commit -m "${safeSubject}"\`${body ? ` followed by \`-m "<body>"\`` : ''}. Do not push.`;
+        text = `Please stage everything and commit the pending changes with this exact message:\n\n${msg}\n\nUse that exact message${body ? ' (subject + body)' : ''} — do not reword it, and never add AI-attribution trailers. Do not push — the operator pushes from the Git dock.`;
       }
       await api.sendChat({ projectId: session.projectId, sessionId: sessionId!, text });
       setFeedback({ kind: 'ok', text: 'Asked the agent to commit.' });

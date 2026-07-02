@@ -650,10 +650,14 @@ export default function Workspace() {
     const liveState: SessionGitState | null = useSessionStateOnly(IS_WEBKIT ? null : s.id);
     const stripeColor = liveState ? SESSION_STATE_STRIPE[liveState] : 'transparent';
     const stripeLabel = liveState && liveState !== 'no-repo' ? SESSION_STATE_LONG_LABELS[liveState] : null;
+    // Hovering a session row shows the FULL branch name (rows truncate it),
+    // plus the live git/PR state when there is one.
+    const rowTitle = [s.title, s.branch ? `branch · ${s.branch}` : null, stripeLabel]
+      .filter(Boolean).join('\n');
     return (
       <div className={`ws-row${isActive ? ' ws-active' : ''}`} onClick={() => openSession(s)}
         aria-label={stripeLabel ? `${s.title} — ${stripeLabel}` : s.title}
-        title={stripeLabel ?? undefined}
+        title={rowTitle}
         style={{
           display: 'flex', alignItems: 'center', gap: 7,
           // Internal padding adjusted so the 4px stripe takes the leftmost
@@ -676,7 +680,7 @@ export default function Workspace() {
             style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'baseline', gap: 6, font: `${isActive ? 600 : 500} var(--fs-footnote)/1.35 var(--font-text)`, color: s.archived ? 'var(--ink-tertiary)' : (isActive ? 'var(--ink)' : 'var(--ink-secondary)') }}>
             <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
             {s.codename && (
-              <span title={`Session codename · ${displayCodename(s.codename)}`} style={{ flexShrink: 0, font: '600 9px/1 var(--font-mono)', letterSpacing: '0.05em', color: 'var(--ink-tertiary)', textTransform: 'uppercase' }}>
+              <span title={s.branch ? `Branch · ${s.branch}` : `Session codename · ${displayCodename(s.codename)}`} style={{ flexShrink: 0, font: '600 9px/1 var(--font-mono)', letterSpacing: '0.05em', color: 'var(--ink-tertiary)', textTransform: 'uppercase' }}>
                 {s.codename}
               </span>
             )}
@@ -1155,6 +1159,7 @@ export default function Workspace() {
             </div>
             {IS_LOCAL && activeProject?.path && (
               <RightSidebar project={activeProject} changed={changedFiles} checks={checks}
+                session={sessions.find(s => s.id === activeTab?.sessionId) ?? null}
                 onOpenFile={p => openFile(activeProject.id, p)}
                 collapsed={sidebarCollapsed} onToggleCollapse={toggleSidebar} />
             )}
