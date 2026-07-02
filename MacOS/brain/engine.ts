@@ -462,11 +462,16 @@ interface RunHooks {
 }
 
 /** Injects a user message into a LIVE Claude turn via the SDK's streaming-input
-    channel + `interrupt()` (NOT a cancel-and-reseed). Returns true if delivered;
-    false if the turn already settled (channel closed) so the caller falls back to a
-    normal send. Registered per-run via runClaude's `onSteerReady`. See
-    ./steerable-input.ts. */
-export type SteerFn = (text: string) => Promise<boolean>;
+    channel (NOT a cancel-and-reseed). Returns true if delivered; false if the
+    turn already settled (channel closed) so the caller falls back to a normal
+    send. Two delivery modes:
+      - `interrupt: true` (default) — also calls `interrupt()` so the agent
+        ABANDONS its current work and picks the message up immediately.
+      - `interrupt: false` — queue-steer: the message is pushed into the input
+        channel WITHOUT interrupting, so the SDK delivers it at the next tool-call
+        boundary while the current work keeps going.
+    Registered per-run via runClaude's `onSteerReady`. See ./steerable-input.ts. */
+export type SteerFn = (text: string, opts?: { interrupt?: boolean }) => Promise<boolean>;
 
 /* Per-1M-token prices for a live cost ESTIMATE (the SDK's exact total_cost_usd
    replaces it when the run finishes). Standard Anthropic pricing; cache reads
@@ -1731,18 +1736,22 @@ async function runClaude(
   };
   const progress = () => hooks.onProgress?.(proseOf(items), items, liveUsage());
   // Steerable turns: hand the host a SteerFn that injects a user message into THIS
-  // live session. It pushes the message into the input channel, surfaces it inline
-  // as a `steer` transcript item, then interrupts the current turn so the agent
-  // abandons what it's doing and picks the steer up at the next boundary — same
+  // live session. It pushes the message into the input channel and surfaces it
+  // inline as a `steer` transcript item. Default mode also interrupts the current
+  // turn so the agent abandons what it's doing and picks the steer up at the next
+  // boundary; `interrupt:false` (queue-steer) skips the interrupt so the SDK
+  // delivers the message between tool calls while the run keeps going — same
   // subprocess, full context kept (no cancel + resume). Cleared when the run ends.
   if (onSteerReady && steerInput) {
     const channel = steerInput;
-    onSteerReady(async (text: string): Promise<boolean> => {
+    onSteerReady(async (text: string, opts?: { interrupt?: boolean }): Promise<boolean> => {
       if (channel.closed) return false;
       if (!channel.push(userMsg(text, false))) return false;
       items.push({ kind: 'steer', text, ts: Date.now() });
       progress();
-      try { await it.interrupt(); } catch { /* no active turn to interrupt — the queued msg is picked up at the next pull */ }
+      if (opts?.interrupt !== false) {
+        try { await it.interrupt(); } catch { /* no active turn to interrupt — the queued msg is picked up at the next pull */ }
+      }
       return true;
     });
   }
@@ -2760,16 +2769,19 @@ export class LocalEngine {
   isRunning(jobId: string): boolean { return this.running.has(jobId); }
 
   /** STEER a running chat turn: inject a follow-up user message into the LIVE Claude
-      Agent SDK session (streaming input + `interrupt()`) so the agent abandons its
-      current turn and picks the message up at the next boundary — same subprocess,
-      full context, NO cancel-and-reseed. Returns `{ steered:false }` when the job
-      isn't running a steerable turn (already finished, codex, plan mode, or a non-
-      chat run) so the caller can fall back to a normal send. */
-  async steer(jobId: string, text: string): Promise<{ steered: boolean }> {
+      Agent SDK session (streaming input) — same subprocess, full context, NO
+      cancel-and-reseed. Default also `interrupt()`s so the agent abandons its
+      current turn and picks the message up immediately; `{ interrupt:false }`
+      (queue-steer) pushes WITHOUT interrupting so the SDK delivers the message at
+      the next tool-call boundary while the run keeps going. Returns
+      `{ steered:false }` when the job isn't running a steerable turn (already
+      finished, codex, plan mode, or a non-chat run) so the caller can fall back
+      to a normal send. */
+  async steer(jobId: string, text: string, opts?: { interrupt?: boolean }): Promise<{ steered: boolean }> {
     const t = text.trim();
     const steer = this.running.get(jobId)?.steer;
     if (!t || !steer) return { steered: false };
-    try { return { steered: await steer(t) }; }
+    try { return { steered: await steer(t, opts) }; }
     catch { return { steered: false }; }
   }
 

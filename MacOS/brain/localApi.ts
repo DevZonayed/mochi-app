@@ -1136,8 +1136,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       // Steer a running chat turn: inject a follow-up into the LIVE session instead
       // of cancelling + reseeding. { steered:false } ⇒ the turn already settled, so
-      // the caller (composer ⌘↩) falls back to a normal send.
-      case 'steerJob': return engine.steer(String(p.id ?? ''), String(p.text ?? ''));
+      // the caller (composer ⌘↩ / queue "steer now") falls back to a normal send.
+      // `interrupt:false` = queue-steer: deliver at the next tool-call boundary
+      // WITHOUT abandoning the current work.
+      case 'steerJob': return engine.steer(String(p.id ?? ''), String(p.text ?? ''), { interrupt: p.interrupt !== false });
       case 'deleteJob': { store.deleteJob(String(p.id ?? '')); return { ok: true }; }
 
       // ── Background tasks (long-lived processes the agent started) ──

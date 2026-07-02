@@ -1390,6 +1390,7 @@ function liveActivity(job: Job, transcript: TranscriptItem[]): string {
     if (last.kind === 'thinking') return 'Thinking…';
     if (last.kind === 'image') return 'Saving image…';
     if (last.kind === 'ask') return 'Waiting for your answer…';
+    if (last.kind === 'steer') return 'Picking up your message…';
     if ((last.kind === 'text' || last.kind === 'result') && last.text.trim()) return 'Responding…';
   }
   return 'Thinking…';
@@ -2143,6 +2144,21 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
     } else if (it.kind === 'image') {
       blocks.push(<InlineImage key={`${keyPrefix}im${i}`} item={it} jobId={opts.jobId} />);
       i++;
+    } else if (it.kind === 'steer') {
+      // A user message injected INTO the live run (composer ⌘↩ or the queue's
+      // "steer now"). Rendered as a distinct interjection block so the thread
+      // shows where the operator redirected the agent mid-turn.
+      blocks.push(
+        <div key={`${keyPrefix}sv${i}`} style={{ margin: '10px 0', display: 'flex', alignItems: 'flex-start', gap: 8, padding: '9px 12px', borderRadius: 12,
+          background: 'color-mix(in srgb, var(--blue) 8%, transparent)', border: '0.5px solid color-mix(in srgb, var(--blue) 25%, transparent)' }}>
+          <Icon name="bolt" size={12} stroke={2.2} style={{ color: 'var(--blue)', flexShrink: 0, marginTop: 3 }} />
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ font: '600 10px/1 var(--font-text)', color: 'var(--blue)', textTransform: 'uppercase', letterSpacing: '0.4px', marginBottom: 4 }}>Steered mid-run</div>
+            <div style={{ font: '400 13px/1.45 var(--font-text)', color: 'var(--ink)', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{it.text}</div>
+          </div>
+        </div>
+      );
+      i++;
     } else {
       const idx = i;
       blocks.push(
@@ -2566,7 +2582,7 @@ function SchedulePicker({ initial, onPick, onRepeat, onClose }: { initial?: numb
   );
 }
 
-function QueuePanel({ queue, hold, onMoveToFront, onRemove, onEdit, onReorder }: { queue: QueueItem[]; hold?: 'limit' | 'paused' | 'failed' | 'cancelled' | null; onMoveToFront: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
+function QueuePanel({ queue, hold, canSteer, onSteerNow, onMoveToFront, onRemove, onEdit, onReorder }: { queue: QueueItem[]; hold?: 'limit' | 'paused' | 'failed' | 'cancelled' | null; canSteer?: boolean; onSteerNow?: (i: number) => void; onMoveToFront: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
   // When the drainer is holding (the agent isn't at a clean idle), surface WHY so a
   // paused/limited queue never looks stuck. Send-now / edit / remove stay available.
   const holdBadge =
@@ -2609,6 +2625,7 @@ function QueuePanel({ queue, hold, onMoveToFront, onRemove, onEdit, onReorder }:
     else if (e.key === 'Enter') { e.preventDefault(); if (s > 0) onMoveToFront(s); }
     else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); if (s >= 0) onRemove(s); }
     else if (e.key.toLowerCase() === 'e') { e.preventDefault(); if (s >= 0) onEdit(s); }
+    else if (e.key.toLowerCase() === 's') { e.preventDefault(); if (s >= 0 && canSteer && onSteerNow && !queue[s]?.atts?.length) onSteerNow(s); }
     else if (e.key === 'Escape') { e.preventDefault(); select(-1); ref.current?.blur(); }
   };
 
@@ -2681,11 +2698,20 @@ function QueuePanel({ queue, hold, onMoveToFront, onRemove, onEdit, onReorder }:
                     <QBtn title="Move down — runs later" onClick={() => move(i, i + 1)} color="var(--ink-tertiary)"><Icon name="chevronDown" size={13} /></QBtn>
                     <QBtn title="Edit (move back to the box)" onClick={() => onEdit(i)} color="var(--ink-tertiary)"><Icon name="arrowLeft" size={13} stroke={2.2} /></QBtn>
                     <QBtn title="Remove" onClick={() => onRemove(i)} color="var(--ink-tertiary)"><Icon name="x" size={13} stroke={2.4} /></QBtn>
-                    {/* Move to FRONT — runs next when the agent finishes. NEVER cancels the
-                        live run (the old "Send now — interrupt and steer" was scrapped
-                        per image_nqm3a.png — the operator's chat said "Stopped" the
-                        moment they sent a message mid-tool-call). The red abort button
-                        in the chat header is the only stop control now. */}
+                    {/* Steer NOW — inject into the LIVE run WITHOUT interrupting: the
+                        message rides the SDK's streaming-input channel and the agent
+                        picks it up at the next tool-call boundary while its current
+                        work keeps going. This is NOT the old scrapped "Send now —
+                        interrupt and steer" (image_nqm3a.png — that one cancelled the
+                        run); nothing here ever stops the live job. Text-only: rows
+                        with attachments queue normally (the steer channel carries no
+                        files). */}
+                    {canSteer && onSteerNow && !attCount && (
+                      <QBtn title="Steer now — the agent picks this up at its next step (run keeps going)" onClick={() => onSteerNow(i)} color="var(--purple)"><Icon name="bolt" size={13} stroke={2.2} /></QBtn>
+                    )}
+                    {/* Move to FRONT — runs next when the agent finishes. Never cancels
+                        the live run; the red abort button in the chat header is the
+                        only stop control. */}
                     {i > 0 && (
                       <QBtn title="Move to front — runs next when the current turn finishes" onClick={() => onMoveToFront(i)} color="var(--blue)"><Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-90deg)' }} /></QBtn>
                     )}
@@ -2698,6 +2724,7 @@ function QueuePanel({ queue, hold, onMoveToFront, onRemove, onEdit, onReorder }:
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">↑↓</span> navigate</span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⌥↑↓</span> reorder</span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">E</span> edit</span>
+            {canSteer && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">S</span> steer now</span>}
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⌫</span> delete</span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><span className="kbd">⏎</span> move to front</span>
             <span style={{ flex: 1 }} />
@@ -3576,6 +3603,24 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     next.unshift(item);
     return next;
   });
+  // Steer a QUEUED row into the LIVE run: the text rides the running SDK
+  // session's streaming-input channel with `interrupt:false`, so the agent picks
+  // it up at its next tool-call boundary while the current work KEEPS GOING —
+  // this never cancels or interrupts anything (unlike the scrapped interrupt-
+  // steer; see the QueuePanel comment). If the turn isn't steerable (already
+  // settled, codex, plan mode) it falls back to a normal send / re-queue.
+  const steerNow = (i: number) => {
+    const item = queue[i];
+    if (item == null || item.atts?.length) return; // steer channel is text-only
+    const turn = lastTurn;
+    removeFromQueue(i); // optimistic — re-queued at the front on hard failure
+    if (!streaming || !turn) { void sendRaw(item.text, item.atts); return; }
+    void api.steerJob(turn.id, item.text, { interrupt: false }).then(r => {
+      // Not steerable (turn settled between click and RPC, codex, plan mode)
+      // → send it as a normal message so nothing is ever lost.
+      if (!r.steered) void sendRaw(item.text, item.atts);
+    }).catch(() => mutateQueue(q => [{ text: item.text, atts: item.atts }, ...q]));
+  };
   // Pop a queued row back into the composer (text + any attachments).
   const editQueued = (i: number) => {
     const item = queue[i]; if (item == null) return;
@@ -3869,7 +3914,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
             <ScheduledQueue items={upcomingSched} now={schedNow} onCancel={cancelSchedule} onEdit={editSchedule} />
           )}
           {queue.length > 0 && (
-            <QueuePanel queue={queue} hold={queueHoldReason} onMoveToFront={moveToFront} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
+            <QueuePanel queue={queue} hold={queueHoldReason} canSteer={streaming} onSteerNow={steerNow} onMoveToFront={moveToFront} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
           )}
           {slashOpen && (
             <div style={{ marginBottom: 8, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.22))', overflow: 'hidden', padding: 5 }}>

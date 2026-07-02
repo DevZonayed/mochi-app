@@ -131,7 +131,7 @@ export interface ConversationScan {
   conversations: ScannedConversation[];
 }
 export interface TranscriptItem {
-  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image';
+  kind: 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review' | 'image' | 'steer';
   text: string;
   name?: string;
   /** tool: secondary de-emphasized detail (e.g. raw shell command behind a Bash description). */
@@ -1366,6 +1366,16 @@ export const api = {
       req<Job>('/api/jobs/run', { method: 'POST', body: JSON.stringify(input) })),
   cancelJob: (id: string) =>
     call<Job>('cancelJob', { id }, () => req<Job>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' })),
+  /** Steer a RUNNING chat turn: inject a follow-up user message into the live
+      session. Default interrupts (agent abandons current work); pass
+      `{ interrupt: false }` (queue-steer) to deliver at the next tool-call
+      boundary while the run keeps going. `{ steered: false }` ⇒ turn already
+      settled / not steerable — the caller falls back to a normal send. Mac-local
+      only: the remote (REST) path resolves `{ steered: false }` so remotes fall
+      back gracefully. */
+  steerJob: (id: string, text: string, opts?: { interrupt?: boolean }) =>
+    call<{ steered: boolean }>('steerJob', { id, text, ...(opts?.interrupt === false ? { interrupt: false } : {}) },
+      async () => ({ steered: false })),
   deleteJob: (id: string) =>
     call<{ ok: boolean }>('deleteJob', { id }, () => req<{ ok: boolean }>(`/api/jobs/${encodeURIComponent(id)}/delete`, { method: 'POST' })),
 
