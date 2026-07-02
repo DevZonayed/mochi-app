@@ -202,8 +202,8 @@ export function makeGitCtx(store: Store, gitService: GitService, sessionId: stri
 export function nextActionFor(state: SessionGitStatus['state']): string {
   switch (state) {
     case 'no-repo':       return 'Not a git repo — nothing to do.';
-    case 'clean':         return 'No changes yet. Make edits, then commit (Bash: git add -A && git commit -m "…").';
-    case 'uncommitted':   return 'Working tree has uncommitted changes. Commit them with Bash (git add -A && git commit -m "…") before pushing.';
+    case 'clean':         return 'No changes yet. Make edits, then stage everything and commit with a Conventional-Commits message.';
+    case 'uncommitted':   return 'Working tree has uncommitted changes. Stage everything and commit with a Conventional-Commits message (never add AI-attribution trailers) before pushing.';
     case 'ready-to-push': return 'Local commits ready. Call git_push, then pr_create.';
     case 'ready-for-pr':  return 'Pushed and ahead of base. Call pr_create.';
     case 'pr-mergeable':  return 'PR is open and clean. Call pr_merge to land it.';

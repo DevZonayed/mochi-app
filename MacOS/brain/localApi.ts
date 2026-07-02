@@ -20,7 +20,9 @@ import { pruneSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { githubConnectionStatus } from './github-auth.js';
 import { ghState, resolveGh } from './gh-cli.js';
 import { slugify, suggestAvailableSlug, checkRepoAvailable } from './github-slug.js';
-import { getViewer, listOwners, parseGitHubRemote } from './github.js';
+import { provisionGitHubRemote, ensureContinuumExcluded } from './repo-provision.js';
+import { getViewer, listOwners, listOrgs, parseGitHubRemote } from './github.js';
+import type { MemorySync } from './memory-sync.js';
 import { discoverMemoryRepo } from './memory-repo.js';
 import { getClaudeUsage } from './claude-usage.js';
 import { bootstrapNewProject, bootstrapProject, realFs, realGit, readOriginRemote } from './project-bootstrap.js';
@@ -146,11 +148,73 @@ const rootOfProject = (store: Store, projectId: unknown): string => {
   return root;
 };
 
+/* Candidate roots for a file RPC, in priority order:
+     1. the ACTIVE session's worktree (when a sessionId is passed) — the Files
+        panel is session-scoped: each chat works on its own branch/worktree,
+        so the tree must show THAT checkout, not the project root,
+     2. the project root,
+     3. every other session worktree of the project — chat path links carry
+        absolute worktree paths that must stay openable after switching chats.
+   Everything still funnels through resolveInsideRoot, so the escape/symlink
+   defenses hold for each candidate. */
+const rootsFor = (store: Store, projectId: unknown, sessionId?: unknown): string[] => {
+  const pid = String(projectId);
+  const roots: string[] = [];
+  const sid = sessionId == null ? '' : String(sessionId);
+  if (sid) {
+    const s = store.getSession(sid);
+    if (s && s.projectId === pid && s.worktreePath && existsSync(s.worktreePath)) roots.push(s.worktreePath);
+  }
+  const proj = store.getProject(pid)?.path;
+  if (proj && !roots.includes(proj)) roots.push(proj);
+  for (const s of store.listSessions()) {
+    if (s.projectId === pid && s.worktreePath && existsSync(s.worktreePath) && !roots.includes(s.worktreePath)) roots.push(s.worktreePath);
+  }
+  if (!roots.length) throw new Error('this project has no folder on disk');
+  return roots;
+};
+const resolveInRoots = (roots: string[], rel: string): string => {
+  let lastErr: unknown;
+  for (const r of roots) {
+    try { return resolveInsideRoot(r, rel); } catch (e) { lastErr = e; }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('path escapes project');
+};
+
 /** Module-level map of runId → child process for the `runCommand`/`killCommand`
     pair (matches the `runningCmds` map in main.ts). */
 const runningCmds = new Map<string, ChildProcess>();
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null, gitWatcher?: GitWatcher, browserManager?: import('./browser/manager.js').BrowserManager) {
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null, gitWatcher?: GitWatcher, browserManager?: import('./browser/manager.js').BrowserManager, memorySync?: MemorySync) {
+  /** Fire-and-forget GitHub provisioning for a NEW project folder: create the
+      private remote repo, wire origin, push. Gated by Settings.autoCreateRepo
+      (default ON) + a connected GitHub account. Never blocks project creation.
+      Complements the dual-repo `bootstrapProject` flow — this arm only fires
+      for projects created WITHOUT a repoUrl (adopted folders / plain creates). */
+  const provisionProject = (projectId: string, dir: string, name: string): void => {
+    const settings = store.getSettings();
+    if (settings.autoCreateRepo === false) return;
+    const token = providers.getLocalKey('github');
+    if (!token) return;
+    ensureContinuumExcluded(dir); // memory never enters the shared repo
+    void provisionGitHubRemote({ dir, name, token, owner: undefined, private: true })
+      .then((res) => {
+        const proj = store.getProject(projectId);
+        if (!proj) return;
+        if (res.ok && res.created) {
+          try {
+            const updated = store.updateProject(projectId, { repoUrl: res.remoteUrl ?? '' });
+            emit('project', updated);
+          } catch { /* project gone */ }
+          store.pushEvent({ kind: 'repo-created', title: `GitHub repository created: ${res.fullName}`, subtitle: res.pushed ? 'initial push done' : res.reason, projectId });
+        } else if (!res.ok) {
+          store.pushEvent({ kind: 'repo-create-failed', title: `GitHub repo setup failed for ${name}`, subtitle: res.reason, projectId });
+        }
+      })
+      .catch((e: unknown) => {
+        store.pushEvent({ kind: 'repo-create-failed', title: `GitHub repo setup failed for ${name}`, subtitle: e instanceof Error ? e.message.slice(0, 200) : undefined, projectId });
+      });
+  };
   return async function dispatch(method: string, params: Params = {}): Promise<unknown> {
     const p = params ?? {};
     switch (method) {
@@ -176,6 +240,18 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (typeof p.feedbackRepo === 'string') { // '' clears it; otherwise must look like owner/repo
           const v = p.feedbackRepo.trim().slice(0, 140);
           if (v === '' || REPO_RE.test(v)) patch.feedbackRepo = v;
+        }
+        // GitHub automation + memory-repo settings.
+        if (typeof p.autoCreateRepo === 'boolean') patch.autoCreateRepo = p.autoCreateRepo;
+        if (typeof p.autoPushCommits === 'boolean') patch.autoPushCommits = p.autoPushCommits;
+        if (typeof p.memorySyncEnabled === 'boolean') patch.memorySyncEnabled = p.memorySyncEnabled;
+        if (typeof p.memoryRepoOwner === 'string') { // '' = personal profile; else an org login
+          const v = p.memoryRepoOwner.trim().slice(0, 60);
+          if (v === '' || /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(v)) patch.memoryRepoOwner = v;
+        }
+        if (typeof p.memoryRepoName === 'string') {
+          const v = p.memoryRepoName.trim().slice(0, 90);
+          if (v === '' || /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(v)) patch.memoryRepoName = v;
         }
         if (p.browser && typeof p.browser === 'object') {
           const cur = store.getSettings().browser ?? { enabled: true, headless: false };
@@ -287,6 +363,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const proj = store.getProject(String(p.id ?? ''));
         if (!proj) return bad('project not found', 404);
         writeProjectState(projectRootOf(proj), typeof p.state === 'string' ? p.state : '');
+        memorySync?.scheduleSync(proj.id); // mirror the edit to the memory repo
         return { ok: true };
       }
       // Commit a referable snapshot of the project (design + attachments).
@@ -425,6 +502,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (projPath) {
           void ensureGitHooks(projPath).catch(() => { /* best-effort */ });
           void ensureCommitIdentity(projPath).catch(() => { /* best-effort */ });
+          // Tight GitHub coupling: a new project with a folder gets its private
+          // remote repo created + pushed immediately (unless one already exists).
+          if (existsSync(projPath) && !(typeof p.repoUrl === 'string' && p.repoUrl)) {
+            provisionProject(proj.id, projPath, proj.name);
+          }
         }
         emit('project', proj);
         return proj;
@@ -509,6 +591,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (result.ok && result.info.isRepo) {
           void ensureGitHooks(dir).catch(() => { /* lifecycle side-effects never block */ });
           void ensureCommitIdentity(dir).catch(() => { /* gh CLI may be absent */ });
+          ensureContinuumExcluded(dir); // adopted repos: memory stays out of git too
         }
         return result;
       }
@@ -548,6 +631,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           // before the first commit in this repo can happen.
           void ensureGitHooks(result.dir).catch(() => { /* best-effort */ });
           void ensureCommitIdentity(result.dir).catch(() => { /* best-effort */ });
+          ensureContinuumExcluded(result.dir); // memory never enters the shared repo
           emit('clone', { phase: 'done', projectId: proj.id, dir: result.dir, branch: result.branch });
           emit('project', proj);
           store.pushEvent({ kind: 'clone-done', title: `Cloned ${proj.name}`, subtitle: result.branch ? `branch ${result.branch}` : undefined, projectId: proj.id });
@@ -1052,8 +1136,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       // Steer a running chat turn: inject a follow-up into the LIVE session instead
       // of cancelling + reseeding. { steered:false } ⇒ the turn already settled, so
-      // the caller (composer ⌘↩) falls back to a normal send.
-      case 'steerJob': return engine.steer(String(p.id ?? ''), String(p.text ?? ''));
+      // the caller (composer ⌘↩ / queue "steer now") falls back to a normal send.
+      // `interrupt:false` = queue-steer: deliver at the next tool-call boundary
+      // WITHOUT abandoning the current work.
+      case 'steerJob': return engine.steer(String(p.id ?? ''), String(p.text ?? ''), { interrupt: p.interrupt !== false });
       case 'deleteJob': { store.deleteJob(String(p.id ?? '')); return { ok: true }; }
 
       // ── Background tasks (long-lived processes the agent started) ──
@@ -1398,6 +1484,26 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // Live GitHub connection status (login + scopes + repo-scope capability).
       // The token is borrowed live from the gh CLI — nothing is stored by us.
       case 'githubStatus': return githubConnectionStatus(providers.getLocalKey('github'));
+      // Owners where repos (project + memory) can be created: personal + orgs.
+      // (The New-project picker uses the richer `listOwners` arm below.)
+      case 'listGithubOwners': {
+        const token = providers.getLocalKey('github');
+        if (!token) bad('connect GitHub first', 400);
+        const [viewer, orgs] = await Promise.all([
+          getViewer(token as string),
+          listOrgs(token as string).catch(() => [] as string[]),
+        ]);
+        return { personal: viewer.login, orgs };
+      }
+      // Memory repository: status + manual "sync now" (per project or ALL).
+      case 'memorySyncStatus': return memorySync ? memorySync.getStatus() : { enabled: false };
+      case 'memorySyncNow': {
+        if (!memorySync) bad('memory sync is not available', 500);
+        const id = typeof p.projectId === 'string' && p.projectId ? p.projectId : undefined;
+        if (id) return await memorySync!.syncProject(id);
+        await memorySync!.syncAll();
+        return { ok: true };
+      }
       // OAuth sign-in via the GitHub CLI device flow (downloads gh on first use,
       // opens the browser). Long-lived; emits 'github-device'. gh keeps the token.
       case 'githubLogin': return engine.githubLogin();
@@ -1925,9 +2031,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return { dataUrl: `data:${mime};base64,${b64}` };
       }
 
-      // Read a file's text — confined to the project folder.
+      // Read a file's text — confined to the project's roots (session worktree
+      // first when a sessionId is passed, then project root, then other
+      // session worktrees — chat path links carry absolute worktree paths).
       case 'readFile': {
-        const real = resolveInsideRoot(rootOfProject(store, p.projectId), String(p.path ?? ''));
+        const real = resolveInRoots(rootsFor(store, p.projectId, p.sessionId), String(p.path ?? ''));
         const st = await fsp.stat(real);
         if (!st.isFile()) return bad('not a file');
         if (st.size > 2 * 1024 * 1024) {
@@ -1947,7 +2055,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (typeof text !== 'string') return bad('text must be a string');
         if (text.length > 4 * 1024 * 1024) return bad('file too large to save here (4 MB cap)');
         if (text.includes('\u0000')) return bad('refused to write NUL byte (binary)');
-        const real = resolveInsideRoot(rootOfProject(store, p.projectId), String(p.path ?? ''));
+        const real = resolveInRoots(rootsFor(store, p.projectId, p.sessionId), String(p.path ?? ''));
         const st = await fsp.stat(real);
         if (!st.isFile()) return bad('not a file');
         await fsp.writeFile(real, text, 'utf8');
@@ -1955,9 +2063,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return { path: real, bytes: next.size, mtime: next.mtimeMs };
       }
 
-      // List a directory's immediate entries — confined to the project.
+      // List a directory's immediate entries — confined to the project. With a
+      // sessionId, the listing is scoped to THAT session's worktree (the
+      // session's own branch checkout), not the project root.
       case 'listDir': {
-        const real = resolveInsideRoot(rootOfProject(store, p.projectId), String(p.path ?? ''));
+        const real = resolveInRoots(rootsFor(store, p.projectId, p.sessionId), String(p.path ?? ''));
         const st = await fsp.stat(real);
         if (!st.isDirectory()) return bad('not a directory');
         const dirents = await fsp.readdir(real, { withFileTypes: true });

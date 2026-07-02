@@ -42,6 +42,8 @@ import {
   type PlanModeGate, type PlanModeExitRequest,
 } from './plan-mode-gate.js';
 import type { GitService } from './git-service.js';
+import type { MemorySync } from './memory-sync.js';
+import { generateSessionName } from './session-naming.js';
 import { waSendAllowed } from './whatsapp.js';
 import { classifyBashCommand, bgRedirectReason } from './bg-command-guard.js';
 import type { CronRunner } from './cron.js';
@@ -202,11 +204,12 @@ const PR_DIRECTIVE =
   `\`git push\` / \`git merge\` via Bash for these specific intents (it bypasses auth, the active ` +
   `worktree, and the live status events the UI reads):\n\n` +
   `• "create a PR" / "open a PR" / "ship this" / "let's PR": call git_status first; if dirty, ` +
-  `commit with Bash (\`git add -A && git commit -m "…"\`); then call pr_create (pushes for you).\n` +
+  `stage everything and commit with a clear Conventional-Commits message; then call pr_create ` +
+  `(pushes for you).\n` +
   `• "merge" / "land it" / "ship": call pr_merge — only when git_status reports pr-mergeable.\n` +
   `• "resolve the conflicts" / "fix the conflicts" / a PR shows pr-conflicts: call ` +
   `pr_resolve_conflicts. If it returns conflicted files, Read each, Edit out the ` +
-  `<<<<<<</=======/>>>>>>> markers keeping the intended content, Bash-commit, then call ` +
+  `<<<<<<</=======/>>>>>>> markers keeping the intended content, commit, then call ` +
   `pr_resolve_conflicts again to confirm clean + push.\n` +
   `• "push" / "send to github" without a PR ask: call git_push.\n` +
   `• "fix the CI" / "the checks are failing" / a PR reports failing checks: inspect GitHub Actions ` +
@@ -221,8 +224,10 @@ const PR_DIRECTIVE =
   `addressed.\n` +
   `• Status questions ("what's the state?" / "is the PR ready?"): call git_status.\n\n` +
   `Always run git_status BEFORE the action so you know what step the lifecycle is on. ` +
-  `Bash is still the right tool for commits, diffs, and inspections (incl. read-only \`gh\` checks/` +
-  `comments lookups) — just not for the push/PR/merge/resolve actions themselves.`;
+  `When committing: stage everything, write a Conventional-Commits message yourself, and never ` +
+  `add AI-attribution trailers (no Co-Authored-By / "Generated with" lines). Bash is still the ` +
+  `right tool for commits, diffs, and inspections (incl. read-only \`gh\` checks/comments lookups) ` +
+  `— just not for the push/PR/merge/resolve actions themselves.`;
 // SP3 — primary↔reviewer loop: how many review→fix→re-review rounds at most.
 const REVIEW_MAX_ROUNDS = 2;
 // Image generation. When a turn reads like an image request, inject the OpenAI
@@ -460,11 +465,16 @@ interface RunHooks {
 }
 
 /** Injects a user message into a LIVE Claude turn via the SDK's streaming-input
-    channel + `interrupt()` (NOT a cancel-and-reseed). Returns true if delivered;
-    false if the turn already settled (channel closed) so the caller falls back to a
-    normal send. Registered per-run via runClaude's `onSteerReady`. See
-    ./steerable-input.ts. */
-export type SteerFn = (text: string) => Promise<boolean>;
+    channel (NOT a cancel-and-reseed). Returns true if delivered; false if the
+    turn already settled (channel closed) so the caller falls back to a normal
+    send. Two delivery modes:
+      - `interrupt: true` (default) — also calls `interrupt()` so the agent
+        ABANDONS its current work and picks the message up immediately.
+      - `interrupt: false` — queue-steer: the message is pushed into the input
+        channel WITHOUT interrupting, so the SDK delivers it at the next tool-call
+        boundary while the current work keeps going.
+    Registered per-run via runClaude's `onSteerReady`. See ./steerable-input.ts. */
+export type SteerFn = (text: string, opts?: { interrupt?: boolean }) => Promise<boolean>;
 
 /* Per-1M-token prices for a live cost ESTIMATE (the SDK's exact total_cost_usd
    replaces it when the run finishes). Standard Anthropic pricing; cache reads
@@ -1433,7 +1443,7 @@ async function runClaude(
                 return txt(r.ok ? 'Merged. The session\'s work is on the base branch now — you can archive the worktree if you\'re done.' : `Merge failed: ${r.reason ?? 'unknown'}`);
               })),
             tool('pr_resolve_conflicts',
-              'PREPARE conflict resolution: pull the base branch into this chat\'s branch. The actual operation requires a HUMAN to click "Apply Resolution" in the desktop UI — calling this tool surfaces a confirmation dialog listing the files that would change. Use when git_status reports pr-conflicts or when the PR is behind. After the human approves and conflict markers are produced, Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), commit via Bash (`git add -A && git commit -m "resolve conflicts"`), then call this tool again.',
+              'PREPARE conflict resolution: pull the base branch into this chat\'s branch. The actual operation requires a HUMAN to click "Apply Resolution" in the desktop UI — calling this tool surfaces a confirmation dialog listing the files that would change. Use when git_status reports pr-conflicts or when the PR is behind. After the human approves and conflict markers are produced, Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), stage everything and commit (e.g. "fix: resolve merge conflicts"), then call this tool again.',
               {},
               wrap(async () => {
                 if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
@@ -1449,7 +1459,7 @@ async function runClaude(
                 }
                 if (r.conflicts && r.conflicts.length > 0) {
                   const list = r.conflicts.map(f => `  - ${f}`).join('\n');
-                  return txt(`Pulled base; ${r.conflicts.length} file(s) need conflict markers resolved:\n${list}\n\nNext: Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), then\n  Bash: git add -A && git commit -m "resolve merge conflicts"\nFinally call pr_resolve_conflicts again to confirm clean + push.`);
+                  return txt(`Pulled base; ${r.conflicts.length} file(s) need conflict markers resolved:\n${list}\n\nNext: Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), then stage everything and commit (e.g. "fix: resolve merge conflicts").\nFinally call pr_resolve_conflicts again to confirm clean + push.`);
                 }
                 return txt(`pr_resolve_conflicts failed: ${r.reason ?? 'unknown'}`);
               })),
@@ -1761,18 +1771,22 @@ async function runClaude(
   };
   const progress = () => hooks.onProgress?.(proseOf(items), items, liveUsage());
   // Steerable turns: hand the host a SteerFn that injects a user message into THIS
-  // live session. It pushes the message into the input channel, surfaces it inline
-  // as a `steer` transcript item, then interrupts the current turn so the agent
-  // abandons what it's doing and picks the steer up at the next boundary — same
+  // live session. It pushes the message into the input channel and surfaces it
+  // inline as a `steer` transcript item. Default mode also interrupts the current
+  // turn so the agent abandons what it's doing and picks the steer up at the next
+  // boundary; `interrupt:false` (queue-steer) skips the interrupt so the SDK
+  // delivers the message between tool calls while the run keeps going — same
   // subprocess, full context kept (no cancel + resume). Cleared when the run ends.
   if (onSteerReady && steerInput) {
     const channel = steerInput;
-    onSteerReady(async (text: string): Promise<boolean> => {
+    onSteerReady(async (text: string, opts?: { interrupt?: boolean }): Promise<boolean> => {
       if (channel.closed) return false;
       if (!channel.push(userMsg(text, false))) return false;
       items.push({ kind: 'steer', text, ts: Date.now() });
       progress();
-      try { await it.interrupt(); } catch { /* no active turn to interrupt — the queued msg is picked up at the next pull */ }
+      if (opts?.interrupt !== false) {
+        try { await it.interrupt(); } catch { /* no active turn to interrupt — the queued msg is picked up at the next pull */ }
+      }
       return true;
     });
   }
@@ -2374,6 +2388,10 @@ export class LocalEngine {
       don't need a GitService at all). */
   private gitService?: GitService;
   setGitService(g: GitService) { this.gitService = g; }
+  /** MemorySync — mirrors .continuum into the central memory repository after
+      every checkpoint. Injected from main.ts; optional so tests skip it. */
+  private memorySync?: MemorySync;
+  setMemorySync(m: MemorySync) { this.memorySync = m; }
 
   /* ── Background tasks ────────────────────────────────────────────────
      Long-lived processes the agent starts (dev servers, watchers) that must
@@ -2786,16 +2804,19 @@ export class LocalEngine {
   isRunning(jobId: string): boolean { return this.running.has(jobId); }
 
   /** STEER a running chat turn: inject a follow-up user message into the LIVE Claude
-      Agent SDK session (streaming input + `interrupt()`) so the agent abandons its
-      current turn and picks the message up at the next boundary — same subprocess,
-      full context, NO cancel-and-reseed. Returns `{ steered:false }` when the job
-      isn't running a steerable turn (already finished, codex, plan mode, or a non-
-      chat run) so the caller can fall back to a normal send. */
-  async steer(jobId: string, text: string): Promise<{ steered: boolean }> {
+      Agent SDK session (streaming input) — same subprocess, full context, NO
+      cancel-and-reseed. Default also `interrupt()`s so the agent abandons its
+      current turn and picks the message up immediately; `{ interrupt:false }`
+      (queue-steer) pushes WITHOUT interrupting so the SDK delivers the message at
+      the next tool-call boundary while the run keeps going. Returns
+      `{ steered:false }` when the job isn't running a steerable turn (already
+      finished, codex, plan mode, or a non-chat run) so the caller can fall back
+      to a normal send. */
+  async steer(jobId: string, text: string, opts?: { interrupt?: boolean }): Promise<{ steered: boolean }> {
     const t = text.trim();
     const steer = this.running.get(jobId)?.steer;
     if (!t || !steer) return { steered: false };
-    try { return { steered: await steer(t) }; }
+    try { return { steered: await steer(t, opts) }; }
     catch { return { steered: false }; }
   }
 
@@ -3895,20 +3916,50 @@ export class LocalEngine {
       this.running.delete(jobId);
       if (isChat) this.store.touchSession(session.id);
       this.emit('job', done);
-      // Post-turn git refresh + auto-rename hook.
-      //
-      // The agent may have committed / staged / pushed during this turn. The
-      // chat-header chip + contextual action read live `git-status` events, but
-      // nothing recomputes them when a turn ends — so without an explicit
-      // refresh the chip stays "Uncommitted" and the action never advances to
-      // "Push" until the 30s background poller catches up. Recompute + re-emit
-      // now so the UI reflects the new state the instant the turn finishes.
-      //
-      // The auto-rename hook (first informative turn ripens the title → swap the
-      // codename-only branch for a task-derived slug; fires once per session,
-      // gated inside) runs first when applicable, then we refresh against the
-      // freshest session so the emitted status carries the post-rename branch.
-      if (isChat) this.refreshGitAfterTurn(session.id, { allowRename: true });
+      // Post-turn git pipeline + status refresh. Order matters and is the ONLY
+      // order that works:
+      //   1. AI-name the session (title + branch slug from the first exchange),
+      //   2. rename the branch (renameSessionBranch refuses once pushed/PR'd),
+      //   3. auto-push so no completed work ever stays local-only,
+      //   4. recompute + re-emit `git-status` — the agent may have committed /
+      //      staged / pushed during the turn, and the chat-header chip +
+      //      contextual action are purely event-driven, so without this they'd
+      //      sit stale until the 30s background poller catches up.
+      // Naming/rename fire once per session (gated by branchRenamedAt); the
+      // push + refresh run after EVERY chat turn. All fire-and-forget — a git
+      // or model hiccup never breaks the finished turn. The rename is owned by
+      // this pipeline (AI slug > deterministic slug), so the trailing refresh
+      // never re-runs it (no allowRename).
+      if (isChat && this.gitService) {
+        const gs = this.gitService;
+        const fresh = this.store.getSession(session.id);
+        const refresh = () => this.refreshGitAfterTurn(session.id);
+        if (fresh && fresh.branch && fresh.codename && !fresh.branchRenamedAt) {
+          const userMessage = cur.input;
+          const assistantText = output;
+          const key = anthropicKey ?? this.providers?.getLocalKey('anthropic');
+          void (async () => {
+            let slugOverride: string | undefined;
+            if (key) {
+              const named = await generateSessionName({ userMessage, assistantText, apiKey: key });
+              if (named) {
+                slugOverride = named.slug;
+                try {
+                  const s2 = this.store.updateSession(session.id, { title: named.title.slice(0, 60) });
+                  this.emit('session', s2);
+                } catch { /* session gone mid-flight */ }
+              }
+            }
+            // Falls back to the deterministic branchSlug(title) path when the
+            // model was unavailable — the pre-existing behavior, never worse.
+            await gs.syncAfterTurn(session.id, slugOverride);
+          })().then(refresh, refresh);
+        } else if (fresh) {
+          // autoPushSession early-bails (disabled / no token / nothing new)
+          // WITHOUT emitting status, so the refresh must run unconditionally.
+          void gs.autoPushSession(fresh).then(refresh, refresh);
+        }
+      }
       // AskUserQuestion follow-up: if this chat turn ended on a question the user
       // hasn't answered (the SDK auto-dismisses it headless), arm a countdown that
       // auto-sends the recommended option after ASK_BASE_MS. The question card shows
@@ -3966,6 +4017,8 @@ export class LocalEngine {
       // any design turn) so the chain reflects real deltas, not chatter.
       if ((wroteFiles || project?.kind === 'design') && !opts.plan) {
         try { appendCheckpoint(cwd, { summary: `${cur.input.slice(0, 200).trim()}${output ? `\n→ ${output.slice(0, 300).trim()}` : ''}`, tags: project?.kind ? [project.kind] : [] }, Date.now()); } catch { /* memory is best-effort */ }
+        // Mirror the fresh checkpoint into the memory repository (debounced).
+        try { this.memorySync?.scheduleSync(job.projectId); } catch { /* best-effort */ }
       }
       // Chat replies don't ping the events feed — per-message noise; failures still do.
       if (!isChat) this.store.pushEvent({ kind: 'job-done', title: `Done: ${done.title}`, projectId: done.projectId, jobId });

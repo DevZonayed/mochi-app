@@ -3,11 +3,12 @@
    persists the resulting paths into the store. */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, lstatSync, symlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { addWorktree, worktreeExists, removeWorktree, resolveBaseBranch, fetchOrigin, copyGlobsInto, isGitRepo } from './git.js';
+import { addWorktree, worktreeExists, removeWorktree, resolveBaseBranch, fetchOrigin, copyGlobsInto, isGitRepo, localRefExists } from './git.js';
 import { resolveCopyGlobs } from './worktree-include.js';
+import { ensureContinuumExcluded } from './repo-provision.js';
 
 /** Where all session worktrees live (app-managed, outside the repo). */
 export function worktreeRootDir(): string {
@@ -48,12 +49,35 @@ function readWorktreeInclude(repoDir: string): string | null {
   try { return readFileSync(path.join(repoDir, '.worktreeinclude'), 'utf8'); } catch { return null; }
 }
 
+/** Share project memory across sessions: the worktree's `.continuum` becomes a
+    SYMLINK to the main checkout's `.continuum`. Without this every session's
+    checkpoints/STATE.md land in its own worktree copy — fragmenting memory and
+    leaving the project-root `.continuum` (the one MemorySync mirrors to GitHub)
+    stale. `.continuum/` is git-excluded via `.git/info/exclude` (shared with
+    worktrees through the common git dir), so the symlink is invisible to git.
+    A pre-existing REAL directory is left untouched (never destroy memory). */
+export function ensureContinuumLink(repoDir: string, wtPath: string): void {
+  try {
+    const link = path.join(wtPath, '.continuum');
+    try { lstatSync(link); return; } catch { /* absent → create the link */ }
+    const target = path.join(repoDir, '.continuum');
+    mkdirSync(target, { recursive: true });
+    symlinkSync(target, link, 'dir');
+  } catch { /* best-effort — a worktree without the link still works, just unshared */ }
+}
+
 /** Create-or-resolve this session's worktree. Idempotent and symlink-safe. */
 export function ensureSessionWorktree(opts: EnsureWorktreeOpts): EnsureWorktreeResult {
   const wtPath = path.join(opts.worktreeRoot, opts.projectId, opts.sessionId);
 
+  // Keep `.continuum/` git-invisible for the repo AND all its worktrees (the
+  // exclude file lives in the common git dir) — an agent `git add -A` in the
+  // worktree must never stage the memory symlink.
+  ensureContinuumExcluded(opts.repoDir);
+
   // Already registered → reuse it (no recreate). worktreeExists canonicalizes paths.
   if (existsSync(wtPath) && worktreeExists(opts.repoDir, wtPath)) {
+    ensureContinuumLink(opts.repoDir, wtPath); // backfill for pre-existing worktrees
     return { ok: true, cwd: wtPath, created: false, branch: opts.branch, base: opts.base ?? null };
   }
 
@@ -65,13 +89,22 @@ export function ensureSessionWorktree(opts: EnsureWorktreeOpts): EnsureWorktreeR
   const base = opts.base ?? resolveBaseBranch(opts.repoDir);
   mkdirSync(path.dirname(wtPath), { recursive: true });
 
-  const add = addWorktree(opts.repoDir, wtPath, opts.branch, base);
+  // Fork from the REMOTE base (origin/<base>) when it exists — the local base
+  // branch can be arbitrarily backdated (the operator rarely pulls the main
+  // checkout), and `fetchOrigin` above updates origin/* refs, NOT local ones.
+  // `base` stays the short name for callers/persistence (session.baseBranch);
+  // only the worktree start point is remote-qualified.
+  const startPoint = base.startsWith('origin/')
+    ? base
+    : (localRefExists(opts.repoDir, `origin/${base}`) ? `origin/${base}` : base);
+  const add = addWorktree(opts.repoDir, wtPath, opts.branch, startPoint);
   if (!add.ok) {
     return { ok: false, cwd: opts.repoDir, created: false, branch: opts.branch, base, reason: add.reason };
   }
   // Files to copy: a committed `.worktreeinclude` wins, else project copyGlobs, else .env*.
   const globs = resolveCopyGlobs({ worktreeIncludeText: readWorktreeInclude(opts.repoDir), projectGlobs: opts.copyGlobs });
   if (globs.length) copyGlobsInto(opts.repoDir, wtPath, globs);
+  ensureContinuumLink(opts.repoDir, wtPath);
   if (opts.setupScript && opts.setupScript.trim()) (opts.runSetup ?? defaultRunSetup)(wtPath, opts.setupScript, opts.env);
 
   return { ok: true, cwd: wtPath, created: true, branch: opts.branch, base };

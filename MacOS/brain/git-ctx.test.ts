@@ -248,6 +248,19 @@ describe('nextActionFor', () => {
   test('pr-conflicts hint mentions pr_resolve_conflicts', () => {
     expect(nextActionFor('pr-conflicts')).toMatch(/pr_resolve_conflicts/);
   });
+  test('commit hints speak the app lifecycle, not raw git CLI incantations', () => {
+    // Operator-reported bug: every prompt surface that asks the agent to
+    // commit must NOT prescribe `git add -A && git commit -m` command lines —
+    // it says WHAT to do (stage everything, Conventional-Commits message),
+    // and the agent picks its own mechanics.
+    for (const ss of ['clean', 'uncommitted'] as const) {
+      const t = nextActionFor(ss);
+      expect(t).not.toMatch(/git add -A/);
+      expect(t).not.toMatch(/git commit -m/);
+      expect(t).toMatch(/commit/i);
+    }
+    expect(nextActionFor('uncommitted')).toMatch(/Conventional-Commits/);
+  });
   test('pr-merged hint explains the squash-merge cleanup path', () => {
     // The bug we fixed: after squash-merge the branch shows "ahead" with
     // different SHAs and the user wonders what to do. The hint must

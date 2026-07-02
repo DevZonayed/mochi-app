@@ -28,6 +28,7 @@
      • Run button: aria-label="Run AI resolution", disabled while in flight. */
 
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { api } from '../lib/api';
 import { ApiError } from '../lib/api';
 import type { ConflictFile, ConflictHunk } from '../lib/git-types';
@@ -62,17 +63,25 @@ export function buildConflictResolutionPrompt(args: {
   instructions: string;
 }): string {
   const { prTitle, branch, files, instructions } = args;
+  // No local conflict markers yet (GitHub reports conflicts but the base
+  // branch hasn't been merged into the worktree) → the agent must pull the
+  // base in itself via pr_resolve_conflicts, then resolve what surfaces.
+  const noLocal = files.length === 0;
   const fileList = files.map(f => `  • ${f.path}${f.unreadable ? ' (unreadable)' : ` (${f.hunks.length} hunk${f.hunks.length === 1 ? '' : 's'})`}`).join('\n');
   const header = [
     '[Conflict resolution mode]',
-    `The current PR (${prTitle ?? branch ?? 'this branch'}) has merge conflicts in the following files:`,
-    fileList || '  • (none — git reports no conflicted files; double-check the worktree)',
+    noLocal
+      ? `The current PR (${prTitle ?? branch ?? 'this branch'}) has merge conflicts, but this worktree has no conflict markers yet — the base branch has not been merged in.`
+      : `The current PR (${prTitle ?? branch ?? 'this branch'}) has merge conflicts in the following files:`,
+    ...(noLocal ? [] : [fileList]),
     '',
     instructions.trim()
       ? `The operator has provided these additional instructions: "${instructions.trim()}"`
       : 'The operator did not provide additional instructions — use your best judgment.',
     '',
-    'Resolve each file. Edit out the <<<<<<</=======/>>>>>>> markers. Preserve the intended behavior of both sides where possible. When all conflicts are clean, call pr_resolve_conflicts (it will prompt the operator to confirm and finalize).',
+    noLocal
+      ? 'Call pr_resolve_conflicts first — it pulls the base branch into this worktree and reports the conflicted files. Read each one, edit out the <<<<<<</=======/>>>>>>> markers, preserve the intended behavior of both sides where possible, then call pr_resolve_conflicts again (it will prompt the operator to confirm and finalize).'
+      : 'Resolve each file. Edit out the <<<<<<</=======/>>>>>>> markers. Preserve the intended behavior of both sides where possible. When all conflicts are clean, call pr_resolve_conflicts (it will prompt the operator to confirm and finalize).',
   ].join('\n');
 
   // Append the live hunks as fenced blocks so the agent has the same view the
@@ -162,7 +171,11 @@ export function AiConflictResolveDialog({ open, sessionId, projectId, branch, pr
 
   const totalHunks = files.reduce((n, f) => n + f.hunks.length, 0);
   const fileCount = files.length;
-  const canRun = !submitting && !loading && fileCount > 0;
+  // Zero local hunks must NOT disable Run: when GitHub reports conflicts but
+  // the base branch hasn't been merged into the worktree yet, there ARE no
+  // markers on disk — the agent pulls the base in via pr_resolve_conflicts
+  // and resolves what surfaces. Only an in-flight dispatch/load blocks Run.
+  const canRun = !submitting && !loading;
 
   const run = async (): Promise<void> => {
     if (!canRun) return;
@@ -183,10 +196,14 @@ export function AiConflictResolveDialog({ open, sessionId, projectId, branch, pr
     }
   };
 
-  return (
+  // Portal to <body>: this dialog is rendered from inside the chat header,
+  // whose `backdrop-filter: blur()` makes it the containing block for
+  // position:fixed descendants (WebKit) — without the portal, `inset: 0`
+  // resolves against the small header box and the card clips off-screen.
+  return createPortal(
     <div role="presentation" data-testid="ai-conflict-overlay" onClick={onClose} style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.36)', zIndex: 9100,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
       backdropFilter: 'blur(2px)', WebkitBackdropFilter: 'blur(2px)',
     }}>
       <div ref={dialogRef}
@@ -227,7 +244,7 @@ export function AiConflictResolveDialog({ open, sessionId, projectId, branch, pr
           )}
           {!loading && !loadError && files.length === 0 && (
             <div style={{ color: 'var(--ink-tertiary)', font: '500 var(--fs-body)/1.4 var(--font-text)' }}>
-              No active conflicts found in the worktree. If the PR shows conflicts on GitHub, click the "Pull base" action on the dock first to start the merge.
+              No conflict markers in the worktree yet — the base branch hasn't been merged in. Run will ask the agent to pull the base branch in and resolve the conflicts it surfaces.
             </div>
           )}
 
@@ -296,7 +313,8 @@ export function AiConflictResolveDialog({ open, sessionId, projectId, branch, pr
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

@@ -38,6 +38,36 @@ describe('addWorktree / listWorktrees / worktreeExists', () => {
     expect(res.ok).toBe(true);
   });
 
+  test('resets an existing branch with NO unique commits onto the base (stale fork point)', () => {
+    const r = repo();
+    // Branch forked at the old tip, then the base advances (e.g. a fetch moved
+    // origin/main). Recreating the worktree must NOT resurrect the stale tip.
+    execFileSync('git', ['-C', r, 'branch', 'mochi/stale'], { encoding: 'utf8' });
+    writeFileSync(path.join(r, 'newer.txt'), 'newer\n');
+    execFileSync('git', ['-C', r, 'add', '-A'], { encoding: 'utf8' });
+    execFileSync('git', ['-C', r, 'commit', '-q', '-m', 'advance main'], { encoding: 'utf8' });
+    const mainSha = execFileSync('git', ['-C', r, 'rev-parse', 'main'], { encoding: 'utf8' }).trim();
+    const wt = path.join(tmp(), 'wt');
+    const res = addWorktree(r, wt, 'mochi/stale', 'main');
+    expect(res.ok).toBe(true);
+    expect(execFileSync('git', ['-C', wt, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(mainSha);
+  });
+
+  test('preserves an existing branch that HAS its own commits (never destroys session work)', () => {
+    const r = repo();
+    execFileSync('git', ['-C', r, 'checkout', '-q', '-b', 'mochi/worked'], { encoding: 'utf8' });
+    writeFileSync(path.join(r, 'session-work.txt'), 'precious\n');
+    execFileSync('git', ['-C', r, 'add', '-A'], { encoding: 'utf8' });
+    execFileSync('git', ['-C', r, 'commit', '-q', '-m', 'session work'], { encoding: 'utf8' });
+    const workSha = execFileSync('git', ['-C', r, 'rev-parse', 'mochi/worked'], { encoding: 'utf8' }).trim();
+    execFileSync('git', ['-C', r, 'checkout', '-q', 'main'], { encoding: 'utf8' });
+    const wt = path.join(tmp(), 'wt');
+    const res = addWorktree(r, wt, 'mochi/worked', 'main');
+    expect(res.ok).toBe(true);
+    expect(execFileSync('git', ['-C', wt, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(workSha);
+    expect(existsSync(path.join(wt, 'session-work.txt'))).toBe(true);
+  });
+
   test('worktreeExists is false for a path that is not a worktree', () => {
     const r = repo();
     expect(worktreeExists(r, path.join(tmp(), 'nope'))).toBe(false);
