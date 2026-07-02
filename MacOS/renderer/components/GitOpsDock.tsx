@@ -328,8 +328,10 @@ export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps)
     setComposerOpen(false);
     // No direct IPC for `git commit` from the renderer; the safe path is to
     // ask the agent in this chat to make the commit with this exact message.
-    // The agent already has Bash; this stays consistent with how every other
-    // git op (push/PR/merge/resolve) flows on master.
+    // The prompt speaks the app's own lifecycle (git_status tool → commit →
+    // dock handles push/PR) instead of prescribing raw git CLI incantations —
+    // the agent picks its own mechanics, and the operator-visible text stays
+    // inline with the gh-based flow everywhere else in the app.
     if (!session?.projectId) { setFeedback({ kind: 'err', text: 'Session has no project.' }); return; }
     setBusy(true); setFeedback(null);
     try {
@@ -339,11 +341,10 @@ export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps)
         // Conventional-Commits message. Any body the user did type is passed as
         // intent ("why") for the agent to fold in.
         const why = body ? `\n\nContext to fold into the message (the "why"):\n${body}` : '';
-        text = `Please review the pending changes (\`git status\` / \`git diff\`), then commit them with a clear Conventional-Commits message you compose yourself (e.g. \`feat(desktop): …\` or \`fix: …\`). Run \`git add -A\` then \`git commit\`. Do not push.${why}`;
+        text = `Please review the pending changes with your git_status tool, then stage everything and commit with a clear Conventional-Commits message you compose yourself (e.g. \`feat(desktop): …\` or \`fix: …\`). Do not push — the operator pushes from the Git dock. Never add AI-attribution trailers.${why}`;
       } else {
         const msg = body ? `${subject}\n\n${body}` : subject;
-        const safeSubject = subject.replace(/"/g, '\\"');
-        text = `Please commit the pending changes with this exact message:\n\n${msg}\n\nRun \`git add -A\` then \`git commit -m "${safeSubject}"\`${body ? ` followed by \`-m "<body>"\`` : ''}. Do not push.`;
+        text = `Please stage everything and commit the pending changes with this exact message:\n\n${msg}\n\nUse that exact message${body ? ' (subject + body)' : ''} — do not reword it, and never add AI-attribution trailers. Do not push — the operator pushes from the Git dock.`;
       }
       await api.sendChat({ projectId: session.projectId, sessionId: sessionId!, text });
       setFeedback({ kind: 'ok', text: 'Asked the agent to commit.' });

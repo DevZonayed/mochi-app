@@ -86,12 +86,19 @@ describe('buildConflictResolutionPrompt', () => {
     expect(p).toContain('unreadable');
   });
 
-  test('handles an empty file list without crashing (defensive)', () => {
+  test('empty file list → pull-base-first instructions (GitHub conflicts, no local markers)', () => {
+    // Zero local hunks is the COMMON entry: GitHub reports the PR conflicted
+    // but the base branch was never merged into the worktree, so there are no
+    // markers on disk. The prompt must tell the agent to call
+    // pr_resolve_conflicts FIRST (it pulls the base in), then resolve.
     const p = buildConflictResolutionPrompt({ prTitle: null, branch: null, files: [], instructions: '' });
-    expect(typeof p).toBe('string');
-    expect(p.length).toBeGreaterThan(0);
-    // Falls back to a placeholder bullet rather than emitting an empty section.
-    expect(p).toContain('(none');
+    expect(p.startsWith('[Conflict resolution mode]')).toBe(true);
+    expect(p).toContain('no conflict markers yet');
+    expect(p).toContain('Call pr_resolve_conflicts first');
+    expect(p).toContain('call pr_resolve_conflicts again');
+    // No stray empty file-list section.
+    expect(p).not.toContain('in the following files');
+    expect(p).not.toContain('(none');
   });
 
   test('emits diff3 base section when present', () => {
