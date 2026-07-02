@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, lstatSync, symlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { addWorktree, worktreeExists, removeWorktree, resolveBaseBranch, fetchOrigin, copyGlobsInto, isGitRepo } from './git.js';
+import { addWorktree, worktreeExists, removeWorktree, resolveBaseBranch, fetchOrigin, copyGlobsInto, isGitRepo, localRefExists } from './git.js';
 import { resolveCopyGlobs } from './worktree-include.js';
 import { ensureContinuumExcluded } from './repo-provision.js';
 
@@ -89,7 +89,15 @@ export function ensureSessionWorktree(opts: EnsureWorktreeOpts): EnsureWorktreeR
   const base = opts.base ?? resolveBaseBranch(opts.repoDir);
   mkdirSync(path.dirname(wtPath), { recursive: true });
 
-  const add = addWorktree(opts.repoDir, wtPath, opts.branch, base);
+  // Fork from the REMOTE base (origin/<base>) when it exists — the local base
+  // branch can be arbitrarily backdated (the operator rarely pulls the main
+  // checkout), and `fetchOrigin` above updates origin/* refs, NOT local ones.
+  // `base` stays the short name for callers/persistence (session.baseBranch);
+  // only the worktree start point is remote-qualified.
+  const startPoint = base.startsWith('origin/')
+    ? base
+    : (localRefExists(opts.repoDir, `origin/${base}`) ? `origin/${base}` : base);
+  const add = addWorktree(opts.repoDir, wtPath, opts.branch, startPoint);
   if (!add.ok) {
     return { ok: false, cwd: opts.repoDir, created: false, branch: opts.branch, base, reason: add.reason };
   }

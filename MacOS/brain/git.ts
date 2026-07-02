@@ -326,12 +326,15 @@ export function listWorktrees(repoDir: string): WorktreeEntry[] {
   return out;
 }
 
-/** Add a worktree for `branch` (created from `base` if it doesn't exist yet). */
+/** Add a worktree for `branch` (created from `base` if it doesn't exist yet).
+    `base` may be a remote ref like `origin/master` — `--no-track` keeps the new
+    session branch from tracking it (we never want `git push` on a feature branch
+    to default to origin/master). */
 export function addWorktree(repoDir: string, wtPath: string, branch: string, base: string): { ok: boolean; path: string; reason?: string } {
   const branchExists = execGit(['-C', repoDir, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]).code === 0;
   const args = branchExists
     ? ['-C', repoDir, 'worktree', 'add', wtPath, branch]
-    : ['-C', repoDir, 'worktree', 'add', '-b', branch, wtPath, base];
+    : ['-C', repoDir, 'worktree', 'add', '--no-track', '-b', branch, wtPath, base];
   const r = execGit(args, { timeout: 60_000 });
   return r.ok ? { ok: true, path: wtPath } : { ok: false, path: wtPath, reason: r.out.slice(0, 300) };
 }
