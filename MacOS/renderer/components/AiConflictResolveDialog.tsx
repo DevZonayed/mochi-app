@@ -28,6 +28,7 @@
      • Run button: aria-label="Run AI resolution", disabled while in flight. */
 
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { api } from '../lib/api';
 import { ApiError } from '../lib/api';
 import type { ConflictFile, ConflictHunk } from '../lib/git-types';
@@ -195,10 +196,14 @@ export function AiConflictResolveDialog({ open, sessionId, projectId, branch, pr
     }
   };
 
-  return (
+  // Portal to <body>: this dialog is rendered from inside the chat header,
+  // whose `backdrop-filter: blur()` makes it the containing block for
+  // position:fixed descendants (WebKit) — without the portal, `inset: 0`
+  // resolves against the small header box and the card clips off-screen.
+  return createPortal(
     <div role="presentation" data-testid="ai-conflict-overlay" onClick={onClose} style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.36)', zIndex: 9100,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
       backdropFilter: 'blur(2px)', WebkitBackdropFilter: 'blur(2px)',
     }}>
       <div ref={dialogRef}
@@ -308,7 +313,8 @@ export function AiConflictResolveDialog({ open, sessionId, projectId, branch, pr
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

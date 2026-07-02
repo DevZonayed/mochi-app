@@ -27,6 +27,7 @@
        or PR ("Merge PR #42", "Push branch foo/bar"). */
 
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { api } from '../lib/api';
 import { displayCodename, codenameFromBranch, SESSION_STATE_COLOR } from '../lib/git-types';
 import type { GithubConnection } from '../lib/git-types';
@@ -57,16 +58,22 @@ function ConfirmDialog({ open, title, body, okText, danger, onCancel, onOk, busy
     return () => { clearTimeout(t); window.removeEventListener('keydown', onKey, true); };
   }, [open, onCancel]);
   if (!open) return null;
-  return (
+  // Portal to <body>: the dock lives inside the chat header, whose
+  // `backdrop-filter: blur()` makes it the containing block for
+  // position:fixed descendants (WebKit). Rendered in place, `inset: 0`
+  // would resolve against the ~46px header box and the card's top half
+  // disappears under the tab strip. The portal restores viewport centring.
+  return createPortal(
     <div role="presentation" onClick={onCancel} style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.32)', zIndex: 9000,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
       backdropFilter: 'blur(2px)', WebkitBackdropFilter: 'blur(2px)',
     }}>
       <div role="alertdialog" aria-modal="true" aria-labelledby="git-confirm-title"
         onClick={(e) => e.stopPropagation()}
         style={{
           width: 440, maxWidth: 'calc(100vw - 32px)', padding: 20,
+          maxHeight: 'calc(100vh - 48px)', overflowY: 'auto',
           borderRadius: 14, background: 'var(--bg-elevated)',
           boxShadow: '0 30px 60px rgba(0,0,0,0.25), 0 0 0 0.5px var(--separator-strong)',
           font: '500 var(--fs-body)/1.45 var(--font-text)', color: 'var(--ink)',
@@ -87,7 +94,8 @@ function ConfirmDialog({ open, title, body, okText, danger, onCancel, onOk, busy
           }}>{busy ? 'Working…' : okText}</button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -119,16 +127,18 @@ function CommitComposer({ open, onCancel, onSubmit, busy }: {
   const ok = subjectValid;
   const submit = () => { if (ok && !busy) onSubmit(trimmed, body.trim()); };
 
-  return (
+  // Portal to <body> — same containing-block trap as ConfirmDialog above.
+  return createPortal(
     <div role="presentation" onClick={onCancel} style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.32)', zIndex: 9000,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
       backdropFilter: 'blur(2px)', WebkitBackdropFilter: 'blur(2px)',
     }}>
       <div role="dialog" aria-modal="true" aria-labelledby="git-commit-title"
         onClick={(e) => e.stopPropagation()}
         style={{
           width: 540, maxWidth: 'calc(100vw - 32px)', padding: 20, borderRadius: 14,
+          maxHeight: 'calc(100vh - 48px)', overflowY: 'auto',
           background: 'var(--bg-elevated)',
           boxShadow: '0 30px 60px rgba(0,0,0,0.25), 0 0 0 0.5px var(--separator-strong)',
           color: 'var(--ink)',
@@ -173,7 +183,8 @@ function CommitComposer({ open, onCancel, onSubmit, busy }: {
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
