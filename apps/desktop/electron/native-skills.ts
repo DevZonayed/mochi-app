@@ -138,10 +138,21 @@ function safeRead(p: string): string { try { return readFileSync(p, 'utf8'); } c
 
 /* The always-on, high-priority prompt block. Injected at the very TOP of every
    real run (both engines) so native skills are considered FIRST — ahead of the
-   dynamic registry search. Lists the whole catalog as a name→description index;
-   the agent reads a specific SKILL.md when a task matches. Special-cases image
-   generation (imagegen) because that one is non-negotiable. */
-export function nativeSkillsPromptBlock(disabledSlugs?: Set<string>): string {
+   dynamic registry search. Special-cases image generation (imagegen) because
+   that one is non-negotiable.
+
+   Two shapes, keyed on `opts.index`:
+   - index:true (Codex — no skill auto-discovery): the whole catalog as a
+     name→description index; the agent reads a specific SKILL.md when a task
+     matches. ~2.7K tokens.
+   - index:false (Claude — the Agent SDK ALREADY auto-discovers every SKILL.md
+     via settingSources:['project'], so repeating the catalog here would
+     double-list all 40+ skills every turn): just the header + the imagegen
+     rule + a one-line pointer that natives are pre-installed and appear among
+     its discovered skills. Saves ~2.5K tokens per Claude turn with zero
+     capability loss. */
+export function nativeSkillsPromptBlock(disabledSlugs?: Set<string>, opts?: { index?: boolean }): string {
+  const withIndex = opts?.index !== false;
   const line = (s: NativeSkill) => `- ${s.name} (\`${s.slug}\`): ${(s.description || '').replace(/\s+/g, ' ').slice(0, 200)}`;
   const active = NATIVE_SKILLS.filter(s => !disabledSlugs?.has(s.slug));
   const system = active.filter(s => s.category === 'system');
@@ -154,8 +165,10 @@ export function nativeSkillsPromptBlock(disabledSlugs?: Set<string>): string {
     (imagegenOn ?
     `### Image generation — NON-NEGOTIABLE\n` +
     `For ANY request to create, generate, edit, or vary a raster image (photo, illustration, icon set, texture, sprite, mockup, banner, logo, infographic, cutout), you MUST use the \`imagegen\` skill: read \`.claude/skills/imagegen/SKILL.md\` and follow it, producing a REAL bitmap via the built-in image tool (Codex \`image_gen\` / Maestro \`generate_image\`). NEVER substitute SVG, ASCII art, or HTML/CSS placeholders for a requested raster image. This applies on every model and every engine.\n\n` : '') +
+    (withIndex ?
     `### The catalog (system skills first — they are foundational)\n` +
-    `${index}\n` +
+    `${index}\n` :
+    `These native skills are among your auto-discovered project skills (each has its SKILL.md under \`.claude/skills/<slug>/\`) — prefer a matching native skill over a registry search.\n`) +
     `</native_skills>\n\n`
   );
 }

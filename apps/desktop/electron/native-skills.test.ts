@@ -104,6 +104,32 @@ describe('nativeSkillsPromptBlock', () => {
     expect(block).not.toContain('`pdf`');
     expect(block).toContain('`skill-creator`');
   });
+
+  it('lean mode (index:false, for Claude) keeps the imagegen rule but drops the catalog', () => {
+    const block = nativeSkillsPromptBlock(undefined, { index: false });
+    expect(block).toContain('<native_skills');
+    expect(block).toContain('NON-NEGOTIABLE');
+    expect(block).toContain('NEVER substitute SVG');
+    // No catalog index — only imagegen (named in the rule) may appear.
+    expect(block).not.toContain('### The catalog');
+    expect(block).not.toContain('`pdf`');
+    expect(block).not.toContain('`skill-creator`');
+    // Pointer to auto-discovered skills replaces the index.
+    expect(block).toContain('auto-discovered');
+    // And it is meaningfully smaller than the full block.
+    expect(block.length).toBeLessThan(nativeSkillsPromptBlock().length / 3);
+  });
+
+  it('lean mode with imagegen disabled shrinks to just the header + pointer', () => {
+    const block = nativeSkillsPromptBlock(new Set(['imagegen']), { index: false });
+    expect(block).not.toContain('NON-NEGOTIABLE');
+    expect(block).toContain('auto-discovered');
+    expect(block).toContain('</native_skills>');
+  });
+
+  it('index:true (Codex) and the default produce the full catalog', () => {
+    expect(nativeSkillsPromptBlock(undefined, { index: true })).toBe(nativeSkillsPromptBlock());
+  });
 });
 
 describe('nativeSkillSummaries', () => {

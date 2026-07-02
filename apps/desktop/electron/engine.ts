@@ -2873,7 +2873,11 @@ export class LocalEngine {
               .filter(s => s.addedBy === 'native' && s.enabled === false)
               .map(s => s.slug),
           );
-          nativeSkillsBlock = nativeSkillsPromptBlock(offNative);
+          // Claude auto-discovers every SKILL.md via settingSources:['project'], so
+          // sending it the full 40+ line catalog index would DOUBLE-LIST every skill
+          // (~2.5K wasted tokens per turn). Claude gets the lean block (imagegen rule
+          // + pointer); Codex has no auto-discovery, so it keeps the full index.
+          nativeSkillsBlock = nativeSkillsPromptBlock(offNative, { index: master !== 'claude' });
         } catch { /* best-effort — a bundled-skill hiccup never fails a run */ }
       }
 
