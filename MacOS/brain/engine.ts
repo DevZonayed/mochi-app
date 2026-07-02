@@ -201,11 +201,12 @@ const PR_DIRECTIVE =
   `\`git push\` / \`git merge\` via Bash for these specific intents (it bypasses auth, the active ` +
   `worktree, and the live status events the UI reads):\n\n` +
   `• "create a PR" / "open a PR" / "ship this" / "let's PR": call git_status first; if dirty, ` +
-  `commit with Bash (\`git add -A && git commit -m "…"\`); then call pr_create (pushes for you).\n` +
+  `stage everything and commit with a clear Conventional-Commits message; then call pr_create ` +
+  `(pushes for you).\n` +
   `• "merge" / "land it" / "ship": call pr_merge — only when git_status reports pr-mergeable.\n` +
   `• "resolve the conflicts" / "fix the conflicts" / a PR shows pr-conflicts: call ` +
   `pr_resolve_conflicts. If it returns conflicted files, Read each, Edit out the ` +
-  `<<<<<<</=======/>>>>>>> markers keeping the intended content, Bash-commit, then call ` +
+  `<<<<<<</=======/>>>>>>> markers keeping the intended content, commit, then call ` +
   `pr_resolve_conflicts again to confirm clean + push.\n` +
   `• "push" / "send to github" without a PR ask: call git_push.\n` +
   `• "fix the CI" / "the checks are failing" / a PR reports failing checks: inspect GitHub Actions ` +
@@ -220,8 +221,10 @@ const PR_DIRECTIVE =
   `addressed.\n` +
   `• Status questions ("what's the state?" / "is the PR ready?"): call git_status.\n\n` +
   `Always run git_status BEFORE the action so you know what step the lifecycle is on. ` +
-  `Bash is still the right tool for commits, diffs, and inspections (incl. read-only \`gh\` checks/` +
-  `comments lookups) — just not for the push/PR/merge/resolve actions themselves.`;
+  `When committing: stage everything, write a Conventional-Commits message yourself, and never ` +
+  `add AI-attribution trailers (no Co-Authored-By / "Generated with" lines). Bash is still the ` +
+  `right tool for commits, diffs, and inspections (incl. read-only \`gh\` checks/comments lookups) ` +
+  `— just not for the push/PR/merge/resolve actions themselves.`;
 // SP3 — primary↔reviewer loop: how many review→fix→re-review rounds at most.
 const REVIEW_MAX_ROUNDS = 2;
 // Image generation. When a turn reads like an image request, inject the OpenAI
@@ -1432,7 +1435,7 @@ async function runClaude(
                 return txt(r.ok ? 'Merged. The session\'s work is on the base branch now — you can archive the worktree if you\'re done.' : `Merge failed: ${r.reason ?? 'unknown'}`);
               })),
             tool('pr_resolve_conflicts',
-              'PREPARE conflict resolution: pull the base branch into this chat\'s branch. The actual operation requires a HUMAN to click "Apply Resolution" in the desktop UI — calling this tool surfaces a confirmation dialog listing the files that would change. Use when git_status reports pr-conflicts or when the PR is behind. After the human approves and conflict markers are produced, Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), commit via Bash (`git add -A && git commit -m "resolve conflicts"`), then call this tool again.',
+              'PREPARE conflict resolution: pull the base branch into this chat\'s branch. The actual operation requires a HUMAN to click "Apply Resolution" in the desktop UI — calling this tool surfaces a confirmation dialog listing the files that would change. Use when git_status reports pr-conflicts or when the PR is behind. After the human approves and conflict markers are produced, Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), stage everything and commit (e.g. "fix: resolve merge conflicts"), then call this tool again.',
               {},
               wrap(async () => {
                 if (!gitCtx.available()) return txt('This session has no live git/PR lifecycle.');
@@ -1448,7 +1451,7 @@ async function runClaude(
                 }
                 if (r.conflicts && r.conflicts.length > 0) {
                   const list = r.conflicts.map(f => `  - ${f}`).join('\n');
-                  return txt(`Pulled base; ${r.conflicts.length} file(s) need conflict markers resolved:\n${list}\n\nNext: Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), then\n  Bash: git add -A && git commit -m "resolve merge conflicts"\nFinally call pr_resolve_conflicts again to confirm clean + push.`);
+                  return txt(`Pulled base; ${r.conflicts.length} file(s) need conflict markers resolved:\n${list}\n\nNext: Read each file, resolve the <<<<<<< / ======= / >>>>>>> markers (keep the intended content), then stage everything and commit (e.g. "fix: resolve merge conflicts").\nFinally call pr_resolve_conflicts again to confirm clean + push.`);
                 }
                 return txt(`pr_resolve_conflicts failed: ${r.reason ?? 'unknown'}`);
               })),
