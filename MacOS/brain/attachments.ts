@@ -187,6 +187,57 @@ export function scrubAbsPathsForRelay(text: string): string {
     (_m, _full: string, base: string) => `@.continuum/Attachment/${base}`);
 }
 
+/** Minimal shape of a persisted chat attachment this module needs to inline. */
+export interface AttachedFileLike {
+  name: string;
+  kind: 'text' | 'file';
+  /** Legacy: text inlined into the job. New writes leave this undefined. */
+  content?: string;
+  /** On-disk path under `.continuum/Attachment/`. */
+  path?: string;
+}
+
+/** Build the trailing "attached file(s)" block appended to the prompt for the
+    turn a file is attached.
+
+    WHY this exists: the composer puts an inline `@<absPath>` marker in the prompt
+    for each attachment, but the Agent SDK does NOT expand `@path` mentions the way
+    the Claude Code CLI does — the path arrives as plain literal text with no
+    content. Without this block the model just echoes the path back (e.g.
+    "look at @…/Pasted_text_xxx.txt") having never seen what was pasted. So every
+    attached TEXT file is inlined here (from `content`, else read from `path`);
+    binaries that have no inline `@path` in the prompt get a Read hint instead.
+
+    Pure + injectable IO (`exists`/`readText`) so it's unit-testable without disk.
+    Returns '' when there's nothing to add. `budget` caps total inlined text. */
+export function attachedFilesBlock(
+  files: readonly AttachedFileLike[],
+  input: string,
+  io: { exists: (p: string) => boolean; readText: (p: string) => string },
+  budget = 400 * 1024,
+): string {
+  if (!files?.length) return '';
+  const parts: string[] = [];
+  let left = budget;
+  for (const f of files) {
+    let textBody: string | undefined;
+    if (f.kind === 'text') {
+      if (f.content != null) textBody = f.content;
+      else if (f.path && io.exists(f.path)) { try { textBody = io.readText(f.path); } catch { /* unreadable — skip */ } }
+    }
+    if (textBody !== undefined) {
+      if (left <= 0) continue;
+      const body = textBody.length > left ? textBody.slice(0, left) + '\n…(truncated)' : textBody;
+      left -= Math.min(textBody.length, left);
+      parts.push(`### Attached file: ${f.name}\n\`\`\`\n${body}\n\`\`\``);
+    } else if (f.kind === 'file' && f.path && io.exists(f.path) && !input.includes(`@${f.path}`)) {
+      parts.push(`The user attached the file \`${f.name}\` (saved at ${f.path}). Read it with your tools if it's relevant.`);
+    }
+  }
+  if (!parts.length) return '';
+  return `\n\n---\n\nThe user attached the following file(s):\n\n${parts.join('\n\n')}`;
+}
+
 /** A standalone path token regex used by the renderer to tokenize a message
     bubble into prose + inline attachment chips. Matches both absolute paths and
     the relay-scrubbed `@.continuum/Attachment/<file>` form. Accepts spaces in
