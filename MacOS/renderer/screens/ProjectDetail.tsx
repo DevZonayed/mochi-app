@@ -820,6 +820,18 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
   const builtins = caps.filter(c => c.kind !== 'mcp');
   const mcps = caps.filter(c => c.kind === 'mcp');
   const installedIds = new Set(installed.map(s => s.id));
+  // Built-in (native) skills ship with the app: their own collapsible group with
+  // a toggle — no Remove (they re-materialise on the next run by design).
+  const nativeSkills = installed.filter(s => s.addedBy === 'native');
+  const userInstalled = installed.filter(s => s.addedBy !== 'native');
+  const nativeOn = nativeSkills.filter(s => s.enabled !== false).length;
+  const [nativesOpen, setNativesOpen] = React.useState(false);
+  const toggleNative = async (s: InstalledSkill) => {
+    if (!projectId) return;
+    const next = s.enabled === false;
+    setInstalled(list => list.map(x => (x.id === s.id ? { ...x, enabled: next } : x)));
+    try { await api.setProjectSkillEnabled(projectId, s.id, next); } catch { reload(); }
+  };
   const runSearch = async (term: string) => {
     setSearching(true);
     try { const r = await api.searchSkills(term, 24); setResults(r.results); } catch { setResults([]); }
@@ -885,11 +897,11 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
         {!searching && q && results.length === 0 && <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', padding: '6px 2px' }}>No skills match “{q}”. The agent can also add skills itself during a run.</div>}
       </div>
 
-      {/* Installed in this project */}
-      {installed.length > 0 && (
+      {/* Installed in this project (operator/agent-added — built-ins live below) */}
+      {userInstalled.length > 0 && (
         <GroupedList header="Installed in this project">
-          {installed.map((s, i) => (
-            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px', borderBottom: i === installed.length - 1 ? 'none' : '0.5px solid var(--separator)' }}>
+          {userInstalled.map((s, i) => (
+            <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '11px 14px', borderBottom: i === userInstalled.length - 1 ? 'none' : '0.5px solid var(--separator)' }}>
               <Icon name="spark" size={16} style={{ color: 'var(--indigo)', flexShrink: 0 }} />
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</div>
@@ -900,6 +912,37 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
               <button onClick={() => void remove(s)} className="link-btn" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Remove</button>
             </div>
           ))}
+        </GroupedList>
+      )}
+
+      {/* Built-in skills — bundled with the app, toggle only */}
+      {nativeSkills.length > 0 && (
+        <GroupedList header="Built-in skills">
+          <button onClick={() => setNativesOpen(o => !o)}
+            style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 10, padding: '11px 14px', border: 'none', background: 'color-mix(in srgb, var(--purple) 5%, transparent)', cursor: 'pointer', textAlign: 'left' }}>
+            <Icon name="spark" size={16} style={{ color: 'var(--purple)', flexShrink: 0 }} />
+            <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>
+              Ship with the app and stay up to date automatically — image generation, office documents (docx/pdf/pptx/xlsx), deploys, Figma, security and more. The agent activates one only when a task matches.
+            </span>
+            <span style={{ flexShrink: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)', background: 'color-mix(in srgb, var(--purple) 12%, transparent)', borderRadius: 999, padding: '3px 8px' }}>{nativeOn}/{nativeSkills.length} on</span>
+            <Icon name={nativesOpen ? 'chevronDown' : 'chevronRight'} size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} />
+          </button>
+          {nativesOpen && nativeSkills.slice().sort((a, b) => a.name.localeCompare(b.name)).map(s => {
+            const on = s.enabled !== false;
+            return (
+              <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '9px 14px', borderTop: '0.5px solid var(--separator)', opacity: on ? 1 : 0.6 }}>
+                <Icon name="spark" size={15} style={{ color: on ? 'var(--purple)' : 'var(--ink-tertiary)', flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                    <span style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
+                    <span title="Ships with the app — can be turned off, not removed" style={{ flexShrink: 0, height: 16, padding: '0 6px', borderRadius: 999, background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)', font: '600 var(--fs-caption)/16px var(--font-text)' }}>built-in</span>
+                  </div>
+                  {s.description && <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.description}</div>}
+                </div>
+                <Switch on={on} onChange={() => void toggleNative(s)} />
+              </div>
+            );
+          })}
         </GroupedList>
       )}
 

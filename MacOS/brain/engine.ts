@@ -31,6 +31,7 @@ import { normalizeRunMode, canStartBackgroundRun } from './run-mode.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
 import { ensureBrowserSkill } from './browser-skill.js';
+import { ensureNativeSkills, nativeSkillsPromptBlock, nativeSkillSummaries, isNativeSkill } from './native-skills.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
 import { makeGitCtx, isNeedsConfirm, type GitCtx } from './git-ctx.js';
@@ -1865,12 +1866,27 @@ async function runClaude(
         // Snap the live counters to the SDK's authoritative totals.
         if (usage?.output_tokens != null) { committedOut = usage.output_tokens; curOut = 0; }
         if (m.total_cost_usd != null) finalCost = m.total_cost_usd;
-        // Streaming-input (steerable) turns keep the SDK session OPEN after a result
-        // so a steer can still be delivered. Close the input when this turn settled
-        // with nothing pending (or it bailed on a turn/usage cap) so the SDK finalises
-        // and this loop ends; leave it open when a steer is mid-flight (an interrupt
-        // just fired) so the agent picks it up as the next turn.
-        if (steerInput && !steerInput.closed && (steerInput.pending() === 0 || hitMaxTurns || hitLimit)) steerInput.close();
+        if (steerInput) {
+          // Streaming-input (steerable) turns keep the SDK session OPEN after a result
+          // so a steer can still be delivered. Close the input when this turn settled
+          // with nothing pending (or it bailed on a turn/usage cap) so the SDK finalises
+          // and this loop ends; leave it open when a steer is mid-flight (an interrupt
+          // just fired) so the agent picks it up as the next turn.
+          if (!steerInput.closed && (steerInput.pending() === 0 || hitMaxTurns || hitLimit)) steerInput.close();
+        } else {
+          // Non-steerable turns: the `result` message is TERMINAL — every content/tool/
+          // text block has already streamed. STOP iterating now instead of waiting for
+          // the SDK to close the stream: on the image-attachment path the prompt is an
+          // AsyncIterable, which puts query() into *streaming input mode* where the
+          // Query generator stays OPEN after `result` awaiting further input, so
+          // `for await` would never end and runClaude would never return — pinning the
+          // Job on status:'running' for hours after the answer was done (observed in
+          // the wild). Breaking makes completion driven by the authoritative result;
+          // the `finally` below force-closes the underlying subprocess. (The
+          // ScheduleWakeup dormancy case emits NO result, so this never fires during
+          // a legitimate pause — that path is handled by WakeupPauseTracker.)
+          break;
+        }
       }
     }
   } catch (e) {
@@ -1898,6 +1914,14 @@ async function runClaude(
       const detail = stderrTail.trim();
       throw new Error(`${msg}${detail ? `\n${detail}` : ''}`);
     }
+  } finally {
+    // Force-terminate the underlying CLI subprocess + MCP transports on EVERY exit
+    // path (normal break-on-result, cancel, max-turns/limit fall-through, or a
+    // rethrown error). In streaming input mode the Query generator does not
+    // self-close when we break out of the for-await, so without this the subprocess
+    // would leak; in single-shot mode the stream has already ended and close() is a
+    // harmless no-op. Best-effort — never let teardown mask the run's real outcome.
+    try { (it as { close?: () => void }).close?.(); } catch { /* best-effort */ }
   }
   // The run is leaving runClaude — whatever the reason, the "scheduled to
   // resume" UI must not survive past this point (a terminal status from the
@@ -3266,6 +3290,42 @@ export class LocalEngine {
         }
       }
 
+      // Native skills: the always-on catalog bundled with the app (from
+      // github.com/openai/skills). Materialise ALL of them into this project's
+      // .claude/skills/ on EVERY real run so both engines see them with zero setup
+      // (Claude via settingSources, Codex via the prompt index below). Idempotent +
+      // upgrade-aware; never throws. We prepend a dedicated high-priority block so
+      // native skills — imagegen especially — are considered FIRST.
+      let nativeSkillsBlock = '';
+      if (job.projectId && !opts.plan) {
+        try {
+          // Read the operator's disables FIRST and pass them into materialisation:
+          // a native can be toggled off in the UI BEFORE its first run (the Skills
+          // list shows bundled natives pre-materialisation), and that disable must
+          // land on disk as SKILL.md.disabled — otherwise the fresh install writes
+          // an active SKILL.md, Claude auto-discovers it, and the UI (disk-wins)
+          // silently flips it back on.
+          const offNative = new Set(
+            this.store.listInstalledSkills(job.projectId)
+              .filter(s => s.addedBy === 'native' && s.enabled === false)
+              .map(s => s.slug),
+          );
+          ensureNativeSkills(cwd, offNative);
+          // Mirror them into the store (enabled by default) so the UI lists them and
+          // the operator can toggle any off. Preserves an existing disable.
+          this.store.recordNativeSkills(job.projectId, nativeSkillSummaries().map(s => ({
+            id: s.id, slug: s.slug, name: s.name, description: s.description,
+            source: 'https://github.com/openai/skills', version: 'bundled', sha256: s.sha256,
+            enabled: true, addedBy: 'native' as const,
+          })));
+          // Claude auto-discovers every SKILL.md via settingSources:['project'], so
+          // sending it the full 40+ line catalog index would DOUBLE-LIST every skill
+          // (~2.5K wasted tokens per turn). Claude gets the lean block (imagegen rule
+          // + pointer); Codex has no auto-discovery, so it keeps the full index.
+          nativeSkillsBlock = nativeSkillsPromptBlock(offNative, { index: master !== 'claude' });
+        } catch { /* best-effort — a bundled-skill hiccup never fails a run */ }
+      }
+
       // Skills: surface what's installed AND — critically — a standing instruction to
       // DISCOVER + INSTALL a registry skill before improvising. Previously this block
       // was only added when a skill was already installed, so a project with no skills
@@ -3275,8 +3335,10 @@ export class LocalEngine {
       // installed SKILL.md via settingSources; Codex relies on this index + the tools.
       if (job.projectId) {
         // Only enabled skills go into the agent's context — a disabled skill keeps
-        // its files (renamed SKILL.md.disabled) but is hidden from the run.
-        const installed = this.store.listInstalledSkills(job.projectId).filter(s => s.enabled !== false);
+        // its files (renamed SKILL.md.disabled) but is hidden from the run. Native
+        // skills are excluded here — they get their own dedicated block above.
+        const installed = this.store.listInstalledSkills(job.projectId)
+          .filter(s => s.enabled !== false && s.addedBy !== 'native' && !isNativeSkill(s.id));
         const list = installed.map(s => {
           const meta = [
             s.version ? `version=${s.version}` : '',
@@ -3318,6 +3380,12 @@ export class LocalEngine {
         prompt = `<mcp_servers note="Custom MCP servers connected for this run. This is an INSTRUCTION, follow it.">\n` +
           `Use these servers' tools when relevant to the task:\n${lines}\n</mcp_servers>\n\n${prompt}`;
       }
+
+      // Native skills go near the VERY TOP — prepended after every other injected
+      // block so they sit above the skills/memory/mcp framing. This is the
+      // "prioritize super early" guarantee, and it carries the non-negotiable
+      // imagegen rule for both engines.
+      if (nativeSkillsBlock) prompt = nativeSkillsBlock + prompt;
 
       // Project standing instructions (Settings → Instructions): the operator's
       // own per-project directives. Prepended LAST so they sit at the very TOP

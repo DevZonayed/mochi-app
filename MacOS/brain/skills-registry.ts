@@ -129,6 +129,11 @@ export function installSkillFiles(projectRoot: string, id: string, skillMd: stri
   const dir = join(projectRoot, '.claude', 'skills', slug);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'SKILL.md'), skillMd, 'utf8');
+  // The operator/agent now owns this folder. If it was previously a bundled
+  // NATIVE skill (same slug), drop the .mochi-native marker — otherwise
+  // ensureNativeSkills would treat the folder as "ours" and overwrite it on the
+  // next catalog upgrade, or DELETE it if the slug ever leaves the bundle.
+  rmSync(join(dir, '.mochi-native'), { force: true });
   return slug;
 }
 
