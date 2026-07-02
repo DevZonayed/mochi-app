@@ -437,7 +437,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         }
         const updated = store.updateSession(s.id, { archivedAt: Date.now(), worktreePath: undefined });
         emit('session', updated);
-        return updated;
+        return { ok: true };
       }
       // Per-session git/PR status (local facts + live PR). Emits a git-status event too.
       case 'getSessionGitStatus': {
