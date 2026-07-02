@@ -168,8 +168,8 @@ describe('the trailer-stripping hook itself', () => {
   test('strips Claude attribution but keeps human co-authors and is idempotent', () => {
     // Locate the committed hook by walking up from this test file's dir.
     const here = path.dirname(new URL(import.meta.url).pathname);
-    // electron/ → apps/desktop/ → apps/ → repo root
-    const repoRoot = path.resolve(here, '..', '..', '..');
+    // brain/ → MacOS/ → repo root
+    const repoRoot = path.resolve(here, '..', '..');
     const hook = path.join(repoRoot, '.githooks', 'prepare-commit-msg');
     expect(existsSync(hook)).toBe(true);
 
@@ -204,7 +204,7 @@ describe('the trailer-stripping hook itself', () => {
 
   test('leaves a clean message completely untouched', () => {
     const here = path.dirname(new URL(import.meta.url).pathname);
-    const repoRoot = path.resolve(here, '..', '..', '..');
+    const repoRoot = path.resolve(here, '..', '..');
     const hook = path.join(repoRoot, '.githooks', 'prepare-commit-msg');
 
     const msgPath = path.join(tmp(), 'COMMIT_EDITMSG');

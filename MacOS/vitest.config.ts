@@ -6,7 +6,9 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     environment: 'node',
-    include: ['brain/**/*.test.ts'],
+    // Renderer unit tests (renderer/**) are pure-logic modules and run fine
+    // under node — keeping them here means `pnpm test` covers the whole app.
+    include: ['brain/**/*.test.ts', 'renderer/**/*.test.ts'],
   },
   resolve: {
     extensionAlias: { '.js': ['.ts', '.js'] },

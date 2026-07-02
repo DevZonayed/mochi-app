@@ -143,6 +143,12 @@ describe('formatTranscript — misc kinds & fallbacks', () => {
     expect(out).toContain('↳ Skill: Brainstorming');
   });
 
+  test('reading a .claude/skills/<slug>/SKILL.md renders as a Skill activation', () => {
+    const out = formatTranscript([job({ transcript: [ti({ kind: 'tool', name: 'Read', text: '/Users/me/app/.claude/skills/imagegen/SKILL.md' })] })], { mode: 'concise' });
+    expect(out).toContain('↳ Skill: Imagegen');
+    expect(out).not.toContain('SKILL.md');
+  });
+
   test('review verdict line', () => {
     const out = formatTranscript([job({ transcript: [ti({ kind: 'review', verdict: 'needs-work', text: 'fix the bug' })] })], { mode: 'concise' });
     expect(out).toContain('[review: needs-work]');

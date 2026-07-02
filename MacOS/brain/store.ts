@@ -771,8 +771,9 @@ export interface InstalledSkill {
   disabledReason?: string | null;
   mirrorRepo?: string | null;
   auditStatus?: string | null;
-  /** Who installed it: 'operator' from the UI, 'agent' when the model self-installed mid-run. */
-  addedBy?: 'operator' | 'agent';
+  /** Who installed it: 'operator' from the UI, 'agent' when the model self-installed
+      mid-run, 'native' for the always-on skills bundled with the app. */
+  addedBy?: 'operator' | 'agent' | 'native';
   installedAt: number;
 }
 
@@ -1048,6 +1049,39 @@ export class Store {
     if (enabled) rec.disabledReason = null;
     this.save();
     return rec;
+  }
+  /** Batch-upsert the always-on native skills for a project in ONE save. Preserves
+      an existing record's `enabled` flag (so an operator's disable sticks across
+      upgrades), PRUNES native records that left the bundled catalog (mirrors the
+      on-disk prune in ensureNativeSkills), and only writes when something actually
+      changed. */
+  recordNativeSkills(projectId: string, recs: Omit<InstalledSkill, 'installedAt'>[]): void {
+    if (!this.data.installedSkills) this.data.installedSkills = {};
+    const list = this.data.installedSkills[projectId] ?? (this.data.installedSkills[projectId] = []);
+    let changed = false;
+    for (const r of recs) {
+      const i = list.findIndex(x => x.id === r.id || x.slug === r.slug);
+      if (i >= 0) {
+        const prev = list[i];
+        // A same-slug record the OPERATOR/AGENT installed (a registry skill over
+        // a native slug) is theirs — do NOT convert it to addedBy:'native' (that
+        // would misattribute it in the UI and make it eligible for the native
+        // prune below). The on-disk folder is equally theirs (ensureNativeSkills
+        // returns 'kept'), so leave the record untouched.
+        if (prev.addedBy !== 'native') continue;
+        const merged: InstalledSkill = { ...prev, ...r, enabled: prev.enabled, installedAt: prev.installedAt };
+        if (JSON.stringify(prev) !== JSON.stringify(merged)) { list[i] = merged; changed = true; }
+      } else {
+        list.push({ ...r, installedAt: Date.now() });
+        changed = true;
+      }
+    }
+    // A native record whose slug is no longer bundled = the app dropped that
+    // skill — remove the mirror too (operator/agent-installed records are kept).
+    const current = new Set(recs.map(r => r.slug));
+    const pruned = list.filter(x => x.addedBy !== 'native' || current.has(x.slug));
+    if (pruned.length !== list.length) { this.data.installedSkills[projectId] = pruned; changed = true; }
+    if (changed) this.save();
   }
   /** Upsert a bare record for a skill found on disk but not yet tracked (e.g. dropped in manually). */
   ensureInstalledSkill(projectId: string, rec: Omit<InstalledSkill, 'installedAt'>): InstalledSkill {

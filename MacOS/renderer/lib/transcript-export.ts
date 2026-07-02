@@ -11,7 +11,7 @@
    Pure + DOM-free so it unit-tests cleanly and can be reused outside Workspace. */
 
 import type { Job, TranscriptItem } from './api';
-import { isSkillTool, prettySkillName, scrubInternalMcp, toolDisplay } from './toolDisplay';
+import { isSkillTool, prettySkillName, scrubInternalMcp, skillSlugFromReadPath, toolDisplay } from './toolDisplay';
 
 export type TranscriptMode = 'concise' | 'full';
 
@@ -46,7 +46,8 @@ function fmtDur(ms?: number): string {
     short raw command). Full: + status, duration, multi-line command, file preview. */
 function toolBlock(it: TranscriptItem, mode: TranscriptMode): string {
   const name = it.name ?? '';
-  if (isSkillTool(name)) return `↳ Skill: ${prettySkillName(it.text || '')}`.trimEnd();
+  const readSkillSlug = skillSlugFromReadPath(name, it.text);
+  if (isSkillTool(name) || readSkillSlug) return `↳ Skill: ${prettySkillName(readSkillSlug ?? it.text ?? '')}`.trimEnd();
 
   const d = toolDisplay(name);
   // Scrub `mcp__maestro__*` plumbing so the exported transcript matches the

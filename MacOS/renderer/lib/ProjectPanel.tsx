@@ -120,7 +120,13 @@ function SkillsBody({ projectId }: { projectId: string }) {
     try { await api.setProjectSkillEnabled(projectId, s.id, next); } catch { reloadInstalled(); }
   };
   const installedIds = new Set(installed.map(s => s.id));
-  const activeCount = installed.filter(s => s.enabled !== false).length;
+  // Built-in (native) skills ship with the app — shown in their own collapsible
+  // section with a toggle (no Remove: they'd just re-materialise next run).
+  const natives = installed.filter(s => s.addedBy === 'native');
+  const userSkills = installed.filter(s => s.addedBy !== 'native');
+  const nativeActive = natives.filter(s => s.enabled !== false).length;
+  const [nativesOpen, setNativesOpen] = React.useState(false);
+  const activeCount = userSkills.filter(s => s.enabled !== false).length;
   const riskTint = (r?: string) => {
     const v = (r || '').toUpperCase();
     if (v === 'MEDIUM') return 'var(--orange)';
@@ -134,7 +140,7 @@ function SkillsBody({ projectId }: { projectId: string }) {
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 9 }}>
           <div style={{ font: '700 var(--fs-headline)/1 var(--font-display)', color: 'var(--ink)' }}>Project skills</div>
           <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-            {activeCount} active{installed.length !== activeCount ? ` · ${installed.length - activeCount} disabled` : ''}{meta ? ` · ${meta.count} in registry` : ''}
+            {activeCount} active{userSkills.length !== activeCount ? ` · ${userSkills.length - activeCount} disabled` : ''}{natives.length ? ` · ${nativeActive} built-in` : ''}{meta ? ` · ${meta.count} in registry` : ''}
           </span>
         </div>
         <div style={{ font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
@@ -142,9 +148,9 @@ function SkillsBody({ projectId }: { projectId: string }) {
         </div>
       </div>
 
-      {installed.length > 0 ? (
+      {userSkills.length > 0 ? (
         <div style={{ border: '0.5px solid var(--separator)', borderRadius: 12, background: 'var(--surface)', overflow: 'hidden' }}>
-          {installed.slice().sort((a, b) => Number(b.enabled !== false) - Number(a.enabled !== false)).map((s, i, arr) => {
+          {userSkills.slice().sort((a, b) => Number(b.enabled !== false) - Number(a.enabled !== false)).map((s, i, arr) => {
             const on = s.enabled !== false;
             return (
               <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderBottom: i === arr.length - 1 ? 'none' : '0.5px solid var(--separator)', opacity: on ? 1 : 0.6 }}>
@@ -166,6 +172,37 @@ function SkillsBody({ projectId }: { projectId: string }) {
       ) : (
         <div style={{ padding: '18px 14px', border: '0.5px dashed var(--separator)', borderRadius: 12, color: 'var(--ink-tertiary)', font: '400 var(--fs-footnote)/1.5 var(--font-text)', textAlign: 'center' }}>
           No skills on this project yet. Search below to add one — or the agent will add what it needs during a run, and it’ll show up here.
+        </div>
+      )}
+
+      {natives.length > 0 && (
+        <div style={{ border: '0.5px solid color-mix(in srgb, var(--purple) 22%, var(--separator))', borderRadius: 12, background: 'var(--surface)', overflow: 'hidden' }}>
+          <button onClick={() => setNativesOpen(o => !o)}
+            style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 9, padding: '11px 12px', border: 'none', background: 'color-mix(in srgb, var(--purple) 5%, transparent)', cursor: 'pointer', textAlign: 'left' }}>
+            <Icon name="spark" size={15} style={{ color: 'var(--purple)', flexShrink: 0 }} />
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ font: '600 var(--fs-footnote)/1.25 var(--font-text)', color: 'var(--ink)' }}>Built-in skills</span>
+              <span style={{ display: 'block', font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-tertiary)' }}>Bundled with the app and kept up to date automatically — image generation, office documents, deploys, Figma and more.</span>
+            </span>
+            <span style={{ flexShrink: 0, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)', background: 'color-mix(in srgb, var(--purple) 12%, transparent)', borderRadius: 'var(--r-pill, 999px)', padding: '3px 8px' }}>{nativeActive}/{natives.length} on</span>
+            <Icon name={nativesOpen ? 'chevronDown' : 'chevronRight'} size={13} style={{ color: 'var(--ink-tertiary)', flexShrink: 0 }} />
+          </button>
+          {nativesOpen && natives.slice().sort((a, b) => a.name.localeCompare(b.name)).map(s => {
+            const on = s.enabled !== false;
+            return (
+              <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px', borderTop: '0.5px solid var(--separator)', opacity: on ? 1 : 0.6 }}>
+                <Icon name="spark" size={14} style={{ color: on ? 'var(--purple)' : 'var(--ink-tertiary)', flexShrink: 0 }} />
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                    <span style={{ font: '600 var(--fs-footnote)/1.25 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
+                    <span title="Ships with the app — can be turned off, not removed" style={{ flexShrink: 0, height: 16, padding: '0 6px', borderRadius: 'var(--r-pill, 999px)', background: 'color-mix(in srgb, var(--purple) 14%, transparent)', color: 'var(--purple)', font: '600 var(--fs-caption)/16px var(--font-text)' }}>built-in</span>
+                  </span>
+                  {s.description && <span style={{ display: 'block', font: '400 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.description}</span>}
+                </span>
+                <Switch on={on} onChange={() => void toggle(s)} />
+              </div>
+            );
+          })}
         </div>
       )}
 
