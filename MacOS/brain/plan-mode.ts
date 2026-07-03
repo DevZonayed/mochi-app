@@ -42,6 +42,25 @@ const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
  *  - any other write → deny (read-only).
  *  - anything else that reaches this gate → deny (read tools never reach
  *    canUseTool in plan mode, so a non-read tool here is a mutation attempt). */
+/** File name for a materialized plan, slugged from a seed (jobId) or the clock.
+ *  Codex runs sandboxed read-only in plan mode, so the HOST writes the plan
+ *  file on its behalf after the run — this names that file deterministically. */
+export function planFileName(seed?: string): string {
+  const raw = (seed && seed.trim()) || Date.now().toString(36);
+  const slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'plan';
+  return `plan-${slug}.md`;
+}
+
+/** Chat note appended after the host saves a Codex plan to disk. Mirrors the
+ *  Claude-side flow (plan file + in-chat approval, never a popup). */
+export function planSavedNote(relPath: string): string {
+  return (
+    `\n\n---\n\nPlan saved to \`${relPath}\`. Review it, then approve here in chat: ` +
+    `turn off Plan mode and reply (e.g. "approved — execute the plan") to let the agent build it. ` +
+    `No popup will appear — this message is the approval request.`
+  );
+}
+
 export function planPermission(
   cwd: string,
   toolName: string,

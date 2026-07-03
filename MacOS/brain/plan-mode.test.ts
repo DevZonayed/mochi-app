@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
-import { isPlanFile, planPermission, PLAN_DIR, PLAN_DIRECTIVE } from './plan-mode.js';
+import { isPlanFile, planPermission, planFileName, planSavedNote, PLAN_DIR, PLAN_DIRECTIVE } from './plan-mode.js';
 
 const CWD = '/repo';
 const planAbs = path.join(CWD, PLAN_DIR, 'plan-foo.md');
@@ -69,6 +69,35 @@ describe('planPermission', () => {
     const d = planPermission(CWD, 'Bash', { command: 'rm -rf /' });
     expect(d.behavior).toBe('deny');
     if (d.behavior === 'deny') expect(d.message).toMatch(/read-only/);
+  });
+});
+
+describe('planFileName', () => {
+  it('slugs the seed into a markdown filename', () => {
+    expect(planFileName('Job_42/Alpha')).toBe('plan-job-42-alpha.md');
+  });
+
+  it('trims leading/trailing separator runs', () => {
+    expect(planFileName('--Hello World!--')).toBe('plan-hello-world.md');
+  });
+
+  it('caps the slug at 40 chars', () => {
+    const name = planFileName('x'.repeat(120));
+    expect(name).toBe(`plan-${'x'.repeat(40)}.md`);
+  });
+
+  it('falls back to a non-empty slug when the seed is empty or all symbols', () => {
+    expect(planFileName('###')).toBe('plan-plan.md');
+    expect(planFileName()).toMatch(/^plan-[a-z0-9]+\.md$/);
+  });
+});
+
+describe('planSavedNote', () => {
+  it('mentions the path and in-chat approval, and rules out a popup', () => {
+    const note = planSavedNote('.maestro/plans/plan-x.md');
+    expect(note).toContain('.maestro/plans/plan-x.md');
+    expect(note).toMatch(/turn off Plan mode/i);
+    expect(note).toMatch(/No popup/i);
   });
 });
 

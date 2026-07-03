@@ -124,3 +124,18 @@ export function bgRedirectReason(command: string, rule: BgGuardVerdict['rule']):
     `the trailing \`&\` and run it in the foreground.`
   );
 }
+
+/** Stable retry-hint surfaced to the agent when it calls the BUILT-IN Bash tool
+    with `run_in_background: true` (the canUseTool deny path in engine.ts).
+    Background dev servers started via the built-in Bash live as children of the
+    Claude Code CLI subprocess; when the operator force-sends, engine.cancel
+    SIGTERMs the CLI and takes the dev server down with it. Maestro's own
+    `mcp__maestro__run_in_background` spawns detached children off the app's
+    process tree, so they survive a turn cancel. Short + actionable so the agent
+    re-issues the same intent against the right tool without extra reasoning. */
+export const BG_RUN_IN_BACKGROUND_DENY =
+  'Use mcp__maestro__run_in_background instead. The built-in Bash run_in_background option ' +
+  'lives as a child of the Claude Code CLI subprocess and gets killed when the user steers / ' +
+  'force-sends (which is why this turn would lose your dev server). The Maestro tool is ' +
+  'detached at the Electron process level and persists across turns — re-call with the same ' +
+  'command via mcp__maestro__run_in_background.';
