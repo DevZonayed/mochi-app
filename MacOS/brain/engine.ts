@@ -37,17 +37,13 @@ import { ensureNativeSkills, nativeSkillsPromptBlock, nativeSkillSummaries, isNa
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
 import { makeGitCtx, isNeedsConfirm, type GitCtx } from './git-ctx.js';
-import {
-  createPlanModeGate, BG_RUN_IN_BACKGROUND_DENY,
-  type PlanModeGate, type PlanModeExitRequest,
-} from './plan-mode-gate.js';
 import type { GitService } from './git-service.js';
 import type { MemorySync } from './memory-sync.js';
 import { generateSessionName } from './session-naming.js';
 import { waSendAllowed } from './whatsapp.js';
-import { classifyBashCommand, bgRedirectReason } from './bg-command-guard.js';
+import { classifyBashCommand, bgRedirectReason, BG_RUN_IN_BACKGROUND_DENY } from './bg-command-guard.js';
 import type { CronRunner } from './cron.js';
-import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
+import type { McpServerConfig, CanUseTool } from '@anthropic-ai/claude-agent-sdk';
 import { createSteerableInput, type SteerableInput } from './steerable-input.js';
 import type { Providers } from './providers.js';
 import {
@@ -71,6 +67,7 @@ import {
 import { resolveGh, downloadGh } from './gh-cli.js';
 import { ghTokenFrom, githubConnectionStatus, type GithubConnection } from './github-auth.js';
 import { WakeupPauseTracker } from './wakeup-pause.js';
+import { PLAN_DIRECTIVE, PLAN_DIR, planPermission, planFileName, planSavedNote } from './plan-mode.js';
 import { SubAgentRouter, extractToolResultText } from './subagent-routing.js';
 import { shell } from 'electron';
 
@@ -176,6 +173,12 @@ const GOAL_DIRECTIVE =
   `completion. Don't stop to ask for confirmation on routine steps; plan, implement, ` +
   `test, and self-correct in a loop until the goal is fully met or you are genuinely ` +
   `blocked. If blocked, state precisely what's needed.`;
+// Plan mode — NO popup. The operator explicitly does not want the SDK's
+// ExitPlanMode approval dialog. Instead the agent writes its plan to a Markdown
+// file under `.maestro/plans/`, replies with the path, and asks for approval in
+// chat. runClaude wires `planPermission` into the SDK's canUseTool (below).
+// The pure logic + directive live in ./plan-mode so they can be unit-tested
+// without dragging in electron. See electron/plan-mode.test.ts.
 // Background execution: a coding agent constantly starts dev servers and watchers. In
 // the FOREGROUND shell those block the whole turn until they time out (the chat sits
 // there "generating") AND get killed the instant the user steers or sends the next
@@ -269,19 +272,23 @@ const IMAGE_DIRECTIVE_CODEX = IMAGE_METHOD +
 // Codex plan mode: codex has no built-in plan-mode protocol like Claude's
 // SDK (no permissionMode:'plan' / ExitPlanMode tool). We emulate it with a
 // prompt directive + a read-only sandbox so the agent CAN'T accidentally
-// modify the workspace even if it tries. The plan body the agent writes
-// becomes the dialog's plan, and on approve the renderer auto-queues an
-// "execute the plan now" follow-up message (codex exec is one-shot, so the
-// approval can't continue the SAME run the way Claude's SDK does).
+// modify the workspace even if it tries. NO popup: the child runs sandboxed
+// read-only, so after the run ends the HOST saves the reply as a Markdown
+// plan under `.maestro/plans/` and appends an in-chat approval note (mirrors
+// the Claude flow in plan-mode.ts). The operator reviews the file, turns off
+// Plan mode, and replies to execute — codex exec is one-shot, so the next
+// message is a fresh run anyway.
 const CODEX_PLAN_DIRECTIVE =
   `\n\n---\n\n[Plan mode — propose first, do not act] The user is in plan mode. ` +
   `DO NOT make any file changes, run any commands, or invoke any tools that mutate ` +
   `the workspace. Your job this turn is to write ONE detailed, step-by-step plan ` +
   `for accomplishing the request — list the files to touch, the order of changes, ` +
   `the verification steps. Use clear headings and bullet lists. Be specific (file ` +
-  `paths, function names, exact commands) so the user can judge it. The user will ` +
-  `then approve or push back. Do not include code blocks longer than ~15 lines — ` +
-  `keep it a plan, not the implementation. End your reply with a one-line summary.`;
+  `paths, function names, exact commands) so the user can judge it. Your reply will ` +
+  `be saved verbatim as a Markdown plan file under ${PLAN_DIR}/ and the user will ` +
+  `approve or push back in chat — do not expect a popup or an approval tool. Do not ` +
+  `include code blocks longer than ~15 lines — keep it a plan, not the ` +
+  `implementation. End your reply with a one-line summary.`;
 const IMG_FILE_RE = /\.(png|jpe?g|webp|gif)$/i;
 /* Identify an image by its MAGIC BYTES, not a (possibly wrong) client-supplied
    mime. Returns one of the four media types Anthropic vision accepts, or null —
@@ -677,11 +684,6 @@ export interface PrConfirmRequest {
 }
 export type EmitConfirm = (req: PrConfirmRequest) => void;
 
-/** Side channel for the plan-mode exit gate. Mirrors EmitConfirm — runClaude
- *  calls it the moment the agent invokes ExitPlanMode, the renderer shows a
- *  modal, and the operator's click resolves the gate's pending Promise. */
-export type EmitPlanExit = (req: PlanModeExitRequest) => void;
-
 /** Format the `add_skill_to_project` tool reply. A registry skill installed
  *  mid-turn is NOT re-scanned by the running CLI (settingSources discovery is a
  *  startup-only scan), so we deliver the SKILL.md body INLINE — the agent can
@@ -717,8 +719,6 @@ async function runClaude(
   commsCtx?: CommsCtx,
   emitConfirm?: EmitConfirm,
   sessionId?: string | null,
-  planGate?: PlanModeGate,
-  emitPlanExit?: EmitPlanExit,
   jobId?: string | null,
   /** When provided, this run uses the SDK's STREAMING-INPUT mode so the user can
       STEER it: the callback is handed a SteerFn the moment the live query is built
@@ -1640,64 +1640,36 @@ async function runClaude(
           }
         : {}),
       stderr: (d: string) => { stderrTail = (stderrTail + d).slice(-2000); },
-      /* canUseTool — the SDK's permission hook. Handles two cases the host MUST
+      /* canUseTool — the SDK's permission hook. Handles the cases the host MUST
          own, and lets everything else through (the SDK's permissionMode +
          allowedTools already gate the rest).
 
-         1. ExitPlanMode: in plan mode the SDK suspends the run on this tool
-            until the host approves. Without a canUseTool callback the call
-            never resolves → the agent stays trapped in plan mode forever. We
-            emit a `plan-mode-exit-request` event so the renderer can show a
-            modal, await the operator's decision via the shared planGate, and
-            return allow / deny accordingly.
+         1. Plan mode: a NO-POPUP planning pass (the operator explicitly does
+            NOT want the ExitPlanMode approval dialog). planPermission denies
+            ExitPlanMode outright — the agent instead writes its plan to a
+            Markdown file under `.maestro/plans/`, replies with the path, and
+            asks for approval in chat (see PLAN_DIRECTIVE). It allows ONLY that
+            plan-file write and keeps everything else read-only. There is no
+            plan-approval popup anywhere anymore — approval is a plain chat
+            reply on both engines.
 
-         2. Bash with `run_in_background: true`: deny + retry hint so the agent
-            re-issues against mcp__maestro__run_in_background. The built-in
-            variant spawns inside the Claude Code CLI subprocess and dies when
-            the operator force-sends (engine.cancel SIGTERMs the CLI), which is
-            the second bug the user reported. The Maestro tool spawns detached
-            off the Electron process tree, so the dev server survives a steer. */
-      canUseTool: async (toolName, input, options) => {
-        if (toolName === 'ExitPlanMode') {
-          if (!planGate || !emitPlanExit) {
-            // The host didn't wire the gate (legacy callsite or test path) —
-            // fall through to allow. Matches the previous behaviour where the
-            // SDK eventually no-op'd the ExitPlanMode call.
-            return { behavior: 'allow' };
-          }
-          const planBody = typeof (input as { plan?: unknown }).plan === 'string'
-            ? (input as { plan: string }).plan
-            : '';
-          const req: PlanModeExitRequest = {
-            toolUseID: options.toolUseID,
-            plan: planBody,
-            sessionId: sessionId ?? null,
-            jobId: jobId ?? null,
-            engine: 'claude',
-          };
-          // Surface the request to the renderer modal. Best-effort: a missing
-          // window simply means no dialog appears, and the gate either resolves
-          // when the operator finally gets to it, or the abort signal fires.
-          try { emitPlanExit(req); } catch { /* renderer gone */ }
-          try {
-            const approved = await planGate.requestExit(req, { signal: options.signal });
-            return approved
-              ? { behavior: 'allow' }
-              : { behavior: 'deny', message: 'Operator wants more planning before any execution. Stay in plan mode, refine the plan based on their notes, and call ExitPlanMode again when ready.', interrupt: false };
-          } catch (e) {
-            // Aborted (run cancelled) — deny without interrupting; the surrounding
-            // for-await loop will see the abort signal and throw CancelledError.
-            return { behavior: 'deny', message: e instanceof Error ? e.message : 'cancelled', interrupt: false };
-          }
+         2. Bash with `run_in_background: true` (real, non-plan runs): deny +
+            retry hint so the agent re-issues against
+            mcp__maestro__run_in_background. The built-in variant spawns inside
+            the Claude Code CLI subprocess and dies when the operator
+            force-sends (engine.cancel SIGTERMs the CLI). The Maestro tool
+            spawns detached off the Electron process tree, so the dev server
+            survives a steer. */
+      canUseTool: (async (toolName, input) => {
+        if (plan) {
+          const d = planPermission(cwd, toolName, input);
+          return d.behavior === 'allow' ? { behavior: 'allow', updatedInput: input } : d;
         }
         if (toolName === 'Bash' && (input as { run_in_background?: unknown }).run_in_background === true) {
-          // Force the agent off the CLI-owned background path — see the BG_*
-          // constant for the full retry hint. interrupt:false → the agent gets
-          // the message back and re-calls with mcp__maestro__run_in_background.
           return { behavior: 'deny', message: BG_RUN_IN_BACKGROUND_DENY, interrupt: false };
         }
         return { behavior: 'allow' };
-      },
+      }) as CanUseTool,
     },
   });
   // Expose the live query handle to the in-process maestro MCP tools (e.g.
@@ -2019,19 +1991,12 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
     /** Plan mode (the operator turned on the Plan toggle in the composer). Forces
         sandbox=read-only, disables every MCP bridge that could mutate the
         workspace, and appends CODEX_PLAN_DIRECTIVE so codex writes a plan
-        instead of executing. After the run completes the engine parks on the
-        shared planGate (the SAME one Claude's canUseTool uses) so the operator
-        sees the SAME ExitPlanModeDialog regardless of which engine ran. */
+        instead of executing. NO popup: because the child is sandboxed
+        read-only it can't write the plan file itself, so after the run the
+        HOST saves the reply under `.maestro/plans/` and appends an in-chat
+        approval note (same flow Claude's planPermission produces). */
     plan?: boolean;
-    /** Shared plan-mode gate (LocalEngine.planGate). When `plan` is true the
-        engine emits `plan-mode-exit-request` and awaits the operator's decision
-        here before resolving the run. */
-    planGate?: PlanModeGate;
-    /** Side channel for emitting the plan-mode-exit-request event so the
-        renderer's ExitPlanModeDialog can show the plan + buttons. */
-    emitPlanExit?: EmitPlanExit;
-    /** Job id (turn). Logged + used to synthesise a deterministic toolUseID
-        for the gate (codex has no SDK-issued id). */
+    /** Job id (turn). Logged + used to name the materialized plan file. */
     jobId?: string | null;
   },
   imageFiles?: string[]): Promise<EngineRun> {
@@ -2053,8 +2018,8 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   // Plan mode hardening: when plan=true we treat the run like a reviewer pass
   // — no MCP bridge, no custom MCP servers, read-only sandbox — so even if the
   // agent tries to act despite the prompt directive, the sandbox refuses. The
-  // dialog then surfaces what the agent wrote; on approve the renderer queues
-  // the actual execution turn.
+  // host then saves what the agent wrote as the plan file; the operator
+  // approves in chat and the next message executes.
   const planMode = !!ctx?.plan;
   const effectiveReadOnly = readOnly || planMode;
   // Native MCP for codex: one stdio bridge forwards the Skill-Broker and
@@ -2076,8 +2041,8 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
   // Maestro runs don't pollute ~/.codex/sessions or the `codex resume` picker.
   const keepRollout = !readOnly && !!ctx?.imageIntent && !!ctx?.publishing;
   // Plan-mode directive overlays the user's prompt: codex sees its real request
-  // PLUS instructions to propose a plan and not act. The dialog later surfaces
-  // codex's reply as the plan body for the operator to approve.
+  // PLUS instructions to propose a plan and not act. The host later saves
+  // codex's reply as the plan Markdown for the operator to review in chat.
   const effectivePrompt = planMode ? `${prompt}${CODEX_PLAN_DIRECTIVE}` : prompt;
   const args = [
     'exec', '--json', ...(keepRollout ? [] : ['--ephemeral']), '--skip-git-repo-check',
@@ -2272,37 +2237,26 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
       // The tool path is trusted even outside imageIntent (codex may generate on a
       // turn our heuristic didn't flag); prepend so tool-made assets come first.
       if (viaTool.length) images = [...viaTool, ...(images ?? [])].slice(0, 6);
-      // Codex plan-mode parking: when this was a plan-only run, the agent's
-      // final text IS the plan. Park on the shared planGate (same one
-      // Claude's canUseTool uses) so the renderer's ExitPlanModeDialog
-      // surfaces it with the SAME UI regardless of which engine ran. On
-      // approve we append an approval note and resolve normally — the
-      // renderer auto-queues an "execute the plan now" follow-up message
-      // (codex exec is one-shot; we can't continue the run from inside).
-      // On deny we append a "refine" note and stay in plan mode for the
-      // next message.
+      // Codex plan-mode materialization: when this was a plan-only run, the
+      // agent's final text IS the plan. The child ran sandboxed read-only so
+      // it couldn't write the plan file itself — the HOST (this process, not
+      // sandboxed) saves it under `.maestro/plans/` and appends an in-chat
+      // approval note. NO popup: the operator reviews the file, turns off
+      // Plan mode, and replies to execute (mirrors Claude's planPermission
+      // flow — codex exec is one-shot, so the next message is a fresh run
+      // either way).
       const planText = text || proseOf(items);
-      if (planMode && ctx?.planGate && ctx?.emitPlanExit && planText && !hooks.signal?.aborted) {
-        // Synthetic id (codex has no SDK toolUseID). Pad with random so two
-        // overlapping codex plan turns can't collide on the gate's Map.
-        const toolUseID = `codex-${ctx.jobId ?? 'job'}-${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`;
-        const req: PlanModeExitRequest = {
-          toolUseID,
-          plan: planText,
-          sessionId: ctx.sessionId ?? null,
-          jobId: ctx.jobId ?? null,
-          engine: 'codex',
-        };
-        try { ctx.emitPlanExit(req); } catch { /* renderer gone */ }
-        ctx.planGate.requestExit(req, { signal: hooks.signal })
-          .then(approved => {
-            const note = approved
-              ? '\n\n— Plan approved. Executing on the next message.'
-              : '\n\n— Plan refinement requested. Stay in plan mode and revise.';
-            items.push({ kind: 'text', text: note, ts: Date.now() });
-            resolve({ text: `${text || planText}${note}`, tokens, cost: 0, model: model ?? 'codex', transcript: items, images });
-          })
-          .catch(() => { reject(new CancelledError()); });
+      if (planMode && planText && !hooks.signal?.aborted) {
+        let note = '';
+        try {
+          const rel = path.join(PLAN_DIR, planFileName(ctx?.jobId ?? undefined));
+          const abs = path.resolve(cwd, rel);
+          mkdirSync(path.dirname(abs), { recursive: true });
+          writeFileSync(abs, `${planText.trim()}\n`, 'utf8');
+          note = planSavedNote(rel);
+        } catch { /* unwritable cwd — the plan text is still right here in chat */ }
+        if (note) items.push({ kind: 'text', text: note, ts: Date.now() });
+        resolve({ text: `${text || planText}${note}`, tokens, cost: 0, model: model ?? 'codex', transcript: items, images });
         return;
       }
       // Subscription run — Codex doesn't bill per-token, so cost stays 0.
@@ -2338,16 +2292,6 @@ export class LocalEngine {
   private githubLoginChild?: ChildProcess;
   /** In-flight engine binary downloads → their abort handle (one per engine). */
   private engineInstalls = new Map<EngineId, AbortController>();
-
-  /** Plan-mode exit gate: the agent's ExitPlanMode tool call parks here until
-      the operator clicks Approve / Keep Planning in the renderer dialog. Same
-      gate is exposed via getPlanGate() so localApi.ts can resolve the request
-      from the IPC side. See plan-mode-gate.ts for the full contract — this is
-      the Mac-local host side of the Claude Agent SDK's plan-mode protocol
-      which the renderer was previously missing entirely. */
-  private planGate: PlanModeGate = createPlanModeGate();
-  /** Exposed to localApi.ts so the IPC handler can resolve pending requests. */
-  getPlanGate(): PlanModeGate { return this.planGate; }
 
   constructor(private store: Store, private emit: (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => void, private providers?: Providers) {}
 
@@ -3320,6 +3264,9 @@ export class LocalEngine {
       // (the transcript shows job.input only), so our context format isn't exposed.
       if (cur.agentContext) prompt += `\n\n${cur.agentContext}`;
       if (goalMode) prompt += GOAL_DIRECTIVE;
+      // Plan mode: steer the agent to write a plan Markdown file + ask for approval
+      // in chat instead of firing ExitPlanMode (no popup). Enforced by canUseTool.
+      if (opts.plan) prompt += PLAN_DIRECTIVE;
       // AskUserQuestion in this app renders as an interactive countdown card; the SDK
       // reports the call as "dismissed" headless, which the model otherwise narrates.
       // Tell Claude that's expected so it waits gracefully instead of apologizing.
@@ -3706,13 +3653,6 @@ export class LocalEngine {
       const emitConfirm: EmitConfirm = (req) => {
         try { this.emit('pr-confirm-request', req, { desktopOnly: true }); } catch { /* window gone */ }
       };
-      // Plan-mode exit gate: emit the same desktop-only event shape so the
-      // renderer's ExitPlanModeDialog can subscribe alongside the PR confirm
-      // one. The planGate (shared instance on LocalEngine) holds the Promise
-      // the canUseTool callback awaits. See plan-mode-gate.ts.
-      const emitPlanExit: EmitPlanExit = (req) => {
-        try { this.emit('plan-mode-exit-request', req, { desktopOnly: true }); } catch { /* window gone */ }
-      };
       // Steering: only the PRIMARY chat turn is steerable (not plan mode, not a
       // one-off non-chat job). When that run builds its live query it hands back a
       // SteerFn, which we park on the job handle so engine.steer(jobId, text) can
@@ -3720,8 +3660,8 @@ export class LocalEngine {
       const onSteerReady: ((s: SteerFn | null) => void) | undefined =
         (isChat && !opts.plan) ? (s) => { handle.steer = s ?? undefined; } : undefined;
       const runPrimary = (): Promise<EngineRun> => master === 'claude'
-        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, this.planGate, emitPlanExit, jobId, onSteerReady, this.mediaGen)
-        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx, emitConfirm, sessionId: session?.id ?? null, plan: opts.plan, planGate: this.planGate, emitPlanExit, jobId }, codexImageFiles);
+        ? runClaude(prompt, cwd, effort, anthropicKey, goalMode ? GOAL_MAX_TURNS : undefined, hooks, resumeId, masterModel, opts.plan, this.imageGen, job.projectId, claudeImages, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, emitConfirm, session?.id ?? null, jobId, onSteerReady, this.mediaGen)
+        : runCodex(prompt, cwd, hooks, false, masterModel, { ...imageCtx, customCodexServers: codexCustomFrags, gitCtx, emitConfirm, sessionId: session?.id ?? null, plan: opts.plan, jobId }, codexImageFiles);
       // Auto-retry a transient engine crash (e.g. "process exited with code 1" on a
       // network/service blip) so a one-off hiccup never surfaces as a dead run the
       // operator has to retry by hand. The retry starts the turn fresh; resumeId is
@@ -3806,7 +3746,7 @@ export class LocalEngine {
             // Continuation runs aren't in plan mode (`false` for plan above), so
             // the gate / emit-event are only used by the BG retry-hint path. Pass
             // them anyway so the canUseTool deny stays consistent across resumes.
-            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, undefined, session?.id ?? null, this.planGate, emitPlanExit, jobId, undefined, this.mediaGen);
+            cont = await runClaude(CONTINUE_PROMPT, cwd, effort, anthropicKey, undefined, contHooks, main.sdkSessionId, masterModel, false, this.imageGen, job.projectId, undefined, skillsCtx, bgCtx, browserCtx, claudeCustomMcp, scheduleCtx, gitCtx, commsCtx, undefined, session?.id ?? null, jobId, undefined, this.mediaGen);
           } catch (ce) { if (ce instanceof CancelledError || ac.signal.aborted) throw ce; break; }
           main = {
             text: cont.text || main.text,

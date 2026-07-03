@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyBashCommand, bgRedirectReason } from './bg-command-guard.js';
+import { classifyBashCommand, bgRedirectReason, BG_RUN_IN_BACKGROUND_DENY } from './bg-command-guard.js';
 
 describe('classifyBashCommand — redirect long-lived / backgrounded shells', () => {
   it("redirects the SDK Bash tool's own run_in_background flag", () => {
@@ -118,5 +118,16 @@ describe('bgRedirectReason', () => {
     const long = 'node ' + 'x'.repeat(300);
     const msg = bgRedirectReason(long, 'shell-background');
     expect(msg).toContain('…');
+  });
+});
+
+describe('BG_RUN_IN_BACKGROUND_DENY', () => {
+  it('mentions the Maestro tool the agent must retry with', () => {
+    expect(BG_RUN_IN_BACKGROUND_DENY).toContain('mcp__maestro__run_in_background');
+  });
+
+  it('explains WHY (killed on steer / force-send)', () => {
+    expect(BG_RUN_IN_BACKGROUND_DENY.length).toBeGreaterThan(80);
+    expect(BG_RUN_IN_BACKGROUND_DENY.toLowerCase()).toContain('killed');
   });
 });
