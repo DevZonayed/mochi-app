@@ -48,7 +48,7 @@ function entryPath(): string {
   }
 }
 
-/* Account gate (desktop only). The Maestro desktop now requires an account
+/* Account gate (desktop only). The Mochlet desktop now requires an account
    session: until the operator signs in, show the Login screen; the host
    connection to the server only starts once a session token exists (pushed to
    main from the auth lib). The web build (!IS_LOCAL) keeps its own token-based

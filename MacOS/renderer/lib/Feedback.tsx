@@ -130,7 +130,7 @@ function FeedbackModal({ onClose }: { onClose: () => void }) {
             </div>
 
             <textarea ref={taRef} value={message} onChange={e => setMessage(e.target.value)}
-              placeholder={category === 'bug' ? 'What went wrong? What did you expect?' : category === 'idea' ? 'What would make Maestro better?' : 'Tell us what’s on your mind…'}
+              placeholder={category === 'bug' ? 'What went wrong? What did you expect?' : category === 'idea' ? 'What would make Mochlet better?' : 'Tell us what’s on your mind…'}
               style={{ width: '100%', boxSizing: 'border-box', minHeight: 118, resize: 'vertical', padding: '12px 13px',
                 border: '1px solid var(--separator-strong, var(--separator))', borderRadius: 12, outline: 'none',
                 background: 'var(--fill-tertiary)', font: '400 var(--fs-body)/1.45 var(--font-text)', color: 'var(--ink)' }} />

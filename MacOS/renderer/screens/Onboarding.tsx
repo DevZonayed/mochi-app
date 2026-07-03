@@ -1,4 +1,4 @@
-/* Maestro onboarding — first-run setup assistant.
+/* Mochlet onboarding — first-run setup assistant.
    Ported from the Babel-standalone prototype (design/project/onboarding/*.jsx)
    to an ES-module TypeScript React screen. Visual output is unchanged: a
    floating macOS setup-assistant window with an animated muted blue/purple
@@ -13,7 +13,7 @@ import { useNavigate } from 'react-router-dom';
 import { api, ApiError, type GithubDevice } from '../lib/api';
 import {
   Icon,
-  MaestroMark,
+  MochletMark,
   AnthropicGlyph,
   OpenAIGlyph,
   type IconName,
@@ -216,7 +216,7 @@ function WelcomeStep() {
     <div style={{ textAlign: 'center', paddingTop: 8 }}>
       <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 26 }}>
         <div style={{ filter: 'drop-shadow(0 16px 32px rgba(90,70,200,0.35))' }}>
-          <MaestroMark size={104} />
+          <MochletMark size={104} />
         </div>
       </div>
       <h1 style={{
@@ -226,7 +226,7 @@ function WelcomeStep() {
       <p style={{
         margin: '0 auto', maxWidth: 360, font: '400 var(--fs-body)/1.45 var(--font-text)',
         color: 'var(--ink-secondary)', textWrap: 'pretty',
-      } as React.CSSProperties}>Maestro is your command deck for AI work — projects, schedulers, studio, and budgets, run from one calm place.</p>
+      } as React.CSSProperties}>Mochlet is your command deck for AI work — projects, schedulers, studio, and budgets, run from one calm place.</p>
     </div>
   );
 }
@@ -244,7 +244,7 @@ function WorkspaceStep({ value, onChange }: WorkspaceStepProps) {
     <div>
       <StepHeading icon="folder" tint="var(--blue)"
         title="Name your workspace"
-        sub="Everything in Maestro lives under one workspace — yours." />
+        sub="Everything in Mochlet lives under one workspace — yours." />
       <GroupedList footer="You can rename it later in Settings.">
         <Row last style={{ padding: '4px 14px' }}>
           <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)', width: 92, flexShrink: 0 }}>Name</span>
@@ -370,13 +370,13 @@ function BudgetStep(_props: BudgetStepProps) {
   const lines: [IconName, string, string, string][] = [
     ['terminal', 'var(--blue)', 'Coding runs on your Claude Code / Codex sign-ins', "No per-run billing — they're covered by your plan."],
     ['clapper', 'var(--purple)', 'Media runs on your fal key', 'Images, video, and voice are metered — real spend, shown live.'],
-    ['gauge', 'var(--green)', 'No caps — just calculation', "Maestro tracks every cost in the Costs view. You're never surprised, and nothing stops at a line."],
+    ['gauge', 'var(--green)', 'No caps — just calculation', "Mochlet tracks every cost in the Costs view. You're never surprised, and nothing stops at a line."],
   ];
   return (
     <div>
       <StepHeading icon="gauge" tint="var(--green)"
         title="How costs work"
-        sub="No budget caps. Maestro calculates spend so you always know — it never blocks a job." />
+        sub="No budget caps. Mochlet calculates spend so you always know — it never blocks a job." />
       <div style={{
         background: 'var(--bg-grouped)', borderRadius: 'var(--r-group)',
         border: '0.5px solid var(--separator)', padding: 14, display: 'flex', flexDirection: 'column', gap: 4,
@@ -436,7 +436,7 @@ function PairStep({ secondsLeft, onRefresh }: PairStepProps) {
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ marginBottom: 16 }}>
-            <div style={{ font: '600 var(--fs-headline)/1.25 var(--font-text)', color: 'var(--ink)', letterSpacing: '-0.01em' }}>Scan with the Maestro app</div>
+            <div style={{ font: '600 var(--fs-headline)/1.25 var(--font-text)', color: 'var(--ink)', letterSpacing: '-0.01em' }}>Scan with the Mochlet app</div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
               <svg width="22" height="22" viewBox="0 0 24 24" style={{ transform: 'rotate(-90deg)', flexShrink: 0 }}>
                 <circle cx="12" cy="12" r="9" fill="none" stroke="var(--fill-secondary)" strokeWidth="3" />
@@ -450,7 +450,7 @@ function PairStep({ secondsLeft, onRefresh }: PairStepProps) {
             </div>
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-            {['Open Maestro on iPhone', 'Tap Pair a device', 'Point it at this code'].map((t, i) => (
+            {['Open Mochlet on iPhone', 'Tap Pair a device', 'Point it at this code'].map((t, i) => (
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <span style={{
                   width: 20, height: 20, borderRadius: '50%', flexShrink: 0,
@@ -499,8 +499,8 @@ function DashboardPeek({ workspace, budget }: DashboardPeekProps) {
         borderRight: '0.5px solid var(--separator)', display: 'flex', flexDirection: 'column', gap: 2,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: '0 8px 16px' }}>
-          <MaestroMark size={26} />
-          <span style={{ font: '700 15px/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Maestro</span>
+          <MochletMark size={26} />
+          <span style={{ font: '700 15px/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Mochlet</span>
         </div>
         {nav.map(n => (
           <div key={n.label} style={{

@@ -56,15 +56,40 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/web"
 cp "$BUILD_DIR/$EXEC_NAME" "$APP/Contents/MacOS/$EXEC_NAME"
 cp -R "$ROOT/build/web/." "$APP/Contents/Resources/web/"
 
+# ── App icon ─────────────────────────────────────────────────────────────────
+# Build AppIcon.icns from the master AppIcon.png (1254×1254). macOS wants a full
+# iconset (each size @1x and @2x); sips downsamples the master into each slot and
+# iconutil packs them. If the tools or source are missing we warn and continue so
+# a dev build without the icon still succeeds.
+ICON_SRC="$ROOT/AppIcon.png"
+if [ -f "$ICON_SRC" ] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+  echo "> generating AppIcon.icns"
+  ICONSET="$(mktemp -d)/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  for spec in "16:16x16" "32:16x16@2x" "32:32x32" "64:32x32@2x" \
+              "128:128x128" "256:128x128@2x" "256:256x256" "512:256x256@2x" \
+              "512:512x512" "1024:512x512@2x"; do
+    px="${spec%%:*}"; name="${spec#*:}"
+    sips -z "$px" "$px" "$ICON_SRC" --out "$ICONSET/icon_$name.png" >/dev/null 2>&1
+  done
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns" \
+    && echo "  wrote $(du -h "$APP/Contents/Resources/AppIcon.icns" | cut -f1) AppIcon.icns" \
+    || echo "  warning: iconutil failed — bundle will have no icon"
+  rm -rf "$(dirname "$ICONSET")"
+else
+  echo "  warning: AppIcon.png or sips/iconutil missing — skipping app icon"
+fi
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>CFBundleName</key><string>$APP_NAME</string>
-  <key>CFBundleDisplayName</key><string>Maestro</string>
+  <key>CFBundleDisplayName</key><string>Mochlet</string>
   <key>CFBundleIdentifier</key><string>cloud.nexalance.maestro.webkit</string>
   <key>CFBundleExecutable</key><string>$EXEC_NAME</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
@@ -72,9 +97,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
-  <key>NSDesktopFolderUsageDescription</key><string>Maestro reads Desktop project folders you add so the local agent can show files, run tasks, and render chats.</string>
-  <key>NSDocumentsFolderUsageDescription</key><string>Maestro reads project folders you add from Documents so the local agent can show files, run tasks, and render chats.</string>
-  <key>NSDownloadsFolderUsageDescription</key><string>Maestro reads project folders you add from Downloads so the local agent can show files, run tasks, and render chats.</string>
+  <key>NSDesktopFolderUsageDescription</key><string>Mochlet reads Desktop project folders you add so the local agent can show files, run tasks, and render chats.</string>
+  <key>NSDocumentsFolderUsageDescription</key><string>Mochlet reads project folders you add from Documents so the local agent can show files, run tasks, and render chats.</string>
+  <key>NSDownloadsFolderUsageDescription</key><string>Mochlet reads project folders you add from Downloads so the local agent can show files, run tasks, and render chats.</string>
 </dict>
 </plist>
 PLIST

@@ -1,6 +1,6 @@
-# Mochi Chrome extension
+# Mochlet Chrome extension
 
-This is the Manifest V3 Chrome extension that pairs with the Mochi desktop app
+This is the Manifest V3 Chrome extension that pairs with the Mochlet desktop app
 over the local WebSocket bridge on `127.0.0.1:9234`
 (see `apps/desktop/electron/extension-bridge.ts`). It gives the in-app agent
 real-browser superpowers — every `browser_*` MCP tool the agent calls is
@@ -26,12 +26,12 @@ can Load Unpacked it in `chrome://extensions`.
 
 ## How to install (developer / power-user)
 
-1. Open the Mochi desktop app once.
+1. Open the Mochlet desktop app once.
 2. Settings → Browser extension → "Reveal extension folder" (or: open the app
    bundle's `Resources/extension/`).
 3. In Chrome: `chrome://extensions` → enable Developer mode → "Load unpacked"
    → select that folder.
-4. Click the Mochi toolbar icon → paste the pairing token shown in Settings.
+4. Click the Mochlet toolbar icon → paste the pairing token shown in Settings.
    The dot turns green.
 
 ## How to modify (for contributors)

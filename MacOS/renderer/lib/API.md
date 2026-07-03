@@ -1,4 +1,4 @@
-# Maestro Desktop Design Library — Export Catalog
+# Mochlet Desktop Design Library — Export Catalog
 
 Ported from the Babel-standalone design prototype (`design/project/lib/*.jsx`) to
 ES-module TypeScript React. Visual output (inline styles, classNames, `var(--…)`
@@ -48,8 +48,8 @@ Lucide-style 24×24 line icon. Inherits `currentColor`. Renders an `<svg>` with
 - `stroke` — stroke width. Default `1.75`.
 - `style` — applied to the `<svg>`.
 
-### `function MaestroMark(props: { size?: number })`
-The Maestro brand squircle (gradient `#5E8BFF → #7C5CFF → #A24BE0`) with the
+### `function MochletMark(props: { size?: number })`
+The Mochlet brand squircle (gradient `#5E8BFF → #7C5CFF → #A24BE0`) with the
 conductor/agent-fleet glyph. Uses `React.useId()` for unique gradient IDs.
 - `size` — px. Default `96`.
 
@@ -209,7 +209,7 @@ provided.** Closes on outside-click (document `mousedown` listener while open).
 
 ## `src/lib/appShell.tsx`
 
-> Imports `Icon`, `MaestroMark`, and `IconName` from `./icons`, and `useNavigate`
+> Imports `Icon`, `MochletMark`, and `IconName` from `./icons`, and `useNavigate`
 > from `react-router-dom`. **Must be rendered inside a react-router `<Router>`**
 > (e.g. `BrowserRouter`/`HashRouter`/`MemoryRouter`) because `AppShell` calls
 > `useNavigate()`.
@@ -253,7 +253,7 @@ positioned top-left. No props.
 ```
 
 ### `function Sidebar(props: SidebarProps)`
-260px frosted sidebar: workspace header (`MaestroMark` + `WORKSPACE`), the `NAV`
+260px frosted sidebar: workspace header (`MochletMark` + `WORKSPACE`), the `NAV`
 list (active item highlighted blue, badges shown), and a pinned Settings button.
 `onNav` fires with the nav `key` (or `'settings'`); the active item is matched
 against `active`. Standalone — `AppShell` wires `onNav` to the router for you.

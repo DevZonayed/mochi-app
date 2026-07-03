@@ -792,7 +792,7 @@ export default function SkillsRegistry({ embedded = false }: { embedded?: boolea
     setAdded(s); // preserve the existing "added" toast animation
     try {
       if (s.id.includes('/')) {
-        await api.registryAdminPatchSkill(s.id, { enabled: !s.installed, disabledReason: s.installed ? 'Disabled from Maestro portal' : '' });
+        await api.registryAdminPatchSkill(s.id, { enabled: !s.installed, disabledReason: s.installed ? 'Disabled from Mochlet portal' : '' });
         setSkills(prev => prev.map(p => (p.id === s.id ? { ...p, installed: !s.installed, scan: s.installed ? 'quarantined' : 'ok' } : p)));
       } else {
         const updated = await api.toggleSkill(s.id);

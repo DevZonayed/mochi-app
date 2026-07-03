@@ -222,7 +222,7 @@ function GeneralPane({ theme, setTheme, workspace }: {
       <PaneHead>General</PaneHead>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
         <GroupedList header="Workspace">
-          <Row><span style={{ width: 110, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Name</span><input key={workspace?.id ?? 'ws'} defaultValue={workspace?.name ?? 'Maestro'} onBlur={e => saveName(e.target.value)} style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)', padding: '13px 0' }} /></Row>
+          <Row><span style={{ width: 110, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Name</span><input key={workspace?.id ?? 'ws'} defaultValue={workspace?.name ?? 'Mochlet'} onBlur={e => saveName(e.target.value)} style={{ flex: 1, border: 'none', outline: 'none', background: 'transparent', font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)', padding: '13px 0' }} /></Row>
           <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Appearance</span><Seg options={['Light', 'Dark', 'Auto']} value={getThemePref() === 'auto' ? 'Auto' : getThemePref() === 'dark' ? 'Dark' : 'Light'} onChange={v => setThemePref(v === 'Auto' ? 'auto' : v === 'Dark' ? 'dark' : 'light')} /></Row>
         </GroupedList>
         <GroupedList header="Workspace mode" footer={PURPOSE_SUB[purpose]}>
@@ -239,7 +239,7 @@ function GeneralPane({ theme, setTheme, workspace }: {
           <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default engine</span><ModelSwitcher value={model} onChange={v => patch({ defaultEngine: v === 'claude' || v === 'codex' ? v : 'auto' })} align="right" /></Row>
         </GroupedList>
         <GroupedList header="Startup">
-          <ToggleRow label="Open Maestro at login" on={settings?.openAtLogin ?? false} onChange={v => patch({ openAtLogin: v })} last />
+          <ToggleRow label="Open Mochlet at login" on={settings?.openAtLogin ?? false} onChange={v => patch({ openAtLogin: v })} last />
         </GroupedList>
         <GroupedList header="Connection" footer="Direct mode links this Mac and your phone over an encrypted WebRTC channel for lower latency, and falls back to the relay automatically. Needs the phone's dev build; restrictive networks need a TURN server.">
           <ToggleRow label="Direct device connection (P2P)" sub="Experimental — desktop ↔ phone peer-to-peer when the network allows." on={settings?.p2pEnabled ?? false} onChange={v => patch({ p2pEnabled: v })} last />
@@ -316,7 +316,7 @@ function NotificationsPane() {
                 <span style={{ width: 38, textAlign: 'right', font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{pct}%</span>
               </span>
             </Row>
-            <ToggleRow label="Only when Maestro isn't focused" sub="Stay quiet while you're actively watching; chime only when the window is in the background." on={s.onlyWhenUnfocused} onChange={v => patch({ onlyWhenUnfocused: v })} last />
+            <ToggleRow label="Only when Mochlet isn't focused" sub="Stay quiet while you're actively watching; chime only when the window is in the background." on={s.onlyWhenUnfocused} onChange={v => patch({ onlyWhenUnfocused: v })} last />
           </GroupedList>
         </div>
       </div>
@@ -992,7 +992,7 @@ function BrowserPane() {
       <div>
         <PaneHead>Browser</PaneHead>
         <GroupedList footer="Browser control is available from the Mac app.">
-          <Row last><span style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>Open Maestro on your Mac to manage browser profiles.</span></Row>
+          <Row last><span style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>Open Mochlet on your Mac to manage browser profiles.</span></Row>
         </GroupedList>
       </div>
     );
@@ -1178,7 +1178,7 @@ function DevicesPane() {
             {devIcon('var(--fill-tertiary)', 'var(--ink-tertiary)', 'smartphone')}
             <span style={{ flex: 1 }}>
               <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>No remotes yet</span>
-              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Open Maestro on your phone and sign in with the same account.</span>
+              <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Open Mochlet on your phone and sign in with the same account.</span>
             </span>
           </Row>
         ) : remotes.map((d, i) => renderRow(d, i, remotes))}
@@ -1235,7 +1235,7 @@ function UpdatesPane() {
       <div>
         <PaneHead>Updates</PaneHead>
         <GroupedList footer="Updates are managed in the desktop app.">
-          <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Open Maestro on your Mac to check for updates.</span></Row>
+          <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Open Mochlet on your Mac to check for updates.</span></Row>
         </GroupedList>
       </div>
     );
