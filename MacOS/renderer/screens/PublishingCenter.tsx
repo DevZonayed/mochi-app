@@ -1,7 +1,7 @@
 /* Publishing Center — a real LOCAL pipeline. Approved Studio media (and imported
    files) become drafts here; you write a caption, pick platforms, then Export
    (copies media + caption to ~/Maestro/Exports/<platform>/ and your clipboard,
-   reveals in Finder) or Schedule (the cron runner exports it when due). Maestro
+   reveals in Finder) or Schedule (the cron runner exports it when due). Mochlet
    never posts on your behalf — every send is an auditable local export with a
    provenance hash in the ledger. Nothing publishes without you. */
 
@@ -233,7 +233,7 @@ export default function PublishingCenter() {
                   ))}
                 </div>}
               <div style={{ marginTop: 16, padding: '12px 14px', borderRadius: 12, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>
-                Maestro exports to Finder rather than posting for you — so there are no platform tokens to leak and you stay in control of every post.
+                Mochlet exports to Finder rather than posting for you — so there are no platform tokens to leak and you stay in control of every post.
               </div>
             </>
           )}

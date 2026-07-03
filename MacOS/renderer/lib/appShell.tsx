@@ -1,11 +1,11 @@
-/* Shared Maestro desktop app chrome: scaled macOS window, frosted sidebar,
+/* Shared Mochlet desktop app chrome: scaled macOS window, frosted sidebar,
    frosted toolbar with traffic lights + budget chip. Used by every app page.
    Ported to ES-module TypeScript React with react-router navigation —
    visual output unchanged. */
 
 import React from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { Icon, MaestroMark } from './icons';
+import { Icon, MochletMark } from './icons';
 import { NAV_ROUTES, ALL_NAV, CODING_NAV, DESIGN_NAV, pathForNav } from './routes';
 import { api } from './api';
 import { CountUp } from './ui';
@@ -155,7 +155,7 @@ export function useSidebar() {
 }
 
 /** Default workspace name until the live one loads (and for fresh installs). */
-export const WORKSPACE = 'Maestro';
+export const WORKSPACE = 'Mochlet';
 
 /* Live workspace name — one shared, ref-counted fetch for the whole chrome.
    Refreshes on project events (workspace is created lazily with the first one). */
@@ -249,7 +249,7 @@ export function Sidebar({ active, onNav, onWorkspace }: SidebarProps) {
         <button onClick={onWorkspace} style={{
           flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', borderRadius: 10, textAlign: 'left',
         }} className="ws-header win-no-drag">
-          <MaestroMark size={30} />
+          <MochletMark size={30} />
           <span style={{ flex: 1, minWidth: 0 }}>
             <span style={{ display: 'block', font: '700 var(--fs-callout)/1.1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{workspaceName}</span>
             <span style={{ display: 'block', font: '400 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 1 }}>Workspace</span>

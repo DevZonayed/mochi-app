@@ -930,7 +930,7 @@ export default function Scheduler() {
         {/* durability reassurance */}
         <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginBottom: 18, font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
           <Icon name="shield" size={14} style={{ color: 'var(--green)' }} />
-          Schedules fire on this Mac while Maestro is running. A missed time rolls forward — or, with catch-up on, still runs later the same day.
+          Schedules fire on this Mac while Mochlet is running. A missed time rolls forward — or, with catch-up on, still runs later the same day.
         </div>
 
         {/* body */}

@@ -1,4 +1,4 @@
-/* The Design genre workspace — Maestro's agent-native design canvas (its take on
+/* The Design genre workspace — Mochlet's agent-native design canvas (its take on
    OpenDesign): you describe what you want, the agent (Claude/Codex) builds ONE
    self-contained, live-previewable HTML artifact, refines it in place, pulls in
    generated imagery, and you can hand the result off to code. Left = the design

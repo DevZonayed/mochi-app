@@ -2,8 +2,8 @@
   "name": "@maestro/macos",
   "version": "0.1.28",
   "private": true,
-  "description": "Maestro WebKit macOS app — the Node brain + React renderer served by the native WKWebView shell (MacOS/webview-app) via the headless sidecar (MacOS/sidecar).",
-  "author": "Maestro",
+  "description": "Mochlet WebKit macOS app — the Node brain + React renderer served by the native WKWebView shell (MacOS/webview-app) via the headless sidecar (MacOS/sidecar).",
+  "author": "Mochlet",
   "scripts": {
     "dev": "vite --config vite.web.config.ts",
     "build": "tsc --noEmit -p tsconfig.json && vite build --config vite.web.config.ts",

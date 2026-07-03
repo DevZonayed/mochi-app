@@ -197,7 +197,7 @@ export class CodexBridge {
       case 'download_skill': {
         if (!reg.skills) return errRes('skill tools are not enabled for this run');
         const c = await fetchSkillContent(registryBase(), String(a.skillId ?? ''));
-        const body = c.skillMd.length > 32000 ? c.skillMd.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]' : c.skillMd;
+        const body = c.skillMd.length > 32000 ? c.skillMd.slice(0, 32000) + '\n\n[truncated by Mochlet after 32000 characters]' : c.skillMd;
         return txt(`# ${c.name}\n\nid=${c.id}\nsha256=${c.sha256 ?? 'unknown'}\n\n${body}`);
       }
       case 'add_skill_to_project': {
@@ -233,7 +233,7 @@ export class CodexBridge {
         // Agent-SDK startup-scan to refresh), so inline body is the robust same-turn
         // delivery. Mirrors the download_skill 32k cap above.
         const installedBody = content.skillMd.length > 32000
-          ? content.skillMd.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]'
+          ? content.skillMd.slice(0, 32000) + '\n\n[truncated by Mochlet after 32000 characters]'
           : content.skillMd;
         return txt(`Installed "${rec.name}" -> .claude/skills/${rec.slug}/SKILL.md${rec.sha256 ? ` (sha256 ${rec.sha256.slice(0, 12)})` : ''}.\n\nFollow these instructions for the task:\n\n---\n${installedBody}\n---`);
       }
@@ -352,7 +352,7 @@ export class CodexBridge {
    free and defensive (the socket may drop). */
 const SHIM_TOOLS = JSON.stringify([
   { name: 'generate_image', description: 'Generate (or edit) a REAL raster image from a text prompt and save it as a project asset shown inline in the chat. ALWAYS use this for any image/logo/icon/illustration/render request — never draw an SVG, ASCII art, or an HTML/CSS placeholder, and never use your built-in image tool (it produces no saved file here). To edit an existing image, pass its path as source_image. aspect may be "1:1" (default), "16:9", or "9:16".', inputSchema: { type: 'object', properties: { prompt: { type: 'string' }, aspect: { type: 'string' }, source_image: { type: 'string' } }, required: ['prompt'] } },
-  { name: 'search_skills', description: 'Search the live Maestro skill registry for specialized SKILL.md instructions. Public search excludes disabled skills.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number' } }, required: ['query'] } },
+  { name: 'search_skills', description: 'Search the live Mochlet skill registry for specialized SKILL.md instructions. Public search excludes disabled skills.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'number' } }, required: ['query'] } },
   { name: 'get_skill', description: 'Fetch metadata for one registry skill by id, including audit, version, and original source state.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },
   { name: 'download_skill', description: 'Download a registry skill SKILL.md without installing it into the project.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },
   { name: 'add_skill_to_project', description: 'Install a registry skill into this project at .claude/skills/<slug>/SKILL.md. Read that file before using the skill.', inputSchema: { type: 'object', properties: { skillId: { type: 'string' } }, required: ['skillId'] } },

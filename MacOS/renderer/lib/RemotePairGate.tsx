@@ -35,7 +35,7 @@ function PairForm({ reason, onPaired }: { reason: string; onPaired: () => void }
         <div style={{ width: 52, height: 52, margin: '0 auto 14px', borderRadius: 14, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--blue, #2f6bff) 16%, transparent)', color: 'var(--blue, #2f6bff)', font: '700 22px/1 var(--font-display, system-ui)' }}>⌘</div>
         <h1 style={{ margin: '0 0 6px', font: '700 var(--fs-title2, 22px)/1.2 var(--font-display, system-ui)', letterSpacing: '-0.01em', color: 'var(--ink, #fff)' }}>Connect to your Mac</h1>
         <p style={{ margin: '0 0 18px', font: '400 var(--fs-subhead, 15px)/1.45 var(--font-text, system-ui)', color: 'var(--ink-secondary, #9aa0ad)', textWrap: 'pretty' }}>
-          {reason ? reason : 'Enter the pairing code from the Maestro desktop app (Settings ▸ Devices).'}
+          {reason ? reason : 'Enter the pairing code from the Mochlet desktop app (Settings ▸ Devices).'}
         </p>
         <input
           value={code}

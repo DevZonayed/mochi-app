@@ -1,6 +1,6 @@
-/* Maestro desktop — data client.
+/* Mochlet desktop — data client.
 
-   In the ELECTRON APP every call routes over IPC to the local Maestro core in
+   In the ELECTRON APP every call routes over IPC to the local Mochlet core in
    the main process: data + execution live on this Mac (Claude Code login, local
    store, local engine). In a BROWSER (the hosted web build) the same surface
    falls back to REST against the relay server, which mirrors the Mac's pushed

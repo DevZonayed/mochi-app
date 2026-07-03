@@ -699,7 +699,7 @@ export function formatSkillInstallReply(
     + ` It is now active for this project — invoke it via the Skill tool when relevant.`;
   if (!skillMdBody) return `${head} Now read that file and follow it.`;
   const trimmed = skillMdBody.length > 32000
-    ? skillMdBody.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]'
+    ? skillMdBody.slice(0, 32000) + '\n\n[truncated by Mochlet after 32000 characters]'
     : skillMdBody;
   return `${head}\n\nFollow these instructions for the task:\n\n---\n${trimmed}\n---`;
 }
@@ -846,7 +846,7 @@ async function runClaude(
           ] : []),
           ...(skillsCtx ? [
             tool('search_skills',
-              'Search the live Maestro skill registry for a specialized SKILL.md. Call this FIRST — at the very start of a substantive task (build/scaffold, edit code, generate a design/content, or any domain-specific work), before you do the work — then add_skill_to_project and follow the best match. Installing and following a dedicated skill beats improvising. Public search excludes disabled skills.',
+              'Search the live Mochlet skill registry for a specialized SKILL.md. Call this FIRST — at the very start of a substantive task (build/scaffold, edit code, generate a design/content, or any domain-specific work), before you do the work — then add_skill_to_project and follow the best match. Installing and following a dedicated skill beats improvising. Public search excludes disabled skills.',
               { query: z.string().describe('What you need, e.g. "edit pdf", "google sheets", "stripe", "next.js best practices".'), limit: z.number().optional().describe('Max results (default 8).') },
               wrap(async (a: { query: string; limit?: number }) => {
                 const r = await skillsCtx.search(a.query, a.limit ?? 8);
@@ -865,7 +865,7 @@ async function runClaude(
               { skillId: z.string().describe('The registry id from search_skills.') },
               wrap(async (a: { skillId: string }) => {
                 const c = await skillsCtx.download(a.skillId);
-                const body = c.skillMd.length > 32000 ? c.skillMd.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]' : c.skillMd;
+                const body = c.skillMd.length > 32000 ? c.skillMd.slice(0, 32000) + '\n\n[truncated by Mochlet after 32000 characters]' : c.skillMd;
                 return txt(`# ${c.name}\n\nid=${c.id}\nsha256=${c.sha256 ?? 'unknown'}\n\n${body}`);
               })),
             tool('add_skill_to_project',
@@ -985,7 +985,7 @@ async function runClaude(
                 try { const r = await browserCall('navigate', { url: a.url }, 45000) as { url?: string }; return txt(`Opened ${r?.url ?? a.url}. Use browser_read or browser_snapshot to see the page.`); }
                 catch (e) {
                   if (/no active session|session_start first/i.test(String((e as Error).message ?? e))) {
-                    await browserCall('session_start', { url: a.url, title: 'Maestro Agent', color: 'blue' }, 45000);
+                    await browserCall('session_start', { url: a.url, title: 'Mochlet Agent', color: 'blue' }, 45000);
                     return txt(`Opened a new browser tab at ${a.url}. Use browser_read or browser_snapshot to see the page.`);
                   }
                   throw e;

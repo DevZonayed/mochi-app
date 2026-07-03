@@ -49,7 +49,7 @@ const NEVER_RETRY_RE = /not\s+signed\s+in|cli\s+not\s+found|not\s+found\s+on\s+t
     TRANSIENT_FAIL_RE but broader (it also catches our own boot-sweep + the
     engine's "kept hitting a transient error" summary, since both surface as
     a failed job the operator would otherwise have to retry by hand). */
-const RETRY_WORTHY_RE = /Interrupted\s+—\s+Maestro\s+was\s+restarted|exited\s+with\s+code|exited\s+unexpectedly|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|socket\s+hang\s+up|fetch\s+failed|network\s+error|premature\s+close|stream\s+(?:closed|ended|error)|overloaded|rate.?limit|too\s+many\s+requests|\b429\b|internal\s+server\s+error|bad\s+gateway|service\s+unavailable|gateway\s+timeout|temporarily|kept\s+hitting\s+a\s+transient\s+error|process\s+died|connection\s+reset|read\s+ECONNRESET|write\s+EPIPE/i;
+const RETRY_WORTHY_RE = /Interrupted\s+—\s+(?:Mochlet|Maestro)\s+was\s+restarted|exited\s+with\s+code|exited\s+unexpectedly|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|socket\s+hang\s+up|fetch\s+failed|network\s+error|premature\s+close|stream\s+(?:closed|ended|error)|overloaded|rate.?limit|too\s+many\s+requests|\b429\b|internal\s+server\s+error|bad\s+gateway|service\s+unavailable|gateway\s+timeout|temporarily|kept\s+hitting\s+a\s+transient\s+error|process\s+died|connection\s+reset|read\s+ECONNRESET|write\s+EPIPE/i;
 
 /** Is this error worth a scheduled retry? Deterministic problems return
     false; transient/restart/overload errors return true. Empty/unknown

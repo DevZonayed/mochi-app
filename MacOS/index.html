@@ -3,10 +3,66 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Maestro</title>
+    <title>Mochlet</title>
+    <style>
+      :root { color-scheme: dark; }
+      html, body { margin: 0; height: 100%; background: #1b1b1f; }
+      /* Pre-React splash — matches the native loader so the WebKit hand-off is
+         seamless (no blank flash before the React app mounts). React's render
+         replaces #root's children, tearing this down automatically. */
+      #boot-splash {
+        position: fixed; inset: 0; z-index: 2147483647;
+        display: flex; align-items: center; justify-content: center;
+        background: #1b1b1f;
+        -webkit-user-select: none; user-select: none;
+        pointer-events: none;
+      }
+      #boot-splash svg { width: 148px; height: 148px; display: block; }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div id="boot-splash">
+        <svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <style>
+            .bs-mark { transform-origin: 256px 256px; animation: bs-breathe 1800ms cubic-bezier(.4, 0, .2, 1) infinite; }
+            .bs-rim { transform-origin: 256px 256px; stroke-dasharray: 760 280; animation: bs-spin 1800ms linear infinite, bs-pulse 1800ms cubic-bezier(.4, 0, .2, 1) infinite; }
+            .bs-smile { stroke-dasharray: 132; stroke-dashoffset: 132; animation: bs-smile 1800ms cubic-bezier(.2, .8, .2, 1) infinite; }
+            .bs-dot { transform-origin: 256px 256px; animation: bs-orbit 1800ms cubic-bezier(.4, 0, .2, 1) infinite; }
+            @keyframes bs-breathe { 0%, 100% { transform: scale(.965); } 42%, 62% { transform: scale(1); } }
+            @keyframes bs-spin { to { transform: rotate(360deg); } }
+            @keyframes bs-pulse { 0%, 100% { opacity: .35; stroke-width: 5; } 50% { opacity: .95; stroke-width: 7; } }
+            @keyframes bs-smile { 0% { stroke-dashoffset: 132; opacity: .35; } 38%, 70% { stroke-dashoffset: 0; opacity: 1; } 100% { stroke-dashoffset: -132; opacity: .35; } }
+            @keyframes bs-orbit { 0% { transform: rotate(-28deg) translateY(-150px) scale(.82); opacity: .2; } 42% { transform: rotate(28deg) translateY(-150px) scale(1); opacity: 1; } 100% { transform: rotate(332deg) translateY(-150px) scale(.82); opacity: .2; } }
+          </style>
+          <defs>
+            <linearGradient id="bsFill" x1="142" y1="126" x2="382" y2="398" gradientUnits="userSpaceOnUse">
+              <stop offset="0" stop-color="#2388FF"/>
+              <stop offset=".42" stop-color="#5E8BFF"/>
+              <stop offset=".7" stop-color="#7C5CFF"/>
+              <stop offset="1" stop-color="#A24BE0"/>
+            </linearGradient>
+            <linearGradient id="bsRim" x1="102" y1="112" x2="414" y2="410" gradientUnits="userSpaceOnUse">
+              <stop offset="0" stop-color="#2388FF"/>
+              <stop offset=".32" stop-color="#7C5CFF"/>
+              <stop offset=".68" stop-color="#A24BE0"/>
+              <stop offset="1" stop-color="#25E6C8"/>
+            </linearGradient>
+            <filter id="bsGlow" x="70" y="70" width="372" height="372" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+              <feGaussianBlur stdDeviation="18" result="blur"/>
+              <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.141 0 0 0 0 0.533 0 0 0 0 1 0 0 0 .32 0"/>
+            </filter>
+          </defs>
+          <rect x="133" y="119" width="246" height="246" rx="78" fill="#2388FF" opacity=".22" filter="url(#bsGlow)"/>
+          <g class="bs-mark">
+            <rect x="132" y="118" width="248" height="248" rx="80" fill="url(#bsFill)"/>
+            <rect class="bs-rim" x="126" y="112" width="260" height="260" rx="86" stroke="url(#bsRim)" stroke-linecap="round"/>
+            <circle class="bs-dot" cx="256" cy="256" r="7" fill="#25E6C8"/>
+            <path class="bs-smile" d="M218 257C229 281 243 288 256 288C269 288 283 281 294 257" stroke="white" stroke-width="20" stroke-linecap="round"/>
+          </g>
+        </svg>
+      </div>
+    </div>
     <script type="module" src="/renderer/main.tsx"></script>
   </body>
 </html>
