@@ -36,7 +36,7 @@ import { makeGitCtx, type GitCtx } from './git-ctx.js';
 import type { GitService } from './git-service.js';
 import { waSendAllowed } from './whatsapp.js';
 import type { CronRunner } from './cron.js';
-import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
+import type { McpServerConfig, CanUseTool } from '@anthropic-ai/claude-agent-sdk';
 import type { Providers } from './providers.js';
 import {
   enginesRoot, managedBinary, systemBinary, bundledBinary, downloadEngine, engineState,
@@ -57,6 +57,7 @@ import {
 import { resolveGh, downloadGh } from './gh-cli.js';
 import { ghTokenFrom, githubConnectionStatus, type GithubConnection } from './github-auth.js';
 import { WakeupPauseTracker } from './wakeup-pause.js';
+import { PLAN_DIRECTIVE, planPermission } from './plan-mode.js';
 import { shell } from 'electron';
 
 // Agent-loop turn budget per effort. Every tool call consumes a turn, so a
@@ -161,6 +162,12 @@ const GOAL_DIRECTIVE =
   `completion. Don't stop to ask for confirmation on routine steps; plan, implement, ` +
   `test, and self-correct in a loop until the goal is fully met or you are genuinely ` +
   `blocked. If blocked, state precisely what's needed.`;
+// Plan mode — NO popup. The operator explicitly does not want the SDK's
+// ExitPlanMode approval dialog. Instead the agent writes its plan to a Markdown
+// file under `.maestro/plans/`, replies with the path, and asks for approval in
+// chat. runClaude wires `planPermission` into the SDK's canUseTool (below).
+// The pure logic + directive live in ./plan-mode so they can be unit-tested
+// without dragging in electron. See electron/plan-mode.test.ts.
 // Background execution: a coding agent constantly starts dev servers and watchers. In
 // the FOREGROUND shell those block the whole turn until they time out (the chat sits
 // there "generating") AND get killed the instant the user steers or sends the next
@@ -1332,6 +1339,17 @@ async function runClaude(
       settingSources: ['project'],
       // Plan mode → propose a plan, no execution. Otherwise run freely on this Mac.
       permissionMode: plan ? 'plan' : 'bypassPermissions',
+      // Plan mode is a NO-POPUP planning pass. In plan mode the SDK routes every
+      // write + the ExitPlanMode tool to canUseTool. We (a) let the agent write
+      // ONLY its plan Markdown under `.maestro/plans/`, keeping everything else
+      // read-only, and (b) deny ExitPlanMode outright so the SDK's approval
+      // dialog never fires — approval happens in chat (see PLAN_DIRECTIVE).
+      ...(plan ? {
+        canUseTool: (async (toolName, input) => {
+          const d = planPermission(cwd, toolName, input);
+          return d.behavior === 'allow' ? { behavior: 'allow', updatedInput: input } : d;
+        }) as CanUseTool,
+      } : {}),
       includePartialMessages: !!hooks.onProgress,
       // generate_image: in-process MCP server + auto-allow its fully-qualified name.
       // Under 'bypassPermissions' tools auto-run; allowedTools future-proofs any
@@ -2730,6 +2748,9 @@ export class LocalEngine {
         prompt = `${base}${cur.input}`;
       }
       if (goalMode) prompt += GOAL_DIRECTIVE;
+      // Plan mode: steer the agent to write a plan Markdown file + ask for approval
+      // in chat instead of firing ExitPlanMode (no popup). Enforced by canUseTool.
+      if (opts.plan) prompt += PLAN_DIRECTIVE;
       // AskUserQuestion in this app renders as an interactive countdown card; the SDK
       // reports the call as "dismissed" headless, which the model otherwise narrates.
       // Tell Claude that's expected so it waits gracefully instead of apologizing.

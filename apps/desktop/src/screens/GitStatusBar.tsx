@@ -7,9 +7,10 @@ import { useSessionGitState } from '../lib/useSessionGitState';
 
 /* Per-session PR/git status chip + the single contextual action (Conductor-style).
    Subscribes to live git-status events via the shared cache. Every outward action
-   confirms first, shows a persistent success/failure message (not a fleeting
-   icon), and PR/merge actions are gated on a connected GitHub account. Renders
-   nothing for non-repo sessions or one-off jobs (no sessionId).
+   confirms inline first (a compact "Merge? [Confirm] [Cancel]" in the chip — no
+   blocking browser popup), shows a persistent success/failure message (not a
+   fleeting icon), and PR/merge actions are gated on a connected GitHub account.
+   Renders nothing for non-repo sessions or one-off jobs (no sessionId).
 
    Two variants:
    • `inline` (default) — the small chip used in the transcript header
@@ -55,11 +56,19 @@ export interface GitStatusBarProps {
   codename?: string | null;
 }
 
+type Pending = { fn: () => Promise<{ ok: boolean; reason?: string }>; opts: RunOpts };
+
 export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitStatusBarProps) {
   const st = useSessionGitState(sessionId);
   const [busy, setBusy] = React.useState(false);
   const [msg, setMsg] = React.useState<{ kind: 'err' | 'ok'; text: string } | null>(null);
   const [gh, setGh] = React.useState<{ connected: boolean; hasRepoScope: boolean } | null>(null);
+  // A staged action awaiting inline confirmation (replaces the old blocking
+  // window.confirm popup). Null when nothing is pending. Cleared whenever the
+  // session or its git state changes underneath us so a stale confirm can't
+  // fire the wrong action.
+  const [pending, setPending] = React.useState<Pending | null>(null);
+  React.useEffect(() => { setPending(null); }, [sessionId, st?.state]);
 
   // The cache only auto-fetches without PR (cheap). The header variant wants
   // a one-time WITH-PR refresh on first mount per session so the action label
@@ -86,8 +95,8 @@ export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitSta
 
   const ghBlocked = needsGitHub && gh != null && (!gh.connected || !gh.hasRepoScope);
 
-  const run: Runner = async (fn, opts = {}) => {
-    if (opts.confirm && !window.confirm(opts.confirm)) return;
+  // Actually run the action. Confirmation (if any) has already happened inline.
+  const execute = async (fn: Pending['fn'], opts: RunOpts) => {
     setBusy(true); setMsg(null);
     try {
       const r = await fn();
@@ -102,6 +111,15 @@ export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitSta
     try { await api.refreshSessionGitStatus(sessionId); }
     catch { setMsg(m => m ?? { kind: 'err', text: 'Couldn’t refresh git status — it may be stale.' }); }
   };
+
+  // A confirmable action stages itself for an inline "Confirm / Cancel" prompt
+  // in the chip instead of opening a blocking browser popup. Actions without a
+  // confirm string run immediately.
+  const run: Runner = (fn, opts = {}) => {
+    if (opts.confirm) { setMsg(null); setPending({ fn, opts }); return; }
+    void execute(fn, opts);
+  };
+  const confirmPending = () => { const p = pending; setPending(null); if (p) void execute(p.fn, p.opts); };
 
   const action = actionFor(st, run);
   const checks = st.pr?.checks ?? [];
@@ -118,6 +136,23 @@ export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitSta
       : null;
 
   const actionDisabled = busy || ghBlocked;
+
+  // Inline confirmation controls that stand in for the action button while an
+  // action is staged — a compact "Merge? [Confirm] [Cancel]" right in the chip,
+  // instead of a blocking browser popup. `big` picks header vs inline sizing.
+  const confirmControls = (big: boolean) => {
+    const base = big ? btnHeader : btnInline;
+    const danger = action?.tone === 'danger';
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }} title={pending?.opts.confirm}>
+        <span style={{ color: 'var(--ink-secondary)' }}>{action?.label}?</span>
+        <button disabled={busy} onClick={confirmPending} style={{ ...base, color: '#fff',
+          background: danger ? 'var(--red)' : 'var(--blue)', borderColor: 'transparent',
+          ...(busy ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}>{busy ? '…' : 'Confirm'}</button>
+        <button disabled={busy} onClick={() => setPending(null)} style={base}>Cancel</button>
+      </span>
+    );
+  };
 
   if (variant === 'header') {
     const actionBtn = action
@@ -145,7 +180,7 @@ export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitSta
             PR #{st.pr.number}
           </button>
         )}
-        {actionBtn}
+        {pending ? confirmControls(true) : actionBtn}
         {feedback}
       </div>
     );
@@ -163,7 +198,9 @@ export function GitStatusBar({ sessionId, variant = 'inline', codename }: GitSta
       {st.local.behind > 0 && <span title="commits behind base">↓{st.local.behind}</span>}
       {checkSummary && <span>· {checkSummary}</span>}
       {st.pr && <button onClick={() => window.open(st.pr!.url, '_blank')} style={btnInline}>PR #{st.pr.number}</button>}
-      {action && <button disabled={actionDisabled} onClick={action.go} title={ghBlocked ? 'Connect GitHub first' : undefined} style={{ ...btnInline, color: action.tone === 'danger' ? 'var(--red)' : 'var(--blue)', ...(actionDisabled ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}>{busy ? '…' : action.label}</button>}
+      {pending
+        ? confirmControls(false)
+        : (action && <button disabled={actionDisabled} onClick={action.go} title={ghBlocked ? 'Connect GitHub first' : undefined} style={{ ...btnInline, color: action.tone === 'danger' ? 'var(--red)' : 'var(--blue)', ...(actionDisabled ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}>{busy ? '…' : action.label}</button>)}
       {feedback}
     </div>
   );
