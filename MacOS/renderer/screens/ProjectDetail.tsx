@@ -1399,7 +1399,7 @@ function liveActivity(job: Job, transcript: TranscriptItem[]): string {
 /** The agent's extended-thinking, rendered as calm dimmed prose (the model's inner
     voice) under a small purple "Thinking" header. Live = auto-expanded + streaming
     caret; settled = collapsed to a one-line preview you can open. This is the block
-    Maestro used to throw away — the whole reason the transcript felt mechanical. */
+    Mochlet used to throw away — the whole reason the transcript felt mechanical. */
 function ThinkingNode({ item, live }: { item: TranscriptItem; live?: boolean }) {
   // `open` is DERIVED from `live` (expanded while this is the block streaming,
   // collapsed the moment the model moves on) — so a long reasoning block doesn't
@@ -2743,7 +2743,7 @@ function QueuePanel({ queue, hold, canSteer, onSteerNow, onMoveToFront, onRemove
    Workspace tabs) can adopt it. Fills its parent — only the thread scrolls. */
 
 /* Composer slash-commands — type `/` to scaffold a coding instruction. These are
-   Maestro's own prompt commands (they work the same whichever engine runs the
+   Mochlet's own prompt commands (they work the same whichever engine runs the
    chat), shown in a menu like Claude Code's. */
 // Per-session composer queue, persisted to localStorage so the "N queued" box
 // survives the chat unmounting — e.g. navigating to Settings (a sibling route)

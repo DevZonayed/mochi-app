@@ -1,4 +1,4 @@
-/* Maestro — account sign-in / register.
+/* Mochlet — account sign-in / register.
 
    The desktop app now gates on an account session (email + password) against the
    account server. This is a full-window experience (no AppShell sidebar): same
@@ -7,7 +7,7 @@
    the app then unlocks (see App.tsx gating). */
 
 import React from 'react';
-import { Icon, MaestroMark } from '../lib/icons';
+import { Icon, MochletMark } from '../lib/icons';
 import { useTheme, type Theme } from '../lib/appShell';
 import { signIn, signUp } from '../lib/auth';
 
@@ -72,7 +72,7 @@ function AuthCard() {
     <form onSubmit={submit} className="pair-card" style={{ width: 420, padding: 36, borderRadius: 'var(--r-card)', background: 'var(--glass-tint)',
       backdropFilter: 'blur(34px) saturate(180%)', WebkitBackdropFilter: 'blur(34px) saturate(180%)', border: '0.5px solid var(--glass-border)',
       boxShadow: 'var(--card-shadow), var(--glass-inner)', textAlign: 'center' }}>
-      <div style={{ marginBottom: 18 }}><MaestroMark size={56} /></div>
+      <div style={{ marginBottom: 18 }}><MochletMark size={56} /></div>
       <h1 style={{ margin: '0 0 8px', font: '700 var(--fs-title1)/1.1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>
         {isRegister ? 'Create your account' : 'Welcome back'}
       </h1>
@@ -113,7 +113,7 @@ function AuthCard() {
       </button>
 
       <div style={{ marginTop: 18, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>
-        {isRegister ? 'Already have an account? ' : 'New to Maestro? '}
+        {isRegister ? 'Already have an account? ' : 'New to Mochlet? '}
         <button type="button" className="link-btn" onClick={() => { setMode(isRegister ? 'signin' : 'register'); setError(''); }}>
           {isRegister ? 'Sign in' : 'Create one'}
         </button>

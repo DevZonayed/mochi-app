@@ -9,7 +9,12 @@ import { startDesktopP2P } from './p2p/peer';
 // (the web bundle keeps using the relay); flag-gated on the main side.
 startDesktopP2P();
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
+// Tear down the pre-React boot splash (index.html) before mounting so React
+// owns a clean #root — otherwise createRoot warns about replacing children.
+const rootEl = document.getElementById('root')!;
+document.getElementById('boot-splash')?.remove();
+
+ReactDOM.createRoot(rootEl).render(
   <React.StrictMode>
     <App />
   </React.StrictMode>,

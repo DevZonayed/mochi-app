@@ -1,6 +1,6 @@
-# Maestro WebKit App
+# Mochlet WebKit App
 
-This is the native macOS WebKit host for the existing Maestro React renderer.
+This is the native macOS WebKit host for the existing Mochlet React renderer.
 It does not bundle Electron or Chromium.
 
 - `WKWebView` renders the Vite-built React UI from `Contents/Resources/web`.

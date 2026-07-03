@@ -1,4 +1,4 @@
-/* Shared Maestro UI primitives: pill buttons, grouped-inset lists,
+/* Shared Mochlet UI primitives: pill buttons, grouped-inset lists,
    iOS switch, status pill, spinner, segmented control.
    Ported to ES-module TypeScript React — visual output unchanged. */
 
@@ -261,7 +261,7 @@ export interface ModelOption {
   cost: number;
 }
 
-/* The real engines Maestro runs on this Mac. 'auto' follows the routing set in
+/* The real engines Mochlet runs on this Mac. 'auto' follows the routing set in
    Settings → Engines; the other two force a per-job engine override. Both run on
    your own sign-ins (Claude Code subscription / Codex ChatGPT), so cost is 0 here. */
 export const DEFAULT_MODELS: ModelOption[] = [

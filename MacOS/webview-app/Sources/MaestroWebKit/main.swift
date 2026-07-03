@@ -89,7 +89,7 @@ final class SidecarProcess {
             DispatchQueue.main.async {
                 guard let self, self.process === exited else { return }
                 self.process = nil
-                self.onFailure("The Maestro sidecar stopped.")
+                self.onFailure("The Mochlet sidecar stopped.")
             }
         }
 
@@ -266,6 +266,7 @@ final class SidecarProcess {
 final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavigationDelegate, NSWindowDelegate {
     private var window: NSWindow!
     private var webView: WKWebView?
+    private var loadingWebView: WKWebView?
     private var sidecar: SidecarProcess?
     private var windowObservers: [NSObjectProtocol] = []
     private let titleBarHeight: CGFloat = 40
@@ -276,7 +277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         NSApp.setActivationPolicy(.regular)
         installMainMenu()
         makeWindow()
-        showLoading("Starting Maestro...")
+        showLoading("Starting Mochlet...")
 
         let sidecar = SidecarProcess(
             onReady: { [weak self] endpoint in self?.loadWebApp(endpoint) },
@@ -303,7 +304,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     /// keep `target == nil` so each action travels the responder chain into the
     /// web content, where WKWebView turns `paste:` into a real DOM paste event.
     private func installMainMenu() {
-        let appName = "Maestro"
+        let appName = "Mochlet"
         let mainMenu = NSMenu()
 
         // ── App menu ───────────────────────────────────────────────────────
@@ -452,7 +453,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             defer: false
         )
         window.center()
-        window.title = "Maestro"
+        window.title = "Mochlet"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = false
@@ -464,23 +465,174 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         scheduleTrafficLightAlignment()
     }
 
-    private func showLoading(_ message: String) {
-        let label = NSTextField(labelWithString: message)
-        label.font = NSFont.systemFont(ofSize: 14, weight: .medium)
-        label.textColor = .secondaryLabelColor
-        label.alignment = .center
+    /// The exact animated Mochlet loader mark (breathing squircle + orbiting dot +
+    /// tracing smile). Rendered in a WKWebView because the mark relies on CSS
+    /// keyframes, which only a browser engine animates. Kept byte-for-byte with the
+    /// design source so the splash matches the brand asset precisely.
+    private static let loaderSVG = """
+    <svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <style>
+        :root {
+          color-scheme: dark;
+        }
 
-        let view = NSView()
-        view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        view.addSubview(label)
-        label.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-        ])
+        .stage {
+          fill: #1b1b1f;
+        }
+
+        .mark {
+          transform-origin: 256px 256px;
+          animation: breathe 1800ms cubic-bezier(.4, 0, .2, 1) infinite;
+        }
+
+        .rim {
+          transform-origin: 256px 256px;
+          stroke-dasharray: 760 280;
+          animation:
+            rim-spin 1800ms linear infinite,
+            rim-pulse 1800ms cubic-bezier(.4, 0, .2, 1) infinite;
+        }
+
+        .smile {
+          stroke-dasharray: 132;
+          stroke-dashoffset: 132;
+          animation: smile-ready 1800ms cubic-bezier(.2, .8, .2, 1) infinite;
+        }
+
+        .dot {
+          transform-origin: 256px 256px;
+          animation: dot-orbit 1800ms cubic-bezier(.4, 0, .2, 1) infinite;
+        }
+
+        @keyframes breathe {
+          0%, 100% { transform: scale(.965); }
+          42%, 62% { transform: scale(1); }
+        }
+
+        @keyframes rim-spin {
+          to { transform: rotate(360deg); }
+        }
+
+        @keyframes rim-pulse {
+          0%, 100% { opacity: .35; stroke-width: 5; }
+          50% { opacity: .95; stroke-width: 7; }
+        }
+
+        @keyframes smile-ready {
+          0% { stroke-dashoffset: 132; opacity: .35; }
+          38%, 70% { stroke-dashoffset: 0; opacity: 1; }
+          100% { stroke-dashoffset: -132; opacity: .35; }
+        }
+
+        @keyframes dot-orbit {
+          0% { transform: rotate(-28deg) translateY(-150px) scale(.82); opacity: .2; }
+          42% { transform: rotate(28deg) translateY(-150px) scale(1); opacity: 1; }
+          100% { transform: rotate(332deg) translateY(-150px) scale(.82); opacity: .2; }
+        }
+      </style>
+
+      <defs>
+        <linearGradient id="mochletFill" x1="142" y1="126" x2="382" y2="398" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#2388FF"/>
+          <stop offset=".42" stop-color="#5E8BFF"/>
+          <stop offset=".7" stop-color="#7C5CFF"/>
+          <stop offset="1" stop-color="#A24BE0"/>
+        </linearGradient>
+        <linearGradient id="mochletRim" x1="102" y1="112" x2="414" y2="410" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#2388FF"/>
+          <stop offset=".32" stop-color="#7C5CFF"/>
+          <stop offset=".68" stop-color="#A24BE0"/>
+          <stop offset="1" stop-color="#25E6C8"/>
+        </linearGradient>
+        <filter id="softGlow" x="70" y="70" width="372" height="372" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+          <feGaussianBlur stdDeviation="18" result="blur"/>
+          <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.141 0 0 0 0 0.533 0 0 0 0 1 0 0 0 .32 0"/>
+        </filter>
+      </defs>
+
+      <rect class="stage" width="512" height="512" rx="48"/>
+      <rect x="133" y="119" width="246" height="246" rx="78" fill="#2388FF" opacity=".22" filter="url(#softGlow)"/>
+      <g class="mark">
+        <rect x="132" y="118" width="248" height="248" rx="80" fill="url(#mochletFill)"/>
+        <rect class="rim" x="126" y="112" width="260" height="260" rx="86" stroke="url(#mochletRim)" stroke-linecap="round"/>
+        <circle class="dot" cx="256" cy="256" r="7" fill="#25E6C8"/>
+        <path class="smile" d="M218 257C229 281 243 288 256 288C269 288 283 281 294 257" stroke="white" stroke-width="20" stroke-linecap="round"/>
+      </g>
+    </svg>
+    """
+
+    private func loadingHTML(_ message: String) -> String {
+        let escaped = message
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        return """
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <style>
+            :root { color-scheme: dark; }
+            html, body { margin: 0; height: 100%; background: #1b1b1f; overflow: hidden; }
+            .wrap {
+              position: fixed; inset: 0;
+              display: flex; flex-direction: column;
+              align-items: center; justify-content: center;
+              gap: 30px;
+              -webkit-user-select: none; user-select: none;
+            }
+            .mark-box { width: 148px; height: 148px; }
+            .mark-box svg { width: 100%; height: 100%; display: block; }
+            .status {
+              font: 500 14px -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Segoe UI", sans-serif;
+              color: rgba(235, 235, 245, 0.6);
+              text-align: center;
+              max-width: 78vw;
+              line-height: 1.45;
+              letter-spacing: 0.2px;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="wrap">
+            <div class="mark-box">\(AppDelegate.loaderSVG)</div>
+            <div class="status">\(escaped)</div>
+          </div>
+        </body>
+        </html>
+        """
+    }
+
+    private func showLoading(_ message: String) {
+        // If the loader webview is already up, just swap the status text so the
+        // animation doesn't restart when a failure message replaces "Starting…".
+        if let existing = loadingWebView {
+            let js = "var s=document.querySelector('.status'); if(s){s.textContent=\(jsStringLiteral(message));}"
+            existing.evaluateJavaScript(js, completionHandler: nil)
+            return
+        }
+
+        let config = WKWebViewConfiguration()
+        let view = WKWebView(frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 1440, height: 940),
+                             configuration: config)
+        view.autoresizingMask = [.width, .height]
+        view.setValue(false, forKey: "drawsBackground")  // let the #1b1b1f page paint edge-to-edge
+        view.loadHTMLString(loadingHTML(message), baseURL: nil)
+
         window.contentView = view
+        loadingWebView = view
         scheduleTrafficLightAlignment()
+    }
+
+    /// Safely encode an arbitrary Swift string as a JS string literal for injection.
+    private func jsStringLiteral(_ s: String) -> String {
+        let escaped = s
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "")
+        return "\"\(escaped)\""
     }
 
     private func loadWebApp(_ endpoint: SidecarEndpoint) {
@@ -517,6 +669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
         window.contentView = view
         webView = view
+        loadingWebView = nil  // splash handed off to the real app view
         scheduleTrafficLightAlignment()
 
         guard let url = URL(string: "http://127.0.0.1:\(endpoint.port)/app/index.html") else {

@@ -414,7 +414,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         b!.setBrowserHold(true);
         const url = typeof p.url === 'string' && p.url ? p.url : 'about:blank';
         try { await b!.request('navigate', { url }, 45000); }
-        catch { try { await b!.request('session_start', { url, title: 'Maestro', color: 'blue' }, 45000); } catch { /* surfaced as held-but-empty */ } }
+        catch { try { await b!.request('session_start', { url, title: 'Mochlet', color: 'blue' }, 45000); } catch { /* surfaced as held-but-empty */ } }
         return { ok: true, held: true };
       }
       // Manually close the extension browser the user pinned open: drop the hold +
@@ -1908,7 +1908,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           rec.message,
           '',
           '---',
-          `*Filed from Maestro feedback (${rec.source}).*`,
+          `*Filed from Mochlet feedback (${rec.source}).*`,
           ctx.screen ? `- Screen: \`${ctx.screen}\`` : '',
           ctx.appVersion ? `- App version: \`${ctx.appVersion}\`` : '',
           ctx.platform ? `- Platform: \`${ctx.platform}\`` : '',

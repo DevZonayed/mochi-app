@@ -65,7 +65,7 @@ describe('seedProjectFiles', () => {
     const written = seedProjectFiles('/proj', 'My App', fs, new Date('2026-06-23T10:00:00Z'));
     expect(written.sort()).toEqual(['.claude/settings.json', '.continuum/STATE.md', '.gitignore', 'README.md']);
     expect(fs.files.get('/proj/README.md')).toContain('# My App');
-    expect(fs.files.get('/proj/README.md')).toContain('Created 2026-06-23 with Maestro.');
+    expect(fs.files.get('/proj/README.md')).toContain('Created 2026-06-23 with Mochlet.');
     expect(fs.files.get('/proj/.gitignore')).toContain('node_modules/');
     expect(fs.files.get('/proj/.gitignore')).toContain('.env');
     expect(fs.files.get('/proj/.continuum/STATE.md')).toContain('# My App');

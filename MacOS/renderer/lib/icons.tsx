@@ -1,15 +1,15 @@
-/* Maestro brand mark, provider glyphs, and Lucide-style line icons.
+/* Mochlet brand mark, provider glyphs, and Lucide-style line icons.
    All inherit currentColor unless a gradient is used.
    Ported to ES-module TypeScript React — visual output unchanged. */
 
 import React from 'react';
 
-// ── Maestro app mark: a squircle with an orchestration glyph
+// ── Mochlet app mark: a squircle with an orchestration glyph
 //    (a central conductor node radiating to a fleet of agent nodes)
-export function MaestroMark({ size = 96 }: { size?: number }) {
+export function MochletMark({ size = 96 }: { size?: number }) {
   const id = React.useId().replace(/:/g, '');
   return (
-    <svg width={size} height={size} viewBox="0 0 96 96" fill="none" aria-label="Maestro">
+    <svg width={size} height={size} viewBox="0 0 96 96" fill="none" aria-label="Mochlet">
       <defs>
         <linearGradient id={`mg-${id}`} x1="14" y1="10" x2="82" y2="86" gradientUnits="userSpaceOnUse">
           <stop stopColor="#5E8BFF" />

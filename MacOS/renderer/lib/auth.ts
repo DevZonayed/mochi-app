@@ -1,6 +1,6 @@
 /* Account auth for the desktop app.
 
-   The Maestro desktop now connects to an account-based server (Better Auth) at
+   The Mochlet desktop now connects to an account-based server (Better Auth) at
    API_BASE. The renderer owns the session: it signs in / registers over raw
    fetch, reads the session token from the `set-auth-token` response header
    (falling back to the JSON body's `token`), persists it in localStorage, and

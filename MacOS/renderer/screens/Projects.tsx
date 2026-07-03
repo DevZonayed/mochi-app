@@ -920,7 +920,7 @@ function NewProjectSheet({ open, onClose, onCreated, suggestedName }: { open: bo
           <div style={{ padding: 20, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
             {isCode && !IS_LOCAL ? (
               <div style={{ padding: '16px 18px', borderRadius: 12, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', font: '400 var(--fs-body)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
-                Coding projects open a folder or clone a repo on your Mac — create them in the <b style={{ color: 'var(--ink)' }}>Maestro desktop app</b>. (This is a remote view.)
+                Coding projects open a folder or clone a repo on your Mac — create them in the <b style={{ color: 'var(--ink)' }}>Mochlet desktop app</b>. (This is a remote view.)
               </div>
             ) : (
             <>
@@ -1359,7 +1359,7 @@ export default function Projects() {
                 </div>
               </div>
               <p style={{ margin: '0 0 18px', font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
-                This removes the project and its chats from Maestro. {p?.path ? 'The folder on disk is left untouched.' : ''} This can’t be undone.
+                This removes the project and its chats from Mochlet. {p?.path ? 'The folder on disk is left untouched.' : ''} This can’t be undone.
               </p>
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
                 <button onClick={() => setConfirmDel(null)} style={{ height: 36, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Cancel</button>

@@ -118,18 +118,18 @@ export class TelegramBot {
     if (!binding) {
       this.store.upsertPendingChat({ chatId: String(chatId), name: chatName(msg.chat), kind: msg.chat.type === 'private' ? 'dm' : 'group', firstText: text.slice(0, 200) });
       this.emit('comms', this.store.commsStatus());
-      this.reply(chatId, `👋 This chat isn’t linked to Maestro yet. Open Maestro → Comms on your Mac to bind it, then send /run <task>.`);
+      this.reply(chatId, `👋 This chat isn’t linked to Mochlet yet. Open Mochlet → Comms on your Mac to bind it, then send /run <task>.`);
       return;
     }
 
     if (text === '/gates' || text === '/gates@') return this.sendGates(chatId, binding.permissions.approveGates);
 
     if (text.startsWith('/run') || (text && !text.startsWith('/'))) {
-      if (!binding.permissions.startJobs) { this.reply(chatId, 'This chat isn’t allowed to start jobs. Enable it in Maestro → Comms.'); return; }
+      if (!binding.permissions.startJobs) { this.reply(chatId, 'This chat isn’t allowed to start jobs. Enable it in Mochlet → Comms.'); return; }
       const prompt = text.startsWith('/run') ? text.slice(4).trim() : text;
       if (!prompt) { this.reply(chatId, 'Send /run followed by what you want done.'); return; }
       const project = (binding.projectId ? this.store.getProject(binding.projectId) : undefined) ?? this.store.listProjects()[0];
-      if (!project) { this.reply(chatId, 'No project to run in yet. Create one in Maestro first.'); return; }
+      if (!project) { this.reply(chatId, 'No project to run in yet. Create one in Mochlet first.'); return; }
       const job = this.store.createJob(project.id, prompt, `Telegram: ${prompt.slice(0, 40)}`, 'balanced');
       this.emit('job', job);
       this.reply(chatId, `▶️ On it — running in ${project.name}…`);
@@ -142,7 +142,7 @@ export class TelegramBot {
       return;
     }
 
-    if (text === '/start' || text === '/help') { this.reply(chatId, 'Maestro bot. Commands:\n/run <task> — start a job on your Mac\n/gates — review pending approvals'); return; }
+    if (text === '/start' || text === '/help') { this.reply(chatId, 'Mochlet bot. Commands:\n/run <task> — start a job on your Mac\n/gates — review pending approvals'); return; }
     this.reply(chatId, 'Unknown command. Try /run <task> or /gates.');
   }
 
@@ -153,7 +153,7 @@ export class TelegramBot {
       const reply_markup = canApprove ? { inline_keyboard: [[{ text: '✅ Approve', callback_data: `approve:${a.id}` }, { text: '✖️ Deny', callback_data: `deny:${a.id}` }]] } : undefined;
       this.send(chatId, clip(`🚦 ${a.title}\n${a.subtitle || ''}\n\n${a.detail || ''}`, 1200), reply_markup);
     }
-    if (!canApprove) this.reply(chatId, 'This chat can view gates but not approve. Enable “Approve gates” in Maestro → Comms.');
+    if (!canApprove) this.reply(chatId, 'This chat can view gates but not approve. Enable “Approve gates” in Mochlet → Comms.');
   }
 
   private async handleCallback(cb: TgCallback): Promise<void> {

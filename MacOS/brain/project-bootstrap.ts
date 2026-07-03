@@ -92,7 +92,7 @@ export interface BootstrapDeps {
 /** README.md seed — one line, project title + creation date. */
 function seedReadme(name: string, when: Date): string {
   const day = when.toISOString().slice(0, 10);
-  return `# ${name}\n\nCreated ${day} with Maestro.\n`;
+  return `# ${name}\n\nCreated ${day} with Mochlet.\n`;
 }
 
 /** .gitignore seed — defensive, not exhaustive. The user can extend it. */

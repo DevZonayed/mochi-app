@@ -124,7 +124,7 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 12, borderRadius: 12, background: 'color-mix(in srgb, var(--orange, #ff9f0a) 12%, transparent)', border: '0.5px solid color-mix(in srgb, var(--orange, #ff9f0a) 40%, transparent)', marginBottom: 14 }}>
           <Icon name="shield" size={18} style={{ color: 'var(--orange, #ff9f0a)', flexShrink: 0 }} />
           <span style={{ flex: 1, font: '400 var(--fs-footnote)/1.35 var(--font-text)', color: 'var(--ink)' }}>
-            Before Maestro messages summaries to your own number, it needs your OK.{wa.pendingSummaries?.length ? ` ${wa.pendingSummaries.length} waiting.` : ''}
+            Before Mochlet messages summaries to your own number, it needs your OK.{wa.pendingSummaries?.length ? ` ${wa.pendingSummaries.length} waiting.` : ''}
           </span>
           {IS_LOCAL && <button onClick={approve} disabled={busy} style={{ height: 34, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', flexShrink: 0 }}>{busy ? '…' : 'Allow'}</button>}
         </div>
@@ -276,7 +276,7 @@ function BindSheet({ pending, projects, onClose, onBound }: { pending: PendingCh
     <div onMouseDown={onClose} style={{ position: 'absolute', inset: 0, zIndex: 80, display: 'grid', placeItems: 'center', padding: 32, background: 'rgba(10,12,24,0.32)', backdropFilter: 'blur(3px)' }}>
       <div onMouseDown={e => e.stopPropagation()} style={{ width: 440, background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--glass-border)', boxShadow: '0 40px 100px rgba(10,15,40,0.5)', padding: 22 }}>
         <h2 style={{ margin: '0 0 4px', font: '700 var(--fs-title2)/1.1 var(--font-display)', color: 'var(--ink)' }}>{isWa ? 'Track' : 'Bind'} “{pending.name}”</h2>
-        <p style={{ margin: '0 0 16px', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>{isWa ? 'File this chat under a project and session. When it goes quiet for 15 minutes, Maestro summarizes it to your number.' : 'Let this chat control Maestro with the permissions you choose.'}</p>
+        <p style={{ margin: '0 0 16px', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>{isWa ? 'File this chat under a project and session. When it goes quiet for 15 minutes, Mochlet summarizes it to your number.' : 'Let this chat control Mochlet with the permissions you choose.'}</p>
         <label style={{ display: 'block', marginBottom: 16 }}>
           <span style={labelStyle}>{isWa ? 'Project' : 'Default project'}</span>
           <select value={projectId} onChange={e => setProjectId(e.target.value)} style={selectStyle}>
@@ -445,7 +445,7 @@ export default function CommsGateway() {
       <style>{CSS}</style>
       <div style={{ padding: '24px 28px 36px' }}>
         <h1 style={{ margin: '0 0 4px', font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Comms</h1>
-        <p style={{ margin: '0 0 20px', font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Drive Maestro from Telegram, and let WhatsApp chats summarize themselves to your number when they go quiet — all on this Mac.</p>
+        <p style={{ margin: '0 0 20px', font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Drive Mochlet from Telegram, and let WhatsApp chats summarize themselves to your number when they go quiet — all on this Mac.</p>
 
         <div style={{ display: 'inline-flex', padding: 3, background: 'var(--fill-secondary)', borderRadius: 11, marginBottom: 22 }}>
           {TABS.map(([k, label]) => (
