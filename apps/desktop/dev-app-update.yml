@@ -1,7 +1,0 @@
-# Only used in DEV when MAESTRO_TEST_UPDATES=1 (autoUpdater.forceDevUpdateConfig).
-# Lets you exercise the full check → download flow against the real GitHub
-# releases without packaging the app. Safe to commit; ignored in production
-# builds (electron-builder writes its own app-update.yml from the publish block).
-provider: github
-owner: DevZonayed
-repo: mochi-app

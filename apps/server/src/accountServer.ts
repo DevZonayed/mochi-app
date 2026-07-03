@@ -14,11 +14,34 @@ import { forwardCommand } from './routing.js';
 import { routeSignal, turnCredentials } from './webrtc.js';
 import { registerHostWs } from './wsHost.js';
 import { registerRemoteWs } from './wsRemote.js';
+import { addPushToken, removePushToken } from './push.js';
 
 /** Run all migrations (device + Better Auth). Call before listen(). */
 export async function migrateAll(): Promise<void> {
   await runMigrations();
   await migrateAuth();
+}
+
+/** CORS headers for a hijacked Better Auth (`/api/auth/*`) response.
+
+   We hijack the reply and let Better Auth write the raw response itself (see
+   below), which means `@fastify/cors`'s `onSend` hook never runs for these
+   routes. Without this, the OPTIONS preflight gets CORS headers (cors handles it
+   directly) but the ACTUAL response does not — so a real browser origin (the
+   desktop DEV build at http://localhost:5173) can't read it and `fetch` throws
+   "Failed to fetch" on sign-in. Packaged apps load from file:// (null Origin →
+   not a CORS request) so they were unaffected and masked the bug.
+
+   We reflect the request Origin (matching the `cors({ origin: true })` policy)
+   and expose `set-auth-token` — the header the renderer reads the session token
+   from, which the browser hides on cross-origin responses unless exposed. */
+export function authCorsHeaders(origin: string | undefined): Record<string, string> {
+  if (!origin) return {};
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Expose-Headers': 'set-auth-token',
+    Vary: 'Origin',
+  };
 }
 
 export function buildAccountServer(): FastifyInstance {
@@ -31,6 +54,12 @@ export function buildAccountServer(): FastifyInstance {
   const baHandler = toNodeHandler(auth);
   app.addHook('onRequest', async (req, reply) => {
     if ((req.raw.url ?? '').startsWith('/api/auth/')) {
+      // Set CORS headers on the raw response BEFORE hijacking — @fastify/cors's
+      // onSend hook does not run for a hijacked reply, so without this the actual
+      // auth response reaches a browser with no Access-Control-Allow-Origin. See
+      // authCorsHeaders() for the full rationale.
+      const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+      for (const [k, v] of Object.entries(authCorsHeaders(origin))) reply.raw.setHeader(k, v);
       reply.hijack();
       await baHandler(req.raw, reply.raw);
     }
@@ -64,6 +93,24 @@ export function buildAccountServer(): FastifyInstance {
     const { toDeviceId, signal } = (req.body ?? {}) as { toDeviceId?: string; signal?: unknown };
     await routeSignal(userId, deviceIdOf(req) ?? '', toDeviceId ?? '', signal);
     return { ok: true };
+  });
+
+  // ── Expo push registration ────────────────────────────────────────────
+  // The phone POSTs its Expo push token here at launch + on foreground; we
+  // mirror the host's alert-worthy events into Expo so a CLOSED app still
+  // gets an OS notification. Account-scoped: only the user's own Macs can
+  // cause their own phones to buzz. See push.ts for the full rationale.
+  app.post('/api/push/register', async (req) => {
+    const userId = (req as ReqWithUser).userId as string;
+    const { token } = (req.body ?? {}) as { token?: string };
+    const devices = await addPushToken(userId, token ?? '');
+    return { ok: true, devices };
+  });
+  app.post('/api/push/unregister', async (req) => {
+    const userId = (req as ReqWithUser).userId as string;
+    const { token } = (req.body ?? {}) as { token?: string };
+    const devices = await removePushToken(userId, token ?? '');
+    return { ok: true, devices };
   });
 
   // Generic account-scoped command forward. The legacy /api/jobs|projects|… routes
