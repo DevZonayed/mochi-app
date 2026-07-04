@@ -4,7 +4,7 @@
    progress streams back so the UI can show it live. */
 
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, readdirSync, statSync, copyFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, readdirSync, statSync, copyFileSync, realpathSync, writeFileSync, readFileSync, appendFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import path from 'node:path';
@@ -266,6 +266,42 @@ export async function aheadBehindAsync(dir: string, base: string): Promise<{ ahe
   const behind = Number(left);
   const ahead = Number(right);
   return { ahead: Number.isFinite(ahead) ? ahead : 0, behind: Number.isFinite(behind) ? behind : 0 };
+}
+
+/** Maestro's own app-local droppings — per-project memory (`.continuum/`) and
+    design-pipeline state (`.maestro/`) that the app itself writes into every
+    repo it touches. Untracked, never meant to be committed — but `git status
+    --porcelain` counts untracked files, so they kept every session's chip stuck
+    on "Uncommitted" forever (image_rnydz.png) and would ride along a `git add
+    -A`. Hidden via the repo-LOCAL exclude file (`info/exclude`), NOT the shared
+    `.gitignore`, so we never edit a tracked file the operator's team owns.
+
+    NO trailing slash — session worktrees carry `.continuum` as a SYMLINK to
+    the project's folder, and a `x/` pattern (directories only) does NOT match
+    a symlink. That's precisely why a pre-existing `.continuum/` exclude entry
+    still left every worktree session reading "Uncommitted". */
+export const MAESTRO_EXCLUDES = ['.continuum', '.maestro'];
+
+/** Idempotently append MAESTRO_EXCLUDES to the repo's local exclude file.
+    `--git-path info/exclude` resolves through linked worktrees to the COMMON
+    git dir, so one write covers the main checkout AND every session worktree.
+    Best-effort: any failure is swallowed — status must never break over this. */
+export async function ensureMaestroExcludes(dir: string): Promise<void> {
+  try {
+    const r = await execGitAsync(['-C', dir, 'rev-parse', '--git-path', 'info/exclude']);
+    if (!r.ok || !r.out) return;
+    const file = path.isAbsolute(r.out) ? r.out : path.join(dir, r.out);
+    let cur = '';
+    try { cur = readFileSync(file, 'utf8'); } catch { /* no exclude file yet */ }
+    const have = new Set(cur.split('\n').map(l => l.trim()));
+    // Exact match only: an existing `.continuum/` (dir-only) line does NOT
+    // cover the worktree symlink, so the slash-less pattern must still land.
+    const missing = MAESTRO_EXCLUDES.filter(p => !have.has(p));
+    if (!missing.length) return;
+    mkdirSync(path.dirname(file), { recursive: true });
+    const lead = cur && !cur.endsWith('\n') ? '\n' : '';
+    appendFileSync(file, `${lead}# Maestro app-local state (auto-added — never committed)\n${missing.join('\n')}\n`);
+  } catch { /* best-effort */ }
 }
 
 /** Async twin of `isDirty`. */

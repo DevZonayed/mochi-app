@@ -5,7 +5,7 @@
 import { existsSync } from 'node:fs';
 import type { Store, ChatSession, Project } from './store.js';
 import type { Providers } from './providers.js';
-import { isGitRepo, repoInfo, repoInfoAsync, resolveBaseBranch, resolveBaseBranchAsync, aheadBehindAsync, isDirtyAsync, localRefExistsAsync, dirtyFileCountAsync, lastCommitInfoAsync, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug, listConflictedFiles, getActiveConflictHunks, type ConflictFile } from './git.js';
+import { isGitRepo, repoInfo, repoInfoAsync, resolveBaseBranch, resolveBaseBranchAsync, aheadBehindAsync, isDirtyAsync, localRefExistsAsync, dirtyFileCountAsync, lastCommitInfoAsync, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug, listConflictedFiles, getActiveConflictHunks, ensureMaestroExcludes, type ConflictFile } from './git.js';
 import { parseGitHubRemote, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, getRepo, pickMergeMethod } from './github.js';
 import { deriveState, type LocalState, type LocalSnapshot, type PrStatus, type SessionGitStatus, type MergePreviewResult, type ResolvePreviewResult } from './pr-state.js';
 
@@ -31,6 +31,9 @@ export function pickPrFields(
 
 export class GitService {
   private cache = new Map<string, SessionGitStatus>();
+  /** Dirs whose repo-local exclude file already hides Maestro's own droppings
+      (`.continuum/`, `.maestro/`) — one idempotent write per dir per launch. */
+  private excludesEnsured = new Set<string>();
 
   constructor(private store: Store, private emit: Emit, private providers: Providers) {}
 
@@ -46,6 +49,13 @@ export class GitService {
   async localState(session: ChatSession, project: Project): Promise<LocalState> {
     const dir = this.dirFor(session, project);
     if (!dir) return EMPTY_LOCAL;
+    // Before ANY dirty math: make sure the app's own `.continuum/` + `.maestro/`
+    // folders are excluded from git's view, or every session reads "Uncommitted"
+    // forever no matter how clean the actual work is (image_rnydz.png).
+    if (!this.excludesEnsured.has(dir)) {
+      this.excludesEnsured.add(dir);
+      await ensureMaestroExcludes(dir);
+    }
     const base = session.baseBranch ?? await resolveBaseBranchAsync(dir);
     const branch = session.branch ?? (await repoInfoAsync(dir)).branch ?? null;
     const { ahead, behind } = await aheadBehindAsync(dir, base);

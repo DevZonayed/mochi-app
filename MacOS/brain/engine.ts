@@ -42,6 +42,7 @@ import { makeGitCtx, isNeedsConfirm, type GitCtx } from './git-ctx.js';
 import type { GitService } from './git-service.js';
 import type { MemorySync } from './memory-sync.js';
 import { generateSessionName } from './session-naming.js';
+import { resolveClaudeOAuthToken } from './claude-usage.js';
 import { waSendAllowed } from './whatsapp.js';
 import { classifyBashCommand, bgRedirectReason, BG_RUN_IN_BACKGROUND_DENY } from './bg-command-guard.js';
 import type { CronRunner } from './cron.js';
@@ -2950,11 +2951,14 @@ export class LocalEngine {
       s.sessionId === opts.sessionId && s.enabled && blockingKinds.has(s.kind ?? ''),
     );
 
-    // Sonnet judgment — gated by API key. If we get a clean verdict, trust it;
-    // if not (no key, network blip, malformed JSON), fall back to the regex.
+    // Sonnet judgment — needs SOME Anthropic credential. API key when the
+    // operator pasted one; otherwise the Claude subscription OAuth token (the
+    // common case on this Mac — without it the judge silently degraded to the
+    // regex). Clean verdict → trust it; any failure → regex fallback.
     const apiKey = this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined;
+    const judgeOauth = apiKey ? undefined : (await resolveClaudeOAuthToken() ?? undefined);
     let judged: JudgeResult | null = null;
-    if (apiKey) {
+    if (apiKey || judgeOauth) {
       // Gather a tiny bit of context — last 3 turns from THIS session — so the
       // judge can distinguish "asked Y in the body, agent already answered it"
       // from "asked Y, awaiting user". Cheap to gather; bounded in size.
@@ -2970,6 +2974,7 @@ export class LocalEngine {
       } catch { /* best-effort */ }
       judged = await judgeFollowup({
         apiKey,
+        oauthToken: judgeOauth,
         lastAssistantText: lastText,
         contextTurns: ctx,
         goalMode: opts.goalMode,
@@ -3987,8 +3992,13 @@ export class LocalEngine {
           const key = anthropicKey ?? this.providers?.getLocalKey('anthropic');
           void (async () => {
             let slugOverride: string | undefined;
-            if (key) {
-              const named = await generateSessionName({ userMessage, assistantText, apiKey: key });
+            // Subscription sign-ins have NO raw API key — the naming call
+            // silently never ran and every session kept the deterministic
+            // slug-of-the-first-message branch/title (image_rnydz.png). Fall
+            // back to the Claude Code OAuth token, which /v1/messages accepts.
+            const oauthToken = key ? undefined : (await resolveClaudeOAuthToken() ?? undefined);
+            if (key || oauthToken) {
+              const named = await generateSessionName({ userMessage, assistantText, apiKey: key, oauthToken });
               if (named) {
                 slugOverride = named.slug;
                 try {

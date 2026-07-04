@@ -29,7 +29,11 @@ export interface ClaudeUsage {
   error?: string;
 }
 
-async function resolveToken(): Promise<string | null> {
+/** Resolve the Claude subscription OAuth token the way the CLI stores it:
+    env → ~/.claude/.credentials.json → macOS keychain. Exported because the
+    session-namer / autopilot-judge reuse it for /v1/messages when the operator
+    signs in via subscription (no raw API key on this Mac). */
+export async function resolveClaudeOAuthToken(): Promise<string | null> {
   const env = process.env.CLAUDE_CODE_OAUTH_TOKEN;
   if (env && env.trim()) return env.trim();
   // ~/.claude/.credentials.json → { claudeAiOauth: { accessToken } }
@@ -61,7 +65,7 @@ const bucket = (x: { utilization?: number; resets_at?: string } | null | undefin
     as `{ error }` so the caller can degrade gracefully. */
 export async function getClaudeUsage(force = false): Promise<ClaudeUsage> {
   if (!force && cache && Date.now() - cache.at < TTL_MS) return cache.data;
-  const token = await resolveToken();
+  const token = await resolveClaudeOAuthToken();
   if (!token) { const d: ClaudeUsage = { fetchedAt: Date.now(), error: 'no-token' }; cache = { at: Date.now(), data: d }; return d; }
   try {
     const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
