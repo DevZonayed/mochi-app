@@ -15,8 +15,14 @@ export interface NamingInput {
   userMessage: string;
   /** The assistant's reply tail — helps the model name what actually happened. */
   assistantText?: string;
-  /** Anthropic API key from the Keychain; missing → caller falls back. */
-  apiKey: string;
+  /** Anthropic API key from the Keychain. Optional — subscription sign-ins
+      have no key and authenticate with `oauthToken` instead. */
+  apiKey?: string;
+  /** Claude subscription OAuth token (Claude Code's own credential — env /
+      ~/.claude/.credentials.json / Keychain, see claude-usage.ts). Sent as
+      `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`; proven live
+      against /v1/messages. Used when `apiKey` is absent. Neither → null. */
+  oauthToken?: string;
   model?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
@@ -66,7 +72,7 @@ export function parseNamingReply(raw: string): SessionName | null {
 /** Ask the model for {title, slug}. Null on ANY failure — callers keep the
     deterministic fallback. Soft timeout so the post-turn path never hangs. */
 export async function generateSessionName(input: NamingInput): Promise<SessionName | null> {
-  if (!input.apiKey || !input.userMessage?.trim()) return null;
+  if ((!input.apiKey && !input.oauthToken) || !input.userMessage?.trim()) return null;
   const fetcher = input.fetchImpl ?? globalThis.fetch;
   if (typeof fetcher !== 'function') return null;
   const controller = new AbortController();
@@ -81,14 +87,22 @@ export async function generateSessionName(input: NamingInput): Promise<SessionNa
     parts.push('', 'Assistant reply (tail, for context):', '---', input.assistantText.trim().slice(-1600), '---');
   }
   parts.push('', 'Output exactly one JSON object: {"title", "slug"}. Nothing else.');
+  // Auth: raw API key when the operator pasted one; otherwise the Claude
+  // subscription OAuth token (Bearer + oauth beta header — same shape as
+  // claude-usage.ts, verified working on /v1/messages).
+  const headers: Record<string, string> = {
+    'anthropic-version': '2023-06-01',
+    'content-type': 'application/json',
+  };
+  if (input.apiKey) headers['x-api-key'] = input.apiKey;
+  else {
+    headers.authorization = `Bearer ${input.oauthToken}`;
+    headers['anthropic-beta'] = 'oauth-2025-04-20';
+  }
   try {
     const res = await fetcher('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'x-api-key': input.apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({
         model: input.model ?? DEFAULT_NAMING_MODEL,
         max_tokens: 160,

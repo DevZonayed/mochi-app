@@ -50,9 +50,11 @@ export interface ImportedTurn {
   createdAt: number;
 }
 export interface ImportedBlock {
-  kind: 'text' | 'tool' | 'result';
+  kind: 'text' | 'thinking' | 'tool' | 'result';
   text: string;
   name?: string;
+  /** tool only: the raw detail (shell command / JSON args) behind the human label. */
+  cmd?: string;
   ts: number;
 }
 
@@ -93,6 +95,10 @@ function stripSystemWrappers(text: string): string {
     .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, '')
     .replace(/<user_instructions>[\s\S]*?<\/user_instructions>/gi, '')
     .replace(/<permissions[\s\S]*?(?:<\/permissions[^>]*>|$)/gi, '')
+    .replace(/<command-message>[\s\S]*?<\/command-message>/gi, '')
+    .replace(/<command-args>[\s\S]*?<\/command-args>/gi, '')
+    .replace(/<command-name>([\s\S]*?)<\/command-name>/gi, '$1')
+    .replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/gi, '')
     .trim();
 }
 
@@ -120,20 +126,54 @@ function parseJsonl(file: string): Record<string, unknown>[] {
 
 /* ── Claude Code ────────────────────────────────────────────────────────── */
 
-function claudeTextOf(content: unknown): { text: string; tools: { name: string; detail: string }[] } {
+/** A human-readable label for a tool call, mirroring how live transcripts label
+    chips (Bash description / file path / search pattern), so imported history
+    reads like a real session instead of raw JSON args. */
+function toolHumanLabel(name: string, input: Record<string, unknown>): { label: string; detail?: string } {
+  const s = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const short = (v: string, n = 120): string => (v.length > n ? v.slice(0, n) + '…' : v);
+  const relish = (p: string): string => p.replace(/^\/Users\/[^/]+\//, '~/');
+  switch (name) {
+    case 'Bash': {
+      const desc = s(input.description); const cmd = s(input.command);
+      return desc ? { label: short(desc), detail: short(cmd, 400) } : { label: short(cmd) || 'shell' };
+    }
+    case 'Read': case 'Write': case 'Edit': case 'MultiEdit': case 'NotebookEdit':
+      return { label: short(relish(s(input.file_path) || s(input.path) || name)) };
+    case 'Grep': case 'Glob':
+      return { label: short(s(input.pattern) || name) };
+    case 'Task': case 'Agent':
+      return { label: short(s(input.description) || 'sub-agent'), detail: short(s(input.prompt), 400) };
+    case 'WebFetch': case 'WebSearch':
+      return { label: short(s(input.url) || s(input.query) || name) };
+    case 'TodoWrite':
+      return { label: 'update todo list' };
+    case 'AskUserQuestion':
+      return { label: 'ask the user' };
+    case 'Skill':
+      return { label: short(s(input.skill) || 'skill') };
+  }
+  if (/generate_image|image_gen/i.test(name)) return { label: short(s(input.prompt) || 'generate image', 160) };
+  const json = JSON.stringify(input);
+  const first = s(input.description) || s(input.prompt) || s(input.file_path) || s(input.selector) || s(input.url) || s(input.query) || s(input.command);
+  return first ? { label: short(first), detail: short(json, 400) } : { label: name.replace(/^mcp__\w+__/, ''), detail: short(json, 400) };
+}
+
+function claudeTextOf(content: unknown): { text: string; thinking: string[]; tools: { name: string; label: string; detail?: string }[] } {
   // user content is usually a string; assistant content is a block array.
-  if (typeof content === 'string') return { text: content, tools: [] };
-  const tools: { name: string; detail: string }[] = [];
+  if (typeof content === 'string') return { text: content, thinking: [], tools: [] };
+  const tools: { name: string; label: string; detail?: string }[] = [];
+  const thinking: string[] = [];
   const parts: string[] = [];
   if (Array.isArray(content)) {
     for (const b of content) {
       if (!b || typeof b !== 'object') continue;
       const bb = b as Record<string, unknown>;
       if (bb.type === 'text' && typeof bb.text === 'string') parts.push(bb.text);
-      else if (bb.type === 'thinking' && typeof bb.thinking === 'string') parts.push(bb.thinking);
+      else if (bb.type === 'thinking' && typeof bb.thinking === 'string') thinking.push(bb.thinking);
       else if (bb.type === 'tool_use' && typeof bb.name === 'string') {
-        const input = bb.input && typeof bb.input === 'object' ? JSON.stringify(bb.input) : '';
-        tools.push({ name: bb.name, detail: input.slice(0, 400) });
+        const input = (bb.input && typeof bb.input === 'object' ? bb.input : {}) as Record<string, unknown>;
+        tools.push({ name: bb.name, ...toolHumanLabel(bb.name, input) });
       } else if (bb.type === 'tool_result') {
         const c = bb.content;
         const txt = typeof c === 'string' ? c : Array.isArray(c) ? c.map(x => (x && typeof x === 'object' && typeof (x as Record<string, unknown>).text === 'string' ? (x as Record<string, string>).text : '')).join('') : '';
@@ -141,7 +181,7 @@ function claudeTextOf(content: unknown): { text: string; tools: { name: string; 
       }
     }
   }
-  return { text: parts.join('\n\n'), tools };
+  return { text: parts.join('\n\n'), thinking, tools };
 }
 
 function scanClaude(projectPath: string): ScannedConversation[] {
@@ -186,21 +226,23 @@ function parseClaude(file: string): ImportedTurn[] {
   for (const r of rows) {
     const type = r.type;
     if (type !== 'user' && type !== 'assistant') continue;
+    if (r.isMeta === true) continue; // harness bookkeeping rows, never shown live
     const ts = toMs(r.timestamp);
     const m = r.message as Record<string, unknown> | undefined;
-    const { text, tools } = claudeTextOf(m?.content);
+    const { text, thinking, tools } = claudeTextOf(m?.content);
     if (type === 'user') {
       // A tool_result-only user turn belongs to the running assistant turn.
       const isToolResult = Array.isArray(m?.content) && (m!.content as unknown[]).every(b => b && typeof b === 'object' && (b as Record<string, unknown>).type === 'tool_result');
       if (isToolResult && cur) { if (text.trim()) cur.transcript.push({ kind: 'result', text: cap(text), ts }); continue; }
       const clean = stripSystemWrappers(text);
-      if (!clean) { cur = null; continue; } // pure system/boilerplate — not a human turn
+      if (!clean || clean.startsWith('Caveat:')) { cur = null; continue; } // pure system/boilerplate — not a human turn
       cur = { input: cap(clean), output: '', transcript: [], createdAt: ts };
       turns.push(cur);
     } else {
       if (!cur) { cur = { input: '', output: '', transcript: [], createdAt: ts }; turns.push(cur); }
+      for (const th of thinking) if (th.trim()) cur.transcript.push({ kind: 'thinking', text: cap(th), ts });
       if (text.trim()) { cur.transcript.push({ kind: 'text', text: cap(text), ts }); cur.output = cap(text); }
-      for (const t of tools) cur.transcript.push({ kind: 'tool', text: t.detail, name: t.name, ts });
+      for (const t of tools) cur.transcript.push({ kind: 'tool', text: t.label, name: t.name, ...(t.detail ? { cmd: t.detail } : {}), ts });
     }
   }
   return turns.filter(t => t.input.trim() || t.transcript.length);
@@ -304,7 +346,11 @@ function parseCodex(file: string): ImportedTurn[] {
     } else if ((p.type === 'function_call' || p.type === 'custom_tool_call') && cur) {
       const name = typeof p.name === 'string' ? p.name : 'tool';
       const args = typeof p.arguments === 'string' ? p.arguments : p.input && typeof p.input === 'object' ? JSON.stringify(p.input) : '';
-      cur.transcript.push({ kind: 'tool', text: String(args).slice(0, 400), name, ts });
+      let parsed: Record<string, unknown> = {};
+      try { const j: unknown = JSON.parse(String(args)); if (j && typeof j === 'object' && !Array.isArray(j)) parsed = j as Record<string, unknown>; } catch { /* raw string args */ }
+      const { label, detail } = toolHumanLabel(name, parsed);
+      const cmd = (detail ?? String(args)).slice(0, 400);
+      cur.transcript.push({ kind: 'tool', text: label, name, ...(cmd ? { cmd } : {}), ts });
     }
   }
   // Skip the leading developer/system turn Codex injects (its first "user" is
@@ -364,16 +410,16 @@ function scanConductor(projectPath: string): ScannedConversation[] {
 
 /** Decode a Conductor message body. User rows are plain text; assistant rows are
     a JSON-encoded Claude SDK message whose content is a text/tool block array. */
-function conductorBody(role: string, content: string): { text: string; tools: { name: string; detail: string }[] } {
-  if (role === 'user') return { text: content, tools: [] };
+function conductorBody(role: string, content: string): ReturnType<typeof claudeTextOf> {
+  if (role === 'user') return { text: content, thinking: [], tools: [] };
   const s = (content || '').trim();
-  if (!s.startsWith('{')) return { text: content, tools: [] };
+  if (!s.startsWith('{')) return { text: content, thinking: [], tools: [] };
   try {
     const obj = JSON.parse(s) as Record<string, unknown>;
     const msg = (obj.message as Record<string, unknown> | undefined) ?? obj;
     return claudeTextOf(msg.content);
   } catch {
-    return { text: content, tools: [] };
+    return { text: content, thinking: [], tools: [] };
   }
 }
 
@@ -387,7 +433,7 @@ function parseConductor(sessionId: string): ImportedTurn[] {
   let cur: ImportedTurn | null = null;
   for (const r of rows) {
     const ts = toMs(r.sent_at ?? r.created_at);
-    const { text, tools } = conductorBody(r.role, r.content);
+    const { text, thinking, tools } = conductorBody(r.role, r.content);
     if (r.role === 'user') {
       const clean = stripSystemWrappers(text);
       if (!clean) { cur = null; continue; }
@@ -395,8 +441,9 @@ function parseConductor(sessionId: string): ImportedTurn[] {
       turns.push(cur);
     } else {
       if (!cur) { cur = { input: '', output: '', transcript: [], createdAt: ts }; turns.push(cur); }
+      for (const th of thinking) if (th.trim()) cur.transcript.push({ kind: 'thinking', text: cap(th), ts });
       if (text.trim()) { cur.transcript.push({ kind: 'text', text: cap(text), ts }); cur.output = cap(text); }
-      for (const t of tools) cur.transcript.push({ kind: 'tool', text: t.detail, name: t.name, ts });
+      for (const t of tools) cur.transcript.push({ kind: 'tool', text: t.label, name: t.name, ...(t.detail ? { cmd: t.detail } : {}), ts });
     }
   }
   return turns.filter(t => t.input.trim() || t.transcript.length);

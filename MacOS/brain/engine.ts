@@ -33,6 +33,8 @@ import { normalizeRunMode, canStartBackgroundRun } from './run-mode.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
 import { ensureBrowserSkill } from './browser-skill.js';
+import { DESIGN_DIRECTIVE, DESIGN_PHASES, designDirectiveFor, designNeedsBrowser, designWantsFfmpeg, isWorkflowDesign, parseWorkflowMarker, WORKFLOW_MARKER_REL, type DesignPhase, type DesignFlow } from './design-workflow.js';
+import { resolveFfmpeg, ensureFfmpeg, managedFfmpegTarget } from './ffmpeg.js';
 import { ensureNativeSkills, nativeSkillsPromptBlock, nativeSkillSummaries, isNativeSkill } from './native-skills.js';
 import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
@@ -40,6 +42,7 @@ import { makeGitCtx, isNeedsConfirm, type GitCtx } from './git-ctx.js';
 import type { GitService } from './git-service.js';
 import type { MemorySync } from './memory-sync.js';
 import { generateSessionName } from './session-naming.js';
+import { resolveClaudeOAuthToken } from './claude-usage.js';
 import { waSendAllowed } from './whatsapp.js';
 import { classifyBashCommand, bgRedirectReason, BG_RUN_IN_BACKGROUND_DENY } from './bg-command-guard.js';
 import type { CronRunner } from './cron.js';
@@ -111,13 +114,18 @@ const ASK_DIRECTIVE =
 // Design mode (the Design genre): steer the agent to produce ONE self-contained,
 // live-previewable HTML artifact — the OpenDesign "agent-native design" model, but
 // on Maestro's own engines + image-gen. Prepended to every turn of a design project.
-const BROWSER_DIRECTIVE =
+const browserDirective = (native: boolean): string =>
   `\n\n---\n\n[Browser mode ON] The user turned on BROWSER for this message — drive their REAL ` +
-  `connected Chrome (their logged-in profiles, cookies, sessions) via the mcp__maestro__browser_* tools. ` +
+  `Chrome (their logged-in profiles, cookies, sessions) via the mcp__maestro__browser_* tools. ` +
   `Do NOT use WebSearch/WebFetch.\n\n` +
-  `**First call: \`mcp__maestro__browser_status\`.** If no profile is connected, tell the user to open the ` +
-  `Mochi Chrome extension and pair it (the app shows the token under Settings → Browser extension), then stop ` +
-  `— do not loop.\n\n` +
+  (native
+    ? `**Just start with \`mcp__maestro__browser_navigate\`.** This app launches a dedicated Chrome window ` +
+      `for this project ON DEMAND — "not open/connected yet" only means you haven't navigated yet. NEVER ask ` +
+      `the user to pair, install, or open an extension; there is none. If Chrome itself fails to launch ` +
+      `(browser_status reports \`chrome-launch-failed\`), tell the user in one line and stop.\n\n`
+    : `**First call: \`mcp__maestro__browser_status\`.** If no profile is connected, tell the user to open the ` +
+      `Mochi Chrome extension and pair it (the app shows the token under Settings → Browser extension), then stop ` +
+      `— do not loop.\n\n`) +
   `**The reading ladder (cheap → expensive)** — climb in order, NEVER start with snapshot on a heavy SPA:\n` +
   `  1. \`browser_read\` — visible text. Read like a human.\n` +
   `  2. \`browser_links\` — navigation choices.\n` +
@@ -130,9 +138,13 @@ const BROWSER_DIRECTIVE =
   `\`browser_download_url\` (Chrome download to user's Downloads folder), \`browser_console_messages\` + ` +
   `\`browser_network_requests\` (debug what broke), \`browser_emulate_viewport\` (test mobile/iPad), ` +
   `\`browser_upload_file\` (drive file inputs), \`browser_wait_for_selector\` (instead of fixed sleeps).\n\n` +
-  `**Connection-loss recovery:** browser_* tools auto-retry once when the extension drops briefly (it ` +
-  `reconnects with exponential backoff up to ~15s). If you still get "browser profile disconnected" or ` +
-  `"No browser connected" AFTER the retry, tell the user one line and stop. Do not loop.\n\n` +
+  (native
+    ? `**Connection-loss recovery:** if the user closed the project's Chrome window mid-task ("browser not ` +
+      `open for this project"), just call browser_navigate again — it relaunches the window. If Chrome ` +
+      `repeatedly fails to launch, tell the user one line and stop. Do not loop.\n\n`
+    : `**Connection-loss recovery:** browser_* tools auto-retry once when the extension drops briefly (it ` +
+      `reconnects with exponential backoff up to ~15s). If you still get "browser profile disconnected" or ` +
+      `"No browser connected" AFTER the retry, tell the user one line and stop. Do not loop.\n\n`) +
   `Read \`.claude/skills/browser/SKILL.md\` (auto-installed in this project) for the full tool reference + ` +
   `recipes (image-grab, heavy-DOM rescue, debugging, mobile emulation).`;
 
@@ -146,28 +158,8 @@ const WHATSAPP_DIRECTIVE =
   `with no chatId/phone and it goes to that personal number); messaging other contacts is blocked unless they ` +
   `enabled it (the send tool will tell you). Chats assigned to THIS project are marked [project] — prefer them.`;
 
-const DESIGN_DIRECTIVE =
-  `\n\n---\n\n[Design mode] You are a senior product designer working in a live design ` +
-  `canvas. Build and iteratively refine ONE self-contained artifact at \`design/index.html\` ` +
-  `(create the \`design/\` folder if needed). Rules:\n` +
-  `• Self-contained & live-previewable: all CSS in a single <style> block, web fonts via ` +
-  `Google Fonts <link>, no build step and no local JS frameworks. It must render correctly ` +
-  `opened on its own.\n` +
-  `• Distinctive, production-grade visual design — intentional type scale, spacing, colour, ` +
-  `hierarchy and motion. Avoid generic/templated AI aesthetics. Honour the project's design ` +
-  `system / brand if one is given in the instructions.\n` +
-  `• Imagery: when you need a photo/illustration/icon/texture, CALL the generate_image tool, ` +
-  `then save/reference the file under \`design/\` and link it with a ROOT-ABSOLUTE path ` +
-  `(e.g. \`/design/hero.png\`) so the live preview resolves it. Prefer CSS/SVG for simple shapes.\n` +
-  `• Iterate in place: EDIT \`design/index.html\` for changes — don't spawn new files per tweak. ` +
-  `Keep it the single source of truth. After a change, briefly say what you changed.\n` +
-  `• This artifact is real, hand-off-able front-end code: write clean, semantic HTML so it can ` +
-  `later become a coding project.\n` +
-  `• You are fluent in the common design surfaces — landing pages, dashboards & data UIs, mobile ` +
-  `app screens, slide decks, posters, emails, pricing pages, and brand kits. Bring real craft to ` +
-  `whichever the user asks for: a coherent type scale, a considered colour system, a grid, real ` +
-  `content (no lorem ipsum), responsive behaviour, and tasteful detail (states, shadows, motion). ` +
-  `If a brand/design system is recorded in the project memory or instructions, apply it faithfully.`;
+// DESIGN_DIRECTIVE now lives in ./design-workflow.ts (imported above) alongside
+// the guided-workflow phase directives; designDirectiveFor() picks per turn.
 const GOAL_DIRECTIVE =
   `\n\n---\n\n[Goal mode] Pursue the request above as a goal: work autonomously to ` +
   `completion. Don't stop to ask for confirmation on routine steps; plan, implement, ` +
@@ -644,6 +636,11 @@ interface ExtensionBridgeLike {
 interface BrowserCtx {
   connected: () => boolean;
   profile: () => string | null;
+  /** True when backed by the in-process Playwright manager (native app): the
+      per-project Chrome window LAUNCHES ON DEMAND, so "not connected" just means
+      "not launched yet — navigate and it opens". False/absent = the legacy
+      Chrome-extension bridge, where the user really must pair a profile. */
+  native?: boolean;
   call: (type: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>;
   /** Agent-placed background watch: poll a JS condition on the active tab and
       post a NEW chat turn into THIS session when it transitions to true. Bound
@@ -699,7 +696,7 @@ export function formatSkillInstallReply(
     + ` It is now active for this project — invoke it via the Skill tool when relevant.`;
   if (!skillMdBody) return `${head} Now read that file and follow it.`;
   const trimmed = skillMdBody.length > 32000
-    ? skillMdBody.slice(0, 32000) + '\n\n[truncated by Mochlet after 32000 characters]'
+    ? skillMdBody.slice(0, 32000) + '\n\n[truncated by Maestro after 32000 characters]'
     : skillMdBody;
   return `${head}\n\nFollow these instructions for the task:\n\n---\n${trimmed}\n---`;
 }
@@ -968,10 +965,16 @@ async function runClaude(
             const json = (v: unknown, max = 16000) => txt(JSON.stringify(v, null, 2).slice(0, max));
             return [
             tool('browser_status',
-              'Check whether the user\'s real Chrome browser is connected (via the Mochi extension) and which profile is active. Use BEFORE other browser_* tools when in doubt, and AFTER a tool reports a disconnect to confirm.',
+              'Check whether the user\'s real Chrome browser is connected/open and which profile is active. Use BEFORE other browser_* tools when in doubt, and AFTER a tool reports a disconnect to confirm.',
               {},
               wrap(async () => {
-                if (!browserCtx.connected()) return txt('No browser connected. Ask the user to open the Mochi Chrome extension and pair/activate a profile (the app shows the token under Settings → Browser extension).');
+                if (!browserCtx.connected()) {
+                  // Native (Playwright) manager: the per-project Chrome window simply
+                  // hasn't been launched yet — the agent should proceed, not stop and
+                  // ask the user to pair anything.
+                  if (browserCtx.native) return txt('Browser available but not launched yet for this project. Just call browser_navigate with your first URL (or browser_session_start) — a dedicated Chrome window opens automatically. Do NOT ask the user to pair or install anything.');
+                  return txt('No browser connected. Ask the user to open the Mochi Chrome extension and pair/activate a profile (the app shows the token under Settings → Browser extension).');
+                }
                 let where = '';
                 try { const t = await browserCtx.call('tab_url') as { url?: string }; if (t?.url) where = ` Current tab: ${t.url}`; } catch { /* no tab yet */ }
                 return txt(`Browser connected — active profile "${browserCtx.profile() ?? 'Chrome'}".${where}`);
@@ -2948,11 +2951,14 @@ export class LocalEngine {
       s.sessionId === opts.sessionId && s.enabled && blockingKinds.has(s.kind ?? ''),
     );
 
-    // Sonnet judgment — gated by API key. If we get a clean verdict, trust it;
-    // if not (no key, network blip, malformed JSON), fall back to the regex.
+    // Sonnet judgment — needs SOME Anthropic credential. API key when the
+    // operator pasted one; otherwise the Claude subscription OAuth token (the
+    // common case on this Mac — without it the judge silently degraded to the
+    // regex). Clean verdict → trust it; any failure → regex fallback.
     const apiKey = this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined;
+    const judgeOauth = apiKey ? undefined : (await resolveClaudeOAuthToken() ?? undefined);
     let judged: JudgeResult | null = null;
-    if (apiKey) {
+    if (apiKey || judgeOauth) {
       // Gather a tiny bit of context — last 3 turns from THIS session — so the
       // judge can distinguish "asked Y in the body, agent already answered it"
       // from "asked Y, awaiting user". Cheap to gather; bounded in size.
@@ -2968,6 +2974,7 @@ export class LocalEngine {
       } catch { /* best-effort */ }
       judged = await judgeFollowup({
         apiKey,
+        oauthToken: judgeOauth,
         lastAssistantText: lastText,
         contextTurns: ctx,
         goalMode: opts.goalMode,
@@ -3275,8 +3282,22 @@ export class LocalEngine {
       // foreground shell. Mounted on real Claude runs, and on Codex runs with a project
       // (the stdio bridge forwards the same tools there).
       if (!opts.plan && (master === 'claude' || (master === 'codex' && job.projectId))) prompt += BG_DIRECTIVE;
-      // Design genre: steer the turn toward the live, self-contained design artifact.
-      if (project?.kind === 'design') prompt += DESIGN_DIRECTIVE;
+      // Design genre: steer the turn toward the live, self-contained design
+      // artifact. Guided-workflow projects (raw/redesign) additionally get the
+      // current PHASE directive (research → brand → choice → design → complete)
+      // and — when the flow needs it — a pre-provisioned ffmpeg. ffmpeg mirrors
+      // the engines: downloaded on demand into userData, never bundled. If it
+      // isn't on disk yet we kick off the (single-flight) background download
+      // and pre-announce the install path so the agent can wait for it.
+      if (project?.kind === 'design') {
+        let ff: { path: string | null; target: string | null } | undefined;
+        if (designWantsFfmpeg(project)) {
+          const have = resolveFfmpeg();
+          if (!have) void ensureFfmpeg().catch(() => { /* offline → the agent is told the path may not appear */ });
+          ff = { path: have, target: managedFfmpegTarget() };
+        }
+        prompt += designDirectiveFor(project, ff ? { ffmpeg: ff } : undefined);
+      }
       // Image intent → inject the imagegen-skill methodology so the agent shapes a
       // structured, high-quality prompt before generating. Claude routes through the
       // maestro generate_image tool (mounted when imageGen is configured + not plan);
@@ -3571,6 +3592,7 @@ export class LocalEngine {
       const mgrPid = job.projectId ?? session?.projectId ?? null;
       const mgr = (this.browserManager && mgrPid) ? this.browserManager : null;
       const browserCtx: BrowserCtx | undefined = ((mgr || bridge) && !opts.plan) ? {
+        native: !!mgr,
         connected: () => (mgr ? mgr.status(mgrPid!).open : bridge!.hasActiveBrowser()),
         profile: () => (mgr ? (mgr.status(mgrPid!).open ? `project:${mgrPid}` : null) : bridge!.activeProfile()),
         call: (type, params, timeoutMs) => (mgr ? mgr.call(mgrPid!, type, params ?? {}, timeoutMs) : bridge!.request(type, params ?? {}, timeoutMs)),
@@ -3604,9 +3626,12 @@ export class LocalEngine {
       /* Auto-install the bundled `browser` SKILL.md so the agent reads the full
          tool reference + recipes BEFORE its first browser_* call. Idempotent — it
          won't clobber an operator-edited copy. Gated on browser mode being ON for
-         this turn AND a bridge existing (browserCtx truthy implies both). */
-      if (opts.browser && browserCtx) {
-        try { ensureBrowserSkill(cwd); } catch { /* best-effort; missing doc never fails a run */ }
+         this turn AND a bridge existing (browserCtx truthy implies both). Design
+         research/brand phases are browser-first, so they force it on without the
+         operator having to remember the @browser toggle. */
+      const browserOn = (opts.browser || designNeedsBrowser(project)) && !!browserCtx;
+      if (browserOn) {
+        try { ensureBrowserSkill(cwd, !!browserCtx?.native); } catch { /* best-effort; missing doc never fails a run */ }
       }
       // Schedule capability: let the agent inspect + manage recurring/scheduled
       // tasks and discover projects/sessions to target. Off in plan mode.
@@ -3635,9 +3660,10 @@ export class LocalEngine {
         sendText: (chatId, text) => this.comms!.sendText(chatId, text),
         markRead: (chatId) => this.comms!.markRead(chatId),
       } : undefined;
-      // Browser mode (composer toggle): the maestro MCP tools are deferred, so an
-      // explicit directive ensures the agent loads + uses the real-Chrome tools.
-      if (opts.browser && browserCtx) prompt += BROWSER_DIRECTIVE;
+      // Browser mode (composer toggle OR design research/brand auto-enable): the
+      // maestro MCP tools are deferred, so an explicit directive ensures the agent
+      // loads + uses the real-Chrome tools.
+      if (browserOn) prompt += browserDirective(!!browserCtx?.native);
       // WhatsApp linked → tell the agent it CAN read/send (the tools are deferred, so
       // the directive ensures it reaches for them instead of saying it can't).
       if (commsCtx) prompt += WHATSAPP_DIRECTIVE;
@@ -3966,8 +3992,13 @@ export class LocalEngine {
           const key = anthropicKey ?? this.providers?.getLocalKey('anthropic');
           void (async () => {
             let slugOverride: string | undefined;
-            if (key) {
-              const named = await generateSessionName({ userMessage, assistantText, apiKey: key });
+            // Subscription sign-ins have NO raw API key — the naming call
+            // silently never ran and every session kept the deterministic
+            // slug-of-the-first-message branch/title (image_rnydz.png). Fall
+            // back to the Claude Code OAuth token, which /v1/messages accepts.
+            const oauthToken = key ? undefined : (await resolveClaudeOAuthToken() ?? undefined);
+            if (key || oauthToken) {
+              const named = await generateSessionName({ userMessage, assistantText, apiKey: key, oauthToken });
               if (named) {
                 slugOverride = named.slug;
                 try {
@@ -4045,6 +4076,40 @@ export class LocalEngine {
         try { appendCheckpoint(cwd, { summary: `${cur.input.slice(0, 200).trim()}${output ? `\n→ ${output.slice(0, 300).trim()}` : ''}`, tags: project?.kind ? [project.kind] : [] }, Date.now()); } catch { /* memory is best-effort */ }
         // Mirror the fresh checkpoint into the memory repository (debounced).
         try { this.memorySync?.scheduleSync(job.projectId); } catch { /* best-effort */ }
+      }
+      // Guided design workflow: the agent reports phase/flow completion by
+      // writing the on-disk marker (.maestro/design/state.json). Read it back
+      // after every successful turn and sync the store + UI. File-based on
+      // purpose — it works identically on the Claude AND Codex engines with
+      // zero per-engine tool plumbing.
+      if (isWorkflowDesign(project) && job.projectId && !opts.plan) {
+        try {
+          // A repo-backed project can carry TWO marker copies: the session
+          // worktree's (agent-written this turn, at cwd) and the project
+          // path's (operator-written via updateProject). Trust the NEWEST
+          // one, and never move the phase BACKWARD — the pipeline is one-way,
+          // so a stale worktree copy can't undo the operator's flow choice.
+          let best: { phase?: DesignPhase; flow?: DesignFlow; mtime: number } | null = null;
+          for (const root of [...new Set([cwd, project?.path].filter((r): r is string => !!r))]) {
+            const markerPath = path.join(root, WORKFLOW_MARKER_REL);
+            if (!existsSync(markerPath)) continue;
+            const marker = parseWorkflowMarker(readFileSync(markerPath, 'utf8'));
+            if (!marker) continue;
+            const mtime = statSync(markerPath).mtimeMs;
+            if (!best || mtime > best.mtime) best = { ...marker, mtime };
+          }
+          const curP = best ? this.store.getProject(job.projectId) : undefined;
+          if (best && curP) {
+            const patch: { designPhase?: DesignPhase; designFlow?: DesignFlow } = {};
+            const curIdx = DESIGN_PHASES.indexOf(curP.designPhase ?? 'research');
+            if (best.phase && best.phase !== curP.designPhase && DESIGN_PHASES.indexOf(best.phase) > curIdx) patch.designPhase = best.phase;
+            if (best.flow && best.flow !== curP.designFlow) patch.designFlow = best.flow;
+            if (patch.designPhase || patch.designFlow) {
+              const p2 = this.store.updateProject(job.projectId, patch);
+              this.emit('project', p2);
+            }
+          }
+        } catch { /* phase sync is best-effort; the next turn re-reads the marker */ }
       }
       // Chat replies don't ping the events feed — per-message noise; failures still do.
       if (!isChat) this.store.pushEvent({ kind: 'job-done', title: `Done: ${done.title}`, projectId: done.projectId, jobId });

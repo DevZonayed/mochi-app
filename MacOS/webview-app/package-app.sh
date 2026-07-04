@@ -2,7 +2,10 @@
 set -euo pipefail
 
 CONFIG="${1:-release}"
-APP_NAME="Maestro WebKit"
+# The product name shipped to users. Renaming here renames dist/<name>.app and
+# the CFBundleName; the CFBundleIdentifier stays cloud.nexalance.maestro.webkit
+# on purpose (keychain entries + TCC permissions are keyed by it).
+APP_NAME="Mochlet"
 EXEC_NAME="MaestroWebKit"
 VERSION="${MAESTRO_VERSION:-0.1.28}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -31,7 +34,9 @@ resolve_path() {
 # (vite, esbuild) would break. Pin a real, standalone node to the FRONT of PATH
 # for the whole build so nothing depends on the shim.
 node_is_real() { [ -x "$1" ] && [ "$(stat -f%z "$1" 2>/dev/null || echo 0)" -gt 1048576 ] && file -b "$1" 2>/dev/null | grep -q "Mach-O"; }
-for cand in /opt/homebrew/bin/node /usr/local/bin/node "/Applications/Maestro WebKit.app/Contents/Resources/sidecar/bin/node"; do
+for cand in /opt/homebrew/bin/node /usr/local/bin/node \
+  "/Applications/Mochlet.app/Contents/Resources/sidecar/bin/node" \
+  "/Applications/Maestro WebKit.app/Contents/Resources/sidecar/bin/node"; do
   rp="$(resolve_path "$cand" 2>/dev/null || true)"
   if node_is_real "$rp"; then
     export PATH="$(dirname "$rp"):$PATH"
@@ -123,6 +128,7 @@ node_is_real() { [ -x "$1" ] && [ "$(stat -f%z "$1" 2>/dev/null || echo 0)" -gt 
 if ! node_is_real "$REAL_NODE"; then
   echo "  note: '$REAL_NODE' looks like a shim/non-binary; searching for a real node"
   for cand in \
+    "/Applications/Mochlet.app/Contents/Resources/sidecar/bin/node" \
     "/Applications/Maestro WebKit.app/Contents/Resources/sidecar/bin/node" \
     "/opt/homebrew/bin/node" \
     "/usr/local/bin/node"; do

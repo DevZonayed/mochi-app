@@ -138,9 +138,25 @@ describe('buildJudgeUserMessage', () => {
 });
 
 describe('judgeFollowup', () => {
-  it('returns null when there is no API key (autopilot still works via regex)', async () => {
+  it('returns null when there is no credential at all (autopilot still works via regex)', async () => {
     const r = await judgeFollowup({ apiKey: '', lastAssistantText: 'next up' });
     expect(r).toBeNull();
+    expect(await judgeFollowup({ lastAssistantText: 'next up' })).toBeNull();
+  });
+  // Subscription sign-ins have no raw API key — the judge must run on the
+  // Claude Code OAuth token instead of silently degrading to the regex.
+  it('authenticates with Bearer + oauth beta header when only oauthToken is present', async () => {
+    const fetchImpl = vi.fn(async () => fakeResponse('{"verdict":"continue","reason":"ok"}'));
+    const r = await judgeFollowup({
+      oauthToken: 'sk-ant-oat01-xyz',
+      lastAssistantText: 'want me to keep going?',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(r).toEqual({ verdict: 'continue', reason: 'ok' });
+    const h = (fetchImpl.mock.calls[0] as [string, RequestInit])[1].headers as Record<string, string>;
+    expect(h.authorization).toBe('Bearer sk-ant-oat01-xyz');
+    expect(h['anthropic-beta']).toBe('oauth-2025-04-20');
+    expect(h['x-api-key']).toBeUndefined();
   });
   it('returns null when there is no last text', async () => {
     const r = await judgeFollowup({ apiKey: 'sk-x', lastAssistantText: '' });

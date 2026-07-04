@@ -79,8 +79,13 @@ export interface JudgeInput {
       so the judge can sanity-check whether the agent's still pursuing it. */
   originalGoal?: string;
   /** Anthropic API key from the Mac's Keychain (providers.getLocalKey).
-      Missing key → caller falls back to regex. */
-  apiKey: string;
+      Optional — subscription sign-ins have no key and pass `oauthToken`. */
+  apiKey?: string;
+  /** Claude subscription OAuth token (env / ~/.claude/.credentials.json /
+      Keychain — see claude-usage.ts). Sent as `Authorization: Bearer` +
+      `anthropic-beta: oauth-2025-04-20`. Used when `apiKey` is absent;
+      NEITHER present → caller falls back to regex. */
+  oauthToken?: string;
   /** Override model — defaults to Claude Sonnet 4.6 per the operator's ask
       ("use sonet"). Kept overridable for unit tests + future re-tuning. */
   model?: string;
@@ -232,21 +237,29 @@ export function buildJudgeUserMessage(input: Pick<JudgeInput, 'lastAssistantText
     block. Uses AbortController to enforce a soft timeout so we don't
     block the engine's post-turn path forever. */
 export async function judgeFollowup(input: JudgeInput): Promise<JudgeResult | null> {
-  if (!input.apiKey || !input.lastAssistantText?.trim()) return null;
+  if ((!input.apiKey && !input.oauthToken) || !input.lastAssistantText?.trim()) return null;
   const fetcher = input.fetchImpl ?? globalThis.fetch;
   if (typeof fetcher !== 'function') return null;
   const model = input.model ?? DEFAULT_JUDGE_MODEL;
   const userMsg = buildJudgeUserMessage(input);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Math.max(1000, input.timeoutMs ?? 8000));
+  // Auth: raw API key when present; else the Claude subscription OAuth token
+  // (Bearer + oauth beta header — same shape as claude-usage.ts, verified
+  // working on /v1/messages). Same dual-auth as session-naming.ts.
+  const headers: Record<string, string> = {
+    'anthropic-version': '2023-06-01',
+    'content-type': 'application/json',
+  };
+  if (input.apiKey) headers['x-api-key'] = input.apiKey;
+  else {
+    headers.authorization = `Bearer ${input.oauthToken}`;
+    headers['anthropic-beta'] = 'oauth-2025-04-20';
+  }
   try {
     const res = await fetcher('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'x-api-key': input.apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
+      headers,
       // Tight budget: 320 output tokens is plenty for {verdict, reason, items}.
       // Adaptive thinking would be wasted on such a constrained decision.
       body: JSON.stringify({

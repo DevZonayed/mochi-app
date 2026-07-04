@@ -8,10 +8,11 @@
    remote controls. */
 
 import { app } from 'electron';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { BrowserSettings } from './browser/types.js';
+import type { DesignMode, DesignPhase, DesignFlow, DesignBrief } from './design-workflow.js';
 import { quietDeadline } from './whatsapp-quiet.js';
 import { WaStore, type WaChatMeta, type WaStoredMessage, type WaMessageInput, type WaChatKind } from './wa-store.js';
 import type { RemoteDevice } from './relay.js';
@@ -65,6 +66,19 @@ export interface Project {
       + mobile). Absent/false = visible. Toggled via updateProject; syncs like any
       other field on the updatedAt delta-sync. */
   hidden?: boolean;
+  /** Guided design workflow (design projects only). Absent → classic freeform
+      design canvas. 'raw' = from a PRD; 'redesign' = from an existing product. */
+  designMode?: DesignMode;
+  /** Where the guided workflow currently is (research → brand → choice →
+      design → complete). Advanced by the agent via the on-disk phase marker
+      (.maestro/design/state.json) which the engine syncs back post-turn. */
+  designPhase?: DesignPhase;
+  /** Chosen at the 'choice' gate: 'direct' (live-design now) or 'advanced'
+      (per-section imagery pipeline before assembly). */
+  designFlow?: DesignFlow;
+  /** The operator's creation-time inputs (PRD / existing url / inspirations /
+      resources / auto-answer preference). Sanitized at the API boundary. */
+  designBrief?: DesignBrief;
   createdAt: number;
   /** Set on create + bumped on every mutation (incl. reorder). Drives the
       relay's delta-sync filter (/api/sync?since=ts). */
@@ -823,9 +837,76 @@ const SEED_JOB_TITLE = 'Merge PR #482 — auth refactor';
 
 const ASSET_TINTS = ['#5b8cff', '#9b6bff', '#41c8d4', '#ff9f6b', '#6bd49a', '#ff6b9f'];
 
+/* ── Multi-writer durability ──────────────────────────────────────────────
+   The store is a single JSON file loaded once into memory; every mutation
+   rewrites the whole file. If a SECOND process (a second app instance, a
+   helper) also holds the store, a naive whole-file overwrite is
+   last-writer-wins — the newer process silently erases the other's rows
+   (this is how a freshly-created project + its chat sessions vanished). To
+   make persistence lossless without a heavyweight lock, `save()` detects that
+   the on-disk file changed since we last touched it and MERGES the foreign
+   copy into ours before writing: id-keyed collections take the union by id
+   (newest `updatedAt` wins), tombstones from both sides propagate deletes, and
+   per-key maps union their keys. So two writers CONVERGE instead of clobber.
+   In the normal single-writer case the stamp always matches and this costs
+   one `stat` — no reparse, behaviour identical to before. */
+
+/** id-keyed row collections that merge by id + newest-write-wins. */
+const MERGE_COLLECTIONS = [
+  'projects', 'jobs', 'sessions', 'approvals', 'schedules', 'browserWatches',
+  'skills', 'templates', 'assets', 'publishDrafts', 'publishLedger', 'briefs',
+  'researchRuns', 'events', 'chatBindings', 'pendingChats', 'commEvents',
+  'feedback', 'mcpServers',
+] as const;
+
+/** Per-key maps (Record<string, …>) that merge by unioning keys (ours wins on
+    a key collision — these are per-project/per-session and rarely contended). */
+const MERGE_RECORD_MAPS = [
+  'designComments', 'installedSkills', 'retryCounters', 'keepGoingCounters',
+  'providerKeys', 'waChats',
+] as const;
+
+/** The write timestamp used to pick a winner when two writers hold the same
+    row id: the newest write wins. Falls back through a row's known time fields. */
+function rowStamp(r: unknown): number {
+  if (!r || typeof r !== 'object') return 0;
+  const o = r as Record<string, unknown>;
+  for (const k of ['updatedAt', 'resolvedAt', 'createdAt', 'installedAt', 'ts', 'at'] as const) {
+    const v = o[k];
+    if (typeof v === 'number' && v > 0) return v;
+  }
+  return 0;
+}
+
+type Row = { id?: unknown };
+
+/** Union two versions of an id-keyed collection: keep every id from either
+    side, newest write wins on a shared id, and drop any id a tombstone deletes. */
+function mergeRows(mine: Row[], theirs: Row[], deletedAt: Map<string, number>): Row[] {
+  const byId = new Map<string, Row>();
+  const noId: Row[] = [];
+  for (const r of theirs) if (r && typeof r.id === 'string') byId.set(r.id, r);
+  for (const r of mine) {
+    if (!r || typeof r.id !== 'string') { noId.push(r); continue; }
+    const ex = byId.get(r.id);
+    if (!ex || rowStamp(r) >= rowStamp(ex)) byId.set(r.id, r);
+  }
+  const out: Row[] = [];
+  for (const r of byId.values()) {
+    const del = deletedAt.get(r.id as string);
+    if (del !== undefined && del >= rowStamp(r)) continue; // deleted after last write
+    out.push(r);
+  }
+  return [...out, ...noId];
+}
+
 export class Store {
   private file: string;
   private data!: StoreData;
+  /** `mtimeMs:size` of the store file as we last read/wrote it. A mismatch on
+      the next save means another process wrote concurrently → merge, don't
+      clobber. Null until the first successful read/write. */
+  private diskStamp: string | null = null;
   /** Full WhatsApp chat + message store (every chat, JSONL-backed). The
       monolithic `waChats` field is legacy — migrated into this on first load. */
   readonly wa: WaStore;
@@ -856,6 +937,8 @@ export class Store {
   private load(): void {
     try {
       this.data = JSON.parse(readFileSync(this.file, 'utf8')) as StoreData;
+      // Baseline for the multi-writer conflict check in save().
+      this.diskStamp = this.currentStamp();
       let dirty = false;
       // migrations for stores written by older builds (dirty-flag pattern)
       if (!this.data.accessToken) { this.data.accessToken = newPairingToken(); dirty = true; }
@@ -952,7 +1035,72 @@ export class Store {
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private save(): void {
     if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = null; }
-    try { writeFileSync(this.file, JSON.stringify(this.data, null, 2)); } catch { /* disk hiccup — retry next save */ }
+    try {
+      // Another process wrote since we last touched the file → absorb its rows
+      // first so our write can't erase them (lossless multi-writer convergence).
+      if (this.diskStamp !== null && this.currentStamp() !== this.diskStamp) {
+        this.absorbForeignWrites();
+      }
+      // Atomic write: serialize to a temp sibling, then rename over the target.
+      // A rename is atomic on the same filesystem, so a crash mid-write can
+      // never leave a half-written (unparseable) store, and no reader sees a
+      // torn file.
+      const tmp = `${this.file}.tmp-${process.pid}`;
+      writeFileSync(tmp, JSON.stringify(this.data, null, 2));
+      renameSync(tmp, this.file);
+      this.diskStamp = this.currentStamp();
+    } catch { /* disk hiccup — retry next save */ }
+  }
+
+  /** `mtimeMs:size` of the store file, or null if it isn't there yet. */
+  private currentStamp(): string | null {
+    try { const s = statSync(this.file); return `${s.mtimeMs}:${s.size}`; }
+    catch { return null; }
+  }
+
+  /** Read the current on-disk store and MERGE anything it has that we don't
+      (or that it wrote more recently) into our in-memory copy, so the write we
+      are about to do preserves the other writer's rows. Best-effort: an
+      unreadable/partial file just leaves our copy untouched. */
+  private absorbForeignWrites(): void {
+    let disk: StoreData;
+    try { disk = JSON.parse(readFileSync(this.file, 'utf8')) as StoreData; }
+    catch { return; }
+
+    // Union tombstones (both sides) so deletes propagate either direction.
+    const tomb = new Map<string, Tombstone>();
+    for (const t of disk.tombstones ?? []) tomb.set(`${t.kind}:${t.id}`, t);
+    for (const t of this.data.tombstones ?? []) {
+      const k = `${t.kind}:${t.id}`; const ex = tomb.get(k);
+      if (!ex || t.ts > ex.ts) tomb.set(k, t);
+    }
+    const tombstones = [...tomb.values()];
+    const deletedAt = new Map<string, number>(); // entity id → newest delete ts
+    for (const t of tombstones) {
+      const ex = deletedAt.get(t.id);
+      if (ex === undefined || t.ts > ex) deletedAt.set(t.id, t.ts);
+    }
+
+    const self = this.data as unknown as Record<string, unknown>;
+    const other = disk as unknown as Record<string, unknown>;
+    for (const key of MERGE_COLLECTIONS) {
+      const mine = self[key]; const theirs = other[key];
+      if (!Array.isArray(mine) && !Array.isArray(theirs)) continue;
+      self[key] = mergeRows(
+        (Array.isArray(mine) ? mine : []) as Row[],
+        (Array.isArray(theirs) ? theirs : []) as Row[],
+        deletedAt,
+      );
+    }
+    for (const key of MERGE_RECORD_MAPS) {
+      const theirs = other[key];
+      if (!theirs || typeof theirs !== 'object') continue;
+      const mine = (self[key] && typeof self[key] === 'object' ? self[key] : (self[key] = {})) as Record<string, unknown>;
+      for (const k of Object.keys(theirs as Record<string, unknown>)) {
+        if (!(k in mine)) mine[k] = (theirs as Record<string, unknown>)[k];
+      }
+    }
+    this.data.tombstones = tombstones.slice(-MAX_TOMBSTONES);
   }
   /** Debounced save for high-frequency live updates: at most one disk write per
       window; any direct save() flushes immediately and cancels the timer. */
@@ -1167,7 +1315,7 @@ export class Store {
     while (taken.has(`${wanted} v${n}`)) n++;
     return `${wanted} v${n}`;
   }
-  createProject(args: { name: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string; memorySlug?: string; memoryRepoUrl?: string }): Project {
+  createProject(args: { name: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string; memorySlug?: string; memoryRepoUrl?: string; designMode?: DesignMode; designPhase?: DesignPhase; designBrief?: DesignBrief }): Project {
     const ws = this.data.workspace ?? this.createWorkspace('My Workspace');
     const t = now();
     const p: Project = {
@@ -1175,12 +1323,13 @@ export class Store {
       template: args.template ?? 'claude-code', instructions: args.instructions ?? '', color: args.color ?? 'blue',
       kind: args.kind, path: args.path, repoUrl: args.repoUrl,
       memorySlug: args.memorySlug, memoryRepoUrl: args.memoryRepoUrl,
+      designMode: args.designMode, designPhase: args.designPhase, designBrief: args.designBrief,
       createdAt: t, updatedAt: t,
     };
     this.data.projects.push(p); this.save();
     return p;
   }
-  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden'>>): Project {
+  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden' | 'designMode' | 'designPhase' | 'designFlow' | 'designBrief'>>): Project {
     const cur = this.getProject(projectId);
     if (!cur) throw Object.assign(new Error('project not found'), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });

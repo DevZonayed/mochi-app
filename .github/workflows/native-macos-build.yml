@@ -1,4 +1,4 @@
-name: Build native WebKit macOS app
+name: Build Mochlet macOS app
 
 on:
   release:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing GitHub Release tag to attach assets to. Leave blank to cut a fresh maestro-webkit-v<version> release.
+        description: Existing GitHub Release tag to attach assets to. Leave blank to cut a fresh mochlet-v<version> release.
         required: false
         type: string
       publish_release:
@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build Maestro WebKit for macOS
+    name: Build Mochlet for macOS
     runs-on: macos-15
     env:
       MAESTRO_REQUIRE_EMBEDDED_NODE: "1"
@@ -53,6 +53,7 @@ jobs:
           version=""
           if [ -n "${RELEASE_TAG:-}" ]; then
             version="$RELEASE_TAG"
+            version="${version#mochlet-v}"
             version="${version#maestro-webkit-v}"
             version="${version#maestro-macos-v}"
             version="${version#maestro-native-v}"
@@ -104,13 +105,13 @@ jobs:
           mkdir -p dmg-root
 
           short_sha="${GITHUB_SHA::7}"
-          dmg="artifacts/Maestro-WebKit-macOS-${MAESTRO_VERSION}-${short_sha}.dmg"
-          app="MacOS/webview-app/dist/Maestro WebKit.app"
+          dmg="artifacts/Mochlet-macOS-${MAESTRO_VERSION}-${short_sha}.dmg"
+          app="MacOS/webview-app/dist/Mochlet.app"
 
           test -d "$app"
-          ditto "$app" "dmg-root/Maestro WebKit.app"
+          ditto "$app" "dmg-root/Mochlet.app"
           ln -s /Applications dmg-root/Applications
-          hdiutil create -volname "Maestro WebKit ${MAESTRO_VERSION}" -srcfolder dmg-root -ov -format UDZO "$dmg"
+          hdiutil create -volname "Mochlet ${MAESTRO_VERSION}" -srcfolder dmg-root -ov -format UDZO "$dmg"
           shasum -a 256 "$dmg" > "$dmg.sha256"
 
           echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
@@ -119,7 +120,7 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: Maestro-WebKit-macOS-${{ steps.version.outputs.version }}-${{ github.run_number }}
+          name: Mochlet-macOS-${{ steps.version.outputs.version }}-${{ github.run_number }}
           path: artifacts/*
           if-no-files-found: error
           retention-days: 30
@@ -135,7 +136,7 @@ jobs:
 
           # If GitHub already made the release (release: published trigger) reuse
           # its tag; otherwise cut a fresh tag from the resolved app version.
-          tag="${RELEASE_TAG:-maestro-webkit-v${MAESTRO_VERSION}}"
+          tag="${RELEASE_TAG:-mochlet-v${MAESTRO_VERSION}}"
 
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag exists — uploading assets."
@@ -144,7 +145,7 @@ jobs:
             echo "Creating release $tag at $GITHUB_SHA."
             gh release create "$tag" artifacts/* \
               --target "$GITHUB_SHA" \
-              --title "Maestro WebKit ${MAESTRO_VERSION}" \
+              --title "Mochlet ${MAESTRO_VERSION}" \
               --generate-notes \
               --latest
           fi
