@@ -8,7 +8,7 @@
    remote controls. */
 
 import { app } from 'electron';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync, openSync, writeSync, closeSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { BrowserSettings } from './browser/types.js';
@@ -880,6 +880,26 @@ function rowStamp(r: unknown): number {
 
 type Row = { id?: unknown };
 
+/* ── Cross-process write lock ──────────────────────────────────────────────
+   The merge in save() converges two writers only when their read-merge-write
+   runs to completion without another writer's rename landing in the middle.
+   Under real concurrency (the app + a sidecar + a smoke run all sharing one
+   `maestro-store.json`) two saves can interleave — writer B reads the file
+   BEFORE writer A's rename, then B's own rename clobbers A's just-written row,
+   which vanishes with no tombstone (this is how a freshly-created project was
+   lost). A short-lived advisory lockfile serializes the whole critical section
+   across processes so the merge can never be raced. If the lock can't be taken
+   in time we proceed anyway (best-effort — never wedge the app on a save). */
+const LOCK_STALE_MS = 10_000;   // a lock older than this is from a crashed writer → steal it
+const LOCK_TIMEOUT_MS = 3_000;  // give up waiting and save lockless after this
+const LOCK_SPIN_MS = 12;        // backoff between acquire attempts
+
+/** Block the current thread for `ms` without a busy-spin (save() is sync). */
+function sleepSync(ms: number): void {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, ms)); }
+  catch { /* SharedArrayBuffer unavailable — fall through, caller just retries hotter */ }
+}
+
 /** Union two versions of an id-keyed collection: keep every id from either
     side, newest write wins on a shared id, and drop any id a tombstone deletes. */
 function mergeRows(mine: Row[], theirs: Row[], deletedAt: Map<string, number>): Row[] {
@@ -1035,6 +1055,11 @@ export class Store {
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private save(): void {
     if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = null; }
+    // Serialize the read-merge-write across processes so a concurrent writer's
+    // rename can't land between our absorb and our own rename (which is how a
+    // just-created row was clobbered). Best-effort: null fd = we timed out and
+    // save lockless rather than wedge the app.
+    const fd = this.acquireLock();
     try {
       // Another process wrote since we last touched the file → absorb its rows
       // first so our write can't erase them (lossless multi-writer convergence).
@@ -1050,6 +1075,40 @@ export class Store {
       renameSync(tmp, this.file);
       this.diskStamp = this.currentStamp();
     } catch { /* disk hiccup — retry next save */ }
+    finally { if (fd !== null) this.releaseLock(fd); }
+  }
+
+  /** Path of the advisory lockfile guarding writes to the store. */
+  private get lockFile(): string { return `${this.file}.lock`; }
+
+  /** Take the cross-process write lock via an O_EXCL create (atomic on the same
+      filesystem). Retries with backoff until LOCK_TIMEOUT_MS, stealing a lock
+      that's older than LOCK_STALE_MS (its owner crashed). Returns the open fd,
+      or null if we gave up — the caller then saves lockless (unchanged legacy
+      behavior) so a stuck lock can never freeze persistence. */
+  private acquireLock(): number | null {
+    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    for (;;) {
+      try {
+        const fd = openSync(this.lockFile, 'wx'); // O_CREAT | O_EXCL | O_WRONLY
+        try { writeSync(fd, `${process.pid}:${Date.now()}`); } catch { /* diagnostic only */ }
+        return fd;
+      } catch {
+        // Lock is held. Reclaim it if the holder died mid-write (stale mtime).
+        try {
+          const st = statSync(this.lockFile);
+          if (Date.now() - st.mtimeMs > LOCK_STALE_MS) { try { unlinkSync(this.lockFile); } catch { /* raced */ } continue; }
+        } catch { continue; /* lock vanished between open and stat — retry immediately */ }
+        if (Date.now() >= deadline) return null;
+        sleepSync(LOCK_SPIN_MS);
+      }
+    }
+  }
+
+  /** Release the write lock: close the fd and remove the lockfile. */
+  private releaseLock(fd: number): void {
+    try { closeSync(fd); } catch { /* already closed */ }
+    try { unlinkSync(this.lockFile); } catch { /* already gone */ }
   }
 
   /** `mtimeMs:size` of the store file, or null if it isn't there yet. */
