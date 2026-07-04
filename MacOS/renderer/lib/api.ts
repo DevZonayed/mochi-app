@@ -49,7 +49,30 @@ export interface Project {
   order?: number;
   /** Reversible soft-hide: true → dropped from the default Projects view. */
   hidden?: boolean;
+  /** Guided design workflow (design projects only). Absent → classic canvas. */
+  designMode?: DesignMode;
+  /** Where the guided workflow currently is (advanced by the agent, synced
+      back by the brain after every turn). */
+  designPhase?: DesignPhase;
+  /** Chosen at the 'choice' gate: direct live-design vs the advanced
+      per-section imagery pipeline. */
+  designFlow?: DesignFlow;
+  /** The operator's creation-time inputs (PRD / urls / resources). */
+  designBrief?: DesignBrief;
   createdAt: number;
+}
+/* Guided design workflow (mirrors electron/design-workflow.ts — the renderer
+   can't import brain modules, so the small types are duplicated here). */
+export type DesignMode = 'raw' | 'redesign';
+export type DesignPhase = 'research' | 'brand' | 'choice' | 'design' | 'complete';
+export type DesignFlow = 'direct' | 'advanced';
+export interface DesignBrief {
+  prd?: string;
+  existingUrl?: string;
+  existingPath?: string;
+  inspirations?: string[];
+  resources?: string[];
+  autoAnswer?: boolean;
 }
 /** A branch usable as a base for a new chat (mirrors electron/git.ts). */
 export interface BranchInfo {
@@ -976,7 +999,7 @@ export const api = {
   // Projects
   listProjects: (workspaceId?: string) =>
     call<Project[]>('listProjects', { workspaceId }, () => req<Project[]>('/api/projects' + qp({ workspaceId }))),
-  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string; memorySlug?: string; memoryRepoUrl?: string }) =>
+  createProject: (input: { name: string; workspaceId?: string; template?: string; instructions?: string; color?: string; kind?: ProjectKind; path?: string; repoUrl?: string; memorySlug?: string; memoryRepoUrl?: string; designMode?: DesignMode; designBrief?: DesignBrief }) =>
     call<Project>('createProject', { ...input }, () =>
       req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(input) })),
   // openProject / closeProject: desktop-only lifecycle hooks for the dual-repo
@@ -990,7 +1013,7 @@ export const api = {
       'openProject', { id }, () => Promise.resolve({ ok: true, skipped: true as const, reason: 'remote' })),
   closeProject: (id: string) =>
     call<{ ok: boolean }>('closeProject', { id }, () => Promise.resolve({ ok: true })),
-  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden'>>) =>
+  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden' | 'designPhase' | 'designFlow'>>) =>
     call<Project>('updateProject', { id, ...patch }, () =>
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   reorderProjects: (ids: string[]) =>

@@ -17,12 +17,17 @@ function setup() {
   const project = s.createProject({ name: 'Proj' });
   const session = s.createSession(project.id, 'Chat');
   const run = vi.fn().mockResolvedValue(undefined);
-  const engine = { run } as unknown as LocalEngine;
+  // Overlap guard (image_hx5ow.png): answerQuestion now checks whether the asking
+  // turn is STILL live and steers into it instead of spawning a parallel run.
+  const isRunning = vi.fn().mockReturnValue(false);
+  const steer = vi.fn().mockResolvedValue({ steered: true });
+  const cancel = vi.fn().mockReturnValue(null);
+  const engine = { run, isRunning, steer, cancel } as unknown as LocalEngine;
   const emit = vi.fn();
   // media/research/publishing/telegram/whatsapp/providers aren't touched by these cases.
   const stub = {} as never;
   const dispatch = createDispatch(s, engine, stub, stub, stub, stub, stub, stub, emit);
-  return { s, project, session, run, emit, dispatch };
+  return { s, project, session, run, isRunning, steer, cancel, emit, dispatch };
 }
 
 /** Mirror what engine.armAskFollowup does after a turn ends on an unanswered ask. */
@@ -75,6 +80,40 @@ describe('question flow — answer/extend via real dispatch', () => {
     const armed = armAuto(s, project.id, session.id);
     s.updateSchedule(armed.id, { paused: true });
     await expect(dispatch('extendQuestion', { sessionId: session.id })).rejects.toThrow();
+  });
+
+  it('answerQuestion STEERS into a still-live asking turn instead of spawning a parallel run', async () => {
+    const { s, project, session, run, isRunning, steer, dispatch } = setup();
+    armAuto(s, project.id, session.id);
+    // The asking turn is still generating (the SDK dismissed the AskUserQuestion
+    // and the model kept thinking) — the reported overlap scenario.
+    const asking = s.createJob(project.id, 'build a portfolio', 'build a portfolio', undefined, session.id);
+    s.updateJob(asking.id, { status: 'running' });
+    isRunning.mockImplementation((id: string) => id === asking.id);
+
+    const jobsBefore = s.listJobs(undefined, session.id).length;
+    const out = await dispatch('answerQuestion', { sessionId: session.id, answer: 'Full multipage' }) as { id: string };
+
+    expect(steer).toHaveBeenCalledWith(asking.id, `${ANSWER_PREFIX} Full multipage`, { interrupt: false });
+    expect(out.id).toBe(asking.id);                                   // the LIVE turn is the answer's home
+    expect(run).not.toHaveBeenCalled();                               // NO second concurrent run
+    expect(s.listJobs(undefined, session.id).length).toBe(jobsBefore); // no extra job row
+    expect(s.listSchedules().some(x => x.kind === 'auto-answer')).toBe(false); // countdown still cancelled
+  });
+
+  it('answerQuestion cancels a live-but-unsteerable turn before running the answer (no overlap)', async () => {
+    const { s, project, session, run, isRunning, steer, cancel, dispatch } = setup();
+    const asking = s.createJob(project.id, 'ask', 'ask', undefined, session.id);
+    s.updateJob(asking.id, { status: 'running' });
+    isRunning.mockImplementation((id: string) => id === asking.id);
+    steer.mockResolvedValue({ steered: false }); // codex / plan-mode: no steer channel
+
+    const out = await dispatch('answerQuestion', { sessionId: session.id, answer: 'Option B' }) as { id: string; input: string };
+
+    expect(cancel).toHaveBeenCalledWith(asking.id);   // stale turn stopped first…
+    expect(out.id).not.toBe(asking.id);               // …then the answer runs as its own turn
+    expect(out.input).toBe(`${ANSWER_PREFIX} Option B`);
+    expect(run).toHaveBeenCalledTimes(1);
   });
 
   it('answerQuestion rejects an empty answer or unknown session', async () => {

@@ -638,6 +638,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private func loadWebApp(_ endpoint: SidecarEndpoint) {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
+        // The Design workspace's "Full screen" preview button calls
+        // element.requestFullscreen(); WKWebView keeps the Fullscreen API OFF
+        // unless this is opted in, which left that button silently dead.
+        if #available(macOS 12.3, *) {
+            config.preferences.isElementFullscreenEnabled = true
+        }
         let controller = WKUserContentController()
         controller.add(self, name: "maestroNative")
         controller.add(self, name: "maestroLog")

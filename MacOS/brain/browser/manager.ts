@@ -213,9 +213,14 @@ export class BrowserManager {
   protected liveFor(projectId: string): Live | undefined { return this.live.get(projectId); }
 
   async navigate(projectId: string, url: string): Promise<BrowserStatus> {
-    if (!this.live.has(projectId)) await this.open(projectId);
+    if (!this.live.has(projectId)) {
+      // Launch on demand — and PROPAGATE a failed launch instead of returning a
+      // bare closed status (which callers would misread as "opened").
+      const opened = await this.open(projectId);
+      if (!opened.open) throw new Error(opened.error ?? 'chrome-launch-failed: could not open a Chrome window for this project');
+    }
     const live = this.live.get(projectId);
-    if (!live) return this.status(projectId);
+    if (!live) throw new Error('browser not open for this project');
     live.net.length = 0; live.cons.length = 0; // network/console are "since navigation"
     await live.page.goto(url, { waitUntil: 'domcontentloaded' });
     return this.push(projectId);
@@ -255,6 +260,13 @@ export class BrowserManager {
   async call(projectId: string, type: string, params: Record<string, unknown> = {}, timeoutMs = 30000): Promise<unknown> {
     if (type === 'status') return this.status(projectId);
     if (type === 'navigate') { const s = await this.navigate(projectId, String(params.url)); return { url: s.url }; }
+    // Explicit launch: opens the per-project Chrome window if it isn't already
+    // (idempotent). Everything below this line requires a live window.
+    if (type === 'session_start') {
+      const s = await this.open(projectId, params.url ? { startUrl: String(params.url) } : undefined);
+      if (!s.open) throw new Error(s.error ?? 'chrome-launch-failed: could not open a Chrome window for this project');
+      return { ok: true, ...s };
+    }
     const l = this.requireLive(projectId);
     const page = l.page as any;
     switch (type) {
@@ -302,7 +314,6 @@ export class BrowserManager {
         return { ok: true };
       }
       // ── lifecycle / raw ────────────────────────────────────────
-      case 'session_start': return { ok: true, ...this.status(projectId) };
       case 'session_end': return { ok: true }; // per-project browser stays open
       case 'cdp': { const sess = await (l.ctx as any).newCDPSession(page); return { result: await sess.send(String(params.method), (params.params ?? {}) as object) }; }
       case 'download_url': return { dataUrl: await page.evaluate(`(async()=>{const r=await fetch(${JSON.stringify(String(params.url))});const b=await r.blob();return await new Promise(rs=>{const f=new FileReader();f.onload=()=>rs(f.result);f.readAsDataURL(b);});})()`) };

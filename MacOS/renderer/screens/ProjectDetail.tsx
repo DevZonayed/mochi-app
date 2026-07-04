@@ -2136,7 +2136,11 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
       blocks.push(<ThinkingNode key={`${keyPrefix}think${i}`} item={it} live={opts.caretAt === i} />);
       i++;
     } else if (it.kind === 'ask') {
-      blocks.push(<QuestionCard key={`${keyPrefix}q${i}`} ask={it.ask} onAnswer={opts.onAnswer ?? (() => {})} answered={!!opts.answered} pending={opts.pendingAsk ?? null} onExtend={opts.onExtendAsk} onCancel={opts.onCancelAsk} />);
+      // Answered in-place: when the asking turn was still LIVE, the answer is
+      // steered INTO the run (a 'steer' item after the card) instead of starting
+      // a new turn — freeze the card's options so it can't be answered twice.
+      const answeredInPlace = items.slice(i + 1).some(x => x.kind === 'steer' && x.text.startsWith('[User answered AskUserQuestion]'));
+      blocks.push(<QuestionCard key={`${keyPrefix}q${i}`} ask={it.ask} onAnswer={opts.onAnswer ?? (() => {})} answered={!!opts.answered || answeredInPlace} pending={answeredInPlace ? null : opts.pendingAsk ?? null} onExtend={opts.onExtendAsk} onCancel={opts.onCancelAsk} />);
       i++;
     } else if (it.kind === 'review') {
       blocks.push(<ReviewCard key={`${keyPrefix}rv${i}`} item={it} />);

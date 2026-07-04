@@ -3,9 +3,16 @@
    self-contained, live-previewable HTML artifact, refines it in place, pulls in
    generated imagery, and you can hand the result off to code. Left = the design
    conversation (the shared ChatThread, in design mode via the project's kind);
-   right = a live preview served over the maestro-design:// protocol. The split is
-   draggable (like the CodeSpace), the preview can go full-screen, and generated
-   images open in an in-place modal (there's no tab system on this surface). */
+   right = a live preview served by the sidecar's same-origin /design/<id>/ route
+   (the renderer itself is loaded from the sidecar, so a relative URL resolves).
+   The split is draggable (like the CodeSpace), the preview can go full-screen,
+   and generated images open in an in-place modal (no tab system here).
+
+   Designs can be created in three ways: a classic blank canvas, or one of the
+   two guided workflows — "Raw design" (from a PRD) and "Redesign" (from an
+   existing product + inspiration links). Guided projects move through phases
+   (Research → Brand → Choose → Design → Ready) surfaced as a progress bar, with
+   a Direct-vs-Advanced flow gate the operator answers right on the canvas. */
 
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -13,7 +20,7 @@ import { AppShell } from '../lib/appShell';
 import { Icon } from '../lib/icons';
 import { Switch } from '../lib/ui';
 import { ImageViewer } from '../lib/CodeView';
-import { api, IS_LOCAL, type Project, type ChatSession, type DesignComment, type InstalledSkill, type RegistrySkillSummary } from '../lib/api';
+import { api, IS_LOCAL, type Project, type ChatSession, type DesignComment, type InstalledSkill, type RegistrySkillSummary, type DesignMode, type DesignPhase, type DesignFlow, type DesignBrief } from '../lib/api';
 import { ChatThread } from './ProjectDetail';
 import { displayCodename } from '../lib/git-types';
 import { SessionActivityDot } from './SessionStateDot';
@@ -78,6 +85,21 @@ const DS_SCROLL_CSS = `
 .ds-sess-x:hover { color: var(--red, #e5484d) !important; }
 `;
 
+/* Guided-workflow presentation: the five phases as a progress bar. Mirrors
+   electron/design-workflow.ts (renderer can't import brain modules). */
+const PHASES: { key: DesignPhase; label: string }[] = [
+  { key: 'research', label: 'Research' },
+  { key: 'brand', label: 'Brand' },
+  { key: 'choice', label: 'Choose' },
+  { key: 'design', label: 'Design' },
+  { key: 'complete', label: 'Ready' },
+];
+const MODE_CARDS: { key: 'classic' | DesignMode; label: string; hint: string; icon: 'brush' | 'file' | 'globe' }[] = [
+  { key: 'classic', label: 'Blank canvas', hint: 'Describe it in chat — the agent designs live', icon: 'brush' },
+  { key: 'raw', label: 'Raw design', hint: 'From a PRD — deep research, Q&A, brand, then design', icon: 'file' },
+  { key: 'redesign', label: 'Redesign', hint: 'From an existing product + inspiration sites', icon: 'globe' },
+];
+
 /** Compact relative timestamp for the session pills (now / 5m / 3h / 2d / 1w). */
 function relTime(ts: number): string {
   const s = Math.floor((Date.now() - ts) / 1000);
@@ -98,6 +120,12 @@ export default function DesignWorkspace() {
   const [device, setDevice] = React.useState('desktop');
   const [creating, setCreating] = React.useState(false);
   const [newName, setNewName] = React.useState('');
+  // Guided-workflow creation inputs (the "New design" sheet).
+  const [newMode, setNewMode] = React.useState<'classic' | DesignMode>('classic');
+  const [newPath, setNewPath] = React.useState<string | null>(null);
+  const [nb, setNb] = React.useState({ prd: '', existingUrl: '', existingPath: '', inspirations: '', autoAnswer: false });
+  const [creatingBusy, setCreatingBusy] = React.useState(false);
+  const [choosing, setChoosing] = React.useState(false); // Direct/Advanced pick in flight
   const [snap, setSnap] = React.useState<string | null>(null); // last snapshot result (toast)
   const [running, setRunning] = React.useState(false);  // a run is in flight for the active design
   const [fsActive, setFsActive] = React.useState(false); // preview is in real full-screen
@@ -148,6 +176,16 @@ export default function DesignWorkspace() {
     return () => { on = false; };
   }, [activeId]);
 
+  // Keep projects live — the brain emits 'project' when the agent advances a
+  // guided workflow's phase (marker sync), so the phase bar + choice gate
+  // update without a manual refresh.
+  React.useEffect(() => {
+    const unsub = api.subscribe({ onProject: (p) => {
+      setProjects(ps => ps.some(x => x.id === p.id) ? ps.map(x => x.id === p.id ? p : x) : (p.kind === 'design' ? [...ps, p] : ps));
+    } });
+    return () => unsub();
+  }, []);
+
   // Keep the session strip live (new/renamed/deleted sessions from any surface).
   React.useEffect(() => {
     if (!activeId) return;
@@ -196,12 +234,72 @@ export default function DesignWorkspace() {
     return () => document.removeEventListener('fullscreenchange', onFs);
   }, []);
 
+  const resetCreateSheet = () => {
+    setCreating(false); setNewName(''); setNewMode('classic'); setNewPath(null);
+    setNb({ prd: '', existingUrl: '', existingPath: '', inspirations: '', autoAnswer: false });
+  };
   const createDesign = async (presetName?: string) => {
+    if (creatingBusy) return;
     const name = (presetName || newName).trim() || `Design ${designProjects.length + 1}`;
+    const mode: 'classic' | DesignMode = presetName ? 'classic' : newMode;
+    setCreatingBusy(true);
     try {
-      const p = await api.createProject({ name, kind: 'design', template: 'design', color: 'purple' });
-      setProjects(ps => [...ps, p]); setActiveId(p.id); setSessionId(null); setCreating(false); setNewName('');
+      const designMode = mode === 'classic' ? undefined : mode;
+      const brief: DesignBrief | undefined = designMode ? {
+        ...(nb.prd.trim() ? { prd: nb.prd.trim() } : {}),
+        ...(nb.existingUrl.trim() ? { existingUrl: nb.existingUrl.trim() } : {}),
+        ...(nb.existingPath.trim() ? { existingPath: nb.existingPath.trim() } : {}),
+        ...(nb.inspirations.trim() ? { inspirations: nb.inspirations.split(/[\n,]+/).map(s => s.trim()).filter(Boolean) } : {}),
+        ...(nb.autoAnswer ? { autoAnswer: true } : {}),
+      } : undefined;
+      const p = await api.createProject({
+        name, kind: 'design', template: 'design', color: 'purple',
+        ...(newPath ? { path: newPath } : {}),
+        ...(designMode ? { designMode, designBrief: brief } : {}),
+      });
+      setProjects(ps => [...ps, p]); setActiveId(p.id); setSessionId(null);
+      // The project exists — close the sheet NOW so a kickoff hiccup can't
+      // leave it open and mint a duplicate on a second Create click.
+      const autoAnswer = nb.autoAnswer;
+      resetCreateSheet();
+      // Guided workflow: kick off the research phase immediately (browser on —
+      // the research/brand phases are browser-first).
+      if (designMode) {
+        try {
+          const kickoff = designMode === 'raw'
+            ? `Start the research phase for this design project.${autoAnswer
+              ? ' Research the brief deeply, answer your own open questions with clearly-reasoned choices, and give me the full answer sheet to review before moving on.'
+              : ' Research the brief deeply and ask me every open question you need answered — one at a time — before moving on.'}`
+            : 'Start the research phase for this redesign project. Audit the existing product and every inspiration link from the brief in the real browser — screenshots, content, palette, competitors — then walk me through what you found.';
+          const resp = await api.sendChat({ projectId: p.id, text: kickoff, browser: true });
+          setSessions(ss => ss.some(x => x.id === resp.session.id) ? ss : [resp.session, ...ss]);
+          setSessionId(resp.session.id);
+        } catch { /* kickoff failed — the operator can just send a message */ }
+      }
     } catch { /* surfaced by the empty state */ }
+    setCreatingBusy(false);
+  };
+  // The Direct-vs-Advanced gate: persist the choice (which also mirrors it into
+  // the on-disk marker for the agent) and immediately start the design phase.
+  const chooseFlow = async (flow: DesignFlow) => {
+    if (!active || choosing) return;
+    setChoosing(true);
+    try {
+      const p = await api.updateProject(active.id, { designFlow: flow, designPhase: 'design' });
+      setProjects(ps => ps.map(x => x.id === p.id ? p : x));
+      const msg = flow === 'direct'
+        ? 'I choose the direct flow. Begin the design phase now — build the complete design from the research and brand foundations.'
+        : 'I choose the advanced flow. Begin the design phase now — classify every page and section first, then work through the full per-section pipeline.';
+      const resp = await api.sendChat({ projectId: active.id, text: msg, sessionId: sessionId ?? undefined });
+      if (resp.session.id !== sessionId) {
+        setSessions(ss => ss.some(x => x.id === resp.session.id) ? ss : [resp.session, ...ss]);
+        setSessionId(resp.session.id);
+      }
+    } catch { /* the chat surfaces send errors */ }
+    setChoosing(false);
+  };
+  const pickFolderInto = async (set: (path: string) => void) => {
+    try { const r = await api.pickFolder(); if (r?.path) set(r.path); } catch { /* cancelled */ }
   };
   const removeSession = async (id: string) => {
     setSessions(ss => ss.filter(x => x.id !== id));
@@ -349,7 +447,11 @@ export default function DesignWorkspace() {
     setSending(false);
   };
 
-  const previewUrl = active ? `maestro-design://${active.id}/design/index.html?t=${nonce}` : '';
+  // Same-origin sidecar route (the renderer is served BY the sidecar, so a
+  // relative URL resolves; the old maestro-design:// custom protocol only
+  // existed in the retired Electron shell and macOS shows a "no application
+  // set to open the URL" dialog for it).
+  const previewUrl = active ? `/design/${active.id}/design/index.html?t=${nonce}` : '';
   const dev = DEVICES.find(d => d.key === device) ?? DEVICES[0];
 
   return (
@@ -372,17 +474,9 @@ export default function DesignWorkspace() {
             })}
           </div>
           <div style={{ padding: 10, borderTop: '0.5px solid var(--separator)' }}>
-            {creating ? (
-              <div style={{ display: 'flex', gap: 6 }}>
-                <input autoFocus value={newName} onChange={e => setNewName(e.target.value)} placeholder="Design name…" onKeyDown={e => { if (e.key === 'Enter') void createDesign(); if (e.key === 'Escape') setCreating(false); }}
-                  style={{ flex: 1, minWidth: 0, height: 30, padding: '0 9px', borderRadius: 8, border: '1px solid var(--blue)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none' }} />
-                <button onClick={() => void createDesign()} style={{ height: 30, padding: '0 10px', borderRadius: 8, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Add</button>
-              </div>
-            ) : (
-              <button onClick={() => setCreating(true)} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, width: '100%', height: 34, borderRadius: 9, border: '1px dashed var(--separator-strong, var(--separator))', color: 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
-                <Icon name="plus" size={14} /> New design
-              </button>
-            )}
+            <button onClick={() => setCreating(true)} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, width: '100%', height: 34, borderRadius: 9, border: '1px dashed var(--separator-strong, var(--separator))', color: 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>
+              <Icon name="plus" size={14} /> New design
+            </button>
           </div>
         </aside>
 
@@ -435,6 +529,33 @@ export default function DesignWorkspace() {
                   );
                 })}
               </div>
+              {/* guided-workflow progress — Research → Brand → Choose → Design → Ready */}
+              {active.designMode && (() => {
+                const cur = active.designPhase ?? 'research';
+                const curIdx = PHASES.findIndex(x => x.key === cur);
+                return (
+                  <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 4, padding: '7px 12px', borderBottom: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
+                    <span title={active.designMode === 'raw' ? 'Raw design — from your PRD' : 'Redesign — from an existing product'} style={{ flexShrink: 0, height: 18, padding: '0 7px', borderRadius: 'var(--r-pill)', background: 'color-mix(in srgb, var(--purple, #a855f7) 16%, transparent)', color: 'var(--purple, #a855f7)', font: '700 10px/18px var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase' }}>{active.designMode === 'raw' ? 'Raw' : 'Redesign'}</span>
+                    <span style={{ width: 4 }} />
+                    {PHASES.map((ph, i) => {
+                      const state = i < curIdx ? 'done' : i === curIdx ? 'now' : 'todo';
+                      return (
+                        <React.Fragment key={ph.key}>
+                          {i > 0 && <span style={{ width: 10, height: 1.5, flexShrink: 0, background: i <= curIdx ? 'var(--blue)' : 'var(--separator)' }} />}
+                          <span style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 4, height: 20, padding: '0 8px', borderRadius: 'var(--r-pill)',
+                            background: state === 'now' ? 'var(--blue)' : state === 'done' ? 'color-mix(in srgb, var(--blue) 14%, transparent)' : 'transparent',
+                            border: state === 'todo' ? '0.5px solid var(--separator)' : 'none',
+                            color: state === 'now' ? '#fff' : state === 'done' ? 'var(--blue)' : 'var(--ink-tertiary)',
+                            font: `${state === 'now' ? 700 : 600} 10.5px/1 var(--font-text)` }}>
+                            {state === 'done' && <Icon name="check" size={9} />}{ph.label}
+                          </span>
+                        </React.Fragment>
+                      );
+                    })}
+                    {active.designFlow && <span style={{ marginLeft: 'auto', flexShrink: 0, font: '600 10px/1 var(--font-mono)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>{active.designFlow}</span>}
+                  </div>
+                );
+              })()}
               <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
                 <ChatThread key={active.id + ':' + (sessionId ?? 'new')} flush autoFocus projectId={active.id} project={active}
                   sessionId={sessionId} onSessionCreated={(s) => { setSessions(ss => ss.some(x => x.id === s.id) ? ss : [s, ...ss]); setSessionId(s.id); }}
@@ -481,6 +602,30 @@ export default function DesignWorkspace() {
                   sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
                   style={{ width: dev.w ? Math.min(dev.w, 1400) : '100%', height: '100%', minHeight: dev.w ? 700 : '100%', border: dev.w ? '0.5px solid var(--separator)' : 'none', borderRadius: dev.w ? 12 : 0, background: '#fff', boxShadow: dev.w ? 'var(--card-shadow)' : 'none' }} />
               </div>
+
+              {/* guided-workflow gate — research + brand are done; pick how to design */}
+              {active.designMode && (active.designPhase ?? 'research') === 'choice' && (
+                <div style={{ position: 'absolute', left: 0, right: 0, top: 46, bottom: 0, zIndex: 35, display: 'grid', placeItems: 'center', padding: 24, background: 'color-mix(in srgb, var(--bg) 62%, transparent)', backdropFilter: 'blur(7px)' }}>
+                  <div style={{ width: 'min(560px, 100%)', borderRadius: 18, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 24px 80px rgba(0,0,0,0.35)', padding: '22px 22px 18px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+                      <div style={{ width: 30, height: 30, borderRadius: 9, background: 'linear-gradient(135deg, var(--blue), var(--purple, #a855f7))', display: 'grid', placeItems: 'center', flexShrink: 0 }}><Icon name="spark" size={15} style={{ color: '#fff' }} /></div>
+                      <div style={{ font: '700 var(--fs-headline)/1.2 var(--font-display)', color: 'var(--ink)' }}>Research & brand are ready — how should we design?</div>
+                    </div>
+                    <div style={{ font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-secondary)', margin: '0 0 14px 40px' }}>The brand board is live in the preview behind this card. Both paths use everything gathered so far.</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                      <button onClick={() => void chooseFlow('direct')} disabled={choosing} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 5, padding: '14px 14px 12px', borderRadius: 13, border: '0.5px solid var(--separator)', background: 'var(--surface)', color: 'var(--ink)', cursor: choosing ? 'default' : 'pointer', textAlign: 'left', opacity: choosing ? 0.65 : 1 }}>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 7, font: '700 var(--fs-subhead)/1 var(--font-text)' }}><Icon name="bolt" size={15} style={{ color: 'var(--blue)' }} /> Direct design</span>
+                        <span style={{ font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>Start designing live right now — fastest path to a complete design on the canvas.</span>
+                      </button>
+                      <button onClick={() => void chooseFlow('advanced')} disabled={choosing} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 5, padding: '14px 14px 12px', borderRadius: 13, border: '0.5px solid var(--separator)', background: 'var(--surface)', color: 'var(--ink)', cursor: choosing ? 'default' : 'pointer', textAlign: 'left', opacity: choosing ? 0.65 : 1 }}>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 7, font: '700 var(--fs-subhead)/1 var(--font-text)' }}><Icon name="layers" size={15} style={{ color: 'var(--purple, #a855f7)' }} /> Advanced design</span>
+                        <span style={{ font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>Every page and section gets its own crafted visual pass with versioned regeneration — deeper, slower, premium result.</span>
+                      </button>
+                    </div>
+                    {choosing && <div style={{ marginTop: 12, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--blue)', textAlign: 'center' }}>Starting the design phase…</div>}
+                  </div>
+                </div>
+              )}
 
               {/* note composer — appears when an element is picked in comment mode */}
               {pick && (
@@ -551,6 +696,91 @@ export default function DesignWorkspace() {
           <div onClick={e => e.stopPropagation()} style={{ position: 'relative', width: 'min(1100px, 92vw)', height: 'min(86vh, 900px)', display: 'flex', flexDirection: 'column', borderRadius: 16, overflow: 'hidden', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 24px 80px rgba(0,0,0,0.45)' }}>
             <ImageViewer assetId={modalImg.assetId} name={modalImg.name} imagePath={modalImg.imagePath} />
             <button onClick={() => setModalImg(null)} title="Close" className="tb-icon" style={{ position: 'absolute', top: 8, right: 8, width: 32, height: 32, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', cursor: 'pointer' }}><Icon name="x" size={16} /></button>
+          </div>
+        </div>
+      )}
+
+      {/* new-design sheet — name + mode (blank / raw / redesign) + per-mode inputs */}
+      {creating && (
+        <div onClick={() => !creatingBusy && resetCreateSheet()} style={{ position: 'fixed', inset: 0, zIndex: 2100, background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(4px)', display: 'grid', placeItems: 'center', padding: '5vh 5vw' }}>
+          <div onClick={e => e.stopPropagation()} className="ds-scroll" style={{ width: 'min(560px, 94vw)', maxHeight: '90vh', overflow: 'auto', display: 'flex', flexDirection: 'column', borderRadius: 18, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: '0 24px 80px rgba(0,0,0,0.45)' }}>
+            <div style={{ padding: '18px 20px 4px', display: 'flex', alignItems: 'flex-start', gap: 11 }}>
+              <div style={{ width: 30, height: 30, flexShrink: 0, borderRadius: 9, background: 'linear-gradient(135deg, var(--blue), var(--purple, #a855f7))', display: 'grid', placeItems: 'center' }}><Icon name="brush" size={15} style={{ color: '#fff' }} /></div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ font: '700 var(--fs-headline)/1.2 var(--font-display)', color: 'var(--ink)' }}>New design</div>
+                <div style={{ font: '400 var(--fs-caption)/1.45 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Pick how this design starts — jump straight onto the canvas, or let the agent research and build a brand first.</div>
+              </div>
+            </div>
+            <div style={{ padding: '14px 20px', display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <HoField label="Name">
+                <input autoFocus value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. Atlas landing page"
+                  onKeyDown={e => { if (e.key === 'Escape' && !creatingBusy) resetCreateSheet(); }}
+                  style={{ width: '100%', height: 34, padding: '0 11px', borderRadius: 9, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none', boxSizing: 'border-box' }} />
+              </HoField>
+              <HoField label="Start from">
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+                  {MODE_CARDS.map(m => {
+                    const on = newMode === m.key;
+                    return (
+                      <button key={m.key} onClick={() => setNewMode(m.key)} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4, minHeight: 74, padding: '10px 11px', borderRadius: 11, border: on ? 'none' : '0.5px solid var(--separator)', background: on ? 'var(--blue)' : 'var(--surface)', color: on ? '#fff' : 'var(--ink)', cursor: 'pointer', textAlign: 'left' }}>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 6, font: '600 var(--fs-footnote)/1 var(--font-text)' }}><Icon name={m.icon} size={13} /> {m.label}</span>
+                        <span style={{ font: '400 var(--fs-caption)/1.35 var(--font-text)', color: on ? 'rgba(255,255,255,.8)' : 'var(--ink-tertiary)' }}>{m.hint}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </HoField>
+              {newMode === 'raw' && (
+                <>
+                  <HoField label="Project requirements (PRD)">
+                    <textarea value={nb.prd} onChange={e => setNb(b => ({ ...b, prd: e.target.value }))} placeholder="Paste your PRD or describe the product in detail — audience, features, tone, must-haves…"
+                      style={{ width: '100%', minHeight: 120, resize: 'vertical', padding: '9px 11px', borderRadius: 10, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1.45 var(--font-text)', outline: 'none', boxSizing: 'border-box' }} />
+                  </HoField>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderRadius: 10, background: 'var(--surface)', border: '0.5px solid var(--separator)' }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ font: '600 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink)' }}>Agent answers its own questions</div>
+                      <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>Instead of asking you each open question, the agent decides — you review the answer sheet before it continues.</div>
+                    </div>
+                    <Switch on={nb.autoAnswer} onChange={() => setNb(b => ({ ...b, autoAnswer: !b.autoAnswer }))} />
+                  </div>
+                </>
+              )}
+              {newMode === 'redesign' && (
+                <>
+                  <HoField label="Existing product URL">
+                    <input value={nb.existingUrl} onChange={e => setNb(b => ({ ...b, existingUrl: e.target.value }))} placeholder="https://your-current-app.com"
+                      style={{ width: '100%', height: 34, padding: '0 11px', borderRadius: 9, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none', boxSizing: 'border-box' }} />
+                  </HoField>
+                  <HoField label="Existing project folder (optional)">
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <input value={nb.existingPath} onChange={e => setNb(b => ({ ...b, existingPath: e.target.value }))} placeholder="Local source of the current product"
+                        style={{ flex: 1, minWidth: 0, height: 34, padding: '0 11px', borderRadius: 9, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1 var(--font-text)', outline: 'none' }} />
+                      {IS_LOCAL && <button onClick={() => void pickFolderInto(pth => setNb(b => ({ ...b, existingPath: pth })))} style={{ height: 34, padding: '0 12px', borderRadius: 9, border: '0.5px solid var(--separator)', background: 'var(--surface)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Choose…</button>}
+                    </div>
+                  </HoField>
+                  <HoField label="Inspiration & competitor sites">
+                    <textarea value={nb.inspirations} onChange={e => setNb(b => ({ ...b, inspirations: e.target.value }))} placeholder={'One URL per line — sites you love, direct competitors…'}
+                      style={{ width: '100%', minHeight: 72, resize: 'vertical', padding: '9px 11px', borderRadius: 10, border: '1px solid var(--separator)', background: 'var(--bg)', color: 'var(--ink)', font: '400 var(--fs-footnote)/1.45 var(--font-text)', outline: 'none', boxSizing: 'border-box' }} />
+                  </HoField>
+                </>
+              )}
+              {newMode !== 'classic' && (
+                <HoField label="Save in folder (optional)">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1.3 var(--font-mono)', color: newPath ? 'var(--ink)' : 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{newPath ?? 'Auto — a new folder under ~/Maestro'}</span>
+                    {IS_LOCAL && <button onClick={() => void pickFolderInto(setNewPath)} style={{ height: 30, padding: '0 12px', borderRadius: 8, border: '0.5px solid var(--separator)', background: 'var(--surface)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Choose…</button>}
+                    {newPath && <button onClick={() => setNewPath(null)} className="tb-icon" style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}><Icon name="x" size={13} /></button>}
+                  </div>
+                </HoField>
+              )}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '6px 20px 18px' }}>
+              <button onClick={() => resetCreateSheet()} disabled={creatingBusy} style={{ height: 36, padding: '0 16px', borderRadius: 10, background: 'transparent', color: 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Cancel</button>
+              <button onClick={() => void createDesign()} disabled={creatingBusy || (newMode === 'raw' && !nb.prd.trim()) || (newMode === 'redesign' && !nb.existingUrl.trim() && !nb.existingPath.trim())}
+                style={{ display: 'flex', alignItems: 'center', gap: 7, height: 36, padding: '0 16px', borderRadius: 10, border: 'none', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: creatingBusy ? 'default' : 'pointer', opacity: creatingBusy || (newMode === 'raw' && !nb.prd.trim()) || (newMode === 'redesign' && !nb.existingUrl.trim() && !nb.existingPath.trim()) ? 0.6 : 1 }}>
+                <Icon name="brush" size={14} /> {creatingBusy ? (newMode === 'classic' ? 'Creating…' : 'Creating & starting research…') : 'Create design'}
+              </button>
+            </div>
           </div>
         </div>
       )}

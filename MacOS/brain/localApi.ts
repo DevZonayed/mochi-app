@@ -36,7 +36,8 @@ import { saveAttachment, substitutePlaceholders } from './attachments.js';
 import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
 import { nativeSkillSummaries } from './native-skills.js';
 import { scanConversations, parseConversation, type ConvSource } from './conversation-sync.js';
-import { existsSync, mkdirSync, cpSync, readdirSync, statSync, realpathSync, promises as fsp } from 'node:fs';
+import { sanitizeDesignBrief, serializeWorkflowMarker, WORKFLOW_MARKER_REL, type DesignFlow, type DesignPhase } from './design-workflow.js';
+import { existsSync, mkdirSync, cpSync, readdirSync, statSync, realpathSync, writeFileSync, promises as fsp } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -486,6 +487,18 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           projPath = nodePath.join(homedir(), 'Maestro', `${safe}-${Math.random().toString(36).slice(2, 8)}`);
           try { mkdirSync(nodePath.join(projPath, 'design'), { recursive: true }); } catch { /* best effort */ }
         }
+        // Guided design workflow: mode picked at creation → project starts in
+        // the research phase with a sanitized brief + on-disk phase marker.
+        const designMode = kind === 'design' && (p.designMode === 'raw' || p.designMode === 'redesign') ? p.designMode : undefined;
+        const designBrief = designMode ? sanitizeDesignBrief(p.designBrief) : undefined;
+        if (designMode && projPath) {
+          try {
+            mkdirSync(nodePath.join(projPath, 'research'), { recursive: true });
+            const marker = nodePath.join(projPath, WORKFLOW_MARKER_REL);
+            mkdirSync(nodePath.dirname(marker), { recursive: true });
+            writeFileSync(marker, serializeWorkflowMarker({ phase: 'research' }));
+          } catch { /* best effort — the agent recreates these on first run */ }
+        }
         const proj = store.createProject({
           name: p.name as string, template: p.template as string | undefined, instructions: p.instructions as string | undefined,
           color: p.color as string | undefined, kind,
@@ -496,6 +509,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           // find the memory clone.
           memorySlug: typeof p.memorySlug === 'string' && p.memorySlug ? p.memorySlug : undefined,
           memoryRepoUrl: typeof p.memoryRepoUrl === 'string' && p.memoryRepoUrl ? p.memoryRepoUrl : undefined,
+          designMode, designPhase: designMode ? 'research' : undefined, designBrief,
         });
         // If the project points at an existing repo on disk, wire the
         // trailer-stripping hook + align commit identity to the gh user.
@@ -547,8 +561,26 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (p.runMode === 'concurrent' || p.runMode === 'nonconcurrent') patch.runMode = p.runMode;
         // Reversible soft-hide from the Projects view.
         if (typeof p.hidden === 'boolean') patch.hidden = p.hidden;
+        // Guided design workflow: the operator's flow choice + phase moves
+        // (e.g. the Direct/Advanced pick at the 'choice' gate). Only workflow
+        // design projects accept these — a stray phase patch must never plant
+        // a .maestro/design marker inside e.g. a coding repo.
+        const target = store.getProject(String(p.id ?? ''));
+        if (target?.designMode === 'raw' || target?.designMode === 'redesign') {
+          if (p.designFlow === 'direct' || p.designFlow === 'advanced') patch.designFlow = p.designFlow as DesignFlow;
+          if (p.designPhase === 'research' || p.designPhase === 'brand' || p.designPhase === 'choice' || p.designPhase === 'design' || p.designPhase === 'complete') patch.designPhase = p.designPhase as DesignPhase;
+        }
         if (Object.keys(patch).length === 0) bad('no valid project fields');
         const proj = store.updateProject(String(p.id ?? ''), patch);
+        // Mirror phase/flow moves into the on-disk marker so the agent's next
+        // turn sees the operator's choice (the marker is the shared channel).
+        if ((patch.designPhase || patch.designFlow) && proj.path) {
+          try {
+            const marker = nodePath.join(proj.path, WORKFLOW_MARKER_REL);
+            mkdirSync(nodePath.dirname(marker), { recursive: true });
+            writeFileSync(marker, serializeWorkflowMarker({ phase: proj.designPhase ?? 'research', flow: proj.designFlow }));
+          } catch { /* best effort */ }
+        }
         emit('project', proj);
         return proj;
       }
@@ -906,6 +938,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
               kind: b.kind,
               text: b.text,
               ...(b.name ? { name: b.name } : {}),
+              ...(b.cmd ? { cmd: b.cmd } : {}),
               ...(b.kind === 'tool' ? { toolStatus: 'done' as const } : {}),
               ts: b.ts || t.createdAt,
             })),
@@ -1255,6 +1288,23 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           if (s.kind === 'auto-answer' && s.sessionId === sessionId) { store.deleteSchedule(s.id); emit('schedule', { id: s.id, deleted: true }); }
         }
         const text = answerMessage(answer);
+        // THE OVERLAP FIX (image_hx5ow.png): the SDK "dismisses" AskUserQuestion and
+        // the asking turn often KEEPS RUNNING (thinking/wrap-up) while the card is
+        // already on screen. Unconditionally spawning a fresh engine.run here put TWO
+        // live turns on one session — the answer bubble was immediately followed by a
+        // second "thinking…" turn racing the first (Design + CodeSpace both, since
+        // both use this RPC via the shared ChatThread). If the asking turn is still
+        // live, STEER the answer into it (queue-steer: same subprocess, delivered at
+        // the next boundary, no lost work) instead of launching a parallel run.
+        const liveJob = store.listJobs(undefined, sessionId).find(j => engine.isRunning(j.id));
+        if (liveJob) {
+          const { steered } = await engine.steer(liveJob.id, text, { interrupt: false });
+          if (steered) return store.getJob(liveJob.id) ?? liveJob;
+          // Live but not steerable (codex / plan-mode / non-chat run): cancel the
+          // stale asking turn so the answer below can't race it. Cancel-and-reseed
+          // is the pre-steer behaviour — correct, just less seamless.
+          if (engine.isRunning(liveJob.id)) engine.cancel(liveJob.id);
+        }
         const job = store.createJob(session.projectId, text, text.slice(0, 60), undefined, session.id);
         emit('job', job);
         const opts = session.primary ? { engine: session.primary.engine, model: session.primary.model, reviewer: session.reviewer } : {};

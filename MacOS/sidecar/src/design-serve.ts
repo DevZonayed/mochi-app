@@ -35,12 +35,20 @@ html{scroll-behavior:smooth}
 ::-webkit-scrollbar-thumb:hover{background:rgba(140,142,152,.72);background-clip:padding-box}
 `;
 
-// Mochi-style comment harness, WKWebView-adapted: page→Swift via webkit.messageHandlers.maestroDesign,
-// Swift→page via a dispatched 'message' event (window.dispatchEvent(new MessageEvent('message',{data}))).
+// Mochi-style comment harness. The preview is an <iframe> inside the React renderer,
+// so element picks go BACK to the parent frame via window.parent.postMessage carrying
+// the __maestroDesign flag the renderer's 'message' listener requires (a native
+// webkit.messageHandlers.maestroDesign handler is kept only as a fallback for a future
+// standalone WKWebView pane — it is NOT registered by the Swift shell today).
+// Parent→page direction is plain postMessage ({ __maestro:true, type:'comment-mode'|'comment-markers'|'flash' }).
 const DESIGN_COMMENT_HARNESS = `(function(){
   if (window.__maestroComments) return; window.__maestroComments = true;
   var mh=(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.maestroDesign)||null;
-  function post(x){ try{ if(mh) mh.postMessage(x); }catch(_){} }
+  function post(x){
+    try{ x.__maestroDesign=true; }catch(_){}
+    try{ if(window.parent&&window.parent!==window){ window.parent.postMessage(x,'*'); return; } }catch(_){}
+    try{ if(mh) mh.postMessage(x); }catch(_){}
+  }
   var mode=false, hover=null, markers=[];
   var box=document.createElement('div');
   box.style.cssText='position:fixed;z-index:2147483646;pointer-events:none;border:2px solid #2f81f7;background:rgba(47,129,247,.12);border-radius:4px;display:none;box-sizing:border-box';
@@ -90,7 +98,7 @@ const DESIGN_COMMENT_HARNESS = `(function(){
     var d=e.data; if(!d||!d.__maestro) return;
     if(d.type==='comment-mode') setMode(!!d.on);
     if(d.type==='comment-markers'){ markers=Array.isArray(d.items)?d.items:[]; renderPins(); }
-    if(d.type==='flash'&&d.selector){ try{ var el=document.querySelector(d.selector); if(el){ el.scrollIntoView({behavior:'smooth',block:'center'}); frame(el); setTimeout(function(){ if(!mode) box.style.display='none'; },1300); } }catch(_){} }
+    if(d.type==='flash'&&d.selector){ try{ var el=document.querySelector(d.selector); if(el){ el.scrollIntoView({behavior:'smooth',block:'center'}); var n=0, iv=setInterval(function(){ frame(el); if(++n>=14) clearInterval(iv); },100); setTimeout(function(){ clearInterval(iv); if(!mode) box.style.display='none'; },1700); } }catch(_){} }
   });
 })();`;
 
