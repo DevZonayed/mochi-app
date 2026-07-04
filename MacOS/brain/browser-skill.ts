@@ -21,19 +21,36 @@ export const BROWSER_SKILL_SLUG = 'browser';
 export const BROWSER_SKILL_ID = 'mochi/browser';
 
 /* The skill body. Documents EVERY agent-facing browser_* MCP tool that
-   apps/desktop/electron/engine.ts registers, plus the recipes a real session
-   needs: heavy-DOM rescue, connection-loss recovery, image extraction, file
-   download, network/console debugging. Keep this in lock-step with the tool
-   block in engine.ts — when you add a tool there, add a one-liner here. */
-export const BROWSER_SKILL_MD = `---
+   engine.ts registers, plus the recipes a real session needs: heavy-DOM rescue,
+   connection-loss recovery, image extraction, file download, network/console
+   debugging. Keep this in lock-step with the tool block in engine.ts — when you
+   add a tool there, add a one-liner here.
+
+   Two backends share the tool surface but differ in lifecycle, so the text is
+   generated per backend (`native`):
+   - native  = in-process Playwright manager (WebKit app / sidecar): a dedicated
+     per-project Chrome window that LAUNCHES ON DEMAND — never mention pairing.
+   - !native = legacy Chrome-extension bridge (Electron era): the user really
+     must pair/activate a profile in the Mochi extension. */
+export const browserSkillMd = (native = true): string => `---
 name: browser
-description: "Use this skill whenever the user asks you to drive their REAL Chrome browser (via the Mochi extension) — open a site, log in, click, type, screenshot, extract data, watch the network, download a file, run JS in a page. Do NOT use WebFetch/WebSearch for these — use the browser_* tools listed below."
+description: "Use this skill whenever the user asks you to drive their REAL Chrome browser — open a site, log in, click, type, screenshot, extract data, watch the network, download a file, run JS in a page. Do NOT use WebFetch/WebSearch for these — use the browser_* tools listed below."
 allowed-tools: [mcp__maestro__browser_status, mcp__maestro__browser_navigate, mcp__maestro__browser_snapshot, mcp__maestro__browser_read, mcp__maestro__browser_links, mcp__maestro__browser_click, mcp__maestro__browser_type, mcp__maestro__browser_screenshot, mcp__maestro__browser_evaluate, mcp__maestro__browser_scroll, mcp__maestro__browser_press_key, mcp__maestro__browser_click_at, mcp__maestro__browser_hover, mcp__maestro__browser_drag, mcp__maestro__browser_wait, mcp__maestro__browser_wait_for_selector, mcp__maestro__browser_find_by_role_name, mcp__maestro__browser_match_count, mcp__maestro__browser_resolve_box, mcp__maestro__browser_assert, mcp__maestro__browser_open_tab, mcp__maestro__browser_list_tabs, mcp__maestro__browser_close_tab, mcp__maestro__browser_tab_url, mcp__maestro__browser_go_back, mcp__maestro__browser_go_forward, mcp__maestro__browser_console_messages, mcp__maestro__browser_network_requests, mcp__maestro__browser_upload_file, mcp__maestro__browser_download_url, mcp__maestro__browser_grab_image, mcp__maestro__browser_save_image, mcp__maestro__browser_storage_get, mcp__maestro__browser_storage_set, mcp__maestro__browser_storage_clear, mcp__maestro__browser_cookies_get, mcp__maestro__browser_cookies_set, mcp__maestro__browser_cookies_clear, mcp__maestro__browser_cdp, mcp__maestro__browser_pdf, mcp__maestro__browser_window_resize, mcp__maestro__browser_emulate_viewport, mcp__maestro__browser_clear_emulation, mcp__maestro__browser_session_start, mcp__maestro__browser_session_end, mcp__maestro__browser_watch, mcp__maestro__browser_watch_list, mcp__maestro__browser_watch_cancel]
 ---
 
 # Browser
 
-You can drive the user's REAL Chrome (their logged-in profiles, cookies, sessions) through the Mochi extension. Everything you do happens in a visible browser window with a live cursor; the user can watch.
+${native
+  ? `You can drive the user's REAL Chrome (their logged-in profile state, cookies, sessions). The app owns a dedicated Chrome window per project — it LAUNCHES ON DEMAND (seeded with the user's sign-ins) and everything happens in that visible window; the user can watch.
+
+## Just navigate — the window launches itself
+
+\`\`\`
+mcp__maestro__browser_navigate({url: "https://…"})
+\`\`\`
+
+The first \`browser_navigate\` (or \`browser_session_start\`) opens the project's Chrome window automatically. \`browser_status\` saying "not open/connected yet" only means you haven't navigated yet — it is NOT an error, do NOT stop, and NEVER ask the user to pair, install, or open an extension. Only stop if Chrome itself fails to launch (\`chrome-launch-failed\` — tell the user in one line). Do NOT silently fall back to WebFetch.`
+  : `You can drive the user's REAL Chrome (their logged-in profiles, cookies, sessions) through the Mochi extension. Everything you do happens in a visible browser window with a live cursor; the user can watch.
 
 ## The first call, always
 
@@ -41,7 +58,7 @@ You can drive the user's REAL Chrome (their logged-in profiles, cookies, session
 mcp__maestro__browser_status
 \`\`\`
 
-This tells you: is a browser connected? which profile? what tab is open? If no profile is connected, ask the user to open the Mochi Chrome extension and pair it (the app shows the token under Settings → Browser extension). Do NOT silently fall back to WebFetch.
+This tells you: is a browser connected? which profile? what tab is open? If no profile is connected, ask the user to open the Mochi Chrome extension and pair it (the app shows the token under Settings → Browser extension). Do NOT silently fall back to WebFetch.`}
 
 ## The 48+ tools, grouped
 
@@ -133,9 +150,11 @@ If \`browser_snapshot\` returns garbage or times out:
 
 ## Connection-loss recovery
 
-Browser tools auto-retry once when the active profile drops briefly (the extension reconnects with exponential backoff up to 15s). If you get \`"browser profile disconnected"\` or \`"No browser connected"\` AFTER the retry:
+${native
+  ? `If a tool reports \`"browser not open for this project"\` mid-task, the user probably closed the project's Chrome window — just call \`browser_navigate\` again and it relaunches (same profile, same logins). Only if Chrome repeatedly fails to LAUNCH (\`chrome-launch-failed\`) tell the user one line and stop. Do not loop.`
+  : `Browser tools auto-retry once when the active profile drops briefly (the extension reconnects with exponential backoff up to 15s). If you get \`"browser profile disconnected"\` or \`"No browser connected"\` AFTER the retry:
 1. Call \`browser_status\` — confirm.
-2. Tell the user one line: *"The Mochi extension dropped — open it (Chrome toolbar) and click Reconnect, or activate a profile."* Then stop. Do not loop.
+2. Tell the user one line: *"The Mochi extension dropped — open it (Chrome toolbar) and click Reconnect, or activate a profile."* Then stop. Do not loop.`}
 
 ## Recipes
 
@@ -291,26 +310,34 @@ If a watch isn't firing, call \`browser_watch_list\` and check \`lastResult\`:
 - Don't read sensitive form values (passwords, OTP) into the transcript — drive them, don't echo them.
 `;
 
+/** Canonical (native / WebKit-app) rendering — kept as a const for the registry
+    UI + tests. The extension variant comes from browserSkillMd(false). */
+export const BROWSER_SKILL_MD = browserSkillMd(true);
+
 /** Write the bundled browser SKILL.md into the project IF it's not already there
-    (or if it's a stale copy of a prior bundled version we shipped). Returns
-    `installed` when we wrote new content, `kept` when we left an operator's
-    customised copy alone, `unchanged` when the existing file already matches. */
-export function ensureBrowserSkill(projectRoot: string): { slug: string; status: 'installed' | 'kept' | 'unchanged' } {
+    (or if it's a stale copy of a prior bundled version we shipped). `native`
+    picks the backend the text documents (Playwright manager vs extension bridge)
+    — pass the same flag as the turn's BrowserCtx. Returns `installed` when we
+    wrote new content, `kept` when we left an operator's customised copy alone,
+    `unchanged` when the existing file already matches. */
+export function ensureBrowserSkill(projectRoot: string, native = true): { slug: string; status: 'installed' | 'kept' | 'unchanged' } {
   const dir = join(projectRoot, '.claude', 'skills', BROWSER_SKILL_SLUG);
   const file = join(dir, 'SKILL.md');
+  const body = browserSkillMd(native);
   try {
     mkdirSync(dir, { recursive: true });
     if (existsSync(file)) {
       const existing = readFileSync(file, 'utf8');
-      if (existing === BROWSER_SKILL_MD) return { slug: BROWSER_SKILL_SLUG, status: 'unchanged' };
+      if (existing === body) return { slug: BROWSER_SKILL_SLUG, status: 'unchanged' };
       // Detect a prior bundled copy by its frontmatter `name: browser` line + the
       // distinctive "N+ tools" header (number-agnostic — we've gone 30 → 40 once
       // already and will go higher). If both are present, treat it as ours and
-      // upgrade in place. Otherwise the operator has edited the file — leave it.
+      // upgrade in place (also swaps backend variants when the wiring changes).
+      // Otherwise the operator has edited the file — leave it.
       const ours = /^name:\s*browser\s*$/m.test(existing) && /## The \d+\+ tools/m.test(existing);
       if (!ours) return { slug: BROWSER_SKILL_SLUG, status: 'kept' };
     }
-    writeFileSync(file, BROWSER_SKILL_MD, 'utf8');
+    writeFileSync(file, body, 'utf8');
     return { slug: BROWSER_SKILL_SLUG, status: 'installed' };
   } catch {
     // Best-effort. Don't fail the run because we couldn't drop a doc file.
@@ -318,7 +345,7 @@ export function ensureBrowserSkill(projectRoot: string): { slug: string; status:
   }
 }
 
-/** Stable hash of the bundled SKILL.md — for the registry-summary UI. */
+/** Stable hash of the bundled SKILL.md (native rendering) — for the registry-summary UI. */
 export function browserSkillSha256(): string {
   return createHash('sha256').update(BROWSER_SKILL_MD).digest('hex');
 }

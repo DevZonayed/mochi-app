@@ -58,7 +58,7 @@ renderer, and restarts the sidecar on crash. In **dev** the sidecar runs the
 brain's TypeScript directly via Node loader hooks (no build step). In
 **production** it's a single esbuild bundle (`maestro-sidecar.mjs`) with an
 embedded Node runtime and externalized native deps, all inside
-`Maestro WebKit.app/Contents/Resources`.
+`Mochlet.app/Contents/Resources`.
 
 ## Build & run
 
@@ -77,7 +77,7 @@ node MacOS/sidecar/src/smoke-test.mjs --bundle  # prod bundle path
 cd MacOS && pnpm run build      # tsc --noEmit && vite build --config vite.web.config.ts
 
 # Assemble the distributable app (renderer + swift shell + sidecar bundle + node)
-MacOS/webview-app/package-app.sh release        # → MacOS/webview-app/dist/Maestro WebKit.app
+MacOS/webview-app/package-app.sh release        # → MacOS/webview-app/dist/Mochlet.app
 ```
 
 CI: `.github/workflows/native-macos-build.yml` runs `package-app.sh release`,

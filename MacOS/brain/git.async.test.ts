@@ -1,6 +1,7 @@
 import { describe, test, expect, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { rmSync, writeFileSync } from 'node:fs';
+import { rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { makeTempRepo } from './test-helpers.js';
 import {
@@ -11,6 +12,7 @@ import {
   resolveBaseBranch, resolveBaseBranchAsync,
   localRefExists, localRefExistsAsync,
   execGitAsync, _activeGitCount,
+  ensureMaestroExcludes,
 } from './git.js';
 
 /* The async git helpers are the new hot path (file-watcher recompute + overview
@@ -62,6 +64,63 @@ describe('async git helpers match their sync twins', () => {
     expect(await dirtyFileCountAsync(missing)).toBe(0);
     expect(await lastCommitInfoAsync(missing)).toEqual({ subject: null, at: null });
     expect(await localRefExistsAsync(missing, 'main')).toBe(false);
+  });
+});
+
+describe('ensureMaestroExcludes — the app\'s own droppings never read as dirty', () => {
+  test('.continuum/.maestro stop counting toward dirty; real changes still do', async () => {
+    const r = repo();
+    // The app writes its per-project memory + design state — untracked.
+    mkdirSync(path.join(r, '.continuum'), { recursive: true });
+    writeFileSync(path.join(r, '.continuum', 'STATE.md'), 'memory\n');
+    mkdirSync(path.join(r, '.maestro', 'design'), { recursive: true });
+    writeFileSync(path.join(r, '.maestro', 'design', 'state.json'), '{}\n');
+    expect(await isDirtyAsync(r)).toBe(true); // the pre-fix false "Uncommitted"
+
+    await ensureMaestroExcludes(r);
+    expect(await isDirtyAsync(r)).toBe(false);
+    expect(await dirtyFileCountAsync(r)).toBe(0);
+
+    // A REAL change must still register — the exclude hides only our folders.
+    writeFileSync(path.join(r, 'work.txt'), 'real work\n');
+    expect(await isDirtyAsync(r)).toBe(true);
+    expect(await dirtyFileCountAsync(r)).toBe(1);
+  });
+
+  test('idempotent: a second run appends nothing', async () => {
+    const r = repo();
+    await ensureMaestroExcludes(r);
+    const file = path.join(r, '.git', 'info', 'exclude');
+    const once = readFileSync(file, 'utf8');
+    await ensureMaestroExcludes(r);
+    expect(readFileSync(file, 'utf8')).toBe(once);
+    expect((once.match(/^\.continuum$/gm) ?? []).length).toBe(1);
+  });
+
+  test('worktree + SYMLINK (the reported shape): a dir-only `.continuum/` entry is not enough', async () => {
+    // Session worktrees hold `.continuum` as a symlink to the project's folder.
+    // A trailing-slash gitignore pattern matches DIRECTORIES only — so the
+    // pre-existing `.continuum/` exclude line left the chip on "Uncommitted".
+    const r = repo();
+    const wt = path.join(tmpdir(), `maestro-excl-wt-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    cleanup.push(wt);
+    git(r, 'worktree', 'add', '-q', '-b', 'wt-branch', wt);
+    mkdirSync(path.join(r, '.continuum'), { recursive: true });
+    writeFileSync(path.join(r, '.continuum', 'STATE.md'), 'memory\n');
+    symlinkSync(path.join(r, '.continuum'), path.join(wt, '.continuum'));
+    // Seed the OLD dir-only entry — proves it does NOT cover the symlink.
+    mkdirSync(path.join(r, '.git', 'info'), { recursive: true });
+    writeFileSync(path.join(r, '.git', 'info', 'exclude'), '.continuum/\n');
+    expect(await isDirtyAsync(wt)).toBe(true); // the bug: still "Uncommitted"
+
+    // `--git-path info/exclude` resolves to the COMMON dir → one write covers all.
+    await ensureMaestroExcludes(wt);
+    expect(await isDirtyAsync(wt)).toBe(false);
+    expect(await isDirtyAsync(r)).toBe(false);
+  });
+
+  test('non-repo path: no throw, no effect', async () => {
+    await expect(ensureMaestroExcludes('/this/path/does/not/exist/maestro-excl-xyz')).resolves.toBeUndefined();
   });
 });
 

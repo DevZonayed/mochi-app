@@ -14,5 +14,5 @@ Build:
 ```sh
 cd MacOS/webview-app
 ./package-app.sh debug
-open "dist/Maestro WebKit.app"
+open "dist/Mochlet.app"
 ```
