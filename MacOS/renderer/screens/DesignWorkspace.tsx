@@ -125,6 +125,7 @@ export default function DesignWorkspace() {
   const [newPath, setNewPath] = React.useState<string | null>(null);
   const [nb, setNb] = React.useState({ prd: '', existingUrl: '', existingPath: '', inspirations: '', autoAnswer: false });
   const [creatingBusy, setCreatingBusy] = React.useState(false);
+  const [createErr, setCreateErr] = React.useState<string | null>(null);
   const [choosing, setChoosing] = React.useState(false); // Direct/Advanced pick in flight
   const [snap, setSnap] = React.useState<string | null>(null); // last snapshot result (toast)
   const [running, setRunning] = React.useState(false);  // a run is in flight for the active design
@@ -235,14 +236,14 @@ export default function DesignWorkspace() {
   }, []);
 
   const resetCreateSheet = () => {
-    setCreating(false); setNewName(''); setNewMode('classic'); setNewPath(null);
+    setCreating(false); setNewName(''); setNewMode('classic'); setNewPath(null); setCreateErr(null);
     setNb({ prd: '', existingUrl: '', existingPath: '', inspirations: '', autoAnswer: false });
   };
   const createDesign = async (presetName?: string) => {
     if (creatingBusy) return;
     const name = (presetName || newName).trim() || `Design ${designProjects.length + 1}`;
     const mode: 'classic' | DesignMode = presetName ? 'classic' : newMode;
-    setCreatingBusy(true);
+    setCreatingBusy(true); setCreateErr(null);
     try {
       const designMode = mode === 'classic' ? undefined : mode;
       const brief: DesignBrief | undefined = designMode ? {
@@ -276,7 +277,13 @@ export default function DesignWorkspace() {
           setSessionId(resp.session.id);
         } catch { /* kickoff failed — the operator can just send a message */ }
       }
-    } catch { /* surfaced by the empty state */ }
+    } catch (e) {
+      // Keep the sheet OPEN and tell the operator exactly what failed — a
+      // silently-swallowed error here is how a "created" design could vanish
+      // with no trace (the folder was made on disk but the store row never
+      // persisted). Surfacing it lets them retry instead of losing the work.
+      setCreateErr(e instanceof Error ? e.message : 'Could not create the design project. Please try again.');
+    }
     setCreatingBusy(false);
   };
   // The Direct-vs-Advanced gate: persist the choice (which also mirrors it into
@@ -764,14 +771,20 @@ export default function DesignWorkspace() {
                   </HoField>
                 </>
               )}
-              {newMode !== 'classic' && (
-                <HoField label="Save in folder (optional)">
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1.3 var(--font-mono)', color: newPath ? 'var(--ink)' : 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{newPath ?? 'Auto — a new folder under ~/Maestro'}</span>
-                    {IS_LOCAL && <button onClick={() => void pickFolderInto(setNewPath)} style={{ height: 30, padding: '0 12px', borderRadius: 8, border: '0.5px solid var(--separator)', background: 'var(--surface)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Choose…</button>}
-                    {newPath && <button onClick={() => setNewPath(null)} className="tb-icon" style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}><Icon name="x" size={13} /></button>}
-                  </div>
-                </HoField>
+              <HoField label="Save in folder">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ flex: 1, minWidth: 0, font: '400 var(--fs-caption)/1.3 var(--font-mono)', color: newPath ? 'var(--ink)' : 'var(--ink-tertiary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{newPath ?? 'Auto — a new folder under ~/Maestro'}</span>
+                  {IS_LOCAL
+                    ? <button onClick={() => void pickFolderInto(setNewPath)} style={{ height: 30, padding: '0 12px', borderRadius: 8, border: '0.5px solid var(--separator)', background: 'var(--surface)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Choose…</button>
+                    : <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>desktop only</span>}
+                  {newPath && <button onClick={() => setNewPath(null)} className="tb-icon" style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)' }}><Icon name="x" size={13} /></button>}
+                </div>
+              </HoField>
+              {createErr && (
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 12px', borderRadius: 10, background: 'color-mix(in srgb, var(--red, #ff3b30) 12%, transparent)', border: '0.5px solid color-mix(in srgb, var(--red, #ff3b30) 40%, transparent)' }}>
+                  <Icon name="alert" size={14} style={{ color: 'var(--red, #ff3b30)', flexShrink: 0, marginTop: 1 }} />
+                  <div style={{ font: '500 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink)' }}>Couldn’t create the design: {createErr}</div>
+                </div>
               )}
             </div>
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '6px 20px 18px' }}>

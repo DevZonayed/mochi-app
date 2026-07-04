@@ -11,12 +11,15 @@
    the foreign copy in before writing (union by id, newest-write-wins, deletes
    propagate via tombstones), so two writers CONVERGE instead of clobber. */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { rmSync } from 'node:fs';
+import { rmSync, writeFileSync, existsSync, statSync, utimesSync } from 'node:fs';
+import { join } from 'node:path';
 
 const hoisted = vi.hoisted(() => ({ dir: `/tmp/maestro-store-multiwriter-test-${process.pid}` }));
 vi.mock('electron', () => ({ app: { getPath: () => hoisted.dir } }));
 
 import { Store } from './store.js';
+
+const LOCK = join(hoisted.dir, 'maestro-store.json.lock');
 
 describe('Store — concurrent writers do not clobber each other', () => {
   beforeEach(() => { rmSync(hoisted.dir, { recursive: true, force: true }); });
@@ -80,4 +83,58 @@ describe('Store — concurrent writers do not clobber each other', () => {
     expect(names).toEqual(['Keep']);
     expect(C.getProject(doomed.id)).toBeUndefined();
   });
+});
+
+describe('Store — write lock keeps the critical section serial without wedging', () => {
+  beforeEach(() => { rmSync(hoisted.dir, { recursive: true, force: true }); });
+
+  it('releases the lockfile after every save (no leak)', () => {
+    const A = new Store();
+    A.createProject({ name: 'Alpha' });
+    // A well-behaved writer must not leave its lockfile behind, or the next
+    // writer would have to wait out the whole steal timeout on every save.
+    expect(existsSync(LOCK)).toBe(false);
+    A.createProject({ name: 'Beta' });
+    expect(existsSync(LOCK)).toBe(false);
+  });
+
+  it('reclaims a STALE lock left by a crashed writer and still persists', () => {
+    const A = new Store();
+    const p = A.createProject({ name: 'Alpha' });
+
+    // Simulate a writer that crashed mid-save: a lockfile that nobody will ever
+    // release, with an mtime well past LOCK_STALE_MS (10s).
+    writeFileSync(LOCK, '999999:0');
+    const old = Date.now() / 1000 - 60; // 60s ago
+    utimesSync(LOCK, old, old);
+
+    // The next save must steal the stale lock rather than block forever.
+    A.updateProject(p.id, { color: 'blue' });
+
+    const C = new Store();
+    expect(C.getProject(p.id)?.color).toBe('blue');
+    expect(existsSync(LOCK)).toBe(false); // stolen + released
+  });
+
+  it('a FRESH foreign lock is waited out, then save proceeds lockless (never freezes)', () => {
+    const A = new Store();
+    const p = A.createProject({ name: 'Alpha' });
+
+    // A concurrent writer is holding a fresh lock (mtime = now). We can't wait
+    // for it in a single-process test, so assert the save still completes within
+    // a bounded time (LOCK_TIMEOUT_MS ~3s) instead of hanging the app forever.
+    writeFileSync(LOCK, `${process.pid + 1}:${Date.now()}`);
+    statSync(LOCK); // fresh
+
+    const started = Date.now();
+    A.updateProject(p.id, { name: 'Renamed' }); // must return, lockless, after timeout
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeGreaterThanOrEqual(2_000); // actually waited on the lock
+    expect(elapsed).toBeLessThan(5_000);           // but gave up before wedging
+
+    rmSync(LOCK, { force: true }); // drop the simulated foreign holder
+    const C = new Store();
+    expect(C.getProject(p.id)?.name).toBe('Renamed'); // the lockless save landed
+  }, 10_000);
 });
