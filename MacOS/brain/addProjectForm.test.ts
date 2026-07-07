@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import {
   validateCloneInput,
   validateNewLocalInput,
+  validateContextInput,
   buildCloneArgs,
   TABS,
 } from '../renderer/lib/addProjectForm.js';
@@ -64,9 +65,24 @@ describe('buildCloneArgs', () => {
   });
 });
 
+describe('validateContextInput', () => {
+  it('is "empty, no error" when no name typed', () => {
+    expect(validateContextInput('')).toEqual({ ok: false, reason: null });
+    expect(validateContextInput('  ')).toEqual({ ok: false, reason: null });
+  });
+  it('rejects names with invalid characters', () => {
+    const r = validateContextInput('acme/ops');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/letters/);
+  });
+  it('accepts a clean operator name (no folder needed — auto-provisioned)', () => {
+    expect(validateContextInput('Acme Ops_v2.1')).toEqual({ ok: true, reason: null });
+  });
+});
+
 describe('TABS', () => {
-  it('has exactly three tabs in the documented order', () => {
-    expect(TABS.map(t => t.id)).toEqual(['folder', 'new', 'clone']);
+  it('has exactly four tabs in the documented order', () => {
+    expect(TABS.map(t => t.id)).toEqual(['folder', 'new', 'clone', 'context']);
   });
   it('each tab has a non-empty label + sub-label for the tablist', () => {
     for (const t of TABS) {

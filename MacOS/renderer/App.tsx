@@ -99,6 +99,7 @@ export function App() {
           <Route path="/" element={<Navigate to={entryPath()} replace />} />
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="/workspace" element={<Workspace />} />
+          <Route path="/operator" element={<Workspace operator />} />
           <Route path="/design-workspace" element={<DesignWorkspace />} />
           <Route path="/projects" element={<Projects />} />
           <Route path="/project-detail" element={<ProjectDetail />} />

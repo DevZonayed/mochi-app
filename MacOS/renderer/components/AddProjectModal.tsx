@@ -23,6 +23,7 @@ import {
   TABS,
   validateCloneInput,
   validateNewLocalInput,
+  validateContextInput,
   buildCloneArgs,
 } from '../lib/addProjectForm';
 import { planOpenFolder, projectNameFromPath, type OpenFolderPlan } from '../lib/open-folder-flow';
@@ -50,10 +51,13 @@ interface Props {
       to update its project list + auto-expand the new entry in the sidebar +
       raise a "Project '<name>' added — click to open chat" toast. */
   onAdded: (project: Project) => void;
+  /** Which tab to open on. Defaults to 'folder'; the Agent workspace passes
+      'context' so its empty-state "Create operator" lands on the right panel. */
+  initialTab?: AddProjectTab;
 }
 
-export function AddProjectModal({ open, onClose, onAdded }: Props) {
-  const [tab, setTab] = React.useState<AddProjectTab>('folder');
+export function AddProjectModal({ open, onClose, onAdded, initialTab }: Props) {
+  const [tab, setTab] = React.useState<AddProjectTab>(initialTab ?? 'folder');
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -62,6 +66,10 @@ export function AddProjectModal({ open, onClose, onAdded }: Props) {
   // is not on master yet (see the note rendered inside the New tab).
   const [newName, setNewName] = React.useState('');
   const [newParent, setNewParent] = React.useState<string | null>(null);
+
+  // Tab 4 (Context) state — just a name. The brain auto-creates the folder
+  // (~/Maestro/<name>-<rand>, NO GitHub repo) and the single Operator session.
+  const [ctxName, setCtxName] = React.useState('');
 
   // Tab 3 (Clone) state — single text input + chosen parent folder + the
   // gh repo view metadata card (loaded only after the user has typed a
@@ -85,6 +93,7 @@ export function AddProjectModal({ open, onClose, onAdded }: Props) {
   // opens it, dismisses with Esc, opens again from a different sidebar).
   React.useEffect(() => {
     if (!open) return;
+    setTab(initialTab ?? 'folder');
     setError(null);
     setBusy(false);
     setMeta(null);
@@ -122,6 +131,7 @@ export function AddProjectModal({ open, onClose, onAdded }: Props) {
 
   const cloneValidation = validateCloneInput(cloneText, cloneParent);
   const newValidation = validateNewLocalInput(newName, newParent);
+  const contextValidation = validateContextInput(ctxName);
 
   // Debounced metadata fetch when the user pastes a recognisable ref. We
   // don't make it gating — they can clone without the preview card too —
@@ -294,6 +304,21 @@ export function AddProjectModal({ open, onClose, onAdded }: Props) {
       onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to create project.');
+    } finally { setBusy(false); }
+  };
+
+  /** Create a Context (universal operator) project. No path/parent picker —
+      the brain provisions the knowledge folder itself and seeds the single
+      continuous Operator session; NO GitHub repo is created. */
+  const submitContext = async () => {
+    if (!contextValidation.ok) return;
+    setError(null); setBusy(true);
+    try {
+      const proj = await api.createProject({ name: ctxName.trim(), kind: 'context', instructions: '', color: 'orange' });
+      onAdded(proj);
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to create context project.');
     } finally { setBusy(false); }
   };
 
@@ -531,6 +556,44 @@ export function AddProjectModal({ open, onClose, onAdded }: Props) {
                   style={{ height: 36, padding: '0 16px', borderRadius: 10, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
                   {busy && <span className="apm-spin" style={{ width: 13, height: 13, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.5)', borderTopColor: '#fff' }} />}
                   Clone
+                </button>
+              </div>
+            </div>
+          )}
+
+          {tab === 'context' && (
+            <div role="tabpanel" id="apm-panel-context" aria-labelledby="apm-tab-context" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <p style={{ margin: 0, font: '400 var(--fs-subhead)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                A universal operator: ONE continuous conversation that remembers every message,
+                meeting note and decision. Connect coding/design projects and WhatsApp chats to it —
+                it triages client messages, dispatches work, and reports back.
+              </p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <label htmlFor="apm-ctx-name" style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Project name</label>
+                <input
+                  id="apm-ctx-name"
+                  data-autofocus
+                  value={ctxName}
+                  onChange={e => setCtxName(e.target.value)}
+                  placeholder="acme-client"
+                  className="apm-input"
+                  style={{ height: 36, padding: '0 12px', borderRadius: 10, border: '1px solid var(--separator)', background: 'var(--bg-base)', font: '500 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink)' }}
+                />
+              </div>
+              <div style={{ padding: '10px 12px', borderRadius: 10, background: 'color-mix(in srgb, var(--orange, #ff9500) 6%, transparent)', border: '0.5px solid color-mix(in srgb, var(--orange, #ff9500) 24%, transparent)', font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-secondary)' }}>
+                Creates a knowledge folder under <code>~/Maestro</code> (no GitHub repo) and a single
+                Operator session. Link projects + a WhatsApp chat afterwards in Project settings → Connections.
+              </div>
+              <div aria-live="polite" style={{ minHeight: 18, font: '500 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--red, #ff3b30)' }}>
+                {contextValidation.reason ?? ''}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                <button onClick={onClose} disabled={busy} className="apm-btn"
+                  style={{ height: 36, padding: '0 16px', borderRadius: 10, background: 'transparent', color: 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Cancel</button>
+                <button onClick={submitContext} disabled={busy || !contextValidation.ok} className="apm-btn"
+                  style={{ height: 36, padding: '0 16px', borderRadius: 10, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                  {busy && <span className="apm-spin" style={{ width: 13, height: 13, borderRadius: '50%', border: '2px solid rgba(255,255,255,0.5)', borderTopColor: '#fff' }} />}
+                  Create operator
                 </button>
               </div>
             </div>
