@@ -471,7 +471,7 @@ export interface BrowserStatus {
 }
 export interface ChromeProfile { dir: string; name: string }
 export interface ChromeStatus { installed: boolean; path: string | null; version: string | null; running: boolean }
-export interface BrowserSeedInfo { sourceDir: string; sourceName: string; importedAt: number; cookieCount: number }
+export interface BrowserSeedInfo { sourceDir: string; sourceName: string; importedAt: number; cookieCount: number; appBound?: boolean; warnings?: string[] }
 export interface BrowserProfilePath { path: string }
 export interface AppSettings {
   defaultEffort: Effort;
