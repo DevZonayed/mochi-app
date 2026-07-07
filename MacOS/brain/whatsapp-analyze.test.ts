@@ -106,3 +106,76 @@ describe('whatsapp analyzer', () => {
     expect(s.listPendingSummaries()).toHaveLength(0);   // outbox drained
   });
 });
+
+/* Context (knowledge/operator) projects: a bound quiet chat routes through the
+   triage→operator intake instead of the classic summarizer — unless the intake
+   reports 'fallback' (triage unreachable), in which case the classic path runs
+   so no client message is ever lost. */
+describe('whatsapp analyzer — context-project intake routing', () => {
+  function setupContext() {
+    const s = new Store();
+    s.setWhatsappState({ sendApproved: true });
+    const ctx = s.createProject({ name: 'Acme Ops', kind: 'context' });
+    s.createSession(ctx.id, 'Operator');
+    s.bindChat({ chatId: 'c1', name: 'Acme Corp', kind: 'dm', provider: 'whatsapp', projectId: ctx.id });
+    s.recordWaMessage({ chatId: 'c1', name: 'Acme Corp', fromMe: false, senderName: 'Bob', text: 'checkout throws a 500', ts: 1000 });
+    const engine = { run: vi.fn() } as unknown as LocalEngine;
+    return { s, ctx, engine };
+  }
+
+  it("intake 'dispatched' → watermark advances, classic summarizer never runs", async () => {
+    const { s, ctx, engine } = setupContext();
+    const summarize = vi.fn(fixedSummary);
+    const intake = vi.fn(async () => 'dispatched' as const);
+    const { client, sent } = sendSpy();
+    const analyze = makeWhatsappAnalyzer({ store: s, engine, client, emit: vi.fn(), summarize, intake });
+
+    await analyze(s.armWhatsappTimer({ chatId: 'c1', projectId: ctx.id }));
+
+    expect(intake).toHaveBeenCalledTimes(1);
+    expect(intake.mock.calls[0][0]).toMatchObject({ chatId: 'c1', chatName: 'Acme Corp' });
+    expect(intake.mock.calls[0][0].project.kind).toBe('context');
+    expect(summarize).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+    // watermark advanced → a re-fire sees nothing new
+    expect(s.getWaTranscript('c1', { sinceReported: true })).toHaveLength(0);
+  });
+
+  it("intake 'noted' → watermark advances silently (chatter costs nothing)", async () => {
+    const { s, ctx, engine } = setupContext();
+    const summarize = vi.fn(fixedSummary);
+    const { client, sent } = sendSpy();
+    const analyze = makeWhatsappAnalyzer({ store: s, engine, client, emit: vi.fn(), summarize, intake: async () => 'noted' });
+
+    await analyze(s.armWhatsappTimer({ chatId: 'c1', projectId: ctx.id }));
+
+    expect(summarize).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+    expect(s.listPendingSummaries()).toHaveLength(0);
+    expect(s.getWaTranscript('c1', { sinceReported: true })).toHaveLength(0);
+  });
+
+  it("intake 'fallback' → the CLASSIC summarizer still delivers (dead judge loses nothing)", async () => {
+    const { s, ctx, engine } = setupContext();
+    const { client, sent } = sendSpy();
+    const analyze = makeWhatsappAnalyzer({ store: s, engine, client, emit: vi.fn(), summarize: fixedSummary, intake: async () => 'fallback' });
+
+    await analyze(s.armWhatsappTimer({ chatId: 'c1', projectId: ctx.id }));
+
+    expect(sent).toHaveLength(1); // classic summary went out
+    expect(s.getWaTranscript('c1', { sinceReported: true })).toHaveLength(0);
+  });
+
+  it('non-context projects never consult the intake', async () => {
+    const { s, p, engine } = setup(); // plain project from the shared setup
+    s.setWhatsappState({ sendApproved: true });
+    const intake = vi.fn(async () => 'dispatched' as const);
+    const { client, sent } = sendSpy();
+    const analyze = makeWhatsappAnalyzer({ store: s, engine, client, emit: vi.fn(), summarize: fixedSummary, intake });
+
+    await analyze(s.armWhatsappTimer({ chatId: 'c1', projectId: p.id }));
+
+    expect(intake).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(1); // classic path as before
+  });
+});

@@ -9,8 +9,9 @@
    instructions to follow. Sending is gated: the very first summary is held until
    the operator approves, then flushed and all later summaries flow. */
 
-import type { Store, Schedule, WaMessage } from './store.js';
+import type { Store, Schedule, WaMessage, Project } from './store.js';
 import type { LocalEngine } from './engine.js';
+import type { IntakeOutcome } from './context-operator.js';
 
 export interface WaClientLike { sendToSelf(text: string): Promise<boolean> }
 
@@ -21,6 +22,11 @@ export interface WaAnalyzeDeps {
   emit: (name: string, data: unknown) => void;
   /** Injectable summarizer; defaults to a one-shot engine run. Tests pass a stub. */
   summarize?: (input: { chatName: string; transcript: string; projectId: string | null; sessionId?: string }) => Promise<string>;
+  /** Context-project intake (triage → operator turn). When the quiet chat is
+      bound to a 'context' project, this replaces the classic summary: the cheap
+      judge decides whether the burst deserves the operator agent's attention.
+      'fallback' → the classic summarizer runs after all (judge unreachable). */
+  intake?: (args: { project: Project; chatId: string; chatName: string; msgs: WaMessage[] }) => Promise<IntakeOutcome>;
 }
 
 /** One line per message: "HH:MM Sender: text" (UTC, stable for tests/logs). */
@@ -69,6 +75,20 @@ async function runAnalysis(deps: WaAnalyzeDeps, s: Schedule): Promise<void> {
   if (msgs.length === 0) return; // nothing new since the last summary — quiet, once
   const chat = deps.store.listWaChats().find(c => c.chatId === chatId);
   const chatName = chat?.name ?? chatId;
+
+  // Context (knowledge/operator) projects take the triage→operator path: a cheap
+  // model decides whether the burst deserves attention; actionable bursts become
+  // a full-context turn in the project's single operator session. Only a triage
+  // FAILURE ('fallback') falls through to the classic self-summary below.
+  const boundProject = s.projectId ? deps.store.getProject(s.projectId) : undefined;
+  if (boundProject?.kind === 'context' && deps.intake) {
+    const outcome = await deps.intake({ project: boundProject, chatId, chatName, msgs });
+    if (outcome !== 'fallback') {
+      deps.store.markWaReported(chatId, msgs[msgs.length - 1].ts);
+      return;
+    }
+  }
+
   const summarize = deps.summarize ?? defaultSummarize(deps);
   const summary = (await summarize({ chatName, transcript: formatTranscript(msgs), projectId: s.projectId, sessionId: s.sessionId })).trim();
 

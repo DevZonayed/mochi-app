@@ -319,3 +319,91 @@ describe('WhatsAppClient — connection + send', () => {
     expect(s.getWaTranscript('111@s.whatsapp.net').map(m => m.text)).toEqual(['via socket']);
   });
 });
+
+/* Operator quoted-reply routing — when the operator QUOTES a message a context
+   agent sent them (note-to-self, or the notify DM) and replies, ingest hands
+   the reply to onOperatorReply instead of the normal pend/timer path. */
+describe('WhatsAppClient.ingest — operator quoted-reply routing', () => {
+  const OWN = '15551234567@s.whatsapp.net';
+  const NOTIFY = '99999@s.whatsapp.net';
+
+  function quotedReply(chatId: string, quoted: string, text: string, opts: { fromMe?: boolean } = {}) {
+    return {
+      key: { remoteJid: chatId, fromMe: !!opts.fromMe, id: `qr-${text}` },
+      message: { extendedTextMessage: { text, contextInfo: { quotedMessage: { conversation: quoted } } } },
+      messageTimestamp: 1700000000,
+      pushName: 'You',
+    };
+  }
+
+  /** A store with a context project whose agent has sent `text` to `chatId`. */
+  function withSend(chatId: string, text: string) {
+    const s = new Store();
+    const ctx = s.createProject({ name: 'Ops', kind: 'context' });
+    const sess = s.createSession(ctx.id, 'Operator');
+    s.recordContextWaSend({ projectId: ctx.id, sessionId: sess.id, chatId, text });
+    return s;
+  }
+
+  it('note-to-self (own jid, fromMe): the quoted reply reaches the handler, not the pend/timer path', () => {
+    const s = withSend(OWN, 'Should I deploy the checkout fix?');
+    s.setWhatsappState({ connected: true, jid: OWN });
+    const onOperatorReply = vi.fn(async () => true);
+    const client = new WhatsAppClient(s, vi.fn(), { onOperatorReply });
+
+    client.ingest(quotedReply(OWN, 'Should I deploy the checkout fix?', 'yes, go ahead', { fromMe: true }));
+
+    expect(onOperatorReply).toHaveBeenCalledTimes(1);
+    expect(onOperatorReply).toHaveBeenCalledWith({ chatId: OWN, quotedText: 'Should I deploy the checkout fix?', text: 'yes, go ahead' });
+    expect(s.listPendingChats()).toHaveLength(0);
+    expect(s.listSchedules().filter(x => x.kind === 'whatsapp-analyze')).toHaveLength(0);
+  });
+
+  it('notify DM (different personal number, NOT fromMe): routed the same way', () => {
+    const s = withSend(NOTIFY, 'Need permission to push the hotfix.');
+    s.setWhatsappState({ connected: true, jid: OWN, notifyJid: NOTIFY });
+    const onOperatorReply = vi.fn(async () => true);
+    const client = new WhatsAppClient(s, vi.fn(), { onOperatorReply });
+
+    client.ingest(quotedReply(NOTIFY, 'Need permission to push the hotfix.', 'approved'));
+
+    expect(onOperatorReply).toHaveBeenCalledWith({ chatId: NOTIFY, quotedText: 'Need permission to push the hotfix.', text: 'approved' });
+    // Without the routing this untracked DM would have been surfaced as pending.
+    expect(s.listPendingChats()).toHaveLength(0);
+  });
+
+  it('a quote that matches NO recorded send falls through (own chat: shown, never pended)', () => {
+    const s = withSend(OWN, 'the real send');
+    s.setWhatsappState({ connected: true, jid: OWN });
+    const onOperatorReply = vi.fn(async () => true);
+    const client = new WhatsAppClient(s, vi.fn(), { onOperatorReply });
+
+    client.ingest(quotedReply(OWN, 'some other message entirely', 'reply', { fromMe: true }));
+
+    expect(onOperatorReply).not.toHaveBeenCalled();
+    expect(s.listPendingChats()).toHaveLength(0); // own-chat notes still never pend
+  });
+
+  it('a quoted reply in a NON-operator chat takes the normal path (pended, handler untouched)', () => {
+    const s = withSend('888@s.whatsapp.net', 'leaked into a client chat'); // even a ring match must not fire here
+    s.setWhatsappState({ connected: true, jid: OWN });
+    const onOperatorReply = vi.fn(async () => true);
+    const client = new WhatsAppClient(s, vi.fn(), { onOperatorReply });
+
+    client.ingest(quotedReply('888@s.whatsapp.net', 'leaked into a client chat', 'a client reply'));
+
+    expect(onOperatorReply).not.toHaveBeenCalled();
+    expect(s.listPendingChats().some(c => c.chatId === '888@s.whatsapp.net')).toBe(true); // normal untracked flow
+  });
+
+  it('without the onOperatorReply dep, quoted replies behave exactly as before', () => {
+    const s = withSend(OWN, 'Should I deploy?');
+    s.setWhatsappState({ connected: true, jid: OWN });
+    const client = new WhatsAppClient(s, vi.fn()); // no deps at all
+
+    client.ingest(quotedReply(OWN, 'Should I deploy?', 'yes', { fromMe: true }));
+
+    expect(s.listPendingChats()).toHaveLength(0); // own notes: shown, never pended/timed
+    expect(s.waMessages(OWN).map(m => m.text)).toEqual(['yes']); // still captured for the view
+  });
+});
