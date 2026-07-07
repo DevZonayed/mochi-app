@@ -22,6 +22,7 @@ import { formatTranscript, type TranscriptMode } from '../lib/transcript-export'
 import { BranchPicker } from '../components/BranchPicker';
 import { projectColor } from '../lib/project-color';
 import { projectVisibleTabs, lastTabForProject } from '../lib/tab-grouping';
+import { resolveOperatorScope, newChatTargetProject } from '../lib/operatorScope';
 import { AddProjectModal } from '../components/AddProjectModal';
 import { WorkspaceOverview } from '../components/WorkspaceOverview';
 
@@ -126,6 +127,7 @@ const KIND_META: { key: KindFilter; label: string; icon: IconName; tint: string 
   { key: 'coding', label: 'Code', icon: 'terminal', tint: 'var(--blue)' },
   { key: 'content', label: 'Content', icon: 'clapper', tint: 'var(--purple)' },
   { key: 'research', label: 'Research', icon: 'telescope', tint: 'var(--indigo)' },
+  { key: 'context', label: 'Context', icon: 'spark', tint: 'var(--orange)' },
   { key: 'general', label: 'General', icon: 'command', tint: 'var(--ink-secondary)' },
 ];
 const kindOf = (k: KindFilter) => KIND_META.find(m => m.key === k) ?? KIND_META[0];
@@ -142,7 +144,12 @@ function MenuRow({ icon, label, shortcut, onClick, tone = 'default' }: { icon: I
   );
 }
 
-export default function Workspace() {
+/** `operator` mode renders the SAME workspace machinery but scoped to the
+    Context genre: the project list is locked to context projects (the kind
+    pills are hidden), the header reads "Agent", and the "+" opens straight on
+    the Context tab. It's the dedicated top-nav destination that sits beside
+    CodeSpace and Design. */
+export default function Workspace({ operator = false }: { operator?: boolean } = {}) {
   const navigate = useNavigate();
   const location = useLocation();
   const seedConsumed = React.useRef(false);
@@ -171,10 +178,17 @@ export default function Workspace() {
   const [showHidden, setShowHidden] = React.useState(false);
   // Per-project "Archived" sub-list expanded state.
   const [archivedOpen, setArchivedOpen] = React.useState<Set<string>>(new Set());
-  const [kindFilter, setKindFilterState] = React.useState<KindFilter>(() => {
+  const [storedKindFilter, setKindFilterState] = React.useState<KindFilter>(() => {
     try { const v = localStorage.getItem(KIND_FILTER_KEY); return (v && KIND_META.some(m => m.key === v)) ? v as KindFilter : 'all'; } catch { return 'all'; }
   });
-  const setKindFilter = (k: KindFilter) => { setKindFilterState(k); try { localStorage.setItem(KIND_FILTER_KEY, k); } catch { /* ignore */ } };
+  // DERIVED, not initial state: /workspace and /operator render this same
+  // component type, so React re-uses the mounted instance when the top-nav
+  // switches between them — a useState initializer would keep CodeSpace's
+  // filter and leak every coding project into the Agent view. Deriving locks
+  // operator mode to 'context' on every render, and going back to CodeSpace
+  // restores the stored filter untouched.
+  const kindFilter: KindFilter = operator ? 'context' : storedKindFilter;
+  const setKindFilter = (k: KindFilter) => { if (operator) return; setKindFilterState(k); try { localStorage.setItem(KIND_FILTER_KEY, k); } catch { /* ignore */ } };
   const [query, setQuery] = React.useState('');
   const newCounter = React.useRef(0);
   const restored = React.useRef(false);
@@ -392,6 +406,18 @@ export default function Workspace() {
     setActiveKey(target?.key ?? null);
   }, [tabs, lastActiveByProject, setActiveProjectId]);
 
+  // Operator (Agent) mode scopes the WHOLE surface — rail, tab strip, main
+  // pane — to the context genre. /workspace and /operator render this same
+  // mounted component, so a coding project can arrive as the active project
+  // when the top-nav switches; re-aim at a context project (or clear the
+  // strip when none exists yet, so coding tabs never bleed into the Agent view).
+  React.useEffect(() => {
+    if (!operator) return;
+    const act = resolveOperatorScope(projects, activeProjectId);
+    if (act.type === 'switch') switchToProject(act.pid);
+    else if (act.type === 'clear') { setActiveProjectId(null); setActiveKey(null); }
+  }, [operator, activeProjectId, projects, switchToProject, setActiveProjectId]);
+
   // The visible-in-strip tabs (project-scoped). Storage still holds every
   // open tab across every project — this is just the render filter.
   const visibleTabs = React.useMemo(() => projectVisibleTabs(tabs, activeProjectId), [tabs, activeProjectId]);
@@ -496,6 +522,23 @@ export default function Workspace() {
       worktree from a specific branch (the picker's path); omit it for the
       legacy default-branch flow (⌘/Ctrl+click on the "+" button). */
   const newChat = (projectId: string, base?: string) => {
+    // Context projects have exactly ONE continuous operator session — from
+    // project start to end, every message lives in that conversation. "New
+    // chat" therefore re-opens the primary session instead of forking a
+    // second one (the brain routes sessionless sends the same way).
+    const proj = projById[projectId];
+    if (proj?.kind === 'context') {
+      const primary = sessions
+        .filter(s => s.projectId === projectId && !s.archived)
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (primary) {
+        openSession(primary);
+        if (!expanded.has(projectId)) setExpanded(e => new Set(e).add(projectId));
+        return;
+      }
+      // No session yet (freshly adopted store) — fall through to a plain new
+      // tab; the brain's sendChat will still bind it to the primary session.
+    }
     const key = `new:${newCounter.current++}`;
     setTabs(ts => [...ts, { key, projectId, sessionId: null, title: 'New chat', ...(base ? { base } : {}) }]);
     setActiveKey(key); setActiveProjectId(projectId);
@@ -747,14 +790,14 @@ export default function Workspace() {
   }, [visibleTabs, activeKey]);
 
   return (
-    <AppShell active="workspace">
+    <AppShell active={operator ? 'operator' : 'workspace'}>
       <style>{PAGE_CSS}</style>
       <div style={{ height: '100%', display: 'flex', minHeight: 0 }}>
         {/* ── left tree: pinned + projects → chats ── */}
         <div style={{ width: 260, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '0.5px solid var(--separator)', background: 'var(--bg-grouped)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 14px 10px' }}>
-            <Icon name="terminal" size={16} style={{ color: 'var(--blue)' }} />
-            <span style={{ flex: 1, font: '700 var(--fs-callout)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>CodeSpace</span>
+            <Icon name={operator ? 'spark' : 'terminal'} size={16} style={{ color: operator ? 'var(--orange)' : 'var(--blue)' }} />
+            <span style={{ flex: 1, font: '700 var(--fs-callout)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>{operator ? 'Agent' : 'CodeSpace'}</span>
             {/* "+" now opens the in-workspace <AddProjectModal />; no more
                 redirect to /projects (that broke the user's "everything in
                 workspace" expectation). The modal handles all three flows
@@ -775,8 +818,9 @@ export default function Workspace() {
                 {query && <button onClick={() => setQuery('')} title="Clear" style={{ width: 18, height: 18, borderRadius: 5, display: 'grid', placeItems: 'center', color: 'var(--ink-tertiary)', flexShrink: 0 }}><Icon name="x" size={11} stroke={2.4} /></button>}
               </div>
               {/* single horizontal row — the vertical mouse wheel scrolls it
-                  sideways so every category is reachable without wrapping */}
-              <div className="ws-kinds" onWheel={e => { const el = e.currentTarget; if (Math.abs(e.deltaY) >= Math.abs(e.deltaX)) el.scrollLeft += e.deltaY; }}
+                  sideways so every category is reachable without wrapping.
+                  Hidden in the Agent view, which is locked to the context genre. */}
+              {!operator && <div className="ws-kinds" onWheel={e => { const el = e.currentTarget; if (Math.abs(e.deltaY) >= Math.abs(e.deltaX)) el.scrollLeft += e.deltaY; }}
                 style={{ display: 'flex', gap: 5, overflowX: 'auto', WebkitMaskImage: 'linear-gradient(to right, #000 calc(100% - 16px), transparent)', maskImage: 'linear-gradient(to right, #000 calc(100% - 16px), transparent)' }}>
                 {KIND_META.map(m => {
                   const on = kindFilter === m.key;
@@ -792,7 +836,7 @@ export default function Workspace() {
                     </button>
                   );
                 })}
-              </div>
+              </div>}
             </div>
           )}
 
@@ -811,8 +855,8 @@ export default function Workspace() {
           <div className="ws-tree" style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '0 8px 12px' }}>
             {projects.length === 0 && (
               <div style={{ padding: '40px 14px', textAlign: 'center', font: '400 var(--fs-footnote)/1.55 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-                No projects yet.
-                <button onClick={() => setAddOpen(true)} style={{ display: 'block', margin: '12px auto 0', height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>Create a project</button>
+                {operator ? 'No agents yet. An agent is a universal operator with one continuous conversation.' : 'No projects yet.'}
+                <button onClick={() => setAddOpen(true)} style={{ display: 'block', margin: '12px auto 0', height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>{operator ? 'Create an agent' : 'Create a project'}</button>
               </div>
             )}
 
@@ -823,7 +867,7 @@ export default function Workspace() {
               </>
             )}
 
-            {visibleProjects.length > 0 && sectionLabel(kindFilter === 'all' ? 'Projects' : `${kindOf(kindFilter).label} projects`)}
+            {visibleProjects.length > 0 && sectionLabel(operator ? 'Agents' : kindFilter === 'all' ? 'Projects' : `${kindOf(kindFilter).label} projects`)}
             {hiddenCount > 0 && (
               <button onClick={() => setShowHidden(v => !v)} style={{ display: 'flex', alignItems: 'center', gap: 7, width: '100%', textAlign: 'left', padding: '4px 8px', margin: '0 0 2px', borderRadius: 7, color: 'var(--ink-tertiary)', font: '500 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>
                 <Icon name={showHidden ? 'eye' : 'eyeOff'} size={13} /> {showHidden ? `Hide ${hiddenCount} hidden` : `Show ${hiddenCount} hidden`}
@@ -831,8 +875,10 @@ export default function Workspace() {
             )}
             {projects.length > 0 && visibleProjects.length === 0 && (
               <div style={{ padding: '24px 14px', textAlign: 'center', font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-                No {kindFilter === 'all' ? '' : kindOf(kindFilter).label.toLowerCase() + ' '}projects{q ? ' match' : ''}.
-                {(q || kindFilter !== 'all') && <button onClick={() => { setQuery(''); setKindFilter('all'); }} style={{ display: 'block', margin: '10px auto 0', height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Clear filters</button>}
+                {operator ? `No agents yet${q ? ' match' : ''}.` : <>No {kindFilter === 'all' ? '' : kindOf(kindFilter).label.toLowerCase() + ' '}projects{q ? ' match' : ''}.</>}
+                {operator
+                  ? <button onClick={() => setAddOpen(true)} style={{ display: 'block', margin: '10px auto 0', height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Create an agent</button>
+                  : (q || kindFilter !== 'all') && <button onClick={() => { setQuery(''); setKindFilter('all'); }} style={{ display: 'block', margin: '10px auto 0', height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer' }}>Clear filters</button>}
               </div>
             )}
             {visibleProjects.map(p => {
@@ -884,6 +930,13 @@ export default function Workspace() {
                           // default branch (origin/HEAD). Preserves the zero-friction
                           // path for power users who don't care about the base.
                           if (e.metaKey || e.ctrlKey) {
+                            setPickerProj(null);
+                            newChat(p.id);
+                            return;
+                          }
+                          // Context projects have no repo (and a single operator
+                          // session) — a base-branch picker is meaningless there.
+                          if (p.kind === 'context') {
                             setPickerProj(null);
                             newChat(p.id);
                             return;
@@ -1079,8 +1132,10 @@ export default function Workspace() {
             )}
             {/* New-chat "+" — opens the new tab in the active project (so the
                 strip stays project-scoped). Falls back to the first project
-                only when nothing is active yet. */}
-            <button onClick={() => newChat(activeProjectId ?? projects[0]?.id ?? '')} disabled={projects.length === 0}
+                only when nothing is active yet — in operator mode that fallback
+                is restricted to context projects so a coding chat can't open
+                inside the Agent view. */}
+            <button onClick={() => { const pid = newChatTargetProject(operator, activeProjectId, projects); if (pid) newChat(pid); else setAddOpen(true); }} disabled={projects.length === 0}
               title={activeProjectId ? `New chat in ${projById[activeProjectId]?.name ?? 'project'}` : 'New chat'} className="ws-newbtn"
               style={{ width: 36, flexShrink: 0, display: 'grid', placeItems: 'center', borderLeft: '0.5px solid var(--separator)', color: 'var(--ink-secondary)', background: 'transparent', cursor: projects.length ? 'pointer' : 'default' }}>
               <Icon name="plus" size={15} stroke={2.4} />
@@ -1197,7 +1252,7 @@ export default function Workspace() {
       {/* In-workspace add-project modal — dims the workspace but leaves it
           visible, so the user knows they did NOT navigate away. The "+"
           button above opens it; success returns through onProjectAdded. */}
-      <AddProjectModal open={addOpen} onClose={() => setAddOpen(false)} onAdded={onProjectAdded} />
+      <AddProjectModal open={addOpen} onClose={() => setAddOpen(false)} onAdded={onProjectAdded} initialTab={operator ? 'context' : undefined} />
     </AppShell>
   );
 }

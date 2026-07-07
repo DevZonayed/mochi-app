@@ -34,7 +34,7 @@ export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
-export type ProjectKind = 'coding' | 'design' | 'content' | 'research' | 'general';
+export type ProjectKind = 'coding' | 'design' | 'content' | 'research' | 'general' | 'context';
 
 export interface Workspace { id: string; name: string; budgetCap: number; createdAt: number }
 export interface Project {
@@ -79,6 +79,11 @@ export interface Project {
   /** The operator's creation-time inputs (PRD / existing url / inspirations /
       resources / auto-answer preference). Sanitized at the API boundary. */
   designBrief?: DesignBrief;
+  /** Context (knowledge/operator) projects only: the coding/design projects this
+      operator is CONNECTED to. Its agent may read their `.continuum` memory and
+      dispatch work sessions into them (operator-linked, never self-expanding —
+      only updateProject mutates this list). */
+  linkedProjectIds?: string[];
   createdAt: number;
   /** Set on create + bumped on every mutation (incl. reorder). Drives the
       relay's delta-sync filter (/api/sync?since=ts). */
@@ -601,6 +606,35 @@ export interface WaChat {
   messages: WaMessage[];
 }
 
+/* ── Context (knowledge/operator) projects ─────────────────────────────── */
+
+/** One unit of work a Context project's operator agent dispatched into a
+    CONNECTED coding/design project (its own session + job over there). Persisted
+    so the engine's post-turn hook can report the result BACK into the context
+    session even across an app restart. */
+export interface ContextDispatch {
+  id: string;
+  /** The context project + its single operator session that asked for the work. */
+  contextProjectId: string;
+  contextSessionId: string;
+  /** Where the work runs. */
+  targetProjectId: string;
+  targetSessionId: string;
+  jobId: string;
+  title: string;
+  status: 'running' | 'done' | 'failed';
+  /** Set once the completion report has been fired back into the context
+      session, so a re-emitted job event can never double-report. */
+  reportedAt?: number;
+  createdAt: number;
+  finishedAt?: number;
+}
+
+/** A WhatsApp message a context project's agent sent to the OPERATOR, recorded
+    so a quoted reply from the operator can be routed back into that project's
+    session (the reply's quotedText is prefix-matched against `text`). */
+export interface ContextWaSend { projectId: string; sessionId: string; chatId: string; text: string; at: number }
+
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
   whatsapp: { connected: boolean; jid: string | null; name: string | null; tracked: number; sendApproved: boolean };
@@ -706,6 +740,10 @@ interface StoreData {
       condition that posts a NEW chat message when the criteria becomes true).
       See BrowserWatch + browser-watch.ts. Mac-local; not relayed. */
   browserWatches?: BrowserWatch[];
+  /** Context projects: dispatched cross-project work units (see ContextDispatch). */
+  contextDispatches?: ContextDispatch[];
+  /** Context projects: recent agent→operator WhatsApp sends (reply-routing ring). */
+  contextWaSends?: ContextWaSend[];
   skills: Skill[];
   templates: Template[];
   assets: Asset[];
@@ -1388,7 +1426,7 @@ export class Store {
     this.data.projects.push(p); this.save();
     return p;
   }
-  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden' | 'designMode' | 'designPhase' | 'designFlow' | 'designBrief'>>): Project {
+  updateProject(projectId: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden' | 'designMode' | 'designPhase' | 'designFlow' | 'designBrief' | 'linkedProjectIds'>>): Project {
     const cur = this.getProject(projectId);
     if (!cur) throw Object.assign(new Error('project not found'), { statusCode: 404 });
     Object.assign(cur, patch, { updatedAt: now() });
@@ -2040,6 +2078,64 @@ export class Store {
       if (s.kind === 'whatsapp-analyze' && s.chatId === chatId && s.enabled) { s.enabled = false; s.nextRun = null; }
     }
     this.save();
+  }
+
+  // ── Context (knowledge/operator) projects ──────────────────────────
+  /** The single operator session of a context project — OLDEST non-archived.
+      Context projects hold exactly ONE conversation from start to end; callers
+      route every message here instead of creating a fresh session. */
+  primarySessionOf(projectId: string): ChatSession | undefined {
+    return this.data.sessions
+      .filter(s => s.projectId === projectId && !s.archived)
+      .sort((a, b) => a.createdAt - b.createdAt)[0];
+  }
+  /** Record a cross-project work dispatch (operator agent → linked project). */
+  recordContextDispatch(input: Omit<ContextDispatch, 'id' | 'status' | 'createdAt'>): ContextDispatch {
+    if (!this.data.contextDispatches) this.data.contextDispatches = [];
+    const rec: ContextDispatch = { ...input, id: id(), status: 'running', createdAt: now() };
+    this.data.contextDispatches.push(rec);
+    // Ring: keep the last 200 dispatches so a long-lived operator never bloats.
+    if (this.data.contextDispatches.length > 200) this.data.contextDispatches.splice(0, this.data.contextDispatches.length - 200);
+    this.save();
+    return rec;
+  }
+  getContextDispatch(dispatchId: string): ContextDispatch | undefined {
+    return (this.data.contextDispatches ?? []).find(d => d.id === dispatchId);
+  }
+  listContextDispatches(contextProjectId: string): ContextDispatch[] {
+    return (this.data.contextDispatches ?? []).filter(d => d.contextProjectId === contextProjectId).sort((a, b) => b.createdAt - a.createdAt);
+  }
+  /** Settle the dispatch that owns `jobId` (if any) and claim its ONE report
+      slot. Returns the dispatch exactly once — a second call for the same job
+      returns null, so the engine's post-turn report can never double-fire. */
+  settleContextDispatch(jobId: string, status: 'done' | 'failed'): ContextDispatch | null {
+    const d = (this.data.contextDispatches ?? []).find(x => x.jobId === jobId);
+    if (!d || d.reportedAt) return null;
+    d.status = status; d.finishedAt = now(); d.reportedAt = now();
+    this.save();
+    return d;
+  }
+  /** Remember a context agent → operator WhatsApp send (reply-routing ring). */
+  recordContextWaSend(input: Omit<ContextWaSend, 'at'>): void {
+    if (!input.text.trim()) return;
+    if (!this.data.contextWaSends) this.data.contextWaSends = [];
+    this.data.contextWaSends.push({ ...input, at: now() });
+    if (this.data.contextWaSends.length > 80) this.data.contextWaSends.splice(0, this.data.contextWaSends.length - 80);
+    this.save();
+  }
+  /** Match a quoted reply back to the context send it quotes. WhatsApp quotes
+      carry the quoted TEXT (not our msgId), so match on a normalized prefix —
+      newest send wins when several share a prefix. */
+  matchContextWaSend(chatId: string, quotedText: string): ContextWaSend | null {
+    const norm = (s: string) => s.replace(/\s+/g, ' ').trim().slice(0, 64).toLowerCase();
+    const q = norm(quotedText);
+    if (!q) return null;
+    const ring = (this.data.contextWaSends ?? []).filter(s => s.chatId === chatId);
+    for (let i = ring.length - 1; i >= 0; i--) {
+      const t = norm(ring[i].text);
+      if (t.startsWith(q) || q.startsWith(t)) return ring[i];
+    }
+    return null;
   }
 
   // ── Browser watches (background "observe an element / condition") ───

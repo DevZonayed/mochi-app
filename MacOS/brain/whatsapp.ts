@@ -233,6 +233,11 @@ export type LinkResult = { method: 'qr'; dataUrl: string } | { method: 'pairing'
 interface WaDeps {
   makeSocket?: (authDir: string) => Promise<WaSocket>;
   qrToDataUrl?: (qr: string) => Promise<string>;
+  /** Context-operator reply routing: when the operator QUOTES a message a
+      context agent sent them (note-to-self or the notify DM) and replies, the
+      reply is handed here (context-operator.makeOperatorReplyHandler) instead
+      of the normal pend/timer path. Resolves true when it owned the message. */
+  onOperatorReply?: (evt: { chatId: string; quotedText: string; text: string }) => Promise<boolean>;
 }
 
 // Permanent-failure close codes that must NOT auto-reconnect (adapted from the
@@ -324,7 +329,24 @@ export class WhatsAppClient {
     if (!msg) return;
     const stored = this.capture(msg, true);
     if (stored) this.emit('wa-message', { chatId: msg.chatId, message: stored, chat: this.store.waGetChat(msg.chatId) });
-    const own = this.store.whatsappState().jid;
+    const st = this.store.whatsappState();
+    const own = st.jid;
+    // Operator quoted-reply → context session. The agent's messages to the
+    // operator go to notifyJid || jid (sendToSelf); when the operator REPLIES
+    // by quoting one of them, route the reply back into the context project's
+    // operator session instead of pending/timing it. The sync ring match keeps
+    // this path zero-cost for every unrelated message.
+    if (msg.quotedText && this.deps.onOperatorReply) {
+      const notify = st.notifyJid || own;
+      const isOperatorChannel =
+        (!!own && msg.chatId === own && msg.fromMe) ||                          // note-to-self (same account)
+        (!!notify && msg.chatId === notify && msg.chatId !== own && !msg.fromMe); // personal notify number
+      const replyText = displayText(msg);
+      if (isOperatorChannel && replyText && this.store.matchContextWaSend(msg.chatId, msg.quotedText)) {
+        void this.deps.onOperatorReply({ chatId: msg.chatId, quotedText: msg.quotedText, text: replyText }).catch(() => {});
+        return;
+      }
+    }
     if (own && msg.chatId === own) return; // own notes: shown, never pended/timed
     const text = displayText(msg);
     if (!text) return; // empty system/protocol frame — captured kind only
