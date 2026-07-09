@@ -8,7 +8,7 @@ export default defineConfig({
     environment: 'node',
     // Renderer unit tests (renderer/**) are pure-logic modules and run fine
     // under node — keeping them here means `pnpm test` covers the whole app.
-    include: ['brain/**/*.test.ts', 'renderer/**/*.test.ts', 'sidecar/**/*.test.ts'],
+    include: ['brain/**/*.test.ts', 'renderer/**/*.test.ts', 'sidecar/**/*.test.ts', 'webview-app/**/*.test.ts'],
   },
   resolve: {
     extensionAlias: { '.js': ['.ts', '.js'] },

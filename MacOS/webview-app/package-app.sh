@@ -7,9 +7,12 @@ CONFIG="${1:-release}"
 # on purpose (keychain entries + TCC permissions are keyed by it).
 APP_NAME="Mochlet"
 EXEC_NAME="MaestroWebKit"
-VERSION="${MAESTRO_VERSION:-0.1.28}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+# Release version resolution (see resolve-version.sh): explicit MAESTRO_VERSION
+# wins; else the nearest reachable mochlet-v* git tag; else 0.0.0-dev. Never a
+# stale hardcoded release number — a plain `./package-app.sh release` derives it.
+VERSION="$(bash "$ROOT/resolve-version.sh" "$REPO_ROOT")"
 BUILD_DIR="$ROOT/.build/$CONFIG"
 OUT="$ROOT/dist"
 APP="$OUT/$APP_NAME.app"
@@ -31,19 +34,73 @@ resolve_path() {
 # The Maestro dev shell prepends a ~121-byte `node` shim that execs the INSTALLED
 # app's bundled node. That target is unstable during packaging — `rm -rf "$APP"`
 # below deletes the dist app's node mid-build — so every `node` / shebang call
-# (vite, esbuild) would break. Pin a real, standalone node to the FRONT of PATH
-# for the whole build so nothing depends on the shim.
+# (vite, esbuild) would break. Pin a real, STANDALONE node to the FRONT of PATH.
+#
+# Crucially, the pinned node also becomes the node we EMBED, so it must be able to
+# load this repo's COMPILED native addons (better-sqlite3 uses a NAN/ABI-specific
+# `.node`; a Node whose NODE_MODULE_VERSION differs — e.g. Homebrew v26/ABI147 vs
+# deps built for Node24/ABI137 — links & signs a bundle that can't `dlopen` at
+# runtime). So a candidate is accepted ONLY if that exact node can resolve+load
+# the repo-root better-sqlite3 and sharp and round-trip an in-memory SQLite DB.
 node_is_real() { [ -x "$1" ] && [ "$(stat -f%z "$1" 2>/dev/null || echo 0)" -gt 1048576 ] && file -b "$1" 2>/dev/null | grep -q "Mach-O"; }
-for cand in /opt/homebrew/bin/node /usr/local/bin/node \
-  "/Applications/Mochlet.app/Contents/Resources/sidecar/bin/node" \
-  "/Applications/Maestro WebKit.app/Contents/Resources/sidecar/bin/node"; do
-  rp="$(resolve_path "$cand" 2>/dev/null || true)"
-  if node_is_real "$rp"; then
-    export PATH="$(dirname "$rp"):$PATH"
-    echo "> using real node for build: $rp"
-    break
-  fi
-done
+
+# ABI/loadability probe: does THIS node load the repo's compiled native deps?
+ABI_PROBE_DIR="$(mktemp -d)"
+ABI_PROBE="$ABI_PROBE_DIR/abi-probe.cjs"
+cat > "$ABI_PROBE" <<'PROBE'
+'use strict';
+// Resolve from the repo root node_modules (hoisted), exactly where the sidecar's
+// externalized native deps are copied from. Require + exercise both addons.
+const { createRequire } = require('node:module');
+const path = require('node:path');
+const repoRoot = process.argv[2];
+const req = createRequire(path.join(repoRoot, 'package.json'));
+const Database = req('better-sqlite3');
+const db = new Database(':memory:');
+try { db.prepare('select sqlite_version() as v').get(); } finally { db.close(); }
+req('sharp'); // loading the native binding is the failure point for a bad ABI
+process.stdout.write(process.version + ' ABI' + process.versions.modules + '\n');
+PROBE
+
+pick_build_node() {
+  local shell_node cand rp ver vinfo
+  # `command -v node` is included first (the shim fails node_is_real and is
+  # skipped; a real shell node would be tried). Then known standalone locations.
+  shell_node="$(command -v node 2>/dev/null || true)"
+  for cand in "$shell_node" /opt/homebrew/bin/node /usr/local/bin/node \
+    "/Applications/Mochlet.app/Contents/Resources/sidecar/bin/node" \
+    "/Applications/Maestro WebKit.app/Contents/Resources/sidecar/bin/node"; do
+    [ -n "$cand" ] || continue
+    rp="$(resolve_path "$cand" 2>/dev/null || true)"
+    [ -n "$rp" ] || continue
+    if ! node_is_real "$rp"; then
+      # Not self-contained (the ~121B dev shim, or a dynamically-linked node too
+      # small to embed standalone). Show its version/ABI when runnable, for truth.
+      vinfo="$("$rp" -e 'process.stdout.write(process.version+" ABI"+process.versions.modules)' 2>/dev/null || echo 'not a runnable standalone node')"
+      echo "  skip (not a self-contained standalone node): $cand ($vinfo)"
+      continue
+    fi
+    if ver="$("$rp" "$ABI_PROBE" "$REPO_ROOT" 2>/dev/null)"; then
+      export PATH="$(dirname "$rp"):$PATH"
+      echo "> using ABI-compatible node for build: $rp ($ver)"
+      return 0
+    fi
+    vinfo="$("$rp" -e 'process.stdout.write(process.version+" ABI"+process.versions.modules)' 2>/dev/null || echo 'unknown')"
+    echo "  skip (cannot load repo native deps — better-sqlite3/sharp ABI mismatch): $rp ($vinfo)"
+  done
+  return 1
+}
+
+if ! pick_build_node; then
+  rm -rf "$ABI_PROBE_DIR"
+  echo "ERROR: no standalone Node found that can load this repo's compiled native modules" >&2
+  echo "  (better-sqlite3 + sharp). Rebuild them under the Node you intend to ship — matching" >&2
+  echo "  its NODE_MODULE_VERSION — e.g.  (cd \"$REPO_ROOT\" && npm rebuild better-sqlite3 sharp)" >&2
+  echo "  with that Node active, or install a standalone Node whose ABI matches. Refusing to" >&2
+  echo "  build a bundle whose embedded Node can't dlopen its native addons." >&2
+  exit 1
+fi
+rm -rf "$ABI_PROBE_DIR"
 
 echo "> building React renderer for WebKit"
 if [ ! -x "$REPO_ROOT/node_modules/.bin/vite" ]; then
@@ -182,6 +239,57 @@ echo "> embedding externalized native deps"
 REPO_NM="$REPO_ROOT/node_modules"
 node "$SIDECAR/embed-externals.mjs" "$REPO_NM" "$RES_SC/node_modules" \
   better-sqlite3 sharp jimp link-preview-js qrcode-terminal playwright-core fsevents
+
+# ── Pre-codesign native-module preflight ─────────────────────────────────────
+# A signed bundle that embeds better-sqlite3 / sharp is still broken if their
+# native `.node` addons can't LOAD inside the app's embedded Node (e.g. an
+# `--ignore-scripts` install left `build/Release/better_sqlite3.node` absent).
+# Run the APP'S OWN embedded node, resolve modules exactly as the sidecar does
+# (from Contents/Resources/sidecar), require both native deps, and instantiate +
+# close an in-memory SQLite DB. ANY failure exits nonzero so the build cannot
+# claim success. The smoke script lives in a temp dir — never inside the bundle,
+# so it is not shipped or signed. Prints only non-secret OK/version evidence.
+echo "> preflight: embedded-node native module smoke (sharp + better-sqlite3)"
+SMOKE_NODE="$RES_SC/bin/node"
+if [ -x "$SMOKE_NODE" ]; then
+  SMOKE_DIR="$(mktemp -d)"
+  SMOKE_JS="$SMOKE_DIR/preflight.cjs"
+  cat > "$SMOKE_JS" <<'SMOKE'
+'use strict';
+// Resolve modules from the sidecar Resources dir, identical to how
+// maestro-sidecar.mjs resolves its externalized native deps at runtime.
+const { createRequire } = require('node:module');
+const path = require('node:path');
+const base = process.argv[2];
+const req = createRequire(path.join(base, 'maestro-sidecar.mjs'));
+
+// better-sqlite3: require + instantiate an in-memory DB + trivial query + close.
+const Database = req('better-sqlite3');
+const db = new Database(':memory:');
+try {
+  const v = db.prepare('select sqlite_version() as v').get().v;
+  console.log('  better-sqlite3 OK (sqlite ' + v + ')');
+} finally {
+  db.close();
+}
+
+// sharp: require loads the native binding (the failure point for a broken
+// install); report its version as non-secret evidence.
+const sharp = req('sharp');
+const sv = (sharp.versions && sharp.versions.sharp) || 'unknown';
+console.log('  sharp OK (v' + sv + ')');
+SMOKE
+  if "$SMOKE_NODE" "$SMOKE_JS" "$RES_SC"; then
+    rm -rf "$SMOKE_DIR"
+    echo "  preflight OK"
+  else
+    rm -rf "$SMOKE_DIR"
+    echo "  ERROR: embedded-node native-module preflight FAILED — sharp/better-sqlite3 are not loadable in the bundle; refusing to sign a broken app." >&2
+    exit 1
+  fi
+else
+  echo "  warning: no embedded node at $SMOKE_NODE — skipping native preflight (dev/system-node build)"
+fi
 
 echo "> ad-hoc codesign"
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "  (codesign skipped)"

@@ -11,7 +11,7 @@
    the foreign copy in before writing (union by id, newest-write-wins, deletes
    propagate via tombstones), so two writers CONVERGE instead of clobber. */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { rmSync, writeFileSync, existsSync, statSync, utimesSync } from 'node:fs';
+import { rmSync, writeFileSync, existsSync, statSync, chmodSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 
 const hoisted = vi.hoisted(() => ({ dir: `/tmp/maestro-store-multiwriter-test-${process.pid}` }));
@@ -19,7 +19,9 @@ vi.mock('electron', () => ({ app: { getPath: () => hoisted.dir } }));
 
 import { Store } from './store.js';
 
+const STOREFILE = join(hoisted.dir, 'maestro-store.json');
 const LOCK = join(hoisted.dir, 'maestro-store.json.lock');
+const mode = (f: string) => statSync(f).mode & 0o777;
 
 describe('Store — concurrent writers do not clobber each other', () => {
   beforeEach(() => { rmSync(hoisted.dir, { recursive: true, force: true }); });
@@ -137,4 +139,38 @@ describe('Store — write lock keeps the critical section serial without wedging
     const C = new Store();
     expect(C.getProject(p.id)?.name).toBe('Renamed'); // the lockless save landed
   }, 10_000);
+});
+
+describe('Store — startup temp sweep respects a live writer (no lost-write race)', () => {
+  beforeEach(() => { rmSync(hoisted.dir, { recursive: true, force: true }); });
+
+  it('does not delete a live writer\'s in-flight temp (fresh lock), but hardens it; reaps it once the lock is stale', () => {
+    // Stabilise the on-disk store: the FIRST reload applies a one-time migration
+    // and re-saves, later reloads don't. Construct twice up front so the sweep
+    // constructions below trigger NO save → they never wait on the fresh lock
+    // (avoiding the ~3s acquire timeout).
+    new Store();
+    new Store();
+
+    // A concurrent writer is mid-save: it created its unique temp and holds a
+    // FRESH lock; the rename hasn't happened yet.
+    const liveTemp = `${STOREFILE}.tmp-${process.pid + 1}-abc123`;
+    writeFileSync(liveTemp, 'in-flight store payload');
+    chmodSync(liveTemp, 0o644);
+    writeFileSync(LOCK, `${process.pid + 1}:${Date.now()}`); // fresh lock (mtime = now)
+
+    // Another process boots. Its startup sweep MUST NOT delete the live temp —
+    // doing so would ENOENT the writer's pending rename and silently lose the save.
+    new Store();
+    expect(existsSync(liveTemp)).toBe(true);   // (a) live temp preserved
+    expect(mode(liveTemp)).toBe(0o600);        // (b) still hardened (no secret left 0644)
+
+    // The writer finishes/crashes; its lock goes stale (> LOCK_STALE_MS = 10s old).
+    const stale = Date.now() / 1000 - 30;
+    utimesSync(LOCK, stale, stale);
+
+    // A later boot now safely reaps the orphaned temp.
+    new Store();
+    expect(existsSync(liveTemp)).toBe(false);  // (c) stale-era temp removed
+  });
 });

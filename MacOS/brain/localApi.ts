@@ -776,12 +776,15 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'renameSession': {
         if (!p.title || typeof p.title !== 'string') bad('title required');
-        const s = store.updateSession(String(p.id ?? ''), { title: (p.title as string).slice(0, 60) });
+        // `id` is canonical here; `sessionId` accepted as an alias for parity
+        // with the git/reviewer session tools (external MCP clients mix them).
+        const s = store.updateSession(String(p.id ?? p.sessionId ?? ''), { title: (p.title as string).slice(0, 60) });
         emit('session', s);
         return s;
       }
       case 'deleteSession': {
-        const s = store.getSession(String(p.id ?? ''));
+        const sid = String(p.id ?? p.sessionId ?? '');
+        const s = store.getSession(sid);
         if (s?.worktreePath) {
           const proj = store.getProject(s.projectId);
           if (proj?.path) {
@@ -790,18 +793,18 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         }
         // Stop the git filesystem watcher BEFORE the row vanishes — the
         // watcher holds an fd into `.git`, which would dangle on prune.
-        try { gitWatcher?.detach(String(p.id ?? '')); } catch { /* best effort */ }
-        store.deleteSession(String(p.id ?? ''));
-        emit('session', { id: String(p.id ?? ''), deleted: true });
+        try { gitWatcher?.detach(sid); } catch { /* best effort */ }
+        store.deleteSession(sid);
+        emit('session', { id: sid, deleted: true });
         return { ok: true };
       }
       case 'pinSession': {
-        const s = store.setSessionPinned(String(p.id ?? ''), p.pinned === true);
+        const s = store.setSessionPinned(String(p.id ?? p.sessionId ?? ''), p.pinned === true);
         emit('session', s);
         return s;
       }
       case 'archiveSession': {
-        const s = store.setSessionArchived(String(p.id ?? ''), p.archived === true);
+        const s = store.setSessionArchived(String(p.id ?? p.sessionId ?? ''), p.archived === true);
         emit('session', s);
         return s;
       }
@@ -812,7 +815,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // asks for what they need (avoids blasting megabytes of history into
       // every first turn). The old session stays open for read-only reference.
       case 'continueSession': {
-        const prev = store.getSession(String(p.sessionId ?? ''));
+        const prev = store.getSession(String(p.sessionId ?? p.id ?? ''));
         if (!prev) return bad('session not found', 404);
         const project = store.getProject(prev.projectId);
         if (!project) return bad('project not found', 404);
@@ -844,12 +847,69 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // operator opts in explicitly per chat (was always-on for legacy chats
       // which produced too-eager auto-continues and silent reviewer skips).
       case 'setSessionAutopilot': {
-        const s = store.updateSession(String(p.id ?? ''), { autoPilot: p.enabled === true });
+        // Accept the canonical `sessionId` OR the legacy `id` alias, and the
+        // canonical `enabled` OR the `on` alias — an external MCP client that
+        // sent {sessionId, on:true} was silently getting autoPilot:false.
+        // The schema advertises (enabled|on) as REQUIRED and boolean, but the
+        // External MCP transport forwards tools/call arguments straight to
+        // dispatch WITHOUT Ajv validation (external-mcp.ts) — so a missing or
+        // non-boolean flag (`{sessionId}`, `{sessionId, on:"true"}`) must be
+        // rejected HERE, or it would silently DISABLE autopilot and report
+        // success. Only a real boolean is honoured.
+        const enabled = typeof p.enabled === 'boolean' ? p.enabled
+          : typeof p.on === 'boolean' ? p.on : undefined;
+        if (enabled === undefined) bad('setSessionAutopilot needs a boolean `enabled` (alias `on`)');
+        const s = store.updateSession(String(p.sessionId ?? p.id ?? ''), { autoPilot: enabled });
         emit('session', s);
         return s;
       }
       case 'setSessionReviewer': {
-        const s = store.updateSession(String(p.id ?? ''), { reviewerEnabled: p.enabled === true });
+        // Two independent concerns on one tool:
+        //   • the reviewer ROLE (which engine/model reviews) — persisted in
+        //     `session.reviewer` (a {engine, model} object, or the literal
+        //     "off"). An external client sending {reviewer:{engine,model}} was
+        //     previously ignored — only the boolean below was ever applied.
+        //   • whether the reviewer pass RUNS every turn — the boolean
+        //     `reviewerEnabled` toggled by the composer button.
+        // Session id: canonical `sessionId`, `id` accepted as an alias.
+        const patch: { reviewer?: RoleChoice | 'off'; reviewerEnabled?: boolean } = {};
+        if (p.reviewer !== undefined) {
+          // Only two honest forms are accepted (matching what the schema
+          // advertises): the literal "off", or a role object with a KNOWN engine.
+          // Anything else (junk string, {} with no/invalid engine, null, a number)
+          // is REJECTED loudly — never a silent no-op that looks like success.
+          // We do NOT accept null (not advertised) — it falls through to `bad`.
+          if (p.reviewer === 'off') {
+            patch.reviewer = 'off';
+            patch.reviewerEnabled = false; // no role → the pass can't run
+          } else if (p.reviewer && typeof p.reviewer === 'object') {
+            const eng = asEngine((p.reviewer as { engine?: unknown }).engine);
+            if (eng) {
+              patch.reviewer = { engine: eng, model: asModel((p.reviewer as { model?: unknown }).model) };
+              patch.reviewerEnabled = true; // picking a reviewer turns the pass on
+            } else {
+              bad('invalid reviewer: expected {engine, model} with a known engine, or the literal "off"');
+            }
+          } else {
+            bad('invalid reviewer: expected {engine, model} or the literal "off"');
+          }
+        }
+        // An EXPLICIT boolean toggle (renderer path, or {on}) wins over the
+        // role's implied enable, so callers can set a role but keep it paused.
+        // Same rule as autopilot: if a toggle KEY is present it must be a real
+        // boolean — a non-boolean (`enabled:"true"`) is rejected, never coerced
+        // to a silent `false` (dispatch runs unvalidated over External MCP).
+        const flagProvided = p.enabled !== undefined || p.on !== undefined;
+        if (flagProvided) {
+          const enabled = typeof p.enabled === 'boolean' ? p.enabled
+            : typeof p.on === 'boolean' ? p.on : undefined;
+          if (enabled === undefined) bad('setSessionReviewer `enabled` (alias `on`) must be a boolean');
+          patch.reviewerEnabled = enabled;
+        }
+        // Nothing to apply (neither a reviewer nor a toggle) is a client error,
+        // not a misleading success that emits an unchanged session.
+        if (Object.keys(patch).length === 0) bad('setSessionReviewer needs `reviewer` and/or `enabled`');
+        const s = store.updateSession(String(p.sessionId ?? p.id ?? ''), patch);
         emit('session', s);
         return s;
       }
@@ -871,7 +931,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // Per-session git/PR status (local facts + live PR). Emits a git-status event too.
       case 'getSessionGitStatus': {
         if (!gitService) return bad('git service unavailable', 500);
-        const s = store.getSession(String(p.sessionId ?? ''));
+        const s = store.getSession(String(p.sessionId ?? p.id ?? ''));
         if (!s) return bad('session not found', 404);
         // Lazy-attach the filesystem watcher on the first read for this session
         // so live `.git` mutations (commit/push/checkout) push status updates
@@ -884,7 +944,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'refreshSessionGitStatus': {
         if (!gitService) return bad('git service unavailable', 500);
-        const s = store.getSession(String(p.sessionId ?? ''));
+        const s = store.getSession(String(p.sessionId ?? p.id ?? ''));
         if (!s) return bad('session not found', 404);
         if (!NATIVE_WEBKIT) {
           try { gitWatcher?.attach(s.id); } catch { /* best effort */ }
@@ -892,6 +952,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return gitService.fullStatus(s, { withPr: true });
       }
       // ── PR actions (DESKTOP-ONLY, outward — UI confirms before calling) ─
+      // These are destructive/irreversible session tools. We DELIBERATELY accept
+      // only the canonical `sessionId` (no `id` alias): the renderer always passes
+      // sessionId, and we don't broaden the accepted param surface of outward-
+      // facing/irreversible operations without a concrete client need.
       case 'pushSession': {
         if (!gitService) return bad('git service unavailable', 500);
         const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
@@ -930,13 +994,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // for the confirm dialog. Read-only: no GitHub merge call, no worktree changes.
       case 'previewSessionMerge': {
         if (!gitService) return bad('git service unavailable', 500);
-        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        const s = store.getSession(String(p.sessionId ?? p.id ?? '')); if (!s) return bad('session not found', 404);
         const method = p.method === 'merge' || p.method === 'squash' || p.method === 'rebase' ? p.method : undefined;
         return gitService.previewMergePr(s, { method });
       }
       case 'previewSessionResolve': {
         if (!gitService) return bad('git service unavailable', 500);
-        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        const s = store.getSession(String(p.sessionId ?? p.id ?? '')); if (!s) return bad('session not found', 404);
         return gitService.previewResolveSession(s);
       }
       // T8 — read-only conflict hunk extraction for the AI-resolve dialog.
@@ -944,14 +1008,14 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // current `<<<<<<< / >>>>>>>` blocks. Renderer-facing.
       case 'getConflictHunks': {
         if (!gitService) return bad('git service unavailable', 500);
-        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        const s = store.getSession(String(p.sessionId ?? p.id ?? '')); if (!s) return bad('session not found', 404);
         return gitService.getConflictHunks(s);
       }
       // T8 — persist the "additional instructions" the operator last typed
       // into the AI-resolve dialog, so re-runs in the same chat pre-fill
       // the textarea. Empty string clears the hint.
       case 'setConflictResolveHint': {
-        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        const s = store.getSession(String(p.sessionId ?? p.id ?? '')); if (!s) return bad('session not found', 404);
         const raw = typeof p.hint === 'string' ? p.hint : '';
         const trimmed = raw.slice(0, 2000); // 2KB cap, no need for more
         return store.updateSession(s.id, { conflictResolveHint: trimmed || undefined });
@@ -960,7 +1024,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // branch now" button in the chat header).
       case 'renameSessionBranch': {
         if (!gitService) return bad('git service unavailable', 500);
-        const s = store.getSession(String(p.sessionId ?? '')); if (!s) return bad('session not found', 404);
+        const s = store.getSession(String(p.sessionId ?? p.id ?? '')); if (!s) return bad('session not found', 404);
         return gitService.renameSessionBranch(s);
       }
 
@@ -1021,7 +1085,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'sendChat': {
         const projectId = String(p.projectId ?? '');
-        const text = String(p.text ?? '').trim();
+        // `text` is canonical; `prompt`/`message` are accepted aliases so a
+        // generic MCP client that reaches for the conventional field names
+        // still lands its turn (the drift this whole manifest guards against).
+        // First NONBLANK wins — matches the schema's per-alias nonblank rule, so
+        // {text:"", prompt:"hi"} routes "hi" instead of being rejected as empty.
+        const text = String(p.text ?? '').trim() || String(p.prompt ?? '').trim() || String(p.message ?? '').trim();
         const rawImages = Array.isArray(p.images) ? p.images as Array<{ id?: string; dataB64?: string; mime?: string; name?: string }> : [];
         const rawFiles = Array.isArray(p.files) ? p.files as Array<{ id?: string; name?: string; mime?: string; kind?: string; content?: string; dataB64?: string }> : [];
         if (!projectId || (!text && !rawImages.length && !rawFiles.length)) bad('projectId and a message, image, or file required');
@@ -1232,7 +1301,16 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         emit('job', j);
         return j;
       }
-      case 'runJob': return engine.run(String(p.id ?? ''), { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model) });
+      case 'runJob': {
+        // Async: hand back the job snapshot immediately and let the run stream
+        // over job events. Holding the RPC/MCP request open until the agent
+        // finishes was timing out external clients while work continued.
+        const jobId = String(p.id ?? '');
+        const j = store.getJob(jobId);
+        if (!j) return bad('job not found', 404);
+        void engine.run(jobId, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model) }).catch(() => { /* engine records failure on the job */ });
+        return j;
+      }
       case 'cancelJob': {
         const c = engine.cancel(String(p.id ?? ''));
         return c ?? bad('job is not running', 409);
@@ -1261,7 +1339,11 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!store.getProject(String(p.projectId))) bad('project not found', 404);
         const j = store.createJob(String(p.projectId), String(p.input), String(p.title ?? ''), (p.effort as Effort) ?? 'balanced');
         emit('job', j);
-        return engine.run(j.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model) });
+        // Return the job HANDLE promptly and run the agent in the background —
+        // callers (external MCP clients especially) track execution via
+        // getJob/listJobs instead of blocking on a long agent turn.
+        void engine.run(j.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model) }).catch(() => { /* engine records failure on the job */ });
+        return j;
       }
 
       // ── Approvals ──────────────────────────────────────────────
@@ -1347,7 +1429,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // the choice back as the model-recognized `[User answered AskUserQuestion]:`
       // message, resuming the session so the agent continues with the answer.
       case 'answerQuestion': {
-        const sessionId = String(p.sessionId ?? '');
+        const sessionId = String(p.sessionId ?? p.id ?? '');
         const answer = typeof p.answer === 'string' ? p.answer.trim().slice(0, 8000) : '';
         if (!sessionId) bad('sessionId required');
         if (!answer) bad('answer required');
@@ -1385,7 +1467,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // Once the next step would exceed the 30-min cap, pause it gracefully instead —
       // the question then waits indefinitely for a manual reply.
       case 'extendQuestion': {
-        const sessionId = String(p.sessionId ?? '');
+        const sessionId = String(p.sessionId ?? p.id ?? '');
         const s = store.listSchedules().find(x => x.kind === 'auto-answer' && x.sessionId === sessionId && x.enabled && !x.paused);
         if (!s) return bad('no pending question to extend', 404);
         const out = nextExtend(s.armedAt ?? s.createdAt, s.extends ?? 0);

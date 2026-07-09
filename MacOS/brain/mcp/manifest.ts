@@ -30,14 +30,37 @@ export type McpCategoryId =
 
 /** A JSON-Schema property descriptor (the small subset MCP clients actually use). */
 export interface McpProp {
-  type: string | string[];
+  type?: string | string[];
   description?: string;
   items?: { type: string };
-  enum?: readonly string[];
+  enum?: readonly (string | number | null)[];
+  const?: string | number | boolean | null;
+  /** Property-level union (e.g. reviewer = an object OR the literal "off"). */
+  anyOf?: McpProp[];
+  minLength?: number;
+  minItems?: number;
+  /** ECMA-262 pattern (unanchored). We use `\S` to require a NONBLANK string. */
+  pattern?: string;
+  /** For object-typed properties: required keys + nested property shapes (e.g. a
+      reviewer role must carry an `engine`). */
+  required?: string[];
+  properties?: Record<string, McpProp>;
+}
+
+/** A composable JSON-Schema fragment used inside top-level anyOf/allOf/not —
+    enough to express "at least one of these keys", "canonical OR alias", and
+    transport-dependent ("http ⇒ url, else command, but NOT both loopholes")
+    contracts. */
+export interface McpSubSchema {
+  required?: string[];
+  properties?: Record<string, McpProp>;
+  anyOf?: McpSubSchema[];
+  allOf?: McpSubSchema[];
+  not?: McpSubSchema;
 }
 
 /** The per-tool JSON input schema advertised to an external MCP client. */
-export interface McpInputSchema {
+export interface McpInputSchema extends McpSubSchema {
   type: 'object';
   properties: Record<string, McpProp>;
   required?: string[];
@@ -150,9 +173,9 @@ const GROUPS: Record<McpCategoryId, Row[]> = {
     ['pinSession', 'Pin/unpin a session. Params: {id, pinned}.'],
     ['archiveSession', 'Archive/unarchive a session. Params: {id, archived}.'],
     ['continueSession', 'Resume/fork a session. Params: {sessionId, baseRefName?, …}.'],
-    ['setSessionAutopilot', 'Toggle autopilot for a session. Params: {id, enabled}.'],
-    ['setSessionReviewer', 'Toggle the reviewer pass for a session. Params: {id, enabled}.'],
-    ['sendChat', 'Send a chat turn to the agent (the main entrypoint). Params: {projectId, text, sessionId?, …}.'],
+    ['setSessionAutopilot', 'Toggle autopilot for a session. Params: {sessionId|id, enabled|on}.'],
+    ['setSessionReviewer', 'Set the reviewer role and/or toggle the reviewer pass. Params: {sessionId|id, reviewer?:{engine,model}|"off", enabled?|on?}.'],
+    ['sendChat', 'Send a chat turn to the agent (the main entrypoint). Params: {projectId, text (aka prompt|message), sessionId?, …}.'],
     ['scanConversations', 'Scan external CLI conversation history to import. Params: {projectId}.'],
     ['importConversations', 'Import scanned conversations. Params: {projectId, items}.'],
   ],
@@ -350,19 +373,62 @@ const GROUPS: Record<McpCategoryId, Row[]> = {
    Kept tiny + explicit. `additionalProperties: true` everywhere — dispatch
    silently ignores unknown keys, so we document the known contract without
    ever rejecting a caller who sends a valid-but-undocumented extra field. */
-const S = (properties: Record<string, McpProp> = {}, required: string[] = []): McpInputSchema => ({
+const S = (
+  properties: Record<string, McpProp> = {},
+  required: string[] = [],
+  extra: { anyOf?: McpSubSchema[]; allOf?: McpSubSchema[] } = {},
+): McpInputSchema => ({
   type: 'object',
   properties,
   ...(required.length ? { required } : {}),
+  ...(extra.anyOf ? { anyOf: extra.anyOf } : {}),
+  ...(extra.allOf ? { allOf: extra.allOf } : {}),
   additionalProperties: true,
 });
 const str = (description?: string): McpProp => ({ type: 'string', ...(description ? { description } : {}) });
+/** A NONBLANK string (must contain a non-whitespace char) — mirrors dispatch's
+    `String(x).trim()` truthiness checks. `\S` is an unanchored "contains" match. */
+const nbstr = (description?: string): McpProp => ({ type: 'string', pattern: '\\S', ...(description ? { description } : {}) });
 const num = (description?: string): McpProp => ({ type: 'number', ...(description ? { description } : {}) });
+const numOrNull = (description?: string): McpProp => ({ type: ['number', 'null'], ...(description ? { description } : {}) });
 const bool = (description?: string): McpProp => ({ type: 'boolean', ...(description ? { description } : {}) });
 const strList = (description?: string): McpProp => ({ type: 'array', items: { type: 'string' }, ...(description ? { description } : {}) });
 const objList = (description?: string): McpProp => ({ type: 'array', ...(description ? { description } : {}) });
 const obj = (description?: string): McpProp => ({ type: 'object', ...(description ? { description } : {}) });
 const enumStr = (values: readonly string[], description?: string): McpProp => ({ type: 'string', enum: values, ...(description ? { description } : {}) });
+/** A reviewer value: a role OBJECT that carries an `engine` (a bare `{}` is not a
+    valid role), OR the literal string "off". Matches dispatch, which rejects an
+    object with no known engine. */
+const objOrOff = (description?: string): McpProp => ({
+  anyOf: [
+    { type: 'object', required: ['engine'], properties: { engine: { type: 'string' } } },
+    { const: 'off' },
+  ],
+  ...(description ? { description } : {}),
+});
+
+/** "At least one of these keys is present" — the shape both alias groups
+    (canonical OR alias) and payload groups (text|images|files) reduce to. */
+const oneOf = (...names: string[]): McpSubSchema => ({ anyOf: names.map((n) => ({ required: [n] })) });
+/** Like oneOf, but each alternative also requires its key to be a NONBLANK
+    string — so an empty/whitespace value doesn't satisfy the "at least one"
+    contract (mirrors dispatch's truthiness/trim checks). */
+const oneOfNonblank = (...names: string[]): McpSubSchema => ({
+  anyOf: names.map((n) => ({ required: [n], properties: { [n]: nbstr() } })),
+});
+
+/** normalizeMcpInput(): transport defaults to 'stdio'; stdio needs a nonblank
+    `command`, http needs a nonblank `url`. Honest, loophole-free branches:
+      - HTTP: transport === 'http' AND a (nonblank) url — a stray `command`
+        can NEVER stand in for the missing url,
+      - stdio: a (nonblank) command AND the request is NOT the http transport
+        (transport is 'stdio' or omitted).
+    `url`/`command` nonblank-ness is enforced on the tool's top-level props.
+    Shared by addMcpServer + updateMcpServer (both funnel through normalizeMcpInput). */
+const MCP_TRANSPORT_ANYOF: McpSubSchema[] = [
+  { properties: { transport: { const: 'http' } }, required: ['transport', 'url'] },
+  { required: ['command'], not: { required: ['transport'], properties: { transport: { const: 'http' } } } },
+];
 
 const PASSTHROUGH_SCHEMA: McpInputSchema = { type: 'object', properties: {}, additionalProperties: true };
 
@@ -406,7 +472,7 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     primaryKey: str('Picker key for the primary model (or use `primary`).'),
     primary: obj('{engine, model} for the primary role.'),
     reviewerKey: str('Picker key for the reviewer model, or "off".'),
-    reviewer: obj('{engine, model} for the reviewer role, or "off".'),
+    reviewer: objOrOff('{engine, model} for the reviewer role, OR the literal "off".'),
   }),
   getRouting: S(),
   setRouting: S({
@@ -496,20 +562,37 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     projectId: str('Project id.'), title: str('Session title.'), codename: str(),
     baseBranch: str('Branch to fork the worktree from.'), base: str('Alias of baseBranch.'),
   }, ['projectId']),
-  renameSession: S({ id: str('Session id.'), title: str('New title.') }, ['id', 'title']),
-  deleteSession: S({ id: str('Session id.') }, ['id']),
-  pinSession: S({ id: str('Session id.'), pinned: bool('Pin (true) or unpin (false).') }, ['id', 'pinned']),
-  archiveSession: S({ id: str('Session id.'), archived: bool('Archive (true) or unarchive (false).') }, ['id', 'archived']),
+  renameSession: S({ id: str('Session id (sessionId also accepted).'), sessionId: str('Alias of id.'), title: str('New title.') }, ['title'], oneOf('id', 'sessionId')),
+  deleteSession: S({ id: str('Session id (sessionId also accepted).'), sessionId: str('Alias of id.') }, [], oneOf('id', 'sessionId')),
+  pinSession: S({ id: str('Session id (sessionId also accepted).'), sessionId: str('Alias of id.'), pinned: bool('Pin (true) or unpin (false).') }, ['pinned'], oneOf('id', 'sessionId')),
+  archiveSession: S({ id: str('Session id (sessionId also accepted).'), sessionId: str('Alias of id.'), archived: bool('Archive (true) or unarchive (false).') }, ['archived'], oneOf('id', 'sessionId')),
   continueSession: S({
-    sessionId: str('Session id to fork from.'),
+    sessionId: str('Session id to fork from (id also accepted).'),
+    id: str('Alias of sessionId.'),
     baseRefName: str('Base ref for the new session.'),
     prNumber: num(), mergedAt: num(),
-  }, ['sessionId']),
-  setSessionAutopilot: S({ id: str('Session id.'), enabled: bool('Autopilot on/off.') }, ['id', 'enabled']),
-  setSessionReviewer: S({ id: str('Session id.'), enabled: bool('Reviewer pass on/off.') }, ['id', 'enabled']),
+  }, [], oneOf('sessionId', 'id')),
+  // Autopilot: session id via sessionId|id; the desired state via enabled|on.
+  setSessionAutopilot: S(
+    { sessionId: str('Session id (id also accepted).'), id: str('Alias of sessionId.'), enabled: bool('Autopilot on/off.'), on: bool('Alias of enabled.') },
+    [],
+    { allOf: [oneOf('sessionId', 'id'), oneOf('enabled', 'on')] },
+  ),
+  // Reviewer: session id via sessionId|id; supply a reviewer ROLE ({engine, model}
+  // or the literal "off"), and/or the boolean pass toggle (enabled|on).
+  setSessionReviewer: S(
+    {
+      sessionId: str('Session id (id also accepted).'), id: str('Alias of sessionId.'),
+      reviewer: objOrOff('{engine, model} reviewer role, OR the literal "off".'),
+      enabled: bool('Run the reviewer pass every turn.'), on: bool('Alias of enabled.'),
+    },
+    [],
+    { allOf: [oneOf('sessionId', 'id'), oneOf('reviewer', 'enabled', 'on')] },
+  ),
   sendChat: S({
     projectId: str('Project id (required).'),
-    text: str('The message text to send to the agent (the prompt).'),
+    text: str('The message text to send to the agent (the prompt). Aliases: prompt, message.'),
+    prompt: str('Alias of text.'), message: str('Alias of text.'),
     sessionId: str('Existing session id — omit to lazy-create/route to the primary session.'),
     images: objList('Pasted/dropped images: [{id?, dataB64, mime?, name?}].'),
     files: objList('Attachments: [{id?, name?, mime?, kind?, content?, dataB64?}].'),
@@ -519,7 +602,18 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     effort: enumStr(['fast', 'balanced', 'deep', 'max']),
     plan: bool('Plan mode.'), goal: bool('Goal mode.'), browser: bool('Grant browser tools.'),
     agentContext: str('Hidden context delivered to the model but not shown in transcript.'),
-  }, ['projectId']),
+  }, ['projectId'], {
+    // dispatch: projectId AND (NONBLANK text|prompt|message OR >=1 image OR >=1
+    // file). Whitespace-only text is trimmed away by dispatch, so `\S` (nonblank)
+    // is the honest rule; prompt/message are accepted aliases for text.
+    anyOf: [
+      { required: ['text'], properties: { text: nbstr() } },
+      { required: ['prompt'], properties: { prompt: nbstr() } },
+      { required: ['message'], properties: { message: nbstr() } },
+      { required: ['images'], properties: { images: { type: 'array', minItems: 1 } } },
+      { required: ['files'], properties: { files: { type: 'array', minItems: 1 } } },
+    ],
+  }),
   scanConversations: S({ projectId: str('Project id.') }, ['projectId']),
   importConversations: S({
     projectId: str('Project id.'),
@@ -527,26 +621,29 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
   }, ['projectId', 'items']),
 
   // ── git ─────────────────────────────────────────────────────────────────
-  getSessionGitStatus: S({ sessionId: str('Session id.'), withPr: bool('Include live PR status (default true).') }, ['sessionId']),
-  refreshSessionGitStatus: S({ sessionId: str('Session id.') }, ['sessionId']),
+  // All git session tools accept the canonical `sessionId` OR the `id` alias.
+  getSessionGitStatus: S({ sessionId: str('Session id (id also accepted).'), id: str('Alias of sessionId.'), withPr: bool('Include live PR status (default true).') }, [], oneOf('sessionId', 'id')),
+  refreshSessionGitStatus: S({ sessionId: str('Session id (id also accepted).'), id: str('Alias of sessionId.') }, [], oneOf('sessionId', 'id')),
+  // Destructive/irreversible PR actions: canonical `sessionId` ONLY (no `id`
+  // alias) — we don't broaden the param surface of outward-facing operations.
   pushSession: S({ sessionId: str('Session id.') }, ['sessionId']),
   createSessionPR: S({
     sessionId: str('Session id.'), title: str('PR title.'), body: str('PR body.'), base: str('Base branch.'),
   }, ['sessionId']),
   mergeSessionPR: S({ sessionId: str('Session id.'), method: enumStr(['merge', 'squash', 'rebase']) }, ['sessionId']),
   resolveSession: S({ sessionId: str('Session id.') }, ['sessionId']),
-  previewSessionMerge: S({ sessionId: str('Session id.'), method: enumStr(['merge', 'squash', 'rebase']) }, ['sessionId']),
-  previewSessionResolve: S({ sessionId: str('Session id.') }, ['sessionId']),
-  getConflictHunks: S({ sessionId: str('Session id.') }, ['sessionId']),
-  setConflictResolveHint: S({ sessionId: str('Session id.'), hint: str('Additional resolve instructions ("" clears).') }, ['sessionId']),
-  renameSessionBranch: S({ sessionId: str('Session id.') }, ['sessionId']),
-  archiveSessionWorktree: S({ sessionId: str('Session id.'), deleteBranch: bool('Also delete the branch.') }, ['sessionId']),
+  previewSessionMerge: S({ sessionId: str('Session id (id also accepted).'), id: str('Alias of sessionId.'), method: enumStr(['merge', 'squash', 'rebase']) }, [], oneOf('sessionId', 'id')),
+  previewSessionResolve: S({ sessionId: str('Session id (id also accepted).'), id: str('Alias of sessionId.') }, [], oneOf('sessionId', 'id')),
+  getConflictHunks: S({ sessionId: str('Session id (id also accepted).'), id: str('Alias of sessionId.') }, [], oneOf('sessionId', 'id')),
+  setConflictResolveHint: S({ sessionId: str('Session id (id also accepted).'), id: str('Alias of sessionId.'), hint: str('Additional resolve instructions ("" clears).') }, [], oneOf('sessionId', 'id')),
+  renameSessionBranch: S({ sessionId: str('Session id (id also accepted).'), id: str('Alias of sessionId.') }, [], oneOf('sessionId', 'id')),
+  archiveSessionWorktree: S({ sessionId: str('Session id (id also accepted).'), id: str('Alias of sessionId.'), deleteBranch: bool('Also delete the branch.') }, [], oneOf('sessionId', 'id')),
 
   // ── jobs ────────────────────────────────────────────────────────────────
   listJobs: S({ projectId: str(), sessionId: str() }),
   listJobPage: S({ projectId: str(), sessionId: str(), before: num(), cursor: str(), limit: num() }),
   getJob: S({ id: str('Job id.') }, ['id']),
-  getJobDiff: S({ id: str('Job id (jobId also accepted).'), jobId: str('Alias of id.') }, ['id']),
+  getJobDiff: S({ id: str('Job id (jobId also accepted).'), jobId: str('Alias of id.') }, [], oneOf('id', 'jobId')),
   createJob: S({
     projectId: str('Project id.'), input: str('The job prompt/input.'), title: str(),
     effort: enumStr(['fast', 'balanced', 'deep', 'max']),
@@ -565,8 +662,8 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
   listApprovals: S({ status: str('Filter by approval status (optional).') }),
   approveApproval: S({ id: str('Approval id.') }, ['id']),
   denyApproval: S({ id: str('Approval id.') }, ['id']),
-  answerQuestion: S({ sessionId: str('Session id the question belongs to.'), answer: str('The chosen answer text.') }, ['sessionId', 'answer']),
-  extendQuestion: S({ sessionId: str('Session id whose question countdown to extend.') }, ['sessionId']),
+  answerQuestion: S({ sessionId: str('Session id the question belongs to (id also accepted).'), id: str('Alias of sessionId.'), answer: str('The chosen answer text.') }, ['answer'], oneOf('sessionId', 'id')),
+  extendQuestion: S({ sessionId: str('Session id whose question countdown to extend (id also accepted).'), id: str('Alias of sessionId.') }, [], oneOf('sessionId', 'id')),
 
   // ── schedule ────────────────────────────────────────────────────────────
   listSchedules: S(),
@@ -605,23 +702,26 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
   listTemplates: S(),
   searchSkills: S({ q: str('Search query.'), limit: num('Max results (default 30).') }, ['q']),
   skillRegistryMeta: S(),
-  registryGetSkill: S({ id: str('Registry skill id (skillId also accepted).'), skillId: str('Alias of id.') }, ['id']),
-  registrySkillContent: S({ id: str('Registry skill id (skillId also accepted).'), skillId: str('Alias of id.') }, ['id']),
+  registryGetSkill: S({ id: str('Registry skill id (skillId also accepted).'), skillId: str('Alias of id.') }, [], oneOf('id', 'skillId')),
+  registrySkillContent: S({ id: str('Registry skill id (skillId also accepted).'), skillId: str('Alias of id.') }, [], oneOf('id', 'skillId')),
   listProjectSkills: S({ id: str('Project id.') }, ['id']),
   addSkillToProject: S({
     projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.'),
     skillId: str('Registry skill id to install.'),
-    name: str(), description: str(), risk: str(), source: str(), version: str(), via: str(),
-  }, ['projectId', 'skillId']),
+    name: str(), description: str(), risk: str(), source: str(), version: str(), via: str('"agent" or "operator" (who installed it).'),
+    disabledReason: str('If pre-disabled, why (e.g. a failed audit).'),
+    mirrorRepo: str('Upstream mirror repo the skill came from.'),
+    auditStatus: str('Security-audit status recorded for the skill.'),
+  }, ['skillId'], oneOf('projectId', 'id')),
   setProjectSkillEnabled: S({
     projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.'),
     skillId: str('Skill id or slug (slug also accepted).'), slug: str('Alias of skillId.'),
     enabled: bool('Enable/disable.'),
-  }, ['projectId', 'skillId', 'enabled']),
+  }, ['enabled'], { allOf: [oneOf('projectId', 'id'), oneOf('skillId', 'slug')] }),
   removeSkillFromProject: S({
     projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.'),
     skillId: str('Skill id or slug.'), slug: str('Alias of skillId.'),
-  }, ['projectId', 'skillId']),
+  }, [], { allOf: [oneOf('projectId', 'id'), oneOf('skillId', 'slug')] }),
 
   // ── mcp (outbound servers) — validated in normalizeMcpInput (drift-exempt) ─
   listMcpServers: S(),
@@ -629,19 +729,19 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     name: str('Server name (required).'),
     transport: enumStr(['stdio', 'http'], 'Transport (default stdio).'),
     enabled: bool(),
-    command: str('Executable — required for stdio.'), args: strList(), env: objList(), envPassthrough: strList(), cwd: str(),
-    url: str('Endpoint — required for http.'), bearerTokenEnv: str(), headers: objList(), headerEnv: objList(),
+    command: nbstr('Executable — required (nonblank) for stdio.'), args: strList(), env: objList(), envPassthrough: strList(), cwd: str(),
+    url: nbstr('Endpoint — required (nonblank) for http.'), bearerTokenEnv: str(), headers: objList(), headerEnv: objList(),
     skillIds: strList(),
-  }, ['name']),
+  }, ['name'], { anyOf: MCP_TRANSPORT_ANYOF }),
   updateMcpServer: S({
     id: str('Server id (required).'),
     name: str('Server name (required).'),
     transport: enumStr(['stdio', 'http']),
     enabled: bool(),
-    command: str(), args: strList(), env: objList(), envPassthrough: strList(), cwd: str(),
-    url: str(), bearerTokenEnv: str(), headers: objList(), headerEnv: objList(),
+    command: nbstr('Executable — required (nonblank) for stdio.'), args: strList(), env: objList(), envPassthrough: strList(), cwd: str(),
+    url: nbstr('Endpoint — required (nonblank) for http.'), bearerTokenEnv: str(), headers: objList(), headerEnv: objList(),
     skillIds: strList(),
-  }, ['id']),
+  }, ['id', 'name'], { anyOf: MCP_TRANSPORT_ANYOF }),
   setMcpServerEnabled: S({ id: str('Server id.'), enabled: bool('Enable/disable.') }, ['id', 'enabled']),
   removeMcpServer: S({ id: str('Server id.') }, ['id']),
 
@@ -708,7 +808,7 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     assetId: str('Source image asset id (id also accepted).'), id: str('Alias of assetId.'),
     instruction: str('Edit instruction — omit to re-roll the original prompt.'),
     prompt: str('Override base prompt.'), jobId: str('Append the result to this chat turn.'),
-  }, ['assetId']),
+  }, [], oneOf('assetId', 'id')),
   cancelAsset: S({ id: str('Asset id.') }, ['id']),
   deleteAsset: S({ id: str('Asset id.') }, ['id']),
   approveAsset: S({ id: str('Asset id.') }, ['id']),
@@ -727,7 +827,7 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
   createDraft: S({ assetId: str('Asset to draft.'), caption: str(), platforms: strList() }, ['assetId']),
   updateDraft: S({
     id: str('Draft id.'), caption: str(), platforms: strList(),
-    scheduledAt: num('Scheduled time (ms epoch) or null.'), status: enumStr(['draft', 'approved', 'scheduled']),
+    scheduledAt: numOrNull('Scheduled time (ms epoch) or null.'), status: enumStr(['draft', 'approved', 'scheduled']),
   }, ['id']),
   deleteDraft: S({ id: str('Draft id.') }, ['id']),
   scheduleDraft: S({ id: str('Draft id.'), scheduledAt: num('Scheduled time (ms epoch).') }, ['id', 'scheduledAt']),
@@ -762,9 +862,9 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
   waSendMedia: S({
     chatId: str('WhatsApp chat id.'),
     kind: enumStr(['image', 'video', 'audio', 'document'], 'Media kind (default document).'),
-    path: str('Local file path (or use dataB64).'), dataB64: str('Base64 bytes (or use path).'),
+    path: str('Local file path — nonblank (or use dataB64).'), dataB64: str('Base64 bytes — nonblank (or use path).'),
     mimetype: str(), fileName: str(), caption: str(),
-  }, ['chatId']),
+  }, ['chatId'], oneOfNonblank('path', 'dataB64')),
   waReact: S({ chatId: str('WhatsApp chat id.'), msgId: str('Target message id.'), emoji: str('Reaction emoji.') }, ['chatId', 'msgId', 'emoji']),
   waMarkRead: S({ chatId: str('WhatsApp chat id.') }, ['chatId']),
   waSetTyping: S({ chatId: str('WhatsApp chat id.'), on: bool('Typing on/off.') }, ['chatId']),
@@ -783,20 +883,21 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     message: str('Feedback message.'), category: enumStr(['bug', 'idea', 'other']),
     source: enumStr(['desktop', 'web', 'phone']), context: obj('{screen?, platform?, projectId?}.'),
   }, ['message']),
-  updateFeedback: S({ id: str('Feedback id.'), status: enumStr(['new', 'triaged', 'done']) }, ['id']),
+  updateFeedback: S({ id: str('Feedback id.'), status: enumStr(['new', 'triaged', 'done'], 'The only accepted patch field — required.') }, ['id', 'status']),
   deleteFeedback: S({ id: str('Feedback id.') }, ['id']),
   feedbackCreateIssue: S({ id: str('Feedback id.'), repo: str('Target owner/repo (defaults to the settings feedbackRepo).') }, ['id']),
 
   // ── files ───────────────────────────────────────────────────────────────
   revealPath: S({ path: str('Path to reveal in Finder (a leading ~ expands).') }, ['path']),
-  readFile: S({ path: str('File path (relative to a project root or absolute inside it).'), sessionId: str('Scope to a session worktree.'), projectId: str() }, ['path']),
-  listDir: S({ path: str('Directory path (path-confined).'), sessionId: str('Scope to a session worktree.'), projectId: str() }, ['path']),
+  readFile: S({ projectId: str('Project id — REQUIRED (the dispatcher resolves roots from it; sessionId alone is not enough).'), path: str('File path (relative to a project root or absolute inside it).'), sessionId: str('Scope to a session worktree.') }, ['projectId', 'path']),
+  listDir: S({ projectId: str('Project id — REQUIRED.'), path: str('Directory path (path-confined).'), sessionId: str('Scope to a session worktree.') }, ['projectId', 'path']),
   listProjectFiles: S({ projectId: str('Project id.') }, ['projectId']),
   writeFile: S({
+    projectId: str('Project id — REQUIRED (the dispatcher resolves roots from it).'),
     path: str('File path (must be an existing text file inside a project root).'),
     text: str('New file contents (UTF-8, <= 4 MB, no NUL bytes).'),
-    sessionId: str('Scope to a session worktree.'), projectId: str(),
-  }, ['path', 'text']),
+    sessionId: str('Scope to a session worktree.'),
+  }, ['projectId', 'path', 'text']),
   runCommand: S({ projectId: str('Project whose folder is the cwd.'), command: str('Shell command to run.') }, ['projectId', 'command']),
   killCommand: S({ runId: str('The runId returned by runCommand.') }, ['runId']),
 };

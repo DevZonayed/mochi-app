@@ -8,8 +8,8 @@
    remote controls. */
 
 import { app } from 'electron';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync, openSync, writeSync, closeSync, unlinkSync, chmodSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync, lstatSync, openSync, writeSync, closeSync, unlinkSync, chmodSync, fchmodSync, readdirSync, constants as fsConstants } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
 import { randomUUID, randomBytes } from 'node:crypto';
 import type { BrowserSettings } from './browser/types.js';
 import type { DesignMode, DesignPhase, DesignFlow, DesignBrief } from './design-workflow.js';
@@ -963,6 +963,60 @@ function hardenStoreFile(file: string): void {
   try { chmodSync(file, STORE_FILE_MODE); } catch { /* file gone / not owned — nothing we can safely do */ }
 }
 
+/** Is the store write-lock currently held by a LIVE writer? Uses the same
+    LOCK_STALE_MS threshold as acquireLock, so the two agree on "fresh vs stale":
+    a lock whose mtime is within LOCK_STALE_MS means a writer is (probably) mid
+    read-merge-write and may own an in-flight temp. No lock (or a stale one) ⇒
+    not fresh. Never throws. */
+function isFreshLock(lockFile: string): boolean {
+  try { return Date.now() - statSync(lockFile).mtimeMs <= LOCK_STALE_MS; }
+  catch { return false; } // no lock file → nobody's writing
+}
+
+/** Startup hygiene for crash/old-build leftovers: `${file}.tmp-*` siblings can
+    hold a full copy of the store (secrets included) at a loose mode. Handle every
+    such artifact WITHOUT following a symlink or chmod-ing a link's target:
+      - a symlink entry → `unlink` it (unlink never follows the link, so the
+        pointed-to file is untouched); NEVER chmod it (chmod DOES follow). A live
+        writer never creates a symlink temp, so this is always safe,
+      - a regular file → ALWAYS harden it via a no-follow fd (`O_NOFOLLOW` +
+        `fchmod` closes the lstat→chmod TOCTOU where the file is swapped for a
+        symlink). Only UNLINK it when NO fresh lock is held — while a writer holds
+        a fresh lock it may own this exact in-flight temp, and deleting it would
+        ENOENT its pending rename and silently lose the save. Freshness is
+        re-checked immediately before the unlink to shrink the race window,
+      - dirs / sockets / other → leave alone.
+    Best-effort + silent — never throws, never reads or logs contents. */
+function sweepStaleTempSiblings(file: string): void {
+  let names: string[];
+  const dir = dirname(file);
+  try { names = readdirSync(dir); } catch { return; }
+  const prefix = `${basename(file)}.tmp-`;
+  const lockFile = `${file}.lock`;
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    const full = join(dir, name);
+    let st;
+    try { st = lstatSync(full); } catch { continue; } // lstat: classify WITHOUT following
+    if (st.isSymbolicLink()) {
+      try { unlinkSync(full); } catch { /* raced */ } // removes the link entry, not its target
+      continue;
+    }
+    if (!st.isFile()) continue; // dirs/sockets/other — not ours to touch
+    // Regular file: harden through a no-follow fd so a symlink swapped in after
+    // the lstat can't redirect the chmod onto another file.
+    try {
+      const fd = openSync(full, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try { fchmodSync(fd, STORE_FILE_MODE); } finally { closeSync(fd); }
+    } catch { /* vanished or swapped to a symlink — do NOT chmod through it */ }
+    // Only reap it if no live writer is holding a fresh lock (else it may be an
+    // in-flight temp awaiting its rename). Re-check freshness right before unlink.
+    if (!isFreshLock(lockFile)) {
+      try { unlinkSync(full); } catch { /* raced / not owned */ }
+    }
+  }
+}
+
 /** Block the current thread for `ms` without a busy-spin (save() is sync). */
 function sleepSync(ms: number): void {
   try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, ms)); }
@@ -1024,12 +1078,13 @@ export class Store {
   }
 
   private load(): void {
+    // Startup self-heal, BEFORE any read/parse: (a) clamp the target to 0600 even
+    // if its JSON is malformed (older builds wrote it world-readable); (b) harden
+    // and remove any secret-bearing `${file}.tmp-*` crash leftovers.
+    hardenStoreFile(this.file);
+    sweepStaleTempSiblings(this.file);
     try {
       this.data = JSON.parse(readFileSync(this.file, 'utf8')) as StoreData;
-      // Startup self-heal: a store written by an older build predates the
-      // owner-only hardening and may be mode 0644 on disk even though it holds
-      // secrets. Clamp it now, before any migration save re-writes it.
-      hardenStoreFile(this.file);
       // Baseline for the multi-writer conflict check in save().
       this.diskStamp = this.currentStamp();
       let dirty = false;
@@ -1140,19 +1195,38 @@ export class Store {
       if (this.diskStamp !== null && this.currentStamp() !== this.diskStamp) {
         this.absorbForeignWrites();
       }
-      // Atomic write: serialize to a temp sibling, then rename over the target.
-      // A rename is atomic on the same filesystem, so a crash mid-write can
-      // never leave a half-written (unparseable) store, and no reader sees a
-      // torn file.
-      const tmp = `${this.file}.tmp-${process.pid}`;
-      // The store holds secrets (mcpToken, accessToken, extensionToken, provider
-      // key metadata) so it must be owner-only. Create the temp sibling at 0600
-      // up front — the rename inherits its mode, so the target is never briefly
-      // world-readable — then belt-and-suspenders chmod the landed file too.
-      writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: STORE_FILE_MODE });
-      renameSync(tmp, this.file);
-      hardenStoreFile(this.file);
-      this.diskStamp = this.currentStamp();
+      // Atomic write: serialize to a UNIQUE temp sibling created EXCLUSIVELY at
+      // 0600, then rename over the target. The exclusive create (O_EXCL via 'wx')
+      // is the security-critical part:
+      //  - it never reuses/overwrites a pre-existing `${file}.tmp-*` (an old build
+      //    left predictable `${file}.tmp-${pid}` files that `writeFileSync('w')`
+      //    would reuse WITHOUT re-applying the mode → secrets at 0644), and
+      //  - it refuses to write THROUGH an attacker-staged symlink at that path.
+      // The random suffix makes the path unpredictable; the rename is atomic on
+      // the same filesystem, so a crash mid-write can never leave a torn store.
+      const payload = JSON.stringify(this.data, null, 2);
+      let tmp = '';
+      let wfd: number | null = null;
+      try {
+        for (let attempt = 0; attempt < 8 && wfd === null; attempt++) {
+          const candidate = `${this.file}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
+          try { wfd = openSync(candidate, 'wx', STORE_FILE_MODE); tmp = candidate; }
+          catch (e) { if ((e as NodeJS.ErrnoException).code === 'EEXIST') continue; throw e; }
+        }
+        if (wfd === null) throw new Error('could not create a unique store temp file');
+        // writeFileSync on the already-exclusive fd writes the WHOLE payload
+        // (it loops internally), so a partial write can't precede the rename.
+        // It does not close the fd — we close it explicitly below.
+        writeFileSync(wfd, payload);
+        closeSync(wfd); wfd = null;
+        renameSync(tmp, this.file);
+        tmp = ''; // renamed away — nothing to clean up
+        hardenStoreFile(this.file); // belt-and-suspenders on the landed file
+        this.diskStamp = this.currentStamp();
+      } finally {
+        if (wfd !== null) { try { closeSync(wfd); } catch { /* already closed */ } }
+        if (tmp) { try { unlinkSync(tmp); } catch { /* best effort cleanup */ } }
+      }
     } catch { /* disk hiccup — retry next save */ }
     finally { if (fd !== null) this.releaseLock(fd); }
   }

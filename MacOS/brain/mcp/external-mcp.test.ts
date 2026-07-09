@@ -41,6 +41,30 @@ describe('manifest integrity', () => {
   });
 });
 
+describe('normalizeSettings port', () => {
+  const DEFAULT = defaultExternalMcpSettings().port; // 9235
+  it('preserves ephemeral 0 ONLY for a strict numeric 0', () => {
+    expect(normalizeSettings({ port: 0 }).port).toBe(0);
+  });
+  it('keeps a valid integer port 1..65535', () => {
+    expect(normalizeSettings({ port: 9000 }).port).toBe(9000);
+    expect(normalizeSettings({ port: 65535 }).port).toBe(65535);
+  });
+  it('falls back to the default for malformed legacy values (null/""/false)', () => {
+    // These all coerce to 0 via Number(), but must NOT be treated as ephemeral.
+    expect(normalizeSettings({ port: null as unknown as number }).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: '' as unknown as number }).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: false as unknown as number }).port).toBe(DEFAULT);
+  });
+  it('falls back to the default for undefined / junk / out-of-range', () => {
+    expect(normalizeSettings({}).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: 'abc' as unknown as number }).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: 70000 }).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: -1 }).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: 1.5 }).port).toBe(DEFAULT);
+  });
+});
+
 describe('tools/list gating', () => {
   it('returns nothing when disabled', () => {
     expect(listTools(normalizeSettings({ enabled: false }))).toEqual([]);

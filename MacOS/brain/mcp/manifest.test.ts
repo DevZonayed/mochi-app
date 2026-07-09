@@ -73,13 +73,17 @@ describe('reported contract bugs are fixed', () => {
     expect(s.required).toEqual(['id']);
     expect(reads(BLOCKS.get('openProject')!, 'id')).toBe(true);
   });
-  it('sendChat reads {text}, NOT {prompt}, and requires projectId', () => {
+  it('sendChat: text is canonical, prompt/message are INTENTIONAL aliases dispatch reads', () => {
     const s = TOOL_SCHEMAS.sendChat;
     expect(s.properties).toHaveProperty('text');
-    expect(s.properties).not.toHaveProperty('prompt');
+    // prompt/message are now documented aliases (dispatch reads text ?? prompt ?? message).
+    expect(s.properties).toHaveProperty('prompt');
+    expect(s.properties).toHaveProperty('message');
     expect(s.required).toContain('projectId');
     const block = BLOCKS.get('sendChat')!;
     expect(reads(block, 'text')).toBe(true);
+    expect(reads(block, 'prompt')).toBe(true);
+    expect(reads(block, 'message')).toBe(true);
     expect(reads(block, 'projectId')).toBe(true);
   });
   it('steerJob reads {id, text}, NOT {jobId}', () => {
@@ -116,6 +120,30 @@ describe('drift guard — every schema.required is actually read by its dispatch
   it('all manifest methods exist as a dispatch case', () => {
     const missing = MCP_TOOLS.map((t) => t.method).filter((m) => !BLOCKS.has(m));
     expect(missing, `manifest tools with no dispatch case: ${missing.join(', ')}`).toEqual([]);
+  });
+
+  it('reads ⊆ declared: every direct p.<prop> read in a case is a declared property', () => {
+    // The complete contract invariant: a generic MCP client is told the tool
+    // accepts `inputSchema.properties`, so anything the dispatch case DIRECTLY
+    // reads off params (p.<name>) must be advertised. (The reverse — declared but
+    // not directly read — is fine: updateProject/updateSchedule apply a dynamic
+    // allowlist/spread over p[k], so those fields never appear as a literal
+    // p.<name>. additionalProperties stays true; this is about honest docs.)
+    const propRe = /\bp\.([A-Za-z_$][\w$]*)\b/g;
+    const violations: string[] = [];
+    for (const t of MCP_TOOLS) {
+      if (SCHEMA_DRIFT_EXEMPT.has(t.method)) continue; // params consumed in a shared helper
+      const block = BLOCKS.get(t.method);
+      if (!block) continue;
+      const declared = new Set(Object.keys(t.inputSchema.properties));
+      const seen = new Set<string>();
+      let mm: RegExpExecArray | null;
+      while ((mm = propRe.exec(block)) !== null) seen.add(mm[1]);
+      for (const prop of seen) {
+        if (!declared.has(prop)) violations.push(`${t.method}: reads p.${prop} but it is not declared in inputSchema.properties`);
+      }
+    }
+    expect(violations, violations.join('\n')).toEqual([]);
   });
 
   it('required props are literally read as p.<name> in the matching case', () => {
