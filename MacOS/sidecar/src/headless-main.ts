@@ -28,6 +28,7 @@ import { GitWatcher } from '../../brain/git-watcher.js';
 import { MemorySync } from '../../brain/memory-sync.js';
 import { CronRunner } from '../../brain/cron.js';
 import { makeWhatsappAnalyzer } from '../../brain/whatsapp-analyze.js';
+import { contextIntake, makeOperatorReplyHandler } from '../../brain/context-operator.js';
 import { createDispatch, type ExternalMcpControl } from '../../brain/localApi.js';
 import { ExternalMcp } from '../../brain/mcp/external-mcp.js';
 import { setEnginesRoot } from '../../brain/engines.js';
@@ -149,7 +150,11 @@ try {
 } catch (e) { warn('codexBridge', e); }
 
 const telegram = new TelegramBot(store, engine, providers, emit);
-const whatsapp = new WhatsAppClient(store, emit);
+// Context (knowledge/operator) projects: shared deps for the operator pipeline —
+// WA-quiet intake (triage→operator turn) + quoted-reply routing back into the
+// operator session. See brain/context-operator.ts.
+const contextOps = { store, engine, emit };
+const whatsapp = new WhatsAppClient(store, emit, { onOperatorReply: makeOperatorReplyHandler(contextOps) });
 try { engine.setComms(whatsapp); } catch (e) { warn('setComms', e); }
 
 const gitService = new GitService(store, emit, providers);
@@ -167,7 +172,7 @@ setTimeout(() => { void memorySync.syncAll().catch(() => { /* status carries err
 // `schedule_*` MCP tools (gated on `engine.setCron`). Without this, the operator's Schedule queue
 // would never fire. Started in boot() once the WS host is up so fired events reach the client.
 const cron = new CronRunner(store, engine, emit, (nowMs) => publishing.fireDue(nowMs),
-  makeWhatsappAnalyzer({ store, engine, client: whatsapp, emit }));
+  makeWhatsappAnalyzer({ store, engine, client: whatsapp, emit, intake: (args) => contextIntake(contextOps, args) }));
 try { engine.setCron(cron); } catch (e) { warn('setCron', e); }
 
 // Playwright-backed browser for the native app: one persistent context per project,

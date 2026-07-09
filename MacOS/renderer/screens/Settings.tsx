@@ -1171,12 +1171,18 @@ function BrowserPane() {
             <span style={{ flex: 1, minWidth: 0 }}>
               {seed?.sourceDir ? (
                 <>
-                  <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Seeded from {seed.sourceName || seed.sourceDir} · {seed.cookieCount} cookies</span>
+                  <span style={{ display: 'block', font: '400 var(--fs-body)/1.2 var(--font-text)', color: 'var(--ink)' }}>Seeded from {seed.sourceName || seed.sourceDir} · <span style={{ color: seed.cookieCount === 0 ? 'var(--red)' : 'inherit' }}>{seed.cookieCount} cookies</span></span>
                   <span style={{ display: 'block', font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{seed.importedAt ? `Imported ${new Date(seed.importedAt).toLocaleString()}` : 'Imported'}</span>
                 </>
               ) : (
                 <span style={{ display: 'block', font: '400 var(--fs-body)/1.35 var(--font-text)', color: 'var(--ink-secondary)' }}>No seed profile set.</span>
               )}
+              {seed?.warnings?.map((w, i) => (
+                <span key={i} style={{ display: 'flex', gap: 6, font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--orange)', marginTop: 5 }}>
+                  <Icon name="alert" size={13} style={{ color: 'var(--orange)', flexShrink: 0, marginTop: 1 }} />
+                  <span>{w}</span>
+                </span>
+              ))}
               {seedError && <span style={{ display: 'block', font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--red)', marginTop: 5 }}>{seedError}</span>}
             </span>
             {seed?.sourceDir && <button onClick={clearSeed} className="ghost-btn" style={browserButtonStyle}>Clear</button>}

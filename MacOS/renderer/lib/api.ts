@@ -12,7 +12,7 @@ export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
-export type ProjectKind = 'coding' | 'design' | 'content' | 'research' | 'general';
+export type ProjectKind = 'coding' | 'design' | 'content' | 'research' | 'general' | 'context';
 
 export interface Workspace {
   id: string;
@@ -59,6 +59,9 @@ export interface Project {
   designFlow?: DesignFlow;
   /** The operator's creation-time inputs (PRD / urls / resources). */
   designBrief?: DesignBrief;
+  /** Context (knowledge/operator) projects only: the coding/design projects
+      this operator is CONNECTED to (may consult + dispatch work into). */
+  linkedProjectIds?: string[];
   createdAt: number;
 }
 /* Guided design workflow (mirrors electron/design-workflow.ts — the renderer
@@ -489,7 +492,7 @@ export interface BrowserStatus {
 }
 export interface ChromeProfile { dir: string; name: string }
 export interface ChromeStatus { installed: boolean; path: string | null; version: string | null; running: boolean }
-export interface BrowserSeedInfo { sourceDir: string; sourceName: string; importedAt: number; cookieCount: number }
+export interface BrowserSeedInfo { sourceDir: string; sourceName: string; importedAt: number; cookieCount: number; appBound?: boolean; warnings?: string[] }
 export interface BrowserProfilePath { path: string }
 export interface AppSettings {
   defaultEffort: Effort;
@@ -1031,7 +1034,7 @@ export const api = {
       'openProject', { id }, () => Promise.resolve({ ok: true, skipped: true as const, reason: 'remote' })),
   closeProject: (id: string) =>
     call<{ ok: boolean }>('closeProject', { id }, () => Promise.resolve({ ok: true })),
-  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden' | 'designPhase' | 'designFlow'>>) =>
+  updateProject: (id: string, patch: Partial<Pick<Project, 'name' | 'instructions' | 'color' | 'kind' | 'path' | 'repoUrl' | 'template' | 'defaultBaseBranch' | 'setupScript' | 'copyGlobs' | 'runMode' | 'memorySlug' | 'memoryRepoUrl' | 'hidden' | 'designPhase' | 'designFlow' | 'linkedProjectIds'>>) =>
     call<Project>('updateProject', { id, ...patch }, () =>
       req<Project>(`/api/projects/${encodeURIComponent(id)}/update`, { method: 'POST', body: JSON.stringify(patch) })),
   reorderProjects: (ids: string[]) =>

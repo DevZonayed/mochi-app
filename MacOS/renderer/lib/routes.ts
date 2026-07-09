@@ -18,6 +18,7 @@ export interface NavRoute {
 export const NAV_ROUTES: NavRoute[] = [
   { key: 'workspace', path: '/workspace', label: 'CodeSpace', icon: 'terminal' },
   { key: 'design', path: '/design-workspace', label: 'Design', icon: 'brush' },
+  { key: 'operator', path: '/operator', label: 'Agent', icon: 'spark' },
   { key: 'projects', path: '/projects', label: 'Projects', icon: 'layers' },
   { key: 'jobs', path: '/job-monitor', label: 'Jobs', icon: 'jobs' },
   { key: 'approvals', path: '/approvals', label: 'Approvals', icon: 'shield' },
@@ -47,14 +48,14 @@ export const ALL_NAV: NavRoute[] = [...NAV_ROUTES, SETTINGS_ROUTE, FEEDBACK_ROUT
     Projects, Trends and Approvals are hidden too (Approvals surfaces as a bell only
     when a gate is actually pending). Every route stays registered in App.tsx, so
     dropping a key here hides the menu without breaking the route. */
-export const CODING_NAV: NavRoute[] = (['workspace', 'design', 'scheduler', 'comms', 'whatsapp'] as const)
+export const CODING_NAV: NavRoute[] = (['workspace', 'design', 'operator', 'scheduler', 'comms', 'whatsapp'] as const)
   .map(k => NAV_ROUTES.find(r => r.key === k))
   .filter((r): r is NavRoute => !!r);
 
 /** Design-genre navigation — same Workspace + Design lead, plus the media Studio
     a designer reaches for. Projects, Trends and Costs are dropped (Costs lives in
     Settings; Projects/Trends are hidden for now). */
-export const DESIGN_NAV: NavRoute[] = (['workspace', 'design', 'studio', 'comms', 'whatsapp'] as const)
+export const DESIGN_NAV: NavRoute[] = (['workspace', 'design', 'operator', 'studio', 'comms', 'whatsapp'] as const)
   .map(k => NAV_ROUTES.find(r => r.key === k))
   .filter((r): r is NavRoute => !!r);
 

@@ -516,7 +516,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'createProject': {
         if (!p.name || typeof p.name !== 'string') bad('name required');
-        const kind = (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') ? (p.kind as ProjectKind) : undefined;
+        const kind = (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general' || p.kind === 'context') ? (p.kind as ProjectKind) : undefined;
         let projPath = typeof p.path === 'string' && p.path ? p.path : undefined;
         // Design projects get a UNIQUE folder (id-suffixed) so two similarly-named
         // designs never share a folder/preview/memory/git (name-only dirs collide).
@@ -524,6 +524,15 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           const safe = (p.name as string).replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'design';
           projPath = nodePath.join(homedir(), 'Maestro', `${safe}-${Math.random().toString(36).slice(2, 8)}`);
           try { mkdirSync(nodePath.join(projPath, 'design'), { recursive: true }); } catch { /* best effort */ }
+        }
+        // Context (knowledge/operator) projects: same unique-folder treatment —
+        // the folder holds the .continuum memory the operator agent lives off.
+        // NO GitHub repo is provisioned for them (they're a knowledge base, not
+        // a codebase) — see the provisionProject gate below.
+        if (!projPath && kind === 'context') {
+          const safe = (p.name as string).replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'context';
+          projPath = nodePath.join(homedir(), 'Maestro', `${safe}-${Math.random().toString(36).slice(2, 8)}`);
+          try { mkdirSync(projPath, { recursive: true }); } catch { /* best effort */ }
         }
         // Guided design workflow: mode picked at creation → project starts in
         // the research phase with a sanitized brief + on-disk phase marker.
@@ -556,9 +565,17 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           void ensureCommitIdentity(projPath).catch(() => { /* best-effort */ });
           // Tight GitHub coupling: a new project with a folder gets its private
           // remote repo created + pushed immediately (unless one already exists).
-          if (existsSync(projPath) && !(typeof p.repoUrl === 'string' && p.repoUrl)) {
+          // Context projects are exempt — they're a knowledge base, not a codebase.
+          if (kind !== 'context' && existsSync(projPath) && !(typeof p.repoUrl === 'string' && p.repoUrl)) {
             provisionProject(proj.id, projPath, proj.name);
           }
+        }
+        // Context projects live in ONE continuous conversation from day one —
+        // create the single operator session now so every entry point (chat UI,
+        // WhatsApp intake, operator replies, dispatch reports) lands in it.
+        if (kind === 'context') {
+          const s = store.createSession(proj.id, 'Operator');
+          emit('session', s);
         }
         emit('project', proj);
         return proj;
@@ -593,7 +610,16 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         for (const k of ['name', 'instructions', 'color', 'template', 'path', 'repoUrl', 'defaultBaseBranch', 'setupScript', 'memorySlug', 'memoryRepoUrl'] as const) {
           if (typeof p[k] === 'string') patch[k] = p[k];
         }
-        if (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general') patch.kind = p.kind;
+        if (p.kind === 'coding' || p.kind === 'design' || p.kind === 'content' || p.kind === 'research' || p.kind === 'general' || p.kind === 'context') patch.kind = p.kind;
+        // Context projects: the coding/design projects this operator is
+        // CONNECTED to. Validated hard — only existing, other projects (no
+        // self-link, no dangling ids), deduped, capped at 24.
+        if (Array.isArray(p.linkedProjectIds)) {
+          const selfId = String(p.id ?? '');
+          patch.linkedProjectIds = [...new Set((p.linkedProjectIds as unknown[])
+            .filter((x): x is string => typeof x === 'string')
+            .filter((pid) => pid !== selfId && !!store.getProject(pid)))].slice(0, 24);
+        }
         // Worktree isolation settings.
         if (Array.isArray(p.copyGlobs)) patch.copyGlobs = (p.copyGlobs as unknown[]).filter((g): g is string => typeof g === 'string');
         if (p.runMode === 'concurrent' || p.runMode === 'nonconcurrent') patch.runMode = p.runMode;
@@ -1014,6 +1040,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           .trim();
         let session = p.sessionId ? store.getSession(String(p.sessionId)) : undefined;
         if (p.sessionId && !session) bad('session not found', 404);
+        // Context (knowledge/operator) projects hold ONE continuous conversation:
+        // any message without an explicit session routes into the primary
+        // operator session (oldest non-archived) instead of opening a new chat.
+        if (!session && project!.kind === 'context') {
+          session = store.primarySessionOf(projectId);
+        }
         if (!session) {
           // Pick a memorable city codename so the branch (`mochi/<city>/<slug>`)
           // and rails surface a stable callsign for the session from the start.

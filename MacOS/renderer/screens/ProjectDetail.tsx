@@ -36,7 +36,7 @@ import { SessionStateDot, SessionActivityDot } from './SessionStateDot';
 import { useSession, useSessionGitState } from '../lib/useSessionGitState';
 import { useSessionLocked } from '../hooks/useSessionLocked';
 
-const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project' };
+const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project', context: 'Context' };
 function shortHomePath(p: string): string {
   const m = p.match(/^\/Users\/[^/]+\/(.*)$/);
   return m ? `~/${m[1]}` : p;
@@ -1046,23 +1046,82 @@ function BudgetTab() {
 }
 
 /* ───────────────── Settings tab (from pd-tabs.jsx) ───────────────── */
-function SettingsTab() {
+function SettingsTab({ project, onProject }: { project: Project | null; onProject: (p: Project) => void }) {
   return (
     <div style={{ maxWidth: 680, display: 'flex', flexDirection: 'column', gap: 22 }}>
       <GroupedList header="Project">
         <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Name</span>
-          <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Atlas API</span></Row>
-        <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Template</span>
-          <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>Code</span></Row>
+          <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{project?.name ?? '—'}</span></Row>
+        <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Kind</span>
+          <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{KIND_LABEL[project?.kind ?? ''] ?? 'Project'}</span></Row>
         <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Default branch</span>
-          <span style={{ font: '400 var(--fs-body)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>main</span></Row>
+          <span style={{ font: '400 var(--fs-body)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{project?.defaultBaseBranch ?? (project?.kind === 'context' ? '—' : 'main')}</span></Row>
       </GroupedList>
+      {project?.kind === 'context' && <ConnectionsPanel project={project} onProject={onProject} />}
       {IS_LOCAL && <BrowserControl />}
       <GroupedList header="Danger zone" footer="Archiving stops all jobs and hides the project. You can restore it within 30 days.">
         <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--red)' }}>Archive project</span>
           <Icon name="chevronRight" size={16} style={{ color: 'var(--ink-tertiary)' }} /></Row>
       </GroupedList>
     </div>
+  );
+}
+
+/* ConnectionsPanel — context (universal-operator) projects only. Picks which
+   coding/design/content projects this operator is CONNECTED to: the linked set
+   is what the operator agent can read memory from (`project_memory`) and
+   dispatch work into (`dispatch_to_project`). Persisted via updateProject →
+   `linkedProjectIds` (brain validates: existing, non-self, deduped, ≤24).
+   WhatsApp intake is bound separately: assign a chat to THIS project in the
+   WhatsApp screen and the 15-min quiet-timer analysis routes through the
+   operator instead of the plain summarizer. */
+function ConnectionsPanel({ project, onProject }: { project: Project; onProject: (p: Project) => void }) {
+  const [candidates, setCandidates] = React.useState<Project[]>([]);
+  const [saving, setSaving] = React.useState<string | null>(null);
+  const [err, setErr] = React.useState<string | null>(null);
+  const linked = React.useMemo(() => new Set(project.linkedProjectIds ?? []), [project.linkedProjectIds]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    api.listProjects()
+      .then(ps => { if (!cancelled) setCandidates(ps.filter(p => p.id !== project.id && p.kind !== 'context')); })
+      .catch(() => { /* fail soft — empty list renders the hint below */ });
+    return () => { cancelled = true; };
+  }, [project.id]);
+
+  const toggle = async (pid: string) => {
+    if (saving) return;
+    setSaving(pid); setErr(null);
+    const next = new Set(linked);
+    next.has(pid) ? next.delete(pid) : next.add(pid);
+    try {
+      const updated = await api.updateProject(project.id, { linkedProjectIds: [...next] });
+      onProject(updated);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not update connections.');
+    } finally { setSaving(null); }
+  };
+
+  return (
+    <GroupedList
+      header="Connections"
+      footer={err ?? 'Connected projects are what this operator can read memory from and dispatch work into. To route a WhatsApp chat through the operator, assign the chat to this project in the WhatsApp screen.'}
+    >
+      {candidates.length === 0 && (
+        <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>No other projects to connect yet</span></Row>
+      )}
+      {candidates.map((p, i) => (
+        <Row key={p.id} last={i === candidates.length - 1}>
+          <span style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 3 }}>
+            <span style={{ font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</span>
+            <span style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-tertiary)' }}>{KIND_LABEL[p.kind ?? ''] ?? 'Project'}</span>
+          </span>
+          {saving === p.id
+            ? <Spinner size={16} />
+            : <Switch on={linked.has(p.id)} onChange={() => { void toggle(p.id); }} />}
+        </Row>
+      ))}
+    </GroupedList>
   );
 }
 
@@ -4654,7 +4713,7 @@ export default function ProjectDetail() {
         {tab === 'instructions' && <InstructionsTab projectId={projectId} project={project} onSaved={(ins) => setProject(p => p ? { ...p, instructions: ins } : p)} />}
         {tab === 'skills' && <SkillsTab projectId={projectId} />}
         {tab === 'budget' && <BudgetTab />}
-        {tab === 'settings' && <SettingsTab />}
+        {tab === 'settings' && <SettingsTab project={project} onProject={setProject} />}
       </div>
 
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
