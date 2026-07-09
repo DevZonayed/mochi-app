@@ -20,7 +20,7 @@ import {
   api, ApiError, type Workspace, type Project, type ProviderConn, type ProviderId, type Routing, type Roles,
   type AccountDevice, type EngineStatuses, type AppSettings, type BrowserSettings, type ChromeProfile,
   type BrowserSeedInfo, type ChromeStatus, type ExtensionStatus, type UpdateStatus, type GithubDevice,
-  type MemorySyncStatus, IS_LOCAL,
+  type MemorySyncStatus, type ExternalMcpConfig, IS_LOCAL,
 } from '../lib/api';
 import { signOut } from '../lib/auth';
 import { ModelPicker, useModelGroups, keyForRoleChoice, refreshModelGroups } from '../lib/ModelPicker';
@@ -150,6 +150,7 @@ const SET_NAV: SetNavItem[] = [
   { key: 'engines', icon: 'cpu', label: 'Engines', tint: 'var(--purple)' },
   { key: 'skills', icon: 'spark', label: 'Skills & tools', tint: 'var(--indigo)' },
   { key: 'mcp', icon: 'terminal', label: 'MCP servers', tint: 'var(--teal)' },
+  { key: 'external-mcp', icon: 'terminal', label: 'External MCP', tint: 'var(--purple)' },
   { key: 'accounts', icon: 'key', label: 'Accounts & keys', tint: 'var(--blue)' },
   { key: 'extension', icon: 'globe', label: 'Browser extension', tint: 'var(--blue)' },
   { key: 'browser', icon: 'globe', label: 'Browser', tint: 'var(--teal)' },
@@ -874,6 +875,94 @@ const browserInputStyle: React.CSSProperties = {
   padding: '0 10px',
 };
 
+/* ── External MCP: expose the WHOLE app to an OUTSIDE agent ── */
+function JsonConfigBlock({ label, value }: { label: string; value: unknown }) {
+  const text = React.useMemo(() => JSON.stringify(value, null, 2), [value]);
+  const [copied, setCopied] = React.useState(false);
+  const copy = () => {
+    void navigator.clipboard?.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1600); }).catch(() => {});
+  };
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+        <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{label}</span>
+        <button onClick={copy} style={{ ...browserButtonStyle, height: 26, color: copied ? 'var(--green)' : 'var(--ink)' }}>{copied ? 'Copied ✓' : 'Copy'}</button>
+      </div>
+      <pre style={{ margin: 0, padding: '11px 12px', borderRadius: 9, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator-strong)', overflowX: 'auto', font: '400 12px/1.5 var(--font-mono)', color: 'var(--ink)', whiteSpace: 'pre' }}>{text}</pre>
+    </div>
+  );
+}
+
+function ExternalMcpPane() {
+  const [cfg, setCfg] = React.useState<ExternalMcpConfig | null>(null);
+  const [tab, setTab] = React.useState<'stdio' | 'http'>('stdio');
+  const [busy, setBusy] = React.useState(false);
+  const load = React.useCallback(() => { api.mcpAccessConfig().then(setCfg).catch(() => setCfg(null)); }, []);
+  React.useEffect(() => { load(); }, [load]);
+  React.useEffect(() => api.subscribe({ onMcpAccess: (c) => setCfg(c) }), []);
+
+  const mutate = async (patch: Parameters<typeof api.setMcpAccess>[0]) => {
+    setBusy(true);
+    try { setCfg(await api.setMcpAccess(patch)); } catch { /* desktop only */ } finally { setBusy(false); }
+  };
+  const rotate = async () => { setBusy(true); try { setCfg(await api.rotateMcpToken()); } catch { /* noop */ } finally { setBusy(false); } };
+
+  if (!IS_LOCAL) {
+    return <div><PaneHead sub="Only the desktop app can host an MCP server.">External MCP</PaneHead></div>;
+  }
+
+  const enabled = !!cfg?.enabled;
+  return (
+    <div>
+      <PaneHead sub="Let an outside AI agent — Claude Desktop, Cursor, Codex, Cline — drive every Mochi action through the Model Context Protocol. Loopback-only and token-gated; nothing is exposed to the network.">External MCP</PaneHead>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
+        <GroupedList header="Access" footer={enabled
+          ? `Serving ${cfg?.toolCount ?? 0} tools on 127.0.0.1:${cfg?.port ?? '—'} · ${cfg?.running ? 'running' : 'starting…'}`
+          : 'Off — no server is listening and no tools are reachable.'}>
+          <ToggleRow last label="Enable external MCP access" sub="Starts a local, token-gated MCP server an external agent can connect to." on={enabled} onChange={v => void mutate({ enabled: v })} />
+        </GroupedList>
+
+        {enabled && cfg && (
+          <>
+            {cfg.warnings.length > 0 && (
+              <div style={{ padding: '10px 12px', borderRadius: 9, background: 'color-mix(in srgb, var(--orange) 12%, transparent)', border: '0.5px solid color-mix(in srgb, var(--orange) 40%, transparent)', font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink)' }}>
+                {cfg.warnings.map((w, i) => <div key={i}>⚠︎ {w}</div>)}
+              </div>
+            )}
+
+            <GroupedList header="Connect your agent" footer="Paste this into your MCP client's config. stdio spawns a tiny shim that proxies to Mochi; HTTP connects directly to the loopback endpoint. Both carry the token below.">
+              <div style={{ padding: '12px 14px' }}>
+                <Seg options={['stdio', 'http']} value={tab} onChange={v => setTab(v as 'stdio' | 'http')} />
+                <JsonConfigBlock label={tab === 'stdio' ? 'mcp config (stdio)' : 'mcp config (HTTP)'} value={tab === 'stdio' ? cfg.clientJson.stdio : cfg.clientJson.http} />
+              </div>
+            </GroupedList>
+
+            <GroupedList header="Endpoint & token" footer="Rotating the token immediately invalidates every already-pasted config.">
+              <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>HTTP endpoint</span><span style={{ font: '400 13px/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{cfg.endpoints.httpUrl}</span></Row>
+              <Row><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Preferred port</span><input type="number" defaultValue={cfg.requestedPort} onBlur={e => { const n = parseInt(e.target.value, 10); if (n > 0 && n < 65536 && n !== cfg.requestedPort) void mutate({ port: n }); }} style={{ ...browserInputStyle, width: 96, textAlign: 'right' }} /></Row>
+              <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1 var(--font-text)', color: 'var(--ink)' }}>Bearer token</span><CopyCode code={cfg.token} title="Copy token" /><button onClick={() => void rotate()} disabled={busy} style={{ ...browserButtonStyle, marginLeft: 8 }}>Rotate</button></Row>
+            </GroupedList>
+
+            <GroupedList header="Destructive actions" footer="Deletes, shell commands, file writes, PR merges, WhatsApp sends and auth changes. Off by default — the external agent can't run them until you allow it.">
+              <ToggleRow last label="Allow destructive actions" sub="Exposes every irreversible / outward-facing tool to the external agent." on={cfg.allowDestructive} onChange={v => void mutate({ allowDestructive: v })} />
+            </GroupedList>
+
+            <GroupedList header="Categories" footer="Each group of actions can be turned off entirely. Counts show total tools and how many are destructive.">
+              {cfg.categories.map((c, i) => (
+                <ToggleRow key={c.id} last={i === cfg.categories.length - 1}
+                  label={c.title}
+                  sub={`${c.blurb} · ${c.total} tool${c.total === 1 ? '' : 's'}${c.destructive ? `, ${c.destructive} destructive` : ''}`}
+                  on={c.enabled}
+                  onChange={v => void mutate({ categories: { [c.id]: v } })} />
+              ))}
+            </GroupedList>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function BrowserPane() {
   const [browser, setBrowser] = React.useState<BrowserSettings>(DEFAULT_BROWSER_SETTINGS);
   const [chrome, setChrome] = React.useState<ChromeStatus | null>(null);
@@ -1373,6 +1462,7 @@ export default function Settings() {
     engines: <EnginesPane />,
     skills: <SkillsRegistry embedded />,
     mcp: <McpServersPane />,
+    'external-mcp': <ExternalMcpPane />,
     costs: <BudgetDashboard embedded />,
     accounts: <AccountsPane />,
     security: <SecurityPane onExportAudit={() => navigate('/audit')} />,
@@ -1385,7 +1475,7 @@ export default function Settings() {
   };
   const paneMaxWidth = sec === 'skills' || sec === 'costs'
     ? undefined
-    : ['mcp', 'accounts', 'extension', 'browser', 'devices'].includes(sec)
+    : ['mcp', 'external-mcp', 'accounts', 'extension', 'browser', 'devices'].includes(sec)
       ? 860
       : 760;
 

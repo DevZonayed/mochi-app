@@ -365,6 +365,24 @@ export interface CustomMcpServer {
 }
 /** Form payload for creating/updating a custom MCP server (no id/createdAt). */
 export type McpServerInput = Omit<CustomMcpServer, 'id' | 'createdAt'>;
+
+/** One toggleable category of the OUTWARD external-MCP surface (brain/mcp/manifest.ts). */
+export interface ExternalMcpCategory {
+  id: string; title: string; blurb: string; defaultOn: boolean;
+  total: number; destructive: number; enabled: boolean;
+}
+/** Config for the external MCP server that lets an OUTSIDE agent drive the whole app. */
+export interface ExternalMcpConfig {
+  enabled: boolean; running: boolean; port: number; requestedPort: number;
+  token: string; allowDestructive: boolean; toolCount: number;
+  categories: ExternalMcpCategory[];
+  endpoints: { httpUrl: string; stdioCommand: string; stdioArgs: string[]; stdioEnv: Record<string, string> };
+  clientJson: { stdio: unknown; http: unknown };
+  warnings: string[];
+}
+export interface ExternalMcpAccessPatch {
+  enabled?: boolean; port?: number; allowDestructive?: boolean; categories?: Record<string, boolean>;
+}
 export interface BudgetData {
   cap: number;
   spent: number;
@@ -1524,6 +1542,15 @@ export const api = {
   removeMcpServer: (id: string) =>
     call<{ ok: boolean }>('removeMcpServer', { id }, () => Promise.reject(new Error('desktop only'))),
 
+  // External MCP — expose the WHOLE app action surface to an OUTSIDE agent (Claude
+  // Desktop / Cursor / Codex …). Desktop-only: the token + local server live on this Mac.
+  mcpAccessConfig: () =>
+    call<ExternalMcpConfig>('mcpAccessConfig', {}, () => Promise.reject(new Error('desktop only'))),
+  setMcpAccess: (patch: ExternalMcpAccessPatch) =>
+    call<ExternalMcpConfig>('setMcpAccess', { ...patch }, () => Promise.reject(new Error('desktop only'))),
+  rotateMcpToken: () =>
+    call<ExternalMcpConfig>('rotateMcpToken', {}, () => Promise.reject(new Error('desktop only'))),
+
   // Templates
   listTemplates: () => call<Template[]>('listTemplates', {}, () => req<Template[]>('/api/templates')),
 
@@ -1650,7 +1677,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onMemorySync?: (s: MemorySyncStatus) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void; onPrConfirmRequest?: (r: PrConfirmRequest) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onMemorySync?: (s: MemorySyncStatus) => void; onMcpAccess?: (c: ExternalMcpConfig) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void; onPrConfirmRequest?: (r: PrConfirmRequest) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as RemoteDevice[]);
@@ -1670,6 +1697,7 @@ export const api = {
         if (name === 'schedule' && handlers.onSchedule) handlers.onSchedule(data as Schedule);
         if (name === 'github-device' && handlers.onGithubDevice) handlers.onGithubDevice(data as GithubDevice);
         if (name === 'memory-sync' && handlers.onMemorySync) handlers.onMemorySync(data as MemorySyncStatus);
+        if (name === 'mcp-access' && handlers.onMcpAccess) handlers.onMcpAccess(data as ExternalMcpConfig);
         if (name === 'wa-message' && handlers.onWaMessage) handlers.onWaMessage(data as WaMessageEvent);
         if (name === 'wa-chats' && handlers.onWaChats) handlers.onWaChats();
         if (name === 'wa-message-update' && handlers.onWaMessageUpdate) handlers.onWaMessageUpdate(data as { chatId: string });
