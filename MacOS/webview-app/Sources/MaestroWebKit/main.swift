@@ -63,6 +63,13 @@ final class SidecarProcess {
         var env = ProcessInfo.processInfo.environment
         env["MAESTRO_HEADLESS"] = "1"
         env["MAESTRO_NATIVE_WEBKIT"] = "1"
+        // Propagate the packaged app's version (CFBundleShortVersionString) so the
+        // sidecar's electron shim reports the REAL version in health/feedback
+        // instead of a stale hardcoded fallback. Authoritative source of truth.
+        if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+           !version.isEmpty {
+            env["MAESTRO_VERSION"] = version
+        }
         if let webRoot = resolveWebRoot() {
             env["MAESTRO_WEB_ROOT"] = webRoot.path
         }

@@ -160,12 +160,21 @@ describe('ExternalMcp HTTP transport', () => {
   };
   const dispatch: Dispatch = async (method) => { dispatched.push(method); return { ok: method }; };
 
-  beforeEach(() => {
+  // The HTTP server binds asynchronously (net 'listening' event), and with an
+  // ephemeral port (0) the real port isn't known until it fires — so wait for it
+  // before assertions read config().port. This also keeps the suite isolated from
+  // any live Mochlet app already holding the default port 9235 on this machine.
+  const waitListening = async (m: ExternalMcp) => {
+    for (let i = 0; i < 400 && m.config().port === 0; i++) await new Promise((r) => setTimeout(r, 5));
+  };
+
+  beforeEach(async () => {
     tmp = mkdtempSync(path.join(os.tmpdir(), 'mochi-mcp-'));
-    settings = on({ port: 0 }); // ephemeral loopback port
+    settings = on({ port: 0 }); // ephemeral loopback port (avoids a live-app collision)
     dispatched.length = 0;
     mcp = new ExternalMcp({ store, dispatch, shimPath: path.join(tmp, 'shim.cjs'), nodePath: '/usr/bin/node' });
     mcp.start();
+    await waitListening(mcp);
   });
   afterEach(() => { mcp.stop(); rmSync(tmp, { recursive: true, force: true }); });
 

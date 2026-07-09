@@ -58,9 +58,14 @@ export function normalizeSettings(raw: Partial<ExternalMcpSettings> | undefined)
   if (!raw) return base;
   const categories = { ...base.categories, ...(raw.categories ?? {}) };
   const portRaw = Number(raw.port);
+  // Port 0 is the conventional "let the OS pick an ephemeral loopback port"
+  // sentinel — preserve it (startHttp already maps 0 → listen(0)). Only an
+  // absent/NaN/out-of-range value falls back to the default port. (Production
+  // defaults to DEFAULT_PORT and never stores 0, so this only affects callers
+  // that explicitly opt into an ephemeral port.)
   return {
     enabled: !!raw.enabled,
-    port: Number.isInteger(portRaw) && portRaw > 0 && portRaw < 65536 ? portRaw : base.port,
+    port: Number.isInteger(portRaw) && portRaw >= 0 && portRaw < 65536 ? portRaw : base.port,
     allowDestructive: !!raw.allowDestructive,
     categories,
   };

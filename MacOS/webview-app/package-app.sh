@@ -109,6 +109,19 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# Build-time verification: the version we just wrote MUST round-trip out of the
+# bundle, because the sidecar reports it at runtime (env MAESTRO_VERSION, injected
+# by the Swift launcher from this exact key). A mismatch here means health/feedback
+# would report the wrong version — fail the build loudly rather than ship it.
+if command -v plutil >/dev/null 2>&1; then
+  PLIST_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist" 2>/dev/null || true)"
+  if [ "$PLIST_VERSION" != "$VERSION" ]; then
+    echo "  ERROR: Info.plist CFBundleShortVersionString ('$PLIST_VERSION') != build VERSION ('$VERSION')"
+    exit 1
+  fi
+  echo "> verified Info.plist version = $PLIST_VERSION"
+fi
+
 SIDECAR="$ROOT/../sidecar"
 echo "> building sidecar bundle"
 node "$SIDECAR/build.mjs" --external-natives

@@ -8,7 +8,7 @@
    remote controls. */
 
 import { app } from 'electron';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync, openSync, writeSync, closeSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync, openSync, writeSync, closeSync, unlinkSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID, randomBytes } from 'node:crypto';
 import type { BrowserSettings } from './browser/types.js';
@@ -950,6 +950,19 @@ const LOCK_STALE_MS = 10_000;   // a lock older than this is from a crashed writ
 const LOCK_TIMEOUT_MS = 3_000;  // give up waiting and save lockless after this
 const LOCK_SPIN_MS = 12;        // backoff between acquire attempts
 
+/** Owner-only (rw-------) permissions for the on-disk store: it carries secrets
+    (mcpToken, accessToken, extensionToken, provider-key metadata) and must never
+    be group/world readable. */
+const STORE_FILE_MODE = 0o600;
+
+/** Best-effort clamp of the store file to STORE_FILE_MODE. Corrects a file left
+    world-readable by an older build (which wrote it at the umask default, ~0644)
+    without ever throwing — a permission hiccup must not wedge load/save. Never
+    logs the file's contents. */
+function hardenStoreFile(file: string): void {
+  try { chmodSync(file, STORE_FILE_MODE); } catch { /* file gone / not owned — nothing we can safely do */ }
+}
+
 /** Block the current thread for `ms` without a busy-spin (save() is sync). */
 function sleepSync(ms: number): void {
   try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, ms)); }
@@ -1013,6 +1026,10 @@ export class Store {
   private load(): void {
     try {
       this.data = JSON.parse(readFileSync(this.file, 'utf8')) as StoreData;
+      // Startup self-heal: a store written by an older build predates the
+      // owner-only hardening and may be mode 0644 on disk even though it holds
+      // secrets. Clamp it now, before any migration save re-writes it.
+      hardenStoreFile(this.file);
       // Baseline for the multi-writer conflict check in save().
       this.diskStamp = this.currentStamp();
       let dirty = false;
@@ -1128,8 +1145,13 @@ export class Store {
       // never leave a half-written (unparseable) store, and no reader sees a
       // torn file.
       const tmp = `${this.file}.tmp-${process.pid}`;
-      writeFileSync(tmp, JSON.stringify(this.data, null, 2));
+      // The store holds secrets (mcpToken, accessToken, extensionToken, provider
+      // key metadata) so it must be owner-only. Create the temp sibling at 0600
+      // up front — the rename inherits its mode, so the target is never briefly
+      // world-readable — then belt-and-suspenders chmod the landed file too.
+      writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: STORE_FILE_MODE });
       renameSync(tmp, this.file);
+      hardenStoreFile(this.file);
       this.diskStamp = this.currentStamp();
     } catch { /* disk hiccup — retry next save */ }
     finally { if (fd !== null) this.releaseLock(fd); }
