@@ -6,6 +6,7 @@ describe('remote-guard', () => {
     // Regression guard: these MUST stay blocked on any remote transport.
     const mustBlock = [
       'getPairing', 'kickDevice', 'regeneratePairingCode',
+      'mcpAccessConfig', 'setMcpAccess', 'rotateMcpToken',
       'getProjectMemory', 'setProjectMemory', 'snapshotProject', 'archiveSessionWorktree',
       'githubLogout', 'getSessionGitStatus', 'refreshSessionGitStatus',
       'pushSession', 'createSessionPR', 'mergeSessionPR', 'resolveSession',

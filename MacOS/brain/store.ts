@@ -10,7 +10,7 @@
 import { app } from 'electron';
 import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync, openSync, writeSync, closeSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
 import type { BrowserSettings } from './browser/types.js';
 import type { DesignMode, DesignPhase, DesignFlow, DesignBrief } from './design-workflow.js';
 import { quietDeadline } from './whatsapp-quiet.js';
@@ -27,6 +27,9 @@ export function newPairingToken(): string {
   const group = () => Array.from({ length: 4 }, pick).join('');
   return `${group()}-${group()}-${group()}`;
 }
+
+/** High-entropy bearer token for the external MCP endpoint (not human-typed). */
+export function newMcpToken(): string { return randomBytes(24).toString('hex'); }
 
 /* ── Domain types ────────────────────────────────────────────────────── */
 
@@ -660,6 +663,19 @@ export interface AppSettings {
   memoryRepoName?: string;
   /** Playwright-backed per-project browser (native app). */
   browser?: BrowserSettings;
+  /** External MCP exposure — lets an OUTSIDE agent drive the whole app surface. See brain/mcp/. */
+  externalMcp?: ExternalMcpAccess;
+}
+/** Persisted config for the outward-facing MCP server (brain/mcp/external-mcp.ts). */
+export interface ExternalMcpAccess {
+  /** Master switch — false tears the loopback HTTP server down entirely. */
+  enabled: boolean;
+  /** Preferred loopback port (falls back to an ephemeral port if taken). */
+  port: number;
+  /** Expose DESTRUCTIVE tools (deletes, shell, writes, outward sends, auth changes). */
+  allowDestructive: boolean;
+  /** Per-category enable, keyed by McpCategoryId. Missing ⇒ the manifest default. */
+  categories: Record<string, boolean>;
 }
 export const DEFAULT_SETTINGS: AppSettings = { defaultEffort: 'balanced', defaultEngine: 'auto', openAtLogin: false, rescanCadence: 'onchange', favoriteModels: [], p2pEnabled: false, notifications: { ...DEFAULT_NOTIFICATIONS }, autoCreateRepo: true, autoPushCommits: true, memorySyncEnabled: true, memoryRepoOwner: '', memoryRepoName: 'maestro-memory', browser: { enabled: true, headless: false } };
 
@@ -693,6 +709,8 @@ interface StoreData {
   accessToken: string;
   /** Pairing token the local browser extension must present on the control port. Shown in the app; never in snapshots. */
   extensionToken: string;
+  /** Bearer token an EXTERNAL MCP client must present to drive the app. Shown in the app; never in snapshots. */
+  mcpToken?: string;
   routing: Routing;
   settings: AppSettings;
   catalogVersion?: number;
@@ -963,6 +981,7 @@ export class Store {
       // migrations for stores written by older builds (dirty-flag pattern)
       if (!this.data.accessToken) { this.data.accessToken = newPairingToken(); dirty = true; }
       if (!this.data.extensionToken) { this.data.extensionToken = newPairingToken(); dirty = true; }
+      if (!this.data.mcpToken) { this.data.mcpToken = newMcpToken(); dirty = true; }
       if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
       if (!this.data.designComments) { this.data.designComments = {}; dirty = true; }
       if (!this.data.installedSkills) { this.data.installedSkills = {}; dirty = true; }
@@ -1038,7 +1057,7 @@ export class Store {
       if (this.data.jobs.length !== beforeLen) this.save();
     } catch {
       this.data = {
-        deckId: id(), deckSecret: id(), accessToken: newPairingToken(), extensionToken: newPairingToken(),
+        deckId: id(), deckSecret: id(), accessToken: newPairingToken(), extensionToken: newPairingToken(), mcpToken: newMcpToken(),
         routing: { ...DEFAULT_ROUTING }, settings: { ...DEFAULT_SETTINGS }, catalogVersion: CATALOG_VERSION,
         workspace: null,
         projects: [], jobs: [], sessions: [], approvals: [], schedules: [], browserWatches: [], skills: [], templates: [],
@@ -1175,6 +1194,29 @@ export class Store {
   /** Rotate the pairing code (regenerate): persists a fresh token; unpairs every remote. */
   setAccessToken(token: string): void { this.data.accessToken = token; this.save(); }
   get extensionToken(): string { return this.data.extensionToken; }
+
+  /** External-MCP bearer token (lazily minted on older stores). */
+  mcpToken(): string {
+    if (!this.data.mcpToken) { this.data.mcpToken = newMcpToken(); this.save(); }
+    return this.data.mcpToken;
+  }
+  /** Rotate the external-MCP bearer token — invalidates every pasted client config. */
+  rotateMcpToken(): string { this.data.mcpToken = newMcpToken(); this.save(); return this.data.mcpToken; }
+  /** Read the external-MCP access config (undefined ⇒ caller applies manifest defaults). */
+  mcpAccess(): ExternalMcpAccess | undefined { return this.data.settings.externalMcp ? { ...this.data.settings.externalMcp } : undefined; }
+  /** Merge a patch into the external-MCP access config; persists and returns the merged value. */
+  setMcpAccess(patch: Partial<ExternalMcpAccess>): ExternalMcpAccess {
+    const cur = this.data.settings.externalMcp;
+    const next: ExternalMcpAccess = {
+      enabled: patch.enabled ?? cur?.enabled ?? false,
+      port: patch.port ?? cur?.port ?? 9235,
+      allowDestructive: patch.allowDestructive ?? cur?.allowDestructive ?? false,
+      categories: { ...(cur?.categories ?? {}), ...(patch.categories ?? {}) },
+    };
+    this.data.settings = { ...this.data.settings, externalMcp: next };
+    this.save();
+    return next;
+  }
 
   // Remote-device presence (transient; the relay reports the full list, never persisted).
   private remoteDevices: RemoteDevice[] = [];

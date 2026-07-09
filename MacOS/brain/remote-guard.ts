@@ -9,6 +9,8 @@
 export const REMOTE_BLOCKED_METHODS: ReadonlySet<string> = new Set<string>([
   // device/pairing control (raw token, kick, code rotation) — this Mac only
   'getPairing', 'kickDevice', 'regeneratePairingCode',
+  // external-MCP control exposes the bearer token + toggles the whole-app surface — Mac only
+  'mcpAccessConfig', 'setMcpAccess', 'rotateMcpToken',
   // project memory + git/worktree/PR actions read/write local files & run git
   'getProjectMemory', 'setProjectMemory', 'snapshotProject', 'archiveSessionWorktree',
   'githubLogout', 'getSessionGitStatus', 'refreshSessionGitStatus',

@@ -186,7 +186,16 @@ const resolveInRoots = (roots: string[], rel: string): string => {
     pair (matches the `runningCmds` map in main.ts). */
 const runningCmds = new Map<string, ChildProcess>();
 
-export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null, gitWatcher?: GitWatcher, browserManager?: import('./browser/manager.js').BrowserManager, memorySync?: MemorySync) {
+/** Control handle for the outward-facing MCP server (brain/mcp/external-mcp.ts).
+    Kept structural so localApi stays decoupled from the transport implementation. */
+export interface ExternalMcpControl {
+  /** The full config payload for the Settings UI (endpoints, token, category counts). */
+  config(): unknown;
+  /** (Re)start or stop the loopback HTTP server to match the current settings. */
+  apply(): void;
+}
+
+export function createDispatch(store: Store, engine: LocalEngine, media: MediaEngine, research: ResearchEngine, publishing: PublishingEngine, telegram: TelegramBot, whatsapp: WhatsAppClient, providers: Providers, emit: (name: string, data: unknown) => void, relayUrl = '', gitService?: GitService, getExtensionBridge?: () => ExtensionBridge | null, gitWatcher?: GitWatcher, browserManager?: import('./browser/manager.js').BrowserManager, memorySync?: MemorySync, externalMcp?: ExternalMcpControl) {
   /** Fire-and-forget GitHub provisioning for a NEW project folder: create the
       private remote repo, wire origin, push. Gated by Settings.autoCreateRepo
       (default ON) + a connected GitHub account. Never blocks project creation.
@@ -228,6 +237,35 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'costs': return store.costs();
       case 'claudeUsage': return getClaudeUsage(p.force === true);
       case 'listEvents': return store.listEvents();
+
+      // ── External MCP (an outside agent driving the whole app) ──
+      case 'mcpAccessConfig':
+        if (!externalMcp) throw Object.assign(new Error('external MCP is not available on this transport'), { statusCode: 501 });
+        return externalMcp.config();
+      case 'setMcpAccess': {
+        if (!externalMcp) throw Object.assign(new Error('external MCP is not available on this transport'), { statusCode: 501 });
+        const patch: { enabled?: boolean; port?: number; allowDestructive?: boolean; categories?: Record<string, boolean> } = {};
+        if (typeof p.enabled === 'boolean') patch.enabled = p.enabled;
+        if (typeof p.allowDestructive === 'boolean') patch.allowDestructive = p.allowDestructive;
+        if (typeof p.port === 'number' && Number.isInteger(p.port) && p.port > 0 && p.port < 65536) patch.port = p.port;
+        if (p.categories && typeof p.categories === 'object' && !Array.isArray(p.categories)) {
+          const cats: Record<string, boolean> = {};
+          for (const [k, v] of Object.entries(p.categories as Record<string, unknown>)) if (typeof v === 'boolean') cats[k] = v;
+          patch.categories = cats;
+        }
+        store.setMcpAccess(patch);
+        externalMcp.apply();
+        const cfg = externalMcp.config();
+        emit('mcp-access', cfg);
+        return cfg;
+      }
+      case 'rotateMcpToken': {
+        if (!externalMcp) throw Object.assign(new Error('external MCP is not available on this transport'), { statusCode: 501 });
+        store.rotateMcpToken();
+        const cfg = externalMcp.config();
+        emit('mcp-access', cfg);
+        return cfg;
+      }
 
       // ── Settings ───────────────────────────────────────────────
       case 'getSettings': return store.getSettings();

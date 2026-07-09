@@ -28,7 +28,8 @@ import { GitWatcher } from '../../brain/git-watcher.js';
 import { MemorySync } from '../../brain/memory-sync.js';
 import { CronRunner } from '../../brain/cron.js';
 import { makeWhatsappAnalyzer } from '../../brain/whatsapp-analyze.js';
-import { createDispatch } from '../../brain/localApi.js';
+import { createDispatch, type ExternalMcpControl } from '../../brain/localApi.js';
+import { ExternalMcp } from '../../brain/mcp/external-mcp.js';
 import { setEnginesRoot } from '../../brain/engines.js';
 import { bootstrapNodePath } from '../../brain/node-shim.js';
 import { HostClient } from '../../brain/hostClient.js';
@@ -181,12 +182,35 @@ const browserManager = new BrowserManager({
 });
 try { engine.setBrowserManager(browserManager); } catch (e) { warn('setBrowserManager', e); }
 
+// External MCP: exposes the WHOLE dispatch surface to an OUTSIDE agent (Claude Desktop,
+// Cursor, Codex, …) over a loopback+token HTTP endpoint + a stdio shim. Constructed AFTER
+// dispatch (which it calls), but createDispatch needs a control handle to (re)start the
+// server + report config — so we hand it a thin holder that resolves once externalMcp exists.
+let externalMcp: ExternalMcp | null = null;
+const mcpControl: ExternalMcpControl = {
+  config: () => externalMcp?.config() ?? { enabled: false, running: false },
+  apply: () => externalMcp?.apply(),
+};
+
 // The full local dispatch — identical to what the renderer reached over Electron IPC.
 // getExtensionBridge → null (the native app uses Playwright, not the Chrome extension).
 const dispatch = createDispatch(
   store, engine, media, research, publishing, telegram, whatsapp, providers,
-  emit, RELAY_URL, gitService, () => null, gitWatcher, browserManager, memorySync,
+  emit, RELAY_URL, gitService, () => null, gitWatcher, browserManager, memorySync, mcpControl,
 );
+
+externalMcp = new ExternalMcp({
+  store: {
+    mcpAccess: () => store.mcpAccess(),
+    setMcpAccess: (patch) => store.setMcpAccess(patch),
+    mcpToken: () => store.mcpToken(),
+    rotateMcpToken: () => store.rotateMcpToken(),
+  },
+  dispatch: (m, p) => dispatch(m, p),
+  shimPath: path.join(shimApp.getPath('userData'), 'mochi-mcp-stdio.cjs'),
+  nodePath: process.execPath,
+  warn: (label, e) => warn(label, e),
+});
 
 function isJob(x: unknown): x is Job {
   return !!x && typeof x === 'object' && 'input' in x && 'status' in x && 'phase' in x && 'projectId' in x;
@@ -406,6 +430,7 @@ async function boot() {
   process.stderr.write(`[sidecar] full dispatch live on 127.0.0.1:${host.port}\n`);
 
   // Best-effort boot resumes (run AFTER the host is up so their events have somewhere to go).
+  try { externalMcp?.start(); } catch (e) { warn('externalMcp.start', e); }
   try { cron.start(); } catch (e) { warn('cron.start', e); }
   try { media.resumeOnBoot(); } catch (e) { warn('media.resumeOnBoot', e); }
   try { telegram.resumeOnBoot(); } catch (e) { warn('telegram.resumeOnBoot', e); }
@@ -419,6 +444,7 @@ async function boot() {
     process.on(sig, () => {
       try { stopAccountHost(); } catch { /* noop */ }
       try { cron.stop(); } catch { /* noop */ }
+      try { externalMcp?.stop(); } catch { /* noop */ }
       try { gitWatcher.detachAll(); } catch { /* noop */ }
       try { void browserManager.shutdown(); } catch { /* noop */ }
       try { host.close(); } catch { /* noop */ }
