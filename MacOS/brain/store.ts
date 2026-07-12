@@ -14,6 +14,8 @@ import { randomUUID, randomBytes } from 'node:crypto';
 import type { BrowserSettings } from './browser/types.js';
 import type { DesignMode, DesignPhase, DesignFlow, DesignBrief } from './design-workflow.js';
 import { quietDeadline } from './whatsapp-quiet.js';
+// external-mcp imports only ./mcp/manifest (never ./store), so this stays acyclic.
+import { preferredMcpPort } from './mcp/external-mcp.js';
 import { WaStore, type WaChatMeta, type WaStoredMessage, type WaMessageInput, type WaChatKind } from './wa-store.js';
 import type { RemoteDevice } from './relay.js';
 
@@ -1343,7 +1345,10 @@ export class Store {
     const cur = this.data.settings.externalMcp;
     const next: ExternalMcpAccess = {
       enabled: patch.enabled ?? cur?.enabled ?? false,
-      port: patch.port ?? cur?.port ?? 9235,
+      // An explicit patch port, then the already-persisted port, then the
+      // CHANNEL preferred port (MAESTRO_MCP_PORT → 9235/9236/9237). A fresh
+      // preview/development store must NOT persist the production 9235 here.
+      port: patch.port ?? cur?.port ?? preferredMcpPort(),
       allowDestructive: patch.allowDestructive ?? cur?.allowDestructive ?? false,
       categories: { ...(cur?.categories ?? {}), ...(patch.categories ?? {}) },
     };

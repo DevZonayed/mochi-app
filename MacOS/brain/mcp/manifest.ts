@@ -488,10 +488,10 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
 
   // ── projects ────────────────────────────────────────────────────────────
   listProjects: S(),
-  getProject: S({ id: str('Project id.') }, ['id']),
-  getProjectMemory: S({ id: str('Project id.') }, ['id']),
-  setProjectMemory: S({ id: str('Project id.'), state: str('New .continuum STATE.md contents.') }, ['id']),
-  snapshotProject: S({ id: str('Project id.'), message: str('Snapshot commit message.') }, ['id']),
+  getProject: S({ projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.') }, [], oneOf('projectId', 'id')),
+  getProjectMemory: S({ projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.') }, [], oneOf('projectId', 'id')),
+  setProjectMemory: S({ projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.'), state: str('New .continuum STATE.md contents.') }, [], oneOf('projectId', 'id')),
+  snapshotProject: S({ projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.'), message: str('Snapshot commit message.') }, [], oneOf('projectId', 'id')),
   createProject: S({
     name: str('Project name.'),
     kind: enumStr(['coding', 'design', 'content', 'research', 'general', 'context']),
@@ -505,10 +505,10 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     designMode: enumStr(['raw', 'redesign'], 'For design projects: guided-workflow mode.'),
     designBrief: str(),
   }, ['name']),
-  openProject: S({ id: str('Project id to open/activate.') }, ['id']),
-  closeProject: S({ id: str('Project id to close.') }, ['id']),
+  openProject: S({ projectId: str('Project id to open/activate (id also accepted).'), id: str('Alias of projectId.') }, [], oneOf('projectId', 'id')),
+  closeProject: S({ projectId: str('Project id to close (id also accepted).'), id: str('Alias of projectId.') }, [], oneOf('projectId', 'id')),
   updateProject: S({
-    id: str('Project id.'),
+    projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.'),
     name: str(), instructions: str(), color: str(), template: str(), path: str(),
     repoUrl: str(), defaultBaseBranch: str(), setupScript: str(), memorySlug: str(), memoryRepoUrl: str(),
     kind: enumStr(['coding', 'design', 'content', 'research', 'general', 'context']),
@@ -518,9 +518,9 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     hidden: bool('Soft-hide from the Projects view.'),
     designFlow: enumStr(['direct', 'advanced']),
     designPhase: enumStr(['research', 'brand', 'choice', 'design', 'complete']),
-  }, ['id']),
+  }, [], oneOf('projectId', 'id')),
   reorderProjects: S({ ids: strList('Project ids in the desired order.') }, ['ids']),
-  getProjectRepo: S({ id: str('Project id.') }, ['id']),
+  getProjectRepo: S({ projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.') }, [], oneOf('projectId', 'id')),
   githubRepoMetadata: S({ owner: str('GitHub owner/login.'), repo: str('Repository name.') }, ['owner', 'repo']),
   cloneRepo: S({
     url: str('Git clone URL.'),
@@ -529,8 +529,8 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     name: str('Project name (defaults to repo name).'),
     instructions: str(), color: str(),
   }, ['url', 'dest']),
-  revealProject: S({ id: str('Project id.') }, ['id']),
-  deleteProject: S({ id: str('Project id.') }, ['id']),
+  revealProject: S({ projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.') }, [], oneOf('projectId', 'id')),
+  deleteProject: S({ projectId: str('Project id (id also accepted).'), id: str('Alias of projectId.') }, [], oneOf('projectId', 'id')),
   bootstrapProject: S({
     name: str('Project name.'),
     localPath: str('Local folder for the project.'),

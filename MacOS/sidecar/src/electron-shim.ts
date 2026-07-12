@@ -66,16 +66,33 @@ export function resolveAppVersion(): string {
   return cachedVersion;
 }
 
-function userDataDir(): string {
-  const override = process.env.MAESTRO_USER_DATA_DIR;
+/** The `@maestro/<subdir>` userData folder for a release channel. Each channel is
+    ISOLATED so production / preview / development never share a store, token, or
+    runtime. Absent/unknown channel → production (safe default). */
+export function channelSubdir(channel?: string): string {
+  switch (channel) {
+    case 'preview': return 'desktop-preview';
+    case 'development': return 'desktop-development';
+    default: return 'desktop'; // production, unknown, or unset
+  }
+}
+
+/** Resolve the userData path WITHOUT side effects (no mkdir), so it's unit-safe.
+    Precedence: an explicit MAESTRO_USER_DATA_DIR (the Swift launcher injects the
+    channel dir there) always wins; otherwise the channel-specific default from
+    MAESTRO_CHANNEL. */
+export function resolveUserDataPath(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.MAESTRO_USER_DATA_DIR;
   if (override) {
-    const resolved = override.startsWith('~/') || override === '~'
+    return override.startsWith('~/') || override === '~'
       ? path.join(HOME, override.slice(1))
       : path.resolve(override);
-    try { mkdirSync(resolved, { recursive: true }); } catch { /* noop */ }
-    return resolved;
   }
-  const dir = path.join(APP_SUPPORT, '@maestro', 'desktop');
+  return path.join(APP_SUPPORT, '@maestro', channelSubdir(env.MAESTRO_CHANNEL));
+}
+
+function userDataDir(): string {
+  const dir = resolveUserDataPath();
   try { mkdirSync(dir, { recursive: true }); } catch { /* noop */ }
   return dir;
 }

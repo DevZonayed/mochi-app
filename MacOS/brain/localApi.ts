@@ -51,6 +51,13 @@ const bad = (msg: string, statusCode = 400): never => {
   throw Object.assign(new Error(msg), { statusCode });
 };
 
+/** The PROJECT id for a dispatch call. The External MCP surface naturally sends
+    `projectId` for project tools, while the renderer/legacy callers send `id`.
+    Accept EITHER — canonical `projectId` first, `id` as the backwards-compatible
+    alias. Use ONLY where the id denotes a PROJECT (never for comment/session/job
+    ids). Fixes external MCP getProject/openProject({projectId}) → "not found". */
+const projectIdOf = (p: Params): string => String(p.projectId ?? p.id ?? '');
+
 /** A GitHub "owner/repo" slug: each side must start AND end alphanumeric, so
     junk like `owner/..`, `../repo`, or `a/.` is rejected (no traversal-ish names). */
 const REPO_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
@@ -388,18 +395,18 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // ── Projects ───────────────────────────────────────────────
       case 'listProjects': return store.listProjects();
       case 'getProject': {
-        const proj = store.getProject(String(p.id ?? ''));
+        const proj = store.getProject(projectIdOf(p));
         return proj ?? bad('project not found', 404);
       }
       // Per-project .continuum memory (STATE.md + checkpoint chain).
       case 'getProjectMemory': {
-        const proj = store.getProject(String(p.id ?? ''));
+        const proj = store.getProject(projectIdOf(p));
         if (!proj) return bad('project not found', 404);
         const root = projectRootOf(proj);
         return { state: readProjectState(root), checkpoints: listCheckpoints(root, 50) };
       }
       case 'setProjectMemory': {
-        const proj = store.getProject(String(p.id ?? ''));
+        const proj = store.getProject(projectIdOf(p));
         if (!proj) return bad('project not found', 404);
         writeProjectState(projectRootOf(proj), typeof p.state === 'string' ? p.state : '');
         memorySync?.scheduleSync(proj.id); // mirror the edit to the memory repo
@@ -407,7 +414,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       // Commit a referable snapshot of the project (design + attachments).
       case 'snapshotProject': {
-        const proj = store.getProject(String(p.id ?? ''));
+        const proj = store.getProject(projectIdOf(p));
         if (!proj) return bad('project not found', 404);
         return snapshotProject(projectRootOf(proj), typeof p.message === 'string' ? p.message : 'snapshot');
       }
@@ -586,7 +593,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // the same project reuses the watcher. No-op when the project has no
       // memorySlug (legacy projects pre-dual-repo).
       case 'openProject': {
-        const proj = store.getProject(String(p.id ?? ''));
+        const proj = store.getProject(projectIdOf(p));
         if (!proj) return bad('project not found', 404);
         if (!proj.memorySlug || !proj.path) return { ok: true, skipped: true as const, reason: 'no-memory-repo' };
         try {
@@ -601,7 +608,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // closeProject: stop the STATE watcher when the operator leaves a
       // project view (the renderer calls this on unmount).
       case 'closeProject': {
-        const proj = store.getProject(String(p.id ?? ''));
+        const proj = store.getProject(projectIdOf(p));
         if (proj?.memorySlug) closeMemoryWatcher(proj.memorySlug);
         return { ok: true };
       }
@@ -615,7 +622,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // CONNECTED to. Validated hard — only existing, other projects (no
         // self-link, no dangling ids), deduped, capped at 24.
         if (Array.isArray(p.linkedProjectIds)) {
-          const selfId = String(p.id ?? '');
+          const selfId = projectIdOf(p);
           patch.linkedProjectIds = [...new Set((p.linkedProjectIds as unknown[])
             .filter((x): x is string => typeof x === 'string')
             .filter((pid) => pid !== selfId && !!store.getProject(pid)))].slice(0, 24);
@@ -629,13 +636,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // (e.g. the Direct/Advanced pick at the 'choice' gate). Only workflow
         // design projects accept these — a stray phase patch must never plant
         // a .maestro/design marker inside e.g. a coding repo.
-        const target = store.getProject(String(p.id ?? ''));
+        const target = store.getProject(projectIdOf(p));
         if (target?.designMode === 'raw' || target?.designMode === 'redesign') {
           if (p.designFlow === 'direct' || p.designFlow === 'advanced') patch.designFlow = p.designFlow as DesignFlow;
           if (p.designPhase === 'research' || p.designPhase === 'brand' || p.designPhase === 'choice' || p.designPhase === 'design' || p.designPhase === 'complete') patch.designPhase = p.designPhase as DesignPhase;
         }
         if (Object.keys(patch).length === 0) bad('no valid project fields');
-        const proj = store.updateProject(String(p.id ?? ''), patch);
+        const proj = store.updateProject(projectIdOf(p), patch);
         // Mirror phase/flow moves into the on-disk marker so the agent's next
         // turn sees the operator's choice (the marker is the shared channel).
         if ((patch.designPhase || patch.designFlow) && proj.path) {
@@ -692,7 +699,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         return result;
       }
       case 'getProjectRepo': {
-        const proj = store.getProject(String(p.id ?? ''));
+        const proj = store.getProject(projectIdOf(p));
         if (!proj) bad('project not found', 404);
         return proj!.path ? repoInfo(proj!.path) : { branch: null, remote: null, isRepo: false };
       }
@@ -741,12 +748,13 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       }
       case 'revealProject': {
         // Reveal handled natively in main via maestro:revealPath; this returns the path.
-        const proj = store.getProject(String(p.id ?? ''));
+        const proj = store.getProject(projectIdOf(p));
         return { path: proj?.path ?? null };
       }
       case 'deleteProject': {
-        store.deleteProject(String(p.id ?? ''));
-        emit('project', { id: String(p.id ?? ''), deleted: true });
+        const projectId = projectIdOf(p);
+        store.deleteProject(projectId);
+        emit('project', { id: projectId, deleted: true });
         return { ok: true };
       }
 

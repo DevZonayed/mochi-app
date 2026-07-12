@@ -60,18 +60,21 @@ describe('manifest schema coverage', () => {
   });
   it('toMcpTool exposes the accurate schema to tools/list', () => {
     const open = toMcpTool(MCP_TOOL_BY_METHOD.get('openProject')!);
+    expect(open.inputSchema.properties).toHaveProperty('projectId');
     expect(open.inputSchema.properties).toHaveProperty('id');
-    expect(open.inputSchema.required).toContain('id');
   });
 });
 
 describe('reported contract bugs are fixed', () => {
-  it('openProject reads {id}, NOT {projectId}', () => {
+  it('openProject accepts canonical projectId OR the legacy id alias', () => {
     const s = TOOL_SCHEMAS.openProject;
+    expect(s.properties).toHaveProperty('projectId');
     expect(s.properties).toHaveProperty('id');
-    expect(s.properties).not.toHaveProperty('projectId');
-    expect(s.required).toEqual(['id']);
-    expect(reads(BLOCKS.get('openProject')!, 'id')).toBe(true);
+    // No single required key — the oneOf(projectId,id) alternation enforces one.
+    expect(s.required ?? []).toEqual([]);
+    expect(Array.isArray(s.anyOf)).toBe(true);
+    // dispatch resolves the project id via the shared projectIdOf(p) helper.
+    expect(BLOCKS.get('openProject')!).toMatch(/projectIdOf\(p\)/);
   });
   it('sendChat: text is canonical, prompt/message are INTENTIONAL aliases dispatch reads', () => {
     const s = TOOL_SCHEMAS.sendChat;
@@ -93,10 +96,18 @@ describe('reported contract bugs are fixed', () => {
     expect(s.properties).not.toHaveProperty('jobId');
     expect(s.required).toEqual(['id', 'text']);
   });
-  it('the id-vs-projectId family all read {id}', () => {
-    for (const m of ['getProject', 'getProjectMemory', 'updateProject', 'deleteProject', 'getProjectRepo', 'listDesignComments', 'listProjectSkills']) {
-      expect(TOOL_SCHEMAS[m].properties, `${m} should document id`).toHaveProperty('id');
-      expect(TOOL_SCHEMAS[m].properties, `${m} should NOT document projectId`).not.toHaveProperty('projectId');
+  it('project-scoped tools accept canonical projectId + the legacy id alias', () => {
+    // These arms resolve their PROJECT id via projectIdOf(p) = projectId ?? id.
+    for (const m of ['getProject', 'getProjectMemory', 'setProjectMemory', 'snapshotProject',
+      'openProject', 'closeProject', 'updateProject', 'getProjectRepo', 'revealProject', 'deleteProject']) {
+      expect(TOOL_SCHEMAS[m].properties, `${m} projectId`).toHaveProperty('projectId');
+      expect(TOOL_SCHEMAS[m].properties, `${m} id alias`).toHaveProperty('id');
+    }
+    // The design-comment + skill arms still take the project id as `id` (unchanged
+    // in this fix; their id semantics are entangled with comment/skill ids).
+    for (const m of ['listDesignComments', 'listProjectSkills']) {
+      expect(TOOL_SCHEMAS[m].properties, `${m} id`).toHaveProperty('id');
+      expect(TOOL_SCHEMAS[m].properties, `${m} no projectId`).not.toHaveProperty('projectId');
     }
   });
   it('the id-vs-{jobId,assetId,runId} renames are corrected', () => {

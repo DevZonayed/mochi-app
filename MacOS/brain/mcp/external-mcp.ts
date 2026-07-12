@@ -33,6 +33,19 @@ import {
 const PROTOCOL_VERSION = '2025-06-18';
 const DEFAULT_PORT = 9235;
 
+/** The PREFERRED External MCP port for this channel. The Swift launcher injects
+    MAESTRO_MCP_PORT per channel (production 9235 / preview 9236 / development
+    9237); we honor a STRICT valid integer port and reject anything malformed
+    (including '', '0', negatives, floats, out-of-range) → DEFAULT_PORT. This only
+    sets the DEFAULT preferred port; enabling External MCP is still opt-in, and an
+    explicitly-configured store port always wins (see normalizeSettings). */
+export function preferredMcpPort(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.MAESTRO_MCP_PORT;
+  if (raw === undefined || !/^[0-9]+$/.test(raw)) return DEFAULT_PORT; // reject '', '-1', '12.5', ' 9236', 'abc'
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 && n < 65536 ? n : DEFAULT_PORT;  // reject '0', '70000'
+}
+
 export type Dispatch = (method: string, params: Record<string, unknown>) => unknown | Promise<unknown>;
 
 export interface ExternalMcpSettings {
@@ -49,7 +62,9 @@ export interface ExternalMcpSettings {
 export function defaultExternalMcpSettings(): ExternalMcpSettings {
   const categories: Record<string, boolean> = {};
   for (const c of MCP_CATEGORIES) categories[c.id] = c.defaultOn;
-  return { enabled: false, port: DEFAULT_PORT, allowDestructive: false, categories };
+  // `enabled:false` stays the fresh-store default on EVERY channel — the env only
+  // controls the PREFERRED port, never auto-enables the surface.
+  return { enabled: false, port: preferredMcpPort(), allowDestructive: false, categories };
 }
 
 /** Merge stored (possibly partial) settings over defaults. */

@@ -278,3 +278,36 @@ describe('destructive PR tools reject the id alias (canonical sessionId only)', 
     await expect(dispatch('mergeSessionPR', { id: session.id })).rejects.toThrow(/session not found/i);
   });
 });
+
+describe('project tools accept canonical projectId + the legacy id alias (real dispatch)', () => {
+  beforeEach(() => rmSync(hoisted.dir, { recursive: true, force: true }));
+
+  it('getProject resolves via {projectId} (external MCP) AND {id} (legacy)', async () => {
+    const { dispatch, project } = setup();
+    const byProjectId = await dispatch('getProject', { projectId: project.id }) as { id?: string };
+    expect(byProjectId.id).toBe(project.id);        // RED before fix: read only p.id → "project not found"
+    const byId = await dispatch('getProject', { id: project.id }) as { id?: string };
+    expect(byId.id).toBe(project.id);               // legacy renderer path still works
+  });
+
+  it('openProject finds the project via {projectId} AND {id} (was "project not found")', async () => {
+    const { dispatch, project } = setup();
+    const viaProjectId = await dispatch('openProject', { projectId: project.id }) as { ok?: boolean };
+    expect(viaProjectId.ok).toBe(true);             // resolved (no 404 throw) — the reported blocker
+    const viaId = await dispatch('openProject', { id: project.id }) as { ok?: boolean };
+    expect(viaId.ok).toBe(true);
+  });
+
+  it('a genuinely-missing project still 404s (no false positive)', async () => {
+    const { dispatch } = setup();
+    await expect(dispatch('getProject', { projectId: 'no-such-project' })).rejects.toThrow(/not found/i);
+    await expect(dispatch('openProject', { id: 'no-such-project' })).rejects.toThrow(/not found/i);
+  });
+
+  it('updateProject applies via {projectId} — representative read+write arm (no side effects)', async () => {
+    const { dispatch, project } = setup();
+    const updated = await dispatch('updateProject', { projectId: project.id, color: 'blue' }) as { id?: string; color?: string };
+    expect(updated.id).toBe(project.id);
+    expect(updated.color).toBe('blue');
+  });
+});

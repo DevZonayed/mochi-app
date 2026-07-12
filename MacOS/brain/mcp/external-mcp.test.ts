@@ -4,7 +4,7 @@ import path from 'node:path';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 
 import {
-  handleJsonRpc, listTools, toolAllowed, normalizeSettings, defaultExternalMcpSettings,
+  handleJsonRpc, listTools, toolAllowed, normalizeSettings, defaultExternalMcpSettings, preferredMcpPort,
   ExternalMcp, type ExternalMcpSettings, type ExternalMcpStore, type Dispatch,
 } from './external-mcp.ts';
 import { MCP_TOOLS, MCP_TOOL_BY_METHOD, MCP_CATEGORIES, categoryCounts } from './manifest.ts';
@@ -62,6 +62,35 @@ describe('normalizeSettings port', () => {
     expect(normalizeSettings({ port: 70000 }).port).toBe(DEFAULT);
     expect(normalizeSettings({ port: -1 }).port).toBe(DEFAULT);
     expect(normalizeSettings({ port: 1.5 }).port).toBe(DEFAULT);
+  });
+});
+
+describe('MAESTRO_MCP_PORT — channel preferred port (Swift injects per channel)', () => {
+  const OLD = process.env.MAESTRO_MCP_PORT;
+  afterEach(() => { if (OLD === undefined) delete process.env.MAESTRO_MCP_PORT; else process.env.MAESTRO_MCP_PORT = OLD; });
+
+  it('a valid MAESTRO_MCP_PORT becomes the default preferred port (preview 9236 / dev 9237)', () => {
+    process.env.MAESTRO_MCP_PORT = '9236';
+    expect(preferredMcpPort()).toBe(9236);
+    expect(defaultExternalMcpSettings().port).toBe(9236);
+    expect(normalizeSettings({}).port).toBe(9236);
+    process.env.MAESTRO_MCP_PORT = '9237';
+    expect(normalizeSettings({}).port).toBe(9237);
+  });
+  it('rejects a malformed MAESTRO_MCP_PORT and falls back to 9235', () => {
+    for (const b of ['abc', '', '0', '-1', '70000', '12.5', ' 9236']) {
+      process.env.MAESTRO_MCP_PORT = b;
+      expect(preferredMcpPort(), `bad=${JSON.stringify(b)}`).toBe(9235);
+      expect(normalizeSettings({}).port).toBe(9235);
+    }
+  });
+  it('preserves an EXPLICIT numeric port 0 regardless of the env preferred port', () => {
+    process.env.MAESTRO_MCP_PORT = '9236';
+    expect(normalizeSettings({ port: 0 }).port).toBe(0);
+  });
+  it('an explicit valid port overrides the env preferred port', () => {
+    process.env.MAESTRO_MCP_PORT = '9236';
+    expect(normalizeSettings({ port: 9000 }).port).toBe(9000);
   });
 });
 

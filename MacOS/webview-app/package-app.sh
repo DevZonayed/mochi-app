@@ -2,17 +2,44 @@
 set -euo pipefail
 
 CONFIG="${1:-release}"
-# The product name shipped to users. Renaming here renames dist/<name>.app and
-# the CFBundleName; the CFBundleIdentifier stays cloud.nexalance.maestro.webkit
-# on purpose (keychain entries + TCC permissions are keyed by it).
-APP_NAME="Mochlet"
 EXEC_NAME="MaestroWebKit"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+
+# Release CHANNEL selection (see resolve-channel.sh): MAESTRO_CHANNEL picks the
+# channel (production default; unknown REJECTED → the substitution fails under
+# set -e and aborts the build). Each channel gets a distinct app name, bundle id,
+# userData subdir, and preferred MCP port so production / preview / development
+# never share a store, token, keychain entry, TCC grant, or runtime. Production
+# keeps the historical name + bundle id, so its defaults are unchanged.
+CH_OUT="$(bash "$ROOT/resolve-channel.sh")"
+CHANNEL="$(printf '%s\n' "$CH_OUT" | sed -n 's/^CHANNEL=//p')"
+APP_NAME="$(printf '%s\n' "$CH_OUT" | sed -n 's/^APP_NAME=//p')"
+BUNDLE_ID="$(printf '%s\n' "$CH_OUT" | sed -n 's/^BUNDLE_ID=//p')"
+USER_DATA_DIR="$(printf '%s\n' "$CH_OUT" | sed -n 's/^USER_DATA_DIR=//p')"
+MCP_PORT="$(printf '%s\n' "$CH_OUT" | sed -n 's/^MCP_PORT=//p')"
+echo "> channel: $CHANNEL (app '$APP_NAME', id $BUNDLE_ID, userData @maestro/$USER_DATA_DIR, mcp $MCP_PORT)"
 # Release version resolution (see resolve-version.sh): explicit MAESTRO_VERSION
 # wins; else the nearest reachable mochlet-v* git tag; else 0.0.0-dev. Never a
 # stale hardcoded release number — a plain `./package-app.sh release` derives it.
 VERSION="$(bash "$ROOT/resolve-version.sh" "$REPO_ROOT")"
+# Source provenance (see source-fingerprint.sh) — HEAD revision + a content
+# fingerprint + clean/dirty, signed into Info.plist for promotion safety.
+# FAIL CLOSED: do NOT swallow helper failure — if provenance cannot be computed
+# (e.g. the helper fails to parse/run) the substitution fails under set -e and
+# aborts the build, with the helper stderr visible, rather than shipping a build
+# with empty promotion metadata.
+FP_OUT="$(bash "$ROOT/source-fingerprint.sh" "$REPO_ROOT")"
+SOURCE_REV="$(printf '%s\n' "$FP_OUT" | sed -n 's/^SOURCE_REV=//p')"
+SOURCE_FINGERPRINT="$(printf '%s\n' "$FP_OUT" | sed -n 's/^SOURCE_FINGERPRINT=//p')"
+SOURCE_STATUS="$(printf '%s\n' "$FP_OUT" | sed -n 's/^SOURCE_STATUS=//p')"
+# Assert the provenance is well-formed HERE, before spending a whole build on it
+# (the post-package Info.plist preflight re-checks the signed values downstream).
+[[ "$SOURCE_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: source fingerprint malformed/empty — provenance helper failed" >&2; exit 1; }
+[ -n "$SOURCE_REV" ] \
+  || { echo "ERROR: source revision empty — provenance helper failed" >&2; exit 1; }
+echo "> provenance: rev ${SOURCE_REV:0:12} fingerprint ${SOURCE_FINGERPRINT:0:12} ($SOURCE_STATUS)"
 BUILD_DIR="$ROOT/.build/$CONFIG"
 OUT="$ROOT/dist"
 APP="$OUT/$APP_NAME.app"
@@ -148,13 +175,21 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
   <key>CFBundleName</key><string>$APP_NAME</string>
-  <key>CFBundleDisplayName</key><string>Mochlet</string>
-  <key>CFBundleIdentifier</key><string>cloud.nexalance.maestro.webkit</string>
+  <key>CFBundleDisplayName</key><string>$APP_NAME</string>
+  <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleExecutable</key><string>$EXEC_NAME</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
+  <!-- Channel isolation metadata — read by the Swift launcher (Channel enum). -->
+  <key>MaestroChannel</key><string>$CHANNEL</string>
+  <key>MaestroUserDataDir</key><string>$USER_DATA_DIR</string>
+  <key>MaestroMcpPort</key><string>$MCP_PORT</string>
+  <!-- Source provenance (source-fingerprint.sh) — for promotion safety. -->
+  <key>MaestroSourceRevision</key><string>$SOURCE_REV</string>
+  <key>MaestroSourceFingerprint</key><string>$SOURCE_FINGERPRINT</string>
+  <key>MaestroSourceStatus</key><string>$SOURCE_STATUS</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -171,12 +206,40 @@ PLIST
 # by the Swift launcher from this exact key). A mismatch here means health/feedback
 # would report the wrong version — fail the build loudly rather than ship it.
 if command -v plutil >/dev/null 2>&1; then
-  PLIST_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist" 2>/dev/null || true)"
+  IP="$APP/Contents/Info.plist"
+  pkey() { plutil -extract "$1" raw -o - "$IP" 2>/dev/null || true; }
+
+  PLIST_VERSION="$(pkey CFBundleShortVersionString)"
   if [ "$PLIST_VERSION" != "$VERSION" ]; then
     echo "  ERROR: Info.plist CFBundleShortVersionString ('$PLIST_VERSION') != build VERSION ('$VERSION')"
     exit 1
   fi
-  echo "> verified Info.plist version = $PLIST_VERSION"
+  # A shippable version must be a real X.Y.Z release, never the dev fallback.
+  if ! [[ "$PLIST_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "  ERROR: Info.plist version '$PLIST_VERSION' is not a valid X.Y.Z release"
+    exit 1
+  fi
+
+  # Channel + provenance keys must round-trip and be well-formed — an unlabelled
+  # or mismatched bundle must never ship (it would break channel isolation or
+  # promotion provenance).
+  PLIST_CHANNEL="$(pkey MaestroChannel)"
+  case "$PLIST_CHANNEL" in
+    production|preview|development) : ;;
+    *) echo "  ERROR: Info.plist MaestroChannel '$PLIST_CHANNEL' is not a valid channel"; exit 1 ;;
+  esac
+  if [ "$PLIST_CHANNEL" != "$CHANNEL" ] \
+     || [ "$(pkey MaestroUserDataDir)" != "$USER_DATA_DIR" ] \
+     || [ "$(pkey MaestroMcpPort)" != "$MCP_PORT" ]; then
+    echo "  ERROR: Info.plist channel metadata does not match the resolved channel ($CHANNEL)"
+    exit 1
+  fi
+  PLIST_FP="$(pkey MaestroSourceFingerprint)"
+  if ! [[ "$PLIST_FP" =~ ^[0-9a-f]{64}$ ]] || [ -z "$(pkey MaestroSourceRevision)" ]; then
+    echo "  ERROR: Info.plist source provenance (revision/fingerprint) is missing or malformed"
+    exit 1
+  fi
+  echo "> verified Info.plist: version=$PLIST_VERSION channel=$PLIST_CHANNEL provenance ok ($(pkey MaestroSourceStatus))"
 fi
 
 SIDECAR="$ROOT/../sidecar"
