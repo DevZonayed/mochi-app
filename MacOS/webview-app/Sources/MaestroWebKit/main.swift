@@ -2,8 +2,43 @@ import AppKit
 import Foundation
 import WebKit
 
+/// Release-channel identity, read from the SIGNED Info.plist (written by
+/// package-app.sh via resolve-channel.sh). Keeps production / preview /
+/// development fully isolated — distinct display name, userData dir, MCP port,
+/// runtime dir, and debug log. Every value comes from Info.plist, so a plain
+/// Finder launch (no shell env) works. Falls back to production when unset.
+enum Channel {
+    static let name: String =
+        (Bundle.main.object(forInfoDictionaryKey: "MaestroChannel") as? String) ?? "production"
+
+    /// `@maestro/<subdir>` — MUST match sidecar/src/electron-shim.ts channelSubdir.
+    static let userDataDirName: String =
+        (Bundle.main.object(forInfoDictionaryKey: "MaestroUserDataDir") as? String) ?? "desktop"
+
+    /// Preferred External MCP port for this channel, string form for the env.
+    static let mcpPort: String? = {
+        if let s = Bundle.main.object(forInfoDictionaryKey: "MaestroMcpPort") as? String, !s.isEmpty { return s }
+        if let n = Bundle.main.object(forInfoDictionaryKey: "MaestroMcpPort") as? Int { return String(n) }
+        return nil
+    }()
+
+    /// The channel's isolated userData directory (~/Library/Application Support/@maestro/<subdir>).
+    static let userDataURL: URL =
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/@maestro/\(userDataDirName)", isDirectory: true)
+
+    /// Visible product name (Mochlet / Mochlet Preview / Mochlet Development).
+    static let displayName: String =
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+        ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String)
+        ?? "Mochlet"
+
+    /// Debug-log path suffix so channels never clobber each other's log.
+    static let logSuffix: String = name == "production" ? "" : "-\(name)"
+}
+
 enum DebugLog {
-    private static let url = URL(fileURLWithPath: "/tmp/maestro-webkit.log")
+    private static let url = URL(fileURLWithPath: "/tmp/maestro-webkit\(Channel.logSuffix).log")
     private static let lock = NSLock()
 
     static func reset() {
@@ -63,6 +98,21 @@ final class SidecarProcess {
         var env = ProcessInfo.processInfo.environment
         env["MAESTRO_HEADLESS"] = "1"
         env["MAESTRO_NATIVE_WEBKIT"] = "1"
+        // Propagate the packaged app's version (CFBundleShortVersionString) so the
+        // sidecar's electron shim reports the REAL version in health/feedback
+        // instead of a stale hardcoded fallback. Authoritative source of truth.
+        if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+           !version.isEmpty {
+            env["MAESTRO_VERSION"] = version
+        }
+        // Channel isolation: hand the sidecar its channel identity, isolated
+        // userData dir, and preferred External MCP port — all from the signed
+        // Info.plist, so no channel can read/mutate another's store or port.
+        env["MAESTRO_CHANNEL"] = Channel.name
+        env["MAESTRO_USER_DATA_DIR"] = Channel.userDataURL.path
+        if let mcpPort = Channel.mcpPort {
+            env["MAESTRO_MCP_PORT"] = mcpPort
+        }
         if let webRoot = resolveWebRoot() {
             env["MAESTRO_WEB_ROOT"] = webRoot.path
         }
@@ -195,8 +245,10 @@ final class SidecarProcess {
     }
 
     private func runtimeRoot() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Maestro WebKit/runtime", isDirectory: true)
+        // Channel-specific runtime materialization dir (colocated with the
+        // channel's userData) so preview/development never share the production
+        // runtime cache.
+        Channel.userDataURL.appendingPathComponent("runtime", isDirectory: true)
     }
 
     private func materializedRuntimeDirectory(from bundled: URL, name: String) -> URL? {
@@ -277,7 +329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         NSApp.setActivationPolicy(.regular)
         installMainMenu()
         makeWindow()
-        showLoading("Starting Mochlet...")
+        showLoading("Starting \(Channel.displayName)...")
 
         let sidecar = SidecarProcess(
             onReady: { [weak self] endpoint in self?.loadWebApp(endpoint) },
@@ -304,7 +356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     /// keep `target == nil` so each action travels the responder chain into the
     /// web content, where WKWebView turns `paste:` into a real DOM paste event.
     private func installMainMenu() {
-        let appName = "Mochlet"
+        let appName = Channel.displayName
         let mainMenu = NSMenu()
 
         // ── App menu ───────────────────────────────────────────────────────
@@ -453,7 +505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             defer: false
         )
         window.center()
-        window.title = "Mochlet"
+        window.title = Channel.displayName
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = false
@@ -955,8 +1007,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     private func persistedSessionToken() -> String {
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/@maestro/desktop/account-session.json")
+        // Read THIS channel's account session — never the production store from a
+        // preview/development launch.
+        let url = Channel.userDataURL.appendingPathComponent("account-session.json")
         guard
             let data = try? Data(contentsOf: url),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

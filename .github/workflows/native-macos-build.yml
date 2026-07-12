@@ -86,12 +86,22 @@ jobs:
       - name: Build production app bundle
         env:
           MAESTRO_VERSION: ${{ steps.version.outputs.version }}
+          MAESTRO_CHANNEL: production
         run: |
           chmod +x MacOS/webview-app/package-app.sh
           MacOS/webview-app/package-app.sh release
 
-      - name: Smoke test bundled sidecar
-        run: node MacOS/sidecar/src/smoke-test.mjs --bundle
+      - name: Smoke test the EXACT packaged app
+        run: |
+          set -euo pipefail
+          # Isolate the smoke in a fresh temp userData (authoritative over the
+          # channel default) so it can't touch a runner's real store; clean up
+          # reliably on step exit.
+          smoke_tmp="$(mktemp -d)"
+          cleanup() { rm -rf "$smoke_tmp"; }
+          trap cleanup EXIT
+          MAESTRO_USER_DATA_DIR="$smoke_tmp/userdata" \
+            node MacOS/sidecar/src/smoke-test.mjs --app MacOS/webview-app/dist/Mochlet.app
 
       - id: package
         name: Create DMG installer
