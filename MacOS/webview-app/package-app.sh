@@ -2,14 +2,44 @@
 set -euo pipefail
 
 CONFIG="${1:-release}"
-# The product name shipped to users. Renaming here renames dist/<name>.app and
-# the CFBundleName; the CFBundleIdentifier stays cloud.nexalance.maestro.webkit
-# on purpose (keychain entries + TCC permissions are keyed by it).
-APP_NAME="Mochlet"
 EXEC_NAME="MaestroWebKit"
-VERSION="${MAESTRO_VERSION:-0.1.28}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+
+# Release CHANNEL selection (see resolve-channel.sh): MAESTRO_CHANNEL picks the
+# channel (production default; unknown REJECTED → the substitution fails under
+# set -e and aborts the build). Each channel gets a distinct app name, bundle id,
+# userData subdir, and preferred MCP port so production / preview / development
+# never share a store, token, keychain entry, TCC grant, or runtime. Production
+# keeps the historical name + bundle id, so its defaults are unchanged.
+CH_OUT="$(bash "$ROOT/resolve-channel.sh")"
+CHANNEL="$(printf '%s\n' "$CH_OUT" | sed -n 's/^CHANNEL=//p')"
+APP_NAME="$(printf '%s\n' "$CH_OUT" | sed -n 's/^APP_NAME=//p')"
+BUNDLE_ID="$(printf '%s\n' "$CH_OUT" | sed -n 's/^BUNDLE_ID=//p')"
+USER_DATA_DIR="$(printf '%s\n' "$CH_OUT" | sed -n 's/^USER_DATA_DIR=//p')"
+MCP_PORT="$(printf '%s\n' "$CH_OUT" | sed -n 's/^MCP_PORT=//p')"
+echo "> channel: $CHANNEL (app '$APP_NAME', id $BUNDLE_ID, userData @maestro/$USER_DATA_DIR, mcp $MCP_PORT)"
+# Release version resolution (see resolve-version.sh): explicit MAESTRO_VERSION
+# wins; else the nearest reachable mochlet-v* git tag; else 0.0.0-dev. Never a
+# stale hardcoded release number — a plain `./package-app.sh release` derives it.
+VERSION="$(bash "$ROOT/resolve-version.sh" "$REPO_ROOT")"
+# Source provenance (see source-fingerprint.sh) — HEAD revision + a content
+# fingerprint + clean/dirty, signed into Info.plist for promotion safety.
+# FAIL CLOSED: do NOT swallow helper failure — if provenance cannot be computed
+# (e.g. the helper fails to parse/run) the substitution fails under set -e and
+# aborts the build, with the helper stderr visible, rather than shipping a build
+# with empty promotion metadata.
+FP_OUT="$(bash "$ROOT/source-fingerprint.sh" "$REPO_ROOT")"
+SOURCE_REV="$(printf '%s\n' "$FP_OUT" | sed -n 's/^SOURCE_REV=//p')"
+SOURCE_FINGERPRINT="$(printf '%s\n' "$FP_OUT" | sed -n 's/^SOURCE_FINGERPRINT=//p')"
+SOURCE_STATUS="$(printf '%s\n' "$FP_OUT" | sed -n 's/^SOURCE_STATUS=//p')"
+# Assert the provenance is well-formed HERE, before spending a whole build on it
+# (the post-package Info.plist preflight re-checks the signed values downstream).
+[[ "$SOURCE_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] \
+  || { echo "ERROR: source fingerprint malformed/empty — provenance helper failed" >&2; exit 1; }
+[ -n "$SOURCE_REV" ] \
+  || { echo "ERROR: source revision empty — provenance helper failed" >&2; exit 1; }
+echo "> provenance: rev ${SOURCE_REV:0:12} fingerprint ${SOURCE_FINGERPRINT:0:12} ($SOURCE_STATUS)"
 BUILD_DIR="$ROOT/.build/$CONFIG"
 OUT="$ROOT/dist"
 APP="$OUT/$APP_NAME.app"
@@ -31,19 +61,73 @@ resolve_path() {
 # The Maestro dev shell prepends a ~121-byte `node` shim that execs the INSTALLED
 # app's bundled node. That target is unstable during packaging — `rm -rf "$APP"`
 # below deletes the dist app's node mid-build — so every `node` / shebang call
-# (vite, esbuild) would break. Pin a real, standalone node to the FRONT of PATH
-# for the whole build so nothing depends on the shim.
+# (vite, esbuild) would break. Pin a real, STANDALONE node to the FRONT of PATH.
+#
+# Crucially, the pinned node also becomes the node we EMBED, so it must be able to
+# load this repo's COMPILED native addons (better-sqlite3 uses a NAN/ABI-specific
+# `.node`; a Node whose NODE_MODULE_VERSION differs — e.g. Homebrew v26/ABI147 vs
+# deps built for Node24/ABI137 — links & signs a bundle that can't `dlopen` at
+# runtime). So a candidate is accepted ONLY if that exact node can resolve+load
+# the repo-root better-sqlite3 and sharp and round-trip an in-memory SQLite DB.
 node_is_real() { [ -x "$1" ] && [ "$(stat -f%z "$1" 2>/dev/null || echo 0)" -gt 1048576 ] && file -b "$1" 2>/dev/null | grep -q "Mach-O"; }
-for cand in /opt/homebrew/bin/node /usr/local/bin/node \
-  "/Applications/Mochlet.app/Contents/Resources/sidecar/bin/node" \
-  "/Applications/Maestro WebKit.app/Contents/Resources/sidecar/bin/node"; do
-  rp="$(resolve_path "$cand" 2>/dev/null || true)"
-  if node_is_real "$rp"; then
-    export PATH="$(dirname "$rp"):$PATH"
-    echo "> using real node for build: $rp"
-    break
-  fi
-done
+
+# ABI/loadability probe: does THIS node load the repo's compiled native deps?
+ABI_PROBE_DIR="$(mktemp -d)"
+ABI_PROBE="$ABI_PROBE_DIR/abi-probe.cjs"
+cat > "$ABI_PROBE" <<'PROBE'
+'use strict';
+// Resolve from the repo root node_modules (hoisted), exactly where the sidecar's
+// externalized native deps are copied from. Require + exercise both addons.
+const { createRequire } = require('node:module');
+const path = require('node:path');
+const repoRoot = process.argv[2];
+const req = createRequire(path.join(repoRoot, 'package.json'));
+const Database = req('better-sqlite3');
+const db = new Database(':memory:');
+try { db.prepare('select sqlite_version() as v').get(); } finally { db.close(); }
+req('sharp'); // loading the native binding is the failure point for a bad ABI
+process.stdout.write(process.version + ' ABI' + process.versions.modules + '\n');
+PROBE
+
+pick_build_node() {
+  local shell_node cand rp ver vinfo
+  # `command -v node` is included first (the shim fails node_is_real and is
+  # skipped; a real shell node would be tried). Then known standalone locations.
+  shell_node="$(command -v node 2>/dev/null || true)"
+  for cand in "$shell_node" /opt/homebrew/bin/node /usr/local/bin/node \
+    "/Applications/Mochlet.app/Contents/Resources/sidecar/bin/node" \
+    "/Applications/Maestro WebKit.app/Contents/Resources/sidecar/bin/node"; do
+    [ -n "$cand" ] || continue
+    rp="$(resolve_path "$cand" 2>/dev/null || true)"
+    [ -n "$rp" ] || continue
+    if ! node_is_real "$rp"; then
+      # Not self-contained (the ~121B dev shim, or a dynamically-linked node too
+      # small to embed standalone). Show its version/ABI when runnable, for truth.
+      vinfo="$("$rp" -e 'process.stdout.write(process.version+" ABI"+process.versions.modules)' 2>/dev/null || echo 'not a runnable standalone node')"
+      echo "  skip (not a self-contained standalone node): $cand ($vinfo)"
+      continue
+    fi
+    if ver="$("$rp" "$ABI_PROBE" "$REPO_ROOT" 2>/dev/null)"; then
+      export PATH="$(dirname "$rp"):$PATH"
+      echo "> using ABI-compatible node for build: $rp ($ver)"
+      return 0
+    fi
+    vinfo="$("$rp" -e 'process.stdout.write(process.version+" ABI"+process.versions.modules)' 2>/dev/null || echo 'unknown')"
+    echo "  skip (cannot load repo native deps — better-sqlite3/sharp ABI mismatch): $rp ($vinfo)"
+  done
+  return 1
+}
+
+if ! pick_build_node; then
+  rm -rf "$ABI_PROBE_DIR"
+  echo "ERROR: no standalone Node found that can load this repo's compiled native modules" >&2
+  echo "  (better-sqlite3 + sharp). Rebuild them under the Node you intend to ship — matching" >&2
+  echo "  its NODE_MODULE_VERSION — e.g.  (cd \"$REPO_ROOT\" && npm rebuild better-sqlite3 sharp)" >&2
+  echo "  with that Node active, or install a standalone Node whose ABI matches. Refusing to" >&2
+  echo "  build a bundle whose embedded Node can't dlopen its native addons." >&2
+  exit 1
+fi
+rm -rf "$ABI_PROBE_DIR"
 
 echo "> building React renderer for WebKit"
 if [ ! -x "$REPO_ROOT/node_modules/.bin/vite" ]; then
@@ -91,13 +175,21 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
   <key>CFBundleName</key><string>$APP_NAME</string>
-  <key>CFBundleDisplayName</key><string>Mochlet</string>
-  <key>CFBundleIdentifier</key><string>cloud.nexalance.maestro.webkit</string>
+  <key>CFBundleDisplayName</key><string>$APP_NAME</string>
+  <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleExecutable</key><string>$EXEC_NAME</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
+  <!-- Channel isolation metadata — read by the Swift launcher (Channel enum). -->
+  <key>MaestroChannel</key><string>$CHANNEL</string>
+  <key>MaestroUserDataDir</key><string>$USER_DATA_DIR</string>
+  <key>MaestroMcpPort</key><string>$MCP_PORT</string>
+  <!-- Source provenance (source-fingerprint.sh) — for promotion safety. -->
+  <key>MaestroSourceRevision</key><string>$SOURCE_REV</string>
+  <key>MaestroSourceFingerprint</key><string>$SOURCE_FINGERPRINT</string>
+  <key>MaestroSourceStatus</key><string>$SOURCE_STATUS</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -108,6 +200,47 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+# Build-time verification: the version we just wrote MUST round-trip out of the
+# bundle, because the sidecar reports it at runtime (env MAESTRO_VERSION, injected
+# by the Swift launcher from this exact key). A mismatch here means health/feedback
+# would report the wrong version — fail the build loudly rather than ship it.
+if command -v plutil >/dev/null 2>&1; then
+  IP="$APP/Contents/Info.plist"
+  pkey() { plutil -extract "$1" raw -o - "$IP" 2>/dev/null || true; }
+
+  PLIST_VERSION="$(pkey CFBundleShortVersionString)"
+  if [ "$PLIST_VERSION" != "$VERSION" ]; then
+    echo "  ERROR: Info.plist CFBundleShortVersionString ('$PLIST_VERSION') != build VERSION ('$VERSION')"
+    exit 1
+  fi
+  # A shippable version must be a real X.Y.Z release, never the dev fallback.
+  if ! [[ "$PLIST_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "  ERROR: Info.plist version '$PLIST_VERSION' is not a valid X.Y.Z release"
+    exit 1
+  fi
+
+  # Channel + provenance keys must round-trip and be well-formed — an unlabelled
+  # or mismatched bundle must never ship (it would break channel isolation or
+  # promotion provenance).
+  PLIST_CHANNEL="$(pkey MaestroChannel)"
+  case "$PLIST_CHANNEL" in
+    production|preview|development) : ;;
+    *) echo "  ERROR: Info.plist MaestroChannel '$PLIST_CHANNEL' is not a valid channel"; exit 1 ;;
+  esac
+  if [ "$PLIST_CHANNEL" != "$CHANNEL" ] \
+     || [ "$(pkey MaestroUserDataDir)" != "$USER_DATA_DIR" ] \
+     || [ "$(pkey MaestroMcpPort)" != "$MCP_PORT" ]; then
+    echo "  ERROR: Info.plist channel metadata does not match the resolved channel ($CHANNEL)"
+    exit 1
+  fi
+  PLIST_FP="$(pkey MaestroSourceFingerprint)"
+  if ! [[ "$PLIST_FP" =~ ^[0-9a-f]{64}$ ]] || [ -z "$(pkey MaestroSourceRevision)" ]; then
+    echo "  ERROR: Info.plist source provenance (revision/fingerprint) is missing or malformed"
+    exit 1
+  fi
+  echo "> verified Info.plist: version=$PLIST_VERSION channel=$PLIST_CHANNEL provenance ok ($(pkey MaestroSourceStatus))"
+fi
 
 SIDECAR="$ROOT/../sidecar"
 echo "> building sidecar bundle"
@@ -169,6 +302,57 @@ echo "> embedding externalized native deps"
 REPO_NM="$REPO_ROOT/node_modules"
 node "$SIDECAR/embed-externals.mjs" "$REPO_NM" "$RES_SC/node_modules" \
   better-sqlite3 sharp jimp link-preview-js qrcode-terminal playwright-core fsevents
+
+# ── Pre-codesign native-module preflight ─────────────────────────────────────
+# A signed bundle that embeds better-sqlite3 / sharp is still broken if their
+# native `.node` addons can't LOAD inside the app's embedded Node (e.g. an
+# `--ignore-scripts` install left `build/Release/better_sqlite3.node` absent).
+# Run the APP'S OWN embedded node, resolve modules exactly as the sidecar does
+# (from Contents/Resources/sidecar), require both native deps, and instantiate +
+# close an in-memory SQLite DB. ANY failure exits nonzero so the build cannot
+# claim success. The smoke script lives in a temp dir — never inside the bundle,
+# so it is not shipped or signed. Prints only non-secret OK/version evidence.
+echo "> preflight: embedded-node native module smoke (sharp + better-sqlite3)"
+SMOKE_NODE="$RES_SC/bin/node"
+if [ -x "$SMOKE_NODE" ]; then
+  SMOKE_DIR="$(mktemp -d)"
+  SMOKE_JS="$SMOKE_DIR/preflight.cjs"
+  cat > "$SMOKE_JS" <<'SMOKE'
+'use strict';
+// Resolve modules from the sidecar Resources dir, identical to how
+// maestro-sidecar.mjs resolves its externalized native deps at runtime.
+const { createRequire } = require('node:module');
+const path = require('node:path');
+const base = process.argv[2];
+const req = createRequire(path.join(base, 'maestro-sidecar.mjs'));
+
+// better-sqlite3: require + instantiate an in-memory DB + trivial query + close.
+const Database = req('better-sqlite3');
+const db = new Database(':memory:');
+try {
+  const v = db.prepare('select sqlite_version() as v').get().v;
+  console.log('  better-sqlite3 OK (sqlite ' + v + ')');
+} finally {
+  db.close();
+}
+
+// sharp: require loads the native binding (the failure point for a broken
+// install); report its version as non-secret evidence.
+const sharp = req('sharp');
+const sv = (sharp.versions && sharp.versions.sharp) || 'unknown';
+console.log('  sharp OK (v' + sv + ')');
+SMOKE
+  if "$SMOKE_NODE" "$SMOKE_JS" "$RES_SC"; then
+    rm -rf "$SMOKE_DIR"
+    echo "  preflight OK"
+  else
+    rm -rf "$SMOKE_DIR"
+    echo "  ERROR: embedded-node native-module preflight FAILED — sharp/better-sqlite3 are not loadable in the bundle; refusing to sign a broken app." >&2
+    exit 1
+  fi
+else
+  echo "  warning: no embedded node at $SMOKE_NODE — skipping native preflight (dev/system-node build)"
+fi
 
 echo "> ad-hoc codesign"
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "  (codesign skipped)"
