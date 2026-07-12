@@ -7,21 +7,92 @@
 
 import os from 'node:os';
 import path from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync } from 'node:fs';
 
 const HOME = os.homedir();
 const APP_SUPPORT = path.join(HOME, 'Library', 'Application Support');
 
-function userDataDir(): string {
-  const override = process.env.MAESTRO_USER_DATA_DIR;
+// Last-resort version if neither the launcher env nor the bundle Info.plist can
+// be read (e.g. running the sidecar straight from source in dev). This is a
+// FALLBACK only — the packaged app reports its real CFBundleShortVersionString
+// via resolveAppVersion() below, so a stale constant here never reaches users.
+const FALLBACK_VERSION = '0.0.0-dev';
+
+/** Pull CFBundleShortVersionString out of an Info.plist's text. The plist we
+    generate (webview-app/package-app.sh) is a flat <key>/<string> dict, so a
+    tolerant regex is enough and avoids a plist-parser dependency. */
+export function parseBundleVersion(plistText: string): string | null {
+  const m = plistText.match(
+    /<key>\s*CFBundleShortVersionString\s*<\/key>\s*<string>([^<]*)<\/string>/,
+  );
+  const v = m?.[1]?.trim();
+  return v ? v : null;
+}
+
+/** Walk up from a starting path looking for an enclosing `.app/Contents/Info.plist`
+    and return its CFBundleShortVersionString. Returns null outside a bundle. */
+export function readBundleVersion(startPath: string): string | null {
+  let dir = path.dirname(startPath);
+  // The sidecar node lives at <App>.app/Contents/Resources/sidecar/bin/node, so
+  // Info.plist is a few levels up. Bound the walk so we never scan the whole disk.
+  for (let i = 0; i < 8 && dir && dir !== path.dirname(dir); i++) {
+    if (path.basename(dir) === 'Contents') {
+      const plist = path.join(dir, 'Info.plist');
+      try {
+        if (existsSync(plist)) {
+          const v = parseBundleVersion(readFileSync(plist, 'utf8'));
+          if (v) return v;
+        }
+      } catch { /* unreadable plist — keep climbing */ }
+    }
+    dir = path.dirname(dir);
+  }
+  return null;
+}
+
+/** The app version reported to the brain (health, feedback, etc.). Order:
+      1. MAESTRO_VERSION, injected by the Swift launcher from Bundle.main.
+      2. The enclosing packaged app's Info.plist (self-heals if the env is unset).
+      3. A dev fallback.
+    Resolved once and memoised — the version can't change within a process. */
+let cachedVersion: string | null = null;
+export function resolveAppVersion(): string {
+  if (cachedVersion) return cachedVersion;
+  const env = process.env.MAESTRO_VERSION?.trim();
+  cachedVersion =
+    (env && env.length ? env : null)
+    ?? readBundleVersion(process.execPath)
+    ?? FALLBACK_VERSION;
+  return cachedVersion;
+}
+
+/** The `@maestro/<subdir>` userData folder for a release channel. Each channel is
+    ISOLATED so production / preview / development never share a store, token, or
+    runtime. Absent/unknown channel → production (safe default). */
+export function channelSubdir(channel?: string): string {
+  switch (channel) {
+    case 'preview': return 'desktop-preview';
+    case 'development': return 'desktop-development';
+    default: return 'desktop'; // production, unknown, or unset
+  }
+}
+
+/** Resolve the userData path WITHOUT side effects (no mkdir), so it's unit-safe.
+    Precedence: an explicit MAESTRO_USER_DATA_DIR (the Swift launcher injects the
+    channel dir there) always wins; otherwise the channel-specific default from
+    MAESTRO_CHANNEL. */
+export function resolveUserDataPath(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.MAESTRO_USER_DATA_DIR;
   if (override) {
-    const resolved = override.startsWith('~/') || override === '~'
+    return override.startsWith('~/') || override === '~'
       ? path.join(HOME, override.slice(1))
       : path.resolve(override);
-    try { mkdirSync(resolved, { recursive: true }); } catch { /* noop */ }
-    return resolved;
   }
-  const dir = path.join(APP_SUPPORT, '@maestro', 'desktop');
+  return path.join(APP_SUPPORT, '@maestro', channelSubdir(env.MAESTRO_CHANNEL));
+}
+
+function userDataDir(): string {
+  const dir = resolveUserDataPath();
   try { mkdirSync(dir, { recursive: true }); } catch { /* noop */ }
   return dir;
 }
@@ -33,7 +104,7 @@ type PathName =
 export const app = {
   isPackaged: false,
   getName: () => '@maestro/desktop',
-  getVersion: () => process.env.MAESTRO_VERSION ?? '0.1.28',
+  getVersion: () => resolveAppVersion(),
   getPath(name: PathName): string {
     switch (name) {
       case 'home': return HOME;

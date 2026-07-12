@@ -4,7 +4,7 @@ import path from 'node:path';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 
 import {
-  handleJsonRpc, listTools, toolAllowed, normalizeSettings, defaultExternalMcpSettings,
+  handleJsonRpc, listTools, toolAllowed, normalizeSettings, defaultExternalMcpSettings, preferredMcpPort,
   ExternalMcp, type ExternalMcpSettings, type ExternalMcpStore, type Dispatch,
 } from './external-mcp.ts';
 import { MCP_TOOLS, MCP_TOOL_BY_METHOD, MCP_CATEGORIES, categoryCounts } from './manifest.ts';
@@ -38,6 +38,59 @@ describe('manifest integrity', () => {
   it('categoryCounts totals match the flat tool list', () => {
     const sum = categoryCounts().reduce((n, c) => n + c.total, 0);
     expect(sum).toBe(MCP_TOOLS.length);
+  });
+});
+
+describe('normalizeSettings port', () => {
+  const DEFAULT = defaultExternalMcpSettings().port; // 9235
+  it('preserves ephemeral 0 ONLY for a strict numeric 0', () => {
+    expect(normalizeSettings({ port: 0 }).port).toBe(0);
+  });
+  it('keeps a valid integer port 1..65535', () => {
+    expect(normalizeSettings({ port: 9000 }).port).toBe(9000);
+    expect(normalizeSettings({ port: 65535 }).port).toBe(65535);
+  });
+  it('falls back to the default for malformed legacy values (null/""/false)', () => {
+    // These all coerce to 0 via Number(), but must NOT be treated as ephemeral.
+    expect(normalizeSettings({ port: null as unknown as number }).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: '' as unknown as number }).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: false as unknown as number }).port).toBe(DEFAULT);
+  });
+  it('falls back to the default for undefined / junk / out-of-range', () => {
+    expect(normalizeSettings({}).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: 'abc' as unknown as number }).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: 70000 }).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: -1 }).port).toBe(DEFAULT);
+    expect(normalizeSettings({ port: 1.5 }).port).toBe(DEFAULT);
+  });
+});
+
+describe('MAESTRO_MCP_PORT — channel preferred port (Swift injects per channel)', () => {
+  const OLD = process.env.MAESTRO_MCP_PORT;
+  afterEach(() => { if (OLD === undefined) delete process.env.MAESTRO_MCP_PORT; else process.env.MAESTRO_MCP_PORT = OLD; });
+
+  it('a valid MAESTRO_MCP_PORT becomes the default preferred port (preview 9236 / dev 9237)', () => {
+    process.env.MAESTRO_MCP_PORT = '9236';
+    expect(preferredMcpPort()).toBe(9236);
+    expect(defaultExternalMcpSettings().port).toBe(9236);
+    expect(normalizeSettings({}).port).toBe(9236);
+    process.env.MAESTRO_MCP_PORT = '9237';
+    expect(normalizeSettings({}).port).toBe(9237);
+  });
+  it('rejects a malformed MAESTRO_MCP_PORT and falls back to 9235', () => {
+    for (const b of ['abc', '', '0', '-1', '70000', '12.5', ' 9236']) {
+      process.env.MAESTRO_MCP_PORT = b;
+      expect(preferredMcpPort(), `bad=${JSON.stringify(b)}`).toBe(9235);
+      expect(normalizeSettings({}).port).toBe(9235);
+    }
+  });
+  it('preserves an EXPLICIT numeric port 0 regardless of the env preferred port', () => {
+    process.env.MAESTRO_MCP_PORT = '9236';
+    expect(normalizeSettings({ port: 0 }).port).toBe(0);
+  });
+  it('an explicit valid port overrides the env preferred port', () => {
+    process.env.MAESTRO_MCP_PORT = '9236';
+    expect(normalizeSettings({ port: 9000 }).port).toBe(9000);
   });
 });
 
@@ -160,12 +213,21 @@ describe('ExternalMcp HTTP transport', () => {
   };
   const dispatch: Dispatch = async (method) => { dispatched.push(method); return { ok: method }; };
 
-  beforeEach(() => {
+  // The HTTP server binds asynchronously (net 'listening' event), and with an
+  // ephemeral port (0) the real port isn't known until it fires — so wait for it
+  // before assertions read config().port. This also keeps the suite isolated from
+  // any live Mochlet app already holding the default port 9235 on this machine.
+  const waitListening = async (m: ExternalMcp) => {
+    for (let i = 0; i < 400 && m.config().port === 0; i++) await new Promise((r) => setTimeout(r, 5));
+  };
+
+  beforeEach(async () => {
     tmp = mkdtempSync(path.join(os.tmpdir(), 'mochi-mcp-'));
-    settings = on({ port: 0 }); // ephemeral loopback port
+    settings = on({ port: 0 }); // ephemeral loopback port (avoids a live-app collision)
     dispatched.length = 0;
     mcp = new ExternalMcp({ store, dispatch, shimPath: path.join(tmp, 'shim.cjs'), nodePath: '/usr/bin/node' });
     mcp.start();
+    await waitListening(mcp);
   });
   afterEach(() => { mcp.stop(); rmSync(tmp, { recursive: true, force: true }); });
 
