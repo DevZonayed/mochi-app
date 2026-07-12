@@ -29,6 +29,7 @@ import { branchSlug, isGitRepo } from './git.js';
 import { pickCityCodename } from './codenames.js';
 import { ensureSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { allocatePortBase, sessionPortEnv } from './session-ports.js';
+import { SessionRunQueue, type RunOpts } from './session-run-queue.js';
 import { normalizeRunMode, canStartBackgroundRun } from './run-mode.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
 import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
@@ -2391,6 +2392,14 @@ export class LocalEngine {
   /** jobId → live cancel handle (abort for claude, child for codex). `steer` is set
       while a steerable Claude chat turn is mid-flight (see engine.steer / runClaude). */
   private running = new Map<string, { ac: AbortController; child?: ChildProcess; steer?: SteerFn }>();
+  /** Per-session serialization: a session may have AT MOST ONE live agent turn.
+      When run() is asked to start a turn on a session that already has one live,
+      the new job is PARKED here (FIFO per session) and drained one-at-a-time as
+      the active turn ends. This enforces the invariant across every run() caller
+      — sendChat, cron/scheduled monitors, whatsapp-analyze, context-operator —
+      at the single choke point, so an injected monitor/check turn can never race
+      a real agent job on the same worktree/SDK session. */
+  private sessionRuns = new SessionRunQueue();
   /** In-flight `codex login` child (browser OAuth), if any. */
   private codexLoginChild?: ChildProcess;
   private githubLoginChild?: ChildProcess;
@@ -2917,7 +2926,21 @@ export class LocalEngine {
   /** Cancel a running job. Returns the updated (cancelled) job, or null if not running. */
   cancel(jobId: string): Job | null {
     const h = this.running.get(jobId);
-    if (!h) return null;
+    if (!h) {
+      // Not live — but it may be PARKED (queued behind the session's active turn).
+      // Cancel it in place so it never runs; the active turn is untouched.
+      if (this.unparkJob(jobId)) {
+        const job = this.store.getJob(jobId);
+        if (job && job.status !== 'cancelled' && job.status !== 'done' && job.status !== 'failed') {
+          const c = this.store.updateJob(jobId, { status: 'cancelled', phase: 'Cancelled', stage: '', error: null });
+          this.emit('job', c);
+          this.store.pushEvent({ kind: 'job-cancelled', title: `Cancelled: ${c.title}`, projectId: c.projectId, jobId });
+          return c;
+        }
+        return job ?? null;
+      }
+      return null;
+    }
     h.ac.abort();
     try { h.child?.kill('SIGTERM'); } catch { /* gone */ }
     this.running.delete(jobId);
@@ -2926,10 +2949,44 @@ export class LocalEngine {
     const cancelled = this.store.updateJob(jobId, { status: 'cancelled', phase: 'Cancelled', stage: '', error: null });
     this.emit('job', cancelled);
     this.store.pushEvent({ kind: 'job-cancelled', title: `Cancelled: ${cancelled.title}`, projectId: cancelled.projectId, jobId });
+    // The active turn just ended — let the session's next parked turn (if any) run.
+    this.drainSessionRuns(job.sessionId);
     return cancelled;
   }
 
   isRunning(jobId: string): boolean { return this.running.has(jobId); }
+
+  /** True if the session has a LIVE (currently executing) turn other than
+      `exceptJobId`. Backs the one-turn-per-session guard. */
+  isSessionBusy(sessionId: string, exceptJobId?: string): boolean {
+    for (const id of this.running.keys()) {
+      if (id === exceptJobId) continue;
+      if (this.store.getJob(id)?.sessionId === sessionId) return true;
+    }
+    return false;
+  }
+
+  /** Park a job behind the session's active turn, remembering its run options so
+      the drain can replay them verbatim. */
+  private parkSessionRun(sessionId: string, jobId: string, opts: RunOpts): void {
+    this.sessionRuns.park(sessionId, jobId, opts);
+  }
+
+  /** Remove a job from its session queue (used when it's cancelled while parked). */
+  private unparkJob(jobId: string): boolean {
+    return this.sessionRuns.unpark(jobId);
+  }
+
+  /** Called when a session's active turn ends: start the next parked turn (if the
+      session is now free and the next job is still pending). Skips jobs that were
+      cancelled/settled while parked. */
+  private drainSessionRuns(sessionId?: string | null): void {
+    if (!sessionId) return;
+    if (this.isSessionBusy(sessionId)) return; // another turn is still live — wait
+    const nextRun = this.sessionRuns.next(sessionId, (id) => this.store.getJob(id)?.status === 'pending');
+    if (!nextRun) return;
+    void this.run(nextRun.jobId, nextRun.opts).catch(() => { /* the run records its own failure */ });
+  }
 
   /** STEER a running chat turn: inject a follow-up user message into the LIVE Claude
       Agent SDK session (streaming input) — same subprocess, full context, NO
@@ -3226,9 +3283,27 @@ export class LocalEngine {
   }
 
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
-  async run(jobId: string, opts: { effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; plan?: boolean; goal?: boolean; browser?: boolean } = {}): Promise<Job> {
+  async run(jobId: string, opts: RunOpts = {}): Promise<Job> {
     const job = this.store.getJob(jobId);
     if (!job) throw Object.assign(new Error('job not found'), { statusCode: 404 });
+
+    // ── One active agent turn per session ──
+    // If this session already has a live turn, PARK this job instead of racing a
+    // second run() on the same worktree + SDK session (the injected-monitor bug).
+    // It drains automatically when the active turn ends (drainSessionRuns). This
+    // runs BEFORE anything mutates `this.running`, so concurrent run() calls
+    // serialize deterministically (no await precedes it). A job with no session
+    // (project-level work) is never serialized.
+    if (job.sessionId && this.isSessionBusy(job.sessionId, jobId)) {
+      this.parkSessionRun(job.sessionId, jobId, opts);
+      const parked = this.store.updateJob(jobId, {
+        status: 'pending', phase: 'Queued',
+        stage: 'waiting for the current turn to finish…',
+      });
+      this.emit('job', parked);
+      return parked;
+    }
+
     const project = this.store.getProject(job.projectId);
     const routing = this.store.routing();
     const roles = this.store.getRoles();
@@ -4148,6 +4223,8 @@ export class LocalEngine {
         pausedUntil: limitPausedUntil, pausedReason: limitPausedUntil ? 'limit' : null,
       });
       this.running.delete(jobId);
+      // The session's active turn ended — release any turn parked behind it.
+      this.drainSessionRuns(job.sessionId);
       if (isChat) this.store.touchSession(session.id);
       this.emit('job', done);
       // Context dispatch settled? Claim its one report slot and fire the result
@@ -4319,6 +4396,9 @@ export class LocalEngine {
     } catch (e) {
       settleStream();
       this.running.delete(jobId);
+      // The session's active turn ended (cancel/steer-interrupt/failure) — release
+      // any turn parked behind it so the session doesn't stall.
+      this.drainSessionRuns(job.sessionId);
       // Same tidy-up on cancel/failure: a stopped or crashed browser job shouldn't
       // strand an agent-opened window. The retry path (if any) reopens on its own.
       void this.autoCloseBrowserSession(this.store.getJob(jobId)?.sessionId ?? null);

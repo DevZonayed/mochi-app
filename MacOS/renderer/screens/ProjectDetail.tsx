@@ -35,6 +35,9 @@ import { GitOpsDock } from '../components/GitOpsDock';
 import { SessionStateDot, SessionActivityDot } from './SessionStateDot';
 import { useSession, useSessionGitState } from '../lib/useSessionGitState';
 import { useSessionLocked } from '../hooks/useSessionLocked';
+import { compareTurnsOldestFirst, mergeTurns, upsertTurn, reconcileSeededTurns } from '../lib/turnState';
+import { useSessionActiveJobs } from '../lib/useSessionRunning';
+import { deriveSessionControl } from '../lib/sessionActivity';
 
 const KIND_LABEL: Record<string, string> = { coding: 'Code', content: 'Content', research: 'Research', general: 'Project', context: 'Context' };
 function shortHomePath(p: string): string {
@@ -2843,14 +2846,6 @@ const writeQueue = (sid: string | null, q: QueueItem[]): void => {
   catch { /* ignore quota / serialisation — large image bytes may exceed it; the in-memory queue still drains */ }
 };
 const CHAT_PAGE_SIZE = 30;
-function compareTurnsOldestFirst(a: Job, b: Job): number {
-  return (a.createdAt - b.createdAt) || (a.updatedAt - b.updatedAt) || a.id.localeCompare(b.id);
-}
-function mergeTurns(...groups: Job[][]): Job[] {
-  const byId = new Map<string, Job>();
-  for (const group of groups) for (const job of group) byId.set(job.id, job);
-  return [...byId.values()].sort(compareTurnsOldestFirst);
-}
 
 // Per-chat composer draft, persisted to localStorage so a typed-but-unsent
 // prompt survives navigating away and back. A NEW chat (no session yet) keys
@@ -3247,7 +3242,11 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     api.listJobPage({ sessionId: activeId, limit: CHAT_PAGE_SIZE })
       .then(page => {
         if (!alive) return;
-        setTurns(page.jobs);
+        // Reconcile against any live turns already in state: the page is a
+        // snapshot taken when the request dispatched (maybe mid-run), so a turn
+        // that finished live while this fetch was in flight must keep its
+        // terminal copy — otherwise the composer snaps back to "streaming".
+        setTurns(prev => reconcileSeededTurns(page.jobs, prev));
         setHasOlderTurns(page.hasMore);
         setOlderCursor(page.nextCursor);
         setOlderBefore(page.nextBefore);
@@ -3262,11 +3261,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     const unsub = api.subscribe({
       onJob: (j) => {
         if (!j.sessionId || j.sessionId !== activeRef.current) return;
-        setTurns(ts => {
-          const i = ts.findIndex(t => t.id === j.id);
-          if (i === -1) return [...ts, j].sort(compareTurnsOldestFirst);
-          const next = ts.slice(); next[i] = j; return next;
-        });
+        // upsertTurn drops stale / out-of-order frames and never regresses a
+        // finished turn back to "running" (a late relay/bridge reorder) — so the
+        // composer re-enables the instant the turn is terminal and stays that way.
+        setTurns(ts => upsertTurn(ts, j));
       },
       // Background tasks (dev servers/watchers) the agent started for THIS project —
       // tracked live so the user can see + stop them. They persist across turns.
@@ -3409,7 +3407,20 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   // dormant SDK iterator. The countdown chip on the turn itself communicates
   // the wakeup-pending state — the composer doesn't need to also reflect it.
   const lastTurnPaused = !!(lastTurn?.pausedUntil && lastTurn.pausedUntil > Date.now());
-  const streaming = !!lastTurn && (lastTurn.status === 'running' || lastTurn.status === 'pending') && !lastTurnPaused;
+  // SESSION ACTIVITY ≠ the latest turn. A completed turn (e.g. an injected
+  // monitor / scheduled check with a newer createdAt) must NOT present the
+  // session as idle while an EARLIER agent job is still working. Derive activity
+  // + the Abort/steer target from ALL active jobs in the session — the loaded
+  // transcript plus the app-wide cache (covers a running job scrolled out of the
+  // page). `ctrl.controlJobId` is the job Stop/steer must target; a paused job
+  // is not "active" (isLiveRun excludes it), so a wakeup-parked session is idle.
+  const cacheActiveIds = useSessionActiveJobs(activeId);
+  const ctrl = React.useMemo(() => deriveSessionControl(turns, cacheActiveIds), [turns, cacheActiveIds]);
+  const streaming = ctrl.sessionActive;
+  // The active job Stop/steer/queue-drain controls, and its loaded turn (for the
+  // live activity rail) — falls back to the latest turn when not in the page.
+  const controlJobId = ctrl.controlJobId;
+  const controlTurn = (controlJobId && turns.find(t => t.id === controlJobId)) || lastTurn;
   // The last turn ended blocked by a claude.ai usage limit (it ends 'done' with an
   // auto-continue scheduled for reset). The composer queue must HOLD while set —
   // otherwise "not streaming" is misread as "ready" and every queued message flushes
@@ -3637,7 +3648,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   const steerNow = (i: number) => {
     const item = queue[i];
     if (item == null || item.atts?.length) return; // steer channel is text-only
-    const turn = lastTurn;
+    const turn = controlTurn; // steer the ACTIVE job, not the (maybe completed) latest turn
     removeFromQueue(i); // optimistic — restored to the FRONT if the steer doesn't land
     if (!streaming || !turn) { void sendRaw(item.text, item.atts); return; }
     const requeueFront = () => mutateQueue(q => [{ text: item.text, atts: item.atts }, ...q]);
@@ -3681,9 +3692,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     void sendRaw(head.text, head.atts).finally(() => { drainingRef.current = false; });
   }, [streaming, awaitingLimitReset, lastTurnPaused, lastTurn, queue, sendRaw, mutateQueue]);
 
-  // The ONLY stop-the-chat path: the explicit red abort button. Every other
-  // send/steer route is queue-based — see the comment on `sendComposed`.
-  const stop = () => { if (lastTurn) void api.cancelJob(lastTurn.id).catch(() => {}); };
+  // The ONLY stop-the-chat path: the explicit red abort button. Targets the
+  // REAL active job (ctrl.controlJobId) — NOT the latest turn, which may be a
+  // completed monitor turn while an earlier job is the one actually running.
+  const stop = (jobId?: string) => { const id = jobId ?? controlJobId; if (id) void api.cancelJob(id).catch(() => {}); };
 
   const fillComposer = (v: string) => { composerRef.current?.setText(v); composerRef.current?.focus(); };
 
@@ -3939,13 +3951,43 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
           {bgTasks.some(t => t.status === 'running') && (
             <BgTasksPanel tasks={bgTasks} onStop={stopBg} />
           )}
+          {/* Session-level active-agent indicator: an EARLIER agent job is still
+              working while the latest (selected) turn has already finished — e.g.
+              a monitor/scheduled turn landed with a newer timestamp. Without this
+              the composer would look idle with no way to stop the real run. This
+              is distinct from the green background-tasks panel above (detached
+              processes) and from the transcript's selected turn. Abort targets
+              the stranded job's exact id. */}
+          {ctrl.strandedActiveId && (() => {
+            const strandedTurn = turns.find(t => t.id === ctrl.strandedActiveId);
+            const label = strandedTurn?.input?.split('\n')[0]?.slice(0, 80) || 'an earlier task';
+            return (
+              <div role="status" aria-live="polite"
+                aria-label={`Agent still working on an earlier task${strandedTurn ? `: ${label}` : ''}`}
+                style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 9, padding: '9px 12px', borderRadius: 10,
+                  background: 'color-mix(in srgb, var(--purple) 10%, var(--bg-elevated))', border: '1px solid color-mix(in srgb, var(--purple) 28%, transparent)' }}>
+                <span className="breathe" style={{ width: 9, height: 9, borderRadius: 5, background: 'var(--purple)', flexShrink: 0 }} />
+                <span style={{ display: 'flex', flexDirection: 'column', gap: 1, minWidth: 0, flex: 1 }}>
+                  <span style={{ font: '600 var(--fs-caption)/1.2 var(--font-text)', color: 'var(--ink)' }}>Agent is still working on an earlier task</span>
+                  <span style={{ font: '400 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {strandedTurn ? `“${label}”` : 'It’s still running even though the latest reply is complete.'}
+                  </span>
+                </span>
+                <button onClick={() => stop(ctrl.strandedActiveId ?? undefined)} title="Stop the running agent job"
+                  aria-label="Stop the running agent job"
+                  style={{ height: 28, padding: '0 13px', borderRadius: 8, border: '0.5px solid color-mix(in srgb, var(--red) 40%, transparent)', background: 'color-mix(in srgb, var(--red) 12%, transparent)', color: 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer', flexShrink: 0 }}>
+                  Abort
+                </button>
+              </div>
+            );
+          })()}
           {upcomingSched.length > 0 && (
             <ScheduledQueue items={upcomingSched} now={schedNow} onCancel={cancelSchedule} onEdit={editSchedule} />
           )}
           {/* canSteer: only live CLAUDE turns are steerable (codex/plan runs
               report steered:false and would just bounce back to the queue). */}
           {queue.length > 0 && (
-            <QueuePanel queue={queue} hold={queueHoldReason} canSteer={streaming && lastTurn?.engine !== 'codex'} onSteerNow={steerNow} onMoveToFront={moveToFront} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
+            <QueuePanel queue={queue} hold={queueHoldReason} canSteer={streaming && controlTurn?.engine !== 'codex'} onSteerNow={steerNow} onMoveToFront={moveToFront} onRemove={removeFromQueue} onEdit={editQueued} onReorder={moveInQueue} />
           )}
           {slashOpen && (
             <div style={{ marginBottom: 8, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', borderRadius: 12, boxShadow: 'var(--shadow-lg, 0 18px 50px rgba(15,20,60,0.22))', overflow: 'hidden', padding: 5 }}>
@@ -4044,7 +4086,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                       <Icon name="plus" size={18} stroke={2.6} />
                     </button>
                   )}
-                  <button onClick={stop} className="send-fab" title="Stop the run" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
+                  <button onClick={() => stop()} className="send-fab" title="Stop the running agent job" aria-label="Stop the running agent job" style={{ width: 38, height: 38, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center',
                     background: 'color-mix(in srgb, var(--red) 14%, transparent)', color: 'var(--red)', cursor: 'pointer' }}>
                     <span style={{ width: 12, height: 12, borderRadius: 3.5, background: 'currentColor' }} />
                   </button>
@@ -4140,7 +4182,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
               <span style={{ flex: 1, minWidth: 6 }} />
               {streaming
                 ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap' }}>
-                    <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {lastTurn ? liveActivity(lastTurn, lastTurn.transcript ?? []) : 'Working…'}
+                    <span className="breathe" style={{ width: 5, height: 5, borderRadius: 3, background: 'var(--purple)' }} /> {controlTurn ? liveActivity(controlTurn, controlTurn.transcript ?? []) : 'Working…'}
                   </span>
                 : lastTurnPaused
                   // Parked on a ScheduleWakeup — the per-turn chip carries the
