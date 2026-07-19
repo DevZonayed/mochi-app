@@ -427,6 +427,29 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
     expect(await listEnrolledControllers({ accountId })).toEqual([]);
   });
 
+  it('account challenge accepts a safe idempotency key derived from a base64url nonce outside id grammar', async () => {
+    const accountId = 'acct-account-nonce-edge';
+    const host = await makeRegisteredHost(accountId, 'host-account-nonce-edge');
+    await acquireShadowLease({ accountId, hostDeviceId: host.deviceId, scopeId: `account:${accountId}`, requestedLeaseId: 'lease_account_nonce_edge', ttlMs: 120_000 });
+    const controller = await generateShadowIdentity(backend, 'ctrl-account-nonce-edge');
+    const challenge = await createAccountEnrollmentChallenge({
+      accountId, hostDeviceId: host.deviceId, controllerDeviceId: controller.deviceId, requestedCapabilities: ['account.read'],
+      relayOrigin: RELAY_ORIGIN, nowMs: Date.now(), ttlMs: 120_000,
+    });
+    const { request, presentedSecret } = await buildEnrollmentRequest(backend, {
+      controller,
+      bootstrap: challenge.bootstrap,
+      nowMs: Date.now(),
+      nonce: new Uint8Array(16).fill(255),
+      requestedCapabilities: ['account.read'],
+    });
+    expect(request.nonce.startsWith('_')).toBe(true);
+    const first = await submitEnrollmentRequest({ accountId, sessionId: challenge.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: `idem_${request.nonce}`, nowMs: Date.now() });
+    const second = await submitEnrollmentRequest({ accountId, sessionId: challenge.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: `idem_${request.nonce}`, nowMs: Date.now() });
+    expect(first.status).toBe('pending');
+    expect(second.coalesced).toBe(true);
+  });
+
   it('account challenge rejects cross-account and offline hosts without creating a request', async () => {
     const hostA = await makeRegisteredHost('acct-chal-a', 'host-chal-a');
     await makeRegisteredHost('acct-chal-b', 'host-chal-b');

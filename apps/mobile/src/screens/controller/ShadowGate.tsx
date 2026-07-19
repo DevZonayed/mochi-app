@@ -108,6 +108,11 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
     const res = await controller.beginAccountEnrollment(hostDeviceId);
     if (!res.ok) setError(res.reason ?? 'Request failed');
   }, [controller, mode, selected, screenView]);
+  const confirmEnrollment = React.useCallback(async () => {
+    setError(null);
+    const res = await controller.confirmEnrollment();
+    if (!res.ok) setError(state.enrollment.errorReason ?? 'Something went wrong. Please try again.');
+  }, [controller, state.enrollment.errorReason]);
   const toggle = (k: ActionFamilyKey) => setSelected((prev) => { const n = new Set(prev); if (n.has(k)) n.delete(k); else n.add(k); return n; });
 
   // Close the scanner once the runtime leaves the unenrolled phase (parse succeeded).
@@ -196,7 +201,7 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
                 <Text style={{ fontSize: 13, color: theme.color.inkTertiary, textAlign: 'center' }}>No eligible Mac is online for this account.</Text>
               )}
             </View>
-            {error ? <Text role="alert" style={{ fontSize: 13, color: theme.color.red, textAlign: 'center', marginBottom: 14 }}>{error}</Text> : null}
+            {error ?? state.enrollment.errorReason ? <Text role="alert" style={{ fontSize: 13, color: theme.color.red, textAlign: 'center', marginBottom: 14 }}>{error ?? state.enrollment.errorReason}</Text> : null}
             <GhostButton title="Use enrollment code instead" onPress={beginScan} />
             <View style={{ height: 10 }} />
             <GhostButton title="Not now" onPress={() => { void deactivateControllerMode(); }} />
@@ -219,7 +224,8 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
             <View style={{ height: 12 }} />
             <LabeledRow label="Requesting" value={state.enrollment.requestedCapabilityLabels.join(', ')} />
           </View>
-          <PrimaryButton title="Request access" icon="arrowRight" onPress={() => void controller.confirmEnrollment()} />
+          {error ? <Text role="alert" style={{ fontSize: 13, color: theme.color.red, textAlign: 'center', marginBottom: 14 }}>{error}</Text> : null}
+          <PrimaryButton title="Request access" icon="arrowRight" onPress={() => void confirmEnrollment()} />
           <View style={{ height: 10 }} />
           <GhostButton title="Cancel" onPress={() => void controller.cancelEnrollment()} />
         </Centered>

@@ -41,7 +41,7 @@ class FakeRuntime implements EnrollmentRuntimeLike {
     this.state = 'confirming'; return { ok: true, hostFingerprint: 'hostfp_9999', expiresAt: NOW + 60_000 };
   }
   async requestEnrollment(): Promise<{ ok: true } | { ok: false; reason: string }> {
-    if (!this.requestOk) { this.state = 'error'; return { ok: false, reason: 'denied' }; }
+    if (!this.requestOk) { this.state = 'error'; this.lastError = 'enrollment denied'; return { ok: false, reason: 'enrollment denied' }; }
     this.state = 'awaiting-host'; return { ok: true };
   }
   async poll(): Promise<EnrollmentState> { this.state = this.pollResult; return this.state; }
@@ -182,6 +182,20 @@ describe('enrollment gate — real state machine', () => {
     expect(res.ok).toBe(false);
     expect(h.ctrl.getSnapshot().phase).toBe('unenrolled');
     expect(h.ctrl.getSnapshot().enrollment.errorReason).toBe('Something went wrong. Please try again.');
+  });
+
+  it('a failed confirm stays unenrolled with a visible bounded reason and no pending poll', async () => {
+    const h = harness();
+    h.ctrl.start(); await settle();
+    await h.ctrl.beginEnrollment('maestro-shadow://enroll?x');
+    h.runtime.requestOk = false;
+    const res = await h.ctrl.confirmEnrollment();
+    expect(res).toEqual({ ok: false, reason: 'enrollment denied' });
+    const st = h.ctrl.getSnapshot();
+    expect(st.phase).toBe('unenrolled');
+    expect(st.enrollment.errorReason).toBe('Something went wrong. Please try again.');
+    await h.flushTimers();
+    expect(h.ctrl.getSnapshot().phase).toBe('unenrolled');
   });
 });
 

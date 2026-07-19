@@ -170,6 +170,10 @@ export interface AccountEnrollmentMac {
   leaseExpiresAt: number | null;
 }
 
+function enrollmentIdempotencyKey(requestNonce: string): string {
+  return `idem_${requestNonce}`;
+}
+
 function secureKeyIdentity(deviceId: string): string {
   return `maestro.shadow.identity.${deviceId}`;
 }
@@ -413,7 +417,7 @@ export class ShadowMobileEnrollmentRuntime {
       const client = this.client(s.relayOrigin);
       const res = await client.requestBootstrap<{ sessionId: string; controllerDeviceId: string; status: string }>(
         this.shadowSession(s),
-        { method: 'POST', path: '/api/shadow/enroll/request', includeDeviceId: false, body: { sessionId: this.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: request.nonce } },
+        { method: 'POST', path: '/api/shadow/enroll/request', includeDeviceId: false, body: { sessionId: this.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: enrollmentIdempotencyKey(request.nonce) } },
       );
       if (!res.ok) {
         this.fail(res.error ?? 'request-denied');

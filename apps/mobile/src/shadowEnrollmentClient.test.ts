@@ -140,7 +140,9 @@ describe('mobile enrollment runtime — transitions + guards', () => {
     expect(rt.getState()).toBe('confirming');
     expect((await rt.requestEnrollment()).ok).toBe(true);
     expect(rt.getState()).toBe('awaiting-host');
-    expect(calls.find((c) => c.path === '/api/shadow/enroll/request')?.body).toMatchObject({ idempotencyKey: expect.any(String) });
+    const requestBody = calls.find((c) => c.path === '/api/shadow/enroll/request')?.body as { request?: { nonce?: string }; idempotencyKey?: string } | undefined;
+    expect(requestBody).toMatchObject({ idempotencyKey: expect.stringMatching(/^idem_[A-Za-z0-9_-]+$/) });
+    expect(requestBody?.idempotencyKey).toBe(`idem_${requestBody?.request?.nonce}`);
   });
 
   it('account enrollment challenge errors are explicit and do not fall through to awaiting-host', async () => {
