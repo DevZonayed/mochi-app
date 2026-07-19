@@ -243,7 +243,8 @@ export class ShadowHostEnrollmentRuntime {
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
   async start(): Promise<HostRuntimeStatus> {
-    if (this.state === 'running' || this.state === 'starting') return this.status();
+    if (this.state === 'starting') return this.status();
+    if (this.state === 'running' && this.hasUsableLease()) return this.status();
     this.state = 'starting';
     this.lastError = undefined;
     try {
@@ -880,13 +881,22 @@ export class ShadowHostEnrollmentRuntime {
   private async acquireLease(s: Awaited<ReturnType<HostSessionProvider['get']>>): Promise<void> {
     const identity = this.identity!;
     const client = await this.enrolledClient(s);
+    const currentFence = this.record.fence;
+    const shouldRenewCurrentLease = !!currentFence && this.hasUsableLease();
+    if (currentFence && !shouldRenewCurrentLease && this.activeControllers().length > 0) {
+      throw errStatus('host lease expired with active controllers; re-enrollment required', 409);
+    }
     // On restart the same host RENEWS its lease by proving the persisted fence +
     // leaseId (same epoch); a first boot requests a fresh lease.
+    // If the persisted lease is expired or malformed and there are no active
+    // controllers, keep the registered host identity/scope key but request a
+    // fresh epoch/lease. Replaying an expired leaseId is explicitly rejected by
+    // the relay and would otherwise create a permanent startup loop.
     // NOTE: the relay route reads `body.leaseId` (NOT `requestedLeaseId`); sending the
     // wrong field silently regenerates the leaseId on every same-fence renewal, which
     // would change the fence across restarts and break atomic lease-renewal recovery.
-    const body = this.record.fence
-      ? { scopeId: scopeFor(s.accountId), currentFence: this.record.fence, leaseId: this.record.fence.leaseId }
+    const body = shouldRenewCurrentLease && currentFence
+      ? { scopeId: scopeFor(s.accountId), currentFence, leaseId: currentFence.leaseId }
       : { scopeId: scopeFor(s.accountId) };
     const res = await client.requestEnrolled<{ fence: Fence; expiresAt: number }>(
       this.shadowSession(s),
@@ -897,6 +907,14 @@ export class ShadowHostEnrollmentRuntime {
     this.record.fence = res.json.fence;
     this.record.leaseExpiresAt = res.json.expiresAt;
     if (!this.record.scopeKeyCipher) this.setScopeKey(backend.randomBytes(32));
+  }
+
+  private hasUsableLease(): boolean {
+    return !!this.record.fence && typeof this.record.leaseExpiresAt === 'number' && Number.isFinite(this.record.leaseExpiresAt) && this.record.leaseExpiresAt > this.now();
+  }
+
+  private activeControllers(): HostControllerRecord[] {
+    return this.record.controllers.filter((c) => c.status === 'active');
   }
 
   private persist(): void {

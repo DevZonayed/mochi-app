@@ -15,6 +15,7 @@ import { encryptWithKey, decryptWithKey } from '../sidecar/src/safe-storage-cryp
 import { SafeStorageVault, FileHostEnrollmentPersistence, type SafeStorageLike } from './shadow-host-adapters.ts';
 import { ShadowHostEnrollmentRuntime, type HostEnrollmentRecord } from './shadow-enrollment-host.ts';
 import type { ShadowFetch } from '@maestro/realtime/shadowRequestClient';
+import type { Fence } from '@maestro/realtime/shadowProtocol';
 
 /** Mock safeStorage: real MS1 crypto, random key — only the master-key source is faked. */
 function mockSafeStorage(available = true): SafeStorageLike & { available: boolean; key: Buffer } {
@@ -138,5 +139,168 @@ describe('ciphertext-at-rest through the real runtime', () => {
     const scopeKeyB64 = vault.decryptString(Buffer.from(rec.scopeKeyCipher!, 'base64url')) as string;
     expect(raw).not.toContain(scopeKeyB64);
     expect(raw).not.toContain('privateKey');
+  });
+});
+
+describe('expired persisted shadow host lease recovery', () => {
+  const accountId = 'acct_expired';
+  const hostDeviceId = 'host_expired';
+  const relayOrigin = 'https://relay.test';
+  const oldFence: Fence = { accountId, scopeId: `account:${accountId}`, hostDeviceId, epoch: 7, leaseId: 'lease_old' };
+
+  function runtimeWith(recordFile: string, vault: SafeStorageVault, fetch: ShadowFetch, now: () => number): ShadowHostEnrollmentRuntime {
+    return new ShadowHostEnrollmentRuntime({
+      vault,
+      persistence: new FileHostEnrollmentPersistence(recordFile),
+      session: { get: async () => ({ accountId, hostDeviceId, sessionToken: 'tok', relayOrigin }) },
+      transport: { fetch },
+      now,
+    });
+  }
+
+  async function seedRegisteredRecord(recordFile: string, vault: SafeStorageVault, nowMs: number): Promise<HostEnrollmentRecord> {
+    const seedFetch: ShadowFetch = async (url) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/lease') return { status: 200, ok: true, text: async () => JSON.stringify({ fence: oldFence, expiresAt: nowMs + 120_000 }) };
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+    await runtimeWith(recordFile, vault, seedFetch, () => nowMs).start();
+    const seeded = JSON.parse(readFileSync(recordFile, 'utf8')) as HostEnrollmentRecord;
+    seeded.fence = oldFence;
+    seeded.leaseExpiresAt = nowMs - 1;
+    seeded.controllers = [];
+    seeded.sessions = [];
+    writeFileSync(recordFile, JSON.stringify(seeded), { mode: 0o600 });
+    return seeded;
+  }
+
+  async function startWithSeededExpiry(expiry: number | null, controllers: HostEnrollmentRecord['controllers'] = []): Promise<{ rt: ShadowHostEnrollmentRuntime; leaseBodies: Array<Record<string, unknown>>; recordFile: string; nowMs: number }> {
+    const nowMs = 1_800_000_000_000;
+    const vault = new SafeStorageVault(mockSafeStorage());
+    const recordFile = tmpFile('runtime-expiry.json');
+    const seeded = await seedRegisteredRecord(recordFile, vault, nowMs);
+    seeded.leaseExpiresAt = expiry;
+    seeded.controllers = controllers;
+    writeFileSync(recordFile, JSON.stringify(seeded), { mode: 0o600 });
+    const leaseBodies: Array<Record<string, unknown>> = [];
+    const freshFence: Fence = { ...oldFence, epoch: 8, leaseId: 'lease_fresh' };
+    const fetch: ShadowFetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/lease') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        leaseBodies.push(body);
+        return { status: 200, ok: true, text: async () => JSON.stringify({ fence: freshFence, expiresAt: nowMs + 240_000 }) };
+      }
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+    return { rt: runtimeWith(recordFile, vault, fetch, () => nowMs), leaseBodies, recordFile, nowMs };
+  }
+
+  it('RED: expired registered zero-controller restart requests a fresh lease without stale fence or lease id', async () => {
+    const nowMs = 1_800_000_000_000;
+    const vault = new SafeStorageVault(mockSafeStorage());
+    const f = tmpFile('expired-runtime.json');
+    await seedRegisteredRecord(f, vault, nowMs);
+    const leaseBodies: Array<Record<string, unknown>> = [];
+    const freshFence: Fence = { ...oldFence, epoch: 8, leaseId: 'lease_fresh' };
+    const fetch: ShadowFetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/lease') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        leaseBodies.push(body);
+        if (body.currentFence || body.leaseId === oldFence.leaseId) {
+          return { status: 409, ok: false, text: async () => '{"error":"expired lease id cannot be reused"}' };
+        }
+        return { status: 200, ok: true, text: async () => JSON.stringify({ fence: freshFence, expiresAt: nowMs + 240_000 }) };
+      }
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+
+    await expect(runtimeWith(f, vault, fetch, () => nowMs).start()).resolves.toMatchObject({ state: 'running', epoch: 8 });
+    expect(leaseBodies).toHaveLength(1);
+    expect(leaseBodies[0]).toMatchObject({ scopeId: `account:${accountId}` });
+    expect(leaseBodies[0]).not.toHaveProperty('currentFence');
+    expect(leaseBodies[0]).not.toHaveProperty('leaseId');
+    const saved = JSON.parse(readFileSync(f, 'utf8')) as HostEnrollmentRecord;
+    expect(saved.fence).toEqual(freshFence);
+    expect(saved.leaseExpiresAt).toBe(nowMs + 240_000);
+    expect(saved.identityCipher).toBeTruthy();
+    expect(saved.scopeKeyCipher).toBeTruthy();
+  });
+
+  it('unexpired same-host restart still sends exact current fence and lease id', async () => {
+    const nowMs = 1_800_000_000_000;
+    const vault = new SafeStorageVault(mockSafeStorage());
+    const f = tmpFile('unexpired-runtime.json');
+    const seeded = await seedRegisteredRecord(f, vault, nowMs);
+    seeded.leaseExpiresAt = nowMs + 60_000;
+    writeFileSync(f, JSON.stringify(seeded), { mode: 0o600 });
+    const leaseBodies: Array<Record<string, unknown>> = [];
+    const fetch: ShadowFetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/lease') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        leaseBodies.push(body);
+        if (JSON.stringify(body.currentFence) !== JSON.stringify(oldFence) || body.leaseId !== oldFence.leaseId) {
+          return { status: 409, ok: false, text: async () => '{"error":"same host renewal requires current fence proof"}' };
+        }
+        return { status: 200, ok: true, text: async () => JSON.stringify({ fence: oldFence, expiresAt: nowMs + 180_000 }) };
+      }
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+
+    await expect(runtimeWith(f, vault, fetch, () => nowMs).start()).resolves.toMatchObject({ state: 'running', epoch: oldFence.epoch });
+    expect(leaseBodies[0]).toMatchObject({ scopeId: `account:${accountId}`, currentFence: oldFence, leaseId: oldFence.leaseId });
+  });
+
+  it('treats exact-boundary expiry as expired and requests a fresh lease', async () => {
+    const { rt, leaseBodies, nowMs } = await startWithSeededExpiry(1_800_000_000_000);
+    await expect(rt.start()).resolves.toMatchObject({ state: 'running', epoch: 8 });
+    expect(leaseBodies[0]).toEqual({ scopeId: `account:${accountId}` });
+    expect(nowMs).toBe(1_800_000_000_000);
+  });
+
+  it('treats missing expiry on a persisted fence as invalid and requests a fresh lease only with zero controllers', async () => {
+    const { rt, leaseBodies } = await startWithSeededExpiry(null);
+    await expect(rt.start()).resolves.toMatchObject({ state: 'running', epoch: 8 });
+    expect(leaseBodies[0]).toEqual({ scopeId: `account:${accountId}` });
+  });
+
+  it('fails closed instead of refreshing an expired lease when active controllers exist', async () => {
+    const controller = { controllerDeviceId: 'ctrl_live', grantId: 'grant_live', keyId: 'key_live', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
+    const { rt, leaseBodies } = await startWithSeededExpiry(1_800_000_000_000 - 1, [controller]);
+    await expect(rt.start()).rejects.toMatchObject({ statusCode: 409 });
+    await expect(rt.start()).rejects.toThrow(/re-enrollment required/i);
+    expect(leaseBodies).toHaveLength(0);
+    expect(rt.status()).toMatchObject({ state: 'error' });
+    expect(String(rt.status().lastError ?? '')).not.toMatch(/lease_old|grant_live|key_live|ctrl_live/);
+  });
+
+  it('does not report an already-running runtime as running after its lease expires', async () => {
+    let nowMs = 1_800_000_000_000;
+    const vault = new SafeStorageVault(mockSafeStorage());
+    const f = tmpFile('running-expiry.json');
+    const leaseBodies: Array<Record<string, unknown>> = [];
+    const fetch: ShadowFetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/lease') {
+        leaseBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
+        const first = leaseBodies.length === 1;
+        const fence = first ? oldFence : { ...oldFence, epoch: 8, leaseId: 'lease_after_expiry' };
+        return { status: 200, ok: true, text: async () => JSON.stringify({ fence, expiresAt: nowMs + 60_000 }) };
+      }
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+    const rt = runtimeWith(f, vault, fetch, () => nowMs);
+    await expect(rt.start()).resolves.toMatchObject({ state: 'running', epoch: 7 });
+    nowMs += 60_000;
+    await expect(rt.start()).resolves.toMatchObject({ state: 'running', epoch: 8 });
+    expect(leaseBodies).toHaveLength(2);
+    expect(leaseBodies[1]).toEqual({ scopeId: `account:${accountId}` });
   });
 });
