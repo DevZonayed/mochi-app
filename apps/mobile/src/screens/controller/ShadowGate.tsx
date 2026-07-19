@@ -12,6 +12,7 @@ import { useTheme } from '../../theme';
 import { Icon, type IconName } from '../../Icon';
 import type { ShadowUiState } from '../../shadowUiModel';
 import type { ShadowUiController } from '../../shadowUiController';
+import type { AccountEnrollmentMac } from '../../shadowEnrollmentClient';
 import { deactivateControllerMode } from '../../controllerMode';
 import { ACTION_FAMILIES, requestedCapabilitiesFor, type ActionFamilyKey } from '../../shadowActionCapabilities';
 import { Screen, ScreenHeader, Busy, PrimaryButton, GhostButton, EmptyState, useInsets } from './parts';
@@ -56,10 +57,29 @@ function ModeCard({ active, onPress, icon, title, subtitle }: { active: boolean;
   );
 }
 
+function MacRow({ mac, busy, onPress }: { mac: AccountEnrollmentMac; busy: boolean; onPress: () => void }) {
+  const { theme } = useTheme();
+  return (
+    <Pressable disabled={!mac.online || busy} onPress={onPress} accessibilityRole="button" accessibilityState={{ disabled: !mac.online || busy }}
+      style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14, borderRadius: 14, borderWidth: 0.5, borderColor: theme.color.separator, backgroundColor: theme.color.bgElevated, opacity: mac.online ? 1 : 0.55 }}>
+      <View style={{ width: 38, height: 38, borderRadius: 10, alignItems: 'center', justifyContent: 'center', backgroundColor: (mac.online ? theme.color.green : theme.color.inkTertiary) + '22' }}>
+        <Icon name="monitor" size={18} color={mac.online ? theme.color.green : theme.color.inkSecondary} />
+      </View>
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text numberOfLines={1} style={{ fontSize: 15, fontWeight: '700', color: theme.color.ink }}>{mac.name || mac.hostDeviceId}</Text>
+        <Text numberOfLines={1} style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 1 }}>{mac.online ? 'Online' : 'Offline'} · {mac.fingerprint.slice(0, 12)}</Text>
+      </View>
+      <Icon name="chevronRight" size={18} color={theme.color.inkTertiary} />
+    </Pressable>
+  );
+}
+
 export function ShadowGate({ state, controller }: { state: ShadowUiState; controller: ShadowUiController }) {
   const { theme } = useTheme();
   const [scanning, setScanning] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [macs, setMacs] = React.useState<AccountEnrollmentMac[]>([]);
+  const [loadingMacs, setLoadingMacs] = React.useState(false);
   // Least-privilege enrollment choice (Section A): default View only; Control actions is an
   // EXPLICIT opt-in with per-family selection (nothing pre-selected). account.read is always
   // requested (the read floor). The chosen set is applied to the runtime BEFORE the scan.
@@ -73,6 +93,20 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
   const beginScan = React.useCallback(() => {
     void controller.setRequestedCapabilities(requestedCapabilitiesFor(mode, [...selected], screenView));
     setError(null); setScanning(true);
+  }, [controller, mode, selected, screenView]);
+  const loadMacs = React.useCallback(async () => {
+    setLoadingMacs(true);
+    const res = await controller.listAccountMacs();
+    setLoadingMacs(false);
+    if (res.ok) { setMacs(res.macs); setError(null); }
+    else setError(res.reason);
+  }, [controller]);
+  React.useEffect(() => { if (phase === 'unenrolled') void loadMacs(); }, [phase, loadMacs]);
+  const beginAccountMac = React.useCallback(async (hostDeviceId: string) => {
+    void controller.setRequestedCapabilities(requestedCapabilitiesFor(mode, [...selected], screenView));
+    setError(null);
+    const res = await controller.beginAccountEnrollment(hostDeviceId);
+    if (!res.ok) setError(res.reason ?? 'Request failed');
   }, [controller, mode, selected, screenView]);
   const toggle = (k: ActionFamilyKey) => setSelected((prev) => { const n = new Set(prev); if (n.has(k)) n.delete(k); else n.add(k); return n; });
 
@@ -107,7 +141,7 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
             <IconBadge name="smartphone" tone={theme.color.blue} />
             <Text accessibilityRole="header" style={{ fontSize: 24, fontWeight: '700', color: theme.color.ink, textAlign: 'center', marginBottom: 10 }}>Control your Mac from here</Text>
             <Text style={{ fontSize: 15, lineHeight: 21, color: theme.color.inkSecondary, textAlign: 'center', marginBottom: 20 }}>
-              Choose what this device may do, then scan the code on your Mac to enroll. You’ll approve it on the Mac.
+              Choose what this device may do, then select a Mac from your account. You’ll approve it on the Mac.
             </Text>
 
             {/* Least-privilege choice: View only (default) vs Control actions (explicit). */}
@@ -156,8 +190,14 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
             <Text style={{ fontSize: 12, color: theme.color.inkTertiary, textAlign: 'center', marginTop: 14, marginBottom: 16 }}>
               Read access is always included. You can revoke this device from your Mac at any time.
             </Text>
+            <Text style={{ fontSize: 12, fontWeight: '700', color: theme.color.inkSecondary, marginBottom: 8, marginLeft: 2, textTransform: 'uppercase', letterSpacing: 0.4 }}>Your Macs</Text>
+            <View style={{ gap: 10, marginBottom: 14 }}>
+              {loadingMacs ? <Busy label="Finding Macs…" /> : macs.length ? macs.map((m) => <MacRow key={m.hostDeviceId} mac={m} busy={state.busy} onPress={() => void beginAccountMac(m.hostDeviceId)} />) : (
+                <Text style={{ fontSize: 13, color: theme.color.inkTertiary, textAlign: 'center' }}>No eligible Mac is online for this account.</Text>
+              )}
+            </View>
             {error ? <Text role="alert" style={{ fontSize: 13, color: theme.color.red, textAlign: 'center', marginBottom: 14 }}>{error}</Text> : null}
-            <PrimaryButton title="Connect to your Mac" icon="camera" onPress={beginScan} label="Connect to your Mac and scan the code" />
+            <GhostButton title="Use enrollment code instead" onPress={beginScan} />
             <View style={{ height: 10 }} />
             <GhostButton title="Not now" onPress={() => { void deactivateControllerMode(); }} />
           </ScrollView>

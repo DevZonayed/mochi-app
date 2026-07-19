@@ -21,7 +21,7 @@
  * There is NO local boolean that can force `online` — only a verified grant +
  * successful bootstrap/connect reaches it.
  */
-import type { EnrollmentStatus, EnrollmentState } from './shadowEnrollmentClient';
+import type { AccountEnrollmentMac, EnrollmentStatus, EnrollmentState } from './shadowEnrollmentClient';
 import type { ProductionShadowController } from './shadowProductionControllerCore';
 import type { ProjectView, SessionView, JobView, ApprovalView, QuestionView, ScheduleView } from './shadowProjectionSelectors';
 import type { ShadowCapability } from '@maestro/realtime/shadowCapabilities';
@@ -31,6 +31,8 @@ import { deriveShadowUiState, projectionVisible, type ShadowUiState, type Shadow
 export interface EnrollmentRuntimeLike {
   status(): EnrollmentStatus;
   restore(): Promise<EnrollmentStatus>;
+  listAccountMacs(): Promise<{ ok: true; macs: AccountEnrollmentMac[] } | { ok: false; reason: string }>;
+  startAccountEnrollment(hostDeviceId: string): Promise<{ ok: true; hostFingerprint: string; expiresAt: number } | { ok: false; reason: string }>;
   parseBootstrap(raw: string): Promise<{ ok: true; hostFingerprint: string; expiresAt: number } | { ok: false; reason: string }>;
   requestEnrollment(): Promise<{ ok: true } | { ok: false; reason: string }>;
   poll(): Promise<EnrollmentState>;
@@ -351,6 +353,16 @@ export class ShadowUiController {
   async beginEnrollment(bootstrap: string): Promise<{ ok: boolean; reason?: string }> {
     const rt = await this.ensureRuntime();
     const res = await rt.parseBootstrap(bootstrap);
+    await this.refresh();
+    return res.ok ? { ok: true } : { ok: false, reason: res.reason };
+  }
+  async listAccountMacs(): Promise<{ ok: true; macs: AccountEnrollmentMac[] } | { ok: false; reason: string }> {
+    const rt = await this.ensureRuntime();
+    return rt.listAccountMacs();
+  }
+  async beginAccountEnrollment(hostDeviceId: string): Promise<{ ok: boolean; reason?: string }> {
+    const rt = await this.ensureRuntime();
+    const res = await rt.startAccountEnrollment(hostDeviceId);
     await this.refresh();
     return res.ok ? { ok: true } : { ok: false, reason: res.reason };
   }

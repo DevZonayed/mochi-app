@@ -25,6 +25,7 @@ import {
   generateShadowIdentity,
   materializeIdentity,
   decodeEnrollmentBootstrap,
+  encodeEnrollmentBootstrap,
   buildEnrollmentRequest,
   acceptEnrollmentGrant,
   unwrapRotatedScopeKey,
@@ -157,6 +158,16 @@ export interface EnrollmentStatus {
   online: boolean;
   readonlyReason?: 'offline' | 'revoked' | 'locked' | 'awaiting';
   lastError?: string;
+}
+
+export interface AccountEnrollmentMac {
+  hostDeviceId: string;
+  name: string;
+  platform: string;
+  fingerprint: string;
+  online: boolean;
+  lastSeen: number;
+  leaseExpiresAt: number | null;
 }
 
 function secureKeyIdentity(deviceId: string): string {
@@ -328,6 +339,62 @@ export class ShadowMobileEnrollmentRuntime {
     return { ok: true, hostFingerprint: decoded.value.hostSigningKeyId, expiresAt: decoded.value.expiresAt };
   }
 
+  async listAccountMacs(): Promise<{ ok: true; macs: AccountEnrollmentMac[] } | { ok: false; reason: string }> {
+    try {
+      const s = await this.opts.session.get();
+      const client = this.client(s.relayOrigin);
+      const res = await client.requestBootstrap<{ macs: AccountEnrollmentMac[] }>(
+        this.shadowSession(s),
+        { method: 'GET', path: '/api/shadow/enroll/account/macs', includeDeviceId: true },
+      );
+      if (!res.ok || !res.json) return { ok: false, reason: res.error ?? `http-${res.status}` };
+      return { ok: true, macs: Array.isArray(res.json.macs) ? res.json.macs : [] };
+    } catch (e) {
+      return { ok: false, reason: (e as Error).message };
+    }
+  }
+
+  async startAccountEnrollment(hostDeviceId: string): Promise<{ ok: true; hostFingerprint: string; expiresAt: number } | { ok: false; reason: string }> {
+    if (this.state !== 'idle' && this.state !== 'error' && this.state !== 'expired' && this.state !== 'denied' && this.state !== 'cancelled') {
+      return { ok: false, reason: 'busy' };
+    }
+    this.transition('parsing');
+    try {
+      const s = await this.opts.session.get();
+      const client = this.client(s.relayOrigin);
+      const res = await client.requestBootstrap<{ bootstrap: EnrollmentBootstrap }>(
+        this.shadowSession(s),
+        {
+          method: 'POST',
+          path: '/api/shadow/enroll/account/challenge',
+          includeDeviceId: true,
+          body: { hostDeviceId, requestedCapabilities: this.requestedCaps ?? ['account.read'], relayOrigin: s.relayOrigin },
+        },
+      );
+      if (!res.ok || !res.json?.bootstrap) {
+        const reason = res.error ?? `http-${res.status}`;
+        this.fail(reason);
+        return { ok: false, reason };
+      }
+      const decoded = decodeEnrollmentBootstrap(encodeEnrollmentBootstrap(res.json.bootstrap), { allowedOrigins: this.opts.allowedOrigins, nowMs: this.now() });
+      if (!decoded.ok) {
+        this.fail(decoded.reason);
+        return { ok: false, reason: decoded.reason };
+      }
+      if (decoded.value.accountId !== s.accountId || decoded.value.hostDeviceId !== hostDeviceId) {
+        this.fail('challenge-mismatch');
+        return { ok: false, reason: 'challenge-mismatch' };
+      }
+      this.bootstrap = decoded.value;
+      this.transition('confirming');
+      return { ok: true, hostFingerprint: decoded.value.hostSigningKeyId, expiresAt: decoded.value.expiresAt };
+    } catch (e) {
+      const reason = (e as Error).message;
+      this.fail(reason);
+      return { ok: false, reason };
+    }
+  }
+
   /**
    * After the operator confirms the SAS, submit the signed enrollment request +
    * one-time secret proof. idle→requesting→awaiting-host.
@@ -346,7 +413,7 @@ export class ShadowMobileEnrollmentRuntime {
       const client = this.client(s.relayOrigin);
       const res = await client.requestBootstrap<{ sessionId: string; controllerDeviceId: string; status: string }>(
         this.shadowSession(s),
-        { method: 'POST', path: '/api/shadow/enroll/request', includeDeviceId: false, body: { sessionId: this.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret) } },
+        { method: 'POST', path: '/api/shadow/enroll/request', includeDeviceId: false, body: { sessionId: this.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: request.nonce } },
       );
       if (!res.ok) {
         this.fail(res.error ?? 'request-denied');

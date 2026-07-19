@@ -55,6 +55,8 @@ import {
   listEnrollmentSessions,
   listPendingEnrollmentRequests,
   listEnrolledControllers,
+  listAccountEnrollmentMacs,
+  createAccountEnrollmentChallenge,
   pollEnrollment,
   revokeEnrolledController,
 } from './shadowEnrollmentService.js';
@@ -497,9 +499,41 @@ export function buildAccountServer(): FastifyInstance {
   // Bootstrap-controller: submit a signed enrollment request + one-time secret proof.
   app.post('/api/shadow/enroll/request', async (req, reply) => {
     const userId = (req as ReqWithUser).userId as string;
-    const body = (req.body ?? {}) as { sessionId?: string; request?: unknown; presentedSecret?: string };
+    const body = (req.body ?? {}) as { sessionId?: string; request?: unknown; presentedSecret?: string; idempotencyKey?: string };
     try {
-      return await submitEnrollmentRequest({ accountId: userId, sessionId: body.sessionId ?? '', request: body.request as Parameters<typeof submitEnrollmentRequest>[0]['request'], presentedSecret: body.presentedSecret ?? '', nowMs: Date.now() });
+      return await submitEnrollmentRequest({ accountId: userId, sessionId: body.sessionId ?? '', request: body.request as Parameters<typeof submitEnrollmentRequest>[0]['request'], presentedSecret: body.presentedSecret ?? '', idempotencyKey: body.idempotencyKey, nowMs: Date.now() });
+    } catch (e) {
+      const err = e as { statusCode?: number; message?: string };
+      await reply.code(err.statusCode ?? 500).send({ error: err.message ?? 'failed' });
+    }
+  });
+
+  // Account-controller: identity/discovery only. Same-account Macs with active
+  // host identities are visible; online is true only while the live host lease is
+  // unexpired. This route never grants control.
+  app.get('/api/shadow/enroll/account/macs', async (req) => {
+    const userId = (req as ReqWithUser).userId as string;
+    return { macs: await listAccountEnrollmentMacs({ accountId: userId, nowMs: Date.now() }) };
+  });
+
+  // Account-controller: mint a high-entropy, one-time, short-lived challenge for
+  // a selected same-account Mac. The phone must still submit a signed request,
+  // and the Mac must still approve before any grant exists.
+  app.post('/api/shadow/enroll/account/challenge', async (req, reply) => {
+    const userId = (req as ReqWithUser).userId as string;
+    const did = deviceIdOf(req);
+    const body = (req.body ?? {}) as { hostDeviceId?: string; requestedCapabilities?: unknown; ttlMs?: number; relayOrigin?: string };
+    if (!did) { await reply.code(400).send({ error: 'device id required' }); return; }
+    try {
+      return await createAccountEnrollmentChallenge({
+        accountId: userId,
+        hostDeviceId: body.hostDeviceId ?? '',
+        controllerDeviceId: did,
+        requestedCapabilities: body.requestedCapabilities ?? ['account.read'],
+        relayOrigin: body.relayOrigin ?? 'https://api.nexalance.cloud',
+        ttlMs: body.ttlMs,
+        nowMs: Date.now(),
+      });
     } catch (e) {
       const err = e as { statusCode?: number; message?: string };
       await reply.code(err.statusCode ?? 500).send({ error: err.message ?? 'failed' });

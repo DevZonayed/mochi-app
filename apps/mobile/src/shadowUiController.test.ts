@@ -32,6 +32,10 @@ class FakeRuntime implements EnrollmentRuntimeLike {
     return { state: this.state, accountId: 'acct', controllerDeviceId: 'ctrl_device_0123456789abcdef', hostFingerprint: 'hostfp_9999', scopeKeyId: this.state === 'online' ? 'sk' : null, online: this.state === 'online', lastError: this.lastError };
   }
   async restore(): Promise<EnrollmentStatus> { if (this.restoreState) this.state = this.restoreState; return this.status(); }
+  async listAccountMacs() { return { ok: true as const, macs: [{ hostDeviceId: 'host_1', name: 'Mac', platform: 'macos', fingerprint: 'hostfp_9999', online: true, lastSeen: NOW, leaseExpiresAt: NOW + 60_000 }] }; }
+  async startAccountEnrollment(): Promise<{ ok: true; hostFingerprint: string; expiresAt: number } | { ok: false; reason: string }> {
+    this.state = 'confirming'; return { ok: true, hostFingerprint: 'hostfp_9999', expiresAt: NOW + 60_000 };
+  }
   async parseBootstrap(): Promise<{ ok: true; hostFingerprint: string; expiresAt: number } | { ok: false; reason: string }> {
     if (!this.parseOk) { this.state = 'error'; this.lastError = 'bad-bootstrap'; return { ok: false, reason: 'bad-bootstrap' }; }
     this.state = 'confirming'; return { ok: true, hostFingerprint: 'hostfp_9999', expiresAt: NOW + 60_000 };

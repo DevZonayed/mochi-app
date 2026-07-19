@@ -42,6 +42,8 @@ import {
   signHostRotation,
   signControllerPoll,
   computeEnrollmentVerifier,
+  listAccountEnrollmentMacs,
+  createAccountEnrollmentChallenge,
 } from './shadowEnrollmentService.js';
 import { acquireShadowLease } from './shadowRelay.js';
 import { shadowRequestProofBytes } from './shadowRequestAuth.js';
@@ -391,6 +393,47 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
       expect(dump).not.toContain(base64urlEncode(host.keys.agreement.privateKey));
       expect(dump).not.toContain(base64urlEncode(r.controller.keys.signing.privateKey));
     }
+  });
+
+  it('lists only same-account eligible Macs and marks expired leases offline', async () => {
+    const now = Date.now();
+    const hostA = await makeRegisteredHost('acct-list-a', 'host-list-a');
+    await makeRegisteredHost('acct-list-b', 'host-list-b');
+    await acquireShadowLease({ accountId: 'acct-list-a', hostDeviceId: hostA.deviceId, scopeId: 'account:acct-list-a', requestedLeaseId: 'lease_list_a', ttlMs: 120_000 });
+    const macs = await listAccountEnrollmentMacs({ accountId: 'acct-list-a', nowMs: now });
+    expect(macs.map((m) => m.hostDeviceId)).toContain('host-list-a');
+    expect(macs.map((m) => m.hostDeviceId)).not.toContain('host-list-b');
+    expect(macs.find((m) => m.hostDeviceId === 'host-list-a')?.online).toBe(true);
+    await getDb().updateTable('shadow_lease').set({ expires_at: new Date(now - 1) }).where('account_id', '=', 'acct-list-a').where('scope_id', '=', 'account:acct-list-a').execute();
+    const expired = await listAccountEnrollmentMacs({ accountId: 'acct-list-a', nowMs: now });
+    expect(expired.find((m) => m.hostDeviceId === 'host-list-a')?.online).toBe(false);
+  });
+
+  it('account challenge creates a pending request without auto-authorizing control and coalesces duplicate submit', async () => {
+    const accountId = 'acct-account-flow';
+    const host = await makeRegisteredHost(accountId, 'host-account-flow');
+    await acquireShadowLease({ accountId, hostDeviceId: host.deviceId, scopeId: `account:${accountId}`, requestedLeaseId: 'lease_account_flow', ttlMs: 120_000 });
+    const controller = await generateShadowIdentity(backend, 'ctrl-account-flow');
+    const requestedCapabilities = ['account.read', 'session.message'] as const;
+    const challenge = await createAccountEnrollmentChallenge({
+      accountId, hostDeviceId: host.deviceId, controllerDeviceId: controller.deviceId, requestedCapabilities,
+      relayOrigin: RELAY_ORIGIN, nowMs: Date.now(), ttlMs: 120_000,
+    });
+    const { request, presentedSecret } = await buildEnrollmentRequest(backend, { controller, bootstrap: challenge.bootstrap, nowMs: Date.now(), requestedCapabilities });
+    const first = await submitEnrollmentRequest({ accountId, sessionId: challenge.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: request.nonce, nowMs: Date.now() });
+    const second = await submitEnrollmentRequest({ accountId, sessionId: challenge.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: request.nonce, nowMs: Date.now() });
+    expect(first.status).toBe('pending');
+    expect(second.coalesced).toBe(true);
+    expect(await listEnrolledControllers({ accountId })).toEqual([]);
+  });
+
+  it('account challenge rejects cross-account and offline hosts without creating a request', async () => {
+    const hostA = await makeRegisteredHost('acct-chal-a', 'host-chal-a');
+    await makeRegisteredHost('acct-chal-b', 'host-chal-b');
+    await expect(createAccountEnrollmentChallenge({ accountId: 'acct-chal-a', hostDeviceId: 'host-chal-b', controllerDeviceId: 'ctrl-chal-a', requestedCapabilities: ['account.read'], relayOrigin: RELAY_ORIGIN, nowMs: Date.now() })).rejects.toMatchObject({ statusCode: 404 });
+    await expect(createAccountEnrollmentChallenge({ accountId: 'acct-chal-a', hostDeviceId: hostA.deviceId, controllerDeviceId: 'ctrl-chal-a', requestedCapabilities: ['account.read'], relayOrigin: RELAY_ORIGIN, nowMs: Date.now() })).rejects.toMatchObject({ statusCode: 409 });
+    const sessions = await listEnrollmentSessions({ accountId: 'acct-chal-a', hostDeviceId: hostA.deviceId });
+    expect(sessions).toEqual([]);
   });
 });
 

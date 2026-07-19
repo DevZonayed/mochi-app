@@ -35,6 +35,17 @@ function scriptedFetch(routes: Record<string, { status: number; body: unknown }>
   };
 }
 
+function scriptedFetchWithCapture(routes: Record<string, { status: number; body: unknown }>) {
+  const calls: Array<{ path: string; body: unknown }> = [];
+  const fetch: ShadowFetch = async (url, init) => {
+    const path = new URL(url).pathname;
+    calls.push({ path, body: init.body ? JSON.parse(init.body) : null });
+    const r = routes[path] ?? { status: 404, body: { error: 'no route' } };
+    return { status: r.status, ok: r.status >= 200 && r.status < 300, text: async () => JSON.stringify(r.body) };
+  };
+  return { fetch, calls };
+}
+
 async function makeQr(nowMs: number, ttlMs = 120_000): Promise<string> {
   const host = await generateShadowIdentity(backend, 'host_unit');
   const created = await createEnrollmentSession(backend, { host, accountId: ACCOUNT, relayOrigin: ORIGIN, nowMs, ttlMs, serverPepper: new TextEncoder().encode('p') });
@@ -112,6 +123,34 @@ describe('mobile enrollment runtime — transitions + guards', () => {
     const res = await rt.requestEnrollment();
     expect(res.ok).toBe(false);
     expect(rt.getState()).toBe('error');
+  });
+
+  it('lists account Macs and starts enrollment from a server challenge without QR', async () => {
+    const host = await generateShadowIdentity(backend, 'host_account');
+    const challenge = await createEnrollmentSession(backend, { host, accountId: ACCOUNT, relayOrigin: ORIGIN, nowMs: 1_700_000_000_000, ttlMs: 120_000, serverPepper: new TextEncoder().encode('p') });
+    const { fetch, calls } = scriptedFetchWithCapture({
+      '/api/shadow/enroll/account/macs': { status: 200, body: { macs: [{ hostDeviceId: host.deviceId, name: 'Mac', platform: 'macos', fingerprint: host.signingKeyId, online: true, lastSeen: 1, leaseExpiresAt: 2 }] } },
+      '/api/shadow/enroll/account/challenge': { status: 200, body: { bootstrap: challenge.bootstrap } },
+      '/api/shadow/enroll/request': { status: 200, body: { sessionId: challenge.bootstrap.sessionId, controllerDeviceId: 'ctrl_unit', status: 'pending' } },
+    });
+    const { rt } = runtime(fetch);
+    const listed = await rt.listAccountMacs();
+    expect(listed.ok && listed.macs[0]?.hostDeviceId).toBe(host.deviceId);
+    expect((await rt.startAccountEnrollment(host.deviceId)).ok).toBe(true);
+    expect(rt.getState()).toBe('confirming');
+    expect((await rt.requestEnrollment()).ok).toBe(true);
+    expect(rt.getState()).toBe('awaiting-host');
+    expect(calls.find((c) => c.path === '/api/shadow/enroll/request')?.body).toMatchObject({ idempotencyKey: expect.any(String) });
+  });
+
+  it('account enrollment challenge errors are explicit and do not fall through to awaiting-host', async () => {
+    const { rt } = runtime(scriptedFetch({
+      '/api/shadow/enroll/account/challenge': { status: 409, body: { error: 'host offline' } },
+    }));
+    const res = await rt.startAccountEnrollment('host_offline');
+    expect(res).toEqual({ ok: false, reason: 'host offline' });
+    expect(rt.getState()).toBe('error');
+    expect(rt.status().lastError).toBe('host offline');
   });
 
   it('markRevoked is sticky and reports read-only truth', async () => {

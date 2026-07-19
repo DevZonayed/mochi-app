@@ -295,6 +295,7 @@ export interface SubmitEnrollmentRequestInput {
   sessionId: string;
   request: EnrollmentRequest;
   presentedSecret: string; // base64url one-time secret from the QR
+  idempotencyKey?: string;
   nowMs: number;
 }
 
@@ -302,6 +303,7 @@ export interface SubmitEnrollmentRequestView {
   sessionId: string;
   controllerDeviceId: string;
   status: 'pending';
+  coalesced?: boolean;
 }
 
 /**
@@ -314,13 +316,26 @@ export async function submitEnrollmentRequest(input: SubmitEnrollmentRequestInpu
   const accountId = requireId(input.accountId, 'accountId');
   const sessionId = requireId(input.sessionId, 'sessionId');
   const presentedSecret = decode32(requireB64(input.presentedSecret, 'presentedSecret'), 'presentedSecret');
+  if (input.idempotencyKey !== undefined) requireId(input.idempotencyKey, 'idempotencyKey');
   const req = input.request;
   if (!req || typeof req !== 'object') throw status('bad request', 400);
   if (req.sessionId !== sessionId || req.accountId !== accountId) throw status('enrollment denied', 403);
 
   const session = await getDb().selectFrom('shadow_enrollment_session').selectAll().where('account_id', '=', accountId).where('session_id', '=', sessionId).executeTakeFirst();
   if (!session) throw status('enrollment denied', 403);
-  if (session.status !== 'pending') throw status('enrollment already claimed', 409);
+  if (session.status !== 'pending') {
+    if (input.idempotencyKey) {
+      const existing = await getDb().selectFrom('shadow_enrollment_request')
+        .select(['controller_device_id', 'nonce'])
+        .where('account_id', '=', accountId)
+        .where('session_id', '=', sessionId)
+        .executeTakeFirst();
+      if (existing?.controller_device_id === req.controllerDeviceId && existing.nonce === req.nonce) {
+        return { sessionId, controllerDeviceId: existing.controller_device_id, status: 'pending' as const, coalesced: true };
+      }
+    }
+    throw status('enrollment already claimed', 409);
+  }
   if (input.nowMs >= Number(session.expires_at_ms)) throw status('enrollment denied', 403);
   const identity = await activeHostIdentity(getDb(), accountId, session.host_device_id);
   const bootstrap = bootstrapFromSession(session, identity);
@@ -355,6 +370,106 @@ export async function submitEnrollmentRequest(input: SubmitEnrollmentRequestInpu
     }).onConflict((oc) => oc.columns(['account_id', 'session_id']).doNothing()).executeTakeFirst();
     if (Number(inserted.numInsertedOrUpdatedRows ?? 0) === 0) throw status('enrollment already claimed', 409);
     return { sessionId, controllerDeviceId, status: 'pending' as const };
+  });
+}
+
+// ── Account-wise enrollment discovery + challenge ─────────────────────────
+
+export interface AccountEnrollmentMacView {
+  hostDeviceId: string;
+  name: string;
+  platform: string;
+  fingerprint: string;
+  online: boolean;
+  lastSeen: number;
+  leaseExpiresAt: number | null;
+}
+
+export async function listAccountEnrollmentMacs(input: { accountId: string; nowMs: number }): Promise<AccountEnrollmentMacView[]> {
+  const accountId = requireId(input.accountId, 'accountId');
+  const rows = await getDb().selectFrom('device as d')
+    .innerJoin('shadow_host_identity as h', (j) => j.onRef('h.account_id', '=', 'd.user_id').onRef('h.host_device_id', '=', 'd.id'))
+    .leftJoin('shadow_lease as l', (j) => j.onRef('l.account_id', '=', 'd.user_id').onRef('l.host_device_id', '=', 'd.id').on('l.scope_id', '=', accountScope(accountId)))
+    .select([
+      'd.id as host_device_id', 'd.name as name', 'd.platform as platform', 'd.last_seen_at as last_seen_at',
+      'h.fingerprint as fingerprint', 'l.expires_at as lease_expires_at',
+    ])
+    .where('d.user_id', '=', accountId)
+    .where('d.role', '=', 'host')
+    .where('h.status', '=', 'active')
+    .orderBy('d.last_seen_at', 'desc')
+    .execute();
+  return rows.map((r) => {
+    const leaseExpiresAt = r.lease_expires_at ? new Date(r.lease_expires_at).getTime() : null;
+    return {
+      hostDeviceId: r.host_device_id,
+      name: r.name,
+      platform: r.platform,
+      fingerprint: r.fingerprint,
+      online: leaseExpiresAt !== null && leaseExpiresAt > input.nowMs,
+      lastSeen: new Date(r.last_seen_at).getTime(),
+      leaseExpiresAt,
+    };
+  });
+}
+
+export async function createAccountEnrollmentChallenge(input: {
+  accountId: string;
+  hostDeviceId: string;
+  controllerDeviceId: string;
+  requestedCapabilities: unknown;
+  relayOrigin: string;
+  ttlMs?: number;
+  nowMs: number;
+}): Promise<{ bootstrap: EnrollmentBootstrap; requestedCapabilities: ShadowCapability[] }> {
+  const accountId = requireId(input.accountId, 'accountId');
+  const hostDeviceId = requireId(input.hostDeviceId, 'hostDeviceId');
+  requireId(input.controllerDeviceId, 'controllerDeviceId');
+  const relayOrigin = String(input.relayOrigin ?? '');
+  if (!allowedRelayOrigins().includes(relayOrigin)) throw status('relay origin not allowed', 403);
+  const requested = canonicalizeCapabilities(input.requestedCapabilities);
+  if (!requested.ok) throw status('bad requested capabilities', 400);
+  const ttl = Math.min(input.ttlMs ?? SHADOW_ENROLLMENT_SESSION_MAX_TTL_MS, SHADOW_ENROLLMENT_SESSION_MAX_TTL_MS);
+  if (ttl <= 0) throw status('bad ttl', 400);
+
+  return getDb().transaction().execute(async (trx) => {
+    await assertDeviceRole(trx, accountId, hostDeviceId, 'host', 'host not found');
+    const identity = await activeHostIdentity(trx, accountId, hostDeviceId);
+    const lease = await trx.selectFrom('shadow_lease').selectAll()
+      .where('account_id', '=', accountId)
+      .where('scope_id', '=', accountScope(accountId))
+      .where('host_device_id', '=', hostDeviceId)
+      .executeTakeFirst();
+    if (!lease || new Date(lease.expires_at).getTime() <= input.nowMs) throw status('host offline', 409);
+
+    const sessionId = 'aes_' + base64urlEncode(backend.randomBytes(18));
+    const challenge = backend.randomBytes(32);
+    const salt = backend.randomBytes(16);
+    const verifier = await makeEnrollmentSecretVerifier(backend, { sessionId, accountId, secret: challenge, salt, pepper: ENROLLMENT_VERIFIER_PEPPER });
+    const expiresAt = input.nowMs + ttl;
+    const now = new Date();
+    await trx.insertInto('shadow_enrollment_session').values({
+      account_id: accountId, session_id: sessionId, host_device_id: hostDeviceId, host_signing_key_id: identity.signing_key_id,
+      relay_origin: relayOrigin, secret_salt: verifier.salt, secret_verifier: verifier.verifier,
+      expected_fingerprint: `account:${input.controllerDeviceId}:${requested.capabilities.join(',')}`,
+      status: 'pending', created_at_ms: input.nowMs, expires_at_ms: expiresAt, created_at: now, updated_at: now,
+    }).execute();
+    return {
+      bootstrap: {
+        scheme: SHADOW_ENROLLMENT_BOOTSTRAP_SCHEME,
+        v: SHADOW_ENROLLMENT_BOOTSTRAP_VERSION,
+        sessionId,
+        accountId,
+        hostDeviceId,
+        hostSigningKeyId: identity.signing_key_id,
+        hostSigningPublicKey: identity.signing_public_key,
+        hostAgreementPublicKey: identity.agreement_public_key,
+        relayOrigin,
+        secret: base64urlEncode(challenge),
+        expiresAt,
+      },
+      requestedCapabilities: requested.capabilities,
+    };
   });
 }
 
