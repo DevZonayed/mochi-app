@@ -270,6 +270,16 @@ describe('NOTE-2 — sidecar production wiring pins the revoked-set/rotation pro
     expect(headless).toContain('if (renewed) applyLiveHostAuthority(rt)');
   });
 
+  it('keeps the host enrollment lease alive before any controller data plane exists', () => {
+    const renewFn = headless.slice(headless.indexOf('async function renewShadowHostLease'), headless.indexOf('async function onShadowControllerRevoked'));
+    const loopFn = headless.slice(headless.indexOf('function startShadowHostDataLoop'), headless.indexOf('const WEB_ROOT'));
+    expect(renewFn).not.toContain('if (!shadowHostData) return');
+    expect(renewFn).toContain('const rt = await getShadowHostFor()');
+    expect(renewFn).toContain('rt.liveAuthority()');
+    expect(loopFn.indexOf('await renewShadowHostLease()')).toBeLessThan(loopFn.indexOf('if (!svc) return'));
+    expect(loopFn).toContain('await ensureShadowHostStarted(rt)');
+  });
+
   it('a revoke tears down + rebuilds the live plane under the rotated scope key', () => {
     expect(headless).toContain('function onShadowControllerRevoked');
     expect(headless).toContain('afterRevoke: (rt) => onShadowControllerRevoked(rt)');

@@ -41,6 +41,7 @@ import {
   base64urlEncode,
   base64urlDecode,
   structuredEncode,
+  keyFingerprint,
   type ShadowCryptoBackend,
 } from '@maestro/realtime/shadowCrypto';
 import type { Fence } from '@maestro/realtime/shadowProtocol';
@@ -48,9 +49,11 @@ import type { ShadowStore } from './shadowClient';
 import { ShadowControllerService, type ControllerSessionContext } from './shadowControllerService';
 import {
   ShadowRequestClient,
+  type ShadowTransportError,
   type ShadowSession,
   type ShadowRequestSigner,
   type ShadowTransportConfig,
+  type ShadowResponse,
 } from '@maestro/realtime/shadowRequestClient';
 
 /** Must match the server's CONTROLLER_POLL_DOMAIN in shadowEnrollmentService.ts. */
@@ -174,12 +177,90 @@ function enrollmentIdempotencyKey(requestNonce: string): string {
   return `idem_${requestNonce}`;
 }
 
+const SAFE_SERVER_REASON: Record<string, string> = {
+  'Unauthorized — sign in to your Maestro account': 'sign in again',
+  'session expired': 'sign in again',
+  'no account session': 'sign in again',
+  'bad controllerDeviceId': 'invalid device identity',
+  'bad request': 'invalid enrollment request',
+  'enrollment denied': 'enrollment denied',
+  'host offline': 'host offline',
+  'host identity not registered': 'host identity not registered',
+  'relay origin not allowed': 'relay origin not allowed',
+  'enrollment already claimed': 'enrollment already claimed',
+};
+
+const SAFE_SERVER_CODE_REASON: Record<string, string> = {
+  unauthorized: 'sign in again',
+  session_expired: 'sign in again',
+  no_account_session: 'sign in again',
+  bad_controller_device_id: 'invalid device identity',
+  bad_request: 'invalid enrollment request',
+  enrollment_denied: 'enrollment denied',
+  host_offline: 'host offline',
+  host_identity_not_registered: 'host identity not registered',
+  relay_origin_not_allowed: 'relay origin not allowed',
+  enrollment_already_claimed: 'enrollment already claimed',
+};
+
+function safeEnrollmentFailure(stage: 'account macs' | 'account challenge' | 'enrollment request', res: Pick<ShadowResponse<unknown>, 'status' | 'error' | 'code'>): string {
+  const fallback = res.status === 401
+    ? 'sign in again'
+    : res.status === 400
+      ? 'invalid request'
+      : res.status === 409
+        ? 'request conflict'
+        : 'request failed';
+  const safe = (res.error ? SAFE_SERVER_REASON[res.error] : undefined)
+    ?? (res.code ? SAFE_SERVER_CODE_REASON[res.code] : undefined);
+  const detail = safe ?? fallback;
+  const title = stage === 'enrollment request' ? 'Enrollment request rejected' : stage === 'account challenge' ? 'Mac enrollment rejected' : 'Mac list rejected';
+  return `${title} (${res.status}): ${detail}`;
+}
+
+function safeTransportFailure(e: unknown): string {
+  const transport = e as Partial<ShadowTransportError> | null;
+  if (transport && typeof transport === 'object' && typeof transport.kind === 'string') {
+    if (transport.kind === 'network') return 'Network request failed';
+    if (transport.kind === 'timeout') return 'Network request timed out';
+    if (transport.status) return `Enrollment request failed (${transport.status}): ${transport.kind}`;
+    return `Enrollment request failed: ${transport.kind}`;
+  }
+  const msg = e instanceof Error ? e.message : '';
+  if (/unsupported enrollment identity/i.test(msg)) return 'Enrollment identity needs repair; reconnect this device';
+  if (/invalid device identity/i.test(msg)) return 'Enrollment request rejected (400): invalid device identity';
+  if (/network/i.test(msg)) return 'Network request failed';
+  if (/timed?\s*out|abort/i.test(msg)) return 'Network request timed out';
+  return 'Enrollment request failed';
+}
+
 function secureKeyIdentity(deviceId: string): string {
   return `maestro.shadow.identity.${deviceId}`;
 }
 /** Account (scopeId) + device scoped, so revocation wipes only this capability. */
 function secureKeyScope(scopeId: string, controllerDeviceId: string): string {
   return `maestro.shadow.scopeKey.${controllerDeviceId}.${scopeId}`;
+}
+
+const DEVICE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
+const IDENTITY_SELF_TEST_DOMAIN = 'maestro.shadow.mobile.identity.self-test.v1';
+
+interface PersistedIdentityBlob {
+  v?: number;
+  signingSeed: string;
+  signingPub: string;
+  agreementSeed: string;
+  agreementPub: string;
+}
+
+function isPersistedIdentityBlob(value: unknown): value is PersistedIdentityBlob {
+  if (!value || typeof value !== 'object') return false;
+  const r = value as Record<string, unknown>;
+  return (r.v === undefined || r.v === 1)
+    && typeof r.signingSeed === 'string'
+    && typeof r.signingPub === 'string'
+    && typeof r.agreementSeed === 'string'
+    && typeof r.agreementPub === 'string';
 }
 
 /** Controller enrollment runtime core. */
@@ -351,10 +432,10 @@ export class ShadowMobileEnrollmentRuntime {
         this.shadowSession(s),
         { method: 'GET', path: '/api/shadow/enroll/account/macs', includeDeviceId: true },
       );
-      if (!res.ok || !res.json) return { ok: false, reason: res.error ?? `http-${res.status}` };
+      if (!res.ok || !res.json) return { ok: false, reason: safeEnrollmentFailure('account macs', res) };
       return { ok: true, macs: Array.isArray(res.json.macs) ? res.json.macs : [] };
     } catch (e) {
-      return { ok: false, reason: (e as Error).message };
+      return { ok: false, reason: safeTransportFailure(e) };
     }
   }
 
@@ -376,7 +457,7 @@ export class ShadowMobileEnrollmentRuntime {
         },
       );
       if (!res.ok || !res.json?.bootstrap) {
-        const reason = res.error ?? `http-${res.status}`;
+        const reason = safeEnrollmentFailure('account challenge', res);
         this.fail(reason);
         return { ok: false, reason };
       }
@@ -393,7 +474,7 @@ export class ShadowMobileEnrollmentRuntime {
       this.transition('confirming');
       return { ok: true, hostFingerprint: decoded.value.hostSigningKeyId, expiresAt: decoded.value.expiresAt };
     } catch (e) {
-      const reason = (e as Error).message;
+      const reason = safeTransportFailure(e);
       this.fail(reason);
       return { ok: false, reason };
     }
@@ -420,14 +501,16 @@ export class ShadowMobileEnrollmentRuntime {
         { method: 'POST', path: '/api/shadow/enroll/request', includeDeviceId: false, body: { sessionId: this.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: enrollmentIdempotencyKey(request.nonce) } },
       );
       if (!res.ok) {
-        this.fail(res.error ?? 'request-denied');
-        return { ok: false, reason: res.error ?? 'request-denied' };
+        const reason = safeEnrollmentFailure('enrollment request', res);
+        this.fail(reason);
+        return { ok: false, reason };
       }
       this.transition('awaiting-host');
       return { ok: true };
     } catch (e) {
-      this.fail((e as Error).message);
-      return { ok: false, reason: (e as Error).message };
+      const reason = safeTransportFailure(e);
+      this.fail(reason);
+      return { ok: false, reason };
     }
   }
 
@@ -669,19 +752,24 @@ export class ShadowMobileEnrollmentRuntime {
   // ── Internals ─────────────────────────────────────────────────────────────
 
   private async loadOrCreateIdentity(deviceId: string): Promise<ShadowIdentity> {
+    if (!DEVICE_ID_RE.test(deviceId)) throw new Error('invalid device identity');
     if (this.identity && this.identity.deviceId === deviceId) return this.identity;
     const raw = await this.opts.secureStore.getItemAsync(secureKeyIdentity(deviceId));
     if (raw) {
-      const blob = JSON.parse(raw) as { signingSeed: string; signingPub: string; agreementSeed: string; agreementPub: string };
-      const keys: ShadowIdentityKeys = {
-        signing: { privateKey: base64urlDecode(blob.signingSeed), publicKey: base64urlDecode(blob.signingPub) },
-        agreement: { privateKey: base64urlDecode(blob.agreementSeed), publicKey: base64urlDecode(blob.agreementPub) },
-      };
-      this.identity = await materializeIdentity(this.opts.backend, deviceId, keys);
-      return this.identity;
+      const loaded = await this.loadPersistedIdentity(deviceId, raw);
+      if (loaded.ok) {
+        this.identity = loaded.identity;
+        return this.identity;
+      }
+      const activeGrant = this.grant ?? await this.opts.metaStore.loadGrant().catch(() => null);
+      if (activeGrant?.status === 'active') {
+        throw new Error('unsupported enrollment identity; reconnect this device');
+      }
+      await this.opts.secureStore.deleteItemAsync(secureKeyIdentity(deviceId));
     }
     const identity = await generateShadowIdentity(this.opts.backend, deviceId);
     await this.opts.secureStore.setItemAsync(secureKeyIdentity(deviceId), JSON.stringify({
+      v: 1,
       signingSeed: base64urlEncode(identity.keys.signing.privateKey),
       signingPub: base64urlEncode(identity.keys.signing.publicKey),
       agreementSeed: base64urlEncode(identity.keys.agreement.privateKey),
@@ -689,6 +777,39 @@ export class ShadowMobileEnrollmentRuntime {
     }));
     this.identity = identity;
     return identity;
+  }
+
+  private async loadPersistedIdentity(deviceId: string, raw: string): Promise<{ ok: true; identity: ShadowIdentity } | { ok: false; reason: string }> {
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); } catch { return { ok: false, reason: 'bad-json' }; }
+    if (!isPersistedIdentityBlob(parsed)) return { ok: false, reason: 'bad-schema' };
+    let keys: ShadowIdentityKeys;
+    try {
+      keys = {
+        signing: { privateKey: base64urlDecode(parsed.signingSeed), publicKey: base64urlDecode(parsed.signingPub) },
+        agreement: { privateKey: base64urlDecode(parsed.agreementSeed), publicKey: base64urlDecode(parsed.agreementPub) },
+      };
+    } catch {
+      return { ok: false, reason: 'bad-b64' };
+    }
+    if (keys.signing.privateKey.length !== 32 || keys.signing.publicKey.length !== 32 || keys.agreement.privateKey.length !== 32 || keys.agreement.publicKey.length !== 32) {
+      return { ok: false, reason: 'bad-length' };
+    }
+    const identity = await materializeIdentity(this.opts.backend, deviceId, keys);
+    if (!DEVICE_ID_RE.test(identity.deviceId) || !DEVICE_ID_RE.test(identity.signingKeyId) || !DEVICE_ID_RE.test(identity.agreementKeyId)) {
+      return { ok: false, reason: 'bad-id' };
+    }
+    const signingKeyId = await keyFingerprint(this.opts.backend, 'sign', keys.signing.publicKey);
+    const agreementKeyId = await keyFingerprint(this.opts.backend, 'agree', keys.agreement.publicKey);
+    if (signingKeyId !== identity.signingKeyId || agreementKeyId !== identity.agreementKeyId) return { ok: false, reason: 'key-id-mismatch' };
+    const proof = structuredEncode(IDENTITY_SELF_TEST_DOMAIN, [deviceId, keys.signing.publicKey, keys.agreement.publicKey]);
+    const sig = await this.opts.backend.sign(keys.signing.privateKey, proof);
+    if (!(await this.opts.backend.verify(keys.signing.publicKey, proof, sig))) return { ok: false, reason: 'signing-mismatch' };
+    const eph = await this.opts.backend.generateAgreementKeyPair();
+    const left = await this.opts.backend.deriveSharedSecret(keys.agreement.privateKey, eph.publicKey);
+    const right = await this.opts.backend.deriveSharedSecret(eph.privateKey, keys.agreement.publicKey);
+    if (base64urlEncode(left) !== base64urlEncode(right)) return { ok: false, reason: 'agreement-mismatch' };
+    return { ok: true, identity };
   }
 
   private client(relayOrigin: string): ShadowRequestClient {

@@ -693,15 +693,15 @@ async function handleScreenCall(method: string, params: Record<string, unknown>)
 /** Renew the host lease before it expires and atomically refresh the data service authority. */
 const SHADOW_LEASE_RENEW_BEFORE_MS = 120_000;
 async function renewShadowHostLease(): Promise<void> {
-  if (!shadowHostData) return;
   try {
     const rt = await getShadowHostFor();
     // Recover any durable pending renewal intent first (crash between the atomic
     // server commit and local persistence) — replays the same renewalId idempotently.
     const resumed = await rt.resumePendingRenewal();
     if (resumed) applyLiveHostAuthority(rt);
-    const status = shadowHostData.svc.status();
-    if (status.leaseExpiresAt - Date.now() <= SHADOW_LEASE_RENEW_BEFORE_MS) {
+    const authority = rt.liveAuthority();
+    const leaseExpiresAt = shadowHostData?.svc.status().leaseExpiresAt ?? authority?.leaseExpiresAt ?? 0;
+    if (leaseExpiresAt > 0 && leaseExpiresAt - Date.now() <= SHADOW_LEASE_RENEW_BEFORE_MS) {
       const renewed = await rt.renewLease();
       if (renewed) applyLiveHostAuthority(rt);
     }
@@ -749,9 +749,11 @@ function startShadowHostDataLoop(): void {
     if (!accountSessionToken) return;
     void (async () => {
       try {
+        const rt = await getShadowHostFor();
+        await ensureShadowHostStarted(rt);
+        await renewShadowHostLease();
         const svc = await getShadowHostDataService();
         if (!svc) return;
-        await renewShadowHostLease();
         await svc.publish();
         await svc.pollAndExecuteCommands();
       } catch (e) { warn('shadowHostData.loop', e); }

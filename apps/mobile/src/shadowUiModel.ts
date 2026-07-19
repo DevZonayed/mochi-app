@@ -154,7 +154,9 @@ export function genericEnrollmentError(reason: string | undefined, phase: Shadow
   if (phase === 'revoked') return 'Access was revoked from your Mac.';
   if (phase === 'repair') return 'This device’s saved access is no longer valid.';
   if (!reason) return null;
-  // Any residual runtime reason is intentionally NOT shown verbatim.
+  if (/^(Enrollment request rejected|Mac enrollment rejected|Mac list rejected) \((400|401|403|404|409|422|429|500|502|503|504)\): [a-z0-9 .:_-]+$/.test(reason)) return reason;
+  if (reason === 'Network request failed' || reason === 'Network request timed out') return reason;
+  // Any other residual runtime reason is intentionally NOT shown verbatim.
   return 'Something went wrong. Please try again.';
 }
 

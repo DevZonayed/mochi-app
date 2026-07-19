@@ -4,7 +4,14 @@
  */
 process.env.SHADOW_RELAY_ORIGINS = 'https://relay.test';
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { sql } from 'kysely';
 import { runMigrations, getDb, closeDb } from './db.js';
+import * as m0001 from './migrations/0001_devices.js';
+import * as m0002 from './migrations/0002_shadow_relay.js';
+import * as m0003 from './migrations/0003_shadow_enrollment.js';
+import * as m0004 from './migrations/0004_shadow_transition.js';
+import * as m0005 from './migrations/0005_shadow_lease_renewal_receipt.js';
+import * as m0006 from './migrations/0006_shadow_capabilities.js';
 import { upsertDevice } from './accountDevices.js';
 import { nodeShadowCrypto as backend } from '@maestro/realtime/shadowCryptoNode';
 import { base64urlEncode, base64urlDecode } from '@maestro/realtime/shadowCrypto';
@@ -33,6 +40,21 @@ async function resetDb(): Promise<void> {
   await runMigrations();
   for (const t of TABLES) await getDb().deleteFrom(t as never).execute();
   await getDb().deleteFrom('device').execute();
+}
+async function resetToOld0006Db(): Promise<void> {
+  for (const t of TABLES) await getDb().schema.dropTable(t).ifExists().execute();
+  for (const m of [m0001, m0002, m0003, m0004, m0005, m0006]) await m.up(getDb());
+  for (const t of TABLES) await getDb().deleteFrom(t as never).execute();
+  await getDb().deleteFrom('device').execute();
+}
+async function capabilityConstraintDefs(): Promise<Record<string, string>> {
+  const rows = await sql<{ conname: string; def: string }>`
+    SELECT conname, pg_get_constraintdef(oid) AS def
+    FROM pg_constraint
+    WHERE conname IN ('shadow_req_caps_shape', 'shadow_grant_caps_shape')
+    ORDER BY conname
+  `.execute(getDb());
+  return Object.fromEntries(rows.rows.map((row) => [row.conname, row.def]));
 }
 async function makeHost(accountId: string, hostDeviceId: string): Promise<ShadowIdentity> {
   await upsertDevice({ id: hostDeviceId, userId: accountId, role: 'host', name: 'Mac', platform: 'macos' });
@@ -93,6 +115,56 @@ describe.skipIf(!HAS_DB)('server capability persistence (§1-B, real PG)', () =>
     expect(grant!.approved_capabilities).toEqual(['account.read', 'session.message']);
     const controllers = await listEnrolledControllers({ accountId: acct });
     expect(controllers.find((c) => c.controllerDeviceId === 'ctrl_1')!.approvedCapabilities).toEqual(['account.read', 'session.message']);
+  });
+
+  it('fresh migration accepts the exact current 8-cap physical fallback request and grant', async () => {
+    const acct = 'acct-cap-fresh-8'; const host = await makeHost(acct, 'host_fresh_8');
+    const requested: ShadowCapability[] = ['account.read', 'session.message', 'job.start', 'job.cancel', 'approval.respond', 'question.answer', 'session.autopilot.set', 'screen.view'];
+    const ctx = await submitWith(acct, host, 'ctrl_fresh_8', 'es_fresh_8', requested);
+    await submitEnrollmentRequest({ accountId: acct, sessionId: ctx.sessionId, request: ctx.request as never, presentedSecret: base64urlEncode(ctx.presentedSecret), nowMs: ctx.now });
+    await approveWith(acct, host, 'ctrl_fresh_8', ctx, requested);
+    const req = await getDb().selectFrom('shadow_enrollment_request').select(['requested_capabilities']).where('session_id', '=', 'es_fresh_8').executeTakeFirst();
+    const grant = await getDb().selectFrom('shadow_enrollment_grant').select(['approved_capabilities']).where('controller_device_id', '=', 'ctrl_fresh_8').executeTakeFirst();
+    expect(req!.requested_capabilities).toEqual(requested);
+    expect(grant!.approved_capabilities).toEqual(requested);
+    expect(await capabilityConstraintDefs()).toMatchObject({
+      shadow_req_caps_shape: expect.stringContaining('jsonb_array_length(requested_capabilities) >= 1'),
+      shadow_grant_caps_shape: expect.stringContaining('jsonb_array_length(approved_capabilities) <= 8'),
+    });
+  });
+
+  it('upgrades old 0006 capability constraints from 7 to explicit 0007 limit 8 idempotently', async () => {
+    await resetToOld0006Db();
+    const oldDefs = await capabilityConstraintDefs();
+    expect(oldDefs.shadow_req_caps_shape).toContain('jsonb_array_length(requested_capabilities) <= 7');
+    expect(oldDefs.shadow_grant_caps_shape).toContain('jsonb_array_length(approved_capabilities) <= 7');
+
+    const acct = 'acct-cap-upgrade-8'; const host = await makeHost(acct, 'host_upgrade_8');
+    const requested: ShadowCapability[] = ['account.read', 'session.message', 'job.start', 'job.cancel', 'approval.respond', 'question.answer', 'session.autopilot.set', 'screen.view'];
+    const blocked = await submitWith(acct, host, 'ctrl_upgrade_8_blocked', 'es_upgrade_8_blocked', requested);
+    await expect(submitEnrollmentRequest({
+      accountId: acct, sessionId: blocked.sessionId, request: blocked.request as never,
+      presentedSecret: base64urlEncode(blocked.presentedSecret), nowMs: blocked.now,
+    })).rejects.toThrow();
+    expect(await getDb().selectFrom('shadow_enrollment_request').selectAll().where('session_id', '=', 'es_upgrade_8_blocked').execute()).toEqual([]);
+
+    await runMigrations();
+    const upgradedDefs = await capabilityConstraintDefs();
+    expect(upgradedDefs.shadow_req_caps_shape).toContain('jsonb_array_length(requested_capabilities) <= 8');
+    expect(upgradedDefs.shadow_grant_caps_shape).toContain('jsonb_array_length(approved_capabilities) <= 8');
+
+    const allowed = await submitWith(acct, host, 'ctrl_upgrade_8_allowed', 'es_upgrade_8_allowed', requested);
+    const pending = await submitEnrollmentRequest({
+      accountId: acct, sessionId: allowed.sessionId, request: allowed.request as never,
+      presentedSecret: base64urlEncode(allowed.presentedSecret), nowMs: allowed.now,
+    });
+    expect(pending.status).toBe('pending');
+    await approveWith(acct, host, 'ctrl_upgrade_8_allowed', allowed, requested);
+    const grant = await getDb().selectFrom('shadow_enrollment_grant').select(['approved_capabilities']).where('controller_device_id', '=', 'ctrl_upgrade_8_allowed').executeTakeFirst();
+    expect(grant!.approved_capabilities).toEqual(requested);
+
+    await runMigrations();
+    expect(await capabilityConstraintDefs()).toEqual(upgradedDefs);
   });
 
   it('server REJECTS a host approval beyond the verified requested set (403)', async () => {

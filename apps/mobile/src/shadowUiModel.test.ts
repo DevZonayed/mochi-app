@@ -118,6 +118,12 @@ describe('negative security contract — no secrets ever surface', () => {
     expect(genericEnrollmentError('anything', 'repair')).toBe('This device’s saved access is no longer valid.');
     expect(genericEnrollmentError(undefined, 'online')).toBeNull();
   });
+  it('renders allowlisted enrollment status/category errors but not raw diagnostics', () => {
+    expect(genericEnrollmentError('Enrollment request rejected (401): sign in again', 'unenrolled')).toBe('Enrollment request rejected (401): sign in again');
+    expect(genericEnrollmentError('Enrollment request rejected (400): invalid device identity', 'unenrolled')).toBe('Enrollment request rejected (400): invalid device identity');
+    expect(genericEnrollmentError('Network request failed', 'unenrolled')).toBe('Network request failed');
+    expect(genericEnrollmentError('Enrollment request rejected (401): Bearer sk-secret', 'unenrolled')).toBe('Something went wrong. Please try again.');
+  });
   it('the enrollment display exposes no crypto/nonce/transcript/scopeKey fields', () => {
     const st = deriveShadowUiState(inputs({ enrollment: enr('online', { scopeKeyId: 'sk_secret' }) }));
     const keys = Object.keys(st.enrollment);

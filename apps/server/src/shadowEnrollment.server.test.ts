@@ -18,6 +18,7 @@ import {
 } from '@maestro/realtime/shadowCrypto';
 import {
   generateShadowIdentity,
+  materializeIdentity,
   buildEnrollmentRequest,
   approveEnrollment as hostApproveEnrollment,
   acceptEnrollmentGrant,
@@ -448,6 +449,62 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
     const second = await submitEnrollmentRequest({ accountId, sessionId: challenge.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: `idem_${request.nonce}`, nowMs: Date.now() });
     expect(first.status).toBe('pending');
     expect(second.coalesced).toBe(true);
+  });
+
+  it('physical fallback: stale persisted controller identity rejects before persistence, fresh repaired identity persists pending', async () => {
+    const accountId = 'acct-physical-stale-identity';
+    const host = await makeRegisteredHost(accountId, 'host-physical-stale-identity');
+    const controllerDeviceId = '979459b5-controller';
+    const now = Date.now();
+
+    const staleSessionId = 'es_physical_stale_identity';
+    const staleSecret = backend.randomBytes(32);
+    const staleSalt = backend.randomBytes(16);
+    const staleVerifier = await computeEnrollmentVerifier(backend, { sessionId: staleSessionId, accountId, secret: staleSecret, salt: staleSalt });
+    const staleSession = await createEnrollmentSession({
+      accountId, hostDeviceId: host.deviceId, sessionId: staleSessionId, hostSigningKeyId: host.signingKeyId,
+      secretSalt: staleVerifier.salt, secretVerifier: staleVerifier.verifier, relayOrigin: RELAY_ORIGIN, ttlMs: 120_000, nowMs: now,
+    });
+    const staleBootstrap = bootstrapFor(host, accountId, staleSessionId, staleSecret, staleSession.expiresAt);
+    const signing = await backend.generateSigningKeyPair();
+    const otherSigning = await backend.generateSigningKeyPair();
+    const agreement = await backend.generateAgreementKeyPair();
+    const staleIdentity = await materializeIdentity(backend, controllerDeviceId, { signing: { privateKey: signing.privateKey, publicKey: otherSigning.publicKey }, agreement });
+    const staleBuilt = await buildEnrollmentRequest(backend, {
+      controller: staleIdentity,
+      bootstrap: staleBootstrap,
+      nowMs: now,
+      requestedCapabilities: ['account.read', 'session.message', 'job.start', 'job.cancel', 'approval.respond', 'question.answer', 'session.autopilot.set', 'screen.view'],
+    });
+    await expect(submitEnrollmentRequest({
+      accountId, sessionId: staleSessionId, request: staleBuilt.request,
+      presentedSecret: base64urlEncode(staleBuilt.presentedSecret), idempotencyKey: `idem_${staleBuilt.request.nonce}`, nowMs: now,
+    })).rejects.toMatchObject({ statusCode: 403 });
+    expect(await getDb().selectFrom('shadow_enrollment_request').selectAll().where('account_id', '=', accountId).where('session_id', '=', staleSessionId).execute()).toEqual([]);
+
+    const repairedSessionId = 'es_physical_repaired_identity';
+    const repairedSecret = backend.randomBytes(32);
+    const repairedSalt = backend.randomBytes(16);
+    const repairedVerifier = await computeEnrollmentVerifier(backend, { sessionId: repairedSessionId, accountId, secret: repairedSecret, salt: repairedSalt });
+    const repairedSession = await createEnrollmentSession({
+      accountId, hostDeviceId: host.deviceId, sessionId: repairedSessionId, hostSigningKeyId: host.signingKeyId,
+      secretSalt: repairedVerifier.salt, secretVerifier: repairedVerifier.verifier, relayOrigin: RELAY_ORIGIN, ttlMs: 120_000, nowMs: now,
+    });
+    const repairedBootstrap = bootstrapFor(host, accountId, repairedSessionId, repairedSecret, repairedSession.expiresAt);
+    const repairedController = await generateShadowIdentity(backend, controllerDeviceId);
+    const repairedBuilt = await buildEnrollmentRequest(backend, {
+      controller: repairedController,
+      bootstrap: repairedBootstrap,
+      nowMs: now,
+      requestedCapabilities: ['account.read', 'session.message', 'job.start', 'job.cancel', 'approval.respond', 'question.answer', 'session.autopilot.set', 'screen.view'],
+    });
+    const repaired = await submitEnrollmentRequest({
+      accountId, sessionId: repairedSessionId, request: repairedBuilt.request,
+      presentedSecret: base64urlEncode(repairedBuilt.presentedSecret), idempotencyKey: `idem_${repairedBuilt.request.nonce}`, nowMs: now,
+    });
+    expect(repaired.status).toBe('pending');
+    const pending = await getDb().selectFrom('shadow_enrollment_request').selectAll().where('account_id', '=', accountId).where('session_id', '=', repairedSessionId).executeTakeFirst();
+    expect(pending?.controller_device_id).toBe(controllerDeviceId);
   });
 
   it('account challenge rejects cross-account and offline hosts without creating a request', async () => {

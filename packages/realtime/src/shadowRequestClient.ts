@@ -159,6 +159,8 @@ export interface ShadowResponse<T = unknown> {
   readonly json: T | undefined;
   /** Server `{ error }` message when `ok` is false, else undefined. */
   readonly error?: string;
+  /** Server allowlisted `{ code }` when present. Never client/header/body data. */
+  readonly code?: string;
 }
 
 /** Bounded, non-leaking transport error. Never carries secrets/headers/body. */
@@ -338,12 +340,14 @@ export class ShadowRequestClient {
         json = undefined;
       }
     }
+    const record = json && typeof json === 'object' ? json as Record<string, unknown> : null;
     const error =
-      !ok && json && typeof json === 'object' && 'error' in (json as Record<string, unknown>)
-        ? String((json as Record<string, unknown>).error)
+      !ok && record && 'error' in record
+        ? String(record.error)
         : !ok
           ? 'request failed'
           : undefined;
-    return { status: res.status, ok, json, error };
+    const code = !ok && record && typeof record.code === 'string' ? record.code : undefined;
+    return { status: res.status, ok, json, error, code };
   }
 }
