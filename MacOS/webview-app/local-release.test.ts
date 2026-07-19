@@ -53,9 +53,9 @@ describe('semver ordering', () => {
 });
 
 describe('active-job guard (fail safe: allowlist terminal only)', () => {
-  it('allows ONLY the three terminal statuses', () => {
-    expect(TERMINAL_JOB_STATUSES).toEqual(['done', 'failed', 'cancelled']);
-    for (const s of ['done', 'failed', 'cancelled', 'DONE', ' Cancelled ']) expect(isTerminalStatus(s)).toBe(true);
+  it('allows ONLY the terminal statuses', () => {
+    expect(TERMINAL_JOB_STATUSES).toEqual(['done', 'failed', 'cancelled', 'gated']);
+    for (const s of ['done', 'failed', 'cancelled', 'gated', 'DONE', ' Cancelled ', ' GATED ']) expect(isTerminalStatus(s)).toBe(true);
   });
 
   it('treats queued / running / pending / awaiting / unknown / malformed as ACTIVE', () => {
@@ -71,11 +71,11 @@ describe('active-job guard (fail safe: allowlist terminal only)', () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'mochi-lr-'));
     try {
       const f = path.join(dir, 'maestro-store.json');
-      writeFileSync(f, JSON.stringify({ jobs: [{ status: 'done' }, { status: 'failed' }, { status: 'cancelled' }] }));
+      writeFileSync(f, JSON.stringify({ jobs: [{ status: 'done' }, { status: 'failed' }, { status: 'cancelled' }, { status: 'gated' }] }));
       const r = scanStoreForActiveJobs(f);
       expect(r.ok).toBe(true);
       expect(r.activeCount).toBe(0);
-      expect(r.totalJobs).toBe(3);
+      expect(r.totalJobs).toBe(4);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -245,6 +245,16 @@ function funcBody(src: string, name: string): string {
 
 describe('local-release.sh hardening contract', () => {
   const src = () => readFileSync(SCRIPT, 'utf8');
+
+  it('preview install gate uses offline frozen install and fails closed on an incomplete local store', () => {
+    const body = funcBody(src(), 'do_preview');
+    expect(body).toContain('pnpm install --frozen-lockfile --offline');
+    expect(body).not.toContain('pnpm install --frozen-lockfile )');
+    expect(body).not.toContain('pnpm install --frozen-lockfile\n');
+    expect(body).toMatch(/already-resolved lockfile and local pnpm store/);
+    expect(body).toMatch(/fail clearly if the local package cache is incomplete/);
+    expect(body).not.toMatch(/kill[^\n]*pnpm|pkill[^\n]*pnpm|timeout[^\n]*pnpm install/);
+  });
 
   it('smoke runs in a subshell with an EXIT trap — never a leaking RETURN trap', () => {
     const s = src();

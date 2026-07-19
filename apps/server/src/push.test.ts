@@ -169,6 +169,20 @@ describe('push: maybePush event mapping', () => {
     expect(msg.data.kind).toBe('job-failed');
   });
 
+  it('pushes job:gated as a reviewer-needs-work attention event', async () => {
+    const userId = nextUser();
+    await addPushToken(userId, 'tk');
+    const cap = captureFetch(['ok']);
+    const restore = setPushTransport(cap.fetch);
+    try {
+      expect(await maybePush(userId, 'h', 'job', { id: 'job-3', status: 'gated', projectId: 'p1', sessionId: 's1', review: { status: 'needs-work', summary: 'Fix auth', findings: [{ severity: 'high', message: 'Bug' }] } })).toBe(true);
+    } finally { restore(); }
+    const msg = (cap.calls[0].body as Array<{ title: string; body: string; data: { kind: string; projectId: string; sessionId: string; jobId: string } }>)[0];
+    expect(msg.title).toBe('Reviewer needs work');
+    expect(msg.body).toBe('Fix auth (1 finding)');
+    expect(msg.data).toEqual({ kind: 'job-gated', hostId: 'h', jobId: 'job-3', projectId: 'p1', sessionId: 's1' });
+  });
+
   it('pushes approval:pending with approvalId + projectId in nav', async () => {
     const userId = nextUser();
     await addPushToken(userId, 'tk');

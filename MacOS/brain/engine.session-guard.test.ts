@@ -16,9 +16,9 @@ import { LocalEngine } from './engine.js';
 
 type EngineInternals = {
   running: Map<string, { ac: AbortController }>;
-  sessionRuns: { isParked(id: string): boolean };
-  drainSessionRuns(sessionId?: string | null): void;
   available(engine: string): boolean;
+  __setDispatchForTest(fn: (jobId: string) => Promise<ReturnType<Store['getJob']> extends infer J ? NonNullable<J> : never>): void;
+  __runWithSessionLeaseForTest(sessionId: string | undefined, jobId: string, execute: (ac: AbortController, handle: { ac: AbortController }) => Promise<ReturnType<Store['getJob']> extends infer J ? NonNullable<J> : never>): Promise<ReturnType<Store['getJob']> extends infer J ? NonNullable<J> : never>;
 };
 
 /* Force the "no engine available" fast-fail path so a non-parked run() never
@@ -43,23 +43,38 @@ describe('engine.run — one active turn per session', () => {
     const A = store.createJob('proj-1', 'real agent task', 'A', 'balanced', sessionId);
     const B = store.createJob('proj-1', 'Monitor ONLY job A…', 'B (monitor)', 'balanced', sessionId);
 
-    // Simulate A being live (in the engine's running map, as a real run would).
-    internals.running.set(A.id, { ac: new AbortController() });
-    store.updateJob(A.id, { status: 'running', phase: 'Working' });
+    let finishA!: () => void;
+    const finishAPromise = new Promise<void>((resolve) => { finishA = resolve; });
+    internals.__setDispatchForTest((jobId: string) =>
+      internals.__runWithSessionLeaseForTest(sessionId, jobId, async () =>
+        store.updateJob(jobId, { status: 'failed', phase: 'Failed', error: 'no engine available' })
+      )
+    );
+    const ownerPromise = internals.__runWithSessionLeaseForTest(sessionId, A.id, async () => {
+      store.updateJob(A.id, { status: 'running', phase: 'Working' });
+      await finishAPromise;
+      return store.updateJob(A.id, { status: 'done', phase: 'Done' });
+    });
+    await Promise.resolve();
+    expect(store.sessionRunLease(sessionId)).toMatchObject({ owner: A.id, waiters: [] });
 
     // A second run() for the SAME session must PARK B, not start it.
-    const parked = await engine.run(B.id, { effort: 'deep' });
-    expect(parked.status).toBe('pending');
-    expect(parked.phase).toBe('Queued');
-    expect(internals.sessionRuns.isParked(B.id)).toBe(true);
+    const parkedPromise = engine.run(B.id, {});
+    await Promise.resolve();
+    const parked = store.getJob(B.id);
+    expect(parked?.status).toBe('pending');
+    expect(parked?.phase).toBe('Queued');
+    expect(store.sessionRunLease(sessionId)).toMatchObject({ owner: A.id, waiters: [B.id] });
     expect(internals.running.has(B.id)).toBe(false); // never became a concurrent live turn
 
-    // A finishes → draining releases B (it then attempts to run; with no engine
-    // available in the test env it fails fast — the point is it LEFT the queue
-    // and is no longer parked/pending-queued).
-    internals.running.delete(A.id);
-    internals.drainSessionRuns(sessionId);
-    expect(internals.sessionRuns.isParked(B.id)).toBe(false);
+    // A finishes -> the real lease wrapper releases the durable lease, promotes B,
+    // and the test dispatch runs it once. The point is it LEFT the queue and is no
+    // longer pending-queued.
+    finishA();
+    await ownerPromise;
+    const terminal = await parkedPromise;
+    expect(terminal.status).toBe('failed');
+    expect(store.sessionRunLease(sessionId)).toBeUndefined();
     expect(store.getJob(B.id)?.status).not.toBe('pending');
   });
 
@@ -69,7 +84,7 @@ describe('engine.run — one active turn per session', () => {
     const internals = engine as unknown as EngineInternals;
     const job = store.createJob('proj-1', 'hello', 'solo', 'balanced', 'sess-solo');
     await engine.run(job.id, {}); // no other live turn → not parked (proceeds; fails fast on no engine)
-    expect(internals.sessionRuns.isParked(job.id)).toBe(false);
+    expect(store.sessionRunLease('sess-solo')).toBeUndefined();
     expect(store.getJob(job.id)?.status).not.toBe('pending');
   });
 
@@ -80,13 +95,16 @@ describe('engine.run — one active turn per session', () => {
     const sessionId = 'sess-2';
     const A = store.createJob('proj-1', 'live', 'A', 'balanced', sessionId);
     const B = store.createJob('proj-1', 'monitor', 'B', 'balanced', sessionId);
+    expect(store.acquireSessionRunDetailed(sessionId, A.id).outcome).toBe('acquired');
     internals.running.set(A.id, { ac: new AbortController() });
     store.updateJob(A.id, { status: 'running' });
-    await engine.run(B.id, {});
-    expect(internals.sessionRuns.isParked(B.id)).toBe(true);
+    const parkedPromise = engine.run(B.id, {});
+    await Promise.resolve();
+    expect(store.sessionRunLease(sessionId)).toMatchObject({ owner: A.id, waiters: [B.id] });
 
     const cancelled = engine.cancel(B.id);
     expect(cancelled?.status).toBe('cancelled');
-    expect(internals.sessionRuns.isParked(B.id)).toBe(false);
+    await expect(parkedPromise).resolves.toMatchObject({ status: 'cancelled' });
+    expect(store.sessionRunLease(sessionId)).toMatchObject({ owner: A.id, waiters: [] });
   });
 });

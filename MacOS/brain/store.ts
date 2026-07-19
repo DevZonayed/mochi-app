@@ -10,7 +10,7 @@
 import { app } from 'electron';
 import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync, lstatSync, openSync, writeSync, closeSync, unlinkSync, chmodSync, fchmodSync, readdirSync, constants as fsConstants } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import type { BrowserSettings } from './browser/types.js';
 import type { DesignMode, DesignPhase, DesignFlow, DesignBrief } from './design-workflow.js';
 import { quietDeadline } from './whatsapp-quiet.js';
@@ -18,9 +18,47 @@ import { quietDeadline } from './whatsapp-quiet.js';
 import { preferredMcpPort } from './mcp/external-mcp.js';
 import { WaStore, type WaChatMeta, type WaStoredMessage, type WaMessageInput, type WaChatKind } from './wa-store.js';
 import type { RemoteDevice } from './relay.js';
+import {
+  acquire as leaseAcquire, release as leaseRelease, dequeue as leaseDequeue,
+  heartbeat as leaseHeartbeat, recover as leaseRecover, isEmpty as leaseIsEmpty,
+  type SessionLeaseRecord, type AcquireOutcome,
+} from './session-run-queue.js';
+import {
+  REVIEW_GATE_SCHEMA_VERSION,
+  type JobReviewProjection,
+  type ParsedReviewResult,
+  type ReviewGate,
+  type ReviewGateCheck,
+  type ReviewFinding,
+  type ReviewGateOverride,
+  type ReviewGateScope,
+  type ReviewGateStatus,
+  isFailClosedArtifactIdentity,
+  sanitizeReviewDiagnostic,
+} from './review-gate.js';
+import {
+  assertRunIntentCompatible,
+  intentMirrors,
+  legacyIntentFromJob,
+  legacyIntentEvidenceFromSchedule,
+  mergeRunIntent,
+  normalizeRunIntent,
+  type PersistedRunIntent,
+  type RunIntent,
+  type RunIntentInput,
+} from './run-intent.js';
+export type { SessionLeaseRecord } from './session-run-queue.js';
 
 export const id = (): string => randomUUID();
 export const now = (): number => Date.now();
+/** A STABLE session id derived from a caller key — same key → same id, distinct keys →
+    distinct ids (sha256, negligible collision). Used to deterministically bind a lazily
+    created chat session to an idempotency key so a crash-retry never spawns a second one.
+    Formatted as a UUID-shaped string so it reads like any other session id downstream. */
+export const sessionIdForKey = (key: string): string => {
+  const h = createHash('sha256').update(`session:${key}`).digest('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+};
 
 /** Human-enterable pairing token, e.g. "M7K2-Q9XF-4DTB" (no 0/O/1/I). */
 export function newPairingToken(): string {
@@ -35,7 +73,7 @@ export function newMcpToken(): string { return randomBytes(24).toString('hex'); 
 
 /* ── Domain types ────────────────────────────────────────────────────── */
 
-export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
+export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled' | 'gated';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
@@ -109,6 +147,8 @@ export interface TranscriptItem {
   toolStatus?: 'running' | 'done' | 'error';
   /** review only: the reviewer's verdict. */
   verdict?: 'approved' | 'needs-work';
+  /** review only: bounded structured findings projected outside collapsed work. */
+  findings?: ReviewFinding[];
   /** review only: the primary went on to fix the flagged findings → show as resolved. */
   resolved?: boolean;
   durMs?: number;
@@ -178,6 +218,8 @@ export interface Job {
   id: string; projectId: string; title: string; status: JobStatus; phase: string; progress: number;
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
   engine?: EngineId; model?: string;
+  /** Canonical immutable run-mode snapshot. Legacy effort/engine/model/goal are mirrors. */
+  intent?: RunIntent;
   /** Goal mode: this turn ran autonomously toward the goal (SP2). */
   goal?: boolean;
   /** Chat turn: set when this job is one turn of a project chat session. */
@@ -192,6 +234,8 @@ export interface Job {
   agentContext?: string;
   /** Structured run log (assistant text blocks, tool calls, result) — capped. */
   transcript?: TranscriptItem[];
+  /** Relay-safe terminal reviewer projection. No raw diagnostics or secrets. */
+  review?: JobReviewProjection;
   /** Epoch ms when the SDK iterator will be woken back up by a session-scoped
       ScheduleWakeup. While set and in the future, the model is DORMANT — the
       Claude Agent SDK's `query()` stream is held open across the wakeup (NOT
@@ -225,6 +269,8 @@ export interface Job {
   blockedByLimit?: boolean;
   createdAt: number; updatedAt: number;
 }
+
+export type { ParsedReviewResult, JobReviewProjection, ReviewGate, ReviewGateCheck, ReviewGateOverride, ReviewGateScope, ReviewGateStatus };
 
 interface JobPageCursor {
   createdAt: number;
@@ -339,7 +385,7 @@ export interface Tombstone {
 }
 export interface Schedule {
   id: string; projectId: string | null; title: string; time: string; cadence: string; enabled: boolean;
-  nextRun: number | null; lastRun?: number | null; createdAt: number;
+  nextRun: number | null; lastRun?: number | null; createdAt: number; updatedAt?: number;
   /** One-shot "wait & check": fire once at this absolute time, into a chat. */
   fireAt?: number; sessionId?: string; prompt?: string;
   /** A user-scheduled chat message (vs. a recurring schedule or wait-&-check):
@@ -356,9 +402,13 @@ export interface Schedule {
       Maestro was restarted", overload, 429, 5xx).
       'whatsapp-analyze' is the per-chat quiet timer: it fires once a tracked
       WhatsApp chat has sat silent for 15 min, summarizing it back to the operator. */
-  kind?: 'message' | 'auto-continue' | 'auto-answer' | 'keep-going' | 'retry-run' | 'whatsapp-analyze'; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean;
+  kind?: 'message' | 'auto-continue' | 'auto-answer' | 'keep-going' | 'retry-run' | 'whatsapp-analyze'; effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; browser?: boolean; plan?: boolean; goal?: boolean; intent?: PersistedRunIntent;
   /** whatsapp-analyze only: the WhatsApp chat (JID) whose silence this timer watches. */
   chatId?: string;
+  /** auto-answer only: exact AskUserQuestion payload captured from the source
+      turn before emitting actionable question state. Hidden/unloaded turns use
+      this to render the real prompt/options without attaching to another turn. */
+  questionAsk?: string;
   /** auto-answer only: when it was armed (base for the escalating-extend math),
       how many times the user extended, and whether it's been paused past the cap
       (paused = no auto-answer; the question waits indefinitely for a manual reply). */
@@ -520,7 +570,7 @@ export interface Brief {
 export interface ResearchRun { id: string; topic: string; jobId: string; status: 'running' | 'done' | 'failed'; briefCount: number; at: number }
 
 export type AppEventKind =
-  | 'job-done' | 'job-failed' | 'job-cancelled'
+  | 'job-done' | 'job-failed' | 'job-gated' | 'job-cancelled'
   | 'approval-created' | 'approval-resolved'
   | 'schedule-fired' | 'clone-done' | 'clone-failed'
   | 'repo-created' | 'repo-create-failed'
@@ -578,6 +628,7 @@ export interface TelegramState { offset: number; botUsername: string | null; con
     is the persisted view of it. `sendApproved` is the one-time confirmation gate:
     no summary is ever sent until the operator approves the first send. */
 export interface WhatsAppState {
+  status?: 'unlinked' | 'connecting' | 'retrying' | 'offline' | 'connected' | 'paused' | 'needs-attention';
   connected: boolean;
   /** The linked number's own JID (where summaries are sent — "message yourself"). */
   jid: string | null;
@@ -597,8 +648,12 @@ export interface WhatsAppState {
       sent. Distinct from `jid` (the linked account — often a separate "app" number).
       When unset, notifications fall back to the linked account's own "note to self". */
   notifyJid?: string | null;
+  connectedAt?: number | null;
+  lastDisconnectCode?: number | null;
+  nextRetryAt?: number | null;
+  retryAttempt?: number;
 }
-export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [], agentSendToOthers: false, notifyJid: null };
+export const DEFAULT_WHATSAPP_STATE: WhatsAppState = { status: 'unlinked', connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [], agentSendToOthers: false, notifyJid: null, connectedAt: null, lastDisconnectCode: null, nextRetryAt: null, retryAttempt: 0 };
 
 /** One captured WhatsApp message (normalized, text-only — media is noted as a kind). */
 export interface WaMessage { id: string; chatId: string; fromMe: boolean; senderName: string; text: string; ts: number }
@@ -642,7 +697,7 @@ export interface ContextWaSend { projectId: string; sessionId: string; chatId: s
 
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
-  whatsapp: { connected: boolean; jid: string | null; name: string | null; tracked: number; sendApproved: boolean };
+  whatsapp: { connected: boolean; status?: WhatsAppState['status']; jid: string | null; name: string | null; tracked: number; sendApproved: boolean };
 }
 
 /** A built-in notification chime (synthesised client-side; 'none' = silent). */
@@ -764,6 +819,9 @@ interface StoreData {
   contextDispatches?: ContextDispatch[];
   /** Context projects: recent agent→operator WhatsApp sends (reply-routing ring). */
   contextWaSends?: ContextWaSend[];
+  /** Persisted fail-closed reviewer gate rows. Mac-local authority for terminal
+      success, auto/manual push, and PR creation when a session reviewer is enabled. */
+  reviewGates?: ReviewGate[];
   skills: Skill[];
   templates: Template[];
   assets: Asset[];
@@ -838,6 +896,7 @@ export interface CustomMcpServer {
   /** Registry skill ids attached to this server — installed on-demand and
       surfaced to the agent whenever this server is active in a run. */
   skillIds: string[];
+  lastSkillError?: string | null;
   createdAt: number;
 }
 
@@ -855,6 +914,37 @@ export interface InstalledSkill {
   disabledReason?: string | null;
   mirrorRepo?: string | null;
   auditStatus?: string | null;
+  integrity?: {
+    algorithm: 'sha256';
+    digest: string;
+    status: 'verified' | 'legacy-unverified' | 'unverified-local' | 'failed' | 'quarantined';
+    checkedAt: number;
+    failure?: string | null;
+  };
+  provenance?: {
+    kind: 'registry' | 'bundled-native' | 'project-local' | 'local-operator' | 'legacy-registry';
+    source?: string | null;
+    version?: string | null;
+    commit?: string | null;
+  };
+  auditEvidence?: {
+    identity?: string | null;
+    status?: string | null;
+    auditedDigest?: string | null;
+    checkedAt?: string | null;
+  };
+  policy?: {
+    decision: 'allow' | 'block' | 'local-trust' | 'legacy-block';
+    risk?: string | null;
+    reason?: string | null;
+    checkedAt: number;
+  };
+  trustLabel?: {
+    provenance: string;
+    trust: string;
+    digest?: string;
+    version?: string;
+  };
   /** Who installed it: 'operator' from the UI, 'agent' when the model self-installed
       mid-run, 'native' for the always-on skills bundled with the app. */
   addedBy?: 'operator' | 'agent' | 'native';
@@ -878,6 +968,37 @@ const CATALOG_VERSION = 2;
     last sync predates the oldest tombstone should treat the next pull as a
     full re-sync (drop local store, GET /api/sync?since=0). */
 const MAX_TOMBSTONES = 1000;
+/** Trigger-idempotency ledger retention: keep the most recent IDEMPOTENCY_KEEP
+    key→job mappings; prune when the array grows past IDEMPOTENCY_MAX. Generous —
+    a fire/retry/message dupe arrives within seconds/minutes, never thousands of
+    jobs later. */
+const IDEMPOTENCY_MAX = 5000;
+const IDEMPOTENCY_KEEP = 3000;
+/** The createJob arguments a trigger reserves BEFORE the job row exists, so a crash
+    between the reservation and the row can materialize the SAME job (same id) on
+    retry rather than allocating a second one. Persisted inside the ledger entry. */
+export interface IdempotentJobSpec {
+  projectId: string;
+  input: string;
+  title?: string;
+  effort?: Effort;
+  sessionId?: string;
+  inputImages?: ChatImage[];
+  inputFiles?: ChatFile[];
+  agentContext?: string;
+  intent?: RunIntentInput;
+}
+/** One trigger-idempotency ledger row. `jobId` is minted at RESERVATION time (before
+    the job row) and is deterministic across retries; `materialized` flips true once the
+    job row is actually created, which distinguishes a crash-before-create (false → retry
+    materializes the reserved id) from an explicit post-run deletion (true → stale, self-heal). */
+interface IdempotencyEntry {
+  key: string; jobId: string; at: number; spec?: IdempotentJobSpec; materialized?: boolean;
+  /** Question-answer claim only: the answer digest (conflict detection for same key, different
+      answer) and the exact auto-answer schedule to atomically disable when materializing. */
+  answerDigest?: string;
+  scheduleToDisable?: string;
+}
 /** Job retention is two-tiered.
     - `JOB_TRANSCRIPT_RETAIN` jobs keep their full transcript in memory (and on
       disk). Beyond that, finished jobs have their `transcript` field stripped
@@ -912,6 +1033,7 @@ const ASSET_TINTS = ['#5b8cff', '#9b6bff', '#41c8d4', '#ff9f6b', '#6bd49a', '#ff
 /** id-keyed row collections that merge by id + newest-write-wins. */
 const MERGE_COLLECTIONS = [
   'projects', 'jobs', 'sessions', 'approvals', 'schedules', 'browserWatches',
+  'reviewGates',
   'skills', 'templates', 'assets', 'publishDrafts', 'publishLedger', 'briefs',
   'researchRuns', 'events', 'chatBindings', 'pendingChats', 'commEvents',
   'feedback', 'mcpServers',
@@ -948,9 +1070,20 @@ type Row = { id?: unknown };
    lost). A short-lived advisory lockfile serializes the whole critical section
    across processes so the merge can never be raced. If the lock can't be taken
    in time we proceed anyway (best-effort — never wedge the app on a save). */
-const LOCK_STALE_MS = 10_000;   // a lock older than this is from a crashed writer → steal it
+const LOCK_STALE_MS = 10_000;   // a DEAD owner's lock older than this may be stolen (live owners are never stolen)
 const LOCK_TIMEOUT_MS = 3_000;  // give up waiting and save lockless after this
 const LOCK_SPIN_MS = 12;        // backoff between acquire attempts
+
+/** MED-3: a held, fenced file lock — the per-acquisition token gates release/steal so a
+    stealer can never unlink a successor's lock and an owner can never unlink a stealer's. */
+interface FileLockHandle { fd: number; token: string; lock: string }
+
+/** Liveness of a lock-owner pid: `EPERM` means alive-but-not-ours, `ESRCH` means dead. */
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
+}
 
 /** Owner-only (rw-------) permissions for the on-disk store: it carries secrets
     (mcpToken, accessToken, extensionToken, provider-key metadata) and must never
@@ -1055,15 +1188,45 @@ export class Store {
   /** Full WhatsApp chat + message store (every chat, JSONL-backed). The
       monolithic `waChats` field is legacy — migrated into this on first load. */
   readonly wa: WaStore;
+  /** DEDICATED file for the SessionRunQueue lease map, SEPARATE from
+      maestro-store.json so the store's best-effort (occasionally-lockless) save can
+      NEVER clobber a lease: this file is written ONLY under its own strict lock via
+      queueTx() (which fails closed on lock timeout). */
+  private queueFile!: string;
+  private runQueue: Record<string, SessionLeaseRecord> = {};
+  private readonly sessionRunOwnerToken = `${process.pid}:${randomUUID()}`;
+  /** DEDICATED file + in-memory mirror for the trigger-idempotency ledger, SEPARATE
+      from maestro-store.json so an atomic claim can hold ITS OWN lock while
+      createJob()/save() take the (different) main-store lock — no self-deadlock —
+      and so the store's best-effort save can never clobber the ledger. */
+  private idempotencyFile!: string;
+  private idempotency: IdempotencyEntry[] = [];
 
   constructor() {
     const dir = app.getPath('userData');
     mkdirSync(dir, { recursive: true });
     this.file = join(dir, 'maestro-store.json');
+    this.queueFile = join(dir, 'maestro-session-run-queue.json');
+    this.idempotencyFile = join(dir, 'maestro-idempotency.json');
     this.wa = new WaStore(join(dir, 'whatsapp', 'primary', 'store'));
     this.load();
+    this.loadRunQueue();
+    this.loadIdempotency();
     this.migrateInlineWaChats();
     this.seedCatalog();
+  }
+
+  /** Read the persisted SessionRunQueue file into memory (best-effort). */
+  private loadRunQueue(): void {
+    try { hardenStoreFile(this.queueFile); } catch { /* may not exist yet */ }
+    try { this.runQueue = JSON.parse(readFileSync(this.queueFile, 'utf8')) as Record<string, SessionLeaseRecord>; }
+    catch { this.runQueue = {}; }
+    if (!this.runQueue || typeof this.runQueue !== 'object') this.runQueue = {};
+  }
+  private loadIdempotency(): void {
+    try { hardenStoreFile(this.idempotencyFile); } catch { /* may not exist */ }
+    try { const arr = JSON.parse(readFileSync(this.idempotencyFile, 'utf8')); this.idempotency = Array.isArray(arr) ? arr : []; }
+    catch { this.idempotency = []; }
   }
 
   /** One-time lift of any legacy inline `waChats` (captured by older builds into
@@ -1097,6 +1260,19 @@ export class Store {
       if (!this.data.routing) { this.data.routing = { ...DEFAULT_ROUTING }; dirty = true; }
       if (!this.data.designComments) { this.data.designComments = {}; dirty = true; }
       if (!this.data.installedSkills) { this.data.installedSkills = {}; dirty = true; }
+      for (const list of Object.values(this.data.installedSkills ?? {})) {
+        for (const s of list) {
+          if (s.addedBy === 'native') {
+            if (!s.provenance) { s.provenance = { kind: 'bundled-native', source: s.source ?? null, version: s.version ?? 'bundled' }; dirty = true; }
+            if (!s.integrity && s.sha256) { s.integrity = { algorithm: 'sha256', digest: s.sha256, status: 'verified', checkedAt: 0 }; dirty = true; }
+          } else if (!s.integrity) {
+            s.integrity = { algorithm: 'sha256', digest: s.sha256 ?? '', status: s.source ? 'legacy-unverified' : 'unverified-local', checkedAt: 0, failure: s.source ? 'legacy registry record lacks audit-bound digest evidence' : 'local project skill has no registry audit' };
+            s.provenance = { kind: s.source ? 'legacy-registry' : 'project-local', source: s.source ?? null, version: s.version ?? null };
+            if (s.source) { s.enabled = false; s.disabledReason = s.disabledReason ?? 'legacy registry skill requires integrity re-install'; }
+            dirty = true;
+          }
+        }
+      }
       if (!this.data.mcpServers) { this.data.mcpServers = []; dirty = true; }
       // SP1: seed model-level roles on older stores from the engine-level fields.
       if (this.data.routing && !this.data.routing.roles) {
@@ -1118,17 +1294,51 @@ export class Store {
       if (!this.data.researchRuns) { this.data.researchRuns = []; dirty = true; }
       if (!this.data.events) { this.data.events = []; dirty = true; }
       if (!this.data.browserWatches) { this.data.browserWatches = []; dirty = true; }
+      if (!this.data.reviewGates) { this.data.reviewGates = []; dirty = true; }
+      for (const g of this.data.reviewGates) {
+        if (g.status === 'pending') {
+          g.status = 'failed-closed';
+          g.reason = 'Reviewer gate was pending when Maestro restarted.';
+          g.updatedAt = now();
+          g.completedAt = g.updatedAt;
+          dirty = true;
+        }
+      }
       if (!this.data.tombstones) { this.data.tombstones = []; dirty = true; }
       // Backfill `updatedAt` on entities written by an older build (delta-sync
       // protocol needs it on every row, but it's been added incrementally).
       for (const p of this.data.projects) if (p.updatedAt === undefined) { p.updatedAt = p.createdAt; dirty = true; }
       for (const a of this.data.approvals) if (a.updatedAt === undefined) { a.updatedAt = a.resolvedAt ?? a.createdAt; dirty = true; }
+      for (const j of this.data.jobs) {
+        if (!j.intent || j.intent.schemaVersion !== 1) {
+          j.intent = legacyIntentFromJob(j);
+          Object.assign(j, intentMirrors(j.intent));
+          dirty = true;
+        }
+      }
+      for (const s of this.data.schedules) {
+        if (s.updatedAt === undefined) { s.updatedAt = s.createdAt; dirty = true; }
+        if (!s.intent || s.intent.schemaVersion !== 1) {
+          const evidence = legacyIntentEvidenceFromSchedule(s);
+          if (evidence) s.intent = evidence;
+          dirty = true;
+        }
+      }
       if (!this.data.chatBindings) { this.data.chatBindings = []; dirty = true; }
       if (!this.data.pendingChats) { this.data.pendingChats = []; dirty = true; }
       if (!this.data.commEvents) { this.data.commEvents = []; dirty = true; }
       if (!this.data.feedback) { this.data.feedback = []; dirty = true; }
       if (!this.data.telegram) { this.data.telegram = { offset: 0, botUsername: null, connectedAt: null }; dirty = true; }
       if (!this.data.whatsapp) { this.data.whatsapp = { ...DEFAULT_WHATSAPP_STATE, pendingSummaries: [] }; dirty = true; }
+      if (this.data.whatsapp) {
+        const wa = this.data.whatsapp as WhatsAppState;
+        if (!wa.status) { wa.status = wa.linkedAt != null ? 'offline' : 'unlinked'; dirty = true; }
+        if (wa.connected) { wa.connected = false; wa.status = wa.linkedAt != null && wa.status !== 'paused' ? 'offline' : wa.status; dirty = true; }
+        if (wa.connectedAt === undefined) { wa.connectedAt = null; dirty = true; }
+        if (wa.lastDisconnectCode === undefined) { wa.lastDisconnectCode = null; dirty = true; }
+        if (wa.nextRetryAt === undefined) { wa.nextRetryAt = null; dirty = true; }
+        if (wa.retryAttempt === undefined) { wa.retryAttempt = 0; dirty = true; }
+      }
       if (this.data.whatsapp && !this.data.whatsapp.pendingSummaries) {
         const old = (this.data.whatsapp as { pendingSummary?: { text: string; chatName: string; at: number } | null }).pendingSummary;
         this.data.whatsapp.pendingSummaries = old ? [{ id: id(), text: old.text, chatName: old.chatName, at: old.at }] : [];
@@ -1172,7 +1382,7 @@ export class Store {
         deckId: id(), deckSecret: id(), accessToken: newPairingToken(), extensionToken: newPairingToken(), mcpToken: newMcpToken(),
         routing: { ...DEFAULT_ROUTING }, settings: { ...DEFAULT_SETTINGS }, catalogVersion: CATALOG_VERSION,
         workspace: null,
-        projects: [], jobs: [], sessions: [], approvals: [], schedules: [], browserWatches: [], skills: [], templates: [],
+        projects: [], jobs: [], sessions: [], approvals: [], schedules: [], browserWatches: [], reviewGates: [], skills: [], templates: [],
         assets: [], publishDrafts: [], publishLedger: [], briefs: [], researchRuns: [], events: [],
         tombstones: [],
         chatBindings: [], pendingChats: [], commEvents: [], feedback: [],
@@ -1187,50 +1397,305 @@ export class Store {
   private save(): void {
     if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = null; }
     // Serialize the read-merge-write across processes so a concurrent writer's
-    // rename can't land between our absorb and our own rename (which is how a
-    // just-created row was clobbered). Best-effort: null fd = we timed out and
-    // save lockless rather than wedge the app.
+    // rename can't land between our absorb and our own rename.
     const fd = this.acquireLock();
+    if (fd === null) {
+      // Could NOT take the exclusive write lock in time. Writing WITHOUT it would
+      // last-writer-wins clobber a concurrent writer's rows (freshly-created jobs,
+      // the trigger-idempotency ledger, …). FAIL CLOSED: never write lockless —
+      // defer and retry shortly (the lock is only held for the brief write window,
+      // so contention clears quickly). In-memory state is intact until it lands.
+      this.saveSoon(75);
+      return;
+    }
     try {
       // Another process wrote since we last touched the file → absorb its rows
       // first so our write can't erase them (lossless multi-writer convergence).
       if (this.diskStamp !== null && this.currentStamp() !== this.diskStamp) {
         this.absorbForeignWrites();
       }
-      // Atomic write: serialize to a UNIQUE temp sibling created EXCLUSIVELY at
-      // 0600, then rename over the target. The exclusive create (O_EXCL via 'wx')
-      // is the security-critical part:
-      //  - it never reuses/overwrites a pre-existing `${file}.tmp-*` (an old build
-      //    left predictable `${file}.tmp-${pid}` files that `writeFileSync('w')`
-      //    would reuse WITHOUT re-applying the mode → secrets at 0644), and
-      //  - it refuses to write THROUGH an attacker-staged symlink at that path.
-      // The random suffix makes the path unpredictable; the rename is atomic on
-      // the same filesystem, so a crash mid-write can never leave a torn store.
-      const payload = JSON.stringify(this.data, null, 2);
-      let tmp = '';
-      let wfd: number | null = null;
-      try {
-        for (let attempt = 0; attempt < 8 && wfd === null; attempt++) {
-          const candidate = `${this.file}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
-          try { wfd = openSync(candidate, 'wx', STORE_FILE_MODE); tmp = candidate; }
-          catch (e) { if ((e as NodeJS.ErrnoException).code === 'EEXIST') continue; throw e; }
-        }
-        if (wfd === null) throw new Error('could not create a unique store temp file');
-        // writeFileSync on the already-exclusive fd writes the WHOLE payload
-        // (it loops internally), so a partial write can't precede the rename.
-        // It does not close the fd — we close it explicitly below.
-        writeFileSync(wfd, payload);
-        closeSync(wfd); wfd = null;
-        renameSync(tmp, this.file);
-        tmp = ''; // renamed away — nothing to clean up
-        hardenStoreFile(this.file); // belt-and-suspenders on the landed file
-        this.diskStamp = this.currentStamp();
-      } finally {
-        if (wfd !== null) { try { closeSync(wfd); } catch { /* already closed */ } }
-        if (tmp) { try { unlinkSync(tmp); } catch { /* best effort cleanup */ } }
+      this.writeLocked();
+      // Narrow post-durable-write notification (Phase 3A2b1 Section B). Fires a
+      // COARSE "changed" signal AFTER the durable rename — never the raw mutation
+      // args. A listener throw is swallowed so it can never roll back / corrupt the
+      // product Store; the projection listener logs its own redacted diagnostic.
+      this.notifyDurableChange();
+    } catch { this.saveSoon(75); /* disk hiccup — retry */ }
+    finally { this.releaseLock(fd); }
+  }
+
+  /**
+   * MED-3: force the in-memory state to disk SYNCHRONOUSLY, THROWING (retryable) if the
+   * write cannot land — never deferring to `saveSoon`. Used by the idempotent-claim
+   * materialization strand so the answer-Job + disabled schedule are durable on disk
+   * BEFORE the ledger flips `materialized:true`; on a lock-timeout the caller aborts with
+   * the ledger left `materialized:false` (resumable), so a crash never strands a
+   * command-`applied` receipt against an absent Job.
+   */
+  private saveDurableOrThrow(): void {
+    if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = null; }
+    const fd = this.acquireLock();
+    if (fd === null) throw Object.assign(new Error('store-write-lock-timeout — could not persist the claim durably'), { code: 'store-write-lock-timeout', statusCode: 503, retryable: true });
+    try {
+      if (this.diskStamp !== null && this.currentStamp() !== this.diskStamp) this.absorbForeignWrites();
+      this.writeLocked();
+      this.notifyDurableChange();
+    } finally { this.releaseLock(fd); }
+  }
+
+  /** At most one narrow durable-change listener (the shadow projection). */
+  private durableChangeListener: (() => void) | null = null;
+  /**
+   * Register (or clear with `null`) a coarse post-durable-write listener. The
+   * listener receives NO arguments (no secret mutation payload) and MUST NOT throw
+   * meaningfully — any throw is swallowed here so product persistence is never
+   * affected by a projection failure.
+   */
+  onDurableChange(fn: (() => void) | null): void { this.durableChangeListener = fn; }
+  private notifyDurableChange(): void {
+    const fn = this.durableChangeListener;
+    if (!fn) return;
+    try { fn(); } catch { /* listener failure never affects the product Store */ }
+  }
+
+  /** Atomic write of the CURRENT in-memory `this.data` to disk. MUST be called
+      with the write lock held (by save() or a lease transaction). Serializes to a
+      UNIQUE temp sibling created EXCLUSIVELY at 0600, then renames over the target:
+       - the exclusive create (O_EXCL via 'wx') never reuses/overwrites a pre-existing
+         `${file}.tmp-*` (an old build left predictable ones that a plain write would
+         reuse WITHOUT re-applying the mode → secrets at 0644), and refuses to write
+         THROUGH an attacker-staged symlink at that path;
+       - the random suffix makes the path unpredictable; the rename is atomic on the
+         same filesystem, so a crash mid-write can never leave a torn store. */
+  private writeLocked(): void {
+    const payload = JSON.stringify(this.data, null, 2);
+    let tmp = '';
+    let wfd: number | null = null;
+    try {
+      for (let attempt = 0; attempt < 8 && wfd === null; attempt++) {
+        const candidate = `${this.file}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
+        try { wfd = openSync(candidate, 'wx', STORE_FILE_MODE); tmp = candidate; }
+        catch (e) { if ((e as NodeJS.ErrnoException).code === 'EEXIST') continue; throw e; }
       }
-    } catch { /* disk hiccup — retry next save */ }
-    finally { if (fd !== null) this.releaseLock(fd); }
+      if (wfd === null) throw new Error('could not create a unique store temp file');
+      writeFileSync(wfd, payload);
+      closeSync(wfd); wfd = null;
+      renameSync(tmp, this.file);
+      tmp = ''; // renamed away — nothing to clean up
+      hardenStoreFile(this.file); // belt-and-suspenders on the landed file
+      this.diskStamp = this.currentStamp();
+    } finally {
+      if (wfd !== null) { try { closeSync(wfd); } catch { /* already closed */ } }
+      if (tmp) { try { unlinkSync(tmp); } catch { /* best effort cleanup */ } }
+    }
+  }
+
+  /* ── SessionRunQueue: persisted single-writer lease, atomic CAS ─────────────
+     Every lease transition runs a SHORT compare-and-set under the SAME cross-process
+     write lock the store already uses — NEVER held for model-duration work, only for
+     the read-fresh → decide → write. The lease map is re-read from disk inside the
+     lock (authoritative across processes), the pure transition from session-run-queue.ts
+     is applied to the target session, then the whole store is written atomically. */
+
+  /** Take a DEDICATED per-file lock (O_EXCL, steal-if-stale). Returns the fd, or
+      null on timeout. Independent of every other lock. Used for the SessionRunQueue
+      and the idempotency-ledger files (each their own lock, distinct from the main
+      store lock so a create()/save() under the ledger lock can't self-deadlock). */
+  // MED-3 test seams: production uses the real wall clock / pid-liveness / stale threshold.
+  private lockNow: () => number = () => Date.now();
+  private lockPidAlive: (pid: number) => boolean = pidAlive;
+  private lockStaleMs = LOCK_STALE_MS;
+  /** TEST-ONLY: inject clock / liveness / stale-threshold so lock races are exercised without >10s sleeps. */
+  debugSetLockSeamsForTest(seam: { now?: () => number; pidAlive?: (pid: number) => boolean; staleMs?: number }): void {
+    if (seam.now) this.lockNow = seam.now;
+    if (seam.pidAlive) this.lockPidAlive = seam.pidAlive;
+    if (typeof seam.staleMs === 'number') this.lockStaleMs = seam.staleMs;
+  }
+
+  /** MED-3: fenced acquire. Writes an unguessable `pid:acquiredAt:nonce` token; steals ONLY
+      a DEAD owner's lock older than the stale threshold (a live owner is never stolen, no
+      matter how long it holds), and does so race-safely (rename→verify→restore). */
+  private acquireFileLock(lock: string): FileLockHandle | null {
+    const deadline = this.lockNow() + LOCK_TIMEOUT_MS;
+    for (;;) {
+      const token = `${process.pid}:${this.lockNow()}:${randomBytes(12).toString('hex')}`;
+      try {
+        const fd = openSync(lock, 'wx', STORE_FILE_MODE);
+        try { writeSync(fd, token); } catch { /* content is advisory only */ }
+        return { fd, token, lock };
+      } catch {
+        let content: string;
+        try { content = readFileSync(lock, 'utf8'); }
+        catch { continue; } // vanished between open+read → retry the open immediately
+        const parts = content.split(':');
+        const ownerPid = parseInt(parts[0] ?? '', 10);
+        const ownerAt = parseInt(parts[1] ?? '', 10);
+        const age = this.lockNow() - (Number.isFinite(ownerAt) ? ownerAt : this.lockNow());
+        const ownerIsUs = Number.isInteger(ownerPid) && ownerPid === process.pid;
+        const ownerLive = !ownerIsUs && this.lockPidAlive(ownerPid);
+        // Steal ONLY when the owner is dead/unknown AND the lock is stale. A LIVE owner's
+        // lock is NEVER stolen — a >10s stall no longer collapses mutual exclusion.
+        if (!ownerLive && age > this.lockStaleMs) {
+          if (this.stealStaleFileLock(lock, content)) continue; // stole the dead lock → retry open
+          // a successor replaced it during the steal → fall through and keep waiting
+        }
+        if (this.lockNow() >= deadline) return null;
+        sleepSync(LOCK_SPIN_MS);
+      }
+    }
+  }
+
+  /** Atomically rename the believed-dead lock to a unique tombstone, VERIFY it is the same
+      content we inspected, then remove it. If a successor had already replaced the lock
+      (content differs) RESTORE it and fail — a live successor's lock is never destroyed. */
+  private stealStaleFileLock(lock: string, expected: string): boolean {
+    const tomb = `${lock}.stale-${process.pid}-${randomBytes(8).toString('hex')}`;
+    try { renameSync(lock, tomb); }
+    catch { return false; } // vanished / replaced concurrently — nothing of ours to steal
+    let moved = '';
+    try { moved = readFileSync(tomb, 'utf8'); } catch { /* already removed by another */ }
+    if (moved !== expected) {
+      try { renameSync(tomb, lock); } catch { try { unlinkSync(tomb); } catch { /* orphan swept on next open */ } }
+      return false;
+    }
+    try { unlinkSync(tomb); } catch { /* best-effort tombstone cleanup */ }
+    return true;
+  }
+
+  private releaseFileLock(held: FileLockHandle): void {
+    try { closeSync(held.fd); } catch { /* already closed */ }
+    try {
+      // Unlink ONLY if the lockfile still holds OUR token — never a successor's.
+      if (readFileSync(held.lock, 'utf8') === held.token) unlinkSync(held.lock);
+    } catch { /* gone / replaced */ }
+  }
+  private acquireQueueLock(): FileLockHandle | null { return this.acquireFileLock(`${this.queueFile}.lock`); }
+  private releaseQueueLock(held: FileLockHandle): void { this.releaseFileLock(held); }
+
+  /** Atomic 0600 write of a small JSON map to `file` (call with its lock held). */
+  private writeJsonFileLocked(file: string, value: unknown): void {
+    const payload = JSON.stringify(value, null, 2);
+    let tmp = ''; let wfd: number | null = null;
+    try {
+      for (let attempt = 0; attempt < 8 && wfd === null; attempt++) {
+        const candidate = `${file}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
+        try { wfd = openSync(candidate, 'wx', STORE_FILE_MODE); tmp = candidate; }
+        catch (e) { if ((e as NodeJS.ErrnoException).code === 'EEXIST') continue; throw e; }
+      }
+      if (wfd === null) throw new Error('could not create a unique temp file');
+      writeFileSync(wfd, payload); closeSync(wfd); wfd = null;
+      renameSync(tmp, file); tmp = ''; hardenStoreFile(file);
+    } finally {
+      if (wfd !== null) { try { closeSync(wfd); } catch { /* closed */ } }
+      if (tmp) { try { unlinkSync(tmp); } catch { /* best effort */ } }
+    }
+  }
+
+  /** Run a lease transition for ONE session under the DEDICATED queue lock, atomically:
+      re-read the fresh lease map from its own file, apply `fn`, write it back, update
+      the in-memory mirror. FAIL CLOSED — a lease CAS MUST hold the exclusive lock;
+      if it can't be taken, THROW (never mutate lockless). Because the queue lives in
+      its own file written ONLY here, the main store's best-effort save can never
+      clobber it (finding: no lockless overwrite of queue records). */
+  private queueTx<T>(session: string, fn: (rec: SessionLeaseRecord | undefined) => { rec: SessionLeaseRecord; result: T }): T {
+    const held = this.acquireQueueLock();
+    if (held === null) throw Object.assign(new Error('session run-queue lock timeout — could not claim the session lease safely'), { code: 'lease-lock-timeout', statusCode: 503 });
+    try {
+      let disk: Record<string, SessionLeaseRecord>;
+      try { disk = JSON.parse(readFileSync(this.queueFile, 'utf8')) as Record<string, SessionLeaseRecord>; } catch { disk = {}; }
+      if (!disk || typeof disk !== 'object') disk = {};
+      const { rec, result } = fn(disk[session]);
+      if (leaseIsEmpty(rec)) delete disk[session]; else disk[session] = rec;
+      this.writeQueueFileLocked(disk);
+      this.runQueue = disk; // keep the in-memory mirror authoritative
+      return result;
+    } finally { this.releaseQueueLock(held); }
+  }
+
+  /** Atomic 0600 write of the queue map (call with the queue lock held). Same
+      unique-temp + rename discipline as the main store's writeLocked(). */
+  private writeQueueFileLocked(q: Record<string, SessionLeaseRecord>): void {
+    const payload = JSON.stringify(q, null, 2);
+    let tmp = ''; let wfd: number | null = null;
+    try {
+      for (let attempt = 0; attempt < 8 && wfd === null; attempt++) {
+        const candidate = `${this.queueFile}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
+        try { wfd = openSync(candidate, 'wx', STORE_FILE_MODE); tmp = candidate; }
+        catch (e) { if ((e as NodeJS.ErrnoException).code === 'EEXIST') continue; throw e; }
+      }
+      if (wfd === null) throw new Error('could not create a unique queue temp file');
+      writeFileSync(wfd, payload); closeSync(wfd); wfd = null;
+      renameSync(tmp, this.queueFile); tmp = '';
+      hardenStoreFile(this.queueFile);
+    } finally {
+      if (wfd !== null) { try { closeSync(wfd); } catch { /* closed */ } }
+      if (tmp) { try { unlinkSync(tmp); } catch { /* best effort */ } }
+    }
+  }
+
+  /** ATOMICALLY claim the run lease for `session` on behalf of `jobId`. Returns
+      'acquired' (jobId may execute now), 'owned' (already the owner — a re-entrant
+      drain), or 'queued' (a live owner holds it; jobId was FIFO-enqueued exactly once). */
+  acquireSessionRunDetailed(session: string, jobId: string, at = now(), staleMs?: number): { outcome: AcquireOutcome; promoted?: string | null } {
+    return this.queueTx(session, (rec) => {
+      const r = leaseAcquire(rec, jobId, at, staleMs, this.sessionRunOwnerToken);
+      return { rec: r.rec, result: { outcome: r.outcome, promoted: r.promoted ?? null } };
+    });
+  }
+
+  acquireSessionRun(session: string, jobId: string, at = now(), staleMs?: number): AcquireOutcome {
+    return this.acquireSessionRunDetailed(session, jobId, at, staleMs).outcome;
+  }
+
+  /** ATOMICALLY release `jobId`'s lease on `session` and promote the FIFO-earliest
+      waiter. Returns the promoted jobId to dispatch, or null when the queue is empty. */
+  releaseSessionRun(session: string, jobId: string, at = now()): string | null {
+    return this.queueTx(session, (rec) => {
+      const r = leaseRelease(rec, jobId, at, this.sessionRunOwnerToken);
+      return { rec: r.rec, result: r.next };
+    });
+  }
+
+  /** Remove a QUEUED (non-owner) `jobId` from `session`'s wait list — cancelling a
+      job while it's still queued. Never disturbs the active owner. */
+  dequeueSessionRun(session: string, jobId: string): void {
+    this.queueTx(session, (rec) => ({ rec: leaseDequeue(rec, jobId), result: undefined }));
+  }
+
+  /** Refresh the owner's heartbeat for `session` (proof of life for a long turn),
+      so recovery never reclaims a healthy lease. No-op unless jobId owns it. */
+  heartbeatSessionRun(session: string, jobId: string, at = now()): void {
+    this.queueTx(session, (rec) => ({ rec: leaseHeartbeat(rec, jobId, at, this.sessionRunOwnerToken), result: undefined }));
+  }
+
+  /** Read-only snapshot of a session's lease (owner + waiters), or undefined. */
+  sessionRunLease(session: string): SessionLeaseRecord | undefined {
+    return this.runQueue[session];
+  }
+
+  /** Drop a session's lease entirely (e.g. the session was deleted) — persisted
+      under the queue lock so no orphan lease survives. */
+  clearSessionRun(session: string): void {
+    try { this.queueTx(session, () => ({ rec: { owner: null, acquiredAt: 0, heartbeatAt: 0, waiters: [] }, result: undefined })); }
+    catch { delete this.runQueue[session]; /* lock busy — in-memory drop; recovery heals disk */ }
+  }
+
+  /** Boot recovery: heal EVERY persisted session lease. A terminal owner is
+      replaced by the FIFO-next live waiter; a NON-terminal owner (promoted-but-
+      never-started — the crash window) is re-dispatched as the owner. `isTerminal`
+      reports done/failed/cancelled/missing. Returns the jobIds to (re)dispatch —
+      each at most once. Runs AFTER settleOrphanedRuns has terminalized crashed owners. */
+  recoverSessionRuns(isTerminal: (jobId: string) => boolean, at = now()): string[] {
+    const sessions = Object.keys(this.runQueue);
+    const dispatch: string[] = [];
+    for (const session of sessions) {
+      const next = this.queueTx(session, (rec) => {
+        const r = leaseRecover(rec, isTerminal, at, this.sessionRunOwnerToken);
+        return { rec: r.rec, result: r.next };
+      });
+      if (next) dispatch.push(next);
+    }
+    return dispatch;
   }
 
   /** Path of the advisory lockfile guarding writes to the store. */
@@ -1613,6 +2078,284 @@ export class Store {
     if (list.length > MAX_TOMBSTONES) list.splice(0, list.length - MAX_TOMBSTONES);
   }
 
+  /** TRIGGER IDEMPOTENCY. Resolve a trigger-occurrence `key` to a job: if the key
+      was already claimed (this fire already created a job — a cron re-fire, a retry
+      re-attempt, the same inbound message id, or a duplicate API request with the
+      same key), return the ORIGINAL job with `duplicate:true` and DO NOT create a
+      second one; otherwise run `create()` (which makes + persists the job), record
+      key→jobId (bounded retention), and return it with `duplicate:false`.
+
+      Restart-safe (the ledger persists) and cross-instance-convergent (we absorb a
+      concurrent writer's ledger before checking; entries merge by key, earliest wins).
+      Callers that pass no key create ordinary jobs directly — this is NOT applied to
+      distinct user messages. */
+  claimIdempotentJob(key: string, spec: IdempotentJobSpec): { job: Job; duplicate: boolean } {
+    const lock = `${this.idempotencyFile}.lock`;
+    const held = this.acquireFileLock(lock);
+    if (held === null) throw Object.assign(new Error('idempotency lock timeout — could not claim the trigger safely'), { code: 'idempotency-lock-timeout', statusCode: 503 });
+    // The whole read → reserve/materialize → record sequence runs under this lock, so
+    // two Store instances can never both miss the key (the second blocks then sees our
+    // entry). Materialize the job from the RESERVED spec (the persisted `existing.spec`
+    // on a crash-heal, the caller's spec on a fresh claim) so the reserved id always
+    // carries the ORIGINAL creation data — a retry with the same key but different
+    // text/session/attachments can never rewrite the reserved job with divergent data.
+    const materialize = (jobId: string, s: IdempotentJobSpec): Job =>
+      this.createJob(s.projectId, s.input, s.title ?? '', s.effort, s.sessionId, s.inputImages, s.inputFiles, s.agentContext, jobId, s.intent);
+    const persist = (led: IdempotencyEntry[]): void => {
+      if (led.length > IDEMPOTENCY_MAX) led.splice(0, led.length - IDEMPOTENCY_KEEP);
+      this.writeJsonFileLocked(this.idempotencyFile, led);
+      this.idempotency = led;
+    };
+    try {
+      // Read the AUTHORITATIVE ledger from disk under the lock (a concurrent instance's
+      // claim is visible here — this is what makes the claim atomic across instances).
+      let led: IdempotencyEntry[];
+      try { const a = JSON.parse(readFileSync(this.idempotencyFile, 'utf8')); led = Array.isArray(a) ? a : []; }
+      catch { led = []; }
+      const existing = led.find(e => e.key === key);
+      if (existing) {
+        // Pull in a foreign job the other instance created so getJob can see it.
+        if (this.diskStamp !== null && this.currentStamp() !== this.diskStamp) this.absorbForeignWrites();
+        const j = this.getJob(existing.jobId);
+        if (j) { this.idempotency = led; return { job: j, duplicate: true }; }
+        // The job row is missing. Two cases, disambiguated by `materialized`:
+        //  • materialized:false → we crashed AFTER reserving but BEFORE creating the row.
+        //    Materialize the SAME reserved id from the RESERVED spec (never the retry
+        //    caller's spec) and run it — it never ran, so this retry owns the execution
+        //    (duplicate:false). If the reserved spec is somehow absent (a corrupt/legacy
+        //    entry), we cannot faithfully honor the reserved id: recover EXPLICITLY by
+        //    dropping the unusable reservation and falling through to a fresh claim.
+        if (existing.materialized === false && existing.spec) {
+          const job = materialize(existing.jobId, existing.spec);
+          this.saveDurableOrThrow();     // MED-3: job durable BEFORE the flip (throws → resumable)
+          existing.materialized = true;
+          persist(led);
+          return { job, duplicate: false };
+        }
+        //  • materialized:true → the job was created then explicitly DELETED (stale key), OR
+        //    a reservation with no persisted spec → drop the entry and reserve afresh.
+        led = led.filter(e => e.key !== key);
+      }
+      // NEW claim. Persist the RESERVATION first (deterministic jobId, materialized:false)
+      // so a crash before the row is recoverable to the same id; then create the row and
+      // flip materialized:true. A crash between those two leaves materialized:false → the
+      // branch above heals it. A crash after the row but before the flip leaves the row
+      // present → the getJob branch returns it as a duplicate and boot recovery runs it.
+      const jobId = id();
+      const entry: IdempotencyEntry = { key, jobId, at: now(), spec, materialized: false };
+      led.push(entry);
+      persist(led);              // RESERVE (durable) — before any job row exists
+      const job = materialize(jobId, spec);
+      this.saveDurableOrThrow();  // MED-3: job durable BEFORE the flip (throws → ledger stays materialized:false, resumable)
+      entry.materialized = true;
+      persist(led);              // MARK created
+      return { job, duplicate: false };
+    } finally { this.releaseFileLock(held); }
+  }
+
+  /**
+   * Product-idempotent question-answer claim (§2 correction). Binds the command
+   * idempotency `key` to EXACTLY: the question identity (sessionId+sourceJobId), the
+   * answer digest, ONE deterministic answer Job id, and the disabled/answered auto-answer
+   * schedule — all under the idempotency file lock, so two processes serialize and a crash
+   * is resumable:
+   *   - RESERVE (durable) the deterministic jobId + answer spec + the schedule-to-disable
+   *     BEFORE any product mutation; a crash before materialization re-materializes the SAME
+   *     jobId and disables the SAME schedule.
+   *   - MATERIALIZE atomically: the schedule is disabled in-memory then `createJob` persists
+   *     the disabled schedule AND the new Job in ONE store write.
+   * Same key + same answer → the SAME Job (`duplicate:true`), NEVER "question not pending".
+   * Same key + different answer → `{ conflict }`. A NEW key whose question was already
+   * answered by another actor → `{ conflict }` BEFORE creating a Job.
+   */
+  claimIdempotentQuestionAnswer(key: string, input: { sessionId: string; sourceJobId: string; answer: string; answerDigest: string; intent?: RunIntentInput }): { job: Job; duplicate: boolean } | { conflict: string } {
+    const lock = `${this.idempotencyFile}.lock`;
+    const held = this.acquireFileLock(lock);
+    if (held === null) throw Object.assign(new Error('idempotency lock timeout — could not claim the answer safely'), { code: 'idempotency-lock-timeout', statusCode: 503 });
+    const persist = (led: IdempotencyEntry[]): void => {
+      if (led.length > IDEMPOTENCY_MAX) led.splice(0, led.length - IDEMPOTENCY_KEEP);
+      this.writeJsonFileLocked(this.idempotencyFile, led);
+      this.idempotency = led;
+    };
+    /** Disable the reserved schedule + create the deterministic Job in ONE store write. */
+    const materialize = (jobId: string, entry: IdempotencyEntry): Job => {
+      if (entry.scheduleToDisable) {
+        const sch = this.data.schedules.find(s => s.id === entry.scheduleToDisable);
+        if (sch && sch.enabled !== false) { sch.enabled = false; sch.updatedAt = now(); }
+      }
+      const s = entry.spec!;
+      // createJob's single save() persists BOTH the disabled schedule and the new Job atomically.
+      return this.createJob(s.projectId, s.input, s.title ?? '', s.effort, s.sessionId, s.inputImages, s.inputFiles, s.agentContext, jobId, s.intent);
+    };
+    try {
+      let led: IdempotencyEntry[];
+      try { const a = JSON.parse(readFileSync(this.idempotencyFile, 'utf8')); led = Array.isArray(a) ? a : []; }
+      catch { led = []; }
+      const existing = led.find(e => e.key === key);
+      if (existing) {
+        // Same key, DIFFERENT answer digest → conflicting replay.
+        if (existing.answerDigest && existing.answerDigest !== input.answerDigest) return { conflict: 'answer-digest-mismatch' };
+        if (this.diskStamp !== null && this.currentStamp() !== this.diskStamp) this.absorbForeignWrites();
+        const j = this.getJob(existing.jobId);
+        if (j) { this.idempotency = led; return { job: j, duplicate: true }; }
+        // Crash BEFORE materialization → re-materialize the SAME jobId + disable the SAME schedule.
+        if (existing.materialized === false && existing.spec) {
+          const job = materialize(existing.jobId, existing);
+          this.saveDurableOrThrow();     // MED-3: schedule-disable + Job durable BEFORE the flip
+          existing.materialized = true;
+          persist(led);
+          return { job, duplicate: false };
+        }
+        // materialized:true but job deleted → drop the stale entry, reserve afresh below.
+        led = led.filter(e => e.key !== key);
+      }
+      // NEW claim: the answer job's session must exist and the question must STILL be pending
+      // (its auto-answer schedule enabled). If already answered by another actor → conflict.
+      const session = this.getSession(input.sessionId);
+      if (!session) return { conflict: 'session-not-found' };
+      const pending = this.data.schedules.find(s => s.kind === 'auto-answer' && s.sessionId === input.sessionId && s.sourceJobId === input.sourceJobId && s.enabled !== false);
+      if (!pending) return { conflict: 'question-not-pending' };
+      const jobId = id();
+      const text = input.answer;
+      const entry: IdempotencyEntry = {
+        key, jobId, at: now(), materialized: false, answerDigest: input.answerDigest, scheduleToDisable: pending.id,
+        spec: { projectId: session.projectId, input: text, title: text.slice(0, 60), sessionId: session.id, intent: input.intent },
+      };
+      led.push(entry);
+      persist(led);              // RESERVE (durable) before any product mutation
+      const job = materialize(jobId, entry);
+      this.saveDurableOrThrow();  // MED-3: schedule-disable + answer Job durable BEFORE the flip
+      entry.materialized = true;
+      persist(led);              // MARK created
+      return { job, duplicate: false };
+    } finally { this.releaseFileLock(held); }
+  }
+  /** The jobId a trigger key already resolved to, or undefined. */
+  idempotentJobIdFor(key: string): string | undefined {
+    return this.idempotency.find(e => e.key === key)?.jobId;
+  }
+  /** Reserved idempotency jobs that were created but never reached `engine.run` (still
+      'pending' and NOT referenced by any session lease) — the crash-after-create-before-run
+      window. Boot recovery re-dispatches these exactly once so a claimed trigger always
+      produces one run. Jobs already owned/queued by a lease are handled by
+      recoverSessionRuns() instead, so they're excluded here to avoid a double dispatch. */
+  idempotentPendingJobIds(): string[] {
+    const leased = new Set<string>();
+    for (const lease of Object.values(this.runQueue)) {
+      if (lease.owner) leased.add(lease.owner);
+      for (const w of lease.waiters ?? []) leased.add(w);
+    }
+    const out: string[] = [];
+    for (const e of this.idempotency) {
+      if (leased.has(e.jobId)) continue;
+      if (this.getJob(e.jobId)?.status === 'pending') out.push(e.jobId);
+    }
+    return out;
+  }
+
+  // ── Review gates ───────────────────────────────────────────────
+  listReviewGates(scope?: { projectId?: string; sessionId?: string; jobId?: string }): ReviewGate[] {
+    const rows = [...(this.data.reviewGates ?? [])].sort((a, b) =>
+      (b.updatedAt - a.updatedAt) ||
+      (b.createdAt - a.createdAt) ||
+      b.id.localeCompare(a.id),
+    );
+    return rows.filter(g =>
+      (scope?.projectId ? g.projectId === scope.projectId : true) &&
+      (scope?.sessionId ? g.sessionId === scope.sessionId : true) &&
+      (scope?.jobId ? g.jobId === scope.jobId : true),
+    );
+  }
+  latestReviewGateFor(scope: ReviewGateScope): ReviewGate | undefined {
+    return this.listReviewGates({ projectId: scope.projectId, sessionId: scope.sessionId, jobId: scope.jobId })
+      .find(g => g.artifactId === scope.artifactId);
+  }
+  latestSessionReviewGate(sessionId: string): ReviewGate | undefined {
+    return this.listReviewGates({ sessionId })[0];
+  }
+  private nextReviewGateTimestamp(): number {
+    return Math.max(now(), ...((this.data.reviewGates ?? []).map(g => g.updatedAt)), 0) + 1;
+  }
+  private terminalReviewGateTimestamp(gate: ReviewGate): number {
+    const latestForSession = gate.sessionId ? this.latestSessionReviewGate(gate.sessionId) : undefined;
+    if (latestForSession && latestForSession.id !== gate.id && latestForSession.createdAt > gate.createdAt) {
+      return Math.min(gate.updatedAt, latestForSession.createdAt - 1);
+    }
+    return this.nextReviewGateTimestamp();
+  }
+  startReviewGate(scope: ReviewGateScope, reviewerIdentity: string): ReviewGate {
+    const t = this.nextReviewGateTimestamp();
+    const gate: ReviewGate = {
+      id: id(),
+      projectId: scope.projectId,
+      ...(scope.sessionId ? { sessionId: scope.sessionId } : {}),
+      jobId: scope.jobId,
+      artifactId: scope.artifactId,
+      status: 'pending',
+      reason: 'Reviewer is running.',
+      reviewerIdentity,
+      schemaVersion: REVIEW_GATE_SCHEMA_VERSION,
+      createdAt: t,
+      updatedAt: t,
+    };
+    this.data.reviewGates = [gate, ...(this.data.reviewGates ?? [])].slice(0, 500);
+    this.save();
+    return gate;
+  }
+  private claimReviewGateAttempt(scope: ReviewGateScope, gateId?: string): ReviewGate {
+    const latest = this.latestReviewGateFor(scope);
+    if (!gateId) return latest ?? this.startReviewGate(scope, 'unknown');
+    const gate = (this.data.reviewGates ?? []).find(g => g.id === gateId);
+    if (gate && latest?.id === gate.id && gate.status === 'pending') return gate;
+    return latest ?? gate ?? this.startReviewGate(scope, 'unknown');
+  }
+  completeReviewGate(scope: ReviewGateScope, result: ParsedReviewResult, raw: string, gateId?: string): ReviewGate {
+    const gate = this.claimReviewGateAttempt(scope, gateId);
+    if (gateId && (gate.id !== gateId || gate.status !== 'pending')) return gate;
+    gate.status = result.verdict === 'PASS' ? 'pass' : 'needs-work';
+    gate.reason = result.verdict === 'PASS' ? 'Reviewer returned PASS.' : 'Reviewer returned NEEDS_WORK.';
+    gate.parsedResult = result;
+    gate.rawDiagnostic = sanitizeReviewDiagnostic(raw);
+    gate.schemaVersion = REVIEW_GATE_SCHEMA_VERSION;
+    gate.updatedAt = this.terminalReviewGateTimestamp(gate);
+    gate.completedAt = gate.updatedAt;
+    this.save();
+    return gate;
+  }
+  failReviewGate(scope: ReviewGateScope, reason: string, raw?: string, gateId?: string): ReviewGate {
+    const gate = this.claimReviewGateAttempt(scope, gateId);
+    if (gateId && (gate.id !== gateId || gate.status !== 'pending')) return gate;
+    gate.status = 'failed-closed';
+    gate.reason = reason;
+    if (raw !== undefined) gate.rawDiagnostic = sanitizeReviewDiagnostic(raw);
+    gate.updatedAt = this.terminalReviewGateTimestamp(gate);
+    gate.completedAt = gate.updatedAt;
+    this.save();
+    return gate;
+  }
+  overrideReviewGate(scope: ReviewGateScope, reason: string): ReviewGate {
+    const trimmed = reason.trim();
+    if (!trimmed) throw Object.assign(new Error('review override requires a nonblank reason'), { statusCode: 400 });
+    const gate = this.latestReviewGateFor(scope) ?? this.startReviewGate(scope, 'operator');
+    gate.status = 'overridden';
+    gate.reason = trimmed.slice(0, 2000);
+    gate.override = { actor: 'operator', reason: gate.reason, at: this.nextReviewGateTimestamp(), scope };
+    gate.updatedAt = gate.override.at;
+    gate.completedAt = gate.updatedAt;
+    this.pushEvent({ kind: 'approval-created', title: 'Review gate overridden', subtitle: gate.reason, projectId: scope.projectId, jobId: scope.jobId });
+    this.save();
+    return gate;
+  }
+  reviewGateCheck(scope: ReviewGateScope, required: boolean): ReviewGateCheck {
+    if (!required) return { allowed: true, status: 'not-required', reason: 'Reviewer is not required for this session.' };
+    if (isFailClosedArtifactIdentity(scope.artifactId)) return { allowed: false, status: 'failed-closed', reason: 'Review artifact identity could not be safely established.' };
+    const gate = this.latestReviewGateFor(scope);
+    if (!gate) return { allowed: false, status: 'failed-closed', reason: 'No current review gate exists for this artifact.' };
+    if (gate.artifactId !== scope.artifactId) return { allowed: false, status: 'failed-closed', reason: 'Review gate is stale for this artifact.', gate };
+    if (gate.status === 'pass' || gate.status === 'overridden') return { allowed: true, status: gate.status, reason: gate.reason, gate };
+    return { allowed: false, status: gate.status, reason: gate.reason, gate };
+  }
+
   // ── Chat sessions ───────────────────────────────────────────────────
   listSessions(projectId?: string): ChatSession[] {
     const all = [...this.data.sessions].sort((a, b) => b.updatedAt - a.updatedAt);
@@ -1634,9 +2377,13 @@ export class Store {
       keeps the existing `resolveBaseBranch(origin/HEAD → current → 'main')` flow.
       `opts.continuedFrom` seeds the continued-from link for sessions spawned via
       the merged-session "Continue from here" affordance (T7). */
-  createSession(projectId: string, title: string, codename?: string, opts?: { baseBranch?: string; continuedFrom?: ChatSession['continuedFrom'] }): ChatSession {
+  createSession(projectId: string, title: string, codename?: string, opts?: { baseBranch?: string; continuedFrom?: ChatSession['continuedFrom']; id?: string }): ChatSession {
+    // Deterministic-id create is IDEMPOTENT: when a caller binds a session to a stable key
+    // (e.g. sendChat's idempotencyKey → sessionIdForKey) a retry after a crash reuses the
+    // SAME session instead of spawning a second empty one.
+    if (opts?.id) { const existing = this.getSession(opts.id); if (existing) return existing; }
     const t = now();
-    const s: ChatSession = { id: id(), projectId, title: (title.trim() || 'New chat').slice(0, 60), createdAt: t, updatedAt: t };
+    const s: ChatSession = { id: opts?.id ?? id(), projectId, title: (title.trim() || 'New chat').slice(0, 60), createdAt: t, updatedAt: t };
     if (codename) s.codename = codename;
     if (opts?.baseBranch && opts.baseBranch.trim()) s.baseBranch = opts.baseBranch.trim();
     if (opts?.continuedFrom) s.continuedFrom = opts.continuedFrom;
@@ -1681,6 +2428,8 @@ export class Store {
     // each affected job's `updatedAt` so a delta-sync client re-fetches them.
     const t = now();
     for (const j of this.data.jobs) if (j.sessionId === sessionId) { j.sessionId = undefined; j.updatedAt = t; }
+    // Never leave a live orphan run-lease behind a deleted session.
+    if (this.runQueue[sessionId]) { this.clearSessionRun(sessionId); }
     this.save();
   }
   /** External-conversation ids already imported into a project (re-scan dedupe). */
@@ -1748,11 +2497,19 @@ export class Store {
     };
   }
   getJob(jobId: string): Job | undefined { return this.data.jobs.find(j => j.id === jobId); }
-  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[], inputFiles?: ChatFile[], agentContext?: string): Job {
+  createJob(projectId: string, input: string, title = '', effort?: Effort, sessionId?: string, inputImages?: ChatImage[], inputFiles?: ChatFile[], agentContext?: string, explicitIdOrIntent?: string | RunIntentInput, intentInput?: RunIntentInput): Job {
     const t = now();
+    const explicitId = typeof explicitIdOrIntent === 'string' ? explicitIdOrIntent : undefined;
+    const requestedIntent = typeof explicitIdOrIntent === 'object' && explicitIdOrIntent ? explicitIdOrIntent : intentInput;
+    const intent = normalizeRunIntent({ ...(requestedIntent ?? {}), effort: requestedIntent?.effort ?? effort }, effort ?? this.data.settings.defaultEffort);
+    const mirrors = intentMirrors(intent);
     const j: Job = {
-      id: id(), projectId, title: title || input.slice(0, 60) || (inputImages?.length ? 'Image' : inputFiles?.length ? inputFiles[0].name : 'Message'), status: 'pending', phase: 'Queued', progress: 0,
-      input, output: null, error: null, effort: effort ?? this.data.settings.defaultEffort, cost: 0, tokens: 0, stage: '',
+      id: explicitId ?? id(), projectId, title: title || input.slice(0, 60) || (inputImages?.length ? 'Image' : inputFiles?.length ? inputFiles[0].name : 'Message'), status: 'pending', phase: 'Queued', progress: 0,
+      input, output: null, error: null, effort: mirrors.effort, cost: 0, tokens: 0, stage: '',
+      intent,
+      ...(mirrors.engine ? { engine: mirrors.engine } : {}),
+      ...(mirrors.model ? { model: mirrors.model } : {}),
+      ...(mirrors.goal !== undefined ? { goal: mirrors.goal } : {}),
       sessionId,
       ...(inputImages && inputImages.length ? { inputImages } : {}),
       ...(inputFiles && inputFiles.length ? { inputFiles } : {}),
@@ -1803,12 +2560,28 @@ export class Store {
       try { console.log(`[store] job prune: stripped=${stripped} deleted=${deleted} total=${this.data.jobs.length}`); } catch { /* */ }
     }
   }
-  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'engine' | 'model' | 'goal' | 'transcript' | 'pausedUntil' | 'pausedReason' | 'contextTokens' | 'limitResetsAt' | 'blockedByLimit'>>): Job {
+  updateJob(jobId: string, patch: Partial<Pick<Job, 'status' | 'phase' | 'progress' | 'output' | 'error' | 'cost' | 'tokens' | 'stage' | 'effort' | 'engine' | 'model' | 'goal' | 'intent' | 'transcript' | 'review' | 'pausedUntil' | 'pausedReason' | 'contextTokens' | 'limitResetsAt' | 'blockedByLimit'>>): Job {
     const cur = this.getJob(jobId);
     if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
-    Object.assign(cur, patch, { updatedAt: now() });
+    const nextPatch: Partial<Job> = { ...patch };
+    if (patch.intent) {
+      const intent = normalizeRunIntent(patch.intent, cur.effort);
+      Object.assign(nextPatch, intentMirrors(intent), { intent });
+    }
+    Object.assign(cur, nextPatch, { updatedAt: now() });
     this.save();
     return cur;
+  }
+  resolveJobIntent(jobId: string, opts?: RunIntentInput): RunIntent {
+    const cur = this.getJob(jobId);
+    if (!cur) throw Object.assign(new Error(`job not found: ${jobId}`), { statusCode: 404 });
+    const locked = normalizeRunIntent(cur.intent ?? legacyIntentFromJob(cur), cur.effort);
+    assertRunIntentCompatible(locked, opts, cur.effort);
+    return locked;
+  }
+  persistJobIntent(jobId: string, opts?: RunIntentInput): Job {
+    const intent = this.resolveJobIntent(jobId, opts);
+    return this.updateJob(jobId, { intent });
   }
   /** Streaming-frame variant: updates memory + defers the disk write (debounced).
       Used by the engine's high-frequency live flush; terminal states always go
@@ -1830,10 +2603,32 @@ export class Store {
   /** Boot sweep: jobs left 'running'/'pending' by a previous app instance can
       never complete (their child process died with the app) — without this
       they'd show as running forever. Called once at launch, before the engine
-      starts anything new. */
-  settleOrphanedRuns(): Job[] {
-    const orphans = this.data.jobs.filter(j => j.status === 'running' || j.status === 'pending');
-    for (const j of orphans) {
+      starts anything new.
+
+      Queue-aware: a PENDING job that is still a WAITER in the SessionRunQueue never
+      actually started (it was parked behind another turn), so it is RECOVERABLE —
+      left pending for `recoverSessionRuns()` to re-dispatch exactly once — NOT failed.
+      A crashed OWNER (status 'running') and any never-queued pending job DO fail
+      (a partial turn must not silently re-run its side effects). */
+  settleOrphanedRuns(): { failed: Job[]; recoverable: Job[] } {
+    // Jobs referenced by a session lease (either the promoted OWNER or a WAITER) are
+    // queue-managed. A PENDING one never actually started (a promoted-but-never-run
+    // owner in the release→dispatch crash window, or a parked waiter), so it is
+    // RECOVERABLE — kept pending for recoverSessionRuns() to re-dispatch — not failed.
+    const queued = new Set<string>();
+    for (const lease of Object.values(this.runQueue)) {
+      if (lease.owner) queued.add(lease.owner);
+      for (const w of lease.waiters ?? []) queued.add(w);
+    }
+    // A reserved idempotency job that crashed BEFORE engine.run (never reached the
+    // lease) is also RECOVERABLE — boot recovery re-dispatches it exactly once. Failing
+    // it here would break the claimed-trigger "one run" guarantee.
+    for (const e of this.idempotency) queued.add(e.jobId);
+    const failed: Job[] = [];
+    const recoverable: Job[] = [];
+    for (const j of this.data.jobs) {
+      if (j.status !== 'running' && j.status !== 'pending') continue;
+      if (j.status === 'pending' && queued.has(j.id)) { recoverable.push(j); continue; }
       j.status = 'failed';
       j.phase = 'Failed';
       j.stage = '';
@@ -1844,9 +2639,38 @@ export class Store {
       if (j.pausedUntil != null) j.pausedUntil = null;
       if (j.pausedReason != null) j.pausedReason = null;
       j.updatedAt = now();
+      failed.push(j);
     }
-    if (orphans.length) this.save();
-    return orphans;
+    const cleaned = this.disableAutoAnswerSchedulesForSourceJobs(failed.map(j => j.id), { save: false });
+    if (failed.length || cleaned.length) this.save();
+    return { failed, recoverable };
+  }
+
+  /** Disable only AskUserQuestion followups whose exact source job was proven
+      orphaned. This deliberately does not use sessionId: a same-session terminal
+      job may still have a valid unresolved question after restart. Durable
+      disable (rather than schedule deletion) gives multi-writer save/merge a
+      newer row stamp so an older enabled copy cannot resurrect the followup. */
+  disableAutoAnswerSchedulesForSourceJobs(sourceJobIds: Iterable<string>, opts?: { save?: boolean }): Schedule[] {
+    const ids = new Set([...sourceJobIds].filter(Boolean));
+    if (!ids.size) return [];
+    const disabled: Schedule[] = [];
+    for (const s of this.data.schedules) {
+      if (
+        s.kind === 'auto-answer' &&
+        s.enabled !== false &&
+        typeof s.sourceJobId === 'string' &&
+        ids.has(s.sourceJobId)
+      ) {
+        s.enabled = false;
+        s.nextRun = null;
+        s.paused = false;
+        s.updatedAt = Math.max(now(), s.updatedAt ?? 0, s.createdAt) + 1;
+        disabled.push(s);
+      }
+    }
+    if (disabled.length && opts?.save !== false) this.save();
+    return disabled;
   }
 
   // ── Approvals ───────────────────────────────────────────────────────
@@ -1875,22 +2699,38 @@ export class Store {
 
   // ── Schedules ───────────────────────────────────────────────────────
   listSchedules(): Schedule[] { return [...this.data.schedules].sort((a, b) => a.time.localeCompare(b.time)); }
-  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue' | 'auto-answer' | 'keep-going' | 'retry-run' | 'whatsapp-analyze'; chatId?: string; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean; armedAt?: number; extends?: number; everyMinutes?: number; anchorAt?: number; catchUp?: boolean; catchUpWindowMs?: number; retryAttempt?: number; sourceJobId?: string }): Schedule {
+  createSchedule(s: { projectId?: string | null; title: string; time?: string; cadence?: string; fireAt?: number; sessionId?: string; prompt?: string; kind?: 'message' | 'auto-continue' | 'auto-answer' | 'keep-going' | 'retry-run' | 'whatsapp-analyze'; chatId?: string; effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; browser?: boolean; plan?: boolean; goal?: boolean; intent?: RunIntentInput; armedAt?: number; extends?: number; everyMinutes?: number; anchorAt?: number; catchUp?: boolean; catchUpWindowMs?: number; retryAttempt?: number; sourceJobId?: string; questionAsk?: string }): Schedule {
     const at = s.fireAt ? new Date(s.fireAt) : null;
     const time = s.time ?? (at ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}` : '');
+    const intent = normalizeRunIntent({
+      ...(s.intent ?? {}),
+      effort: s.intent?.effort ?? s.effort,
+      engine: s.intent?.engine ?? s.engine,
+      model: s.intent?.model ?? s.model,
+      reviewer: s.intent?.reviewer ?? s.reviewer,
+      browser: s.intent?.browser ?? s.browser,
+      plan: s.intent?.plan ?? s.plan,
+      goal: s.intent?.goal ?? s.goal,
+    }, s.effort ?? this.data.settings.defaultEffort);
+    const t = now();
     const rec: Schedule = {
       id: id(), projectId: s.projectId ?? null, title: s.title, time,
       cadence: s.fireAt ? 'once' : (s.everyMinutes ? 'interval' : (s.cadence ?? 'daily')),
-      enabled: true, nextRun: s.fireAt ?? null, createdAt: now(),
+      enabled: true, nextRun: s.fireAt ?? null, createdAt: t, updatedAt: t,
+      intent,
       ...(s.fireAt ? { fireAt: s.fireAt } : {}),
       ...(s.sessionId ? { sessionId: s.sessionId } : {}),
       ...(s.prompt ? { prompt: s.prompt } : {}),
+      ...(s.questionAsk ? { questionAsk: s.questionAsk } : {}),
       ...(s.kind ? { kind: s.kind } : {}),
       ...(s.chatId ? { chatId: s.chatId } : {}),
-      ...(s.effort ? { effort: s.effort } : {}),
-      ...(s.browser ? { browser: true } : {}),
-      ...(s.plan ? { plan: true } : {}),
-      ...(s.goal ? { goal: true } : {}),
+      effort: intent.effort,
+      ...(intent.engine !== undefined ? { engine: intent.engine } : {}),
+      ...(intent.model !== undefined ? { model: intent.model } : {}),
+      ...(intent.reviewer !== undefined ? { reviewer: intent.reviewer } : {}),
+      ...(intent.browser !== undefined ? { browser: intent.browser } : {}),
+      ...(intent.plan !== undefined ? { plan: intent.plan } : {}),
+      ...(intent.goal !== undefined ? { goal: intent.goal } : {}),
       ...(s.armedAt ? { armedAt: s.armedAt } : {}),
       ...(s.extends ? { extends: s.extends } : {}),
       ...(s.everyMinutes ? { everyMinutes: s.everyMinutes } : {}),
@@ -1906,15 +2746,119 @@ export class Store {
   /** Patch a schedule's timing/extend state (used by the AskUserQuestion extend +
       graceful-pause flow). Re-derives nextRun from fireAt. Returns the updated record. */
   updateSchedule(scheduleId: string, patch: Partial<Pick<Schedule,
-    'fireAt' | 'extends' | 'paused' | 'enabled' | 'prompt' | 'title' | 'time' | 'cadence'
+    'fireAt' | 'extends' | 'paused' | 'enabled' | 'prompt' | 'questionAsk' | 'title' | 'time' | 'cadence'
     | 'everyMinutes' | 'anchorAt' | 'catchUp' | 'catchUpWindowMs'
-    | 'effort' | 'browser' | 'plan' | 'goal' | 'sessionId' | 'projectId'>>): Schedule {
+    | 'effort' | 'engine' | 'model' | 'reviewer' | 'browser' | 'plan' | 'goal' | 'intent' | 'sessionId' | 'projectId' | 'armedAt'>>): Schedule {
     const s = this.data.schedules.find(x => x.id === scheduleId);
     if (!s) throw Object.assign(new Error('schedule not found'), { statusCode: 404 });
-    Object.assign(s, patch);
+    const nextPatch: Partial<Schedule> = { ...patch };
+    const hasIntentPatch =
+      patch.intent !== undefined || patch.effort !== undefined || patch.engine !== undefined ||
+      patch.model !== undefined || patch.reviewer !== undefined || patch.browser !== undefined ||
+      patch.plan !== undefined || patch.goal !== undefined;
+    if (hasIntentPatch) {
+      const intent = mergeRunIntent(normalizeRunIntent(s.intent, s.effort ?? this.data.settings.defaultEffort), {
+        ...(patch.intent ?? {}),
+        effort: patch.intent?.effort ?? patch.effort,
+        engine: patch.intent?.engine ?? patch.engine,
+        model: patch.intent?.model ?? patch.model,
+        reviewer: patch.intent?.reviewer ?? patch.reviewer,
+        browser: patch.intent?.browser ?? patch.browser,
+        plan: patch.intent?.plan ?? patch.plan,
+        goal: patch.intent?.goal ?? patch.goal,
+      }, s.effort ?? this.data.settings.defaultEffort);
+      Object.assign(nextPatch, {
+        intent,
+        effort: intent.effort,
+        engine: intent.engine,
+        model: intent.model,
+        reviewer: intent.reviewer,
+        browser: intent.browser,
+        plan: intent.plan,
+        goal: intent.goal,
+      });
+    }
+    Object.assign(s, nextPatch);
     if (patch.fireAt !== undefined) s.nextRun = patch.fireAt ?? null;
+    if (patch.enabled === false) s.nextRun = null;
+    s.updatedAt = now();
     this.save();
     return s;
+  }
+  /** Idempotent AskUserQuestion auto-answer arming keyed by the exact source
+      turn. One source job can have at most one unresolved terminal question in
+      the current runner lifecycle; different source jobs in the same session
+      remain independently actionable. */
+  upsertAutoAnswerForSource(s: {
+    projectId?: string | null;
+    sessionId: string;
+    sourceJobId: string;
+    title: string;
+    prompt: string;
+    questionAsk: string;
+    fireAt: number;
+    armedAt: number;
+    extends?: number;
+    effort?: Effort;
+    engine?: EngineId;
+    model?: string;
+    reviewer?: RoleChoice | 'off';
+    browser?: boolean;
+    plan?: boolean;
+    goal?: boolean;
+    intent?: RunIntentInput;
+  }): { schedule: Schedule; created: boolean } {
+    const existing = this.data.schedules.find((row) =>
+      row.kind === 'auto-answer' &&
+      row.enabled !== false &&
+      row.sessionId === s.sessionId &&
+      row.sourceJobId === s.sourceJobId,
+    );
+    if (existing) {
+      const patch: Partial<Schedule> = {
+        title: s.title,
+        prompt: s.prompt,
+        questionAsk: s.questionAsk,
+        fireAt: s.fireAt,
+        armedAt: s.armedAt,
+        extends: s.extends ?? 0,
+        paused: false,
+        projectId: s.projectId ?? null,
+        sessionId: s.sessionId,
+        effort: s.effort,
+        engine: s.engine,
+        model: s.model,
+        reviewer: s.reviewer,
+        browser: s.browser,
+        plan: s.plan,
+        goal: s.goal,
+        intent: s.intent ? normalizeRunIntent(s.intent, s.effort ?? this.data.settings.defaultEffort) : undefined,
+      };
+      return { schedule: this.updateSchedule(existing.id, patch), created: false };
+    }
+    return {
+      schedule: this.createSchedule({
+        projectId: s.projectId ?? null,
+        sessionId: s.sessionId,
+        kind: 'auto-answer',
+        title: s.title,
+        prompt: s.prompt,
+        questionAsk: s.questionAsk,
+        fireAt: s.fireAt,
+        armedAt: s.armedAt,
+        extends: s.extends ?? 0,
+        effort: s.effort,
+        engine: s.engine,
+        model: s.model,
+        reviewer: s.reviewer,
+        browser: s.browser,
+        plan: s.plan,
+        goal: s.goal,
+        intent: s.intent,
+        sourceJobId: s.sourceJobId,
+      }),
+      created: true,
+    };
   }
   /** Idempotent "schedule a continue at reset" for a single session.
    *
@@ -1939,6 +2883,7 @@ export class Store {
     title?: string;
     prompt: string;
     effort?: Effort;
+    intent?: RunIntentInput;
   }): { schedule: Schedule; created: boolean } {
     const now = Date.now();
     const existing = this.data.schedules.find((s) =>
@@ -1966,6 +2911,7 @@ export class Store {
       fireAt: opts.fireAt,
       kind: 'auto-continue',
       effort: opts.effort,
+      intent: opts.intent,
     });
     return { schedule, created: true };
   }
@@ -1990,6 +2936,7 @@ export class Store {
     prompt: string;
     fireAt: number;
     effort?: Effort;
+    intent?: RunIntentInput;
     sourceJobId?: string;
     maxPerSession: number;
     bumpCounter?: boolean;
@@ -2029,6 +2976,7 @@ export class Store {
       fireAt: opts.fireAt,
       kind: 'keep-going',
       effort: opts.effort,
+      intent: opts.intent,
       sourceJobId: opts.sourceJobId,
     });
     return { schedule, created: true, capped: false, attempt: opts.bumpCounter !== false ? nextAttempt : current };
@@ -2054,7 +3002,7 @@ export class Store {
       Returns the IDs of the schedules that were disabled so the caller can
       emit `schedule` events for the UI. */
   cancelPendingFollowups(sessionId: string): string[] {
-    const now = Date.now();
+    const t = now();
     const ids: string[] = [];
     for (const s of this.data.schedules) {
       if (s.sessionId !== sessionId) continue;
@@ -2062,11 +3010,12 @@ export class Store {
       if (s.enabled === false) continue;
       // Only cancel rows that haven't fired yet — a one-shot that already
       // ran is a no-op anyway, but skipping it keeps the audit clean.
-      if (typeof s.fireAt === 'number' && s.fireAt <= now && s.lastRun) continue;
+      if (typeof s.fireAt === 'number' && s.fireAt <= t && s.lastRun) continue;
       s.enabled = false;
       // Clear nextRun so the schedule-queue UI shows "—" for the next-run
       // column on a cancelled row, not a stale future timestamp.
       s.nextRun = null;
+      s.updatedAt = t;
       ids.push(s.id);
     }
     if (ids.length) this.save();
@@ -2128,6 +3077,7 @@ export class Store {
     browser?: boolean;
     plan?: boolean;
     goal?: boolean;
+    intent?: RunIntentInput;
   }): { schedule: Schedule; created: boolean } {
     const now = Date.now();
     // Coalesce per (key) — same session OR same source job, whichever the
@@ -2158,6 +3108,7 @@ export class Store {
       browser: opts.browser,
       plan: opts.plan,
       goal: opts.goal,
+      intent: opts.intent,
       retryAttempt: opts.attempt,
       sourceJobId: opts.sourceJobId,
     });
@@ -2165,7 +3116,7 @@ export class Store {
   }
   setScheduleEnabled(scheduleId: string, enabled: boolean): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);
-    if (s) { s.enabled = enabled; this.save(); }
+    if (s) { s.enabled = enabled; if (!enabled) s.nextRun = null; s.updatedAt = now(); this.save(); }
   }
   /** Snapshot of the chat session associated with a pending followup row
       (so the Scheduler UI can show the chat title alongside a 'keep-going' /
@@ -2181,12 +3132,13 @@ export class Store {
       s.lastRun = ts; s.nextRun = nextRun;
       if (opts?.dueAt !== undefined) s.lastDueAt = opts.dueAt;
       s.lastFireLate = !!opts?.late;
+      s.updatedAt = now();
       this.save();
     }
   }
   setScheduleNextRun(scheduleId: string, nextRun: number | null): void {
     const s = this.data.schedules.find(x => x.id === scheduleId);
-    if (s && s.nextRun !== nextRun) { s.nextRun = nextRun; this.save(); }
+    if (s && s.nextRun !== nextRun) { s.nextRun = nextRun; s.updatedAt = now(); this.save(); }
   }
   deleteSchedule(scheduleId: string): void {
     const i = this.data.schedules.findIndex(s => s.id === scheduleId);
@@ -2611,6 +3563,7 @@ export class Store {
       },
       whatsapp: {
         connected: wa.connected,
+        status: wa.status ?? (wa.connected ? 'connected' : wa.linkedAt != null ? 'offline' : 'unlinked'),
         jid: wa.jid,
         name: wa.name,
         tracked: this.data.chatBindings.filter(b => b.provider === 'whatsapp').length,
@@ -2809,7 +3762,7 @@ export class Store {
       greetingProjects: projects.map(p => ({ id: p.id, name: p.name, color: p.color })),
       gates: this.listApprovals('pending'),
       activeJobs: jobs.filter(j => j.status === 'running' || j.status === 'pending').slice(0, 8),
-      recentlyCompleted: jobs.filter(j => j.status === 'done').slice(0, 6),
+      recentlyCompleted: jobs.filter(j => j.status === 'done' || j.status === 'gated').slice(0, 6),
       schedule: this.listSchedules(),
       budget: this.budget(),
     };

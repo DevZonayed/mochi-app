@@ -49,7 +49,7 @@ export function LiveNotifier() {
       return;
     }
     if (name === 'job') {
-      const j = data as { id?: string; status?: string; title?: string; projectId?: string; sessionId?: string } | null;
+      const j = data as { id?: string; status?: string; title?: string; projectId?: string; sessionId?: string; review?: { summary?: string; findings?: unknown[]; status?: string } } | null;
       if (!j?.id) return;
       const base = { projectId: j.projectId, sessionId: j.sessionId, jobId: j.id };
       if (j.status === 'done' && eventAllowed('job-done')) {
@@ -62,6 +62,13 @@ export function LiveNotifier() {
         const nav: PushNavData = { kind: 'job-failed', ...base };
         fireAlert('Job failed', j.title || 'A run failed on your Mac.', nav);
         show({ tint: theme.color.red, icon: 'xCircle', title: 'Job failed', body: j.title || 'A run failed on your Mac.', nav });
+      } else if (j.status === 'gated' && eventAllowed('job-gated')) {
+        const k = `${j.id}:gated`; if (seen.current.has(k)) return; seen.current.add(k);
+        const nav: PushNavData = { kind: 'job-gated', ...base };
+        const count = Array.isArray(j.review?.findings) ? j.review.findings.length : 0;
+        const body = j.review?.summary ? `${j.review.summary}${count ? ` (${count} finding${count === 1 ? '' : 's'})` : ''}` : (j.title || 'A reviewer asked for changes.');
+        fireAlert('Reviewer needs work', body, nav);
+        show({ tint: theme.color.orange, icon: 'alert', title: j.review?.status === 'failed-closed' ? 'Review needs attention' : 'Reviewer needs work', body, nav });
       }
     } else if (name === 'approval') {
       const a = data as { id?: string; status?: string; title?: string; projectId?: string | null; jobId?: string | null } | null;

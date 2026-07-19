@@ -7,8 +7,14 @@
    state and forwards commands to it — the web app is a remote control. */
 
 import type { SessionGitStatus, GithubConnection, MergePreviewResult, ResolvePreviewResult, PrConfirmRequest, ConflictFile } from './git-types';
+import { copyTextWith } from './transcript-copy';
+import type { ShadowCapability } from '@maestro/realtime/shadowCapabilities';
+import type {
+  ShadowHostStatusWire, PendingRequestWire, ControllerWire, ApproveGrantWire, RevokeReceiptWire, ScreenShareStatusWire,
+  CreateSessionWire,
+} from './shadowController';
 
-export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
+export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled' | 'gated';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
@@ -165,6 +171,8 @@ export interface TranscriptItem {
   verdict?: 'approved' | 'needs-work';
   /** review only: the primary fixed the flagged findings → show as resolved. */
   resolved?: boolean;
+  /** review only: capped structured findings projected outside collapsed work. */
+  findings?: ReviewFinding[];
   durMs?: number;
   /** file-writing tools only: capped snapshot of the written content (hover preview). */
   preview?: string;
@@ -191,6 +199,23 @@ export interface TranscriptItem {
   height?: number;
   ts: number;
 }
+export interface ReviewFinding {
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  message: string;
+  file?: string;
+}
+export interface JobReviewProjection {
+  schemaVersion: 1;
+  status: 'needs-work' | 'failed-closed';
+  verdict?: 'NEEDS_WORK';
+  gateId: string;
+  artifactId: string;
+  reviewer: string;
+  reason: string;
+  summary: string;
+  findings: ReviewFinding[];
+  completedAt: number;
+}
 /** An image attached to a user message (pasted/dropped/picked) — vision input.
     imagePath is Mac-local (stripped from the relay snapshot); the bytes are
     resolved on the desktop via api.assetImage(assetId). */
@@ -209,6 +234,7 @@ export interface Job {
   progress: number;
   sessionId?: string;
   transcript?: TranscriptItem[];
+  review?: JobReviewProjection;
   inputImages?: ChatImage[];
   inputFiles?: ChatFile[];
   input: string;
@@ -220,6 +246,7 @@ export interface Job {
   stage: string;
   engine?: EngineId;
   model?: string;
+  intent?: RunIntent;
   goal?: boolean;
   /** Epoch ms when a session-scoped ScheduleWakeup will resume the model. While
       set and in the future, the SDK iterator is open but dormant — the UI
@@ -240,6 +267,23 @@ export interface Job {
   blockedByLimit?: boolean;
   createdAt: number;
   updatedAt: number;
+}
+export type ReviewGateStatus = 'not-required' | 'pending' | 'pass' | 'needs-work' | 'failed-closed' | 'overridden';
+export interface ReviewGate {
+  id?: string;
+  projectId?: string;
+  sessionId?: string;
+  jobId?: string;
+  artifactId?: string;
+  status: ReviewGateStatus;
+  reason: string;
+  reviewerIdentity?: string;
+  schemaVersion?: number;
+  parsedResult?: unknown;
+  override?: { actor: 'operator'; reason: string; at: number; scope: unknown };
+  createdAt?: number;
+  updatedAt?: number;
+  completedAt?: number;
 }
 export interface JobPage {
   jobs: Job[];
@@ -295,6 +339,8 @@ export interface Schedule {
   fireAt?: number;
   sessionId?: string;
   prompt?: string;
+  /** auto-answer only: durable AskUserQuestion payload from the exact source job. */
+  questionAsk?: string;
   /** Schedule kind:
       - 'message' : a user-authored chat message to fire at a future time
       - 'auto-continue' : the usage-limit-reset auto-resume
@@ -304,14 +350,20 @@ export interface Schedule {
       - 'whatsapp-analyze' : per-chat WhatsApp quiet timer */
   kind?: 'message' | 'auto-continue' | 'auto-answer' | 'keep-going' | 'retry-run' | 'whatsapp-analyze';
   effort?: Effort;
+  engine?: EngineId;
+  model?: string;
+  reviewer?: RoleChoice | 'off';
   browser?: boolean;
   plan?: boolean;
   goal?: boolean;
+  intent?: RunIntent;
   /** auto-answer only: armed time (base for the escalating-extend math), extend
       count, and whether it's paused past the 30-min cap (waits for a manual reply). */
   armedAt?: number;
   extends?: number;
   paused?: boolean;
+  /** auto-answer/retry/keep-going provenance: exact source job for the follow-up. */
+  sourceJobId?: string;
   /** Interval cadence (every N minutes) — when set, fires on an interval, not a clock time. */
   everyMinutes?: number;
   /** Clock-mode catch-up: fire a missed daily/weekly slot later the same day. */
@@ -336,12 +388,18 @@ export interface RegistrySkillSummary {
   enabled?: boolean; disabledReason?: string | null; version?: string; sha256?: string | null;
   sourceRepo?: string | null; sourceStatus?: string | null;
   mirrorRepo?: string | null; forkStatus?: string | null; lastSyncAt?: string | null; auditStatus?: string | null;
+  commitSha?: string | null; auditEvidenceId?: string | null; auditedDigest?: string | null;
 }
 /** A registry skill installed into a project (files in <project>/.claude/skills/). */
 export interface InstalledSkill {
   id: string; slug: string; name: string; description?: string; risk?: string; source?: string;
   version?: string; sha256?: string; enabled?: boolean; disabledReason?: string | null;
   mirrorRepo?: string | null; auditStatus?: string | null; addedBy?: 'operator' | 'agent' | 'native'; installedAt: number;
+  integrity?: { algorithm: 'sha256'; digest: string; status: string; checkedAt: number; failure?: string | null };
+  provenance?: { kind: string; source?: string | null; version?: string | null; commit?: string | null };
+  auditEvidence?: { identity?: string | null; status?: string | null; auditedDigest?: string | null; checkedAt?: string | null };
+  policy?: { decision: string; risk?: string | null; reason?: string | null; checkedAt: number };
+  trustLabel?: { provenance: string; trust: string; digest?: string; version?: string };
 }
 export interface Template {
   id: string;
@@ -361,7 +419,7 @@ export interface CustomMcpServer {
   id: string; name: string; enabled: boolean; transport: 'stdio' | 'http';
   command?: string; args?: string[]; env?: McpKv[]; envPassthrough?: string[]; cwd?: string;
   url?: string; bearerTokenEnv?: string; headers?: McpKv[]; headerEnv?: { key: string; valueEnv: string }[];
-  skillIds: string[]; createdAt: number;
+  skillIds: string[]; lastSkillError?: string | null; createdAt: number;
 }
 /** Form payload for creating/updating a custom MCP server (no id/createdAt). */
 export type McpServerInput = Omit<CustomMcpServer, 'id' | 'createdAt'>;
@@ -399,6 +457,16 @@ export interface ProviderConn {
 }
 export type EngineId = 'claude' | 'codex';
 export interface RoleChoice { engine: EngineId; model?: string }
+export interface RunIntent {
+  schemaVersion: 1;
+  effort: Effort;
+  engine?: EngineId;
+  model?: string;
+  reviewer?: RoleChoice | 'off';
+  plan?: boolean;
+  goal?: boolean;
+  browser?: boolean;
+}
 export interface Roles {
   primary: RoleChoice;
   reviewer: RoleChoice | 'off';
@@ -447,7 +515,7 @@ export type GithubDevice =
   | { stage: 'downloading-cli'; pct: number }
   | { stage: 'code'; userCode: string; verificationUri: string };
 export type AppEventKind =
-  | 'job-done' | 'job-failed' | 'job-cancelled'
+  | 'job-done' | 'job-failed' | 'job-gated' | 'job-cancelled'
   | 'approval-created' | 'approval-resolved'
   | 'schedule-fired' | 'clone-done' | 'clone-failed'
   | 'research' | 'publish' | 'comm' | 'asset';
@@ -630,7 +698,8 @@ export interface ChatPermissions { startJobs: boolean; receiveReports: boolean; 
 export interface ChatBinding { chatId: string; name: string; kind: 'dm' | 'group'; provider?: CommsProvider; projectId: string | null; sessionId?: string | null; permissions: ChatPermissions; boundAt: number }
 export interface PendingChat { chatId: string; name: string; kind: 'dm' | 'group'; firstText: string; at: number }
 export interface CommEvent { id: string; dir: 'in' | 'out'; chatId: string; chatName: string; payload: string; status: 'received' | 'sent' | 'failed'; at: number }
-export interface WhatsAppState { connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummaries?: { id: string; text: string; chatName: string; at: number }[]; agentSendToOthers?: boolean; notifyJid?: string | null }
+export type WhatsAppConnectionStatus = 'unlinked' | 'connecting' | 'retrying' | 'offline' | 'connected' | 'paused' | 'needs-attention';
+export interface WhatsAppState { status?: WhatsAppConnectionStatus; connected: boolean; jid: string | null; name: string | null; linkedAt: number | null; sendApproved: boolean; pendingSummaries?: { id: string; text: string; chatName: string; at: number }[]; agentSendToOthers?: boolean; notifyJid?: string | null; connectedAt?: number | null; lastDisconnectCode?: number | null; nextRetryAt?: number | null; retryAttempt?: number }
 export type WaChatKind = 'dm' | 'group' | 'channel';
 export interface WaChatSummary { chatId: string; name: string; kind: WaChatKind; lastMessageAt: number; lastReportedAt: number; count: number }
 /** A WhatsApp chat as shown in the WhatsApp workspace (mirrors electron WaChatMeta). */
@@ -650,10 +719,10 @@ export interface WaMessage {
 }
 /** Live wa-message event payload (Mac-local; never relayed). */
 export interface WaMessageEvent { chatId: string; message: WaMessage; chat?: WaChat }
-export type WhatsAppLink = { method: 'qr'; dataUrl: string } | { method: 'pairing'; code: string };
+export type WhatsAppLink = { method: 'qr'; dataUrl: string } | { method: 'pairing'; code: string } | { method: 'connected' };
 export interface CommsStatus {
   telegram: { connected: boolean; botUsername: string | null; tokenLast4: string | null; messagesToday: number; bindings: number; pending: number };
-  whatsapp: { connected: boolean; jid: string | null; name: string | null; tracked: number; sendApproved: boolean };
+  whatsapp: { connected: boolean; status?: WhatsAppConnectionStatus; jid: string | null; name: string | null; tracked: number; sendApproved: boolean };
 }
 export interface RepoInfo { branch: string | null; remote: string | null; isRepo: boolean }
 /** Confirmation-card metadata for the in-workspace add-project "Clone from
@@ -695,7 +764,24 @@ interface Bridge {
   call?: (method: string, params?: Record<string, unknown>) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   onEvent?: (cb: (e: { name: string; data: unknown }) => void) => () => void;
   pickFolder?: () => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
+  /** Native (WebKit) — reveal an APP-OWNED path (project folder, generated asset,
+      export) in Finder. Trusted callers only. */
   revealPath?: (p: string) => Promise<{ ok: boolean; error?: string }>;
+  reveal?: (p: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Native (WebKit) — copy text to the system clipboard. */
+  copyText?: (text: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Native (WebKit) — open an APP-OWNED path with the OS default app. */
+  openPath?: (p: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Native (WebKit) — reveal a FILE-ARTIFACT path in Finder. CONFINED brain-side:
+      the path is resolved against the project/session roots (or a trusted asset)
+      before the native reveal runs, so a raw transcript path can't reveal an
+      arbitrary file. */
+  revealFile?: (projectId: string, p: string, sessionId?: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Native (WebKit) — open a FILE-ARTIFACT path with the default app. CONFINED. */
+  openFile?: (projectId: string, p: string, sessionId?: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Native (WebKit) — token-gated loopback URL to the sidecar /files/stream
+      route for inline <video>/<audio>/<img>/<embed> playback. Synchronous. */
+  fileStreamUrl?: (projectId: string, p: string, sessionId?: string) => string;
   importAsset?: (projectId: string | null) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   assetImage?: (assetId: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
   readFile?: (projectId: string, p: string, sessionId?: string) => Promise<{ ok: boolean; data?: unknown; error?: string; status?: number }>;
@@ -707,6 +793,19 @@ interface Bridge {
   onCmdOutput?: (cb: (p: CmdOutput) => void) => () => void;
 }
 export interface DirEntry { name: string; path: string; kind: 'file' | 'dir' | 'other' }
+/** A file resolved + read by the native bridge. `path` is the canonical
+    absolute path (shortened/relative/absolute inputs are resolved server-side).
+    Binary files carry no `text` and set `binary:true`; the FileViewer previews
+    them by MIME/kind via a token-gated stream URL instead of loading bytes. */
+export interface FileRead {
+  path: string;
+  name: string;
+  bytes: number;
+  binary: boolean;
+  mime: string;
+  text?: string;
+  truncated?: boolean;
+}
 export interface CmdOutput { runId: string; stream: 'out' | 'err' | 'exit' | string; chunk: string; code?: number }
 const bridge: Bridge | undefined =
   typeof window !== 'undefined' ? (window as unknown as { maestro?: Bridge }).maestro : undefined;
@@ -991,7 +1090,7 @@ const updateUnavailable = (): Promise<never> => Promise.reject(new ApiError(501,
 export const api = {
   base: API_BASE,
   health: () =>
-    call('health', {}, () => req<{ ok: boolean; name: string; version: string; engine: string }>('/health')),
+    call('health', {}, () => req<{ ok: boolean; name: string; version: string; channel?: string; engine: string }>('/health')),
 
   // Aggregates
   dashboard: (workspaceId?: string) =>
@@ -1167,8 +1266,55 @@ export const api = {
     if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'failed');
     return (r.data as FolderInspect | null) ?? null;
   },
-  /** Reveal a local path in Finder — desktop only; no-op in the browser. */
-  revealPath: async (p: string): Promise<void> => { if (bridge?.revealPath) await bridge.revealPath(p); },
+  /** Reveal an APP-OWNED path in Finder (project folder, generated asset, export)
+      — desktop only; no-op in the browser. Trusted callers pass app-owned paths. */
+  revealPath: async (p: string): Promise<{ ok: boolean; error?: string }> => {
+    const fn = bridge?.reveal ?? bridge?.revealPath;
+    if (!fn) return { ok: false, error: 'Reveal in Finder is only available in the desktop app.' };
+    try { return (await fn(p)) ?? { ok: true }; }
+    catch (e) { return { ok: false, error: e instanceof Error ? e.message : 'Could not reveal in Finder' }; }
+  },
+  /** Reveal a FILE-ARTIFACT path in Finder — CONFINED brain-side to the project /
+      session roots (or a trusted asset path). Use this for any path that could
+      originate from a transcript/link, never the raw native reveal. */
+  revealFile: async (projectId: string, p: string, sessionId?: string): Promise<{ ok: boolean; error?: string }> => {
+    if (!bridge?.revealFile) return { ok: false, error: 'Reveal in Finder is only available in the desktop app.' };
+    try { return (await bridge.revealFile(projectId, p, sessionId)) ?? { ok: true }; }
+    catch (e) { return { ok: false, error: e instanceof Error ? e.message : 'Could not reveal in Finder' }; }
+  },
+  /** True when the TRUSTED app-owned native reveal bridge is present. */
+  canReveal: (): boolean => Boolean(bridge?.reveal ?? bridge?.revealPath),
+  /** True when the CONFINED file-artifact reveal bridge is present — gate every
+      FILE-ARTIFACT Reveal control on THIS, not `canReveal`, so the UI never offers
+      a reveal that its confined operation can't actually perform. */
+  canRevealFile: (): boolean => Boolean(bridge?.revealFile),
+  /** True when the CONFINED file-artifact open-with-default bridge is present. */
+  canOpenFile: (): boolean => Boolean(bridge?.openFile),
+  /** Canonical copy-to-clipboard: the native pasteboard bridge on WebKit (where
+      `navigator.clipboard.writeText` is rejected), falling back to the browser
+      Clipboard API on web builds. Resolves a truthful `{ ok, error? }`. */
+  copyTextNative: (text: string): Promise<{ ok: boolean; error?: string }> =>
+    copyTextWith(text, {
+      native: bridge?.copyText,
+      clipboard: typeof navigator !== 'undefined' ? navigator.clipboard : null,
+    }),
+  /** Open a FILE-ARTIFACT path with the OS default app — desktop only, CONFINED
+      brain-side to the project/session roots (or a trusted asset path). */
+  openWithDefault: async (projectId: string, p: string, sessionId?: string): Promise<{ ok: boolean; error?: string }> => {
+    if (!bridge?.openFile) return { ok: false, error: 'Opening with the default app is only available in the desktop app.' };
+    try { return (await bridge.openFile(projectId, p, sessionId)) ?? { ok: true }; }
+    catch (e) { return { ok: false, error: e instanceof Error ? e.message : 'Could not open the file' }; }
+  },
+  /** True when a native open-with-default bridge is present (else hide the control). */
+  canOpenWithDefault: (): boolean => Boolean(bridge?.openFile),
+  /** Token-gated loopback URL for inline media (video/audio/img/pdf embed).
+      Null in the browser / when the native bridge is absent — the FileViewer
+      then falls back to a metadata panel instead of a broken media element. */
+  fileStreamUrl: (projectId: string, p: string, sessionId?: string): string | null => {
+    if (!bridge?.fileStreamUrl) return null;
+    try { return bridge.fileStreamUrl(projectId, p, sessionId) || null; }
+    catch { return null; }
+  },
   /** Resolve a generated-image Asset to a data URL for inline display — desktop only; null on web/phone. */
   assetImage: async (assetId: string): Promise<string | null> => {
     if (!bridge?.assetImage) return null;
@@ -1178,11 +1324,11 @@ export const api = {
   },
   /** Read a file's text — desktop only, confined to the project folder (or a
       session worktree of the project); null in the browser. */
-  readFile: async (projectId: string, p: string, sessionId?: string): Promise<{ path: string; text: string; bytes: number; truncated: boolean } | null> => {
+  readFile: async (projectId: string, p: string, sessionId?: string): Promise<FileRead | null> => {
     if (!bridge?.readFile) return null;
     const r = await bridge.readFile(projectId, p, sessionId);
     if (!r.ok) throw new ApiError(r.status ?? 500, r.error ?? 'read failed');
-    return r.data as { path: string; text: string; bytes: number; truncated: boolean };
+    return r.data as FileRead;
   },
   /** Overwrite an existing text file with new content — desktop only, confined
       to the project folder. Backs in-app file edits made from a chat link.
@@ -1280,10 +1426,11 @@ export const api = {
     call<ChatBinding>('setChatPermissions', { chatId, permissions }, () => req<ChatBinding>('/api/comms/permissions', { method: 'POST', body: JSON.stringify({ chatId, permissions }) })),
 
   // Comms (WhatsApp — desktop owns the Baileys socket; management is desktop-only)
-  whatsappStatus: () => call<WhatsAppState>('whatsappStatus', {}, () => Promise.resolve({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [] } as WhatsAppState)),
+  whatsappStatus: () => call<WhatsAppState>('whatsappStatus', {}, () => Promise.resolve({ status: 'unlinked', connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, pendingSummaries: [] } as WhatsAppState)),
   listWaChats: () => call<WaChatSummary[]>('listWaChats', {}, () => Promise.resolve([] as WaChatSummary[])),
   /** Begin linking the operator's number. QR by default, or a pairing code if a phone is given. */
   whatsappLink: (phone?: string) => call<WhatsAppLink>('whatsappLink', { phone }, () => Promise.reject(new ApiError(403, 'Linking WhatsApp is only available in the desktop app'))),
+  reconnectWhatsApp: () => call<{ ok: boolean }>('reconnectWhatsApp', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
   /** The current QR data-URL while a link is pending (refreshes as the QR rotates). */
   whatsappQr: () => call<{ dataUrl: string | null }>('whatsappQr', {}, () => Promise.resolve({ dataUrl: null })),
   disconnectWhatsApp: () => call<{ ok: boolean }>('disconnectWhatsApp', {}, () => Promise.reject(new ApiError(403, 'desktop only'))),
@@ -1404,7 +1551,7 @@ export const api = {
   runJob: (id: string, effort?: Effort, engine?: EngineId) =>
     call<Job>('runJob', { id, effort, engine }, () =>
       req<Job>(`/api/jobs/${encodeURIComponent(id)}/run`, { method: 'POST', body: JSON.stringify({ ...(effort ? { effort } : {}), ...(engine ? { engine } : {}) }) })),
-  createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort; engine?: EngineId; model?: string }) =>
+  createAndRunJob: (input: { projectId: string; input: string; title?: string; effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; plan?: boolean; goal?: boolean; browser?: boolean }) =>
     call<Job>('createAndRunJob', { ...input }, () =>
       req<Job>('/api/jobs/run', { method: 'POST', body: JSON.stringify(input) })),
   cancelJob: (id: string) =>
@@ -1440,7 +1587,7 @@ export const api = {
 
   // Schedules
   listSchedules: () => call<Schedule[]>('listSchedules', {}, () => req<Schedule[]>('/api/schedules')),
-  createSchedule: (input: { title: string; projectId?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; prompt?: string; sessionId?: string; effort?: Effort; browser?: boolean }) =>
+  createSchedule: (input: { title: string; projectId?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; prompt?: string; sessionId?: string; effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; browser?: boolean; plan?: boolean; goal?: boolean }) =>
     call<Schedule>('createSchedule', { ...input }, () =>
       req<Schedule>('/api/schedules', { method: 'POST', body: JSON.stringify(input) })),
   // Wait-&-check: poke a chat with a one-shot follow-up after delayMs.
@@ -1449,22 +1596,27 @@ export const api = {
       req<Schedule>('/api/schedules/check', { method: 'POST', body: JSON.stringify(input) })),
   // Scheduled message: send a real chat message into a session at an absolute time
   // (fireAt = ms timestamp), carrying composer effort/browser/plan/goal.
-  scheduleMessage: (input: { projectId: string; sessionId?: string; prompt: string; fireAt: number; effort?: Effort; browser?: boolean; plan?: boolean; goal?: boolean }) =>
+  scheduleMessage: (input: { projectId: string; sessionId?: string; prompt: string; fireAt: number; effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; browser?: boolean; plan?: boolean; goal?: boolean }) =>
     call<Schedule>('scheduleMessage', { ...input }, () =>
       req<Schedule>('/api/schedules/message', { method: 'POST', body: JSON.stringify(input) })),
   // Answer a surfaced AskUserQuestion — cancels its countdown, resumes the session
   // with the choice tagged so the model treats it as the direct answer.
-  answerQuestion: (input: { sessionId: string; answer: string }) =>
+  answerQuestion: (input: { sessionId: string; sourceJobId?: string; answer: string }) =>
     call<Job>('answerQuestion', { ...input }, () =>
       req<Job>('/api/questions/answer', { method: 'POST', body: JSON.stringify(input) })),
   // Extend an AskUserQuestion countdown by the next escalating step (or pause past the cap).
-  extendQuestion: (sessionId: string) =>
-    call<Schedule>('extendQuestion', { sessionId }, () =>
-      req<Schedule>('/api/questions/extend', { method: 'POST', body: JSON.stringify({ sessionId }) })),
+  extendQuestion: (input: string | { sessionId: string; sourceJobId?: string }) => {
+    const body = typeof input === 'string' ? { sessionId: input } : input;
+    return call<Schedule>('extendQuestion', { ...body }, () =>
+      req<Schedule>('/api/questions/extend', { method: 'POST', body: JSON.stringify(body) }));
+  },
+  cancelQuestion: (input: { sessionId: string; sourceJobId: string }) =>
+    call<{ ok: boolean }>('cancelQuestion', { ...input }, () =>
+      req<{ ok: boolean }>('/api/questions/cancel', { method: 'POST', body: JSON.stringify(input) })),
   toggleSchedule: (id: string, enabled: boolean) =>
     call<{ ok: boolean }>('toggleSchedule', { id, enabled }, () =>
       req<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) })),
-  updateSchedule: (id: string, patch: { title?: string; prompt?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; enabled?: boolean; effort?: Effort; browser?: boolean; sessionId?: string; projectId?: string }) =>
+  updateSchedule: (id: string, patch: { title?: string; prompt?: string; time?: string; cadence?: string; everyMinutes?: number; catchUp?: boolean; enabled?: boolean; effort?: Effort; engine?: EngineId; model?: string; reviewer?: RoleChoice | 'off'; browser?: boolean; plan?: boolean; goal?: boolean; sessionId?: string; projectId?: string }) =>
     call<Schedule>('updateSchedule', { id, ...patch }, () =>
       req<Schedule>(`/api/schedules/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) })),
   deleteSchedule: (id: string) =>
@@ -1610,6 +1762,12 @@ export const api = {
   createSessionPR: (sessionId: string, title?: string, body?: string, base?: string) =>
     call<{ ok: boolean; url?: string; number?: number; reason?: string }>('createSessionPR', { sessionId, title, body, base }, () =>
       req<{ ok: boolean; url?: string; number?: number; reason?: string }>(`/api/sessions/${sessionId}/pr`, { method: 'POST', body: JSON.stringify({ title, body, base }) })),
+  getReviewGate: (sessionId: string) =>
+    call<ReviewGate>('getReviewGate', { sessionId }, () => Promise.resolve({ status: 'not-required', reason: 'Review gates are local to the desktop app.' })),
+  retryReviewGate: (sessionId: string) =>
+    call<ReviewGate>('retryReviewGate', { sessionId }, () => Promise.reject(new ApiError(403, 'Review retry is only available in the desktop app'))),
+  overrideReviewGate: (sessionId: string, reason: string) =>
+    call<ReviewGate>('overrideReviewGate', { sessionId, reason }, () => Promise.reject(new ApiError(403, 'Review override is only available in the desktop app'))),
   mergeSessionPR: (sessionId: string, method?: 'merge' | 'squash' | 'rebase') =>
     call<{ ok: boolean; reason?: string }>('mergeSessionPR', { sessionId, method }, () =>
       req<{ ok: boolean; reason?: string }>(`/api/sessions/${sessionId}/merge`, { method: 'POST', body: JSON.stringify({ method }) })),
@@ -1663,6 +1821,49 @@ export const api = {
       token the renderer stored at login. Replaces the old pairing-code flow. */
   listDevices: () => reqAccount<AccountDevice[]>('/api/devices'),
 
+  /* ── Shadow controllers (desktop host enrollment management) ───────────────
+     Typed wrappers over the live `shadowHost*` dispatch allowlist
+     (MacOS/brain/shadow-host-dispatch.ts, routed in sidecar headless-main.ts).
+     Host-owned authority — desktop only; a web/phone remote can't manage the
+     host's controllers, so the REST fallback rejects. These wrappers return the
+     RAW wire shapes; the renderer view-model (lib/shadowController.ts) strips
+     crypto material + internal ids before anything is rendered. */
+  shadowHostStatus: () =>
+    call<ShadowHostStatusWire>('shadowHostStatus', {}, () =>
+      Promise.reject(new ApiError(501, 'Controller management is only available in the desktop app'))),
+  /** Create a host-signed enrollment session and return its one-time bootstrap. The
+      `qr` field carries the secret — the view-model (`mapEnrollmentSession`) keeps it
+      out of any text/log surface; only a LOCAL QR renderer consumes it transiently. */
+  shadowHostCreateSession: (input: { ttlMs?: number } = {}) =>
+    call<CreateSessionWire>('shadowHostCreateSession', { ...input }, () =>
+      Promise.reject(new ApiError(501, 'Controller management is only available in the desktop app'))),
+  /** Cancel a pending enrollment session (revokes its unscanned bootstrap). */
+  shadowHostCancel: (sessionId: string) =>
+    call<{ ok: boolean }>('shadowHostCancel', { sessionId }, () =>
+      Promise.reject(new ApiError(501, 'Controller management is only available in the desktop app'))),
+  shadowHostListPending: () =>
+    call<{ requests: PendingRequestWire[] }>('shadowHostListPending', {}, () =>
+      Promise.reject(new ApiError(501, 'Controller management is only available in the desktop app'))),
+  shadowHostApprove: (input: { sessionId: string; capabilities: ShadowCapability[]; controllerName?: string; controllerPlatform?: string }) =>
+    call<ApproveGrantWire>('shadowHostApprove', { ...input }, () =>
+      Promise.reject(new ApiError(501, 'Controller management is only available in the desktop app'))),
+  shadowHostDeny: (sessionId: string) =>
+    call<{ ok: boolean }>('shadowHostDeny', { sessionId }, () =>
+      Promise.reject(new ApiError(501, 'Controller management is only available in the desktop app'))),
+  shadowHostListControllers: () =>
+    call<{ controllers: ControllerWire[] }>('shadowHostListControllers', {}, () =>
+      Promise.reject(new ApiError(501, 'Controller management is only available in the desktop app'))),
+  shadowHostRevoke: (controllerDeviceId: string) =>
+    call<RevokeReceiptWire>('shadowHostRevoke', { controllerDeviceId }, () =>
+      Promise.reject(new ApiError(501, 'Controller management is only available in the desktop app'))),
+  /** Phase 3D1 view-only screen share — read the current viewer status (metadata
+   * only) and stop sharing locally. Never exposes frames/keys. */
+  shadowHostScreenStatus: () =>
+    call<ScreenShareStatusWire>('shadowHostScreenStatus', {}, () =>
+      Promise.resolve({ active: false, deviceLabel: '', sourceLabel: '', startedAtMs: 0 })),
+  shadowHostScreenStop: () =>
+    call<{ ok: boolean }>('shadowHostScreenStop', {}, () => Promise.resolve({ ok: true })),
+
   /** Auto-update — desktop only; `undefined` in web/phone remotes (updates are
       about this Mac's own binary, so they're never exposed over the relay). */
   update: IS_LOCAL ? {
@@ -1677,7 +1878,7 @@ export const api = {
   } : undefined,
 
   /** Live updates: local core events in Electron, relay SSE in the browser. */
-  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onMemorySync?: (s: MemorySyncStatus) => void; onMcpAccess?: (c: ExternalMcpConfig) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void; onPrConfirmRequest?: (r: PrConfirmRequest) => void }): () => void {
+  subscribe(handlers: { onJob?: (job: Job) => void; onApproval?: (a: Approval) => void; onProject?: (p: Project) => void; onClone?: (e: CloneEvent) => void; onAsset?: (a: Asset) => void; onBriefs?: (b: Brief[]) => void; onPublishDraft?: (d: PublishDraft) => void; onComms?: (s: CommsStatus) => void; onSession?: (s: ChatSession & { deleted?: boolean }) => void; onFeedback?: (f: Feedback & { deleted?: boolean }) => void; onBg?: (t: BgTask) => void; onGitStatus?: (s: SessionGitStatus) => void; onReviewGate?: (g: ReviewGate) => void; onEngineDownload?: (p: EngineDownloadProgress) => void; onSchedule?: (s: Schedule) => void; onDevices?: (d: RemoteDevice[]) => void; onGithubDevice?: (d: GithubDevice) => void; onMemorySync?: (s: MemorySyncStatus) => void; onMcpAccess?: (c: ExternalMcpConfig) => void; onWaMessage?: (e: WaMessageEvent) => void; onWaChats?: () => void; onWaMessageUpdate?: (e: { chatId: string }) => void; onPrConfirmRequest?: (r: PrConfirmRequest) => void }): () => void {
     if (bridge?.onEvent) {
       return bridge.onEvent(({ name, data }) => {
         if (name === 'devices' && handlers.onDevices) handlers.onDevices(data as RemoteDevice[]);
@@ -1694,6 +1895,7 @@ export const api = {
         if (name === 'session' && handlers.onSession) handlers.onSession(data as ChatSession & { deleted?: boolean });
         if (name === 'feedback' && handlers.onFeedback) handlers.onFeedback(data as Feedback & { deleted?: boolean });
         if (name === 'git-status' && handlers.onGitStatus) handlers.onGitStatus(data as SessionGitStatus);
+        if (name === 'review-gate' && handlers.onReviewGate) handlers.onReviewGate(data as ReviewGate);
         if (name === 'schedule' && handlers.onSchedule) handlers.onSchedule(data as Schedule);
         if (name === 'github-device' && handlers.onGithubDevice) handlers.onGithubDevice(data as GithubDevice);
         if (name === 'memory-sync' && handlers.onMemorySync) handlers.onMemorySync(data as MemorySyncStatus);
@@ -1719,6 +1921,7 @@ export const api = {
     if (handlers.onSession) es.addEventListener('session', (e: MessageEvent) => { try { handlers.onSession!(JSON.parse(e.data) as ChatSession & { deleted?: boolean }); } catch { /* ignore */ } });
     if (handlers.onFeedback) es.addEventListener('feedback', (e: MessageEvent) => { try { handlers.onFeedback!(JSON.parse(e.data) as Feedback & { deleted?: boolean }); } catch { /* ignore */ } });
     if (handlers.onGitStatus) es.addEventListener('git-status', (e: MessageEvent) => { try { handlers.onGitStatus!(JSON.parse(e.data) as SessionGitStatus); } catch { /* ignore */ } });
+    if (handlers.onReviewGate) es.addEventListener('review-gate', (e: MessageEvent) => { try { handlers.onReviewGate!(JSON.parse(e.data) as ReviewGate); } catch { /* ignore */ } });
     if (handlers.onSchedule) es.addEventListener('schedule', (e: MessageEvent) => { try { handlers.onSchedule!(JSON.parse(e.data) as Schedule); } catch { /* ignore */ } });
     if (handlers.onGithubDevice) es.addEventListener('github-device', (e: MessageEvent) => { try { handlers.onGithubDevice!(JSON.parse(e.data) as GithubDevice); } catch { /* ignore */ } });
     return () => es.close();

@@ -69,6 +69,7 @@ export function nextOccurrence(s: Schedule, from: number): number | null {
 
 export class CronRunner {
   private timer: ReturnType<typeof setInterval> | null = null;
+  private manualFireSeq = 0;
 
   /** firePublish: optional hook to export scheduled publish drafts whose time has come.
       analyzeWhatsapp: optional hook a 'whatsapp-analyze' quiet timer fires when a
@@ -143,11 +144,11 @@ export class CronRunner {
   fireNow(scheduleId: string): boolean {
     const s = this.store.listSchedules().find(x => x.id === scheduleId);
     if (!s) return false;
-    this.fire(s);
+    this.fire(s, { manualOccurrence: `${Date.now()}:${++this.manualFireSeq}` });
     return true;
   }
 
-  private fire(s: Schedule, opts?: { late?: boolean }): void {
+  private fire(s: Schedule, opts?: { late?: boolean; manualOccurrence?: string }): void {
     // A quiet WhatsApp chat fired: hand it to the analyzer (read + summarize +
     // report to self). It does NOT become a normal chat job in a project.
     if (s.kind === 'whatsapp-analyze') {
@@ -177,16 +178,29 @@ export class CronRunner {
       s.kind === 'auto-continue' ? 'Continue (limit reset): ' :
       s.kind === 'auto-answer' ? 'Auto-answer: ' :
       'Scheduled: ';
-    const job = this.store.createJob(project.id, input, `${titlePrefix}${s.title}`, s.effort ?? 'balanced', session?.id);
-    this.emit('job', job);
-    const runOpts = {
+    // TRIGGER IDEMPOTENCY: timer/restart replays can double-fire for the SAME due-time
+    // occurrence, so those use the schedule id + due timestamp. Manual "Run now" is an
+    // explicit new occurrence every time and gets a fresh in-process occurrence key.
+    const occurrenceKey = opts?.manualOccurrence
+      ? `cron:${s.id}:manual:${opts.manualOccurrence}`
+      : `cron:${s.id}:${s.lastDueAt ?? s.fireAt ?? 0}`;
+    const legacyIntent = {
       ...(session?.primary ? { engine: session.primary.engine, model: session.primary.model, reviewer: session.reviewer } : {}),
       ...(s.effort ? { effort: s.effort } : {}),
-      ...(s.browser ? { browser: true } : {}),
-      ...(s.plan ? { plan: true } : {}),
-      ...(s.goal ? { goal: true } : {}),
+      ...(s.engine ? { engine: s.engine } : {}),
+      ...(s.model ? { model: s.model } : {}),
+      ...(s.reviewer !== undefined ? { reviewer: s.reviewer } : {}),
+      ...(s.browser !== undefined ? { browser: s.browser } : {}),
+      ...(s.plan !== undefined ? { plan: s.plan } : {}),
+      ...(s.goal !== undefined ? { goal: s.goal } : {}),
     };
+    const intent = s.intent ?? legacyIntent;
+    const { job, duplicate } = this.store.claimIdempotentJob(occurrenceKey, {
+      projectId: project.id, input, title: `${titlePrefix}${s.title}`, effort: s.effort ?? 'balanced', sessionId: session?.id, intent,
+    });
+    this.emit('job', job);
+    if (duplicate) return; // this occurrence already created + dispatched a job
     // Fire-and-forget: the engine updates + emits job state as it progresses.
-    void this.engine.run(job.id, runOpts).catch(() => { /* engine already recorded the failure on the job */ });
+    void this.engine.run(job.id, {}).catch(() => { /* engine already recorded the failure on the job */ });
   }
 }

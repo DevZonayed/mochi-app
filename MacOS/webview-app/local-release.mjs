@@ -37,10 +37,10 @@ export const isFingerprint = (s) => FINGERPRINT_RE.test(typeof s === 'string' ? 
 
 // ── active-job guard ──────────────────────────────────────────────────────────
 // Canonical JobStatus (MacOS/brain/store.ts): pending | running | done | failed |
-// cancelled. Promotion may quit/replace production ONLY when nothing is in flight,
+// cancelled | gated. Promotion may quit/replace production ONLY when nothing is in flight,
 // so we ALLOWLIST the terminal statuses and treat everything else — including an
 // unknown or malformed status — as active. Fail safe, never fail open.
-export const TERMINAL_JOB_STATUSES = Object.freeze(['done', 'failed', 'cancelled']);
+export const TERMINAL_JOB_STATUSES = Object.freeze(['done', 'failed', 'cancelled', 'gated']);
 
 export function isTerminalStatus(status) {
   return typeof status === 'string' && TERMINAL_JOB_STATUSES.includes(status.trim().toLowerCase());

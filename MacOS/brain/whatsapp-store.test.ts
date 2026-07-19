@@ -29,6 +29,21 @@ describe('Store — WhatsApp connection state', () => {
     expect(reloaded.whatsappState().jid).toBe('15551234567@s.whatsapp.net');
     expect(reloaded.whatsappState().name).toBe('Me');
   });
+
+  it('backfills truthful connection fields and clears stale persisted Live on reload', () => {
+    const s = new Store();
+    s.setWhatsappState({ connected: true, jid: '15551234567@s.whatsapp.net', name: 'Me', linkedAt: 1000 });
+
+    const reloaded = new Store();
+    expect(reloaded.whatsappState()).toMatchObject({
+      connected: false,
+      status: 'offline',
+      jid: '15551234567@s.whatsapp.net',
+      name: 'Me',
+      linkedAt: 1000,
+    });
+    expect(reloaded.whatsappState().connectedAt).toBeNull();
+  });
 });
 
 describe('Store — captured WhatsApp messages', () => {

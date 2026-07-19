@@ -8,6 +8,7 @@ import type { Providers } from './providers.js';
 import { isGitRepo, repoInfo, repoInfoAsync, resolveBaseBranch, resolveBaseBranchAsync, aheadBehindAsync, isDirtyAsync, localRefExistsAsync, dirtyFileCountAsync, lastCommitInfoAsync, pushBranch, fetchOrigin, mergeBaseIntoBranch, renameLocalBranch, branchSlug, listConflictedFiles, getActiveConflictHunks, ensureMaestroExcludes, type ConflictFile } from './git.js';
 import { parseGitHubRemote, findOpenPr, findRecentPr, getPullStatus, createPull, mergePull, getRepo, pickMergeMethod } from './github.js';
 import { deriveState, type LocalState, type LocalSnapshot, type PrStatus, type SessionGitStatus, type MergePreviewResult, type ResolvePreviewResult } from './pr-state.js';
+import { gitArtifactIdentity, type ReviewGateScope } from './review-gate.js';
 
 type Emit = (name: string, data: unknown, opts?: { live?: boolean; desktopOnly?: boolean }) => void;
 const EMPTY_LOCAL: LocalState = { isRepo: false, ahead: 0, behind: 0, dirty: false, pushed: false };
@@ -42,6 +43,20 @@ export class GitService {
   private dirFor(session: ChatSession, project: Project): string | null {
     if (session.worktreePath && existsSync(session.worktreePath)) return session.worktreePath;
     return project.path && isGitRepo(project.path) ? project.path : null;
+  }
+
+  private reviewRequired(session: ChatSession): boolean {
+    return session.reviewerEnabled === true && session.reviewer !== 'off';
+  }
+
+  private reviewGateForGit(session: ChatSession, dir: string): { ok: true } | { ok: false; reason: string } {
+    if (!this.reviewRequired(session)) return { ok: true };
+    const jobs = this.store.listJobs(session.projectId, session.id).filter(j => j.status === 'done' || j.status === 'failed');
+    const latest = jobs[0];
+    if (!latest) return { ok: false, reason: 'review gate blocked: no reviewed job exists for this session' };
+    const scope: ReviewGateScope = { projectId: session.projectId, sessionId: session.id, jobId: latest.id, artifactId: gitArtifactIdentity(dir) };
+    const gate = this.store.reviewGateCheck(scope, true);
+    return gate.allowed ? { ok: true } : { ok: false, reason: `review gate blocked: ${gate.reason}` };
   }
 
   /** Cheap local git facts (no network). Async so the git reads run off the
@@ -136,6 +151,8 @@ export class GitService {
     const project = this.store.getProject(session.projectId);
     const dir = project ? this.dirFor(session, project) : null;
     if (!dir || !session.branch) return { ok: false, reason: 'no worktree or branch for this session' };
+    const gate = this.reviewGateForGit(session, dir);
+    if (!gate.ok) return gate;
     const res = pushBranch(dir, session.branch, { token: this.token() });
     await this.fullStatus(session, { withPr: false });
     return res;
@@ -146,10 +163,12 @@ export class GitService {
     const project = this.store.getProject(session.projectId);
     const token = this.token();
     if (!project?.path || !session.branch) return { ok: false, reason: 'no repo or branch' };
+    const dir = this.dirFor(session, project) ?? project.path;
+    const gate = this.reviewGateForGit(session, dir);
+    if (!gate.ok) return gate;
     if (!token) return { ok: false, reason: 'connect GitHub first' };
     const gh = parseGitHubRemote(repoInfo(project.path).remote);
     if (!gh) return { ok: false, reason: 'this project has no GitHub remote' };
-    const dir = this.dirFor(session, project) ?? project.path;
     const push = pushBranch(dir, session.branch, { token });
     if (!push.ok) return { ok: false, reason: push.reason };
     try {
@@ -352,6 +371,8 @@ export class GitService {
     const dir = project ? this.dirFor(session, project) : null;
     if (!dir || !session.branch || !project?.path) return { ok: true, pushed: false, reason: 'no worktree or branch' };
     if (!parseGitHubRemote(repoInfo(project.path).remote)) return { ok: true, pushed: false, reason: 'no GitHub remote' };
+    const gate = this.reviewGateForGit(session, dir);
+    if (!gate.ok) return { ok: true, pushed: false, reason: gate.reason };
     // Anything to push? Compare against origin/<branch> when it exists (normal
     // incremental push), otherwise against the base (first push of the branch).
     const originRef = `origin/${session.branch}`;

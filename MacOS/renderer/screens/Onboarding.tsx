@@ -590,6 +590,10 @@ export default function Onboarding() {
         setProviders(prev => {
           const next = { ...prev };
           for (const c of conns) {
+            // Only a genuinely usable credential counts as connected here — a
+            // stored-but-unreadable one (status:'reconnect') must NOT be treated
+            // as connected, or onboarding would skip a required reconnect.
+            if (c.status !== 'connected') continue;
             if (c.provider === 'anthropic' || c.provider === 'openai' || c.provider === 'github') next[c.provider] = 'connected';
           }
           return next;

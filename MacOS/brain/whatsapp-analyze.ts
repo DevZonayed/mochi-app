@@ -55,13 +55,29 @@ export function analyzePrompt(chatName: string, transcript: string): string {
   ].join('\n');
 }
 
+/** Small stable string hash for a bounded idempotency key (djb2). */
+function hashKey(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
 function defaultSummarize(deps: WaAnalyzeDeps): NonNullable<WaAnalyzeDeps['summarize']> {
   return async ({ chatName, transcript, projectId, sessionId }) => {
     const project = (projectId ? deps.store.getProject(projectId) : undefined) ?? deps.store.listProjects()[0];
     if (!project) return ''; // no project to run a job in — skip (caller no-ops on empty)
-    const job = deps.store.createJob(project.id, analyzePrompt(chatName, transcript), `WhatsApp summary: ${chatName}`, 'fast', sessionId);
+    // TRIGGER IDEMPOTENCY (belt-and-suspenders atop the sinceReported watermark): a
+    // duplicate/concurrent quiet-timer fire for the SAME window (identical transcript)
+    // resolves to the ORIGINAL summary job instead of running a second analysis.
+    const idemKey = `wa-analyze:${sessionId ?? project.id}:${hashKey(chatName + '\0' + transcript)}`;
+    const claim = deps.store.claimIdempotentJob(idemKey, {
+      projectId: project.id, input: analyzePrompt(chatName, transcript), title: `WhatsApp summary: ${chatName}`, effort: 'fast', sessionId,
+      intent: { effort: 'fast', plan: false, goal: false, browser: false },
+    });
+    const job = claim.job;
     deps.emit('job', job);
-    const done = await deps.engine.run(job.id, { effort: 'fast' });
+    if (claim.duplicate) return (deps.store.getJob(job.id)?.output ?? '').trim();
+    const done = await deps.engine.run(job.id, {});
     return (done?.output ?? deps.store.getJob(job.id)?.output ?? '').trim();
   };
 }

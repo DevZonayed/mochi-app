@@ -8,6 +8,7 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Icon, type IconName } from '../lib/icons';
+import { formatRuntimeIdentity } from '../lib/runtimeIdentity';
 import {
   GroupedList, Row, Switch, EffortDial, ModelSwitcher, CopyCode,
   type EffortStop,
@@ -30,6 +31,7 @@ import { EngineSetup } from '../EngineSetup';
 import SkillsRegistry from './SkillsRegistry';
 import BudgetDashboard from './BudgetDashboard';
 import McpServersPane from './McpServersPane';
+import ControllersPane from './ControllersPane';
 
 /* ───────────────────────── page-specific CSS (from Settings.html) ───────────────────────── */
 const styles = `
@@ -142,6 +144,36 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
   );
 }
 
+/* ───────────────────── runtime identity footer ───────────────────── */
+/* Shows WHICH build is actually running (from the live health response — the real
+   app.getVersion() + validated channel), pinned to the bottom of the settings nav
+   column so it stays visible while the item list scrolls. Fail-soft: honest
+   loading/unavailable text, never a fabricated version. */
+function RuntimeFooter() {
+  const [health, setHealth] = React.useState<{ version?: string; channel?: string } | null>(null);
+  const [state, setState] = React.useState<'loading' | 'ready' | 'error'>('loading');
+  React.useEffect(() => {
+    let alive = true;
+    api.health()
+      .then(h => { if (alive) { setHealth({ version: h.version, channel: h.channel }); setState('ready'); } })
+      .catch(() => { if (alive) setState('error'); });
+    return () => { alive = false; };
+  }, []);
+
+  const id = state === 'ready' && health ? formatRuntimeIdentity(health) : null;
+  const name = id ? id.name : (state === 'loading' ? 'Checking runtime…' : 'Runtime unavailable');
+  const versionLabel = id ? id.versionLabel : (state === 'loading' ? 'Loading version…' : 'Version unavailable');
+  const aria = id ? id.ariaLabel : (state === 'loading' ? 'Checking runtime identity' : 'Runtime identity unavailable');
+
+  return (
+    <div role="status" aria-live="polite" aria-label={aria} title={aria}
+      style={{ flexShrink: 0, marginTop: 8, padding: '10px 10px 2px', borderTop: '0.5px solid var(--separator)' }}>
+      <div style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</div>
+      <div style={{ marginTop: 2, font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)' }}>{versionLabel}</div>
+    </div>
+  );
+}
+
 /* ───────────────────────── settings nav model ───────────────────────── */
 interface SetNavItem { key: string; icon: IconName; label: string; tint: string; }
 
@@ -155,6 +187,7 @@ const SET_NAV: SetNavItem[] = [
   { key: 'extension', icon: 'globe', label: 'Browser extension', tint: 'var(--blue)' },
   { key: 'browser', icon: 'globe', label: 'Browser', tint: 'var(--teal)' },
   { key: 'devices', icon: 'smartphone', label: 'Devices', tint: 'var(--teal)' },
+  { key: 'controllers', icon: 'shield', label: 'Controllers', tint: 'var(--blue)' },
 ];
 
 /* ───────────────────────── pane primitives ───────────────────────── */
@@ -616,7 +649,12 @@ function AccountsPane() {
       <GroupedList footer="Connections live on this Mac: your Claude Code / Codex sign-ins are detected automatically, and any API key is validated live and stored in the Mac's Keychain. Nothing leaves this machine.">
         {REAL_PROVIDERS.map((p, i) => {
           const c = connOf(p.id);
-          const connected = !!c;
+          // A stored-but-unreadable credential comes back as status:'reconnect'
+          // — it is NOT connected (must not show green) and NOT absent (must not
+          // pretend nothing is stored); it drops to the key-input path with an
+          // amber "Reconnect required" note so the user can paste a fresh key.
+          const needsReconnect = c?.status === 'reconnect';
+          const connected = !!c && !needsReconnect;
           const isOpenai = p.id === 'openai';
           const isGithub = p.id === 'github';
           // Codex ChatGPT OAuth button — available whether or not already signed
@@ -632,8 +670,8 @@ function AccountsPane() {
               <span style={{ width: 36, height: 36, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${p.tint} 15%, transparent)`, color: p.tint, font: '800 var(--fs-callout)/1 var(--font-display)' }}>{p.glyph}</span>
               <span style={{ flexShrink: 0, width: 138, minWidth: 0 }}>
                 <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>{p.name}</span>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: errors[p.id] ? 'var(--red)' : connected ? 'var(--green)' : 'var(--ink-secondary)', marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%' }}>
-                  <Icon name="lock" size={11} /> {errors[p.id] ? errors[p.id] : connected ? `Connected · ${c?.detail ?? 'this Mac'}` : p.meta}
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: errors[p.id] ? 'var(--red)' : needsReconnect ? 'var(--orange)' : connected ? 'var(--green)' : 'var(--ink-secondary)', marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%' }}>
+                  <Icon name="lock" size={11} /> {errors[p.id] ? errors[p.id] : needsReconnect ? (c?.detail ?? 'Reconnect required') : connected ? `Connected · ${c?.detail ?? 'this Mac'}` : p.meta}
                 </span>
               </span>
               {connected ? (
@@ -1467,6 +1505,7 @@ export default function Settings() {
     accounts: <AccountsPane />,
     security: <SecurityPane onExportAudit={() => navigate('/audit')} />,
     devices: <DevicesPane />,
+    controllers: <ControllersPane />,
     extension: <ExtensionPane />,
     browser: <BrowserPane />,
     power: <PowerPane />,
@@ -1475,7 +1514,7 @@ export default function Settings() {
   };
   const paneMaxWidth = sec === 'skills' || sec === 'costs'
     ? undefined
-    : ['mcp', 'external-mcp', 'accounts', 'extension', 'browser', 'devices'].includes(sec)
+    : ['mcp', 'external-mcp', 'accounts', 'extension', 'browser', 'devices', 'controllers'].includes(sec)
       ? 860
       : 760;
 
@@ -1492,14 +1531,17 @@ export default function Settings() {
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, position: 'relative', zIndex: 1 }}>
           <Toolbar theme={theme} setTheme={setTheme} onSearch={() => setPaletteOpen(true)} />
           <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-            {/* settings nav */}
-            <aside style={{ width: 232, flexShrink: 0, borderRight: '0.5px solid var(--separator)', padding: '20px 12px', overflowY: 'auto', background: 'var(--bg-grouped)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-              <div style={{ font: '700 var(--fs-title2)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)', padding: '0 10px 14px' }}>Settings</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+            {/* settings nav — fixed title + independently scrollable item list +
+                a pinned runtime-identity footer (stays visible while items scroll,
+                and it's here rather than only the main Sidebar because Coding mode
+                hides that Sidebar). */}
+            <aside style={{ width: 232, flexShrink: 0, borderRight: '0.5px solid var(--separator)', padding: '20px 12px', display: 'flex', flexDirection: 'column', minHeight: 0, background: 'var(--bg-grouped)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
+              <div style={{ font: '700 var(--fs-title2)/1 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)', padding: '0 10px 14px', flexShrink: 0 }}>Settings</div>
+              <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 1 }}>
                 {SET_NAV.map(n => {
                   const on = sec === n.key;
                   return (
-                    <button key={n.key} onClick={() => setSec(n.key)} className={on ? '' : 'set-nav'} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 38, padding: '0 10px', borderRadius: 8, textAlign: 'left',
+                    <button key={n.key} onClick={() => setSec(n.key)} className={on ? '' : 'set-nav'} style={{ display: 'flex', alignItems: 'center', gap: 11, height: 38, flexShrink: 0, padding: '0 10px', borderRadius: 8, textAlign: 'left',
                       background: on ? 'var(--blue)' : 'transparent', color: on ? '#fff' : 'var(--ink)', font: `${on ? 600 : 500} var(--fs-subhead)/1 var(--font-text)`, transition: 'background 140ms ease' }}>
                       <span style={{ width: 26, height: 26, borderRadius: 7, flexShrink: 0, display: 'grid', placeItems: 'center', background: on ? 'rgba(255,255,255,0.2)' : `color-mix(in srgb, ${n.tint} 14%, transparent)`, color: on ? '#fff' : n.tint }}><Icon name={n.icon} size={15} /></span>
                       {n.label}
@@ -1507,6 +1549,7 @@ export default function Settings() {
                   );
                 })}
               </div>
+              <RuntimeFooter />
             </aside>
             {/* pane — Skills/Costs embed their full screens, so they take the pane
                 full-bleed (own scroll + padding) instead of the maxWidth column. */}

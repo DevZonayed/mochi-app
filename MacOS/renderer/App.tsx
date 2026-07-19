@@ -1,6 +1,7 @@
 import React from 'react';
 import { HashRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { UpdateBanner } from './lib/UpdateBanner';
+import { ScreenShareBannerHost } from './lib/ScreenShareBanner';
 import { NotificationCenter } from './lib/notify';
 import { RemotePairGate } from './lib/RemotePairGate';
 import { ErrorBoundary } from './lib/ErrorBoundary';
@@ -126,6 +127,8 @@ export function App() {
       </React.Suspense>
       </ErrorBoundary>
       <UpdateBanner />
+      {/* Phase 3D1: host-visible banner while a controller views this Mac's screen. */}
+      {IS_LOCAL && <ScreenShareBannerHost />}
       <NotificationCenter />
       {/* Mac-local: hard-button gate for the agent's pr_merge / pr_resolve_conflicts.
           Subscribes to `pr-confirm-request` events and re-invokes the existing

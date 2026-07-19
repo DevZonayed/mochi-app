@@ -9,6 +9,7 @@ import { Icon } from '../Icon';
 import { Group, Row } from '../ui';
 import { api, API_BASE, type Device, type Workspace, type Effort as ApiEffort, type EngineId } from '../api';
 import { signOut, getActiveHost } from '../auth';
+import { activateControllerMode } from '../controllerMode';
 import { setFlag, ONBOARDED, getFlag, BIOMETRIC_GATE, clearCache } from '../storage';
 import { unregisterPush } from '../push';
 import { NOTIF_CATEGORIES, getNotifPrefs, setNotifPref } from '../notifPrefs';
@@ -371,6 +372,19 @@ export function SettingsScreen() {
               </View>
               <View style={rowLabel}><Text style={labelText}>Active Mac</Text></View>
               <Text style={{ fontSize: 14, fontWeight: '500', color: theme.color.inkTertiary }}>{activeMac?.name ?? (getActiveHost() ? 'Selected' : 'None')}</Text>
+              <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
+            </Row>
+          </Group>
+        </View>
+
+        {/* Secure controller — the encrypted, read-only mirror (Phase 3C2). */}
+        <View style={{ marginBottom: 22 }}>
+          <Group header="Secure controller" footer="Switch to an end-to-end encrypted, read-only mirror of your Mac. This replaces the app with the secure controller; approve this device from Settings → Controllers on the Mac.">
+            <Row last onPress={() => { void activateControllerMode(); }}>
+              <View style={{ width: 30, height: 30, borderRadius: 8, backgroundColor: theme.color.green + '24', alignItems: 'center', justifyContent: 'center' }}>
+                <Icon name="shield" size={16} color={theme.color.green} />
+              </View>
+              <View style={rowLabel}><Text style={labelText}>Secure controller</Text></View>
               <Icon name="chevronRight" size={16} color={theme.color.inkTertiary} />
             </Row>
           </Group>

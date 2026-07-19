@@ -42,11 +42,11 @@ describe('CronRunner — scheduled message', () => {
 
     (cron as unknown as { tick(): void }).tick();
 
-    // The engine ran exactly once, carrying the captured composer intent.
+    // The engine ran exactly once; the job carries the captured composer intent
+    // and the P0 lease resolves it inside engine.run.
     expect(run).toHaveBeenCalledTimes(1);
     const opts = run.mock.calls[0][1];
-    expect(opts.effort).toBe('deep');
-    expect(opts.browser).toBe(true);
+    expect(opts).toEqual({});
 
     // A real chat job landed in the session with the message text + effort.
     const jobs = s.listJobs(project.id, session.id);
@@ -54,11 +54,48 @@ describe('CronRunner — scheduled message', () => {
     expect(jobs[0].input).toBe('Ship the release now');
     expect(jobs[0].effort).toBe('deep');
     expect(jobs[0].sessionId).toBe(session.id);
+    expect(jobs[0].intent).toMatchObject({ schemaVersion: 1, effort: 'deep', browser: true });
 
     // One-shot: it disabled itself and recorded the run (no re-fire).
     const sched = s.listSchedules()[0];
     expect(sched.enabled).toBe(false);
     expect(sched.lastRun).toBeTruthy();
+  });
+
+  it('fires a due message with full canonical intent, including explicit off/false', () => {
+    const { s, project, session } = setup();
+    const { engine, run } = makeEngine();
+    const cron = new CronRunner(s, engine, vi.fn());
+
+    s.createSchedule({
+      projectId: project.id, sessionId: session.id,
+      title: 'Plan off', prompt: 'continue', fireAt: Date.now() - 1_000,
+      kind: 'message',
+      intent: {
+        effort: 'deep',
+        engine: 'codex',
+        model: 'gpt-5',
+        reviewer: 'off',
+        plan: false,
+        goal: true,
+        browser: false,
+      },
+    });
+
+    (cron as unknown as { tick(): void }).tick();
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][1]).toEqual({});
+    expect(s.listJobs(project.id, session.id)[0].intent).toEqual({
+      schemaVersion: 1,
+      effort: 'deep',
+      engine: 'codex',
+      model: 'gpt-5',
+      reviewer: 'off',
+      plan: false,
+      goal: true,
+      browser: false,
+    });
   });
 
   it('does not fire a message whose time is still in the future', () => {
@@ -90,6 +127,27 @@ describe('CronRunner — scheduled message', () => {
 
     expect(run).toHaveBeenCalledTimes(1);
     expect(s.listJobs(project.id, session.id)).toHaveLength(1);
+  });
+
+  it('manual fireNow creates a fresh job for each explicit run', () => {
+    const { s, project, session } = setup();
+    const { engine, run } = makeEngine();
+    const cron = new CronRunner(s, engine, vi.fn());
+
+    const sched = s.createSchedule({
+      projectId: project.id, sessionId: session.id,
+      title: 'Manual repeat', prompt: 'run this now',
+      fireAt: Date.now() + 60 * 60_000,
+      kind: 'message',
+    });
+
+    expect(cron.fireNow(sched.id)).toBe(true);
+    expect(cron.fireNow(sched.id)).toBe(true);
+
+    expect(run).toHaveBeenCalledTimes(2);
+    const jobs = s.listJobs(project.id, session.id);
+    expect(jobs).toHaveLength(2);
+    expect(new Set(jobs.map(j => j.id)).size).toBe(2);
   });
 
   it('persists kind/effort/browser and a fresh Store reads them back', () => {
@@ -142,6 +200,29 @@ describe('CronRunner — scheduled message', () => {
     const jobs = s.listJobs(project.id, session.id);
     expect(jobs[0].input).toMatch(/^\[User answered AskUserQuestion\]:/);
     expect(s.listSchedules()[0].enabled).toBe(false);
+  });
+
+  it('does not fire an orphan-cleaned auto-answer after restart', () => {
+    const { s, project, session } = setup();
+    const orphan = s.createJob(project.id, 'ask', 'ask', undefined, session.id);
+    s.updateJob(orphan.id, { status: 'running' });
+    s.createSchedule({
+      projectId: project.id, sessionId: session.id, kind: 'auto-answer',
+      sourceJobId: orphan.id,
+      title: 'Auto-answer orphan', prompt: '[User answered AskUserQuestion]: Use a recommended default',
+      fireAt: Date.now() - 1_000, armedAt: Date.now() - 5 * 60_000, extends: 0,
+    });
+
+    expect(s.settleOrphanedRuns().failed).toHaveLength(1);
+    const reloaded = new Store();
+    const { engine, run } = makeEngine();
+    const cron = new CronRunner(reloaded, engine, vi.fn()) as unknown as { tick(): void };
+
+    cron.tick();
+
+    expect(run).not.toHaveBeenCalled();
+    expect(reloaded.listJobs(project.id, session.id)).toHaveLength(1);
+    expect(reloaded.listSchedules()[0].enabled).toBe(false);
   });
 
   it('never fires a paused auto-answer (user extended past the cap)', () => {

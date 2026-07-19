@@ -14,7 +14,7 @@ import { navRef } from './navRef';
 
 /** Shape the relay attaches to every alert push (see apps/server `PushNavData`). */
 export type PushNavData = {
-  kind?: 'job-done' | 'job-failed' | 'approval' | 'schedule-late';
+  kind?: 'job-done' | 'job-failed' | 'job-gated' | 'approval' | 'schedule-late';
   projectId?: string;
   sessionId?: string;
   jobId?: string;
@@ -39,7 +39,7 @@ function dataOf(response: Notifications.NotificationResponse | null | undefined)
 export function routeFor(data: PushNavData | null): { name: 'SessionChat' | 'Approvals' | 'Home'; params?: { projectId: string; sessionId?: string } } | null {
   if (!data) return null;
   // Job-complete / job-failed always carry projectId + (usually) sessionId.
-  if ((data.kind === 'job-done' || data.kind === 'job-failed') && data.projectId) {
+  if ((data.kind === 'job-done' || data.kind === 'job-failed' || data.kind === 'job-gated') && data.projectId) {
     return { name: 'SessionChat', params: { projectId: data.projectId, sessionId: data.sessionId } };
   }
   // Attention (approval): prefer the originating session chat, otherwise the

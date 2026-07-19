@@ -19,6 +19,9 @@ import { SessionStateDot } from './SessionStateDot';
 import { ErrorBoundary } from '../lib/ErrorBoundary';
 import { useSessionStateOnly, useProjectRollupState } from '../lib/useSessionGitState';
 import { formatTranscript, type TranscriptMode } from '../lib/transcript-export';
+import { runTranscriptCopy, type TranscriptCopyOutcome } from '../lib/transcript-copy';
+import { createSingleFlight } from '../lib/single-flight';
+import { useMountedTimerBag } from '../lib/useMountedTimerBag';
 import { BranchPicker } from '../components/BranchPicker';
 import { projectColor } from '../lib/project-color';
 import { projectVisibleTabs, lastTabForProject } from '../lib/tab-grouping';
@@ -202,6 +205,17 @@ export default function Workspace({ operator = false }: { operator?: boolean } =
   const [menuCopied, setMenuCopied] = React.useState<TranscriptMode | null>(null); // ✓ flash inside the open menu
   const [copyHint, setCopyHint] = React.useState<string | null>(null);             // transient toast after a copy
   const copyHintTimer = React.useRef<number | null>(null);
+  // Unmount-safe delayed UI: every setTimeout the copy flow schedules goes
+  // through `bag()`, which clears them all + no-ops any late callback on
+  // unmount so we never setState on a dead Workspace. StrictMode-safe (the hook
+  // re-arms across React 18's dev setup→cleanup→setup remount).
+  const { mounted: mountedRef, bag: timerBag } = useMountedTimerBag();
+  // Coalesce rapid duplicate copy actions (double right-click / repeated ⌘⌥C)
+  // per session+mode so they share ONE fetch + pasteboard write. Lazy-init so
+  // the coordinator is allocated exactly once, not on every render.
+  const copyFlightRef = React.useRef<ReturnType<typeof createSingleFlight<TranscriptCopyOutcome>> | null>(null);
+  if (copyFlightRef.current === null) copyFlightRef.current = createSingleFlight<TranscriptCopyOutcome>();
+  const copyFlight = copyFlightRef.current;
   // active chat's turns, lifted from each ChatThread, for the "Changed files" panel
   const [turnsByTab, setTurnsByTab] = React.useState<Record<string, Job[]>>({});
   // Sessions with a job running/pending right now — drives the sidebar loading spinners.
@@ -422,13 +436,37 @@ export default function Workspace({ operator = false }: { operator?: boolean } =
   // open tab across every project — this is just the render filter.
   const visibleTabs = React.useMemo(() => projectVisibleTabs(tabs, activeProjectId), [tabs, activeProjectId]);
 
-  // Open a file as a tab (deduped on its path).
-  const openFile = (projectId: string, filePath: string) => {
-    const existing = tabs.find(t => t.kind === 'file' && t.filePath === filePath);
+  // Open a file as a tab. Deduped by project + session + path so the SAME file
+  // opened against two different session worktrees (which can hold different
+  // bytes) gets its own tab, while a re-click of the same (project,session,path)
+  // just re-focuses. The path resolves against the given session's worktree.
+  const fileTabKey = (projectId: string, sessionId: string | null, filePath: string) =>
+    `file:${projectId}|${sessionId ?? ''}|${filePath}`;
+  const openFile = (projectId: string, filePath: string, sessionId: string | null = null) => {
+    const key = fileTabKey(projectId, sessionId, filePath);
+    const existing = tabs.find(t => t.kind === 'file' && t.key === key);
     if (existing) { setActiveKey(existing.key); setActiveProjectId(existing.projectId); return; }
-    const key = 'file:' + filePath;
-    setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId: null, title: filePath.split('/').pop() ?? filePath, kind: 'file', filePath }]));
+    setTabs(ts => (ts.some(t => t.key === key) ? ts : [...ts, { key, projectId, sessionId, title: filePath.split('/').pop() ?? filePath, kind: 'file', filePath }]));
     setActiveKey(key); setActiveProjectId(projectId);
+  };
+  // Once a FileViewer resolves the canonical absolute path, re-key its tab so a
+  // later open of a different-shaped input (relative vs. absolute) for the same
+  // file collapses onto the existing tab instead of stacking a duplicate.
+  const onFileCanonical = (tabKey: string, canonical: string) => {
+    setTabs(ts => {
+      const me = ts.find(t => t.key === tabKey && t.kind === 'file');
+      if (!me) return ts;
+      const canonKey = fileTabKey(me.projectId, me.sessionId, canonical);
+      if (canonKey === tabKey) return ts;
+      const twin = ts.find(t => t.key === canonKey && t.kind === 'file');
+      if (twin) {
+        // an existing tab already shows the canonical file — drop this duplicate
+        setActiveKey(cur => (cur === tabKey ? canonKey : cur));
+        return ts.filter(t => t.key !== tabKey);
+      }
+      setActiveKey(cur => (cur === tabKey ? canonKey : cur));
+      return ts.map(t => (t.key === tabKey ? { ...t, key: canonKey, filePath: canonical } : t));
+    });
   };
   // Open a generated/attached image in its own VS Code-style tab (not Finder).
   const openImage = (projectId: string, assetId: string, name: string, imagePath?: string) => {
@@ -478,9 +516,9 @@ export default function Workspace({ operator = false }: { operator?: boolean } =
     setProjects(ps => (ps.some(x => x.id === proj.id) ? ps : [proj, ...ps]));
     setExpanded(e => new Set(e).add(proj.id));
     setCopyHint(`Project '${proj.name}' added — click to open chat`);
-    if (copyHintTimer.current) window.clearTimeout(copyHintTimer.current);
-    copyHintTimer.current = window.setTimeout(() => setCopyHint(null), 2400);
-  }, []);
+    if (copyHintTimer.current != null) timerBag().clear(copyHintTimer.current);
+    copyHintTimer.current = timerBag().set(() => setCopyHint(null), 2400);
+  }, [timerBag]);
 
   // keep the active tab in view + recompute whether the strip overflows
   React.useLayoutEffect(() => {
@@ -618,20 +656,35 @@ export default function Workspace({ operator = false }: { operator?: boolean } =
 
   // ── Copy transcript (concise | full) — the chat tab's context menu, à la Conductor ──
   const showCopyHint = (msg: string) => {
+    if (!mountedRef.current) return;
     setCopyHint(msg);
-    if (copyHintTimer.current) window.clearTimeout(copyHintTimer.current);
-    copyHintTimer.current = window.setTimeout(() => setCopyHint(null), 1700);
+    if (copyHintTimer.current != null) timerBag().clear(copyHintTimer.current);
+    copyHintTimer.current = timerBag().set(() => setCopyHint(null), 1700);
   };
-  const copyTranscript = async (tab: Tab, mode: TranscriptMode) => {
-    if (!tab.sessionId) { showCopyHint('Send a message first'); return; }
-    try {
-      // ChatThread lazy-loads the visible transcript page; copy is an explicit
-      // user action, so fetch the complete session here.
-      const jobs = await api.listJobs(undefined, tab.sessionId);
-      if (!jobs.length) { showCopyHint('Nothing to copy yet'); return; }
-      await navigator.clipboard?.writeText(formatTranscript(jobs, { mode, title: tab.title }));
-      showCopyHint(mode === 'concise' ? 'Copied concise transcript' : 'Copied full transcript');
-    } catch { showCopyHint('Copy failed'); }
+  const copyTranscript = (tab: Tab, mode: TranscriptMode): Promise<TranscriptCopyOutcome> => {
+    // The canonical path for BOTH the tab context menu and the ⌘⌥C shortcut.
+    // ChatThread lazy-loads only the visible transcript page; copy is an
+    // explicit user action, so we fetch the complete session here. Native
+    // WebKit rejects the web Clipboard API, so the copy routes through the
+    // native pasteboard bridge (api.copyTextNative) with a browser fallback,
+    // and we only claim success on a confirmed { ok:true }.
+    //
+    // Rapid duplicate actions (double right-click, repeated ⌘⌥C) coalesce onto
+    // ONE in-flight run per session+mode via the single-flight coordinator, so
+    // we never fire two listJobs fetches / two pasteboard writes for the same
+    // request. Distinct session/mode copies stay independent.
+    const key = `${tab.sessionId ?? 'no-session'}::${mode}`;
+    return copyFlight.run(key, async () => {
+      const outcome = await runTranscriptCopy({
+        hasSession: !!tab.sessionId,
+        loadJobs: () => api.listJobs(undefined, tab.sessionId ?? undefined),
+        format: jobs => formatTranscript(jobs, { mode, title: tab.title }),
+        copy: text => api.copyTextNative(text),
+      });
+      if (outcome.ok) showCopyHint(mode === 'concise' ? 'Copied concise transcript' : 'Copied full transcript');
+      else showCopyHint(outcome.message);
+      return outcome;
+    });
   };
   const openTabMenu = (e: React.MouseEvent, t: Tab) => {
     e.preventDefault(); e.stopPropagation();
@@ -639,9 +692,17 @@ export default function Workspace({ operator = false }: { operator?: boolean } =
     setTabMenu({ key: t.key, x: e.clientX, y: e.clientY });
   };
   const doMenuCopy = (t: Tab, mode: TranscriptMode) => {
-    void copyTranscript(t, mode);
-    setMenuCopied(mode); // ✓ flashes on the row, then the menu closes
-    window.setTimeout(() => { setTabMenu(null); setMenuCopied(null); }, 620);
+    // Only flash the ✓ AFTER the copy actually succeeds — never optimistically,
+    // so a failed copy shows the truthful hint instead of a false "Copied".
+    void copyTranscript(t, mode).then(outcome => {
+      if (!mountedRef.current) return; // Workspace unmounted mid-copy — don't touch dead state
+      if (outcome.ok) {
+        setMenuCopied(mode); // ✓ flashes on the row, then the menu closes
+        timerBag().set(() => { setTabMenu(null); setMenuCopied(null); }, 620);
+      } else {
+        setTabMenu(null); // close the menu; copyTranscript already surfaced the reason
+      }
+    });
   };
   // ⌘⌥C → copy the active chat's concise transcript. Option+C emits 'ç', so match e.code.
   // (A custom chord with no native-menu accelerator, so preventDefault is reliable —
@@ -1199,7 +1260,7 @@ export default function Workspace({ operator = false }: { operator?: boolean } =
               {Array.from(new Map(tabs.map(t => [t.key, t])).values()).map(t => (
                 <div key={t.key} style={{ position: 'absolute', inset: 0, display: t.key === activeKey ? 'flex' : 'none' }}>
                   {t.kind === 'file' && t.filePath
-                    ? <FileViewer projectId={t.projectId} filePath={t.filePath} />
+                    ? <FileViewer projectId={t.projectId} filePath={t.filePath} sessionId={t.sessionId ?? undefined} onCanonical={c => onFileCanonical(t.key, c)} />
                     : t.kind === 'image'
                     ? <ImageViewer assetId={t.imageAssetId} name={t.title} imagePath={t.imagePath} />
                     : t.kind === 'project'
@@ -1208,14 +1269,14 @@ export default function Workspace({ operator = false }: { operator?: boolean } =
                         sessionId={t.sessionId} base={t.base} onSessionCreated={onSessionCreated(t.key)} onOpenSession={openSession}
                         onTurns={js => setTurnsByTab(m => ({ ...m, [t.key]: js }))}
                         onOpenImage={(assetId, name, imagePath) => openImage(t.projectId, assetId, name, imagePath)}
-                        onOpenFile={(filePath) => openFile(t.projectId, filePath)} /></ErrorBoundary>}
+                        onOpenFile={(filePath, sessionId) => openFile(t.projectId, filePath, sessionId ?? t.sessionId ?? null)} /></ErrorBoundary>}
                 </div>
               ))}
             </div>
             {IS_LOCAL && activeProject?.path && (
               <RightSidebar project={activeProject} changed={changedFiles} checks={checks}
                 session={sessions.find(s => s.id === activeTab?.sessionId) ?? null}
-                onOpenFile={p => openFile(activeProject.id, p)}
+                onOpenFile={p => openFile(activeProject.id, p, activeTab?.sessionId ?? null)}
                 collapsed={sidebarCollapsed} onToggleCollapse={toggleSidebar} />
             )}
           </div>

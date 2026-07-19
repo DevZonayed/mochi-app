@@ -6,7 +6,7 @@
    GET /api/sync?host=; live updates ride the /ws/remote WebSocket (RN's global
    WebSocket — no SSE). Same data shapes/contract as the desktop client. */
 
-export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
+export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled' | 'gated';
 export type Effort = 'fast' | 'balanced' | 'deep' | 'max';
 export type ApprovalKind = 'merge' | 'budget' | 'publish' | 'deploy' | 'review';
 export type ApprovalStatus = 'pending' | 'approved' | 'denied';
@@ -29,6 +29,7 @@ export interface TranscriptItem {
   toolStatus?: 'running' | 'done' | 'error';
   verdict?: 'approved' | 'needs-work';
   resolved?: boolean;
+  findings?: ReviewFinding[];
   durMs?: number;
   preview?: string;
   ask?: string;
@@ -47,10 +48,28 @@ export interface TranscriptItem {
   result?: string;
   ts: number;
 }
+export interface ReviewFinding {
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  message: string;
+  file?: string;
+}
+export interface JobReviewProjection {
+  schemaVersion: 1;
+  status: 'needs-work' | 'failed-closed';
+  verdict?: 'NEEDS_WORK';
+  gateId: string;
+  artifactId: string;
+  reviewer: string;
+  reason: string;
+  summary: string;
+  findings: ReviewFinding[];
+  completedAt: number;
+}
 export interface Job {
   id: string; projectId: string; sessionId?: string; title: string; status: JobStatus; phase: string; progress: number;
   input: string; output: string | null; error: string | null; effort: Effort; cost: number; tokens: number; stage: string;
   engine?: EngineId; model?: string; goal?: boolean; transcript?: TranscriptItem[]; createdAt: number; updatedAt: number;
+  review?: JobReviewProjection;
 }
 export interface JobPage {
   jobs: Job[];
@@ -106,7 +125,7 @@ export interface SyncDelta {
   };
 }
 export type AppEventKind =
-  | 'job-done' | 'job-failed' | 'job-cancelled'
+  | 'job-done' | 'job-failed' | 'job-gated' | 'job-cancelled'
   | 'approval-created' | 'approval-resolved'
   | 'schedule-fired' | 'clone-done' | 'clone-failed'
   | 'research' | 'publish' | 'comm' | 'asset';

@@ -163,7 +163,7 @@ export async function handleJsonRpc(msg: JsonRpcRequest, ctx: HandleCtx): Promis
         return ok({ content: [{ type: 'text', text: asText(result) }], structuredContent: wrapStructured(result) });
       } catch (e) {
         const err = e as { message?: string };
-        return ok(toolError(`Mochi action "${name}" failed: ${err?.message ?? 'error'}`));
+        return ok(toolError(`Mochi action "${name}" failed: ${err?.message ?? 'error'}`, publicMcpError(e)));
       }
     }
     default:
@@ -172,13 +172,38 @@ export async function handleJsonRpc(msg: JsonRpcRequest, ctx: HandleCtx): Promis
   }
 }
 
-function toolError(text: string) {
-  return { content: [{ type: 'text', text }], isError: true };
+function toolError(text: string, structuredContent?: Record<string, unknown>) {
+  return structuredContent
+    ? { content: [{ type: 'text', text }], structuredContent, isError: true }
+    : { content: [{ type: 'text', text }], isError: true };
 }
 /** MCP structuredContent must be an object; wrap primitives/arrays. */
 function wrapStructured(v: unknown): Record<string, unknown> {
   if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, unknown>;
   return { result: v };
+}
+
+const PUBLIC_MCP_CODE_RE = /^WA_[A-Z0-9_]{1,48}$/;
+const PUBLIC_MCP_MESSAGES = new Set([
+  'WhatsApp is not linked',
+  'WhatsApp is already linked; use reconnect',
+  'WhatsApp unlink is in progress',
+  'WhatsApp link timed out',
+  'WhatsApp link cancelled: paused',
+  'WhatsApp link cancelled: unlinked',
+  'WhatsApp link cancelled: reconnect',
+  'WhatsApp link cancelled: replaced',
+  'WhatsApp link cancelled: stale',
+]);
+
+function publicMcpError(e: unknown): Record<string, unknown> | undefined {
+  if (!e || typeof e !== 'object') return undefined;
+  const err = e as { mcpPublic?: unknown; code?: unknown; statusCode?: unknown; message?: unknown };
+  if (err.mcpPublic !== true) return undefined;
+  if (typeof err.code !== 'string' || !PUBLIC_MCP_CODE_RE.test(err.code)) return undefined;
+  if (!Number.isInteger(err.statusCode) || (err.statusCode as number) < 400 || (err.statusCode as number) > 499) return undefined;
+  if (typeof err.message !== 'string' || !PUBLIC_MCP_MESSAGES.has(err.message)) return undefined;
+  return { error: { code: err.code, statusCode: err.statusCode, message: err.message } };
 }
 
 /* ────────────────────────────── HTTP + stdio transports ────────────────────────────── */

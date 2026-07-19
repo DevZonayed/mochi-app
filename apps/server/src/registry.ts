@@ -25,7 +25,7 @@ export interface RegistrySkill {
   description: string;
   license: string;
   tags: string[];
-  security: { risk: string; providers: { provider: string; status: string; riskLevel?: string; summary?: string; auditedAt?: string }[] };
+  security: { risk: string; providers: { provider: string; status: string; riskLevel?: string; summary?: string; auditedAt?: string; auditedDigest?: string | null }[] };
   source: string;
   directory: string;
   installCmd: string;
@@ -109,6 +109,8 @@ async function embedText(text: string): Promise<Float32Array> {
 
 function now(): string { return new Date().toISOString(); }
 function sha256(s: string | Buffer): string { return createHash('sha256').update(s).digest('hex'); }
+const SHA256_RE = /^[a-f0-9]{64}$/;
+const PASS_AUDITS = new Set(['pass', 'passed', 'ok', 'clean', 'approved']);
 function json<T>(s: string, fallback: T): T { try { return JSON.parse(s) as T; } catch { return fallback; } }
 function clampLimit(v: unknown, def = 30, max = 100): number {
   return Math.min(Math.max(Number(v) || def, 1), max);
@@ -148,6 +150,57 @@ function scoreRisk(risk: string): number {
   return -4;
 }
 
+export function auditForServedSkillBytes(input: {
+  skillId: string;
+  hash: string;
+  providers: RegistrySkill['security']['providers'];
+}): { identity: string | null; status: string; auditedDigest: string | null; checkedAt?: string | null } {
+  const pass = input.providers.find(a => {
+    const status = String(a.status || '').toLowerCase();
+    const digest = String(a.auditedDigest || '').toLowerCase();
+    return PASS_AUDITS.has(status) && SHA256_RE.test(digest) && digest === input.hash;
+  }) ?? null;
+  if (pass) return { identity: `${input.skillId}:${pass.provider}:${pass.status}:${input.hash}`, status: pass.status, auditedDigest: input.hash, checkedAt: pass.auditedAt ?? null };
+  const first = input.providers[0] ?? null;
+  return { identity: null, status: first ? 'pending' : 'unverified', auditedDigest: null, checkedAt: first?.auditedAt ?? null };
+}
+
+export function summaryAuditEvidence(s: RegistrySkill): { auditEvidenceId: string | null; auditedDigest: string | null } {
+  const digest = String(s.sha256 || '').toLowerCase();
+  if (!SHA256_RE.test(digest)) return { auditEvidenceId: null, auditedDigest: null };
+  const audit = auditForServedSkillBytes({ skillId: s.id, hash: digest, providers: s.security.providers });
+  return { auditEvidenceId: audit.identity, auditedDigest: audit.auditedDigest };
+}
+
+export function providerAuditedDigest(provider: { status?: string; auditedDigest?: string | null; audited_digest?: string | null; provider?: string }): string | null {
+  const explicit = String(provider.auditedDigest ?? provider.audited_digest ?? '').toLowerCase();
+  if (SHA256_RE.test(explicit)) return explicit;
+  return null;
+}
+
+export function auditProvidersForServedBytes(
+  audit: { secure: boolean; risk: string; providers: RegistrySkill['security']['providers'] },
+  servedDigest: string,
+  servedCommit?: string | null,
+): RegistrySkill['security']['providers'] {
+  const digest = String(servedDigest || '').toLowerCase();
+  if (!audit.secure || !SHA256_RE.test(digest)) return audit.providers;
+  const commit = String(servedCommit || '').trim().toLowerCase();
+  return audit.providers.map((a) => {
+    const explicit = providerAuditedDigest(a);
+    if (explicit) return { ...a, auditedDigest: explicit };
+    const status = String(a.status || '').toLowerCase();
+    const auditCommit = String(
+      (a as { commitSha?: string; commit?: string; auditedCommit?: string; commit_sha?: string }).commitSha ??
+      (a as { commitSha?: string; commit?: string; auditedCommit?: string; commit_sha?: string }).commit ??
+      (a as { commitSha?: string; commit?: string; auditedCommit?: string; commit_sha?: string }).auditedCommit ??
+      (a as { commitSha?: string; commit?: string; auditedCommit?: string; commit_sha?: string }).commit_sha ??
+      '',
+    ).trim().toLowerCase();
+    return PASS_AUDITS.has(status) && commit && auditCommit === commit ? { ...a, auditedDigest: digest } : a;
+  });
+}
+
 function rowToSkill(r: SkillRow, audits?: RegistrySkill['security']['providers']): RegistrySkill {
   const tags = json<string[]>(r.tags_json || '[]', []);
   return {
@@ -182,7 +235,9 @@ function rowToSkill(r: SkillRow, audits?: RegistrySkill['security']['providers']
   };
 }
 
-const summary = (s: RegistrySkill) => ({
+const summary = (s: RegistrySkill) => {
+  const audit = summaryAuditEvidence(s);
+  return {
   id: s.id,
   name: s.name,
   description: s.description,
@@ -203,9 +258,13 @@ const summary = (s: RegistrySkill) => ({
   version: 'latest',
   sha256: s.sha256 ?? null,
   auditStatus: s.auditStatus ?? null,
-});
+  commitSha: s.commitSha ?? null,
+  auditEvidenceId: audit.auditEvidenceId,
+  auditedDigest: audit.auditedDigest,
+  };
+};
 
-class RegistryStore {
+export class RegistryStore {
   readonly db: Database.Database;
 
   constructor(file = DB_PATH) {
@@ -286,6 +345,7 @@ class RegistryStore {
         risk_level TEXT,
         summary TEXT,
         audited_at TEXT,
+        audited_digest TEXT,
         raw_json TEXT,
         UNIQUE(skill_id, provider)
       );
@@ -307,6 +367,10 @@ class RegistryStore {
       CREATE INDEX IF NOT EXISTS idx_skills_repo ON skills(owner, repo);
       CREATE INDEX IF NOT EXISTS idx_events_ts ON registry_events(ts);
     `);
+    const auditCols = this.db.prepare('PRAGMA table_info(skill_audits)').all() as Array<{ name: string }>;
+    if (!auditCols.some(c => c.name === 'audited_digest')) {
+      this.db.exec('ALTER TABLE skill_audits ADD COLUMN audited_digest TEXT');
+    }
   }
 
   importSeedIfNeeded(): void {
@@ -352,11 +416,11 @@ class RegistryStore {
         skill_path=excluded.skill_path, raw_base=excluded.raw_base, updated_at=excluded.updated_at
     `);
     const insertAudit = this.db.prepare(`
-      INSERT INTO skill_audits (skill_id, provider, status, risk_level, summary, audited_at, raw_json)
-      VALUES (@skill_id, @provider, @status, @risk_level, @summary, @audited_at, @raw_json)
+      INSERT INTO skill_audits (skill_id, provider, status, risk_level, summary, audited_at, audited_digest, raw_json)
+      VALUES (@skill_id, @provider, @status, @risk_level, @summary, @audited_at, @audited_digest, @raw_json)
       ON CONFLICT(skill_id, provider) DO UPDATE SET
         status=excluded.status, risk_level=excluded.risk_level, summary=excluded.summary,
-        audited_at=excluded.audited_at, raw_json=excluded.raw_json
+        audited_at=excluded.audited_at, audited_digest=excluded.audited_digest, raw_json=excluded.raw_json
     `);
     const insertVec = this.db.prepare(`
       INSERT INTO skill_embeddings (skill_id, model, dim, scale, vector, updated_at)
@@ -409,6 +473,7 @@ class RegistryStore {
             risk_level: a.riskLevel || '',
             summary: a.summary || '',
             audited_at: a.auditedAt || '',
+            audited_digest: (a as { auditedDigest?: string; audited_digest?: string }).auditedDigest ?? (a as { auditedDigest?: string; audited_digest?: string }).audited_digest ?? null,
             raw_json: JSON.stringify(a),
           });
         }
@@ -449,7 +514,7 @@ class RegistryStore {
   get(id: string, includeDisabled = true): RegistrySkill | null {
     const row = this.db.prepare(`SELECT * FROM skills WHERE id=? ${includeDisabled ? '' : 'AND enabled=1'}`).get(id) as SkillRow | undefined;
     if (!row) return null;
-    const audits = this.db.prepare('SELECT provider, status, risk_level AS riskLevel, summary, audited_at AS auditedAt FROM skill_audits WHERE skill_id=? ORDER BY provider')
+    const audits = this.db.prepare('SELECT provider, status, risk_level AS riskLevel, summary, audited_at AS auditedAt, audited_digest AS auditedDigest FROM skill_audits WHERE skill_id=? ORDER BY provider')
       .all(id) as RegistrySkill['security']['providers'];
     return rowToSkill(row, audits);
   }
@@ -521,18 +586,52 @@ class RegistryStore {
     return { count: includeDisabled ? this.countAll() : this.countEnabled(), mode: 'keyword-db', results: results.map(summary) };
   }
 
-  cachedContent(id: string, version: string): { skillMd: string; sha256: string | null } | null {
-    const row = this.db.prepare('SELECT skill_md, sha256 FROM skill_versions WHERE skill_id=? AND version=? AND skill_md IS NOT NULL')
-      .get(id, version) as { skill_md: string; sha256: string | null } | undefined;
-    return row?.skill_md ? { skillMd: row.skill_md, sha256: row.sha256 } : null;
+  cachedContent(id: string, version: string): { skillMd: string; sha256: string | null; commitSha: string | null } | null {
+    const row = this.db.prepare('SELECT skill_md, sha256, commit_sha FROM skill_versions WHERE skill_id=? AND version=? AND skill_md IS NOT NULL')
+      .get(id, version) as { skill_md: string; sha256: string | null; commit_sha: string | null } | undefined;
+    return row?.skill_md ? { skillMd: row.skill_md, sha256: row.sha256, commitSha: row.commit_sha ?? null } : null;
   }
 
-  async content(id: string, version = 'latest'): Promise<{ id: string; name: string; skillMd: string; sha256: string; enabled: boolean }> {
+  private persistAuditEvidenceForServedBytes(id: string, audit: { secure: boolean; risk: string; providers: RegistrySkill['security']['providers'] }, servedDigest: string, servedCommit?: string | null, at = now()): void {
+    const providers = auditProvidersForServedBytes(audit, servedDigest, servedCommit);
+    const tx = this.db.transaction(() => {
+      this.db.prepare('DELETE FROM skill_audits WHERE skill_id=?').run(id);
+      for (const a of providers) {
+        this.db.prepare(`
+          INSERT INTO skill_audits (skill_id, provider, status, risk_level, summary, audited_at, audited_digest, raw_json)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, a.provider || 'unknown', a.status || 'unknown', a.riskLevel || '', a.summary || '', a.auditedAt || '', providerAuditedDigest(a), JSON.stringify(a));
+      }
+      this.db.prepare('UPDATE skills SET risk=?, audit_status=?, updated_at=? WHERE id=?').run(audit.risk, audit.secure ? 'pass' : 'blocked', at, id);
+    });
+    tx();
+  }
+
+  async content(id: string, version = 'latest'): Promise<{ id: string; name: string; skillMd: string; sha256: string; expectedDigest: string; provenance: { kind: 'registry'; source: string; version: string; commit: string | null }; audit: { identity: string | null; status: string; auditedDigest: string | null; checkedAt?: string | null }; risk: string; source: string; enabled: boolean }> {
     const s = this.get(id, true);
     if (!s) throw Object.assign(new Error('skill not found'), { statusCode: 404 });
     if (!s.enabled) throw Object.assign(new Error(`skill disabled${s.disabledReason ? `: ${s.disabledReason}` : ''}`), { statusCode: 403 });
     const cached = this.cachedContent(id, version);
-    if (cached?.skillMd && cached.sha256) return { id, name: s.name, skillMd: cached.skillMd, sha256: cached.sha256, enabled: s.enabled };
+    if (cached?.skillMd) {
+      const hash = sha256(cached.skillMd);
+      if (cached.sha256 && cached.sha256 !== hash) throw Object.assign(new Error('cached content digest mismatch'), { statusCode: 409 });
+      let served = this.get(id, true) ?? s;
+      let audit = auditForServedSkillBytes({ skillId: served.id, hash, providers: served.security.providers });
+      if (!audit.auditedDigest) {
+        const liveAudit = await fetchAudit(s.owner, s.repo, s.skill);
+        if (liveAudit) {
+          this.persistAuditEvidenceForServedBytes(id, liveAudit, hash, cached.commitSha);
+          served = this.get(id, true) ?? served;
+          audit = auditForServedSkillBytes({ skillId: served.id, hash, providers: served.security.providers });
+        }
+      }
+      return {
+      id, name: s.name, skillMd: cached.skillMd, sha256: hash, expectedDigest: hash,
+      provenance: { kind: 'registry', source: s.source, version, commit: cached.commitSha },
+      audit,
+      risk: served.security?.risk ?? 'UNKNOWN', source: s.source, enabled: s.enabled,
+      };
+    }
     const skillMd = await fetchRawSkill(s.rawBase);
     const hash = sha256(skillMd);
     const commitSha = await fetchLatestCommitSha(s.owner, s.repo, s.branch, `${s.skillPath}/SKILL.md`).catch(() => null) ?? s.commitSha ?? null;
@@ -544,8 +643,16 @@ class RegistryStore {
         sha256=excluded.sha256, commit_sha=excluded.commit_sha, skill_md=excluded.skill_md, fetched_at=excluded.fetched_at
     `).run(id, version, hash, commitSha, skillMd, ts);
     this.db.prepare('UPDATE skills SET sha256=?, commit_sha=?, updated_at=? WHERE id=?').run(hash, commitSha, ts, id);
+    const liveAudit = await fetchAudit(s.owner, s.repo, s.skill);
+    if (liveAudit) this.persistAuditEvidenceForServedBytes(id, liveAudit, hash, commitSha, ts);
+    const served = this.get(id, true) ?? s;
     this.event('content-fetch', id, { version, sha256: hash, commitSha });
-    return { id, name: s.name, skillMd, sha256: hash, enabled: s.enabled };
+    return {
+      id, name: s.name, skillMd, sha256: hash, expectedDigest: hash,
+      provenance: { kind: 'registry', source: s.source, version, commit: commitSha },
+      audit: auditForServedSkillBytes({ skillId: served.id, hash, providers: served.security.providers }),
+      risk: served.security?.risk ?? 'UNKNOWN', source: s.source, enabled: s.enabled,
+    };
   }
 
   patch(id: string, patch: Record<string, unknown>): RegistrySkill {
@@ -639,17 +746,42 @@ class RegistryStore {
   async rescan(id: string): Promise<RegistrySkill> {
     const s = this.get(id, true);
     if (!s) throw Object.assign(new Error('skill not found'), { statusCode: 404 });
+    let scannedDigest: string | null = null;
+    let scannedSkillMd: string | null = null;
+    let scannedCommitSha: string | null = null;
+    try {
+      scannedSkillMd = await fetchRawSkill(s.rawBase);
+      scannedDigest = sha256(scannedSkillMd);
+      scannedCommitSha = await fetchLatestCommitSha(s.owner, s.repo, s.branch, `${s.skillPath}/SKILL.md`).catch(() => null);
+    } catch {
+      const cached = this.cachedContent(id, 'latest');
+      if (cached?.skillMd) {
+        scannedSkillMd = cached.skillMd;
+        scannedDigest = sha256(cached.skillMd);
+        scannedCommitSha = s.commitSha ?? null;
+      }
+    }
     const audit = await fetchAudit(s.owner, s.repo, s.skill);
     const t = now();
     if (audit) {
       const risk = audit.risk;
       const tx = this.db.transaction(() => {
-        this.db.prepare('DELETE FROM skill_audits WHERE skill_id=?').run(id);
-        for (const a of audit.providers) {
+        if (scannedSkillMd && scannedDigest) {
           this.db.prepare(`
-            INSERT INTO skill_audits (skill_id, provider, status, risk_level, summary, audited_at, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-          `).run(id, a.provider || 'unknown', a.status || 'unknown', a.riskLevel || '', a.summary || '', a.auditedAt || '', JSON.stringify(a));
+            INSERT INTO skill_versions (skill_id, version, sha256, commit_sha, skill_md, fetched_at)
+            VALUES (?, 'latest', ?, ?, ?, ?)
+            ON CONFLICT(skill_id, version) DO UPDATE SET
+              sha256=excluded.sha256, commit_sha=excluded.commit_sha, skill_md=excluded.skill_md, fetched_at=excluded.fetched_at
+          `).run(id, scannedDigest, scannedCommitSha, scannedSkillMd, t);
+          this.db.prepare('UPDATE skills SET sha256=?, commit_sha=?, updated_at=? WHERE id=?').run(scannedDigest, scannedCommitSha, t, id);
+        }
+        this.db.prepare('DELETE FROM skill_audits WHERE skill_id=?').run(id);
+        const providers = scannedDigest ? auditProvidersForServedBytes(audit, scannedDigest, scannedCommitSha) : audit.providers;
+        for (const a of providers) {
+          this.db.prepare(`
+            INSERT INTO skill_audits (skill_id, provider, status, risk_level, summary, audited_at, audited_digest, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, a.provider || 'unknown', a.status || 'unknown', a.riskLevel || '', a.summary || '', a.auditedAt || '', providerAuditedDigest(a), JSON.stringify(a));
         }
         this.db.prepare('UPDATE skills SET risk=?, audit_status=?, updated_at=? WHERE id=?').run(risk, audit.secure ? 'pass' : 'blocked', t, id);
       });

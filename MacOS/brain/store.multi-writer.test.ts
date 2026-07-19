@@ -118,26 +118,33 @@ describe('Store — write lock keeps the critical section serial without wedging
     expect(existsSync(LOCK)).toBe(false); // stolen + released
   });
 
-  it('a FRESH foreign lock is waited out, then save proceeds lockless (never freezes)', () => {
+  it('a FRESH foreign lock is waited out, then save DEFERS (fail-closed — never writes lockless, never freezes)', () => {
     const A = new Store();
-    const p = A.createProject({ name: 'Alpha' });
+    const p = A.createProject({ name: 'Alpha' }); // persisted before the foreign lock
 
-    // A concurrent writer is holding a fresh lock (mtime = now). We can't wait
-    // for it in a single-process test, so assert the save still completes within
-    // a bounded time (LOCK_TIMEOUT_MS ~3s) instead of hanging the app forever.
+    // A concurrent writer holds a fresh lock (mtime = now).
     writeFileSync(LOCK, `${process.pid + 1}:${Date.now()}`);
     statSync(LOCK); // fresh
 
     const started = Date.now();
-    A.updateProject(p.id, { name: 'Renamed' }); // must return, lockless, after timeout
+    A.updateProject(p.id, { name: 'Renamed' }); // in-memory Renamed; the DISK save must DEFER (not write lockless)
     const elapsed = Date.now() - started;
 
     expect(elapsed).toBeGreaterThanOrEqual(2_000); // actually waited on the lock
     expect(elapsed).toBeLessThan(5_000);           // but gave up before wedging
+    expect(A.getProject(p.id)?.name).toBe('Renamed'); // in-memory state is intact
 
-    rmSync(LOCK, { force: true }); // drop the simulated foreign holder
+    // CRITICAL (finding: no lockless overwrite): while the foreign lock was held the
+    // save did NOT write — the on-disk store is untouched, so a concurrent writer's
+    // rows can never be clobbered.
+    const D = new Store();
+    expect(D.getProject(p.id)?.name).toBe('Alpha');
+
+    // Once the foreign holder releases, a subsequent save lands cleanly under the lock.
+    rmSync(LOCK, { force: true });
+    A.updateProject(p.id, { name: 'Renamed' }); // clears the deferred timer + writes now that the lock is free
     const C = new Store();
-    expect(C.getProject(p.id)?.name).toBe('Renamed'); // the lockless save landed
+    expect(C.getProject(p.id)?.name).toBe('Renamed');
   }, 10_000);
 });
 

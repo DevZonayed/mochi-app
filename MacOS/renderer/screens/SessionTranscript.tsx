@@ -490,10 +490,10 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 
 /* ───────────────────────────── page root ───────────────────────────── */
 
-// Map the live job status onto the screen's RunState vocabulary. The API has no
-// "gate" state — that only arrives via the demo state-switch / Pause control.
+// Map the live job status onto the screen's RunState vocabulary.
 function statusToRunState(s: Job['status']): RunState {
   if (s === 'done') return 'done';
+  if (s === 'gated') return 'gate';
   if (s === 'failed' || s === 'cancelled') return 'failed';
   return 'live'; // pending | running
 }

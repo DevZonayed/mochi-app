@@ -8,9 +8,30 @@
  * this Mac; only the catalog lives on the server.
  */
 
-import { mkdirSync, writeFileSync, rmSync, existsSync, readdirSync, renameSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, readdirSync, renameSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import localIndex from './skills-index.json';
+import {
+  assertRegistrySkillInstallable,
+  canonicalSkillSlug,
+  computeSkillDigest,
+  installVerifiedRegistrySkill,
+  buildRegistryReverifyContent,
+  evaluateSkillTrustForExecution,
+  reverifyRegistrySkill,
+  removeConfinedSkillDir,
+  truthfulSkillLabel,
+  type RegistrySkillContent,
+} from './skill-integrity.js';
+
+export {
+  assertRegistrySkillInstallable,
+  computeSkillDigest,
+  buildRegistryReverifyContent,
+  evaluateSkillTrustForExecution,
+  installVerifiedRegistrySkill,
+  truthfulSkillLabel,
+};
 
 export interface RegistrySkillSummary {
   id: string; name: string; description: string; tags: string[]; license: string;
@@ -18,6 +39,7 @@ export interface RegistrySkillSummary {
   enabled?: boolean; disabledReason?: string | null; version?: string; sha256?: string | null;
   sourceRepo?: string | null; sourceStatus?: string | null;
   mirrorRepo?: string | null; forkStatus?: string | null; lastSyncAt?: string | null; auditStatus?: string | null;
+  commitSha?: string | null; auditEvidenceId?: string | null; auditedDigest?: string | null;
 }
 
 /* Mac-local fallback. The Mac is the brain: a snapshot of the registry index is
@@ -98,49 +120,46 @@ export async function getRegistrySkill(base: string, id: string): Promise<Regist
   }
 }
 
-export async function fetchSkillContent(base: string, id: string): Promise<{ id: string; name: string; skillMd: string; sha256?: string; enabled?: boolean }> {
-  try { return await getJSON(`${base}/registry/skill/content?id=${encodeURIComponent(id)}`); }
+export async function fetchSkillContent(base: string, id: string): Promise<RegistrySkillContent> {
+  try {
+    const raw = await getJSON<RegistrySkillContent & { commitSha?: string; version?: string; auditStatus?: string; auditEvidenceId?: string; auditedDigest?: string; source?: string; risk?: string }>(`${base}/registry/skill/content?id=${encodeURIComponent(id)}`);
+    const audit = raw.audit ?? raw.auditEvidence ?? (
+      raw.auditStatus || raw.auditEvidenceId || raw.auditedDigest
+        ? { identity: raw.auditEvidenceId ?? null, status: raw.auditStatus ?? null, auditedDigest: raw.auditedDigest ?? null }
+        : null
+    );
+    return {
+      ...raw,
+      expectedDigest: raw.expectedDigest ?? raw.sha256,
+      provenance: raw.provenance ?? { kind: 'registry', source: raw.source, version: raw.version ?? 'latest', commit: raw.commitSha ?? null },
+      audit,
+      risk: raw.risk,
+    };
+  }
   catch (e) {
     const status = (e as { statusCode?: number }).statusCode;
     // A reachable registry explicitly blocking a disabled/quarantined skill is
     // authoritative. Do not bypass it with the bundled fallback.
     if (status === 401 || status === 403) throw e;
-    // Fall back to pulling the SKILL.md straight from the author's GitHub.
-    const s = LOCAL.skills.find(x => x.id === id);
-    if (!s) throw Object.assign(new Error('skill not found'), { statusCode: 404 });
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 15000);
-    try {
-      const r = await fetch(`${s.rawBase}/SKILL.md`, { signal: ctrl.signal, headers: { 'user-agent': 'MaestroSkillRegistry/1.0' } });
-      if (!r.ok) throw new Error(`github ${r.status}`);
-      return { id, name: s.name, skillMd: await r.text() };
-    } finally { clearTimeout(t); }
+    throw Object.assign(new Error('registry content unavailable; direct fallback is untrusted'), { statusCode: 503 });
   }
 }
 
 /** A safe on-disk folder name for a skill (the last path segment of its id). */
 export function skillSlug(id: string): string {
-  return (id.split('/').pop() || id).replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
+  return canonicalSkillSlug(id);
 }
 
 /** Write a skill's SKILL.md into <projectRoot>/.claude/skills/<slug>/SKILL.md. */
-export function installSkillFiles(projectRoot: string, id: string, skillMd: string): string {
-  const slug = skillSlug(id);
-  const dir = join(projectRoot, '.claude', 'skills', slug);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'SKILL.md'), skillMd, 'utf8');
-  // The operator/agent now owns this folder. If it was previously a bundled
-  // NATIVE skill (same slug), drop the .mochi-native marker — otherwise
-  // ensureNativeSkills would treat the folder as "ours" and overwrite it on the
-  // next catalog upgrade, or DELETE it if the slug ever leaves the bundle.
-  rmSync(join(dir, '.mochi-native'), { force: true });
-  return slug;
+export function installSkillFiles(projectRoot: string, id: string, skillMd: string, verified?: RegistrySkillContent): string {
+  if (!verified) throw new Error('registry skill install requires audit-bound integrity evidence');
+  const rec = installVerifiedRegistrySkill(projectRoot, { ...verified, id, skillMd });
+  rmSync(join(projectRoot, '.claude', 'skills', rec.slug, '.mochi-native'), { force: true });
+  return rec.slug;
 }
 
 export function removeSkillFiles(projectRoot: string, id: string): void {
-  const slug = skillSlug(id);
-  const dir = join(projectRoot, '.claude', 'skills', slug);
-  if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+  removeConfinedSkillDir(projectRoot, id);
 }
 
 /** Slugs of skills physically present + ENABLED in the project (SKILL.md exists). */
@@ -164,10 +183,17 @@ export function setSkillFilesEnabled(projectRoot: string, id: string, enabled: b
   const active = join(dir, 'SKILL.md');
   const off = join(dir, 'SKILL.md.disabled');
   try {
+    if (existsSync(dir) && lstatSync(dir).isSymbolicLink()) return false;
+    if (existsSync(active) && lstatSync(active).isSymbolicLink()) return false;
+    if (existsSync(off) && lstatSync(off).isSymbolicLink()) return false;
     if (enabled) { if (existsSync(off) && !existsSync(active)) renameSync(off, active); return existsSync(active); }
     if (existsSync(active)) renameSync(active, off);
     return existsSync(off);
   } catch { return false; }
+}
+
+export function reverifyInstalledSkill(projectRoot: string, content: RegistrySkillContent): { ok: true; digest: string } | { ok: false; reason: string } {
+  return reverifyRegistrySkill(projectRoot, content);
 }
 
 /** Every skill folder on disk with its enabled state (SKILL.md → on, .disabled → off). */

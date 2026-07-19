@@ -1,7 +1,4 @@
-/* MCP Gateway — Tools & Gateway page. Segmented tabs (Servers, Live activity,
-   Denials), deferred-loading toggles, live tool-call stream, denial allow flow
-   with a scoped-grant confirm sheet, and the ⌘K command palette.
-   Ported to ES-module TypeScript React — visual output unchanged. */
+/* MCP Gateway — installed MCP skills plus unavailable activity/denial states. */
 
 import React from 'react';
 import { AppShell } from '../lib/appShell';
@@ -38,85 +35,64 @@ const styles = `
 `;
 
 /* ───────────────────────── data ───────────────────────── */
-interface Proj { name: string; color: string; }
-const MCP_PROJ: Record<string, Proj> = {
-  atlas: { name: 'Atlas API', color: 'var(--blue)' },
-  content: { name: 'Q3 Content', color: 'var(--purple)' },
-  scan: { name: 'Market Scan', color: 'var(--indigo)' },
-};
-
-interface Server {
+interface SkillRow {
   id: string;
-  proj: string;
   name: string;
+  description: string;
+  category: string;
+  kind: string;
+  version: string;
+  enabled: boolean;
+  createdAt: number;
   glyph: string;
   tint: string;
-  transport: string;
-  tools: number;
-  loaded: number;
-  defer: boolean;
-  scope: string;
-  signed: boolean;
-  on: boolean;
-  ns: string;
 }
 
-/* Map a live MCP Skill onto the Server card shape the existing JSX renders.
-   Fields the API doesn't supply (transport, tools, loaded, scope, signed,
-   namespace, project bucket, tint) are derived deterministically so the
-   visual layout — project groups, filter chips, glyph chips — is unchanged. */
 const SRV_TINTS = ['var(--ink)', 'var(--teal)', 'var(--orange)', 'var(--indigo)', 'var(--purple)', 'var(--blue)'];
-const PROJ_KEYS = Object.keys(MCP_PROJ);
 
-function skillToServer(sk: ApiSkill, i: number): Server {
+function skillToRow(sk: ApiSkill, i: number): SkillRow {
   const slug = sk.name.toLowerCase().replace(/[^a-z0-9]+/g, '');
   return {
     id: sk.id,
-    proj: PROJ_KEYS[i % PROJ_KEYS.length],
     name: sk.name,
+    description: sk.description,
+    category: sk.category,
+    kind: sk.kind,
+    version: sk.version,
+    enabled: sk.enabled,
+    createdAt: sk.createdAt,
     glyph: (slug.slice(0, 2) || 'mc'),
     tint: SRV_TINTS[i % SRV_TINTS.length],
-    transport: 'HTTP',
-    tools: 0,
-    loaded: 0,
-    defer: true,
-    scope: 'read-only',
-    signed: true,
-    on: sk.enabled,
-    ns: sk.id,
   };
 }
 
-/* ───────────────────────── Servers tab ───────────────────────── */
-function SrvGlyph({ s, size = 38 }: { s: Server; size?: number }) {
+/* ───────────────────────── Installed skills tab ───────────────────────── */
+function SkillGlyph({ s, size = 38 }: { s: SkillRow; size?: number }) {
   return <span style={{ width: size, height: size, borderRadius: 10, flexShrink: 0, display: 'grid', placeItems: 'center', background: `color-mix(in srgb, ${s.tint} 15%, transparent)`, color: s.tint, font: '700 var(--fs-footnote)/1 var(--font-mono)', textTransform: 'uppercase' }}>{s.glyph}</span>;
 }
 
-function ServerRow({ s, last, onToggle }: { s: Server; last: boolean; onToggle: (s: Server) => void }) {
-  const on = s.on;
-  const [defer, setDefer] = React.useState(s.defer);
+function SkillRowView({ s, last, onToggle }: { s: SkillRow; last: boolean; onToggle: (s: SkillRow) => void }) {
+  const on = s.enabled;
+  const installed = Number.isFinite(s.createdAt) && s.createdAt > 0 ? new Date(s.createdAt).toLocaleDateString() : null;
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 16px', borderBottom: last ? 'none' : '0.5px solid var(--separator)', opacity: on ? 1 : 0.62, transition: 'opacity 220ms ease' }}>
-      <SrvGlyph s={s} />
+      <SkillGlyph s={s} />
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
           <span style={{ font: '600 var(--fs-callout)/1.1 var(--font-text)', color: 'var(--ink)' }}>{s.name}</span>
-          <span style={{ height: 18, padding: '0 7px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', font: '600 var(--fs-caption)/18px var(--font-mono)', color: 'var(--ink-secondary)' }}>{s.transport}</span>
-          {s.signed ? <span title="Signature verified" style={{ color: 'var(--green)' }}><Icon name="shield" size={14} /></span> : <span title="Unsigned" style={{ color: 'var(--orange)' }}><Icon name="alert" size={14} /></span>}
+          <span style={{ height: 18, padding: '0 7px', borderRadius: 'var(--r-pill)', background: on ? 'color-mix(in srgb, var(--green) 14%, transparent)' : 'var(--fill-secondary)', font: '600 var(--fs-caption)/18px var(--font-text)', color: on ? 'var(--green)' : 'var(--ink-secondary)' }}>{on ? 'Enabled' : 'Disabled'}</span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>
-          <span className="tool-count" style={{ fontVariantNumeric: 'tabular-nums' }}>{s.tools} tools · {on ? s.loaded : 0} loaded</span>
-          <span style={{ color: 'var(--ink-tertiary)' }}>·</span>
-          <span>{s.scope}</span>
+        {s.description && (
+          <div style={{ marginBottom: 7, font: '400 var(--fs-footnote)/1.35 var(--font-text)', color: 'var(--ink-secondary)', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {s.description}
+          </div>
+        )}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>
+          {s.category && <span style={{ padding: '3px 7px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)' }}>{s.category}</span>}
+          {s.kind && <span style={{ padding: '3px 7px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', fontFamily: 'var(--font-mono)' }}>{s.kind}</span>}
+          {s.version && <span style={{ padding: '3px 7px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', fontFamily: 'var(--font-mono)' }}>v{s.version}</span>}
+          {installed && <span style={{ color: 'var(--ink-tertiary)' }}>Added {installed}</span>}
         </div>
-      </div>
-      {/* deferred-loading */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginRight: 6 }}>
-        <span style={{ textAlign: 'right' }}>
-          <span style={{ display: 'block', font: '500 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)' }}>Load on demand</span>
-          <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>Saves ~85% startup tokens</span>
-        </span>
-        <Switch on={defer} onChange={setDefer} />
       </div>
       <span style={{ width: 1, height: 28, background: 'var(--separator)' }} />
       <Switch on={on} onChange={() => onToggle(s)} />
@@ -124,158 +100,37 @@ function ServerRow({ s, last, onToggle }: { s: Server; last: boolean; onToggle: 
   );
 }
 
-function ServersTab({ servers, onToggle }: { servers: Server[]; onToggle: (s: Server) => void }) {
-  const [filter, setFilter] = React.useState('all');
-  const projs = filter === 'all' ? Object.keys(MCP_PROJ) : [filter];
+function InstalledSkillsTab({ skills, onToggle }: { skills: SkillRow[]; onToggle: (s: SkillRow) => void }) {
   return (
     <div>
-      <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
-        <button onClick={() => setFilter('all')} className="filter-chip" style={{ height: 32, padding: '0 14px', borderRadius: 'var(--r-pill)', background: filter === 'all' ? 'var(--blue)' : 'var(--fill-secondary)', color: filter === 'all' ? '#fff' : 'var(--ink-secondary)', font: '600 var(--fs-subhead)/1 var(--font-text)' }}>All projects</button>
-        {Object.entries(MCP_PROJ).map(([k, p]) => (
-          <button key={k} onClick={() => setFilter(k)} className="filter-chip" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 32, padding: '0 13px', borderRadius: 'var(--r-pill)', background: filter === k ? 'var(--blue)' : 'var(--fill-secondary)', color: filter === k ? '#fff' : 'var(--ink-secondary)', font: '600 var(--fs-subhead)/1 var(--font-text)' }}>
-            <span style={{ width: 7, height: 7, borderRadius: 4, background: p.color }} /> {p.name}
-          </button>
-        ))}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderRadius: '12px 12px 0 0', background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', borderBottom: 'none', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
+        <Icon name="lock" size={13} style={{ color: 'var(--ink-tertiary)' }} /> Installed MCP skills are listed from the local skills registry.
       </div>
-
-      {projs.map(pk => {
-        const rows = servers.filter(s => s.proj === pk);
-        const p = MCP_PROJ[pk];
-        return (
-          <div key={pk} style={{ marginBottom: 24 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-              <span style={{ width: 9, height: 9, borderRadius: 5, background: p.color }} />
-              <span style={{ font: '700 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-secondary)' }}>{p.name}</span>
-              <span style={{ flex: 1 }} />
-              <button className="link-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--blue)' }}><Icon name="plus" size={14} stroke={2.4} /> Add server</button>
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderRadius: '12px 12px 0 0', background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)', borderBottom: 'none', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
-              <Icon name="lock" size={13} style={{ color: 'var(--ink-tertiary)' }} /> Deny by default — agents reach only what you allow here.
-            </div>
-            <div style={{ background: 'var(--bg-elevated)', borderRadius: '0 0 12px 12px', border: '0.5px solid var(--separator)', overflow: 'hidden', boxShadow: 'var(--card-shadow)' }}>
-              {rows.map((s, i) => <ServerRow key={s.id} s={s} last={i === rows.length - 1} onToggle={onToggle} />)}
-            </div>
-          </div>
-        );
-      })}
+      <div style={{ background: 'var(--bg-elevated)', borderRadius: '0 0 12px 12px', border: '0.5px solid var(--separator)', overflow: 'hidden', boxShadow: 'var(--card-shadow)' }}>
+        {skills.length === 0 ? (
+          <div style={{ padding: '34px 16px', textAlign: 'center', font: '400 var(--fs-callout)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>No installed MCP skills.</div>
+        ) : skills.map((s, i) => <SkillRowView key={s.id} s={s} last={i === skills.length - 1} onToggle={onToggle} />)}
+      </div>
     </div>
   );
 }
 
 /* ───────────────────────── Live activity ───────────────────────── */
-interface Call { job: string; server: string; tool: string; scope: string; ok: boolean; ms: string; }
-
-const CALLS_SEED: Call[] = [
-  { job: 'atlas', server: 'github', tool: 'get_pull_request', scope: 'read', ok: true, ms: '142ms' },
-  { job: 'atlas', server: 'postgres', tool: 'query', scope: 'read', ok: true, ms: '38ms' },
-  { job: 'content', server: 'linear', tool: 'create_issue', scope: 'write', ok: true, ms: '210ms' },
-  { job: 'scan', server: 'brave', tool: 'web_search', scope: 'read', ok: true, ms: '480ms' },
-  { job: 'atlas', server: 'github', tool: 'create_commit_status', scope: 'write', ok: true, ms: '96ms' },
-  { job: 'content', server: 'notion', tool: 'append_block', scope: 'write', ok: false, ms: '12ms' },
-  { job: 'atlas', server: 'postgres', tool: 'list_tables', scope: 'read', ok: true, ms: '22ms' },
-  { job: 'scan', server: 'brave', tool: 'news_search', scope: 'read', ok: true, ms: '512ms' },
-];
-const JOB_TINT: Record<string, string> = { atlas: 'var(--blue)', content: 'var(--purple)', scan: 'var(--indigo)' };
-
-interface CallRow extends Call { id: number; t: number; fresh?: boolean; }
-
 function LiveActivity() {
-  const [rows, setRows] = React.useState<CallRow[]>(() => CALLS_SEED.map((c, i) => ({ ...c, id: i, t: 14 * 3600 + 8 * 60 + 22 - i * 3 })));
-  const [paused, setPaused] = React.useState(false);
-  const idRef = React.useRef(CALLS_SEED.length);
-
-  React.useEffect(() => {
-    if (paused) return;
-    const t = setInterval(() => {
-      const c = CALLS_SEED[Math.floor(Math.random() * CALLS_SEED.length)];
-      setRows(r => [{ ...c, id: idRef.current++, t: Math.floor(Date.now() / 1000) % 86400, fresh: true }, ...r].slice(0, 40));
-    }, 1800);
-    return () => clearInterval(t);
-  }, [paused]);
-
-  const fmt = (s: number) => { const h = Math.floor(s / 3600) % 24, m = Math.floor(s / 60) % 60, sec = s % 60; return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`; };
-
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, height: 40, padding: '0 14px', borderRadius: 11, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator)', maxWidth: 360, backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-          <Icon name="search" size={16} style={{ color: 'var(--ink-tertiary)' }} />
-          <span style={{ font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Filter by server, tool, or job</span>
-        </div>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, font: '500 var(--fs-footnote)/1 var(--font-text)', color: paused ? 'var(--ink-tertiary)' : 'var(--green)' }}>
-          {!paused && <span className="breathe" style={{ width: 8, height: 8, borderRadius: 4, background: 'var(--green)' }} />}{paused ? 'Paused' : 'Live'}
-        </span>
-        <button onClick={() => setPaused(p => !p)} className="ghost-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 36, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
-          <Icon name={paused ? 'play' : 'pause'} size={14} /> {paused ? 'Resume' : 'Pause'}
-        </button>
-      </div>
       <div style={{ background: 'var(--bg-elevated)', borderRadius: 14, border: '0.5px solid var(--separator)', overflow: 'hidden', boxShadow: 'var(--card-shadow)' }}>
-        {rows.map((r, i) => (
-          <div key={r.id} className={`call-row ${r.fresh ? 'call-fresh' : ''}`} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '9px 16px', borderBottom: i < rows.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
-            <span style={{ font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', width: 64, flexShrink: 0 }}>{fmt(r.t)}</span>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, width: 96, flexShrink: 0 }}><span style={{ width: 7, height: 7, borderRadius: 4, background: JOB_TINT[r.job] }} /><span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{MCP_PROJ[r.job].name}</span></span>
-            <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}><span style={{ color: 'var(--ink-tertiary)' }}>{r.server}.</span>{r.tool}</span>
-            <span style={{ height: 20, padding: '0 8px', borderRadius: 'var(--r-pill)', background: r.scope === 'write' ? 'color-mix(in srgb, var(--orange) 13%, transparent)' : 'var(--fill-secondary)', color: r.scope === 'write' ? 'var(--orange)' : 'var(--ink-secondary)', font: '600 var(--fs-caption)/20px var(--font-text)', flexShrink: 0 }}>{r.scope}</span>
-            <span style={{ font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', width: 52, textAlign: 'right', flexShrink: 0 }}>{r.ms}</span>
-            <span style={{ width: 8, height: 8, borderRadius: 4, background: r.ok ? 'var(--green)' : 'var(--red)', flexShrink: 0 }} />
-          </div>
-        ))}
+        <div style={{ padding: '34px 16px', textAlign: 'center', font: '400 var(--fs-callout)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>No MCP activity is available.</div>
       </div>
     </div>
   );
 }
 
 /* ───────────────────────── Denials tab ───────────────────────── */
-interface Denial { job: string; server: string; tool: string; reason: string; }
-
-const DENIALS: Denial[] = [
-  { job: 'scan', server: 'web scraper', tool: 'fetch_url', reason: 'Not on project allowlist' },
-  { job: 'atlas', server: 'github', tool: 'delete_repo', reason: 'Capability not granted' },
-  { job: 'content', server: 'notion', tool: 'export_workspace', reason: 'Signature drift' },
-  { job: 'atlas', server: 'postgres', tool: 'drop_table', reason: 'Capability not granted' },
-];
-
-function DenialsTab({ onAllow }: { onAllow: (d: Denial) => void }) {
+function DenialsTab() {
   return (
     <div style={{ background: 'var(--bg-elevated)', borderRadius: 14, border: '0.5px solid var(--separator)', overflow: 'hidden', boxShadow: 'var(--card-shadow)' }}>
-      {DENIALS.map((d, i) => (
-        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '14px 16px', borderBottom: i < DENIALS.length - 1 ? '0.5px solid var(--separator)' : 'none', background: 'rgba(255,59,48,0.03)' }}>
-          <span style={{ width: 32, height: 32, borderRadius: 9, flexShrink: 0, display: 'grid', placeItems: 'center', background: 'rgba(255,59,48,0.12)', color: 'var(--red)' }}><Icon name="lock" size={16} /></span>
-          <span style={{ flex: 1, minWidth: 0 }}>
-            <span style={{ display: 'block', font: '500 var(--fs-callout)/1.1 var(--font-mono)', color: 'var(--ink)' }}><span style={{ color: 'var(--ink-tertiary)' }}>{d.server}.</span>{d.tool}</span>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--red)', marginTop: 3 }}>
-              <Icon name="xCircle" size={12} /> {d.reason} <span style={{ color: 'var(--ink-tertiary)' }}>· {MCP_PROJ[d.job].name}</span>
-            </span>
-          </span>
-          <button onClick={() => onAllow(d)} className="link-btn" style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--blue)', flexShrink: 0 }}>Allow for this project…</button>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/* ───────────────────────── Scoped-grant confirm sheet ───────────────────────── */
-function GrantSheet({ denial, onClose }: { denial: Denial; onClose: () => void }) {
-  return (
-    <div onMouseDown={onClose} style={{ position: 'absolute', inset: 0, zIndex: 80, display: 'grid', placeItems: 'center', padding: 32, background: 'rgba(10,12,24,0.32)', backdropFilter: 'blur(3px)', WebkitBackdropFilter: 'blur(3px)' }}>
-      <div onMouseDown={e => e.stopPropagation()} className="sheet-pop" style={{ width: 420, background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--glass-border)', boxShadow: '0 40px 100px rgba(10,15,40,0.5)', padding: 24 }}>
-        <h2 style={{ margin: '0 0 8px', font: '700 var(--fs-title2)/1.2 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Grant a scoped tool?</h2>
-        <p style={{ margin: '0 0 16px', font: '400 var(--fs-subhead)/1.45 var(--font-text)', color: 'var(--ink-secondary)', textWrap: 'pretty' } as React.CSSProperties}>
-          Allow <span style={{ font: '600 var(--fs-subhead) var(--font-mono)', color: 'var(--ink)' }}>{denial.server}.{denial.tool}</span> for <b style={{ color: 'var(--ink)' }}>{MCP_PROJ[denial.job].name}</b> only. Other projects stay denied.
-        </p>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 18 }}>
-          {[['Scope', 'This project only'], ['Mode', 'Read-only'], ['Expires', 'Until you revoke']].map((r, i) => (
-            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 13px', borderRadius: 10, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)' }}>
-              <span style={{ flex: 1, font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{r[0]}</span>
-              <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>{r[1]}</span>
-            </div>
-          ))}
-        </div>
-        <div style={{ display: 'flex', gap: 10 }}>
-          <button onClick={onClose} style={{ flex: 1, height: 44, borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
-          <button onClick={onClose} className="primary-cta" style={{ flex: 1, height: 44, borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Grant access</button>
-        </div>
-      </div>
+      <div style={{ padding: '34px 16px', textAlign: 'center', font: '400 var(--fs-callout)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>No MCP denials are available.</div>
     </div>
   );
 }
@@ -371,39 +226,34 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 /* ───────────────────────── page root ───────────────────────── */
 interface McpTab { key: string; label: string; icon: IconName; }
 const MCP_TABS: McpTab[] = [
-  { key: 'servers', label: 'Servers', icon: 'cpu' },
+  { key: 'skills', label: 'Installed', icon: 'cpu' },
   { key: 'activity', label: 'Live activity', icon: 'bolt' },
   { key: 'denials', label: 'Denials', icon: 'lock' },
 ];
 
 export default function McpGateway() {
-  const [tab, setTab] = React.useState('servers');
-  const [grant, setGrant] = React.useState<Denial | null>(null);
+  const [tab, setTab] = React.useState('skills');
   const [paletteOpen, setPaletteOpen] = React.useState(false);
-  const [servers, setServers] = React.useState<Server[]>([]); // live MCP skills (kind === 'mcp')
+  const [skills, setSkills] = React.useState<SkillRow[]>([]);
   const ti = MCP_TABS.findIndex(t => t.key === tab);
 
-  // Connected MCP servers come from the skills registry: load on mount and keep
-  // only kind === 'mcp', mapped onto the existing server-card shape.
   React.useEffect(() => {
     let alive = true;
     (async () => {
       try {
         const list = await api.listSkills();
-        if (alive) setServers(list.filter(sk => sk.kind === 'mcp').map(skillToServer));
+        if (alive) setSkills(list.filter(sk => sk.kind === 'mcp').map(skillToRow));
       } catch {
-        if (alive) setServers([]);
+        if (alive) setSkills([]);
       }
     })();
     return () => { alive = false; };
   }, []);
 
-  // Enable/disable an MCP server -> toggle the underlying skill on the server,
-  // then reflect the returned `enabled` flag in state.
-  const onToggleServer = async (s: Server) => {
+  const onToggleSkill = async (s: SkillRow) => {
     try {
       const updated = await api.toggleSkill(s.id);
-      setServers(prev => prev.map(p => (p.id === updated.id ? { ...p, on: updated.enabled } : p)));
+      setSkills(prev => prev.map(p => (p.id === updated.id ? { ...p, enabled: updated.enabled } : p)));
     } catch { /* fail soft — keep current state */ }
   };
 
@@ -429,17 +279,16 @@ export default function McpGateway() {
           </div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20, font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)' }}>
-          <Icon name="shield" size={14} style={{ color: 'var(--green)' }} /> One chokepoint — every tool call passes through the gateway and lands in the audit log.
+          <Icon name="shield" size={14} style={{ color: 'var(--green)' }} /> Installed MCP skills
         </div>
 
         <div key={tab} className="tab-fade">
-          {tab === 'servers' && <ServersTab servers={servers} onToggle={onToggleServer} />}
+          {tab === 'skills' && <InstalledSkillsTab skills={skills} onToggle={onToggleSkill} />}
           {tab === 'activity' && <LiveActivity />}
-          {tab === 'denials' && <DenialsTab onAllow={setGrant} />}
+          {tab === 'denials' && <DenialsTab />}
         </div>
       </div>
 
-      {grant && <GrantSheet denial={grant} onClose={() => setGrant(null)} />}
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </AppShell>
   );

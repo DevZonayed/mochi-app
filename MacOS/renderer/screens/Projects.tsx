@@ -1,4 +1,4 @@
-/* Projects Overview — grid & list of typed projects, budgets, schedules,
+/* Projects Overview — grid & list of typed projects and budgets,
    skeleton-on-load, archive → empty state, template gallery modal, ⌘K palette.
    Ported from the Babel-standalone prototype (design/project/projects/*.jsx +
    command-center/cc-palette.jsx) to an ES-module TypeScript React screen.
@@ -76,10 +76,6 @@ interface Project {
   jobs: number;
   gates: number;
   spent: number;
-  cap: number;
-  subs: number;
-  next: string;
-  activity: string;
   paused?: boolean;
   /** Reversible soft-hide — dropped from the default view, revealed via "Hidden (N)". */
   hidden?: boolean;
@@ -127,11 +123,6 @@ function shortPath(p: string): string {
   return p.startsWith(home) ? `~/${tail}` : tail;
 }
 
-function health(spent: number, cap: number): string {
-  const pct = cap ? spent / cap : 0;
-  return pct >= 0.9 ? 'var(--red)' : pct >= 0.75 ? 'var(--orange)' : 'var(--blue)';
-}
-
 /* Coerce an API project's free-form `template` string onto one of the four
    known template keys this screen renders (falls back to 'code'). */
 function templateKey(t: string): string {
@@ -141,8 +132,7 @@ function templateKey(t: string): string {
 
 /* Build the screen's local Project rows from the live API. Per-project job
    counts and spend are derived from listJobs(id); pending gates from the
-   workspace approvals list. Fields the API does not expose (cap, subs, next,
-   activity) keep sane static defaults so the render shape stays intact. */
+   workspace approvals list. */
 function toRow(p: ApiProject, jobs: Job[], pendingGates: number, sessions: ChatSession[]): Project {
   const running = jobs.filter(j => j.status === 'running' || j.status === 'pending').length;
   const spent = jobs.reduce((sum, j) => sum + (j.cost || 0), 0);
@@ -154,10 +144,6 @@ function toRow(p: ApiProject, jobs: Job[], pendingGates: number, sessions: ChatS
     jobs: running,
     gates: pendingGates,
     spent,
-    cap: 50,
-    subs: 0,
-    next: '—',
-    activity: 'Idle',
     hidden: p.hidden,
     kind: p.kind,
     path: p.path,
@@ -310,12 +296,7 @@ function ProjectCard({ p, onMenu, onOpen, dnd, onHide, onArchiveMerged }: CardPr
               <Icon name={p.repoUrl ? 'gitMerge' : 'folder'} size={12} />
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shortPath(p.path)}</span>
             </span>
-          ) : (
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 24, padding: '0 9px', borderRadius: 'var(--r-pill)',
-              background: 'var(--fill-tertiary)', font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>
-              <Icon name="layers" size={12} /> {p.subs} sub
-            </span>
-          )}
+          ) : null}
           <span style={{ flex: 1 }} />
           {/* Show "Archive merged" only when the rollup says the worst state of
               this project's sessions IS pr-merged (i.e. nothing more urgent is
@@ -329,9 +310,6 @@ function ProjectCard({ p, onMenu, onOpen, dnd, onHide, onArchiveMerged }: CardPr
               <Icon name="archive" size={11} /> Archive merged
             </button>
           )}
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>
-            <Icon name="clock" size={12} /> {p.next === '—' ? p.activity : `Next ${p.next}`}
-          </span>
         </div>
       </div>
     </div>
@@ -355,7 +333,7 @@ function ProjectRow({ p, onMenu, onOpen, onHide, last, dnd }: RowProps) {
   const running = useProjectRunning(p.id, p.sessionIds);
   return (
     <div className={`proj-row${dnd?.draggingId === p.id ? ' dragging' : ''}`} onClick={() => onOpen && onOpen(p.id)} {...(dnd ? dragProps(dnd, p.id) : {})} style={{
-      display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.4fr 0.8fr 1fr 36px', alignItems: 'center', gap: 14,
+      display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.4fr 0.8fr 36px', alignItems: 'center', gap: 14,
       padding: '13px 16px', borderBottom: last ? 'none' : '0.5px solid var(--separator)', cursor: 'pointer',
       opacity: p.hidden ? 0.5 : undefined,
     }}>
@@ -380,7 +358,6 @@ function ProjectRow({ p, onMenu, onOpen, onHide, last, dnd }: RowProps) {
         <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap' }}>{p.spent > 0 ? `$${p.spent.toFixed(2)}` : '—'}</span>
       </div>
       <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{p.path ? (p.repoUrl ? 'repo' : 'folder') : '—'}</span>
-      <span style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{p.next === '—' ? p.activity : `Next ${p.next}`}</span>
       <ProjectMenu hidden={p.hidden} onHide={() => onHide?.(p.id, !p.hidden)} onDelete={() => onMenu(p.id)} />
     </div>
   );
@@ -428,14 +405,14 @@ interface ListTableProps {
 }
 
 function ListTable({ projects, onMenu, onOpen, onHide, dnd }: ListTableProps) {
-  const [sort, setSort] = React.useState<string>('activity');
+  const [sort, setSort] = React.useState<string>('spend');
   const sorted = [...projects].sort((a, b) => sort === 'spend' ? b.spent - a.spent : 0);
-  const cols: [string, string | null][] = [['Project', null], ['Status', null], ['Spend', 'spend'], ['Source', null], ['Schedule', 'activity'], ['', null]];
+  const cols: [string, string | null][] = [['Project', null], ['Status', null], ['Spend', 'spend'], ['Source', null], ['', null]];
   return (
     <div style={{ background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', overflow: 'hidden',
       backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
       {/* header */}
-      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.4fr 0.8fr 1fr 36px', alignItems: 'center', gap: 14,
+      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1.5fr 1.4fr 0.8fr 36px', alignItems: 'center', gap: 14,
         padding: '11px 16px', borderBottom: '0.5px solid var(--separator)', background: 'var(--fill-tertiary)' }}>
         {cols.map(([label, key], i) => (
           <button key={i} onClick={() => key && setSort(key)} style={{ textAlign: 'left', cursor: key ? 'pointer' : 'default',

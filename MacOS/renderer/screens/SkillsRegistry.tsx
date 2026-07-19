@@ -95,6 +95,8 @@ interface Skill {
   forkStatus?: string | null;
   auditStatus?: string | null;
   disabledReason?: string | null;
+  auditEvidenceId?: string | null;
+  auditedDigest?: string | null;
 }
 
 const SK_PALETTE = ['var(--blue)', 'var(--purple)', 'var(--teal)', 'var(--indigo)', 'var(--orange)', 'var(--green)'];
@@ -127,11 +129,13 @@ function SkillGlyph({ name, size = 40, radius = 11 }: SkillGlyphProps) {
   );
 }
 
-// scan: ok | pending | quarantined ; signed: bool
-//
-// All status is derived from real registry signals (enabled state + audit risk).
-// Nothing is fabricated from a hash — a skill only shows pending/quarantined when
-// the registry actually says so.
+function hasVerifiedEvidence(reg: RegistrySkillSummary): boolean {
+  const status = String(reg.auditStatus || '').toLowerCase();
+  const digest = (reg.sha256 || '').toLowerCase();
+  const audited = (reg.auditedDigest || '').toLowerCase();
+  return !!reg.auditEvidenceId && ['passed', 'pass', 'ok', 'clean', 'approved'].includes(status) && !!digest && audited === digest;
+}
+
 /** Map a live API/registry skill into the existing row shape. */
 function toSkill(a: ApiSkill | RegistrySkillSummary): Skill {
   const reg = a as RegistrySkillSummary;
@@ -139,7 +143,10 @@ function toSkill(a: ApiSkill | RegistrySkillSummary): Skill {
   const isRegistry = 'risk' in a || 'tags' in a; // a public/registry skill vs. a local host capability
   const enabled = 'enabled' in a ? a.enabled !== false : local.enabled;
   const risk = (reg.risk || '').toUpperCase();
-  const scan: ScanState = !enabled ? 'quarantined' : risk === 'HIGH' || risk === 'CRITICAL' ? 'quarantined' : risk === 'MEDIUM' ? 'pending' : 'ok';
+  const verified = isRegistry && hasVerifiedEvidence(reg);
+  const scan: ScanState = !enabled || risk === 'HIGH' || risk === 'CRITICAL' || risk === 'BLOCKED'
+    ? 'quarantined'
+    : verified ? 'ok' : 'pending';
   const tags = 'tags' in a && Array.isArray(a.tags)
     ? a.tags
     : local.category
@@ -150,7 +157,7 @@ function toSkill(a: ApiSkill | RegistrySkillSummary): Skill {
     name: a.name,
     ver: ('version' in a && a.version) ? a.version : local.version,
     desc: a.description,
-    signed: enabled && scan !== 'quarantined',
+    signed: enabled && verified,
     scan,
     installed: enabled,
     mine: !isRegistry, // "yours" = a local host capability, not a public-registry entry
@@ -161,13 +168,15 @@ function toSkill(a: ApiSkill | RegistrySkillSummary): Skill {
     forkStatus: reg.sourceStatus || reg.forkStatus,
     auditStatus: reg.auditStatus,
     disabledReason: reg.disabledReason,
+    auditEvidenceId: reg.auditEvidenceId,
+    auditedDigest: reg.auditedDigest,
   };
 }
 
 function ScanChip({ scan }: { scan: ScanState }) {
   const map: Record<ScanState, { label: string; icon: IconName; tint: string; bg: string }> = {
-    ok: { label: 'Scanned', icon: 'check', tint: 'var(--green)', bg: 'rgba(52,199,89,0.15)' },
-    pending: { label: 'Re-scan pending', icon: 'refresh', tint: 'var(--orange)', bg: 'rgba(255,149,0,0.14)' },
+    ok: { label: 'Audit-bound', icon: 'check', tint: 'var(--green)', bg: 'rgba(52,199,89,0.15)' },
+    pending: { label: 'Evidence unavailable', icon: 'refresh', tint: 'var(--orange)', bg: 'rgba(255,149,0,0.14)' },
     quarantined: { label: 'Quarantined', icon: 'lock', tint: 'var(--red)', bg: 'rgba(255,59,48,0.13)' },
   };
   const s = map[scan];
@@ -178,11 +187,11 @@ function ScanChip({ scan }: { scan: ScanState }) {
   );
 }
 
-function SigShield({ signed }: { signed: boolean }) {
+function EvidenceShield({ verified }: { verified: boolean }) {
   return (
-    <span title={signed ? 'Signature verified' : 'Unsigned'} style={{
+    <span title={verified ? 'Exact digest matches audit evidence' : 'No exact-digest audit evidence'} style={{
       display: 'inline-grid', placeItems: 'center', width: 26, height: 26, borderRadius: 8,
-      background: signed ? 'rgba(52,199,89,0.14)' : 'var(--fill-secondary)', color: signed ? 'var(--green)' : 'var(--ink-tertiary)',
+      background: verified ? 'rgba(52,199,89,0.14)' : 'var(--fill-secondary)', color: verified ? 'var(--green)' : 'var(--ink-tertiary)',
     }}>
       <Icon name="shield" size={15} />
     </span>
@@ -199,13 +208,13 @@ function SkillRow({ s, last, onOpen }: { s: Skill; last: boolean; onOpen: (s: Sk
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 3 }}>
           <span style={{ font: '600 var(--fs-callout)/1.1 var(--font-mono)', letterSpacing: '-0.01em', color: 'var(--ink)', whiteSpace: 'nowrap' }}>{s.name}</span>
-          <span style={{ height: 18, padding: '0 7px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', font: '600 var(--fs-caption)/18px var(--font-mono)', color: 'var(--ink-secondary)' }}>v{s.ver}</span>
+          {s.ver && <span style={{ height: 18, padding: '0 7px', borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', font: '600 var(--fs-caption)/18px var(--font-mono)', color: 'var(--ink-secondary)' }}>v{s.ver}</span>}
           {s.mine && <span style={{ height: 18, padding: '0 7px', borderRadius: 'var(--r-pill)', background: 'color-mix(in srgb, var(--blue) 13%, transparent)', font: '600 var(--fs-caption)/18px var(--font-text)', color: 'var(--blue)' }}>Yours</span>}
         </div>
         <div style={{ font: '400 var(--fs-subhead)/1.35 var(--font-text)', color: 'var(--ink-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.desc}</div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-        <SigShield signed={s.signed} />
+        <EvidenceShield verified={s.signed} />
         <ScanChip scan={s.scan} />
         <Icon name="chevronRight" size={16} style={{ color: 'var(--ink-tertiary)' }} />
       </div>
@@ -280,13 +289,13 @@ function SkillDetail({ s, onBack, onAdd, onRescan }: { s: Skill; onBack: () => v
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6, flexWrap: 'wrap' }}>
               <h1 style={{ margin: 0, font: '700 var(--fs-title1)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>{s.name}</h1>
-              <span className="ver-pick" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 26, padding: '0 10px', borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-mono)', cursor: 'pointer' }}>
+              {s.ver && <span className="ver-pick" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 26, padding: '0 10px', borderRadius: 8, background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-footnote)/1 var(--font-mono)', cursor: 'pointer' }}>
                 v{s.ver} <Icon name="chevronDown" size={13} style={{ color: 'var(--ink-tertiary)' }} />
-              </span>
+              </span>}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 9 }}>
-              <SigShield signed={s.signed} />
-              <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{s.installed ? 'Enabled in registry' : (s.disabledReason || 'Disabled in registry')}</span>
+              <EvidenceShield verified={s.signed} />
+              <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-secondary)' }}>{s.signed ? 'Audit verified' : s.scan === 'pending' ? 'Audit pending' : (s.disabledReason || 'Audit failed')}</span>
             </div>
             <button onClick={() => { void navigator.clipboard?.writeText(sha); setCopied(true); setTimeout(() => setCopied(false), 1400); }} className="sha-copy" style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '6px 10px', borderRadius: 8, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)' }}>
               <span style={{ font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>{sha}</span>
@@ -488,7 +497,7 @@ function PublishSheet({ open, onClose, onPublished }: { open: boolean; onClose: 
   };
 
   const scanSteps = [
-    { label: 'Integrity check', sub: 'Hash & signature verified' },
+    { label: 'Integrity check', sub: 'Hash recorded; audit evidence required' },
     { label: 'Static scan', sub: 'Capabilities match declaration' },
     { label: 'Listed in registry', sub: 'Discoverable by meaning' },
   ];
@@ -813,7 +822,7 @@ export default function SkillsRegistry({ embedded = false }: { embedded?: boolea
     setSyncing(true);
     try {
       const r = await api.registryAdminSyncSources({ dryRun, limit: dryRun ? 20 : undefined });
-      setAdded({ id: 'sync', name: `${dryRun ? 'Dry-run' : 'Synced'} ${r.attempted}/${r.repos} original sources`, ver: 'latest', desc: '', signed: true, scan: 'ok', installed: true, mine: true, tags: [] });
+      setAdded({ id: 'sync', name: `${dryRun ? 'Dry-run' : 'Synced'} ${r.attempted}/${r.repos} original sources`, ver: '', desc: '', signed: false, scan: 'pending', installed: true, mine: true, tags: [] });
       await refreshRegistry();
     } catch { /* admin token missing or source unavailable */ }
     setSyncing(false);

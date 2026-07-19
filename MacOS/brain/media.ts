@@ -13,6 +13,10 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { Store, Asset, AssetKind, AssetStage } from './store.js';
+import { isHeaderSafeSecret } from './header-safe.js';
+
+/** Actionable, secret-free message for a stored-but-corrupt fal credential. */
+const FAL_CORRUPT_MSG = 'FAL credential is invalid or corrupted. Reconnect FAL in Settings.';
 
 const POLL_MS = 4000;
 const TIMEOUT_MS = 15 * 60 * 1000;
@@ -129,7 +133,17 @@ function fileToDataUri(filePath: string): string {
 export class MediaEngine {
   private ticking = false;
 
-  constructor(private store: Store, private emit: (name: string, data: unknown) => void, private getKey: () => string | undefined) {}
+  constructor(
+    private store: Store,
+    private emit: (name: string, data: unknown) => void,
+    private getKey: () => string | undefined,
+    /** Optional probe distinguishing an absent credential from a stored-but-
+        corrupt one, so a corrupt key surfaces "reconnect FAL" instead of the
+        generic "connect your key". The shared boundary (providers.getLocalKey)
+        already withholds a corrupt key from getKey(); this only sharpens the
+        message. */
+    private keyState?: () => 'ok' | 'missing' | 'corrupt',
+  ) {}
 
   rates(): MediaRate[] { return mediaRates(); }
   estimateFor(modelKey: string, durationS?: number): number {
@@ -140,7 +154,13 @@ export class MediaEngine {
   /** Submit a generation to fal and start (or keep) the poll ticker. */
   async generate(args: GenArgs): Promise<Asset> {
     const key = this.getKey();
-    if (!key) throw Object.assign(new Error('Connect your fal.ai API key in Settings → Accounts to generate media.'), { statusCode: 503 });
+    // A genuinely absent credential → nothing to persist, ask them to connect.
+    // A stored-but-CORRUPT credential is handled below as a failed asset (with
+    // an actionable "reconnect" message) so it surfaces in the media timeline
+    // exactly like the production failure did, rather than a bare throw.
+    if (!key && this.keyState?.() !== 'corrupt') {
+      throw Object.assign(new Error('Connect your fal.ai API key in Settings → Accounts to generate media.'), { statusCode: 503 });
+    }
     const model = MODELS[args.modelKey];
     if (!model) throw Object.assign(new Error('unknown media model'), { statusCode: 400 });
     if (!args.prompt || !args.prompt.trim()) throw Object.assign(new Error('a prompt is required'), { statusCode: 400 });
@@ -161,6 +181,14 @@ export class MediaEngine {
     this.emit('asset', asset);
 
     try {
+      // A missing or non-header-safe key must NEVER reach fetch's Headers — a
+      // U+FFFD-poisoned value throws a cryptic native ByteString TypeError.
+      // Fail with a clear, secret-free, actionable message instead.
+      // (isHeaderSafeSecret already rejects undefined/empty, so no separate
+      // !key check is needed.)
+      if (!isHeaderSafeSecret(key)) {
+        throw Object.assign(new Error(FAL_CORRUPT_MSG), { statusCode: 502 });
+      }
       const res = await fetch(`https://queue.fal.run/${model.id}`, {
         method: 'POST',
         headers: { authorization: `Key ${key}`, 'content-type': 'application/json' },
@@ -214,7 +242,7 @@ export class MediaEngine {
     const asset = this.store.getAsset(assetId);
     if (!asset) throw Object.assign(new Error('asset not found'), { statusCode: 404 });
     const key = this.getKey();
-    if (asset.cancelUrl && key) {
+    if (asset.cancelUrl && isHeaderSafeSecret(key)) {
       try { await fetch(asset.cancelUrl, { method: 'PUT', headers: { authorization: `Key ${key}` } }); } catch { /* best effort */ }
     }
     const cancelled = this.store.updateAsset(assetId, { status: 'cancelled' });
@@ -241,13 +269,16 @@ export class MediaEngine {
   }
 
   private async pollOne(asset: Asset): Promise<void> {
-    const key = this.getKey();
-    if (!key || !asset.statusUrl) return;
+    // Time out FIRST, regardless of key state — otherwise an in-flight asset
+    // whose key later becomes missing/corrupt would never leave 'generating'
+    // (the ticker would re-poll it forever). This resolves it either way.
     if (Date.now() - asset.createdAt > TIMEOUT_MS) {
       const failed = this.store.updateAsset(asset.id, { status: 'failed', error: 'Generation timed out (15 min).' });
       this.emit('asset', failed);
       return;
     }
+    const key = this.getKey();
+    if (!isHeaderSafeSecret(key) || !asset.statusUrl) return;
     const sres = await fetch(asset.statusUrl, { headers: { authorization: `Key ${key}` } });
     if (!sres.ok) return; // transient — try again next tick
     const status = (await sres.json() as { status?: string }).status;

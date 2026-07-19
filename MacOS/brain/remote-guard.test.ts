@@ -11,6 +11,7 @@ describe('remote-guard', () => {
       'githubLogout', 'getSessionGitStatus', 'refreshSessionGitStatus',
       'pushSession', 'createSessionPR', 'mergeSessionPR', 'resolveSession',
       'previewSessionMerge', 'previewSessionResolve',
+      'overrideReviewGate', 'retryReviewGate',
       'listDesignComments', 'addDesignComment', 'setDesignCommentStatus', 'deleteDesignComment',
       'extensionStatus', 'extensionSetActive', 'extensionPath', 'extensionRevealFolder', 'copyDesignToCode',
       'addSkillToProject', 'removeSkillFromProject', 'scanConversations', 'importConversations',

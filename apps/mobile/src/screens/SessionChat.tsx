@@ -10,6 +10,8 @@ import { Mono } from '../ui';
 import { Markdown, StreamingMarkdown } from '../Markdown';
 import { api, type Job, type TranscriptItem, type Effort, type ModelGroup } from '../api';
 import { cacheGet, cacheSet } from '../storage';
+import { requireShadowController } from '../controllerMode';
+import { SecureControllerBlocked } from './SecureControllerBlocked';
 import { pullSync, useSyncStore } from '../syncStore';
 
 /* One inline composer chip — either an image (vision) or a file (text inlined
@@ -485,10 +487,22 @@ function AgentBlocks({ job, onAnswer, answered }: { job: Job; onAnswer: (text: s
     if (it.kind === 'ask') return <QuestionCard key={i} ask={it.ask || it.text} onAnswer={onAnswer} answered={answered} />;
     if (it.kind === 'review') {
       const ok = it.verdict === 'approved';
+      const findings = it.findings ?? [];
+      const tint = ok ? theme.color.green : theme.color.orange;
       return (
-        <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, borderRadius: 12, padding: 12, backgroundColor: (ok ? theme.color.green : theme.color.orange) + '14', borderWidth: 0.5, borderColor: (ok ? theme.color.green : theme.color.orange) + '40' }}>
-          <Icon name="shield" size={15} color={ok ? theme.color.green : theme.color.orange} />
-          <Text style={{ flex: 1, fontSize: 14, lineHeight: 19, color: theme.color.ink }}>{it.text || (ok ? 'Reviewer approved' : 'Reviewer asked for changes')}{it.resolved ? ' · resolved' : ''}</Text>
+        <View key={i} style={{ gap: 8, borderRadius: 12, padding: 12, backgroundColor: tint + '14', borderWidth: 0.5, borderColor: tint + '40' }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            <Icon name={ok || it.resolved ? 'shield' : 'alert'} size={15} color={tint} />
+            <Text style={{ flex: 1, fontSize: 14, lineHeight: 19, fontWeight: '600', color: theme.color.ink }}>{ok ? 'Reviewer approved' : it.resolved ? 'Reviewer findings resolved' : 'Reviewer needs work'}</Text>
+          </View>
+          {findings.length > 0 ? findings.map((finding, idx) => (
+            <View key={idx} style={{ padding: 9, borderRadius: 10, backgroundColor: theme.color.bgElevated, borderWidth: 0.5, borderColor: tint + '30' }}>
+              <Text style={{ fontSize: 10, fontWeight: '800', letterSpacing: 0.6, textTransform: 'uppercase', color: tint }}>{finding.severity}{finding.file ? ` · ${finding.file}` : ''}</Text>
+              <Text style={{ marginTop: 3, fontSize: 13, lineHeight: 18, color: theme.color.ink }}>{finding.message}</Text>
+            </View>
+          )) : (
+            <Text style={{ fontSize: 14, lineHeight: 19, color: theme.color.ink }}>{it.text || (ok ? 'Reviewer approved' : 'Reviewer asked for changes')}{it.resolved ? ' · resolved' : ''}</Text>
+          )}
         </View>
       );
     }
@@ -575,7 +589,7 @@ function Turn({ job, onAnswer, answered }: { job: Job; onAnswer: (text: string) 
       {/* agent reply */}
       <View style={{ alignSelf: 'flex-start', maxWidth: '94%' }}>
         <AgentBlocks job={job} onAnswer={onAnswer} answered={answered} />
-        {job.status === 'done' || job.status === 'failed' ? (
+        {job.status === 'done' || job.status === 'failed' || job.status === 'gated' ? (
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 }}>
             <Mono style={{ fontSize: 11, color: theme.color.inkTertiary }}>${job.cost.toFixed(2)}</Mono>
             {job.tokens ? <Mono style={{ fontSize: 11, color: theme.color.inkTertiary }}>· {job.tokens.toLocaleString()} tok</Mono> : null}
@@ -605,7 +619,18 @@ function mergeTurns(current: Job[], incoming: Job[]): Job[] {
   return [...byId.values()].sort(compareTurns);
 }
 
+/**
+ * F2 defense-in-depth: while secure-controller mode is active, the legacy tab tree is
+ * unmounted at the ROOT (this screen never mounts). This guard wrapper is belt-and-
+ * suspenders — if a stray navigation ever reached here, `requireShadowController()`
+ * blocks the direct-server session-message (`api.sendChat`) surface instead of rendering.
+ */
 export function SessionChatScreen() {
+  if (requireShadowController()) return <SecureControllerBlocked />;
+  return <SessionChatScreenInner />;
+}
+
+function SessionChatScreenInner() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
   const nav = useNavigation<any>();

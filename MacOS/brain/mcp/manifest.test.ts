@@ -96,6 +96,22 @@ describe('reported contract bugs are fixed', () => {
     expect(s.properties).not.toHaveProperty('jobId');
     expect(s.required).toEqual(['id', 'text']);
   });
+  it('question tools expose exact sourceJobId identity while keeping session compatibility', () => {
+    expect(TOOL_SCHEMAS.answerQuestion.properties).toHaveProperty('sessionId');
+    expect(TOOL_SCHEMAS.answerQuestion.properties).toHaveProperty('sourceJobId');
+    expect(TOOL_SCHEMAS.answerQuestion.required).toEqual(['answer']);
+    expect(reads(BLOCKS.get('answerQuestion')!, 'sourceJobId')).toBe(true);
+
+    expect(TOOL_SCHEMAS.extendQuestion.properties).toHaveProperty('sessionId');
+    expect(TOOL_SCHEMAS.extendQuestion.properties).toHaveProperty('sourceJobId');
+    expect(TOOL_SCHEMAS.extendQuestion.required ?? []).toEqual([]);
+    expect(reads(BLOCKS.get('extendQuestion')!, 'sourceJobId')).toBe(true);
+
+    expect(TOOL_SCHEMAS.cancelQuestion.properties).toHaveProperty('sessionId');
+    expect(TOOL_SCHEMAS.cancelQuestion.properties).toHaveProperty('sourceJobId');
+    expect(TOOL_SCHEMAS.cancelQuestion.required ?? []).toEqual([]);
+    expect(reads(BLOCKS.get('cancelQuestion')!, 'sourceJobId')).toBe(true);
+  });
   it('project-scoped tools accept canonical projectId + the legacy id alias', () => {
     // These arms resolve their PROJECT id via projectIdOf(p) = projectId ?? id.
     for (const m of ['getProject', 'getProjectMemory', 'setProjectMemory', 'snapshotProject',

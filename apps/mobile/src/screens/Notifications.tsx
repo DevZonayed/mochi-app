@@ -15,6 +15,7 @@ type TintKey = 'blue' | 'purple' | 'orange' | 'teal' | 'green' | 'red' | 'indigo
 const KIND_META: Record<AppEventKind, { icon: IconName; tint: TintKey }> = {
   'job-done': { icon: 'checkCircle', tint: 'green' },
   'job-failed': { icon: 'xCircle', tint: 'red' },
+  'job-gated': { icon: 'alert', tint: 'orange' },
   'job-cancelled': { icon: 'xCircle', tint: 'orange' },
   'approval-created': { icon: 'arrowRight', tint: 'orange' },
   'approval-resolved': { icon: 'checkCircle', tint: 'green' },
