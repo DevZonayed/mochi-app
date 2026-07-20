@@ -261,6 +261,8 @@ describe('NOTE-2 — sidecar production wiring pins the revoked-set/rotation pro
   it('renew/resume refresh the live authority from the runtime truth (revoked set + scope-key id)', () => {
     // The single refresh helper reads liveAuthority() (fence + expiry + revoked set + scopeKeyId).
     expect(headless).toContain('function applyLiveHostAuthority');
+    expect(headless).toContain('const plane = shadowHostData');
+    expect(headless).toContain('plane.svc.setAuthority');
     expect(headless).toContain('rt.liveAuthority()');
     expect(headless).toContain('a.revokedControllerDeviceIds, a.scopeKeyId');
     // The old 2-arg setAuthority(renewed.fence, renewed.leaseExpiresAt) shape is gone.

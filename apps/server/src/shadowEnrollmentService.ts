@@ -61,6 +61,11 @@ function status(message: string, statusCode: number): Error & { statusCode: numb
   return Object.assign(new Error(message), { statusCode });
 }
 
+function isPgUniqueViolation(e: unknown, constraintOrIndex: string): boolean {
+  const err = e as { code?: unknown; constraint?: unknown } | undefined;
+  return err?.code === '23505' && err.constraint === constraintOrIndex;
+}
+
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
 const B64URL_RE = /^[A-Za-z0-9_-]{1,4096}$/;
 
@@ -220,6 +225,37 @@ async function activeHostIdentity(db: DbOrTrx, accountId: string, hostDeviceId: 
   return row;
 }
 
+async function expirePendingEnrollmentRequestsForController(db: DbOrTrx, accountId: string, controllerDeviceId: string, nowMs: number): Promise<void> {
+  await sql`
+    WITH expired AS (
+      SELECT r.account_id, r.session_id
+      FROM shadow_enrollment_request r
+      JOIN shadow_enrollment_session s
+        ON s.account_id = r.account_id
+       AND s.session_id = r.session_id
+      WHERE r.account_id = ${accountId}
+        AND r.controller_device_id = ${controllerDeviceId}
+        AND r.status = 'pending'
+        AND s.expires_at_ms <= ${nowMs}
+    ),
+    denied AS (
+      UPDATE shadow_enrollment_request r
+      SET status = 'denied', updated_at = now()
+      FROM expired e
+      WHERE r.account_id = e.account_id
+        AND r.session_id = e.session_id
+        AND r.status = 'pending'
+      RETURNING r.account_id, r.session_id
+    )
+    UPDATE shadow_enrollment_session s
+    SET status = 'cancelled', updated_at = now()
+    FROM denied d
+    WHERE s.account_id = d.account_id
+      AND s.session_id = d.session_id
+      AND s.status IN ('pending', 'consumed')
+  `.execute(db);
+}
+
 // ── Enrollment session (host) ─────────────────────────────────────────────
 
 export interface CreateEnrollmentSessionInput {
@@ -350,27 +386,53 @@ export async function submitEnrollmentRequest(input: SubmitEnrollmentRequestInpu
   if (!secretOk) throw status('enrollment denied', 403);
 
   const controllerDeviceId = requireId(req.controllerDeviceId, 'controllerDeviceId');
+  await expirePendingEnrollmentRequestsForController(getDb(), accountId, controllerDeviceId, input.nowMs);
 
-  return getDb().transaction().execute(async (trx) => {
-    // Single-use consume: flip pending→consumed guarded on status, and insert the
-    // one-per-session request row. Whichever wins the row insert wins the session.
-    const consume = await trx.updateTable('shadow_enrollment_session').set({ status: 'consumed', updated_at: new Date() })
-      .where('account_id', '=', accountId).where('session_id', '=', sessionId).where('status', '=', 'pending').executeTakeFirst();
-    if (Number(consume.numUpdatedRows ?? 0) === 0) throw status('enrollment already claimed', 409);
-    const now = new Date();
-    const inserted = await trx.insertInto('shadow_enrollment_request').values({
-      account_id: accountId, session_id: sessionId, controller_device_id: controllerDeviceId,
-      controller_signing_key_id: req.controllerSigningKeyId, controller_agreement_key_id: req.controllerAgreementKeyId,
-      signing_public_key: req.signingPublicKey, agreement_public_key: req.agreementPublicKey, nonce: req.nonce,
-      requested_at_ms: req.requestedAt, transcript_hash: req.transcriptHash, signature: req.signature, status: 'pending',
-      // Persist the CRYPTOGRAPHICALLY-VERIFIED requested set (bound in the controller
-      // signature; `verifyEnrollmentRequest` returned it). Never a detached plain field.
-      requested_capabilities: JSON.stringify(verified.requestedCapabilities),
-      created_at: now, updated_at: now,
-    }).onConflict((oc) => oc.columns(['account_id', 'session_id']).doNothing()).executeTakeFirst();
-    if (Number(inserted.numInsertedOrUpdatedRows ?? 0) === 0) throw status('enrollment already claimed', 409);
-    return { sessionId, controllerDeviceId, status: 'pending' as const };
-  });
+  const activeGrant = await getDb().selectFrom('shadow_enrollment_grant')
+    .select(['grant_id'])
+    .where('account_id', '=', accountId)
+    .where('controller_device_id', '=', controllerDeviceId)
+    .where('status', '=', 'active')
+    .executeTakeFirst();
+  if (activeGrant) throw status('controller already enrolled', 409);
+
+  const pendingForController = await getDb().selectFrom('shadow_enrollment_request')
+    .select(['session_id'])
+    .where('account_id', '=', accountId)
+    .where('controller_device_id', '=', controllerDeviceId)
+    .where('status', '=', 'pending')
+    .executeTakeFirst();
+  if (pendingForController && pendingForController.session_id !== sessionId) {
+    throw status('controller already enrolled', 409);
+  }
+
+  try {
+    return await getDb().transaction().execute(async (trx) => {
+      // Single-use consume: flip pending→consumed guarded on status, and insert the
+      // one-per-session request row. Whichever wins the row insert wins the session.
+      const consume = await trx.updateTable('shadow_enrollment_session').set({ status: 'consumed', updated_at: new Date() })
+        .where('account_id', '=', accountId).where('session_id', '=', sessionId).where('status', '=', 'pending').executeTakeFirst();
+      if (Number(consume.numUpdatedRows ?? 0) === 0) throw status('enrollment already claimed', 409);
+      const now = new Date();
+      const inserted = await trx.insertInto('shadow_enrollment_request').values({
+        account_id: accountId, session_id: sessionId, controller_device_id: controllerDeviceId,
+        controller_signing_key_id: req.controllerSigningKeyId, controller_agreement_key_id: req.controllerAgreementKeyId,
+        signing_public_key: req.signingPublicKey, agreement_public_key: req.agreementPublicKey, nonce: req.nonce,
+        requested_at_ms: req.requestedAt, transcript_hash: req.transcriptHash, signature: req.signature, status: 'pending',
+        // Persist the CRYPTOGRAPHICALLY-VERIFIED requested set (bound in the controller
+        // signature; `verifyEnrollmentRequest` returned it). Never a detached plain field.
+        requested_capabilities: JSON.stringify(verified.requestedCapabilities),
+        created_at: now, updated_at: now,
+      }).onConflict((oc) => oc.columns(['account_id', 'session_id']).doNothing()).executeTakeFirst();
+      if (Number(inserted.numInsertedOrUpdatedRows ?? 0) === 0) throw status('enrollment already claimed', 409);
+      return { sessionId, controllerDeviceId, status: 'pending' as const };
+    });
+  } catch (e) {
+    if (isPgUniqueViolation(e, 'shadow_enrollment_one_pending_controller_idx')) {
+      throw status('controller already enrolled', 409);
+    }
+    throw e;
+  }
 }
 
 // ── Account-wise enrollment discovery + challenge ─────────────────────────

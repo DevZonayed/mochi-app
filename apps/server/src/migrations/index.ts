@@ -6,6 +6,7 @@ import * as m0004 from './0004_shadow_transition.js';
 import * as m0005 from './0005_shadow_lease_renewal_receipt.js';
 import * as m0006 from './0006_shadow_capabilities.js';
 import * as m0007 from './0007_shadow_capability_limit_8.js';
+import * as m0008 from './0008_shadow_pending_enrollment_unique.js';
 
 /** A migration applied idempotently on boot (see db.runMigrations). */
 export interface Migration {
@@ -24,4 +25,5 @@ export const migrations: Record<string, Migration> = {
   '0005_shadow_lease_renewal_receipt': m0005,
   '0006_shadow_capabilities': m0006,
   '0007_shadow_capability_limit_8': m0007,
+  '0008_shadow_pending_enrollment_unique': m0008,
 };

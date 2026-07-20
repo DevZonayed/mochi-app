@@ -412,10 +412,11 @@ export class ShadowHostCore {
         CREATE TABLE IF NOT EXISTS blob_cas(content_id TEXT PRIMARY KEY, file_path TEXT NOT NULL, plaintext_digest TEXT NOT NULL, ciphertext_digest TEXT NOT NULL, bytes INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, ref_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_accessed_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS corruption(id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, reason TEXT NOT NULL, quarantined_at INTEGER NOT NULL, details_json TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS projection_index(
-          scope_id TEXT NOT NULL, collection TEXT NOT NULL, entity_id TEXT NOT NULL,
+          scope_id TEXT NOT NULL, epoch INTEGER NOT NULL DEFAULT 0, key_id TEXT NOT NULL DEFAULT '',
+          collection TEXT NOT NULL, entity_id TEXT NOT NULL,
           digest TEXT NOT NULL, revision INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
           updated_at INTEGER NOT NULL,
-          PRIMARY KEY(scope_id, collection, entity_id)
+          PRIMARY KEY(scope_id, epoch, key_id, collection, entity_id)
         );
         CREATE INDEX IF NOT EXISTS idx_events_scope_epoch_seq ON events(scope_id, epoch, seq);
         CREATE INDEX IF NOT EXISTS idx_segment_records_segment ON segment_records(scope_id, epoch, segment_id, seq);
@@ -437,8 +438,30 @@ export class ShadowHostCore {
       ]) {
         try { this.db.exec(ddl); } catch {}
       }
+      this.migrateProjectionIndexAuthorityFence();
     });
     runWithBusyRetry(() => tx.immediate());
+  }
+
+  private migrateProjectionIndexAuthorityFence(): void {
+    const cols = this.db.prepare('PRAGMA table_info(projection_index)').all() as Array<{ name: string; pk: number }>;
+    const hasEpoch = cols.some((c) => c.name === 'epoch');
+    const hasKeyId = cols.some((c) => c.name === 'key_id');
+    const pk = cols.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk).map((c) => c.name).join(',');
+    if (hasEpoch && hasKeyId && pk === 'scope_id,epoch,key_id,collection,entity_id') return;
+    this.db.exec(`
+      ALTER TABLE projection_index RENAME TO projection_index_old;
+      CREATE TABLE projection_index(
+        scope_id TEXT NOT NULL, epoch INTEGER NOT NULL DEFAULT 0, key_id TEXT NOT NULL DEFAULT '',
+        collection TEXT NOT NULL, entity_id TEXT NOT NULL,
+        digest TEXT NOT NULL, revision INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(scope_id, epoch, key_id, collection, entity_id)
+      );
+      INSERT OR IGNORE INTO projection_index(scope_id, epoch, key_id, collection, entity_id, digest, revision, deleted, updated_at)
+      SELECT scope_id, 0, '', collection, entity_id, digest, revision, deleted, updated_at FROM projection_index_old;
+      DROP TABLE projection_index_old;
+    `);
   }
 
   private immediate<T>(fn: () => T): T {
@@ -642,8 +665,9 @@ export class ShadowHostCore {
     if (typeof input.digest !== 'string' || input.digest.length === 0 || input.digest.length > 128) throw new Error('projection-digest-invalid');
     const desiredDeleted = input.op === 'delete';
     const result = this.immediate(() => {
-      const row = this.db.prepare('SELECT digest,revision,deleted FROM projection_index WHERE scope_id=? AND collection=? AND entity_id=? LIMIT 1')
-        .get(authority.scopeId, input.collection, input.entityId) as { digest: string; revision: number; deleted: number } | undefined;
+      const keyId = this.keys.currentKey().keyId;
+      const row = this.db.prepare('SELECT digest,revision,deleted FROM projection_index WHERE scope_id=? AND epoch=? AND key_id=? AND collection=? AND entity_id=? LIMIT 1')
+        .get(authority.scopeId, authority.epoch, keyId, input.collection, input.entityId) as { digest: string; revision: number; deleted: number } | undefined;
       if (row) {
         // Quarantine a corrupt index row fail-closed (do not emit a possibly-wrong event).
         if (typeof row.digest !== 'string' || !Number.isInteger(row.revision) || row.revision < 0 || (row.deleted !== 0 && row.deleted !== 1)) {
@@ -664,10 +688,10 @@ export class ShadowHostCore {
         revision: nextRevision, commandId: input.commandId, now: input.now,
       });
       this.db.prepare(`
-        INSERT INTO projection_index(scope_id,collection,entity_id,digest,revision,deleted,updated_at)
-        VALUES(?,?,?,?,?,?,?)
-        ON CONFLICT(scope_id,collection,entity_id) DO UPDATE SET digest=excluded.digest, revision=excluded.revision, deleted=excluded.deleted, updated_at=excluded.updated_at
-      `).run(authority.scopeId, input.collection, input.entityId, input.digest, nextRevision, desiredDeleted ? 1 : 0, input.now);
+        INSERT INTO projection_index(scope_id,epoch,key_id,collection,entity_id,digest,revision,deleted,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(scope_id,epoch,key_id,collection,entity_id) DO UPDATE SET digest=excluded.digest, revision=excluded.revision, deleted=excluded.deleted, updated_at=excluded.updated_at
+      `).run(authority.scopeId, authority.epoch, keyId, input.collection, input.entityId, input.digest, nextRevision, desiredDeleted ? 1 : 0, input.now);
       return { appended: true as const, revision: nextRevision, event };
     });
     if (result.appended) {
@@ -687,8 +711,11 @@ export class ShadowHostCore {
    * next `projectEntity` touch).
    */
   projectionIndexEntities(scopeId: string, collection: ShadowCollection): Array<{ entityId: string; digest: string; revision: number; deleted: boolean }> {
-    const rows = this.db.prepare('SELECT entity_id,digest,revision,deleted FROM projection_index WHERE scope_id=? AND collection=? ORDER BY entity_id ASC')
-      .all(scopeId, collection) as Array<{ entity_id: string; digest: string; revision: number; deleted: number }>;
+    const authority = this.getAuthority(scopeId);
+    if (!authority) return [];
+    const keyId = this.keys.currentKey().keyId;
+    const rows = this.db.prepare('SELECT entity_id,digest,revision,deleted FROM projection_index WHERE scope_id=? AND epoch=? AND key_id=? AND collection=? ORDER BY entity_id ASC')
+      .all(scopeId, authority.epoch, keyId, collection) as Array<{ entity_id: string; digest: string; revision: number; deleted: number }>;
     const out: Array<{ entityId: string; digest: string; revision: number; deleted: boolean }> = [];
     for (const r of rows) {
       if (typeof r.entity_id !== 'string' || typeof r.digest !== 'string' || !Number.isInteger(r.revision)) continue;

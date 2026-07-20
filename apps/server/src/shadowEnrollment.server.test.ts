@@ -8,6 +8,14 @@ import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import { Pool } from 'pg';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import { runMigrations, getDb, closeDb, type DB } from './db.js';
+import * as m0001 from './migrations/0001_devices.js';
+import * as m0002 from './migrations/0002_shadow_relay.js';
+import * as m0003 from './migrations/0003_shadow_enrollment.js';
+import * as m0004 from './migrations/0004_shadow_transition.js';
+import * as m0005 from './migrations/0005_shadow_lease_renewal_receipt.js';
+import * as m0006 from './migrations/0006_shadow_capabilities.js';
+import * as m0007 from './migrations/0007_shadow_capability_limit_8.js';
+import * as m0008 from './migrations/0008_shadow_pending_enrollment_unique.js';
 import { upsertDevice } from './accountDevices.js';
 import { buildAccountServer } from './accountServer.js';
 import { auth, migrateAuth } from './auth.js';
@@ -66,6 +74,12 @@ async function resetDb(): Promise<void> {
   await getDb().deleteFrom('device').execute();
 }
 
+async function resetTo0007Db(): Promise<void> {
+  for (const t of ALL_TABLES) await getDb().schema.dropTable(t).ifExists().execute();
+  for (const m of [m0001, m0002, m0003, m0004, m0005, m0006, m0007]) await m.up(getDb());
+  await getDb().deleteFrom('device').execute();
+}
+
 async function makeRegisteredHost(accountId: string, hostDeviceId: string): Promise<ShadowIdentity> {
   await upsertDevice({ id: hostDeviceId, userId: accountId, role: 'host', name: 'Mac', platform: 'macos' });
   const host = await generateShadowIdentity(backend, hostDeviceId);
@@ -121,6 +135,20 @@ async function fullEnroll(accountId: string, host: ShadowIdentity, controllerDev
   });
   await approveEnrollment({ accountId, hostDeviceId: host.deviceId, sessionId, grant: approval.grant, keyMaterial: approval.keyMaterial, nowMs: now });
   return { controller, sessionId, fence: lease.fence, hostScopeKey: approval.scopeKey, grantMsg: approval.grant, keyMaterial: approval.keyMaterial, bootstrap, transcriptHash };
+}
+
+async function buildPendingRequest(accountId: string, host: ShadowIdentity, controllerDeviceId: string, sessionId: string, now = Date.now()) {
+  const secret = backend.randomBytes(32);
+  const salt = backend.randomBytes(16);
+  const verifier = await computeEnrollmentVerifier(backend, { sessionId, accountId, secret, salt });
+  const session = await createEnrollmentSession({
+    accountId, hostDeviceId: host.deviceId, sessionId, hostSigningKeyId: host.signingKeyId,
+    secretSalt: verifier.salt, secretVerifier: verifier.verifier, relayOrigin: RELAY_ORIGIN, ttlMs: 120_000, nowMs: now,
+  });
+  const bootstrap = bootstrapFor(host, accountId, sessionId, secret, session.expiresAt);
+  const controller = await generateShadowIdentity(backend, controllerDeviceId);
+  const built = await buildEnrollmentRequest(backend, { controller, bootstrap, nowMs: now });
+  return { controller, request: built.request, presentedSecret: base64urlEncode(built.presentedSecret), session, now };
 }
 
 /** Enroll an additional controller against an EXISTING host/lease fence. Returns its grantId. */
@@ -219,6 +247,155 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
     // Controller is now a registered remote device with active signing key.
     const key = await getDb().selectFrom('shadow_registered_key').selectAll().where('account_id', '=', accountId).where('device_id', '=', 'ctrl-happy').where('purpose', '=', 'sign').executeTakeFirst();
     expect(key?.status).toBe('active');
+  });
+
+  it('rejects a fresh pending request for a controller that already has an active grant', async () => {
+    const accountId = 'acct-active-duplicate';
+    const host = await makeRegisteredHost(accountId, 'host-active-duplicate');
+    await fullEnroll(accountId, host, 'ctrl-active-duplicate', 'es_active_duplicate_1');
+
+    const now = Date.now();
+    const sessionId = 'es_active_duplicate_2';
+    const secret = backend.randomBytes(32);
+    const salt = backend.randomBytes(16);
+    const verifier = await computeEnrollmentVerifier(backend, { sessionId, accountId, secret, salt });
+    const session = await createEnrollmentSession({
+      accountId, hostDeviceId: host.deviceId, sessionId, hostSigningKeyId: host.signingKeyId,
+      secretSalt: verifier.salt, secretVerifier: verifier.verifier, relayOrigin: RELAY_ORIGIN, ttlMs: 120_000, nowMs: now,
+    });
+    const bootstrap = bootstrapFor(host, accountId, sessionId, secret, session.expiresAt);
+    const controller = await generateShadowIdentity(backend, 'ctrl-active-duplicate');
+    const { request, presentedSecret } = await buildEnrollmentRequest(backend, { controller, bootstrap, nowMs: now });
+
+    await expect(submitEnrollmentRequest({
+      accountId, sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: `idem_${request.nonce}`, nowMs: now,
+    })).rejects.toMatchObject({ statusCode: 409, message: 'controller already enrolled' });
+
+    const pending = await getDb().selectFrom('shadow_enrollment_request')
+      .selectAll()
+      .where('account_id', '=', accountId)
+      .where('session_id', '=', sessionId)
+      .executeTakeFirst();
+    const sessionAfter = await getDb().selectFrom('shadow_enrollment_session')
+      .selectAll()
+      .where('account_id', '=', accountId)
+      .where('session_id', '=', sessionId)
+      .executeTakeFirst();
+    expect(pending).toBeUndefined();
+    expect(sessionAfter?.status).toBe('pending');
+  });
+
+  it('allows exactly one pending request per account/controller under competing session concurrency', async () => {
+    const accountId = 'acct-pending-concurrent';
+    const hostA = await makeRegisteredHost(accountId, 'host-pending-concurrent-a');
+    const hostB = await makeRegisteredHost(accountId, 'host-pending-concurrent-b');
+    const controllerDeviceId = 'ctrl-pending-concurrent';
+    const a = await buildPendingRequest(accountId, hostA, controllerDeviceId, 'es_pending_concurrent_a');
+    const b = await buildPendingRequest(accountId, hostB, controllerDeviceId, 'es_pending_concurrent_b');
+
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const submitA = (async () => { await barrier; return submitEnrollmentRequest({ accountId, sessionId: 'es_pending_concurrent_a', request: a.request, presentedSecret: a.presentedSecret, idempotencyKey: `idem_${a.request.nonce}`, nowMs: a.now }); })();
+    const submitB = (async () => { await barrier; return submitEnrollmentRequest({ accountId, sessionId: 'es_pending_concurrent_b', request: b.request, presentedSecret: b.presentedSecret, idempotencyKey: `idem_${b.request.nonce}`, nowMs: b.now }); })();
+    release();
+
+    const results = await Promise.allSettled([submitA, submitB]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toMatchObject({ statusCode: 409, message: 'controller already enrolled' });
+    const rows = await getDb().selectFrom('shadow_enrollment_request')
+      .select(['account_id', 'session_id', 'controller_device_id', 'status'])
+      .where('account_id', '=', accountId)
+      .where('controller_device_id', '=', controllerDeviceId)
+      .execute();
+    expect(rows.filter((r) => r.status === 'pending')).toHaveLength(1);
+  });
+
+  it('keeps pending uniqueness account-scoped without cross-tenant leakage', async () => {
+    const hostA = await makeRegisteredHost('acct-pending-tenant-a', 'host-pending-tenant-a');
+    const hostB = await makeRegisteredHost('acct-pending-tenant-b', 'host-pending-tenant-b');
+    const a = await buildPendingRequest('acct-pending-tenant-a', hostA, 'ctrl-shared-name', 'es_pending_tenant_a');
+    const b = await buildPendingRequest('acct-pending-tenant-b', hostB, 'ctrl-shared-name', 'es_pending_tenant_b');
+    await expect(submitEnrollmentRequest({ accountId: 'acct-pending-tenant-a', sessionId: 'es_pending_tenant_a', request: a.request, presentedSecret: a.presentedSecret, idempotencyKey: `idem_${a.request.nonce}`, nowMs: a.now })).resolves.toMatchObject({ status: 'pending' });
+    await expect(submitEnrollmentRequest({ accountId: 'acct-pending-tenant-b', sessionId: 'es_pending_tenant_b', request: b.request, presentedSecret: b.presentedSecret, idempotencyKey: `idem_${b.request.nonce}`, nowMs: b.now })).resolves.toMatchObject({ status: 'pending' });
+    const count = await getDb().selectFrom('shadow_enrollment_request').select(sql<number>`count(*)`.as('count')).where('controller_device_id', '=', 'ctrl-shared-name').executeTakeFirstOrThrow();
+    expect(Number(count.count)).toBe(2);
+  });
+
+  it('coalesces exact idempotent replay but rejects competing pending sessions before grant', async () => {
+    const accountId = 'acct-pending-replay';
+    const host = await makeRegisteredHost(accountId, 'host-pending-replay');
+    const first = await buildPendingRequest(accountId, host, 'ctrl-pending-replay', 'es_pending_replay_1');
+    const inserted = await submitEnrollmentRequest({ accountId, sessionId: 'es_pending_replay_1', request: first.request, presentedSecret: first.presentedSecret, idempotencyKey: `idem_${first.request.nonce}`, nowMs: first.now });
+    const replay = await submitEnrollmentRequest({ accountId, sessionId: 'es_pending_replay_1', request: first.request, presentedSecret: first.presentedSecret, idempotencyKey: `idem_${first.request.nonce}`, nowMs: first.now });
+    expect(inserted.status).toBe('pending');
+    expect(replay.coalesced).toBe(true);
+
+    const second = await buildPendingRequest(accountId, host, 'ctrl-pending-replay', 'es_pending_replay_2');
+    await expect(submitEnrollmentRequest({ accountId, sessionId: 'es_pending_replay_2', request: second.request, presentedSecret: second.presentedSecret, idempotencyKey: `idem_${second.request.nonce}`, nowMs: second.now })).rejects.toMatchObject({ statusCode: 409, message: 'controller already enrolled' });
+    const sessionAfter = await getDb().selectFrom('shadow_enrollment_session').select(['status']).where('account_id', '=', accountId).where('session_id', '=', 'es_pending_replay_2').executeTakeFirst();
+    expect(sessionAfter?.status).toBe('pending');
+  });
+
+  it('allows re-enrollment after pending expiry, after active revoke, but not while active', async () => {
+    const accountId = 'acct-pending-lifecycle';
+    const host = await makeRegisteredHost(accountId, 'host-pending-lifecycle');
+    const first = await buildPendingRequest(accountId, host, 'ctrl-pending-lifecycle-expired', 'es_pending_lifecycle_expired', Date.now());
+    await submitEnrollmentRequest({ accountId, sessionId: 'es_pending_lifecycle_expired', request: first.request, presentedSecret: first.presentedSecret, idempotencyKey: `idem_${first.request.nonce}`, nowMs: first.now });
+    await getDb().updateTable('shadow_enrollment_session')
+      .set({ expires_at_ms: first.now - 1 })
+      .where('account_id', '=', accountId)
+      .where('session_id', '=', 'es_pending_lifecycle_expired')
+      .execute();
+    const second = await buildPendingRequest(accountId, host, 'ctrl-pending-lifecycle-expired', 'es_pending_lifecycle_after_denied');
+    await expect(submitEnrollmentRequest({ accountId, sessionId: 'es_pending_lifecycle_after_denied', request: second.request, presentedSecret: second.presentedSecret, idempotencyKey: `idem_${second.request.nonce}`, nowMs: second.now })).resolves.toMatchObject({ status: 'pending' });
+    const expiredRequest = await getDb().selectFrom('shadow_enrollment_request').select(['status']).where('account_id', '=', accountId).where('session_id', '=', 'es_pending_lifecycle_expired').executeTakeFirst();
+    const expiredSession = await getDb().selectFrom('shadow_enrollment_session').select(['status']).where('account_id', '=', accountId).where('session_id', '=', 'es_pending_lifecycle_expired').executeTakeFirst();
+    expect(expiredRequest?.status).toBe('denied');
+    expect(expiredSession?.status).toBe('cancelled');
+
+    const enrolled = await fullEnroll(accountId, host, 'ctrl-pending-lifecycle-active', 'es_pending_lifecycle_active');
+    const activeDup = await buildPendingRequest(accountId, host, 'ctrl-pending-lifecycle-active', 'es_pending_lifecycle_active_dup');
+    await expect(submitEnrollmentRequest({ accountId, sessionId: 'es_pending_lifecycle_active_dup', request: activeDup.request, presentedSecret: activeDup.presentedSecret, idempotencyKey: `idem_${activeDup.request.nonce}`, nowMs: activeDup.now })).rejects.toMatchObject({ statusCode: 409, message: 'controller already enrolled' });
+
+    const rev = await signDeviceRevocation(backend, host, { family: 'device-revocation', v: 1, fence: enrolled.fence, controllerDeviceId: enrolled.controller.deviceId, revokedAt: Date.now(), keyRotationId: 'kr_pending_lifecycle' });
+    await revokeEnrolledController({ accountId, hostDeviceId: host.deviceId, scopeId: enrolled.fence.scopeId, controllerDeviceId: enrolled.controller.deviceId, revocation: rev, effectiveSeq: 1, nowMs: Date.now() });
+    const afterRevoke = await buildPendingRequest(accountId, host, 'ctrl-pending-lifecycle-active', 'es_pending_lifecycle_after_revoke');
+    await expect(submitEnrollmentRequest({ accountId, sessionId: 'es_pending_lifecycle_after_revoke', request: afterRevoke.request, presentedSecret: afterRevoke.presentedSecret, idempotencyKey: `idem_${afterRevoke.request.nonce}`, nowMs: afterRevoke.now })).resolves.toMatchObject({ status: 'pending' });
+  });
+
+  it('0008 migrates old-schema duplicate pending rows deterministically and reapplies idempotently', async () => {
+    await resetTo0007Db();
+    const accountId = 'acct-old-dup';
+    const host = await makeRegisteredHost(accountId, 'host-old-dup');
+    const now = new Date('2026-07-20T00:00:00.000Z');
+    for (const sid of ['es_old_dup_keep', 'es_old_dup_cancel']) {
+      await getDb().insertInto('shadow_enrollment_session').values({
+        account_id: accountId, session_id: sid, host_device_id: host.deviceId, host_signing_key_id: host.signingKeyId,
+        relay_origin: RELAY_ORIGIN, secret_salt: base64urlEncode(backend.randomBytes(16)), secret_verifier: base64urlEncode(backend.randomBytes(32)),
+        expected_fingerprint: null, status: 'consumed', created_at_ms: 1, expires_at_ms: 9_999_999_999_999, created_at: now, updated_at: now,
+      }).execute();
+    }
+    await getDb().insertInto('shadow_enrollment_request').values([
+      { account_id: accountId, session_id: 'es_old_dup_keep', controller_device_id: 'ctrl-old-dup', controller_signing_key_id: 'sign_keep', controller_agreement_key_id: 'agree_keep', signing_public_key: base64urlEncode(backend.randomBytes(32)), agreement_public_key: base64urlEncode(backend.randomBytes(32)), nonce: 'nonce_keep', requested_at_ms: 1, transcript_hash: base64urlEncode(backend.randomBytes(32)), signature: base64urlEncode(backend.randomBytes(64)), status: 'pending', requested_capabilities: JSON.stringify(['account.read']), created_at: now, updated_at: now },
+      { account_id: accountId, session_id: 'es_old_dup_cancel', controller_device_id: 'ctrl-old-dup', controller_signing_key_id: 'sign_cancel', controller_agreement_key_id: 'agree_cancel', signing_public_key: base64urlEncode(backend.randomBytes(32)), agreement_public_key: base64urlEncode(backend.randomBytes(32)), nonce: 'nonce_cancel', requested_at_ms: 2, transcript_hash: base64urlEncode(backend.randomBytes(32)), signature: base64urlEncode(backend.randomBytes(64)), status: 'pending', requested_capabilities: JSON.stringify(['account.read']), created_at: new Date(now.getTime() + 1), updated_at: now },
+    ]).execute();
+
+    await m0008.up(getDb());
+    await m0008.up(getDb());
+    const requests = await getDb().selectFrom('shadow_enrollment_request').select(['session_id', 'status']).where('account_id', '=', accountId).orderBy('session_id').execute();
+    expect(requests).toEqual([
+      { session_id: 'es_old_dup_cancel', status: 'denied' },
+      { session_id: 'es_old_dup_keep', status: 'pending' },
+    ]);
+    const cancelled = await getDb().selectFrom('shadow_enrollment_session').select(['status']).where('account_id', '=', accountId).where('session_id', '=', 'es_old_dup_cancel').executeTakeFirst();
+    expect(cancelled?.status).toBe('cancelled');
+    await expect(getDb().insertInto('shadow_enrollment_request').values({
+      account_id: accountId, session_id: 'es_old_dup_conflict', controller_device_id: 'ctrl-old-dup', controller_signing_key_id: 'sign_x', controller_agreement_key_id: 'agree_x',
+      signing_public_key: base64urlEncode(backend.randomBytes(32)), agreement_public_key: base64urlEncode(backend.randomBytes(32)), nonce: 'nonce_x', requested_at_ms: 3,
+      transcript_hash: base64urlEncode(backend.randomBytes(32)), signature: base64urlEncode(backend.randomBytes(64)), status: 'pending', requested_capabilities: JSON.stringify(['account.read']), created_at: new Date(), updated_at: new Date(),
+    }).execute()).rejects.toMatchObject({ code: '23505' });
   });
 
   // ── Review finding 1 (expired consumed-session approval) — recreated probe ──

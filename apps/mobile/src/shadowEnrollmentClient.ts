@@ -188,6 +188,7 @@ const SAFE_SERVER_REASON: Record<string, string> = {
   'host identity not registered': 'host identity not registered',
   'relay origin not allowed': 'relay origin not allowed',
   'enrollment already claimed': 'enrollment already claimed',
+  'controller already enrolled': 'controller already enrolled',
 };
 
 const SAFE_SERVER_CODE_REASON: Record<string, string> = {
@@ -201,6 +202,7 @@ const SAFE_SERVER_CODE_REASON: Record<string, string> = {
   host_identity_not_registered: 'host identity not registered',
   relay_origin_not_allowed: 'relay origin not allowed',
   enrollment_already_claimed: 'enrollment already claimed',
+  controller_already_enrolled: 'controller already enrolled',
 };
 
 function safeEnrollmentFailure(stage: 'account macs' | 'account challenge' | 'enrollment request', res: Pick<ShadowResponse<unknown>, 'status' | 'error' | 'code'>): string {

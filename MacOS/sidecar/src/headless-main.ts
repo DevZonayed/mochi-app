@@ -550,11 +550,12 @@ async function stopShadowHostData(): Promise<void> {
  * restart. A missing fence is a no-op.
  */
 function applyLiveHostAuthority(rt: ShadowHostEnrollmentRuntime): void {
-  if (!shadowHostData) return;
+  const plane = shadowHostData;
+  if (!plane) return;
   const a = rt.liveAuthority();
   if (!a) return;
-  shadowHostData.svc.setAuthority(a.fence, a.leaseExpiresAt, a.revokedControllerDeviceIds, a.scopeKeyId ?? undefined);
-  shadowHostData.projection?.setFence(a.fence);
+  plane.svc.setAuthority(a.fence, a.leaseExpiresAt, a.revokedControllerDeviceIds, a.scopeKeyId ?? undefined);
+  plane.projection?.setFence(a.fence);
   void screenOwner?.onAuthorityChanged();
 }
 

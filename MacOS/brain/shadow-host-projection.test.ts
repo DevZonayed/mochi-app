@@ -12,9 +12,9 @@ const fence: Fence = { accountId: 'acct_1', scopeId: 'account:user_1', hostDevic
 function authority(): ShadowAuthority {
   return { accountId: fence.accountId, scopeId: fence.scopeId, hostDeviceId: fence.hostDeviceId, epoch: fence.epoch, leaseId: fence.leaseId, leaseExpiresAt: now + 60_000 };
 }
-function coreAt(dir: string): ShadowHostCore {
-  const core = new ShadowHostCore(join(dir, 'shadow'), new StaticShadowKeyProvider('k1', key));
-  core.setAuthority(authority());
+function coreAt(dir: string, opts?: { keyId?: string; key?: Buffer; auth?: ShadowAuthority }): ShadowHostCore {
+  const core = new ShadowHostCore(join(dir, 'shadow'), new StaticShadowKeyProvider(opts?.keyId ?? 'k1', opts?.key ?? key));
+  core.setAuthority(opts?.auth ?? authority());
   return core;
 }
 const dirs: string[] = [];
@@ -70,6 +70,32 @@ describe('ShadowHostCore.projectEntity — revision/tombstone coherence', () => 
     const changed = proj(reopened, 'p2', 'd2b', { name: 'Beta Prime' });
     expect(changed.appended).toBe(true); expect(changed.revision).toBe(2);
     reopened.close();
+  });
+
+  it('reprojects unchanged entities after authority epoch and scope key rotation', () => {
+    const dir = tmp();
+    const core = coreAt(dir, { keyId: 'wk_old', key: Buffer.alloc(32, 1) });
+    const r1 = proj(core, 'p1', 'd1', { name: 'Alpha' });
+    expect(r1.appended).toBe(true);
+    core.close();
+
+    const rotatedFence: Fence = { ...fence, epoch: 2, leaseId: 'lease_2' };
+    const rotated = new ShadowHostCore(join(dir, 'shadow'), new StaticShadowKeyProvider('wk_new', Buffer.alloc(32, 2)));
+    rotated.setAuthority({ accountId: rotatedFence.accountId, scopeId: rotatedFence.scopeId, hostDeviceId: rotatedFence.hostDeviceId, epoch: 2, leaseId: rotatedFence.leaseId, leaseExpiresAt: now + 60_000 });
+    const r2 = rotated.projectEntity({ fence: rotatedFence, collection: 'project', entityId: 'p1', digest: 'd1', op: 'upsert', payload: { name: 'Alpha' }, now });
+    expect(r2.appended).toBe(true);
+    expect(r2.revision).toBe(1);
+
+    const raw = new Database(join(dir, 'shadow', 'shadow.sqlite'));
+    const counts = raw.prepare('SELECT epoch,key_id,COUNT(*) AS n FROM projection_index GROUP BY epoch,key_id ORDER BY epoch,key_id').all() as Array<{ epoch: number; key_id: string; n: number }>;
+    const eventRows = raw.prepare('SELECT epoch,payload_envelope FROM events ORDER BY epoch ASC').all() as Array<{ epoch: number; payload_envelope: string }>;
+    raw.close();
+    expect(counts).toEqual([{ epoch: 1, key_id: 'wk_old', n: 1 }, { epoch: 2, key_id: 'wk_new', n: 1 }]);
+    expect(eventRows.map((r) => ({ epoch: r.epoch, keyId: (JSON.parse(r.payload_envelope) as { keyId: string }).keyId }))).toEqual([
+      { epoch: 1, keyId: 'wk_old' },
+      { epoch: 2, keyId: 'wk_new' },
+    ]);
+    rotated.close();
   });
 
   it('quarantines a corrupt index row fail-closed without resetting other entities', () => {
