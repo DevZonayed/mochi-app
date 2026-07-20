@@ -45,6 +45,11 @@ export interface ShadowHostDispatchDeps {
    * rotated scope key. Best-effort; a hook failure never fails the revoke result.
    */
   afterRevoke?(rt: ShadowHostEnrollmentRuntime): Promise<void> | void;
+  /**
+   * Invoked AFTER a successful controller approval so the live data plane is
+   * rebuilt/resumed immediately when the prior plane was absent or closed.
+   */
+  afterApprove?(rt: ShadowHostEnrollmentRuntime): Promise<void> | void;
   /** Phase 3D1: the current view-only screen-share status (metadata only). */
   screenShareStatus?(): ScreenShareStatus;
   /** Phase 3D1: operator-initiated local "Stop sharing" (tears the stream down). */
@@ -101,13 +106,17 @@ export function createShadowHostDispatch(deps: ShadowHostDispatchDeps) {
         return { requests: await rt.listPendingRequests() };
       case 'shadowHostApprove':
         await deps.ensureStarted(rt);
-        return await rt.approve({
+        {
+          const result = await rt.approve({
           sessionId: String(params.sessionId ?? ''),
           controllerName: params.controllerName != null ? String(params.controllerName) : undefined,
           controllerPlatform: params.controllerPlatform != null ? String(params.controllerPlatform) : undefined,
           // Host-selected approved capability set (least privilege); undefined = legacy read-only.
           capabilities: Array.isArray(params.capabilities) ? (params.capabilities as string[]).filter((c): c is import('@maestro/realtime/shadowCapabilities').ShadowCapability => typeof c === 'string') : undefined,
-        });
+          });
+          try { await deps.afterApprove?.(rt); } catch { /* live-plane resume is best-effort */ }
+          return result;
+        }
       case 'shadowHostDeny':
         await deps.ensureStarted(rt);
         await rt.deny({ sessionId: String(params.sessionId ?? '') });

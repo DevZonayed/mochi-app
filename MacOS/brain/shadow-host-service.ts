@@ -70,6 +70,10 @@ const backendDefault = nodeShadowCrypto;
 const CLAIM_LEASE_MS = 30_000;
 /** Back-off before a released (not-completed) command becomes reclaimable. */
 const RECLAIM_DELAY_MS = 500;
+const DEFAULT_PUBLISH_DRAIN_BATCHES = 20;
+const MAX_PUBLISH_DRAIN_BATCHES = 100;
+const DEFAULT_PUBLISH_BATCH_LIMIT = 100;
+const MAX_PUBLISH_BATCH_LIMIT = 500;
 
 function sha256Digest(value: string): string {
   return `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}`;
@@ -368,6 +372,7 @@ export class ShadowHostDataService {
   private fence: Fence;
   private state: HostDataServiceState = 'idle';
   private crashPoint: HostCommandCrashPoint | null = null;
+  private publishDrainInFlight: Promise<number> | null = null;
 
   constructor(private readonly opts: ShadowHostDataServiceOptions) {
     this.backend = opts.backend ?? backendDefault;
@@ -435,7 +440,48 @@ export class ShadowHostDataService {
 
   /** Publish all un-published events to the relay (ordered, idempotent). */
   async publish(): Promise<number> {
-    return this.opts.host.publishPending(this.relay, { fence: this.fence, now: this.now() });
+    return this.publishAllPending();
+  }
+
+  /**
+   * Drain pending state events in contiguous relay batches. `ShadowHostCore` keeps
+   * the per-call batch bounded (default 100); this wrapper is the production loop's
+   * bounded "publish until empty" contract so a large first baseline does not stall
+   * after the first batch.
+   */
+  async publishAllPending(maxBatches = 20, batchLimit = 100): Promise<number> {
+    if (!Number.isSafeInteger(maxBatches) || maxBatches < 1 || maxBatches > MAX_PUBLISH_DRAIN_BATCHES) throw new Error('publish-drain-batches-invalid');
+    if (!Number.isSafeInteger(batchLimit) || batchLimit < 1 || batchLimit > MAX_PUBLISH_BATCH_LIMIT) throw new Error('publish-drain-limit-invalid');
+    const effectiveMaxBatches = Math.max(maxBatches, DEFAULT_PUBLISH_DRAIN_BATCHES);
+    const effectiveBatchLimit = Math.max(batchLimit, DEFAULT_PUBLISH_BATCH_LIMIT);
+    if (this.publishDrainInFlight) return this.publishDrainInFlight;
+    const drain = this.drainPendingEvents(effectiveMaxBatches, effectiveBatchLimit);
+    this.publishDrainInFlight = drain;
+    try {
+      return await drain;
+    } finally {
+      if (this.publishDrainInFlight === drain) this.publishDrainInFlight = null;
+    }
+  }
+
+  private async drainPendingEvents(maxBatches: number, batchLimit: number): Promise<number> {
+    let total = 0;
+    for (let i = 0; i < maxBatches; i++) {
+      this.assertOpenForPublish();
+      const published = await this.opts.host.publishPending(this.relay, {
+        fence: this.fence,
+        now: this.now(),
+        limit: batchLimit,
+        beforeMark: () => this.assertOpenForPublish(),
+      });
+      total += published;
+      if (published === 0 || published < batchLimit) break;
+    }
+    return total;
+  }
+
+  private assertOpenForPublish(): void {
+    if (this.state !== 'active') throw new Error('publish-service-closed');
   }
 
   /**
@@ -457,7 +503,7 @@ export class ShadowHostDataService {
     // hot on the requireFence throw). Under valid authority this is the normal publish.
     try {
       this.opts.host.assertCurrentAuthority(this.fence, undefined, this.now());
-      await this.publish();
+      await this.publishAllPending();
     } catch (e) {
       if (!isFenceOrAuthorityError(e)) throw e;
     }
@@ -606,6 +652,7 @@ export class ShadowHostDataService {
     await this.crashAt('after-append-before-relay-ack');
     await this.postRelayAck(commandId, ackCiphertext, ackDigest);
     await this.crashAt('after-relay-ack-before-publish');
+    await this.publishAllPending();
   }
 
   /**
@@ -652,6 +699,7 @@ export class ShadowHostDataService {
       }
     }
     if (row.ackCiphertext && row.ackDigest) await this.postRelayAck(row.commandId, row.ackCiphertext, row.ackDigest);
+    await this.publishAllPending();
   }
 
   private async ackRejected(claim: ClaimedCommand, row: IntakeRow, code: string, message: string): Promise<void> {

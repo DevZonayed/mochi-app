@@ -981,10 +981,19 @@ export class ShadowHostEnrollmentRuntime {
       fence: built.fence,
       store: input.store,
       now: () => this.now(),
-      publish: () => built.dataService.publish().then(() => undefined),
+      publish: () => built.dataService.publishAllPending().then(() => undefined),
       log: input.log,
     });
     return { dataService: built.dataService, projection };
+  }
+
+  dataPlaneUnavailableReason(): 'runtime-not-running' | 'missing-host-identity' | 'missing-scope-key' | 'missing-authority' | 'no-active-controller-enrolled' | null {
+    if (this.state !== 'running') return 'runtime-not-running';
+    if (!this.identity) return 'missing-host-identity';
+    if (!this.scopeKey) return 'missing-scope-key';
+    if (!this.record.fence) return 'missing-authority';
+    if (!this.record.controllers.some((c) => c.status === 'active')) return 'no-active-controller-enrolled';
+    return null;
   }
 
   // ── Internals ──────────────────────────────────────────────────────────────
