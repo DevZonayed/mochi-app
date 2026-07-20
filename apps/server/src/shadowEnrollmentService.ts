@@ -66,6 +66,11 @@ function isPgUniqueViolation(e: unknown, constraintOrIndex: string): boolean {
   return err?.code === '23505' && err.constraint === constraintOrIndex;
 }
 
+function isPgUniqueViolationAny(e: unknown, constraintsOrIndexes: readonly string[]): boolean {
+  const err = e as { code?: unknown; constraint?: unknown } | undefined;
+  return err?.code === '23505' && typeof err.constraint === 'string' && constraintsOrIndexes.includes(err.constraint);
+}
+
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/;
 const B64URL_RE = /^[A-Za-z0-9_-]{1,4096}$/;
 
@@ -652,7 +657,14 @@ export async function approveEnrollment(input: ApproveEnrollmentInput): Promise<
         approved_capabilities: approvedCapabilities, created_at: now, updated_at: now,
       }).execute();
     } catch (e) {
-      // unique (account, scope, controller) or PK (account, grant_id) conflict
+      if (!isPgUniqueViolationAny(e, [
+        'shadow_enrollment_active_grant_controller_idx',
+        'shadow_enrollment_grant_controller_idx',
+        'shadow_enrollment_grant_pk',
+      ])) {
+        throw e;
+      }
+      // Bound only the known active-controller/duplicate-grant uniqueness races.
       throw status('controller already enrolled', 409);
     }
     return { grantId, controllerDeviceId, status: 'active' as const, keyId, expiresAt: grant.expiresAt };
