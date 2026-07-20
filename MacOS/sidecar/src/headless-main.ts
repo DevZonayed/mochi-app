@@ -419,6 +419,7 @@ const handleShadowHostCall = createShadowHostDispatch({
   vaultAvailable: () => new SafeStorageVault(safeStorage).isEncryptionAvailable(),
   getRuntime: () => getShadowHostFor(),
   ensureStarted: (rt) => ensureShadowHostStarted(rt),
+  afterApprove: (rt) => onShadowControllerApproved(rt),
   // Phase 3B0 NOTE-2: refresh (deny + rebuild) the live data plane after a revoke.
   afterRevoke: (rt) => onShadowControllerRevoked(rt),
   // Phase 3D1: the host-visible screen-share status + local Stop (registry-backed;
@@ -508,9 +509,13 @@ function shadowHostCoreDir(accountId: string): string {
 
 async function getShadowHostDataService(): Promise<ShadowHostDataService | null> {
   const accountId = await resolveAccountId();
-  if (shadowHostData && shadowHostData.accountId === accountId) return shadowHostData.svc;
   const rt = await getShadowHostFor();
   await ensureShadowHostStarted(rt);
+  if (shadowHostData && shadowHostData.accountId === accountId) {
+    const reason = rt.dataPlaneUnavailableReason();
+    if (!reason) return shadowHostData.svc;
+    await stopShadowHostData();
+  }
   // Phase 3A2b1 Section B: build the FULL data plane — accepted encrypted host
   // data/command service + the all-project redacted ShadowProductProjection sharing
   // ONE ShadowHostCore. The Store singleton is the projection source; a narrow
@@ -529,6 +534,16 @@ async function getShadowHostDataService(): Promise<ShadowHostDataService | null>
   shadowHostData = { accountId, svc: plane.svc, projection: plane.projection };
   void plane.projection.start().catch((e) => warn('shadowProjection.start', e));
   return plane.svc;
+}
+
+async function getShadowHostDataInactiveReason(): Promise<string> {
+  try {
+    const rt = await getShadowHostFor();
+    await ensureShadowHostStarted(rt);
+    return rt.dataPlaneUnavailableReason() ?? 'data plane unavailable';
+  } catch {
+    return 'runtime-not-running';
+  }
 }
 
 async function stopShadowHostData(): Promise<void> {
@@ -728,16 +743,24 @@ async function onShadowControllerRevoked(rt: ShadowHostEnrollmentRuntime): Promi
   shadowHostData = null; // next getShadowHostDataService() rebuilds under the rotated scope key
 }
 
+async function onShadowControllerApproved(rt: ShadowHostEnrollmentRuntime): Promise<void> {
+  await ensureShadowHostStarted(rt);
+  if (shadowHostData) applyLiveHostAuthority(rt);
+  const svc = await getShadowHostDataService();
+  if (!svc) return;
+  try { await svc.publishAllPending(); } catch (e) { warn('shadowHostData.approve.publish', e); }
+}
+
 async function handleShadowHostDataCall(method: string): Promise<unknown> {
   if (!accountSessionToken) throw Object.assign(new Error('not signed in'), { statusCode: 401 });
   const svc = await getShadowHostDataService();
-  if (!svc) return { active: false, reason: 'no active controller enrolled' };
+  if (!svc) return { active: false, reason: await getShadowHostDataInactiveReason() };
   switch (method) {
     case 'shadowHostDataStatus':
       return { active: true, ...svc.status() };
     case 'shadowHostDataSync': {
       await renewShadowHostLease();
-      const published = await svc.publish();
+      const published = await svc.publishAllPending();
       const commands = await svc.pollAndExecuteCommands();
       return { active: true, published, commands };
     }
@@ -758,7 +781,7 @@ function startShadowHostDataLoop(): void {
         await renewShadowHostLease();
         const svc = await getShadowHostDataService();
         if (!svc) return;
-        await svc.publish();
+        await svc.publishAllPending();
         await svc.pollAndExecuteCommands();
       } catch (e) { warn('shadowHostData.loop', e); }
     })();

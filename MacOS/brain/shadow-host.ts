@@ -1334,7 +1334,7 @@ export class ShadowHostCore {
     });
   }
 
-  async publishPending(relay: ShadowHostRelayPort, input: { fence: Fence; now: number; controllerDeviceId?: string; limit?: number }): Promise<number> {
+  async publishPending(relay: ShadowHostRelayPort, input: { fence: Fence; now: number; controllerDeviceId?: string; limit?: number; beforeMark?: () => void }): Promise<number> {
     const authority = this.requireFence(input.fence, input.controllerDeviceId, input.now);
     const limit = input.limit ?? 100;
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('publish-limit-invalid');
@@ -1351,6 +1351,7 @@ export class ShadowHostCore {
     });
     if (events.length === 0) return 0;
     await relay.publishOrderedEvents(authority.scopeId, input.fence, events);
+    input.beforeMark?.();
     for (const row of rows) {
       const result = this.db.prepare(`
         UPDATE events SET published=1

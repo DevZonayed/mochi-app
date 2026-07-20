@@ -283,6 +283,16 @@ describe('NOTE-2 — sidecar production wiring pins the revoked-set/rotation pro
     expect(loopFn).toContain('await ensureShadowHostStarted(rt)');
   });
 
+  it('approval/recovery resumes the data plane and drains all pending baseline batches', () => {
+    expect(headless).toContain('afterApprove: (rt) => onShadowControllerApproved(rt)');
+    expect(headless).toContain('function onShadowControllerApproved');
+    expect(headless).toContain('await svc.publishAllPending()');
+    expect(headless).toContain('const published = await svc.publishAllPending()');
+    expect(headless).toContain('return rt.dataPlaneUnavailableReason()');
+    expect(dispatch).toContain('afterApprove?');
+    expect(dispatch).toContain('await deps.afterApprove?.(rt)');
+  });
+
   it('a revoke tears down + rebuilds the live plane under the rotated scope key', () => {
     expect(headless).toContain('function onShadowControllerRevoked');
     expect(headless).toContain('afterRevoke: (rt) => onShadowControllerRevoked(rt)');
