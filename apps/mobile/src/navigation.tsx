@@ -1,5 +1,5 @@
 import React from 'react';
-import { View } from 'react-native';
+import { View, Text, Pressable } from 'react-native';
 import { NavigationContainer, DefaultTheme, DarkTheme, type Theme as NavTheme } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
@@ -10,7 +10,11 @@ import { isAuthed } from './auth';
 import { useLive } from './useLive';
 import { navRef } from './navRef';
 import { flushPendingNav } from './pushNav';
-import { subscribeControllerMode, isControllerModeActive, isControllerModeRestored } from './controllerMode';
+import {
+  subscribeControllerMode,
+  getControllerModeSnapshot,
+  restoreControllerMode,
+} from './controllerMode';
 import { chooseRootTree } from './controllerRoot';
 
 import { HomeScreen } from './screens/Home';
@@ -92,15 +96,24 @@ function Tabs() {
 const ControllerStack = createNativeStackNavigator<ControllerStackParamList>();
 
 // Encoded controller-mode snapshot (a stable primitive for useSyncExternalStore).
-const MODE_PENDING = 0, MODE_INACTIVE = 1, MODE_ACTIVE = 2;
+const MODE_PENDING = 0, MODE_INACTIVE = 1, MODE_ACTIVE = 2, MODE_ERROR = 3;
 function modeSnapshot(): number {
-  if (!isControllerModeRestored()) return MODE_PENDING;
-  return isControllerModeActive() ? MODE_ACTIVE : MODE_INACTIVE;
+  const snap = getControllerModeSnapshot();
+  if (snap.kind === 'pending') return MODE_PENDING;
+  if (snap.kind === 'active') return MODE_ACTIVE;
+  if (snap.kind === 'resolution-error') return MODE_ERROR;
+  return MODE_INACTIVE;
 }
 /** Subscribe to the persisted secure-controller mode (restore state + active flag). */
-function useControllerMode(): { restored: boolean; active: boolean } {
+function useControllerMode(): { restored: boolean; active: boolean; indeterminate: boolean; error: string | null } {
   const s = React.useSyncExternalStore(subscribeControllerMode, modeSnapshot, () => MODE_PENDING);
-  return { restored: s !== MODE_PENDING, active: s === MODE_ACTIVE };
+  const snap = getControllerModeSnapshot();
+  return {
+    restored: s !== MODE_PENDING,
+    active: s === MODE_ACTIVE,
+    indeterminate: s === MODE_ERROR,
+    error: snap.kind === 'resolution-error' ? snap.error : null,
+  };
 }
 
 /** Neutral splash while the controller-mode marker is being restored — NEVER the
@@ -110,9 +123,44 @@ function ModeSplash() {
   return <View style={{ flex: 1, backgroundColor: theme.color.bg }} />;
 }
 
+function ControllerModeRetryGate({ error }: { error: string | null }) {
+  const { theme } = useTheme();
+  const [retrying, setRetrying] = React.useState(false);
+  const retry = React.useCallback(() => {
+    setRetrying(true);
+    void restoreControllerMode().finally(() => setRetrying(false));
+  }, []);
+  return (
+    <View style={{ flex: 1, backgroundColor: theme.color.bg, justifyContent: 'center', paddingHorizontal: 24 }}>
+      <View style={{ borderRadius: 18, borderWidth: 0.5, borderColor: theme.color.separator, backgroundColor: theme.color.bgElevated, padding: 18 }}>
+        <View style={{ width: 52, height: 52, borderRadius: 16, backgroundColor: theme.color.orange + '18', alignItems: 'center', justifyContent: 'center', marginBottom: 14 }}>
+          <Icon name="shield" size={24} color={theme.color.orange} />
+        </View>
+        <Text accessibilityRole="header" style={{ fontSize: 22, fontWeight: '700', color: theme.color.ink, marginBottom: 10 }}>
+          Secure controller access is still verifying
+        </Text>
+        <Text style={{ fontSize: 14, lineHeight: 20, color: theme.color.inkSecondary, marginBottom: 10 }}>
+          The app could not verify which account this session belongs to, so it is staying in the secure gate instead of opening legacy direct-mutation screens.
+        </Text>
+        <Text role="alert" style={{ fontSize: 14, lineHeight: 20, color: theme.color.red, marginBottom: 16 }}>
+          {error ?? 'Network error while verifying this account.'}
+        </Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Retry secure verification"
+          onPress={retry}
+          style={{ minHeight: 48, borderRadius: 14, backgroundColor: theme.color.blue, alignItems: 'center', justifyContent: 'center', opacity: retrying ? 0.7 : 1 }}
+        >
+          <Text style={{ fontSize: 15, fontWeight: '700', color: '#fff' }}>{retrying ? 'Retrying…' : 'Retry secure verification'}</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
 export function RootNavigator() {
   const { theme, mode } = useTheme();
-  const { restored, active } = useControllerMode();
+  const { restored, active, indeterminate, error } = useControllerMode();
   const base = mode === 'dark' ? DarkTheme : DefaultTheme;
   const navTheme: NavTheme = {
     ...base,
@@ -133,8 +181,9 @@ export function RootNavigator() {
   //   legacy     → the legacy Stack at Tabs (signed in, mode inactive)
   // `legacy` (authed && restored && !active) is the ONLY tab-mounting branch — sign-out
   // clears auth BEFORE the marker so this branch is never committed mid-sign-out (R1).
-  const tree = chooseRootTree(isAuthed(), restored, active);
+  const tree = chooseRootTree(isAuthed(), restored, active, indeterminate);
   if (tree === 'splash') return <ModeSplash />;
+  if (indeterminate && isAuthed()) return <ControllerModeRetryGate error={error} />;
   if (tree === 'controller') {
     return (
       <NavigationContainer theme={navTheme} ref={navRef} onReady={flushPendingNav}>

@@ -14,9 +14,9 @@ export type RootTree = 'auth' | 'splash' | 'controller' | 'legacy';
  * must therefore clear auth (or flip to `splash`) BEFORE `active` becomes false, or a
  * `legacy` commit leaks for one frame.
  */
-export function chooseRootTree(authed: boolean, restored: boolean, active: boolean): RootTree {
+export function chooseRootTree(authed: boolean, restored: boolean, active: boolean, indeterminate = false): RootTree {
   if (!authed) return 'auth';
-  if (!restored) return 'splash';
+  if (!restored || indeterminate) return 'splash';
   return active ? 'controller' : 'legacy';
 }
 

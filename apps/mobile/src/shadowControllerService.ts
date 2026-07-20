@@ -57,6 +57,9 @@ function sameFence(a: Fence, b: Fence): boolean {
 
 /** Allowed clock skew when treating a reconciled lease as still valid. */
 const LEASE_SKEW_MS = 1_000;
+/** Mirrors the server relay batch ceiling so the mobile can keep draining until caught up. */
+const CONNECT_EVENT_BATCH_LIMIT = 500;
+const CONNECT_DRAIN_PAGE_LIMIT = 12;
 
 export interface ControllerSessionContext {
   accountId: string;
@@ -101,6 +104,11 @@ interface ConnectResponse {
   events?: unknown[];
 }
 
+interface DrainSummary {
+  applied: number;
+  caughtUp: boolean;
+}
+
 /** Production durable controller runtime. */
 export class ShadowControllerService {
   private readonly client: ShadowMobileClient;
@@ -116,6 +124,8 @@ export class ShadowControllerService {
   private reconcileTimer: unknown = null;
   /** Last server-reported lease expiry (observability; the chain authority gates events). */
   private serverLeaseExpiresAt = 0;
+  /** Deduplicates overlapping load/build/connect/tick sync work onto one production seam. */
+  private inFlightSync: Promise<number> | null = null;
 
   constructor(private readonly opts: ShadowControllerServiceOptions) {
     this.backend = opts.backend;
@@ -239,23 +249,7 @@ export class ShadowControllerService {
    */
   async connect(): Promise<number> {
     if (this.isLocked()) throw new Error('controller locked');
-    await this.client.load();
-    // Apply any pending host-signed lease-renewal transition FIRST so the durable
-    // authority (and its expiry) is current before we verify + operate.
-    await this.fetchAndApplyTransitions();
-    await this.reconcileAuthority();
-    if (this.isLocked()) throw new Error('controller locked');
-    const applied = await this.pollEvents();
-    await this.pollAcks();
-    if (!this.isLocked() && !this.leaseExpired()) {
-      await this.client.setOnline(true);
-      this.state = 'online';
-    } else if (!this.isLocked()) {
-      await this.client.setOnline(false);
-      this.state = 'offline';
-    }
-    this.notifyProjectionChange();
-    return applied;
+    return this.syncControllerState(true);
   }
 
   /**
@@ -347,35 +341,76 @@ export class ShadowControllerService {
 
   private async tick(): Promise<void> {
     if (this.isLocked()) { this.stopAutoReconcile(); return; }
-    try { await this.fetchAndApplyTransitions(); await this.reconcileAuthority(); await this.pollEvents(); await this.pollAcks(); }
+    try { await this.syncControllerState(false); }
     catch { /* transient; next tick retries */ }
+  }
+
+  private async syncControllerState(loadFirst: boolean): Promise<number> {
+    if (this.inFlightSync) return this.inFlightSync;
+    this.inFlightSync = (async () => {
+      if (loadFirst) await this.client.load();
+      await this.fetchAndApplyTransitions();
+      const authorityOk = await this.reconcileAuthority();
+      if (this.isLocked()) throw new Error('controller locked');
+      const drained = await this.drainEventPages();
+      await this.pollAcks();
+      if (!this.isLocked()) {
+        const live = authorityOk && !this.leaseExpired() && drained.caughtUp;
+        await this.client.setOnline(live);
+        this.state = live ? 'online' : 'offline';
+      }
+      this.notifyProjectionChange();
+      return drained.applied;
+    })().finally(() => { this.inFlightSync = null; });
+    return this.inFlightSync;
   }
 
   /** Poll the event stream (connect delta) and durably apply. */
   async pollEvents(): Promise<number> {
-    const s = this.client.read();
-    const lastSeq = s.cursor?.lastSeq ?? 0;
-    const hello = {
-      protocolVersion: 1 as const,
-      controllerDeviceId: this.expected.controllerDeviceId,
-      hostDeviceId: this.fence().hostDeviceId,
-      epoch: this.fence().epoch,
-      lastSeq,
-      collectionDigests: {},
-    };
-    const res = await this.request<ConnectResponse>('POST', '/api/shadow/connect', { hello });
-    if (!res.ok) return this.handleTransportError(res.status, 'connect');
-    const events = res.json?.events ?? [];
-    let applied = 0;
-    for (const wire of events) {
-      const result = await this.client.applyWire(wire);
-      if (result.status === 'applied') applied += 1;
+    return (await this.drainEventPages()).applied;
+  }
+
+  private async drainEventPages(): Promise<DrainSummary> {
+    let totalApplied = 0;
+    for (let page = 0; page < CONNECT_DRAIN_PAGE_LIMIT; page++) {
+      const s = this.client.read();
+      const lastSeq = s.cursor?.lastSeq ?? 0;
+      const hello = {
+        protocolVersion: 1 as const,
+        controllerDeviceId: this.expected.controllerDeviceId,
+        hostDeviceId: this.fence().hostDeviceId,
+        epoch: this.fence().epoch,
+        lastSeq,
+        collectionDigests: {},
+      };
+      const res = await this.request<ConnectResponse>('POST', '/api/shadow/connect', { hello });
+      if (!res.ok) {
+        this.handleTransportError(res.status, 'connect');
+        return { applied: totalApplied, caughtUp: false };
+      }
+      const events = Array.isArray(res.json?.events) ? res.json.events : [];
+      let pageApplied = 0;
+      for (const wire of events) {
+        const result = await this.client.applyWire(wire);
+        if (result.status === 'applied') {
+          pageApplied += 1;
+          totalApplied += 1;
+        }
+      }
+      const cursor = this.client.read().cursor;
+      const cursorLastSeq = cursor?.lastSeq ?? lastSeq;
+      if (cursor && cursor.lastSeq > lastSeq) {
+        await this.submitCursor(cursor.lastSeq, cursor.lastEventId ?? undefined, cursor.lastDigest ?? undefined);
+      }
+      if (pageApplied > 0) this.notifyProjectionChange();
+      const targetHead = typeof res.json?.decision?.toSeq === 'number' ? res.json.decision.toSeq : cursorLastSeq;
+      const caughtUp = cursorLastSeq >= targetHead;
+      if (caughtUp && events.length < CONNECT_EVENT_BATCH_LIMIT) return { applied: totalApplied, caughtUp: true };
+      if (events.length === 0 && caughtUp) return { applied: totalApplied, caughtUp: true };
+      if (cursorLastSeq <= lastSeq && events.length === 0) break;
     }
-    const cursor = this.client.read().cursor;
-    if (cursor && cursor.lastSeq > lastSeq) {
-      await this.submitCursor(cursor.lastSeq, cursor.lastEventId ?? undefined, cursor.lastDigest ?? undefined);
-    }
-    return applied;
+    this.lastError = 'baseline-drain-incomplete';
+    return { applied: totalApplied, caughtUp: false };
   }
 
   private async submitCursor(lastSeq: number, lastEventId?: string, lastDigest?: string): Promise<void> {

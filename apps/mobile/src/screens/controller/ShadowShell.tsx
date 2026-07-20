@@ -19,7 +19,7 @@ import type { ShadowUiState } from '../../shadowUiModel';
 import { capabilityLabel } from '../../shadowUiModel';
 import type { ShadowUiController } from '../../shadowUiController';
 import type { ProjectView, SessionView, JobView, ApprovalView, QuestionView, ScheduleView } from '../../shadowProjectionSelectors';
-import { Screen, StatusChip, TapRow, EmptyState, GhostButton, idTint, useInsets, type StatusTone } from './parts';
+import { Screen, StatusChip, TapRow, EmptyState, GhostButton, PrimaryButton, idTint, useInsets, type StatusTone } from './parts';
 import { ScreenSection } from './ScreenViewer';
 import { jobCancellable } from '../../shadowActionModel';
 import { grantedActionFamilies } from '../../shadowActionCapabilities';
@@ -181,12 +181,57 @@ function OfflineBanner({ state }: { state: ShadowUiState }) {
   );
 }
 
+function needsInitialSyncRecovery(state: ShadowUiState, counts: { projects: number; jobs: number; approvals: number; questions: number; schedules: number }): boolean {
+  return !state.connection.online
+    && state.connection.lastSeq == null
+    && counts.projects === 0
+    && counts.jobs === 0
+    && counts.approvals === 0
+    && counts.questions === 0
+    && counts.schedules === 0;
+}
+
+function InitialSyncRecovery({ controller }: { controller: ShadowUiController }) {
+  const { theme } = useTheme();
+  return (
+    <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', paddingHorizontal: 20, paddingVertical: 28 }}>
+      <View style={{ borderRadius: 18, borderWidth: 0.5, borderColor: theme.color.separator, backgroundColor: theme.color.bgElevated, padding: 18, gap: 12 }}>
+        <View style={{ width: 52, height: 52, borderRadius: 16, backgroundColor: theme.color.orange + '18', alignItems: 'center', justifyContent: 'center' }}>
+          <Icon name="smartphone" size={24} color={theme.color.orange} />
+        </View>
+        <Text accessibilityRole="header" style={{ fontSize: 22, fontWeight: '700', color: theme.color.ink }}>
+          Secure sync is still offline
+        </Text>
+        <Text style={{ fontSize: 14, lineHeight: 20, color: theme.color.inkSecondary }}>
+          This device has not finished its first secure sync yet. Keep Mochlet open on your Mac, then retry from here.
+        </Text>
+        <Text style={{ fontSize: 14, lineHeight: 20, color: theme.color.inkSecondary }}>
+          If you approved this phone and then force-stopped it before setup completed, revoke this device on your Mac and enroll again. The phone will not trust a server-only grant without the signed local proof.
+        </Text>
+        <PrimaryButton title="Retry secure sync" icon="refresh" onPress={() => { void controller.refresh(); }} />
+        <GhostButton title="Reconnect this device" onPress={() => { void controller.retryEnrollment(); }} />
+      </View>
+    </ScrollView>
+  );
+}
+
 // ── section bodies ────────────────────────────────────────────────────────────
 
 function SectionBody({ route, setRoute, controller, state, bottomInset }: { route: Route; setRoute: (r: Route) => void; controller: ShadowUiController; state: ShadowUiState; bottomInset: number }) {
   const { theme } = useTheme();
   const proj = controller.projection();
+  const counts = {
+    projects: proj.projects().length,
+    jobs: proj.projects().flatMap((p) => proj.projectJobs(p.id)).length,
+    approvals: proj.pendingApprovals().length,
+    questions: proj.pendingQuestions().length,
+    schedules: proj.schedules().length,
+  };
   const pad = { paddingBottom: bottomInset + 24, paddingTop: 8 };
+
+  if (route.section !== 'controller' && needsInitialSyncRecovery(state, counts)) {
+    return <InitialSyncRecovery controller={controller} />;
+  }
 
   // Drilldown: session detail
   if (route.sessionId) {

@@ -31,13 +31,18 @@ import { setSessionToken, isAuthed, subscribeSession, setActiveHost } from './au
 import {
   activateControllerMode, restoreControllerMode, invalidateControllerMode,
   activeControllerAccountId, deactivateControllerModeForAccount,
-  isControllerModeActive, isControllerModeRestored, subscribeControllerMode,
+  isControllerModeActive, isControllerModeRestored, subscribeControllerMode, getControllerModeSnapshot,
 } from './controllerMode';
 import { chooseRootTree, signOutSecureController, type SecureSignOutDeps, type RootTree } from './controllerRoot';
 
 /** The root re-renders on each controllerMode notify → record the decided tree then. */
 function decideNow(): RootTree {
-  return chooseRootTree(isAuthed(), isControllerModeRestored(), isControllerModeActive());
+  return chooseRootTree(
+    isAuthed(),
+    isControllerModeRestored(),
+    isControllerModeActive(),
+    getControllerModeSnapshot().kind === 'resolution-error',
+  );
 }
 
 async function setupActive(): Promise<void> {
@@ -147,6 +152,7 @@ describe('chooseRootTree — pure decision', () => {
     expect(chooseRootTree(true, true, false)).toBe('legacy');
     expect(chooseRootTree(true, true, true)).toBe('controller');
     expect(chooseRootTree(true, false, true)).toBe('splash');
+    expect(chooseRootTree(true, true, false, true)).toBe('splash');
     expect(chooseRootTree(false, true, false)).toBe('auth');
     expect(chooseRootTree(false, false, false)).toBe('auth');
   });

@@ -29,8 +29,15 @@ const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ user: { id
 import {
   CONTROLLER_MODE_KEY,
   restoreControllerMode, activateControllerMode, deactivateControllerMode, invalidateControllerMode,
-  isControllerModeActive, isControllerModeRestored, requireShadowController,
+  isControllerModeActive, isControllerModeRestored, requireShadowController, getControllerModeSnapshot,
 } from './controllerMode';
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
 
 beforeEach(() => {
   store.clear();
@@ -51,6 +58,76 @@ describe('restore lifecycle', () => {
   it('signed-in with no persisted marker restores to INACTIVE', async () => {
     await restoreControllerMode();
     expect(isControllerModeRestored()).toBe(true);
+    expect(isControllerModeActive()).toBe(false);
+    expect(getControllerModeSnapshot()).toEqual({ kind: 'inactive', accountResolved: true });
+  });
+
+  it('bounded get-session failure stays in the neutral secure retry gate, not legacy or account A', async () => {
+    await activateControllerMode();
+    invalidateControllerMode();
+    fetchMock.mockImplementationOnce(async () => { throw Object.assign(new Error('Request timed out'), { name: 'AbortError' }); });
+    await restoreControllerMode();
+    expect(isControllerModeRestored()).toBe(true);
+    expect(isControllerModeActive()).toBe(false);
+    expect(getControllerModeSnapshot()).toEqual({ kind: 'resolution-error', error: 'Network timeout while verifying this account.' });
+  });
+
+  it('bounded get-session failure after token/account switch does not reactivate the previous account', async () => {
+    await activateControllerMode();
+    token = 'tok-B'; accountId = 'acct-B';
+    invalidateControllerMode();
+    fetchMock.mockImplementationOnce(async () => { throw Object.assign(new Error('Request timed out'), { name: 'AbortError' }); });
+    await restoreControllerMode();
+    expect(isControllerModeRestored()).toBe(true);
+    expect(isControllerModeActive()).toBe(false);
+    expect(getControllerModeSnapshot()).toEqual({ kind: 'resolution-error', error: 'Network timeout while verifying this account.' });
+  });
+
+  it('bounded get-session failure for the same token still requires a fresh retry', async () => {
+    await activateControllerMode();
+    invalidateControllerMode();
+    fetchMock.mockImplementationOnce(async () => { throw Object.assign(new Error('Request timed out'), { name: 'AbortError' }); });
+    await restoreControllerMode();
+    expect(isControllerModeRestored()).toBe(true);
+    expect(isControllerModeActive()).toBe(false);
+    expect(getControllerModeSnapshot()).toEqual({ kind: 'resolution-error', error: 'Network timeout while verifying this account.' });
+  });
+
+  it('sign-out never uses the cached binding fallback', async () => {
+    await activateControllerMode();
+    token = '';
+    invalidateControllerMode();
+    await restoreControllerMode();
+    expect(isControllerModeRestored()).toBe(true);
+    expect(isControllerModeActive()).toBe(false);
+    expect(getControllerModeSnapshot()).toEqual({ kind: 'signed-out' });
+  });
+
+  it('malformed binding storage is ignored and does not activate or crash', async () => {
+    store.set('maestro.mobile.controllerModeLastAccount', 'acct-A');
+    store.set('maestro.mobile.controllerModeLastTokenBinding', '{"accountId":42,"digest":true}');
+    fetchMock.mockImplementationOnce(async () => { throw Object.assign(new Error('Request timed out'), { name: 'AbortError' }); });
+    await restoreControllerMode();
+    expect(isControllerModeActive()).toBe(false);
+    expect(getControllerModeSnapshot()).toEqual({ kind: 'resolution-error', error: 'Network timeout while verifying this account.' });
+  });
+
+  it('late restore A completion cannot overwrite newer restore B after token switch', async () => {
+    const gateA = deferred<{ ok: boolean; json: () => Promise<{ user: { id: string } }> }>();
+    const gateB = deferred<{ ok: boolean; json: () => Promise<{ user: { id: string } }> }>();
+    fetchMock.mockImplementationOnce(() => gateA.promise);
+    const restoreA = restoreControllerMode();
+    token = 'tok-B';
+    accountId = 'acct-B';
+    invalidateControllerMode();
+    fetchMock.mockImplementationOnce(() => gateB.promise);
+    const restoreB = restoreControllerMode();
+    gateB.resolve({ ok: true, json: async () => ({ user: { id: 'acct-B' } }) });
+    await restoreB;
+    expect(getControllerModeSnapshot()).toEqual({ kind: 'inactive', accountResolved: true });
+    gateA.resolve({ ok: true, json: async () => ({ user: { id: 'acct-A' } }) });
+    await restoreA;
+    expect(getControllerModeSnapshot()).toEqual({ kind: 'inactive', accountResolved: true });
     expect(isControllerModeActive()).toBe(false);
   });
 });

@@ -27,6 +27,7 @@ import type { ShadowControllerService } from './shadowControllerService';
 
 const META_DB_NAME = 'maestro-shadow-enroll.db';
 const SHADOW_DB_NAME = 'maestro-shadow.db';
+const SESSION_LOOKUP_TIMEOUT_MS = 15_000;
 
 /** Secure CSPRNG from expo-crypto (fails closed if the native module is absent). */
 function expoRandomSource(length: number): Uint8Array {
@@ -52,7 +53,19 @@ async function resolveAccountId(): Promise<string> {
   const token = getSessionToken();
   if (!token) throw Object.assign(new Error('not signed in'), { statusCode: 401 });
   if (cachedAccount && cachedAccount.token === token) return cachedAccount.accountId;
-  const res = await fetch(`${API_BASE}/api/auth/get-session`, { headers: { authorization: `Bearer ${token}` } });
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), SESSION_LOOKUP_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/api/auth/get-session`, { headers: { authorization: `Bearer ${token}` }, signal: ac.signal });
+  } catch (error) {
+    clearTimeout(timer);
+    if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
+      throw Object.assign(new Error('session lookup timed out'), { statusCode: 0 });
+    }
+    throw error;
+  }
+  clearTimeout(timer);
   if (!res.ok) throw Object.assign(new Error(res.status === 401 ? 'session expired' : `session lookup failed (${res.status})`), { statusCode: res.status });
   const data = (await res.json().catch(() => null)) as { user?: { id?: string } } | null;
   const id = data?.user?.id;

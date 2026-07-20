@@ -18,40 +18,86 @@
  */
 import { getStr, setStr } from './storage';
 import { API_BASE, getSessionToken, isAuthed } from './auth';
+import { sha256Hex } from './shadowClientCore';
 
 /** Persisted map `{ [accountId]: true }`. Non-secret; survives the shadow purge. */
 export const CONTROLLER_MODE_KEY = 'maestro.mobile.controllerMode';
+const CONTROLLER_MODE_LAST_ACCOUNT_KEY = 'maestro.mobile.controllerModeLastAccount';
+const CONTROLLER_MODE_LAST_TOKEN_BINDING_KEY = 'maestro.mobile.controllerModeLastTokenBinding';
+const CONTROLLER_MODE_RESTORE_TIMEOUT_MS = 15_000;
 
 function readMap(): Record<string, boolean> {
   try { const raw = getStr(CONTROLLER_MODE_KEY); return raw ? (JSON.parse(raw) as Record<string, boolean>) : {}; }
   catch { return {}; }
 }
 function writeMap(m: Record<string, boolean>): void { setStr(CONTROLLER_MODE_KEY, JSON.stringify(m)); }
+function readLastAccountId(): string | null {
+  const raw = getStr(CONTROLLER_MODE_LAST_ACCOUNT_KEY);
+  return raw || null;
+}
+function writeLastAccountId(accountId: string | null): void { setStr(CONTROLLER_MODE_LAST_ACCOUNT_KEY, accountId ?? ''); }
+function readLastTokenBinding(): { accountId: string; digest: string } | null {
+  try {
+    const raw = getStr(CONTROLLER_MODE_LAST_TOKEN_BINDING_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { accountId?: unknown; digest?: unknown } | null;
+    if (!parsed || typeof parsed.accountId !== 'string' || typeof parsed.digest !== 'string' || !parsed.accountId || !parsed.digest) return null;
+    return { accountId: parsed.accountId, digest: parsed.digest };
+  } catch { return null; }
+}
+function writeLastTokenBinding(binding: { accountId: string; digest: string } | null): void {
+  setStr(CONTROLLER_MODE_LAST_TOKEN_BINDING_KEY, binding ? JSON.stringify(binding) : '');
+}
+async function tokenBindingDigest(token: string): Promise<string> {
+  return sha256Hex(`controller-mode-token:v1:${token}`);
+}
 
-let restored = false;
+export type ControllerModeSnapshot =
+  | { kind: 'pending' }
+  | { kind: 'signed-out' }
+  | { kind: 'inactive'; accountResolved: true }
+  | { kind: 'active'; accountId: string }
+  | { kind: 'resolution-error'; error: string };
+
+let snapshot: ControllerModeSnapshot = { kind: 'pending' };
 /** The account id for which secure-controller mode is currently active, else null. */
 let activeAccountId: string | null = null;
+let restoreGeneration = 0;
 const subs = new Set<() => void>();
 function notify(): void { for (const cb of [...subs]) { try { cb(); } catch { /* isolate */ } } }
 
 export function subscribeControllerMode(cb: () => void): () => void { subs.add(cb); return () => { subs.delete(cb); }; }
-export function isControllerModeRestored(): boolean { return restored; }
-export function isControllerModeActive(): boolean { return restored && activeAccountId != null; }
+export function getControllerModeSnapshot(): ControllerModeSnapshot { return snapshot; }
+export function isControllerModeRestored(): boolean { return snapshot.kind !== 'pending'; }
+export function isControllerModeActive(): boolean { return snapshot.kind === 'active'; }
+export function controllerModeNeedsResolutionRetry(): boolean { return snapshot.kind === 'resolution-error'; }
+export function controllerModeResolutionError(): string | null {
+  return snapshot.kind === 'resolution-error' ? snapshot.error : null;
+}
 
 let cachedAccount: { token: string; accountId: string } | null = null;
 /** Resolve the signed-in account id from Better Auth get-session (cached per token). */
-async function currentAccountId(): Promise<string | null> {
+async function currentAccountId(): Promise<{ accountId: string | null; error: string | null }> {
   const token = getSessionToken();
-  if (!token) return null;
-  if (cachedAccount && cachedAccount.token === token) return cachedAccount.accountId;
+  if (!token) return { accountId: null, error: null };
+  if (cachedAccount && cachedAccount.token === token) return { accountId: cachedAccount.accountId, error: null };
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), CONTROLLER_MODE_RESTORE_TIMEOUT_MS);
   try {
-    const res = await fetch(`${API_BASE}/api/auth/get-session`, { headers: { authorization: `Bearer ${token}` } });
-    if (!res.ok) return null;
+    const res = await fetch(`${API_BASE}/api/auth/get-session`, { headers: { authorization: `Bearer ${token}` }, signal: ac.signal });
+    if (!res.ok) return { accountId: null, error: res.status === 401 ? null : `Network error (${res.status}) while verifying this account.` };
     const data = (await res.json().catch(() => null)) as { user?: { id?: string } } | null;
     const id = data?.user?.id ?? null;
     if (id) cachedAccount = { token, accountId: id };
-    return id;
-  } catch { return null; }
+    return { accountId: id, error: id ? null : 'Network error while verifying this account.' };
+  } catch (error) {
+    const name = error instanceof Error ? error.name : '';
+    if (name === 'AbortError' || name === 'TimeoutError') {
+      return { accountId: null, error: 'Network timeout while verifying this account.' };
+    }
+    return { accountId: null, error: 'Network error while verifying this account.' };
+  }
+  finally { clearTimeout(timer); }
 }
 
 /**
@@ -61,20 +107,48 @@ async function currentAccountId(): Promise<string | null> {
  * can't leave) but only after `restored` flips, so the splash clears.
  */
 export async function restoreControllerMode(): Promise<void> {
-  if (!isAuthed()) { activeAccountId = null; restored = true; notify(); return; }
-  const id = await currentAccountId();
+  const myGeneration = ++restoreGeneration;
+  const tokenAtStart = getSessionToken();
+  if (!isAuthed() || !tokenAtStart) {
+    activeAccountId = null;
+    snapshot = { kind: 'signed-out' };
+    notify();
+    return;
+  }
   const map = readMap();
-  activeAccountId = id && map[id] ? id : null;
-  restored = true;
+  const fallbackId = readLastAccountId();
+  const fallbackBinding = readLastTokenBinding();
+  const { accountId: id, error } = await currentAccountId();
+  const tokenNow = getSessionToken();
+  if (myGeneration !== restoreGeneration || tokenNow !== tokenAtStart || !isAuthed()) return;
+  if (id && map[id]) {
+    activeAccountId = id;
+    snapshot = { kind: 'active', accountId: id };
+    const digest = await tokenBindingDigest(tokenAtStart);
+    if (myGeneration !== restoreGeneration || getSessionToken() !== tokenAtStart || !isAuthed()) return;
+    writeLastAccountId(id);
+    writeLastTokenBinding({ accountId: id, digest });
+  } else if (!id && error) {
+    activeAccountId = null;
+    snapshot = { kind: 'resolution-error', error };
+  } else {
+    activeAccountId = null;
+    snapshot = { kind: 'inactive', accountResolved: true };
+  }
   notify();
 }
 
 /** Activate secure-controller mode for the current account. Persists BEFORE navigation. */
 export async function activateControllerMode(): Promise<boolean> {
-  const id = await currentAccountId();
+  const token = getSessionToken();
+  const { accountId: id } = await currentAccountId();
   if (!id) return false;
   const map = readMap(); map[id] = true; writeMap(map);
-  activeAccountId = id; restored = true; notify();
+  writeLastAccountId(id);
+  if (token) writeLastTokenBinding({ accountId: id, digest: await tokenBindingDigest(token) });
+  activeAccountId = id;
+  snapshot = { kind: 'active', accountId: id };
+  notify();
   return true;
 }
 
@@ -84,9 +158,13 @@ export async function activateControllerMode(): Promise<boolean> {
  * the cleared marker so a cold restart lands on the legacy tree for this account.
  */
 export async function deactivateControllerMode(): Promise<void> {
-  const id = activeAccountId ?? await currentAccountId();
+  const id = activeAccountId ?? (await currentAccountId()).accountId;
   if (id) { const map = readMap(); delete map[id]; writeMap(map); }
-  activeAccountId = null; notify();
+  if (id && readLastAccountId() === id) writeLastAccountId(null);
+  if (id && readLastTokenBinding()?.accountId === id) writeLastTokenBinding(null);
+  activeAccountId = null;
+  snapshot = isAuthed() ? { kind: 'inactive', accountResolved: true } : { kind: 'signed-out' };
+  notify();
 }
 
 /**
@@ -104,7 +182,11 @@ export function activeControllerAccountId(): string | null { return activeAccoun
  */
 export function deactivateControllerModeForAccount(accountId: string | null): void {
   if (accountId) { const map = readMap(); delete map[accountId]; writeMap(map); }
-  activeAccountId = null; notify();
+  if (accountId && readLastAccountId() === accountId) writeLastAccountId(null);
+  if (accountId && readLastTokenBinding()?.accountId === accountId) writeLastTokenBinding(null);
+  activeAccountId = null;
+  snapshot = isAuthed() ? { kind: 'inactive', accountResolved: true } : { kind: 'signed-out' };
+  notify();
 }
 
 /**
@@ -114,7 +196,11 @@ export function deactivateControllerModeForAccount(accountId: string | null): vo
  * one-frame legacy flash) until the re-resolve completes.
  */
 export function invalidateControllerMode(): void {
-  restored = false; activeAccountId = null; cachedAccount = null; notify();
+  restoreGeneration += 1;
+  snapshot = { kind: 'pending' };
+  activeAccountId = null;
+  cachedAccount = null;
+  notify();
 }
 
 /**
