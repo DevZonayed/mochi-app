@@ -17,6 +17,7 @@ import * as m0006 from './migrations/0006_shadow_capabilities.js';
 import * as m0007 from './migrations/0007_shadow_capability_limit_8.js';
 import * as m0008 from './migrations/0008_shadow_pending_enrollment_unique.js';
 import * as m0009 from './migrations/0009_shadow_grant_active_unique.js';
+import * as m0010 from './migrations/0010_shadow_revocation_grant_history.js';
 import { upsertDevice } from './accountDevices.js';
 import { buildAccountServer } from './accountServer.js';
 import { auth, migrateAuth } from './auth.js';
@@ -147,6 +148,7 @@ interface EnrollResult {
   sessionId: string;
   fence: { accountId: string; scopeId: string; hostDeviceId: string; epoch: number; leaseId: string };
   hostScopeKey: Uint8Array;
+  grantId: string;
   grantMsg: unknown;
   keyMaterial: unknown;
   bootstrap: EnrollmentBootstrap;
@@ -175,8 +177,8 @@ async function fullEnroll(accountId: string, host: ShadowIdentity, controllerDev
     host, fence: lease.fence, controllerDeviceId, controllerAgreementPublicKey: base64urlDecode(request.agreementPublicKey),
     transcriptHash, sessionId, nowMs: now, ttlMs: 120_000,
   });
-  await approveEnrollment({ accountId, hostDeviceId: host.deviceId, sessionId, grant: approval.grant, keyMaterial: approval.keyMaterial, nowMs: now });
-  return { controller, sessionId, fence: lease.fence, hostScopeKey: approval.scopeKey, grantMsg: approval.grant, keyMaterial: approval.keyMaterial, bootstrap, transcriptHash };
+  const view = await approveEnrollment({ accountId, hostDeviceId: host.deviceId, sessionId, grant: approval.grant, keyMaterial: approval.keyMaterial, nowMs: now });
+  return { controller, sessionId, fence: lease.fence, hostScopeKey: approval.scopeKey, grantId: view.grantId, grantMsg: approval.grant, keyMaterial: approval.keyMaterial, bootstrap, transcriptHash };
 }
 
 async function buildPendingRequest(accountId: string, host: ShadowIdentity, controllerDeviceId: string, sessionId: string, now = Date.now()) {
@@ -466,6 +468,7 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
     const accountId = 'acct-0009-reenroll-upgrade';
     const host = await makeRegisteredHost(accountId, 'host-0009-reenroll-upgrade');
     const first = await fullEnroll(accountId, host, 'ctrl-0009-reenroll-upgrade', 'es_0009_first');
+    await m0010.up(getDb());
     const rev = await signDeviceRevocation(backend, host, {
       family: 'device-revocation',
       v: 1,
@@ -509,6 +512,7 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
 
     await m0009.up(getDb());
     await m0009.up(getDb());
+    await m0010.up(getDb());
     const retry = await buildPendingRequest(accountId, host, first.controller.deviceId, 'es_0009_retry');
     await submitEnrollmentRequest({ accountId, sessionId: 'es_0009_retry', request: retry.request, presentedSecret: retry.presentedSecret, idempotencyKey: `idem_${retry.request.nonce}`, nowMs: retry.now });
     await expect(approvePendingWithFence(accountId, host, retry, first.fence)).resolves.toMatchObject({ status: 'active', controllerDeviceId: first.controller.deviceId });
@@ -631,6 +635,7 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
     const first = await fullEnroll(accountId, host, 'ctrl-0009-transitional-restart', 'es_0009_transitional_first');
 
     await m0009.up(getDb());
+    await m0010.up(getDb());
     const rev = await signDeviceRevocation(backend, host, {
       family: 'device-revocation',
       v: 1,
@@ -679,6 +684,49 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
         ORDER BY key_rotation_id
       ) r
     `.execute(getDb())).resolves.toEqual(beforeRevocations);
+  });
+
+  it('0010 upgrades old controller-scoped revocation history to grant-bound indexes without rewriting signed fields', async () => {
+    await resetTo0008Db();
+    await m0009.up(getDb());
+    const accountId = 'acct-0010-old-history';
+    const host = await makeRegisteredHost(accountId, 'host-0010-old-history');
+    const r = await fullEnroll(accountId, host, 'ctrl-0010-old-history', 'es_0010_old_history');
+    const signed = await signDeviceRevocation(backend, host, { family: 'device-revocation', v: 1, fence: r.fence, controllerDeviceId: r.controller.deviceId, revokedAt: 1_800_000_400_000, keyRotationId: 'kr_0010_old' });
+    await getDb().updateTable('shadow_enrollment_grant').set({ status: 'revoked', revoked_at_ms: 1_800_000_400_000, key_rotation_id: 'kr_0010_old', updated_at: new Date() }).where('grant_id', '=', r.grantId).execute();
+    await sql`
+      INSERT INTO shadow_revocation_record (
+        account_id, scope_id, controller_device_id, key_rotation_id, revoked_at_ms, effective_seq,
+        revocation_signature, host_device_id, request_digest, created_at
+      ) VALUES (
+        ${accountId}, ${r.fence.scopeId}, ${r.controller.deviceId}, ${'kr_0010_old'}, ${1_800_000_400_000}, ${14},
+        ${signed.signature}, ${host.deviceId}, ${'legacy-digest-0010'}, now()
+      )
+    `.execute(getDb());
+    const before = await sql`
+      SELECT key_rotation_id, revoked_at_ms, effective_seq, revocation_signature, host_device_id, request_digest
+      FROM shadow_revocation_record
+      WHERE account_id = ${accountId}
+    `.execute(getDb());
+
+    await expect(m0010.up(getDb())).resolves.toBeUndefined();
+    await expect(m0010.up(getDb())).resolves.toBeUndefined();
+    const after = await getDb().selectFrom('shadow_revocation_record').selectAll().where('account_id', '=', accountId).executeTakeFirstOrThrow();
+    expect(after.grant_id).toBe(r.grantId);
+    expect(after.revocation_id).toBe(`${r.grantId}:kr_0010_old`);
+    await expect(sql`
+      SELECT key_rotation_id, revoked_at_ms, effective_seq, revocation_signature, host_device_id, request_digest
+      FROM shadow_revocation_record
+      WHERE account_id = ${accountId}
+    `.execute(getDb())).resolves.toEqual(before);
+
+    const indexes = await sql<{ indexname: string }>`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename = 'shadow_revocation_record'
+        AND indexname IN ('shadow_revocation_record_identity_idx', 'shadow_revocation_record_revocation_id_idx')
+      ORDER BY indexname
+    `.execute(getDb());
+    expect(indexes.rows.map((r) => r.indexname)).toEqual(['shadow_revocation_record_identity_idx', 'shadow_revocation_record_revocation_id_idx']);
   });
 
   it('full startup fails closed on mismatched transitional grant index definitions without row mutation', async () => {
@@ -859,17 +907,49 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
   });
 
   // ── Review finding 2 (conflicting revocation overwrite) — recreated probe ──
-  it('reviewer: rejects conflicting signed revocation replay instead of overwriting the record', async () => {
+  it('reviewer: rejects conflicting same-identity revocation replay instead of overwriting the record', async () => {
     const accountId = 'acct-review-conflicting-revoke';
     const host = await makeRegisteredHost(accountId, 'host-review-conflicting-revoke');
     const r = await fullEnroll(accountId, host, 'ctrl-review-conflicting-revoke', 'es_review_conflicting_revoke');
     const first = await signDeviceRevocation(backend, host, { family: 'device-revocation', v: 1, fence: r.fence, controllerDeviceId: r.controller.deviceId, revokedAt: Date.now(), keyRotationId: 'kr_review_first' });
     await expect(revokeEnrolledController({ accountId, hostDeviceId: host.deviceId, scopeId: r.fence.scopeId, controllerDeviceId: r.controller.deviceId, revocation: first, effectiveSeq: 1, nowMs: Date.now() })).resolves.toMatchObject({ alreadyRevoked: false, keyRotationId: 'kr_review_first' });
-    const conflicting = await signDeviceRevocation(backend, host, { family: 'device-revocation', v: 1, fence: r.fence, controllerDeviceId: r.controller.deviceId, revokedAt: Date.now() + 1, keyRotationId: 'kr_review_conflict' });
+    const conflicting = await signDeviceRevocation(backend, host, { family: 'device-revocation', v: 1, fence: r.fence, controllerDeviceId: r.controller.deviceId, revokedAt: Date.now() + 1, keyRotationId: 'kr_review_first' });
     await expect(revokeEnrolledController({ accountId, hostDeviceId: host.deviceId, scopeId: r.fence.scopeId, controllerDeviceId: r.controller.deviceId, revocation: conflicting, effectiveSeq: 2, nowMs: Date.now() })).rejects.toMatchObject({ statusCode: 409 });
     const stored = await getDb().selectFrom('shadow_revocation_record').selectAll().where('account_id', '=', accountId).where('scope_id', '=', r.fence.scopeId).where('controller_device_id', '=', r.controller.deviceId).executeTakeFirst();
     expect(stored?.key_rotation_id).toBe('kr_review_first');
     expect(stored?.effective_seq).toBe(1);
+  });
+
+  it('revokes grant A, re-enrolls the same controller as grant B, then revokes and replays B with grant-specific history', async () => {
+    const accountId = 'acct-repeated-controller-revoke';
+    const host = await makeRegisteredHost(accountId, 'host-repeated-controller-revoke');
+    const a = await fullEnroll(accountId, host, 'ctrl-repeated-controller-revoke', 'es_repeated_a');
+    const revokeA = await signDeviceRevocation(backend, host, { family: 'device-revocation', v: 1, fence: a.fence, controllerDeviceId: a.controller.deviceId, revokedAt: 1_800_000_200_000, keyRotationId: 'kr_repeated_a' });
+
+    await expect(revokeEnrolledController({ accountId, hostDeviceId: host.deviceId, scopeId: a.fence.scopeId, controllerDeviceId: a.controller.deviceId, revocation: revokeA, effectiveSeq: 11, nowMs: Date.now() })).resolves.toMatchObject({ alreadyRevoked: false });
+    await expect(revokeEnrolledController({ accountId, hostDeviceId: host.deviceId, scopeId: a.fence.scopeId, controllerDeviceId: a.controller.deviceId, revocation: revokeA, effectiveSeq: 11, nowMs: Date.now() })).resolves.toMatchObject({ alreadyRevoked: true });
+    expect((await getDb().selectFrom('shadow_revoked_controller').selectAll().where('account_id', '=', accountId).where('scope_id', '=', a.fence.scopeId).where('controller_device_id', '=', a.controller.deviceId).executeTakeFirst())?.key_rotation_effective_seq).toBe(11);
+
+    const retry = await buildPendingRequest(accountId, host, a.controller.deviceId, 'es_repeated_b');
+    await submitEnrollmentRequest({ accountId, sessionId: retry.session.sessionId, request: retry.request, presentedSecret: retry.presentedSecret, idempotencyKey: `idem_${retry.request.nonce}`, nowMs: retry.now });
+    const b = await approvePendingWithFence(accountId, host, retry, a.fence);
+    expect(b.status).toBe('active');
+    expect(b.grantId).not.toBe(a.grantId);
+    expect(await getDb().selectFrom('shadow_revoked_controller').selectAll().where('account_id', '=', accountId).where('scope_id', '=', a.fence.scopeId).where('controller_device_id', '=', a.controller.deviceId).executeTakeFirst()).toBeUndefined();
+
+    const revokeB = await signDeviceRevocation(backend, host, { family: 'device-revocation', v: 1, fence: a.fence, controllerDeviceId: a.controller.deviceId, revokedAt: 1_800_000_300_000, keyRotationId: 'kr_repeated_b' });
+    await expect(revokeEnrolledController({ accountId, hostDeviceId: host.deviceId, scopeId: a.fence.scopeId, controllerDeviceId: a.controller.deviceId, revocation: revokeB, effectiveSeq: 12, nowMs: Date.now() })).resolves.toMatchObject({ alreadyRevoked: false });
+    await expect(revokeEnrolledController({ accountId, hostDeviceId: host.deviceId, scopeId: a.fence.scopeId, controllerDeviceId: a.controller.deviceId, revocation: revokeB, effectiveSeq: 12, nowMs: Date.now() })).resolves.toMatchObject({ alreadyRevoked: true });
+    const conflictB = await signDeviceRevocation(backend, host, { family: 'device-revocation', v: 1, fence: a.fence, controllerDeviceId: a.controller.deviceId, revokedAt: 1_800_000_300_001, keyRotationId: 'kr_repeated_b' });
+    await expect(revokeEnrolledController({ accountId, hostDeviceId: host.deviceId, scopeId: a.fence.scopeId, controllerDeviceId: a.controller.deviceId, revocation: conflictB, effectiveSeq: 13, nowMs: Date.now() })).rejects.toMatchObject({ statusCode: 409 });
+
+    const rows = await getDb().selectFrom('shadow_revocation_record').selectAll().where('account_id', '=', accountId).where('scope_id', '=', a.fence.scopeId).where('controller_device_id', '=', a.controller.deviceId).orderBy('key_rotation_id').execute();
+    expect(rows.map((r) => ({ grantId: r.grant_id, keyRotationId: r.key_rotation_id, effectiveSeq: r.effective_seq }))).toEqual([
+      { grantId: a.grantId, keyRotationId: 'kr_repeated_a', effectiveSeq: 11 },
+      { grantId: b.grantId, keyRotationId: 'kr_repeated_b', effectiveSeq: 12 },
+    ]);
+    expect(rows.every((r) => r.revocation_id === `${r.grant_id}:${r.key_rotation_id}`)).toBe(true);
+    expect((await getDb().selectFrom('shadow_revoked_controller').selectAll().where('account_id', '=', accountId).where('scope_id', '=', a.fence.scopeId).where('controller_device_id', '=', a.controller.deviceId).executeTakeFirst())?.key_rotation_effective_seq).toBe(12);
   });
 
   it('revocation: exact replay idempotent; each differing field rejected 409 with original row byte-identical + no collateral mutation', async () => {

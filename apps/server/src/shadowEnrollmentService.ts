@@ -928,15 +928,13 @@ export async function revokeEnrolledController(input: RevokeControllerInput): Pr
 
   return getDb().transaction().execute(async (trx) => {
     await sql`select pg_advisory_xact_lock(hashtextextended(${`revoke:${accountId}:${scopeId}:${controllerDeviceId}`}, 0))`.execute(trx);
-    // Read the existing record UNDER LOCK before any mutation. History is
-    // immutable: ONLY a non-null digest that exactly matches the recomputed
-    // full-payload digest (and the core fields) is idempotent. A legacy row with
-    // a NULL digest is UNVERIFIABLE (we cannot prove identical wrapped rotations)
-    // and FAILS CLOSED with 409 — never idempotent, never mutated, never
-    // backfilled. Any other difference is likewise a 409 conflict, leaving the
-    // record + all collateral rows untouched.
+    // Read the same revocation identity UNDER LOCK before any mutation. History
+    // is immutable and grant-specific: an exact replay of the same signed
+    // revocation identity is idempotent, while a later grant for the same durable
+    // controller may create a separate record under its own keyRotationId.
     const existing = await trx.selectFrom('shadow_revocation_record').selectAll()
       .where('account_id', '=', accountId).where('scope_id', '=', scopeId).where('controller_device_id', '=', controllerDeviceId)
+      .where('key_rotation_id', '=', keyRotationId)
       .forUpdate().executeTakeFirst();
     if (existing) {
       if (existing.request_digest == null) throw status('unverifiable legacy revocation', 409);
@@ -949,13 +947,23 @@ export async function revokeEnrolledController(input: RevokeControllerInput): Pr
       throw status('conflicting revocation', 409);
     }
 
-    // First revocation for this (account, scope, controller): the record is
-    // immutable — a plain insert (no doUpdateSet). Concurrent first inserts are
-    // serialized by the advisory lock above, so exactly one reaches this insert
-    // and any concurrent replay/conflict is resolved by the re-read on the branch
-    // above.
+    const activeGrant = await trx.selectFrom('shadow_enrollment_grant')
+      .select(['grant_id'])
+      .where('account_id', '=', accountId)
+      .where('scope_id', '=', scopeId)
+      .where('controller_device_id', '=', controllerDeviceId)
+      .where('status', '=', 'active')
+      .forUpdate()
+      .executeTakeFirst();
+    if (!activeGrant) throw status('controller not actively enrolled', 409);
+    const revocationId = `${activeGrant.grant_id}:${keyRotationId}`;
+
+    // First revocation for this grant identity: the record is immutable — a
+    // plain insert (no doUpdateSet). Concurrent first inserts are serialized by
+    // the advisory lock above, and the unique identity index rejects conflicting
+    // same-keyRotation attempts without overwriting history.
     await trx.insertInto('shadow_revocation_record').values({
-      account_id: accountId, scope_id: scopeId, controller_device_id: controllerDeviceId, key_rotation_id: keyRotationId, revoked_at_ms: m.revokedAt, effective_seq: effectiveSeq, revocation_signature: m.signature, host_device_id: hostDeviceId, request_digest: requestDigest, created_at: new Date(),
+      revocation_id: revocationId, grant_id: activeGrant.grant_id, account_id: accountId, scope_id: scopeId, controller_device_id: controllerDeviceId, key_rotation_id: keyRotationId, revoked_at_ms: m.revokedAt, effective_seq: effectiveSeq, revocation_signature: m.signature, host_device_id: hostDeviceId, request_digest: requestDigest, created_at: new Date(),
     }).execute();
 
     // Enforcement row read by the relay's assertControllerAllowed.
@@ -964,7 +972,7 @@ export async function revokeEnrolledController(input: RevokeControllerInput): Pr
 
     // Immediate signed-request auth denial.
     await trx.updateTable('shadow_registered_key').set({ status: 'revoked', revoked_at: new Date() }).where('account_id', '=', accountId).where('device_id', '=', controllerDeviceId).execute();
-    await trx.updateTable('shadow_enrollment_grant').set({ status: 'revoked', revoked_at_ms: m.revokedAt, key_rotation_id: keyRotationId, updated_at: new Date() }).where('account_id', '=', accountId).where('scope_id', '=', scopeId).where('controller_device_id', '=', controllerDeviceId).execute();
+    await trx.updateTable('shadow_enrollment_grant').set({ status: 'revoked', revoked_at_ms: m.revokedAt, key_rotation_id: keyRotationId, updated_at: new Date() }).where('account_id', '=', accountId).where('scope_id', '=', scopeId).where('controller_device_id', '=', controllerDeviceId).where('grant_id', '=', activeGrant.grant_id).where('status', '=', 'active').execute();
 
     // A revoked controller must not retain any pending/consumed enrollment path.
     // This is part of the same transaction as the grant revoke + scope rotation,

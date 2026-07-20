@@ -274,6 +274,8 @@ export interface ShadowRequestNonceTable {
   created_at: Date;
 }
 export interface ShadowRevocationRecordTable {
+  revocation_id: string | null;
+  grant_id: string | null;
   account_id: string;
   scope_id: string;
   controller_device_id: string;
