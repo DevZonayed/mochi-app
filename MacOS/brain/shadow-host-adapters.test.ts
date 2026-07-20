@@ -14,6 +14,7 @@ import { randomBytes } from 'node:crypto';
 import { encryptWithKey, decryptWithKey } from '../sidecar/src/safe-storage-crypto.ts';
 import { SafeStorageVault, FileHostEnrollmentPersistence, type SafeStorageLike } from './shadow-host-adapters.ts';
 import { ShadowHostEnrollmentRuntime, type HostEnrollmentRecord } from './shadow-enrollment-host.ts';
+import { defineShadowCommandRegistry } from './shadow-host-service.ts';
 import type { ShadowFetch } from '@maestro/realtime/shadowRequestClient';
 import type { Fence } from '@maestro/realtime/shadowProtocol';
 
@@ -302,5 +303,88 @@ describe('expired persisted shadow host lease recovery', () => {
     await expect(rt.start()).resolves.toMatchObject({ state: 'running', epoch: 8 });
     expect(leaseBodies).toHaveLength(2);
     expect(leaseBodies[1]).toEqual({ scopeId: `account:${accountId}` });
+  });
+
+  it('keeps renewing after the only active controller is revoked, then accepts a fresh controller plane', async () => {
+    let nowMs = 1_800_000_000_000;
+    const vault = new SafeStorageVault(mockSafeStorage());
+    const f = tmpFile('post-revoke-renewal.json');
+    const seeded = await seedRegisteredRecord(f, vault, nowMs);
+    seeded.leaseExpiresAt = nowMs + 30_000;
+    seeded.controllers = [{
+      controllerDeviceId: 'ctrl_first',
+      grantId: 'grant_first',
+      keyId: 'wk_first',
+      agreementPublicKey: 'a',
+      transcriptHash: 't',
+      status: 'active',
+    }];
+    writeFileSync(f, JSON.stringify(seeded), { mode: 0o600 });
+
+    const renewBodies: Array<Record<string, unknown>> = [];
+    const revokeBodies: Array<Record<string, unknown>> = [];
+    const fetch: ShadowFetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') {
+        return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      }
+      if (path === '/api/shadow/lease') {
+        return { status: 200, ok: true, text: async () => JSON.stringify({ fence: oldFence, expiresAt: nowMs + 240_000 }) };
+      }
+      if (path === '/api/shadow/enroll/revoke') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        revokeBodies.push(body);
+        return { status: 200, ok: true, text: async () => JSON.stringify({ ok: true, keyRotationId: 'kr_only', alreadyRevoked: false }) };
+      }
+      if (path === '/api/shadow/lease/renew-with-transitions') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        renewBodies.push(body);
+        return { status: 200, ok: true, text: async () => JSON.stringify({ fence: oldFence, expiresAt: body.requestedExpiresAt, replayed: false }) };
+      }
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+    const rt = runtimeWith(f, vault, fetch, () => nowMs);
+    await expect(rt.start()).resolves.toMatchObject({ state: 'running', controllers: 1 });
+
+    await expect(rt.revoke({ controllerDeviceId: 'ctrl_first' })).resolves.toMatchObject({ keyRotationId: 'kr_only', alreadyRevoked: false });
+    expect(revokeBodies).toHaveLength(1);
+    expect(rt.status()).toMatchObject({ state: 'running', controllers: 0 });
+    expect(rt.liveAuthority()).toMatchObject({ fence: oldFence, revokedControllerDeviceIds: ['ctrl_first'], scopeKeyId: null });
+    expect(rt.buildDataService({
+      rootDir: mkdtempSync(join(tmpdir(), 'post-revoke-no-plane-')),
+      transport: { fetch },
+      commandRegistry: defineShadowCommandRegistry({ health: { effectMode: 'read-only', execute: async () => ({ ok: true, completion: { collection: 'command', op: 'checkpoint', entityId: 'health', revision: 1, payload: {} } }) } }),
+    })).toBeNull();
+
+    nowMs += 29_000;
+    await expect(rt.renewLease()).resolves.toMatchObject({ fence: oldFence });
+    nowMs += 239_000;
+    await expect(rt.renewLease()).resolves.toMatchObject({ fence: oldFence });
+    expect(renewBodies).toHaveLength(2);
+    expect(renewBodies.every((b) => Array.isArray(b.grants) && (b.grants as unknown[]).length === 0)).toBe(true);
+    expect(renewBodies.every((b) => JSON.stringify(b.currentFence) === JSON.stringify(oldFence))).toBe(true);
+    expect(rt.liveAuthority()!.leaseExpiresAt).toBe(renewBodies[1].requestedExpiresAt);
+
+    const saved = JSON.parse(readFileSync(f, 'utf8')) as HostEnrollmentRecord;
+    saved.controllers.push({
+      controllerDeviceId: 'ctrl_second',
+      grantId: 'grant_second',
+      keyId: 'wk_second',
+      agreementPublicKey: 'a2',
+      transcriptHash: 't2',
+      status: 'active',
+    });
+    writeFileSync(f, JSON.stringify(saved), { mode: 0o600 });
+    const restarted = runtimeWith(f, vault, fetch, () => nowMs);
+    await expect(restarted.start()).resolves.toMatchObject({ state: 'running', controllers: 1 });
+    expect(restarted.liveAuthority()).toMatchObject({ revokedControllerDeviceIds: ['ctrl_first'], scopeKeyId: 'wk_second' });
+    const svc = restarted.buildDataService({
+      rootDir: mkdtempSync(join(tmpdir(), 'post-revoke-fresh-plane-')),
+      transport: { fetch },
+      commandRegistry: defineShadowCommandRegistry({ health: { effectMode: 'read-only', execute: async () => ({ ok: true, completion: { collection: 'command', op: 'checkpoint', entityId: 'health', revision: 1, payload: {} } }) } }),
+    });
+    expect(svc).not.toBeNull();
+    expect(svc!.authoritySnapshot()).toMatchObject({ scopeKeyId: 'wk_second', revokedControllerDeviceIds: ['ctrl_first'] });
+    svc!.close();
   });
 });

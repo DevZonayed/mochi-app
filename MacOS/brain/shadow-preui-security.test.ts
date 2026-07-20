@@ -274,6 +274,7 @@ describe('NOTE-2 — sidecar production wiring pins the revoked-set/rotation pro
     const renewFn = headless.slice(headless.indexOf('async function renewShadowHostLease'), headless.indexOf('async function onShadowControllerRevoked'));
     const loopFn = headless.slice(headless.indexOf('function startShadowHostDataLoop'), headless.indexOf('const WEB_ROOT'));
     expect(renewFn).not.toContain('if (!shadowHostData) return');
+    expect(renewFn).not.toContain('shadowHostData?.svc.status()');
     expect(renewFn).toContain('const rt = await getShadowHostFor()');
     expect(renewFn).toContain('rt.liveAuthority()');
     expect(loopFn.indexOf('await renewShadowHostLease()')).toBeLessThan(loopFn.indexOf('if (!svc) return'));

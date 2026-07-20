@@ -18,6 +18,18 @@ describe('shadow-projection-schema — safe versioned views', () => {
     expect(JSON.stringify(e.data)).not.toContain('/Users/bob/secret'); // local path never projected
   });
 
+  it('accepts production UUID-shaped ids used by Store rows', () => {
+    const projectId = '8a7d7f17-21d1-446c-97a5-e1bf77103815';
+    const sessionId = '10b42833-8f49-49e6-bf2a-7462b28f1338';
+    const jobId = 'fd124b4d-2ea6-4d4d-a704-09d6066f99e2';
+    const p = { id: projectId, workspaceId: 'w', name: 'UUID Project', template: 't', instructions: '', color: 'blue', createdAt: 1, updatedAt: 2 } as Project;
+    const s = { id: sessionId, projectId, title: 'UUID Session', createdAt: 1, updatedAt: 2 } as ChatSession;
+    const j = { id: jobId, projectId, sessionId, title: 'UUID Job', status: 'pending', phase: 'Queued', progress: 0, input: '', output: null, error: null, effort: 'balanced', cost: 0, tokens: 0, stage: '', createdAt: 1, updatedAt: 2 } as Job;
+    expect(buildProjectView(p)?.entityId).toBe(projectId);
+    expect(buildSessionView(s)?.entityId).toBe(sessionId);
+    expect(buildJobView(j)?.entityId).toBe(jobId);
+  });
+
   it('redacts a secret embedded in a project name (defence-in-depth)', () => {
     const p = { id: 'proj_2', workspaceId: 'w', name: `Alpha ghp_${'x'.repeat(40)}`, template: 't', instructions: '', color: '#fff', createdAt: 1, updatedAt: 2 } as Project;
     const e = buildProjectView(p)!;

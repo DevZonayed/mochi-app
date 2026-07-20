@@ -5,6 +5,7 @@
  * events to prove no secret canary reaches the payload.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
@@ -12,7 +13,7 @@ import Database from 'better-sqlite3';
 const hoisted = vi.hoisted(() => ({ dir: `/tmp/maestro-projection-test-${process.pid}` }));
 vi.mock('electron', () => ({ app: { getPath: () => hoisted.dir } }));
 
-import { Store } from './store.js';
+import { Store, type Job } from './store.js';
 import { ShadowHostCore, StaticShadowKeyProvider, type ShadowAuthority } from './shadow-host.js';
 import { ShadowProductProjection } from './shadow-product-projection.js';
 import type { Fence } from '@maestro/realtime';
@@ -20,6 +21,20 @@ import type { Fence } from '@maestro/realtime';
 const now = 1_800_000_000_000;
 const key = Buffer.alloc(32, 5);
 const CANARY = 'CANARY_SECRET_9z8y7x6w5v4u3t2s1r0q';
+const LOG_LEAK_CANARIES = [
+  '/Users/bob/secret-ghp_1234567890abcdef1234567890abcdef1234',
+  '../relative/path/.env.local',
+  'ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+  'token=secret-token-value-1234567890',
+  'alice@example.com',
+  'https://example.com/callback?token=secret&email=alice@example.com',
+  'query?access_token=abc123&refresh_token=def456',
+  'control\u0000chars\u001b[31m',
+  'OVERLONG_SECRET_'.repeat(40),
+  'REGEX_SAFE_CANARY_ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789',
+  'malicious-name-ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+  'malicious-message-sk-ant-api03abcdefghijklmnopqrstuvwx',
+] as const;
 
 function makeFence(scopeId = 'account:user_1'): Fence {
   return { accountId: 'acct_1', scopeId, hostDeviceId: 'host_mac_1', epoch: 1, leaseId: 'lease_1' };
@@ -36,6 +51,27 @@ function decryptedPayloads(core: ShadowHostCore, sub: string): unknown[] {
   const rows = raw.prepare('SELECT event_id FROM events ORDER BY seq ASC').all() as Array<{ event_id: string }>;
   raw.close();
   return rows.map((r) => core.decryptEventPayload(r.event_id));
+}
+function maliciousError(name: string, message: string): Error {
+  const err = new Error(message);
+  err.name = name;
+  return err;
+}
+function expectNoDiagnosticLeak(logs: string[], extraCanaries: readonly string[] = []): void {
+  const joined = logs.join('\n');
+  for (const canary of [...LOG_LEAK_CANARIES, ...extraCanaries]) {
+    expect(joined).not.toContain(canary);
+  }
+  expect(joined).not.toMatch(/\/Users\/[A-Za-z0-9._-]+/);
+  expect(joined).not.toMatch(/\.\.\/[A-Za-z0-9._/-]+/);
+  expect(joined).not.toMatch(/ghp_[A-Za-z0-9_]{20,}/);
+  expect(joined).not.toMatch(/sk-ant-api03[A-Za-z0-9_-]{16,}/);
+  expect(joined).not.toMatch(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+  expect(joined).not.toMatch(/https?:\/\//);
+  expect(joined).not.toMatch(/[?&](access_)?token=/);
+  for (const line of logs) {
+    expect(line).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f]/);
+  }
 }
 
 describe('ShadowProductProjection — real Store integration', () => {
@@ -85,6 +121,98 @@ describe('ShadowProductProjection — real Store integration', () => {
     const p2row = core.projectionIndexEntities(makeFence().scopeId, 'project').find((e) => e.entityId === p2.id);
     expect(p2row?.deleted).toBe(true);
     core.close();
+  });
+
+  it('first-controller startup projects a representative 48-project / 1500-job UUID snapshot', async () => {
+    const store = new Store();
+    const logs: string[] = [];
+    const firstProject = store.createProject({ name: 'Controller Project 01', kind: 'coding' });
+    const firstSession = store.createSession(firstProject.id, 'controller session 01');
+    const jobs: Job[] = [];
+    const firstJobId = randomUUID();
+    for (let i = 0; i < 48; i++) {
+      const project = i === 0 ? firstProject : store.createProject({ name: `Controller Project ${String(i + 1).padStart(2, '0')}`, kind: 'coding' });
+      const session = i === 0 ? firstSession : store.createSession(project.id, `controller session ${String(i + 1).padStart(2, '0')}`);
+      const jobsForProject = i < 12 ? 32 : 31;
+      for (let j = 0; j < jobsForProject; j++) {
+        const id = i === 0 && j === 0 ? firstJobId : randomUUID();
+        jobs.push({ id, projectId: project.id, sessionId: session.id, title: `Job ${i}-${j}`, status: 'pending', phase: 'Queued', progress: 0, input: '', output: null, error: null, effort: 'balanced', cost: 0, tokens: 0, stage: '', createdAt: now, updatedAt: now });
+      }
+    }
+    expect(store.listProjects()).toHaveLength(48);
+    expect(jobs).toHaveLength(1500);
+
+    const core = makeCore('first-controller');
+    const reader = {
+      listProjects: () => store.listProjects(),
+      listSessions: () => store.listSessions(),
+      listJobs: () => jobs,
+      listApprovals: () => [],
+      listSchedules: () => [],
+    };
+    const projection = new ShadowProductProjection({ host: core, fence: makeFence(), store: reader, now: () => now, log: (m) => logs.push(m) });
+    const result = await projection.start();
+
+    expect(result.quarantined).toBe(0);
+    expect(logs.join('\n')).not.toContain('invalid-projection-entity');
+    expect(core.projectionIndexEntities(makeFence().scopeId, 'project')).toHaveLength(48);
+    expect(core.projectionIndexEntities(makeFence().scopeId, 'job')).toHaveLength(1500);
+
+    const payloads = decryptedPayloads(core, 'first-controller');
+    const joined = JSON.stringify(payloads);
+    expect(joined).toContain(firstProject.id);
+    expect(joined).toContain(firstSession.id);
+    expect(joined).toContain(firstJobId);
+    expect(joined).toContain('Controller Project 01');
+    core.close();
+  }, 90_000);
+
+  it('projection diagnostics never echo thrown message/name/entity content', async () => {
+    const message = LOG_LEAK_CANARIES.join(' ');
+
+    const listLogs: string[] = [];
+    const listReader = {
+      listProjects: () => { throw maliciousError('PathTokenEmailError', message); },
+      listSessions: () => [],
+      listJobs: () => [],
+      listApprovals: () => [],
+      listSchedules: () => [],
+    };
+    const listCore = makeCore('diagnostic-list');
+    await new ShadowProductProjection({ host: listCore, fence: makeFence(), store: listReader, now: () => now, log: (m) => listLogs.push(m) }).scheduleReconcile();
+    expect(listLogs).toContain('projection: list failed (list-failed:Error)');
+    expectNoDiagnosticLeak(listLogs);
+    listCore.close();
+
+    const publishLogs: string[] = [];
+    const publishStore = new Store();
+    publishStore.createProject({ name: 'diagnostic publish project' });
+    const publishCore = makeCore('diagnostic-publish');
+    await new ShadowProductProjection({
+      host: publishCore,
+      fence: makeFence(),
+      store: publishStore,
+      now: () => now,
+      publish: async () => { throw maliciousError('TypeError', message); },
+      log: (m) => publishLogs.push(m),
+    }).scheduleReconcile();
+    expect(publishLogs).toContain('projection: publish failed (publish-failed:TypeError) — will retry on next change');
+    expectNoDiagnosticLeak(publishLogs);
+    publishCore.close();
+
+    const entityLogs: string[] = [];
+    const entityStore = new Store();
+    const entityProject = entityStore.createProject({ name: 'diagnostic entity project' });
+    const entityCore = makeCore('diagnostic-entity');
+    const originalProjectEntity = entityCore.projectEntity.bind(entityCore);
+    vi.spyOn(entityCore, 'projectEntity').mockImplementation((input) => {
+      if (input.collection === 'project') throw maliciousError('SecretPathError', `${message} ${input.entityId}`);
+      return originalProjectEntity(input);
+    });
+    await new ShadowProductProjection({ host: entityCore, fence: makeFence(), store: entityStore, now: () => now, log: (m) => entityLogs.push(m) }).scheduleReconcile();
+    expect(entityLogs).toContain('projection: project skipped (entity-project-failed:Error)');
+    expectNoDiagnosticLeak(entityLogs, [entityProject.id]);
+    entityCore.close();
   });
 
   it('restart of Store + host emits NO duplicate events for unchanged state', async () => {

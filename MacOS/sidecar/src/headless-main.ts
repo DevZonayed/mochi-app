@@ -700,7 +700,10 @@ async function renewShadowHostLease(): Promise<void> {
     const resumed = await rt.resumePendingRenewal();
     if (resumed) applyLiveHostAuthority(rt);
     const authority = rt.liveAuthority();
-    const leaseExpiresAt = shadowHostData?.svc.status().leaseExpiresAt ?? authority?.leaseExpiresAt ?? 0;
+    // Host lease continuity is independent of the controller data plane. After the
+    // last controller is revoked the plane is intentionally torn down, but the host
+    // authority must keep renewing so account Mac discovery remains online.
+    const leaseExpiresAt = authority?.leaseExpiresAt ?? 0;
     if (leaseExpiresAt > 0 && leaseExpiresAt - Date.now() <= SHADOW_LEASE_RENEW_BEFORE_MS) {
       const renewed = await rt.renewLease();
       if (renewed) applyLiveHostAuthority(rt);

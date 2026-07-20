@@ -30,7 +30,7 @@ export const PROJECTION_LIMITS = {
 
 // Safe id grammar — matches the shared shadow protocol id grammar so ids round-trip
 // through `assertSafeId` on the host core without rejection.
-const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,239}$/;
 
 export interface ProjectionEntity {
   collection: ShadowCollection;

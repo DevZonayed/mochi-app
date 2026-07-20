@@ -112,8 +112,8 @@ export class ShadowProductProjection {
     const live = new Map<ShadowCollection, Map<string, ProjectionEntity>>();
     for (const c of PROJECTED_COLLECTIONS) live.set(c, new Map());
 
-    const add = (e: ProjectionEntity | null) => {
-      if (!e) { quarantined++; return; }
+    const add = (stage: ShadowCollection, e: ProjectionEntity | null) => {
+      if (!e) { quarantined++; this.log(`projection: ${stage} skipped (invalid-projection-entity)`); return; }
       const bucket = live.get(e.collection)!;
       if (bucket.size >= PROJECTION_LIMITS.maxEntitiesPerCollection) { truncated = true; return; }
       bucket.set(e.entityId, e);
@@ -121,14 +121,14 @@ export class ShadowProductProjection {
     };
 
     try {
-      for (const p of this.safeList(() => this.store.listProjects())) add(buildProjectView(p));
-      for (const s of this.safeList(() => this.store.listSessions())) add(buildSessionView(s));
-      for (const j of this.safeList(() => this.store.listJobs())) add(buildJobView(j));
-      for (const a of this.safeList(() => this.store.listApprovals())) add(buildApprovalView(a));
-      for (const s of this.safeList(() => this.store.listSchedules())) add(buildScheduleView(s));
-      for (const q of this.deriveQuestions()) add(buildQuestionView(q));
+      for (const p of this.safeList(() => this.store.listProjects())) add('project', buildProjectView(p));
+      for (const s of this.safeList(() => this.store.listSessions())) add('session', buildSessionView(s));
+      for (const j of this.safeList(() => this.store.listJobs())) add('job', buildJobView(j));
+      for (const a of this.safeList(() => this.store.listApprovals())) add('approval', buildApprovalView(a));
+      for (const s of this.safeList(() => this.store.listSchedules())) add('schedule', buildScheduleView(s));
+      for (const q of this.deriveQuestions()) add('question', buildQuestionView(q));
     } catch (err) {
-      this.log(`projection: store read failed (${errName(err)})`);
+      this.log(`projection: store read failed (${safeErr(err, 'store-read-failed')})`);
       return { scanned, emitted, tombstoned, quarantined, truncated };
     }
     if (truncated) this.log(`projection: entity cap ${PROJECTION_LIMITS.maxEntitiesPerCollection} hit — some entities not projected`);
@@ -162,7 +162,7 @@ export class ShadowProductProjection {
 
     if (emitted > 0 && this.publishFn) {
       try { await this.publishFn(); }
-      catch (err) { this.log(`projection: publish failed (${errName(err)}) — will retry on next change`); }
+      catch (err) { this.log(`projection: publish failed (${safeErr(err, 'publish-failed')}) — will retry on next change`); }
     }
     return { scanned, emitted, tombstoned, quarantined, truncated };
   }
@@ -172,14 +172,14 @@ export class ShadowProductProjection {
       return this.host.projectEntity({ fence: this.fence, ...input });
     } catch (err) {
       // A single bad entity never aborts the whole reconcile.
-      this.log(`projection: ${input.collection}/${input.entityId} skipped (${errName(err)})`);
+      this.log(`projection: ${input.collection} skipped (${safeErr(err, 'entity-project-failed')})`);
       return null;
     }
   }
 
   private safeList<T>(fn: () => T[]): T[] {
     try { const r = fn(); return Array.isArray(r) ? r : []; }
-    catch (err) { this.log(`projection: list failed (${errName(err)})`); return []; }
+    catch (err) { this.log(`projection: list failed (${safeErr(err, 'list-failed')})`); return []; }
   }
 
   /**
@@ -232,6 +232,19 @@ function parseQuestionAsk(raw: string): { question: string; choices: string[] } 
   return { question, choices };
 }
 
-function errName(err: unknown): string {
-  return err instanceof Error ? err.name : 'error';
+const ALLOWED_ERROR_NAMES = new Set([
+  'AggregateError',
+  'Error',
+  'EvalError',
+  'RangeError',
+  'ReferenceError',
+  'SyntaxError',
+  'TypeError',
+  'URIError',
+]);
+
+function safeErr(err: unknown, localCode: string): string {
+  if (!(err instanceof Error)) return `${localCode}:Error`;
+  const name = ALLOWED_ERROR_NAMES.has(err.name) ? err.name : 'Error';
+  return `${localCode}:${name}`;
 }
