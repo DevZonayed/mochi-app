@@ -87,6 +87,41 @@ async function resetTo0008Db(): Promise<void> {
   await getDb().deleteFrom('device').execute();
 }
 
+async function grantIndexDefinitions(): Promise<Array<{ indexname: string; indexdef: string }>> {
+  const result = await sql<{ indexname: string; indexdef: string }>`
+    SELECT indexname, indexdef
+    FROM pg_indexes
+    WHERE schemaname = current_schema()
+      AND tablename = 'shadow_enrollment_grant'
+      AND indexname IN ('shadow_enrollment_grant_controller_idx', 'shadow_enrollment_active_grant_controller_idx')
+    ORDER BY indexname
+  `.execute(getDb());
+  return result.rows;
+}
+
+async function expectCanonicalGrantIndex(): Promise<void> {
+  const indexes = await grantIndexDefinitions();
+  expect(indexes).toHaveLength(1);
+  expect(indexes[0]?.indexname).toBe('shadow_enrollment_grant_controller_idx');
+  expect(indexes[0]?.indexdef).toContain('CREATE UNIQUE INDEX shadow_enrollment_grant_controller_idx');
+  expect(indexes[0]?.indexdef).toContain('ON public.shadow_enrollment_grant');
+  expect(indexes[0]?.indexdef).toContain('(account_id, scope_id, controller_device_id)');
+  expect(indexes[0]?.indexdef).toContain("WHERE (status = 'active'::text)");
+}
+
+async function grantRowsJson(accountId: string): Promise<unknown[]> {
+  const result = await sql`
+    SELECT row_to_json(g)::text AS row_json
+    FROM (
+      SELECT *
+      FROM shadow_enrollment_grant
+      WHERE account_id = ${accountId}
+      ORDER BY grant_id
+    ) g
+  `.execute(getDb());
+  return result.rows;
+}
+
 async function makeRegisteredHost(accountId: string, hostDeviceId: string): Promise<ShadowIdentity> {
   await upsertDevice({ id: hostDeviceId, userId: accountId, role: 'host', name: 'Mac', platform: 'macos' });
   const host = await generateShadowIdentity(backend, hostDeviceId);
@@ -487,7 +522,7 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
       .execute();
     expect(rows.map((r) => r.status).sort()).toEqual(['active', 'revoked']);
     expect(rows).toHaveLength(2);
-    await expect(sql`select 1 from pg_indexes where indexname = 'shadow_enrollment_grant_controller_idx'`.execute(getDb())).resolves.toMatchObject({ rows: [] });
+    await expectCanonicalGrantIndex();
     await expect(getDb().insertInto('shadow_enrollment_grant').values({
       account_id: accountId,
       grant_id: 'grant_0009_active_conflict',
@@ -510,7 +545,7 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
       approved_capabilities: JSON.stringify(['account.read']),
       created_at: new Date(),
       updated_at: new Date(),
-    }).execute()).rejects.toMatchObject({ code: '23505', constraint: 'shadow_enrollment_active_grant_controller_idx' });
+    }).execute()).rejects.toMatchObject({ code: '23505', constraint: 'shadow_enrollment_grant_controller_idx' });
   });
 
   it('0009 fails closed on impossible duplicate active grants without mutating state or schema', async () => {
@@ -584,8 +619,106 @@ describe.skipIf(!HAS_DB)('shadow enrollment — migration + host identity + stat
       .execute();
 
     await expect(m0009.up(getDb())).resolves.toBeUndefined();
-    await expect(sql`select 1 from pg_indexes where indexname = 'shadow_enrollment_active_grant_controller_idx'`.execute(getDb())).resolves.toMatchObject({ rows: [{ '?column?': 1 }] });
+    await expectCanonicalGrantIndex();
     await m0009.up(getDb());
+    await expectCanonicalGrantIndex();
+  });
+
+  it('full startup normalizes the production transitional grant index before rerunning 0003', async () => {
+    await resetTo0008Db();
+    const accountId = 'acct-0009-transitional-restart';
+    const host = await makeRegisteredHost(accountId, 'host-0009-transitional-restart');
+    const first = await fullEnroll(accountId, host, 'ctrl-0009-transitional-restart', 'es_0009_transitional_first');
+
+    await m0009.up(getDb());
+    const rev = await signDeviceRevocation(backend, host, {
+      family: 'device-revocation',
+      v: 1,
+      fence: first.fence,
+      controllerDeviceId: first.controller.deviceId,
+      revokedAt: Date.now(),
+      keyRotationId: 'kr_0009_transitional_first',
+    });
+    await revokeEnrolledController({
+      accountId,
+      hostDeviceId: host.deviceId,
+      scopeId: first.fence.scopeId,
+      controllerDeviceId: first.controller.deviceId,
+      revocation: rev,
+      effectiveSeq: 9,
+      nowMs: Date.now(),
+    });
+    const retry = await buildPendingRequest(accountId, host, first.controller.deviceId, 'es_0009_transitional_retry');
+    await submitEnrollmentRequest({ accountId, sessionId: retry.session.sessionId, request: retry.request, presentedSecret: retry.presentedSecret, idempotencyKey: `idem_${retry.request.nonce}`, nowMs: retry.now });
+    await approvePendingWithFence(accountId, host, retry, first.fence);
+
+    await sql`ALTER INDEX shadow_enrollment_grant_controller_idx RENAME TO shadow_enrollment_active_grant_controller_idx`.execute(getDb());
+    const beforeRows = await grantRowsJson(accountId);
+    const beforeRevocations = await sql`
+      SELECT row_to_json(r)::text AS row_json
+      FROM (
+        SELECT *
+        FROM shadow_revocation_record
+        WHERE account_id = ${accountId}
+        ORDER BY key_rotation_id
+      ) r
+    `.execute(getDb());
+
+    await expect(runMigrations()).resolves.toBeUndefined();
+    await expectCanonicalGrantIndex();
+    await expect(runMigrations()).resolves.toBeUndefined();
+    await expect(runMigrations()).resolves.toBeUndefined();
+    await expectCanonicalGrantIndex();
+    expect(await grantRowsJson(accountId)).toEqual(beforeRows);
+    await expect(sql`
+      SELECT row_to_json(r)::text AS row_json
+      FROM (
+        SELECT *
+        FROM shadow_revocation_record
+        WHERE account_id = ${accountId}
+        ORDER BY key_rotation_id
+      ) r
+    `.execute(getDb())).resolves.toEqual(beforeRevocations);
+  });
+
+  it('full startup fails closed on mismatched transitional grant index definitions without row mutation', async () => {
+    await resetTo0008Db();
+    const accountId = 'acct-0009-transitional-mismatch';
+    const host = await makeRegisteredHost(accountId, 'host-0009-transitional-mismatch');
+    await fullEnroll(accountId, host, 'ctrl-0009-transitional-mismatch', 'es_0009_transitional_mismatch');
+    await sql`DROP INDEX shadow_enrollment_grant_controller_idx`.execute(getDb());
+    await sql`
+      CREATE UNIQUE INDEX shadow_enrollment_active_grant_controller_idx
+      ON shadow_enrollment_grant (account_id, scope_id, controller_device_id)
+      WHERE status = 'revoked'
+    `.execute(getDb());
+    const beforeRows = await grantRowsJson(accountId);
+    const beforeIndexes = await grantIndexDefinitions();
+
+    await expect(runMigrations()).rejects.toThrow('migration compatibility blocked: unexpected transitional shadow enrollment grant index definition');
+
+    expect(await grantRowsJson(accountId)).toEqual(beforeRows);
+    expect(await grantIndexDefinitions()).toEqual(beforeIndexes);
+  });
+
+  it('0009 fails closed on mismatched historical grant index definitions without row mutation', async () => {
+    await resetTo0008Db();
+    const accountId = 'acct-0009-historical-mismatch';
+    const host = await makeRegisteredHost(accountId, 'host-0009-historical-mismatch');
+    await fullEnroll(accountId, host, 'ctrl-0009-historical-mismatch', 'es_0009_historical_mismatch');
+    await sql`DROP INDEX shadow_enrollment_grant_controller_idx`.execute(getDb());
+    await sql`
+      CREATE UNIQUE INDEX shadow_enrollment_grant_controller_idx
+      ON shadow_enrollment_grant (account_id, controller_device_id, scope_id)
+      WHERE status = 'active'
+    `.execute(getDb());
+    const beforeRows = await grantRowsJson(accountId);
+    const beforeIndexes = await grantIndexDefinitions();
+
+    await expect(m0009.up(getDb())).rejects.toThrow('migration 0009 blocked: unexpected shadow_enrollment_grant_controller_idx definition');
+
+    expect(await grantRowsJson(accountId)).toEqual(beforeRows);
+    expect(await grantIndexDefinitions()).toEqual(beforeIndexes);
   });
 
   it('approves re-enrollment after revoke while keeping old grant history and transactional key reactivation', async () => {

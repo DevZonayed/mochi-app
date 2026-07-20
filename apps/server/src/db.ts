@@ -2,7 +2,7 @@
    tables (user/session/account/verification) via its CLI migration; we own the
    `device` table via the Kysely migrator below. */
 import { Pool } from 'pg';
-import { Kysely, PostgresDialect, type ColumnType, type JSONColumnType } from 'kysely';
+import { Kysely, PostgresDialect, sql, type ColumnType, type JSONColumnType } from 'kysely';
 import { migrations } from './migrations/index.js';
 
 export interface DeviceTable {
@@ -316,17 +316,76 @@ const url =
 let pool: Pool | null = null;
 let db: Kysely<DB> | null = null;
 
+const HISTORICAL_GRANT_INDEX = 'shadow_enrollment_grant_controller_idx';
+const TRANSITIONAL_GRANT_INDEX = 'shadow_enrollment_active_grant_controller_idx';
+const ACTIVE_GRANT_INDEX_PREDICATE = "(status = 'active'::text)";
+const GRANT_INDEX_COLUMNS = ['account_id', 'scope_id', 'controller_device_id'];
+
+type GrantIndexShape = {
+  indexname: string;
+  is_unique: boolean;
+  columns: string[];
+  predicate: string | null;
+};
+
 export function getPool(): Pool {
   return (pool ??= new Pool({ connectionString: url }));
 }
 export function getDb(): Kysely<DB> {
   return (db ??= new Kysely<DB>({ dialect: new PostgresDialect({ pool: getPool() }) }));
 }
+
+async function getGrantIndexShape(db: Kysely<DB>, indexName: string): Promise<GrantIndexShape | null> {
+  const result = await sql<GrantIndexShape>`
+    SELECT
+      c.relname AS indexname,
+      i.indisunique AS is_unique,
+      array_agg(a.attname ORDER BY keys.ordinality)::text[] AS columns,
+      pg_get_expr(i.indpred, i.indrelid) AS predicate
+    FROM pg_class c
+    JOIN pg_index i ON i.indexrelid = c.oid
+    JOIN pg_class t ON t.oid = i.indrelid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    JOIN unnest(i.indkey) WITH ORDINALITY AS keys(attnum, ordinality) ON true
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = keys.attnum
+    WHERE n.nspname = current_schema()
+      AND t.relname = 'shadow_enrollment_grant'
+      AND c.relname = ${indexName}
+    GROUP BY c.relname, i.indisunique, i.indpred, i.indrelid
+  `.execute(db);
+  const row = result.rows[0];
+  return row ? { ...row, columns: row.columns ?? [] } : null;
+}
+
+function isExactActiveGrantIndex(shape: GrantIndexShape | null): boolean {
+  return !!shape
+    && shape.is_unique
+    && shape.predicate === ACTIVE_GRANT_INDEX_PREDICATE
+    && shape.columns.length === GRANT_INDEX_COLUMNS.length
+    && GRANT_INDEX_COLUMNS.every((col, idx) => shape.columns[idx] === col);
+}
+
+async function normalizeTransitionalGrantIndexBefore0003(db: Kysely<DB>): Promise<void> {
+  await db.transaction().execute(async (trx) => {
+    const historical = await getGrantIndexShape(trx, HISTORICAL_GRANT_INDEX);
+    const transitional = await getGrantIndexShape(trx, TRANSITIONAL_GRANT_INDEX);
+    if (!transitional) return;
+    if (historical) {
+      throw new Error('migration compatibility blocked: ambiguous shadow enrollment grant indexes');
+    }
+    if (!isExactActiveGrantIndex(transitional)) {
+      throw new Error('migration compatibility blocked: unexpected transitional shadow enrollment grant index definition');
+    }
+    await sql`ALTER INDEX ${sql.id(TRANSITIONAL_GRANT_INDEX)} RENAME TO ${sql.id(HISTORICAL_GRANT_INDEX)}`.execute(trx);
+  });
+}
+
 /** Apply migrations in name order. Each migration's `up` is idempotent
     (`createTable ... ifNotExists`), so this is safe to run on every boot —
     no separate migration-tracking table needed for our small schema. */
 export async function runMigrations(): Promise<void> {
   const db = getDb();
+  await normalizeTransitionalGrantIndexBefore0003(db);
   for (const name of Object.keys(migrations).sort()) {
     await migrations[name].up(db);
   }
