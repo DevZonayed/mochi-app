@@ -19,6 +19,7 @@ export const SHADOW_HOST_METHODS = [
   'shadowHostCancel',
   'shadowHostListControllers',
   'shadowHostRevoke',
+  'shadowHostRecoverExpiredController',
   // Phase 3D1 view-only screen share — read-only status + local Stop. NOT enrollment
   // methods; they read/act on the in-process screen-share registry (metadata only).
   'shadowHostScreenStatus',
@@ -117,12 +118,19 @@ export function createShadowHostDispatch(deps: ShadowHostDispatchDeps) {
         return { ok: true };
       case 'shadowHostListControllers':
         await deps.ensureStarted(rt);
-        return { controllers: await rt.listControllers() };
+        if (rt.status().state === 'running') return { controllers: await rt.listControllers() };
+        if (rt.status().recoveryAvailable) return { controllers: await rt.listControllersForRecovery() };
+        return { controllers: [] };
       case 'shadowHostRevoke': {
         await deps.ensureStarted(rt);
         const result = await rt.revoke({ controllerDeviceId: String(params.controllerDeviceId ?? '') });
         // Phase 3B0 NOTE-2: propagate the revocation + scope-key rotation to the live
         // data plane immediately (best-effort; never fails the revoke response).
+        try { await deps.afterRevoke?.(rt); } catch { /* live-plane refresh is best-effort */ }
+        return result;
+      }
+      case 'shadowHostRecoverExpiredController': {
+        const result = await rt.recoverExpiredLeaseController({ controllerDeviceId: String(params.controllerDeviceId ?? '') });
         try { await deps.afterRevoke?.(rt); } catch { /* live-plane refresh is best-effort */ }
         return result;
       }

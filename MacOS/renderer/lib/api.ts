@@ -1856,6 +1856,9 @@ export const api = {
   shadowHostRevoke: (controllerDeviceId: string) =>
     call<RevokeReceiptWire>('shadowHostRevoke', { controllerDeviceId }, () =>
       Promise.reject(new ApiError(501, 'Controller management is only available in the desktop app'))),
+  shadowHostRecoverExpiredController: (controllerDeviceId: string) =>
+    call<RevokeReceiptWire & { leaseReacquired: boolean }>('shadowHostRecoverExpiredController', { controllerDeviceId }, () =>
+      Promise.reject(new ApiError(501, 'Controller recovery is only available in the desktop app'))),
   /** Phase 3D1 view-only screen share — read the current viewer status (metadata
    * only) and stop sharing locally. Never exposes frames/keys. */
   shadowHostScreenStatus: () =>

@@ -66,6 +66,7 @@ export interface ShadowHostStatusWire {
   activeSessions: number;
   controllers: number;
   lastError?: string;
+  recoveryAvailable?: boolean;
 }
 
 export interface PendingRequestWire {
@@ -133,6 +134,7 @@ export interface ControllerStatusView {
   vaultAvailable: boolean;
   activeRequests: number;
   enrolledControllers: number;
+  recoveryAvailable: boolean;
 }
 
 export interface PendingRequestView {
@@ -189,6 +191,7 @@ export function statusView(w: ShadowHostStatusWire): ControllerStatusView {
     vaultAvailable: w.vaultAvailable,
     activeRequests: Number.isFinite(w.activeSessions) ? w.activeSessions : 0,
     enrolledControllers: Number.isFinite(w.controllers) ? w.controllers : 0,
+    recoveryAvailable: w.recoveryAvailable === true,
   };
 }
 

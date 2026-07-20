@@ -10,14 +10,16 @@ import type { ShadowHostEnrollmentRuntime } from './shadow-enrollment-host.ts';
 function fakeRuntime() {
   const calls: string[] = [];
   const rt = {
-    status: () => ({ state: 'running', hostDeviceId: 'h', fingerprint: 'fp', vaultAvailable: true, registered: true, epoch: 1, activeSessions: 0, controllers: 0 }),
+    status: vi.fn(() => ({ state: 'running', hostDeviceId: 'h', fingerprint: 'fp', vaultAvailable: true, registered: true, epoch: 1, activeSessions: 0, controllers: 0 })),
     createEnrollmentSession: vi.fn(async () => { calls.push('create'); return { sessionId: 'es', qr: 'maestro-shadow://enroll?sec=SECRET', expiresAt: 1, hostFingerprint: 'fp', hostAuthString: 'a-b-c' }; }),
     listPendingRequests: vi.fn(async () => { calls.push('listPending'); return [{ sessionId: 'es', controllerDeviceId: 'c', signingPublicKey: 'p', agreementPublicKey: 'a', nonce: 'n', requestedAt: 1, transcriptHash: 't', authString: 'x-y', sessionExpiresAt: 2 }]; }),
     approve: vi.fn(async () => { calls.push('approve'); return { grantId: 'g', controllerDeviceId: 'c', keyId: 'wk', expiresAt: 2 }; }),
     deny: vi.fn(async () => { calls.push('deny'); }),
     cancel: vi.fn(async () => { calls.push('cancel'); }),
     listControllers: vi.fn(async () => { calls.push('listControllers'); return [{ controllerDeviceId: 'c', grantId: 'g', keyId: 'wk', status: 'active', expiresAt: 2 }]; }),
+    listControllersForRecovery: vi.fn(async () => { calls.push('listControllersForRecovery'); return [{ controllerDeviceId: 'c', grantId: 'g', keyId: 'wk', status: 'active', expiresAt: 2 }]; }),
     revoke: vi.fn(async () => { calls.push('revoke'); return { keyRotationId: 'kr_x', alreadyRevoked: false }; }),
+    recoverExpiredLeaseController: vi.fn(async () => { calls.push('recoverExpiredLeaseController'); return { keyRotationId: 'kr_recovery', alreadyRevoked: false, leaseReacquired: true }; }),
   } as unknown as ShadowHostEnrollmentRuntime;
   return { rt, calls };
 }
@@ -40,12 +42,14 @@ describe('shadow host dispatch allowlist', () => {
     expect([...SHADOW_HOST_METHODS]).toEqual([
       'shadowHostStatus', 'shadowHostCreateSession', 'shadowHostListPending', 'shadowHostApprove',
       'shadowHostDeny', 'shadowHostCancel', 'shadowHostListControllers', 'shadowHostRevoke',
+      'shadowHostRecoverExpiredController',
       // Phase 3D1 view-only screen share — read-only status + local Stop.
       'shadowHostScreenStatus', 'shadowHostScreenStop',
     ]);
     expect(isShadowHostMethod('shadowHostApprove')).toBe(true);
     expect(isShadowHostMethod('shadowHostNuke')).toBe(false);
     expect(isShadowHostMethod('shadowHostScreenStatus')).toBe(true);
+    expect(isShadowHostMethod('shadowHostRecoverExpiredController')).toBe(true);
   });
 
   it('serves screen-share status/stop without a session (registry-backed, metadata only)', async () => {
@@ -118,5 +122,29 @@ describe('shadow host dispatch allowlist', () => {
     expect(calls).toContain('cancel');
     expect(calls).toContain('listControllers');
     expect(calls).toContain('revoke');
+  });
+
+  it('does not ensure-start for the explicit expired-lease recovery revoke', async () => {
+    const { dispatch, calls, ensureStarted } = makeDispatch();
+    const rev = await dispatch('shadowHostRecoverExpiredController', { controllerDeviceId: 'c' }) as { keyRotationId: string; leaseReacquired: boolean };
+    expect(rev).toMatchObject({ keyRotationId: 'kr_recovery', leaseReacquired: true });
+    expect(ensureStarted).not.toHaveBeenCalled();
+    expect(calls).toContain('recoverExpiredLeaseController');
+  });
+
+  it('lists controllers through the recovery reader when start fails into recovery state', async () => {
+    const { rt, calls } = fakeRuntime();
+    const ensureStarted = vi.fn(async () => {});
+    (rt.status as unknown as ReturnType<typeof vi.fn>).mockReturnValue?.({ state: 'error', hostDeviceId: 'h', fingerprint: 'fp', vaultAvailable: true, registered: true, epoch: 1, activeSessions: 0, controllers: 1, recoveryAvailable: true });
+    const dispatch = createShadowHostDispatch({
+      signedIn: () => true,
+      hostDeviceId: () => 'deck-1',
+      vaultAvailable: () => true,
+      getRuntime: async () => rt,
+      ensureStarted,
+    });
+    await dispatch('shadowHostListControllers', {});
+    expect(calls).toContain('listControllersForRecovery');
+    expect(calls).not.toContain('listControllers');
   });
 });

@@ -6,7 +6,7 @@
  * recovery + bounds, and — end to end through the real runtime — that no private
  * seed or scope key is ever written in plaintext.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, test } from 'vitest';
 import { mkdtempSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -176,7 +176,7 @@ describe('expired persisted shadow host lease recovery', () => {
     return seeded;
   }
 
-  async function startWithSeededExpiry(expiry: number | null, controllers: HostEnrollmentRecord['controllers'] = []): Promise<{ rt: ShadowHostEnrollmentRuntime; leaseBodies: Array<Record<string, unknown>>; recordFile: string; nowMs: number }> {
+  async function startWithSeededExpiry(expiry: number | null, controllers: HostEnrollmentRecord['controllers'] = []): Promise<{ rt: ShadowHostEnrollmentRuntime; leaseBodies: Array<Record<string, unknown>>; recordFile: string; nowMs: number; vault: SafeStorageVault }> {
     const nowMs = 1_800_000_000_000;
     const vault = new SafeStorageVault(mockSafeStorage());
     const recordFile = tmpFile('runtime-expiry.json');
@@ -196,7 +196,7 @@ describe('expired persisted shadow host lease recovery', () => {
       }
       return { status: 404, ok: false, text: async () => '{"error":"no"}' };
     };
-    return { rt: runtimeWith(recordFile, vault, fetch, () => nowMs), leaseBodies, recordFile, nowMs };
+    return { rt: runtimeWith(recordFile, vault, fetch, () => nowMs), leaseBodies, recordFile, nowMs, vault };
   }
 
   it('RED: expired registered zero-controller restart requests a fresh lease without stale fence or lease id', async () => {
@@ -279,6 +279,164 @@ describe('expired persisted shadow host lease recovery', () => {
     expect(leaseBodies).toHaveLength(0);
     expect(rt.status()).toMatchObject({ state: 'error' });
     expect(String(rt.status().lastError ?? '')).not.toMatch(/lease_old|grant_live|key_live|ctrl_live/);
+  });
+
+  it('recovers an expired active-controller deadlock by signed local revoke and fresh lease reacquire', async () => {
+    const controller = { controllerDeviceId: 'ctrl_failed', grantId: 'grant_failed', keyId: 'key_failed', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
+    const { rt, leaseBodies, recordFile, nowMs } = await startWithSeededExpiry(1_800_000_000_000 - 1, [controller]);
+    const revokeBodies: Array<Record<string, unknown>> = [];
+    const controllerLists = [{ controllerDeviceId: 'ctrl_failed', grantId: 'grant_failed', keyId: 'key_failed', status: 'active', expiresAt: nowMs + 600_000 }];
+    const freshFence: Fence = { ...oldFence, epoch: 8, leaseId: 'lease_recovered' };
+    (rt as unknown as { opts: { transport: { fetch: ShadowFetch } } }).opts.transport.fetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/enroll/controllers') return { status: 200, ok: true, text: async () => JSON.stringify({ controllers: controllerLists }) };
+      if (path === '/api/shadow/enroll/revoke') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        revokeBodies.push(body);
+        return { status: 200, ok: true, text: async () => JSON.stringify({ ok: true, keyRotationId: (body.revocation as { keyRotationId: string }).keyRotationId, alreadyRevoked: false }) };
+      }
+      if (path === '/api/shadow/lease') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+        leaseBodies.push(body);
+        return { status: 200, ok: true, text: async () => JSON.stringify({ fence: freshFence, expiresAt: nowMs + 240_000 }) };
+      }
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+
+    await expect(rt.start()).rejects.toMatchObject({ statusCode: 409 });
+    expect(rt.status()).toMatchObject({ state: 'error', recoveryAvailable: true, controllers: 1 });
+    await expect(rt.listControllersForRecovery()).resolves.toEqual(controllerLists);
+    await expect(rt.recoverExpiredLeaseController({ controllerDeviceId: 'ctrl_failed' })).resolves.toMatchObject({
+      alreadyRevoked: false,
+      leaseReacquired: true,
+    });
+    expect(revokeBodies).toHaveLength(1);
+    expect(revokeBodies[0]).toMatchObject({ scopeId: oldFence.scopeId, controllerDeviceId: 'ctrl_failed', effectiveSeq: 1, remainingRotations: [] });
+    expect(leaseBodies.at(-1)).toEqual({ scopeId: `account:${accountId}` });
+    const saved = JSON.parse(readFileSync(recordFile, 'utf8')) as HostEnrollmentRecord;
+    expect(saved.controllers[0]).toMatchObject({ controllerDeviceId: 'ctrl_failed', status: 'revoked' });
+    expect(saved.fence).toEqual(freshFence);
+    expect(saved.leaseExpiresAt).toBe(nowMs + 240_000);
+  });
+
+  test.each([
+    'after-recovery-intent-before-server',
+    'after-recovery-server-before-local',
+    'after-recovery-local-before-lease',
+    'after-recovery-lease-before-persist',
+  ] as const)('expired recovery resumes byte-identically after crash at %s', async (crashPoint) => {
+    const controller = { controllerDeviceId: 'ctrl_failed', grantId: 'grant_failed', keyId: 'key_failed', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
+    const { rt, recordFile, nowMs, vault } = await startWithSeededExpiry(1_800_000_000_000 - 1, [controller]);
+    const freshFence: Fence = { ...oldFence, epoch: 8, leaseId: `lease_recovered_${crashPoint}` };
+    let acceptedRevokeBody = '';
+    let revokeMutations = 0;
+    let leaseCalls = 0;
+    const fetch: ShadowFetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/enroll/revoke') {
+        const body = String(init?.body ?? '{}');
+        if (!acceptedRevokeBody) {
+          acceptedRevokeBody = body;
+          revokeMutations += 1;
+          return { status: 200, ok: true, text: async () => JSON.stringify({ ok: true, keyRotationId: (JSON.parse(body).revocation).keyRotationId, alreadyRevoked: false }) };
+        }
+        if (body !== acceptedRevokeBody) return { status: 409, ok: false, text: async () => '{"error":"conflicting revocation"}' };
+        return { status: 200, ok: true, text: async () => JSON.stringify({ ok: true, keyRotationId: (JSON.parse(body).revocation).keyRotationId, alreadyRevoked: true }) };
+      }
+      if (path === '/api/shadow/lease') {
+        leaseCalls += 1;
+        return { status: 200, ok: true, text: async () => JSON.stringify({ fence: freshFence, expiresAt: nowMs + 240_000 }) };
+      }
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+    (rt as unknown as { opts: { transport: { fetch: ShadowFetch } } }).opts.transport.fetch = fetch;
+
+    await expect(rt.start()).rejects.toMatchObject({ statusCode: 409 });
+    rt.debugSetExpiredLeaseRecoveryCrashPointForTest(crashPoint);
+    await expect(rt.recoverExpiredLeaseController({ controllerDeviceId: 'ctrl_failed' })).rejects.toThrow(new RegExp(`crash-${crashPoint}`));
+
+    const midRaw = readFileSync(recordFile, 'utf8');
+    const mid = JSON.parse(midRaw) as HostEnrollmentRecord;
+    expect(mid.pendingExpiredLeaseRecovery).toBeTruthy();
+    expect(midRaw).toContain('newScopeKeyCipher');
+    expect(midRaw).not.toContain('newScopeKey":"');
+
+    const expectedRotation = mid.pendingExpiredLeaseRecovery!.keyRotationId;
+    const restarted = runtimeWith(recordFile, vault, fetch, () => nowMs);
+    if (crashPoint === 'after-recovery-lease-before-persist') {
+      await expect(restarted.start()).resolves.toMatchObject({ state: 'running', controllers: 0, epoch: 8 });
+    } else {
+      await expect(restarted.start()).rejects.toMatchObject({ statusCode: 409 });
+      await expect(restarted.recoverExpiredLeaseController({ controllerDeviceId: 'ctrl_failed' })).resolves.toMatchObject({
+        keyRotationId: expectedRotation,
+        leaseReacquired: true,
+      });
+    }
+    expect(revokeMutations).toBe(1);
+    expect(leaseCalls).toBeGreaterThanOrEqual(crashPoint === 'after-recovery-intent-before-server' || crashPoint === 'after-recovery-server-before-local' ? 1 : 0);
+    const saved = JSON.parse(readFileSync(recordFile, 'utf8')) as HostEnrollmentRecord;
+    expect(saved.pendingExpiredLeaseRecovery).toBeUndefined();
+    expect(saved.controllers[0]).toMatchObject({ controllerDeviceId: 'ctrl_failed', status: 'revoked' });
+    expect(saved.revocationSeq).toBe(1);
+    expect(saved.fence).toEqual(freshFence);
+    expect(saved.leaseExpiresAt).toBe(nowMs + 240_000);
+  });
+
+  it('keeps prepared expired recovery durable when the server is unavailable', async () => {
+    const controller = { controllerDeviceId: 'ctrl_failed', grantId: 'grant_failed', keyId: 'key_failed', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
+    const { rt, recordFile } = await startWithSeededExpiry(1_800_000_000_000 - 1, [controller]);
+    (rt as unknown as { opts: { transport: { fetch: ShadowFetch } } }).opts.transport.fetch = async (url) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/enroll/revoke') return { status: 503, ok: false, text: async () => '{"error":"relay unavailable"}' };
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+    await expect(rt.start()).rejects.toMatchObject({ statusCode: 409 });
+    await expect(rt.recoverExpiredLeaseController({ controllerDeviceId: 'ctrl_failed' })).rejects.toMatchObject({ statusCode: 503 });
+    const saved = JSON.parse(readFileSync(recordFile, 'utf8')) as HostEnrollmentRecord;
+    expect(saved.pendingExpiredLeaseRecovery).toMatchObject({ phase: 'prepared', controllerDeviceId: 'ctrl_failed', effectiveSeq: 1 });
+    expect(saved.controllers[0]).toMatchObject({ status: 'active' });
+    expect(saved.revocationSeq).toBe(0);
+  });
+
+  it('does not send recovery revoke when prepared-intent persistence fails', async () => {
+    const controller = { controllerDeviceId: 'ctrl_failed', grantId: 'grant_failed', keyId: 'key_failed', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
+    const { recordFile, nowMs, vault } = await startWithSeededExpiry(1_800_000_000_000 - 1, [controller]);
+    let failNextSave = false;
+    const persistence = {
+      load: () => JSON.parse(readFileSync(recordFile, 'utf8')) as HostEnrollmentRecord,
+      save: (record: HostEnrollmentRecord) => {
+        if (failNextSave) throw new Error('persist failed');
+        writeFileSync(recordFile, JSON.stringify(record), { mode: 0o600 });
+      },
+    };
+    let revokeCalls = 0;
+    const fetch: ShadowFetch = async (url) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/enroll/revoke') {
+        revokeCalls += 1;
+        return { status: 200, ok: true, text: async () => '{"ok":true,"keyRotationId":"kr_should_not_leave","alreadyRevoked":false}' };
+      }
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+    const rt = new ShadowHostEnrollmentRuntime({
+      vault,
+      persistence,
+      session: { get: async () => ({ accountId, hostDeviceId, sessionToken: 'tok', relayOrigin }) },
+      transport: { fetch },
+      now: () => nowMs,
+    });
+    await expect(rt.start()).rejects.toMatchObject({ statusCode: 409 });
+    failNextSave = true;
+    await expect(rt.recoverExpiredLeaseController({ controllerDeviceId: 'ctrl_failed' })).rejects.toThrow(/persist failed/);
+    expect(revokeCalls).toBe(0);
+    const saved = JSON.parse(readFileSync(recordFile, 'utf8')) as HostEnrollmentRecord;
+    expect(saved.pendingExpiredLeaseRecovery).toBeUndefined();
+    expect(saved.controllers[0]).toMatchObject({ status: 'active' });
+    expect(saved.revocationSeq).toBe(0);
   });
 
   it('does not report an already-running runtime as running after its lease expires', async () => {

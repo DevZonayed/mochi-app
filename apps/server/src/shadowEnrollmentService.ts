@@ -954,6 +954,26 @@ export async function revokeEnrolledController(input: RevokeControllerInput): Pr
     await trx.updateTable('shadow_registered_key').set({ status: 'revoked', revoked_at: new Date() }).where('account_id', '=', accountId).where('device_id', '=', controllerDeviceId).execute();
     await trx.updateTable('shadow_enrollment_grant').set({ status: 'revoked', revoked_at_ms: m.revokedAt, key_rotation_id: keyRotationId, updated_at: new Date() }).where('account_id', '=', accountId).where('scope_id', '=', scopeId).where('controller_device_id', '=', controllerDeviceId).execute();
 
+    // A revoked controller must not retain any pending/consumed enrollment path.
+    // This is part of the same transaction as the grant revoke + scope rotation,
+    // so retries observe a single server truth: revoked controller, pending0.
+    await sql`
+      WITH cancelled AS (
+        UPDATE shadow_enrollment_request
+        SET status = 'denied', updated_at = now()
+        WHERE account_id = ${accountId}
+          AND controller_device_id = ${controllerDeviceId}
+          AND status = 'pending'
+        RETURNING account_id, session_id
+      )
+      UPDATE shadow_enrollment_session s
+      SET status = 'cancelled', updated_at = now()
+      FROM cancelled c
+      WHERE s.account_id = c.account_id
+        AND s.session_id = c.session_id
+        AND s.status IN ('pending', 'consumed')
+    `.execute(trx);
+
     // Invalidate outstanding controller state/capabilities/transport.
     await trx.deleteFrom('shadow_cursor').where('account_id', '=', accountId).where('scope_id', '=', scopeId).where('controller_device_id', '=', controllerDeviceId).execute();
     await trx.deleteFrom('shadow_command').where('account_id', '=', accountId).where('scope_id', '=', scopeId).where('controller_device_id', '=', controllerDeviceId).execute();

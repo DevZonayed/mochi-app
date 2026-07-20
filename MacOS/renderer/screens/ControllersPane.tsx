@@ -261,6 +261,7 @@ export default function ControllersPane() {
   const [receipt, setReceipt] = React.useState<ApproveReceiptView | null>(null);
   const [actionError, setActionError] = React.useState<string | null>(null);
   const online = status?.online ?? false;
+  const recoveryAvailable = status?.recoveryAvailable === true;
   const enroll = useEnrollmentSession(setActionError);
 
   const doApprove = async (req: PendingRequestView, caps: ShadowCapability[]) => {
@@ -278,7 +279,9 @@ export default function ControllersPane() {
   };
   const doRevoke = async (ctrl: ControllerView) => {
     setActionError(null);
-    const res = await runMutation(ctrl.controllerDeviceId, () => api.shadowHostRevoke(ctrl.controllerDeviceId));
+    const res = await runMutation(ctrl.controllerDeviceId, () => (
+      recoveryAvailable ? api.shadowHostRecoverExpiredController(ctrl.controllerDeviceId) : api.shadowHostRevoke(ctrl.controllerDeviceId)
+    ));
     if ('error' in res && res.error) { setActionError(res.error); return; }
     setRevoking(null);
   };
@@ -292,9 +295,9 @@ export default function ControllersPane() {
         </div>
         <button
           onClick={() => void enroll.create()}
-          disabled={!online || enroll.busy}
+          disabled={!online || recoveryAvailable || enroll.busy}
           aria-label="Enroll a device — show the enrollment code"
-          style={{ ...primaryBtn, minHeight: 36, opacity: (!online || enroll.busy) ? 0.5 : 1 }}
+          style={{ ...primaryBtn, minHeight: 36, opacity: (!online || recoveryAvailable || enroll.busy) ? 0.5 : 1 }}
         >{enroll.busy && !enroll.session ? 'Generating…' : 'Enroll a device'}</button>
         <button onClick={() => void reload()} aria-label="Refresh controllers" className="ghost-btn" style={{ ...ghostBtn, minHeight: 36 }}>Refresh</button>
       </div>
@@ -334,8 +337,14 @@ export default function ControllersPane() {
               <Row last>
                 {devBadge('var(--orange)', 'cpu')}
                 <span style={{ flex: 1 }}>
-                  <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>Host isn’t running</span>
-                  <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>Approvals and revocation are paused until the host is online.</span>
+                  <span style={{ display: 'block', font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)' }}>
+                    {recoveryAvailable ? 'Controller recovery required' : 'Host isn’t running'}
+                  </span>
+                  <span style={{ display: 'block', font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
+                    {recoveryAvailable
+                      ? 'Revoke the failed active controller from this Mac to reacquire the host lease. New enrollment is paused until recovery completes.'
+                      : 'Approvals and revocation are paused until the host is online.'}
+                  </span>
                 </span>
               </Row>
             </GroupedList>
@@ -393,7 +402,7 @@ export default function ControllersPane() {
             {controllers.length === 0 ? (
               <Row last><span style={{ flex: 1, font: '400 var(--fs-body)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>No enrolled controllers.</span></Row>
             ) : controllers.map((ctrl, i) => {
-              const revocable = ctrl.status === 'active' && online;
+              const revocable = ctrl.status === 'active' && (online || recoveryAvailable);
               return (
                 <Row key={ctrl.controllerDeviceId} last={i === controllers.length - 1}>
                   {devBadge(deviceTint(ctrl.controllerDeviceId), 'smartphone')}
@@ -438,7 +447,9 @@ export default function ControllersPane() {
       )}
       {revoking && (
         <ConfirmDialog title="Revoke this controller?" confirmLabel="Revoke access" busy={!!busy[revoking.controllerDeviceId]}
-          body={<>This immediately removes all access for <b style={{ color: 'var(--ink)' }}>{shortDevice(revoking.controllerDeviceId)}</b> and rotates the host’s keys. The device must enroll again to reconnect.</>}
+          body={recoveryAvailable
+            ? <>This uses the local host identity to revoke <b style={{ color: 'var(--ink)' }}>{shortDevice(revoking.controllerDeviceId)}</b>, rotate the host keys, and reacquire the host lease. The controller data plane stays stopped during recovery.</>
+            : <>This immediately removes all access for <b style={{ color: 'var(--ink)' }}>{shortDevice(revoking.controllerDeviceId)}</b> and rotates the host’s keys. The device must enroll again to reconnect.</>}
           onCancel={() => setRevoking(null)} onConfirm={() => void doRevoke(revoking)} />
       )}
     </div>

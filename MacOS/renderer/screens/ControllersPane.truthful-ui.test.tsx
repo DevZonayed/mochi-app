@@ -9,6 +9,7 @@ const apiMock = vi.hoisted(() => ({
   shadowHostApprove: vi.fn(),
   shadowHostDeny: vi.fn(),
   shadowHostRevoke: vi.fn(),
+  shadowHostRecoverExpiredController: vi.fn(),
 }));
 
 vi.mock('../lib/api', async () => {
@@ -47,6 +48,7 @@ describe('ControllersPane truthful rendered behavior', () => {
     apiMock.shadowHostApprove.mockResolvedValue({ grantId: GRANT_CANARY, keyId: 'KEY-CANARY', controllerDeviceId: 'phone-galaxy-1', expiresAt: 1_784_000_600_000, capabilities: ['account.read', 'job.start'] });
     apiMock.shadowHostDeny.mockResolvedValue({ ok: true });
     apiMock.shadowHostRevoke.mockResolvedValue({ keyRotationId: 'ROT-CANARY', alreadyRevoked: false });
+    apiMock.shadowHostRecoverExpiredController.mockResolvedValue({ keyRotationId: 'ROT-RECOVERY', alreadyRevoked: false, leaseReacquired: true });
   });
   afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
@@ -135,6 +137,27 @@ describe('ControllersPane truthful rendered behavior', () => {
     expect(approve.disabled).toBe(true);
     const revoke = screen.getByRole('button', { name: /Revoke ipad-pro-2/ }) as HTMLButtonElement;
     expect(revoke.disabled).toBe(true);
+  });
+
+  test('expired-lease recovery enables only explicit controller recovery revoke', async () => {
+    apiMock.shadowHostStatus.mockResolvedValue(statusWire({
+      state: 'error',
+      recoveryAvailable: true,
+      lastError: 'host lease expired with active controllers; re-enrollment required',
+    }));
+    const Pane = await ControllersPane();
+    render(<Pane />);
+    expect(await screen.findByText(/Controller recovery required/)).toBeTruthy();
+    const enroll = screen.getByRole('button', { name: /Enroll a device/ }) as HTMLButtonElement;
+    expect(enroll.disabled).toBe(true);
+    const revoke = await screen.findByRole('button', { name: /Revoke ipad-pro-2/ }) as HTMLButtonElement;
+    expect(revoke.disabled).toBe(false);
+    fireEvent.click(revoke);
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText(/reacquire the host lease/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Revoke access' }));
+    await waitFor(() => expect(apiMock.shadowHostRecoverExpiredController).toHaveBeenCalledWith('ipad-pro-2'));
+    expect(apiMock.shadowHostRevoke).not.toHaveBeenCalled();
   });
 
   test('load error shows a bounded generic message + retry, never a raw host error', async () => {

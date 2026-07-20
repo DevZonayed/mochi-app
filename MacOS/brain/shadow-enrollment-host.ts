@@ -106,6 +106,12 @@ export interface HostEnrollmentRecord {
    * signed grants — no private/scope plaintext. At most one pending intent per scope.
    */
   pendingLeaseRenewal?: PendingLeaseRenewal;
+  /**
+   * Durable LOCAL-OPERATOR expired-lease recovery journal. Persisted before any
+   * outward revoke so retries replay the byte-identical revocation request and
+   * never mint a second rotation after a server-side success.
+   */
+  pendingExpiredLeaseRecovery?: PendingExpiredLeaseRecovery;
 }
 
 export interface PendingLeaseRenewal {
@@ -123,6 +129,32 @@ export interface PendingLeaseRenewal {
 const LEASE_RENEW_TTL_MS = 4 * 60_000;
 
 export type HostRenewalCrashPoint = 'after-intent-before-server' | 'after-server-before-local' | 'after-local-before-clear';
+export type HostExpiredLeaseRecoveryCrashPoint =
+  | 'after-recovery-intent-before-server'
+  | 'after-recovery-server-before-local'
+  | 'after-recovery-local-before-lease'
+  | 'after-recovery-lease-before-persist';
+
+export interface PendingExpiredLeaseRecovery {
+  recoveryId: string;
+  phase: 'prepared' | 'server-acked' | 'local-committed' | 'lease-acked';
+  accountId: string;
+  hostDeviceId: string;
+  scopeId: string;
+  controllerDeviceId: string;
+  expectedFence: Fence;
+  expectedRevocationSeq: number;
+  effectiveSeq: number;
+  keyRotationId: string;
+  revokedAt: number;
+  revocation: Awaited<ReturnType<typeof signDeviceRevocation>>;
+  remainingRotations: Array<{ controllerDeviceId: string; grantId: string; keyId: string; wrapNonce: string; wrappedScopeKey: string }>;
+  updatedKeyIds: Array<{ controllerDeviceId: string; keyId: string }>;
+  newScopeKeyCipher: string;
+  createdAt: number;
+  leaseFence?: Fence;
+  leaseExpiresAt?: number;
+}
 
 export interface HostControllerRecord {
   controllerDeviceId: string;
@@ -165,6 +197,7 @@ export interface HostRuntimeStatus {
   activeSessions: number;
   controllers: number;
   lastError?: string;
+  recoveryAvailable?: boolean;
 }
 
 export interface PendingEnrollmentRequestView {
@@ -219,6 +252,7 @@ export class ShadowHostEnrollmentRuntime {
   private identity: ShadowIdentity | null = null;
   private scopeKey: Uint8Array | null = null;
   private renewalCrashPoint: HostRenewalCrashPoint | null = null;
+  private expiredLeaseRecoveryCrashPoint: HostExpiredLeaseRecoveryCrashPoint | null = null;
   private readonly now: () => number;
 
   constructor(private readonly opts: ShadowHostRuntimeOptions) {
@@ -237,6 +271,7 @@ export class ShadowHostEnrollmentRuntime {
       activeSessions: this.record.sessions.filter((s) => s.status === 'pending').length,
       controllers: this.record.controllers.filter((c) => c.status === 'active').length,
       lastError: this.lastError,
+      recoveryAvailable: this.isExpiredActiveControllerRecoveryState(),
     };
   }
 
@@ -261,6 +296,9 @@ export class ShadowHostEnrollmentRuntime {
       await this.loadOrCreateIdentity();
       await this.registerHost(s);
       await this.acquireLease(s);
+      if (this.record.pendingExpiredLeaseRecovery?.phase === 'local-committed' && this.hasUsableLease()) {
+        this.record.pendingExpiredLeaseRecovery = undefined;
+      }
       this.persist();
       this.state = 'running';
       return this.status();
@@ -509,6 +547,25 @@ export class ShadowHostEnrollmentRuntime {
   }
 
   /**
+   * LOCAL-OPERATOR recovery: list server-side controllers while the host runtime is
+   * intentionally not "running" because the persisted lease expired with active
+   * controllers. This uses only the durable host identity + account-local signed
+   * request proof; it does not start the controller data plane or weaken the normal
+   * `requireRunning()` paths.
+   */
+  async listControllersForRecovery(): Promise<Array<{ controllerDeviceId: string; grantId: string; keyId: string; status: string; expiresAt: number }>> {
+    const { s, identity } = await this.requireRecoveryHostIdentity();
+    const client = await this.enrolledClient(s);
+    const res = await client.requestEnrolled<{ controllers: Array<{ controllerDeviceId: string; grantId: string; keyId: string; status: string; expiresAt: number }> }>(
+      this.shadowSession(s),
+      this.signer(identity),
+      { method: 'GET', path: '/api/shadow/enroll/controllers' },
+    );
+    if (!res.ok) throw errStatus(res.error ?? 'list controllers failed', res.status);
+    return res.json?.controllers ?? [];
+  }
+
+  /**
    * Atomic revocation + scope-key rotation for the survivors. The new scope key
    * is only committed to the local vault AFTER the relay accepts the signed
    * revocation, so a relay failure leaves the host's key state unchanged
@@ -571,6 +628,162 @@ export class ShadowHostEnrollmentRuntime {
     this.record.revocationSeq = effectiveSeq;
     this.persist();
     return { keyRotationId: res.json.keyRotationId, alreadyRevoked: res.json.alreadyRevoked };
+  }
+
+  /**
+   * Explicit local recovery for the expired-lease + active-controller deadlock.
+   * It is deliberately narrower than `revoke()`:
+   *  - allowed only in the exact expired-active-controller error state;
+   *  - uses the durable host identity to sign the existing server revoke route;
+   *  - never starts or trusts the controller data plane;
+   *  - commits local revoke/rotation only after server success;
+   *  - then reacquires a fresh host lease so the Mac can become discoverable again.
+   */
+  async recoverExpiredLeaseController(input: { controllerDeviceId: string }): Promise<{ keyRotationId: string; alreadyRevoked: boolean; leaseReacquired: boolean }> {
+    if (!this.isExpiredActiveControllerRecoveryState() && !this.record.pendingExpiredLeaseRecovery) throw errStatus('controller recovery unavailable', 409);
+    const { s, identity } = await this.requireRecoveryHostIdentity();
+    let intent = this.record.pendingExpiredLeaseRecovery;
+    if (intent) {
+      if (intent.accountId !== s.accountId || intent.hostDeviceId !== s.hostDeviceId || intent.controllerDeviceId !== input.controllerDeviceId) {
+        throw errStatus('conflicting controller recovery pending', 409);
+      }
+    } else {
+      intent = await this.buildExpiredLeaseRecoveryIntent(s, identity, input.controllerDeviceId);
+    }
+
+    const client = await this.enrolledClient(s);
+    let alreadyRevoked = false;
+    if (intent.phase === 'prepared') {
+      const res = await client.requestEnrolled<{ ok: boolean; keyRotationId: string; alreadyRevoked: boolean }>(
+        this.shadowSession(s),
+        this.signer(identity),
+        {
+          method: 'POST',
+          path: '/api/shadow/enroll/revoke',
+          body: {
+            scopeId: intent.scopeId,
+            controllerDeviceId: intent.controllerDeviceId,
+            revocation: intent.revocation,
+            effectiveSeq: intent.effectiveSeq,
+            remainingRotations: intent.remainingRotations,
+          },
+        },
+      );
+      if (!res.ok || !res.json) throw errStatus(res.error ?? 'recovery revoke failed', res.status);
+      alreadyRevoked = !!res.json.alreadyRevoked;
+      if (res.json.keyRotationId !== intent.keyRotationId) throw errStatus('recovery revoke mismatch', 409);
+      await this.crashAtExpiredLeaseRecovery('after-recovery-server-before-local');
+      intent.phase = 'server-acked';
+      this.persist();
+    }
+
+    if (intent.phase === 'server-acked') {
+      this.commitExpiredLeaseRecoveryLocal(intent);
+      await this.crashAtExpiredLeaseRecovery('after-recovery-local-before-lease');
+      intent.phase = 'local-committed';
+      this.persist();
+    }
+
+    if (intent.phase === 'local-committed') {
+      this.state = 'running';
+      this.lastError = undefined;
+      await this.acquireLease(s, { allowExpiredActiveControllers: true });
+      if (!this.record.fence || this.record.leaseExpiresAt == null) throw errStatus('recovery lease failed', 409);
+      intent.phase = 'lease-acked';
+      intent.leaseFence = this.record.fence;
+      intent.leaseExpiresAt = this.record.leaseExpiresAt;
+      await this.crashAtExpiredLeaseRecovery('after-recovery-lease-before-persist');
+      this.persist();
+    }
+
+    if (intent.phase === 'lease-acked') {
+      if (intent.leaseFence) this.record.fence = intent.leaseFence;
+      if (intent.leaseExpiresAt != null) this.record.leaseExpiresAt = intent.leaseExpiresAt;
+      this.record.pendingExpiredLeaseRecovery = undefined;
+      this.state = 'running';
+      this.lastError = undefined;
+      this.persist();
+    }
+    return { keyRotationId: intent.keyRotationId, alreadyRevoked, leaseReacquired: this.hasUsableLease() };
+  }
+
+  private async buildExpiredLeaseRecoveryIntent(
+    s: Awaited<ReturnType<HostSessionProvider['get']>>,
+    identity: ShadowIdentity,
+    controllerDeviceId: string,
+  ): Promise<PendingExpiredLeaseRecovery> {
+    const fence = this.requireFence();
+    const target = this.record.controllers.find((c) => c.controllerDeviceId === controllerDeviceId && c.status === 'active');
+    if (!target) throw errStatus('controller not enrolled', 404);
+    const remaining = this.record.controllers.filter((c) => c.controllerDeviceId !== controllerDeviceId && c.status === 'active');
+
+    const nowMs = this.now();
+    const keyRotationId = 'kr_' + base64urlEncode(backend.randomBytes(12));
+    const effectiveSeq = this.record.revocationSeq + 1;
+    const revocation = await signDeviceRevocation(backend, identity, {
+      family: 'device-revocation', v: 1, fence, controllerDeviceId, revokedAt: nowMs, keyRotationId,
+    });
+
+    const newScopeKey = backend.randomBytes(32);
+    const rotations: Array<{ controllerDeviceId: string; grantId: string; keyId: string; wrapNonce: string; wrappedScopeKey: string }> = [];
+    const updatedKeyIds = new Map<string, string>();
+    for (const c of remaining) {
+      const approval = await approveEnrollment(backend, {
+        host: identity, fence, controllerDeviceId: c.controllerDeviceId,
+        controllerAgreementPublicKey: base64urlDecode(c.agreementPublicKey),
+        transcriptHash: base64urlDecode(c.transcriptHash),
+        sessionId: 'recovery-rotation', nowMs, grantId: c.grantId, scopeKey: newScopeKey,
+        capabilities: c.capabilities,
+      });
+      rotations.push({
+        controllerDeviceId: c.controllerDeviceId, grantId: c.grantId, keyId: approval.grant.keyId,
+        wrapNonce: approval.keyMaterial.wrapNonce, wrappedScopeKey: approval.keyMaterial.wrappedScopeKey,
+      });
+      updatedKeyIds.set(c.controllerDeviceId, approval.grant.keyId);
+    }
+    const newScopeKeyCipher = base64urlEncode(this.opts.vault.encryptString(base64urlEncode(newScopeKey)));
+    const intent: PendingExpiredLeaseRecovery = {
+      recoveryId: `er_${nowMs}_${base64urlEncode(backend.randomBytes(9))}`,
+      phase: 'prepared',
+      accountId: s.accountId,
+      hostDeviceId: s.hostDeviceId,
+      scopeId: fence.scopeId,
+      controllerDeviceId,
+      expectedFence: fence,
+      expectedRevocationSeq: this.record.revocationSeq,
+      effectiveSeq,
+      keyRotationId,
+      revokedAt: nowMs,
+      revocation,
+      remainingRotations: rotations,
+      updatedKeyIds: [...updatedKeyIds].map(([cid, keyId]) => ({ controllerDeviceId: cid, keyId })),
+      newScopeKeyCipher,
+      createdAt: nowMs,
+    };
+    this.record.pendingExpiredLeaseRecovery = intent;
+    this.persist();
+    await this.crashAtExpiredLeaseRecovery('after-recovery-intent-before-server');
+    return intent;
+  }
+
+  private commitExpiredLeaseRecoveryLocal(intent: PendingExpiredLeaseRecovery): void {
+    if (this.record.revocationSeq !== intent.expectedRevocationSeq && this.record.revocationSeq !== intent.effectiveSeq) {
+      throw errStatus('recovery revocation fence mismatch', 409);
+    }
+    if (JSON.stringify(this.record.fence) !== JSON.stringify(intent.expectedFence)) {
+      throw errStatus('recovery fence mismatch', 409);
+    }
+    const target = this.record.controllers.find((c) => c.controllerDeviceId === intent.controllerDeviceId);
+    if (!target) throw errStatus('controller not enrolled', 404);
+    this.setScopeKey(base64urlDecode(this.opts.vault.decryptString(base64urlDecode(intent.newScopeKeyCipher))));
+    target.status = 'revoked';
+    const updatedKeyIds = new Map(intent.updatedKeyIds.map((x) => [x.controllerDeviceId, x.keyId]));
+    for (const c of this.record.controllers) {
+      const nk = updatedKeyIds.get(c.controllerDeviceId);
+      if (nk) c.keyId = nk;
+    }
+    this.record.revocationSeq = intent.effectiveSeq;
+    this.record.pendingLeaseRenewal = undefined;
   }
 
   /**
@@ -692,9 +905,18 @@ export class ShadowHostEnrollmentRuntime {
     if (this.renewalCrashPoint === point) throw new Error(`crash-${point}`);
   }
 
+  private async crashAtExpiredLeaseRecovery(point: HostExpiredLeaseRecoveryCrashPoint): Promise<void> {
+    if (this.expiredLeaseRecoveryCrashPoint === point) throw new Error(`crash-${point}`);
+  }
+
   /** TEST-ONLY: inject a crash at a renewal-processing boundary. */
   debugSetRenewalCrashPointForTest(point: HostRenewalCrashPoint | null): void {
     this.renewalCrashPoint = point;
+  }
+
+  /** TEST-ONLY: inject a crash at an expired-lease recovery boundary. */
+  debugSetExpiredLeaseRecoveryCrashPointForTest(point: HostExpiredLeaseRecoveryCrashPoint | null): void {
+    this.expiredLeaseRecoveryCrashPoint = point;
   }
 
   buildDataService(input: {
@@ -878,12 +1100,12 @@ export class ShadowHostEnrollmentRuntime {
     this.record.registered = true;
   }
 
-  private async acquireLease(s: Awaited<ReturnType<HostSessionProvider['get']>>): Promise<void> {
+  private async acquireLease(s: Awaited<ReturnType<HostSessionProvider['get']>>, options: { allowExpiredActiveControllers?: boolean } = {}): Promise<void> {
     const identity = this.identity!;
     const client = await this.enrolledClient(s);
     const currentFence = this.record.fence;
     const shouldRenewCurrentLease = !!currentFence && this.hasUsableLease();
-    if (currentFence && !shouldRenewCurrentLease && this.activeControllers().length > 0) {
+    if (currentFence && !shouldRenewCurrentLease && this.activeControllers().length > 0 && !options.allowExpiredActiveControllers) {
       throw errStatus('host lease expired with active controllers; re-enrollment required', 409);
     }
     // On restart the same host RENEWS its lease by proving the persisted fence +
@@ -911,6 +1133,26 @@ export class ShadowHostEnrollmentRuntime {
 
   private hasUsableLease(): boolean {
     return !!this.record.fence && typeof this.record.leaseExpiresAt === 'number' && Number.isFinite(this.record.leaseExpiresAt) && this.record.leaseExpiresAt > this.now();
+  }
+
+  private isExpiredActiveControllerRecoveryState(): boolean {
+    if (this.record.pendingExpiredLeaseRecovery) return true;
+    return !!this.record.fence
+      && this.activeControllers().length > 0
+      && !this.hasUsableLease()
+      && this.lastError === 'host lease expired with active controllers; re-enrollment required';
+  }
+
+  private async requireRecoveryHostIdentity(): Promise<{ s: Awaited<ReturnType<HostSessionProvider['get']>>; identity: ShadowIdentity }> {
+    if (!this.isExpiredActiveControllerRecoveryState() && !this.record.pendingExpiredLeaseRecovery) throw errStatus('controller recovery unavailable', 409);
+    if (!this.opts.vault.isEncryptionAvailable()) throw errStatus('secure vault unavailable', 503);
+    const s = await this.opts.session.get();
+    if (this.record.hostDeviceId && this.record.hostDeviceId !== s.hostDeviceId) throw errStatus('host device mismatch', 409);
+    this.record.hostDeviceId = s.hostDeviceId;
+    if (!this.identity) await this.loadOrCreateIdentity();
+    if (!this.identity) throw errStatus('host identity unavailable', 409);
+    if (!this.record.registered) await this.registerHost(s);
+    return { s, identity: this.identity };
   }
 
   private activeControllers(): HostControllerRecord[] {
