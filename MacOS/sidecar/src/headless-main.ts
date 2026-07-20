@@ -47,6 +47,7 @@ import { ScreenRelayHostLink } from '../../brain/shadow-screen-relay-link.js';
 import { nodeShadowCrypto as screenBackend } from '@maestro/realtime/shadowCryptoNode';
 import type { ScreenSourcePolicy, ScreenAuthoritySnapshot } from '@maestro/realtime/shadowScreenStream';
 import { ShadowHostDataService, defineShadowCommandRegistry, type HostCommandExecutor, type ShadowCommandRegistry } from '../../brain/shadow-host-service.js';
+import { ShadowHostDataLifecycle } from './shadow-host-data-lifecycle.js';
 import { buildModelGroups, refreshModelGroups } from '../../brain/models.js';
 import { isRemoteBlocked } from '../../brain/remote-guard.js';
 import type { Asset, Job } from '../../brain/store.js';
@@ -434,8 +435,7 @@ const handleShadowHostCall = createShadowHostDispatch({
 // controller is enrolled. Controller commands execute ONLY through this strict
 // allowlist into the existing brain dispatch (operator gates preserved); their
 // results become command-bound completion state events. No new port.
-let shadowHostData: { accountId: string; svc: ShadowHostDataService; projection: ShadowProductProjection | null } | null = null;
-let shadowHostDataTimer: ReturnType<typeof setInterval> | null = null;
+let shadowHostDataCoordinator: ShadowHostDataLifecycle<ShadowHostDataService> | null = null;
 
 /**
  * A read-only controller command: dispatches a proven READ-ONLY brain method and
@@ -507,33 +507,49 @@ function shadowHostCoreDir(accountId: string): string {
   return path.join(shimApp.getPath('userData'), 'shadow-host-core', safe);
 }
 
-async function getShadowHostDataService(): Promise<ShadowHostDataService | null> {
-  const accountId = await resolveAccountId();
-  const rt = await getShadowHostFor();
-  await ensureShadowHostStarted(rt);
-  if (shadowHostData && shadowHostData.accountId === accountId) {
-    const reason = rt.dataPlaneUnavailableReason();
-    if (!reason) return shadowHostData.svc;
-    await stopShadowHostData();
-  }
-  // Phase 3A2b1 Section B: build the FULL data plane — accepted encrypted host
-  // data/command service + the all-project redacted ShadowProductProjection sharing
-  // ONE ShadowHostCore. The Store singleton is the projection source; a narrow
-  // post-durable-write hook drives incremental projection, plus one startup reconcile.
-  const plane = rt.buildDataPlane({
-    rootDir: shadowHostCoreDir(accountId),
-    transport: { fetch: (url, init) => fetch(url, init as RequestInit) as unknown as Parameters<ShadowHostEnrollmentRuntime['buildDataPlane']>[0]['transport']['fetch'] },
-    commandRegistry: SHADOW_CONTROLLER_COMMAND_REGISTRY,
-    store,
-    log: (m) => warn('shadowProjection', m),
+function getShadowHostDataCoordinator(): ShadowHostDataLifecycle<ShadowHostDataService> {
+  if (shadowHostDataCoordinator) return shadowHostDataCoordinator;
+  shadowHostDataCoordinator = new ShadowHostDataLifecycle<ShadowHostDataService>({
+    renewBeforeMs: SHADOW_LEASE_RENEW_BEFORE_MS,
+    intervalMs: 15_000,
+    getAccountId: () => resolveAccountId(),
+    getRuntime: () => getShadowHostFor(),
+    ensureStarted: (rt) => ensureShadowHostStarted(rt as ShadowHostEnrollmentRuntime),
+    dataPlaneUnavailableReason: (rt) => (rt as ShadowHostEnrollmentRuntime).dataPlaneUnavailableReason(),
+    buildPlane: (rt, accountId) => {
+      // Phase 3A2b1 Section B: build the FULL data plane — accepted encrypted host
+      // data/command service + the all-project redacted ShadowProductProjection sharing
+      // ONE ShadowHostCore. The Store singleton is the projection source; a narrow
+      // post-durable-write hook drives incremental projection, plus one startup reconcile.
+      const plane = (rt as ShadowHostEnrollmentRuntime).buildDataPlane({
+        rootDir: shadowHostCoreDir(accountId),
+        transport: { fetch: (url, init) => fetch(url, init as RequestInit) as unknown as Parameters<ShadowHostEnrollmentRuntime['buildDataPlane']>[0]['transport']['fetch'] },
+        commandRegistry: SHADOW_CONTROLLER_COMMAND_REGISTRY,
+        store,
+        log: (m) => warn('shadowProjection', m),
+      });
+      if (!plane) return null;
+      return { accountId, svc: plane.svc, projection: plane.projection };
+    },
+    bindProjection: (plane) => {
+      const projection = plane.projection as ShadowProductProjection | null;
+      if (!projection) return;
+      store.onDurableChange(projection.onDurableChange);
+      void projection.start().catch((e) => warn('shadowProjection.start', e));
+    },
+    unbindProjection: () => store.onDurableChange(null),
+    onAuthorityChanged: () => screenOwner?.onAuthorityChanged(),
+    onLoopService: async (svc) => {
+      await svc.publishAllPending();
+      await svc.pollAndExecuteCommands();
+    },
+    warn,
   });
-  if (!plane) return null;
-  // Tear down the prior account's plane FIRST (no cross-account listeners/state).
-  if (shadowHostData) { try { shadowHostData.projection?.close(); } catch { /* noop */ } try { shadowHostData.svc.close(); } catch { /* noop */ } }
-  store.onDurableChange(plane.projection.onDurableChange);
-  shadowHostData = { accountId, svc: plane.svc, projection: plane.projection };
-  void plane.projection.start().catch((e) => warn('shadowProjection.start', e));
-  return plane.svc;
+  return shadowHostDataCoordinator;
+}
+
+async function getShadowHostDataService(): Promise<ShadowHostDataService | null> {
+  return getShadowHostDataCoordinator().getService();
 }
 
 async function getShadowHostDataInactiveReason(): Promise<string> {
@@ -546,14 +562,8 @@ async function getShadowHostDataInactiveReason(): Promise<string> {
   }
 }
 
-async function stopShadowHostData(): Promise<void> {
-  if (shadowHostDataTimer) { clearInterval(shadowHostDataTimer); shadowHostDataTimer = null; }
-  if (shadowHostData) {
-    try { store.onDurableChange(null); } catch { /* noop */ }
-    try { shadowHostData.projection?.close(); } catch { /* noop */ }
-    try { shadowHostData.svc.close(); } catch { /* noop */ }
-    shadowHostData = null;
-  }
+async function stopShadowHostData(options: { stopTimer?: boolean } = {}): Promise<void> {
+  await getShadowHostDataCoordinator().stop(options);
 }
 
 /**
@@ -565,13 +575,7 @@ async function stopShadowHostData(): Promise<void> {
  * restart. A missing fence is a no-op.
  */
 function applyLiveHostAuthority(rt: ShadowHostEnrollmentRuntime): void {
-  const plane = shadowHostData;
-  if (!plane) return;
-  const a = rt.liveAuthority();
-  if (!a) return;
-  plane.svc.setAuthority(a.fence, a.leaseExpiresAt, a.revokedControllerDeviceIds, a.scopeKeyId ?? undefined);
-  plane.projection?.setFence(a.fence);
-  void screenOwner?.onAuthorityChanged();
+  getShadowHostDataCoordinator().applyLiveAuthority(rt);
 }
 
 // ── Phase 3D1 (B2): PRODUCTION host screen-stream owner ─────────────────────────
@@ -709,22 +713,7 @@ async function handleScreenCall(method: string, params: Record<string, unknown>)
 /** Renew the host lease before it expires and atomically refresh the data service authority. */
 const SHADOW_LEASE_RENEW_BEFORE_MS = 120_000;
 async function renewShadowHostLease(): Promise<void> {
-  try {
-    const rt = await getShadowHostFor();
-    // Recover any durable pending renewal intent first (crash between the atomic
-    // server commit and local persistence) — replays the same renewalId idempotently.
-    const resumed = await rt.resumePendingRenewal();
-    if (resumed) applyLiveHostAuthority(rt);
-    const authority = rt.liveAuthority();
-    // Host lease continuity is independent of the controller data plane. After the
-    // last controller is revoked the plane is intentionally torn down, but the host
-    // authority must keep renewing so account Mac discovery remains online.
-    const leaseExpiresAt = authority?.leaseExpiresAt ?? 0;
-    if (leaseExpiresAt > 0 && leaseExpiresAt - Date.now() <= SHADOW_LEASE_RENEW_BEFORE_MS) {
-      const renewed = await rt.renewLease();
-      if (renewed) applyLiveHostAuthority(rt);
-    }
-  } catch (e) { warn('shadowHostData.renew', e); }
+  await getShadowHostDataCoordinator().renewLease();
 }
 
 /**
@@ -735,18 +724,11 @@ async function renewShadowHostLease(): Promise<void> {
  * stale poller/service survives with the old authority or key.
  */
 async function onShadowControllerRevoked(rt: ShadowHostEnrollmentRuntime): Promise<void> {
-  if (!shadowHostData) return;
-  applyLiveHostAuthority(rt); // deny the revoked controller on the live authority right now
-  try { store.onDurableChange(null); } catch { /* noop */ }
-  try { shadowHostData.projection?.close(); } catch { /* noop */ }
-  try { shadowHostData.svc.close(); } catch { /* noop */ }
-  shadowHostData = null; // next getShadowHostDataService() rebuilds under the rotated scope key
+  await getShadowHostDataCoordinator().onRevoked(rt);
 }
 
 async function onShadowControllerApproved(rt: ShadowHostEnrollmentRuntime): Promise<void> {
-  await ensureShadowHostStarted(rt);
-  if (shadowHostData) applyLiveHostAuthority(rt);
-  const svc = await getShadowHostDataService();
+  const svc = await getShadowHostDataCoordinator().onApproved(rt);
   if (!svc) return;
   try { await svc.publishAllPending(); } catch (e) { warn('shadowHostData.approve.publish', e); }
 }
@@ -771,22 +753,7 @@ async function handleShadowHostDataCall(method: string): Promise<unknown> {
 
 /** Best-effort live sync loop (publish pending events + pull/execute commands). */
 function startShadowHostDataLoop(): void {
-  if (shadowHostDataTimer) return;
-  shadowHostDataTimer = setInterval(() => {
-    if (!accountSessionToken) return;
-    void (async () => {
-      try {
-        const rt = await getShadowHostFor();
-        await ensureShadowHostStarted(rt);
-        await renewShadowHostLease();
-        const svc = await getShadowHostDataService();
-        if (!svc) return;
-        await svc.publishAllPending();
-        await svc.pollAndExecuteCommands();
-      } catch (e) { warn('shadowHostData.loop', e); }
-    })();
-  }, 15_000);
-  if (typeof shadowHostDataTimer.unref === 'function') shadowHostDataTimer.unref();
+  getShadowHostDataCoordinator().startLoop(() => !!accountSessionToken);
 }
 
 const WEB_ROOT = process.env.MAESTRO_WEB_ROOT ? path.resolve(process.env.MAESTRO_WEB_ROOT) : '';

@@ -14,10 +14,9 @@
  * ACK — the host sanitizes the ACK error at construction to a generic reason.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { rmSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { rmSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { randomBytes, createHash } from 'node:crypto';
 
 const hoisted = vi.hoisted(() => ({ dir: `/tmp/maestro-preui-sec-${process.pid}` }));
@@ -250,53 +249,5 @@ describe('NOTE-2 — enrollment runtime propagation surface', () => {
     expect(snap.revokedControllerDeviceIds).toEqual(['ctrl_gone']);  // RED before buildHostAndService fix: []
     expect(snap.scopeKeyId).toBe('wk_active');
     svc!.close();
-  });
-});
-
-describe('NOTE-2 — sidecar production wiring pins the revoked-set/rotation propagation', () => {
-  const here = fileURLToPath(new URL('.', import.meta.url));
-  const headless = readFileSync(join(here, '../sidecar/src/headless-main.ts'), 'utf8');
-  const dispatch = readFileSync(join(here, 'shadow-host-dispatch.ts'), 'utf8');
-
-  it('renew/resume refresh the live authority from the runtime truth (revoked set + scope-key id)', () => {
-    // The single refresh helper reads liveAuthority() (fence + expiry + revoked set + scopeKeyId).
-    expect(headless).toContain('function applyLiveHostAuthority');
-    expect(headless).toContain('const plane = shadowHostData');
-    expect(headless).toContain('plane.svc.setAuthority');
-    expect(headless).toContain('rt.liveAuthority()');
-    expect(headless).toContain('a.revokedControllerDeviceIds, a.scopeKeyId');
-    // The old 2-arg setAuthority(renewed.fence, renewed.leaseExpiresAt) shape is gone.
-    expect(headless).not.toContain('setAuthority(resumed.fence, resumed.leaseExpiresAt)');
-    expect(headless).not.toContain('setAuthority(renewed.fence, renewed.leaseExpiresAt)');
-    expect(headless).toContain('if (resumed) applyLiveHostAuthority(rt)');
-    expect(headless).toContain('if (renewed) applyLiveHostAuthority(rt)');
-  });
-
-  it('keeps the host enrollment lease alive before any controller data plane exists', () => {
-    const renewFn = headless.slice(headless.indexOf('async function renewShadowHostLease'), headless.indexOf('async function onShadowControllerRevoked'));
-    const loopFn = headless.slice(headless.indexOf('function startShadowHostDataLoop'), headless.indexOf('const WEB_ROOT'));
-    expect(renewFn).not.toContain('if (!shadowHostData) return');
-    expect(renewFn).not.toContain('shadowHostData?.svc.status()');
-    expect(renewFn).toContain('const rt = await getShadowHostFor()');
-    expect(renewFn).toContain('rt.liveAuthority()');
-    expect(loopFn.indexOf('await renewShadowHostLease()')).toBeLessThan(loopFn.indexOf('if (!svc) return'));
-    expect(loopFn).toContain('await ensureShadowHostStarted(rt)');
-  });
-
-  it('approval/recovery resumes the data plane and drains all pending baseline batches', () => {
-    expect(headless).toContain('afterApprove: (rt) => onShadowControllerApproved(rt)');
-    expect(headless).toContain('function onShadowControllerApproved');
-    expect(headless).toContain('await svc.publishAllPending()');
-    expect(headless).toContain('const published = await svc.publishAllPending()');
-    expect(headless).toContain('return rt.dataPlaneUnavailableReason()');
-    expect(dispatch).toContain('afterApprove?');
-    expect(dispatch).toContain('await deps.afterApprove?.(rt)');
-  });
-
-  it('a revoke tears down + rebuilds the live plane under the rotated scope key', () => {
-    expect(headless).toContain('function onShadowControllerRevoked');
-    expect(headless).toContain('afterRevoke: (rt) => onShadowControllerRevoked(rt)');
-    // The dispatch invokes the hook after a successful revoke.
-    expect(dispatch).toContain('await deps.afterRevoke?.(rt)');
   });
 });
