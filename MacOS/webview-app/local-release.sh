@@ -194,7 +194,10 @@ do_preview() {
   [ -n "$cand" ] || die "could not resolve a candidate version"
   note "preview candidate: $cand (source ${fp_before:0:12})"
 
-  note "gate: frozen install"; ( cd "$REPO_ROOT" && pnpm install --frozen-lockfile )
+  # Local release uses the already-resolved lockfile and local pnpm store.
+  # It must fail clearly if the local package cache is incomplete instead of
+  # opening registry sockets that can keep pnpm alive after "Done".
+  note "gate: frozen install (offline)"; ( cd "$REPO_ROOT" && pnpm install --frozen-lockfile --offline )
   note "gate: test";           ( cd "$REPO_ROOT" && pnpm test )
   note "gate: typecheck";      ( cd "$REPO_ROOT" && pnpm typecheck )
   note "gate: build";          ( cd "$REPO_ROOT" && pnpm build )

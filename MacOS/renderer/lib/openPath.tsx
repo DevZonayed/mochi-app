@@ -11,7 +11,7 @@
 
 import React from 'react';
 
-export type OpenPathFn = (path: string) => void;
+export type OpenPathFn = (path: string, opts?: { reveal?: boolean }) => void;
 
 /** Null when there's no host to receive opens — PathLink then reveals in Finder. */
 export const OpenPathContext = React.createContext<OpenPathFn | null>(null);

@@ -141,10 +141,12 @@ Ordered cycle: `['FAST', 'BALANCED', 'DEEP', 'MAX']`.
 Per-stop tint color + bar count:
 `FAST` → green/1, `BALANCED` → blue/2, `DEEP` → orange/3, `MAX` → red/4.
 
-#### `const EFFORT_EST: Record<EffortStop, { cost: string; mins: string }>`
-Pre-run estimate per stop:
-`FAST` `{cost:'0.30',mins:'3'}`, `BALANCED` `{cost:'0.60',mins:'6'}`,
-`DEEP` `{cost:'1.80',mins:'36'}`, `MAX` `{cost:'3.00',mins:'72'}`.
+#### `const EFFORT_DEPTH: Record<EffortStop, { label: string; detail: string }>`
+Qualitative depth metadata per stop:
+`FAST` → `{ label: 'Fast', detail: 'Quick pass' }`,
+`BALANCED` → `{ label: 'Balanced', detail: 'Default depth' }`,
+`DEEP` → `{ label: 'Deep', detail: 'More thorough pass' }`,
+`MAX` → `{ label: 'Max', detail: 'Most thorough pass' }`.
 
 #### `interface StrengthBarsProps`
 ```ts
@@ -164,8 +166,8 @@ faded `--ink-tertiary`.
 Effort selector pill. Renders `StrengthBars` + the stop label in the stop's tint.
 **Pass `onChange` to make it interactive** (clicking cycles `FAST → BALANCED →
 DEEP → MAX → …` and shows a 4-dot position indicator); omit `onChange` for a
-read-only display. `compact` shrinks height 34→28. For `DEEP`/`MAX` it appends a
-cost/latency chip (`≈ 3×/5× cost · 6×/12× latency`).
+read-only display. `compact` shrinks height 34→28. It displays the qualitative
+depth label only; it does not display pre-run cost or time estimates.
 
 ### Model switcher
 

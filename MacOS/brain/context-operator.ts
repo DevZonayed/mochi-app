@@ -29,11 +29,16 @@
    WhatsApp replies are trusted (they only arrive via note-to-self or the
    verified notify number, quote-matched to our own sends). */
 
+import { createHash } from 'node:crypto';
 import type { Store, Project, ContextDispatch, WaMessage } from './store.js';
 import type { LocalEngine } from './engine.js';
 import { triageWaBurst, type TriageResult } from './context-triage.js';
 import { formatTranscript } from './whatsapp-analyze.js';
 import { resolveClaudeOAuthToken } from './claude-usage.js';
+
+function stableReplyDigest(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
 
 export interface ContextOperatorDeps {
   store: Store;
@@ -120,9 +125,16 @@ export async function contextIntake(
     const session = deps.store.primarySessionOf(args.project.id);
     if (!session) return 'fallback'; // no operator session yet — degrade, don't drop
     const prompt = buildIntakePrompt({ chatName: args.chatName, chatId: args.chatId, triage, transcript });
-    const job = deps.store.createJob(args.project.id, prompt, `WhatsApp: ${args.chatName} (${triage.kind})`, undefined, session.id);
-    deps.emit('job', job);
-    await deps.engine.run(job.id, {}).catch(() => { /* run failures land on the job record */ });
+    // TRIGGER IDEMPOTENCY: a re-delivered inbound burst must not dispatch twice. Key
+    // by chat + the newest message timestamp in the burst (the occurrence identity).
+    const newestTs = args.msgs.reduce((m, x) => Math.max(m, (x as { ts?: number }).ts ?? 0), 0);
+    const idemKey = `ctx-intake:${args.chatId}:${newestTs}`;
+    const claim = deps.store.claimIdempotentJob(idemKey, {
+      projectId: args.project.id, input: prompt, title: `WhatsApp: ${args.chatName} (${triage.kind})`, sessionId: session.id,
+      intent: { effort: 'balanced', plan: false, goal: false, browser: false },
+    });
+    deps.emit('job', claim.job);
+    if (!claim.duplicate) await deps.engine.run(claim.job.id, {}).catch(() => { /* run failures land on the job record */ });
     return 'dispatched';
   } catch {
     return 'fallback';
@@ -166,9 +178,16 @@ export function makeOperatorReplyHandler(deps: ContextOperatorDeps): (evt: { cha
       const session = deps.store.getSession(send.sessionId) ?? deps.store.primarySessionOf(project.id);
       if (!session) return false;
       const prompt = buildOperatorReplyPrompt({ sentText: send.text, replyText: evt.text.trim() });
-      const job = deps.store.createJob(project.id, prompt, 'Operator reply (WhatsApp)', undefined, session.id);
-      deps.emit('job', job);
-      void deps.engine.run(job.id, {}).catch(() => { /* failures land on the job */ });
+      // TRIGGER IDEMPOTENCY: a re-delivered operator reply must not fire twice. Key by
+      // chat + the matched send's timestamp + a full-content digest of the reply.
+      const rt = evt.text.trim();
+      const idemKey = `ctx-reply:${evt.chatId}:${send.at}:${stableReplyDigest(rt)}`;
+      const claim = deps.store.claimIdempotentJob(idemKey, {
+        projectId: project.id, input: prompt, title: 'Operator reply (WhatsApp)', sessionId: session.id,
+        intent: { effort: 'balanced', plan: false, goal: false, browser: false },
+      });
+      deps.emit('job', claim.job);
+      if (!claim.duplicate) void deps.engine.run(claim.job.id, {}).catch(() => { /* failures land on the job */ });
       return true;
     } catch {
       return false;
@@ -217,7 +236,7 @@ export function reportDispatchIfAny(
     if (!session) return;
     const targetName = deps.store.getProject(d.targetProjectId)?.name ?? d.targetProjectId;
     const prompt = buildDispatchReportPrompt({ dispatch: d, targetProjectName: targetName, output });
-    const job = deps.store.createJob(d.contextProjectId, prompt, `Report: ${d.title}`, undefined, session.id);
+    const job = deps.store.createJob(d.contextProjectId, prompt, `Report: ${d.title}`, undefined, session.id, undefined, undefined, undefined, { effort: 'balanced', plan: false, goal: false, browser: false });
     deps.emit('job', job);
     void deps.engine.run(job.id, {}).catch(() => { /* failures land on the job */ });
   } catch { /* reporting must never break the finishing run */ }

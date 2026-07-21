@@ -73,7 +73,7 @@ const CAP_H = 38, CAP_GAP = 6, LANE_PAD = 11; // capsule height, vertical gap be
 const MIN_CAP_W = 96, CAP_GAP_X = 8;          // min capsule width + min horizontal gap used by the packer
 const MINUTE = 60_000, HOUR = 3_600_000;
 
-type Status = 'running' | 'gated' | 'queued' | 'failed' | 'done' | 'scheduled' | 'cancelled';
+type Status = 'running' | 'queued' | 'failed' | 'done' | 'scheduled' | 'cancelled' | 'gated';
 
 interface Lane {
   id: string;
@@ -100,7 +100,6 @@ interface Job {
   shape: string;
   trigger: string;
   effort: string;
-  autonomy: string;
   engine: string;
   model: string;
   sessionId?: string;
@@ -109,15 +108,15 @@ interface Job {
   _liveCost?: number;
 }
 
-// status: running | gated | queued | failed | done | scheduled
+// status: running | queued | failed | done | scheduled | gated
 const STATUS_META: Record<Status, { label: string; tint: string }> = {
   running:   { label: 'Running',   tint: 'var(--purple)' },
-  gated:     { label: 'Gated',     tint: 'var(--orange)' },
   queued:    { label: 'Queued',    tint: 'var(--ink-secondary)' },
   failed:    { label: 'Failed',    tint: 'var(--red)' },
   done:      { label: 'Done',      tint: 'var(--green)' },
   scheduled: { label: 'Scheduled', tint: 'var(--teal)' },
   cancelled: { label: 'Cancelled', tint: 'var(--ink-tertiary)' },
+  gated:     { label: 'Needs work', tint: 'var(--orange)' },
 };
 
 /* Human label for an absolute timestamp relative to `now`. */
@@ -146,12 +145,10 @@ function fmtAgo(ms: number): string {
 
 /* ── live-API → local timeline Job adapter ──
    The local Job/Status model and the synthetic "minutes" time axis are purely
-   presentational. We map each api Job onto it so the existing render code is
-   unchanged: api status → local status, projectId → lane, cost/tokens through,
-   and a synthetic start/end derived from status+progress so capsules land in a
-   sensible spot relative to the now-line. */
+   presentational. We map each api Job onto it: api status → local status,
+   projectId → lane, cost/tokens through, and real created/updated timestamps. */
 function statusFromApi(s: ApiJob['status']): Status {
-  // pending shows under the Scheduled/Queued/Gated buckets; we surface it as 'scheduled'
+  // pending shows as scheduled because the backend has accepted the job but it is not running yet.
   if (s === 'pending') return 'scheduled';
   return s; // 'running' | 'done' | 'failed' all share names with the local model
 }
@@ -175,7 +172,6 @@ function mapApiJob(j: ApiJob): Job {
     shape: SHAPE_BY_EFFORT[j.effort] ?? 'single',
     trigger: 'hand',
     effort: (effort in EFFORT_TINT ? effort : 'BALANCED'),
-    autonomy: 'Gated',
     engine: j.engine ?? 'claude',
     model: j.model ?? '',
     sessionId: j.sessionId,
@@ -203,24 +199,25 @@ function Capsule({ job, left, width, top, onClick, selected }: CapsuleProps) {
   const fills: Record<Status, React.CSSProperties> = {
     running: { background: 'linear-gradient(120deg, color-mix(in srgb, var(--purple) 26%, var(--bg-elevated)), color-mix(in srgb, var(--purple) 14%, var(--bg-elevated)))',
       border: '1px solid color-mix(in srgb, var(--purple) 45%, transparent)', color: 'var(--ink)' },
-    gated: { background: 'rgba(255,149,0,0.16)', border: '1px solid color-mix(in srgb, var(--orange) 55%, transparent)', color: 'var(--ink)' },
     queued: { background: 'var(--bg-elevated)', border: '1.5px dashed var(--separator-strong)', color: 'var(--ink-secondary)' },
     failed: { background: 'var(--bg-elevated)', border: '1.5px solid color-mix(in srgb, var(--red) 55%, transparent)', color: 'var(--ink)' },
     done: { background: 'var(--fill-secondary)', border: '1px solid var(--separator)', color: 'var(--ink-secondary)' },
     scheduled: { background: 'transparent', border: '1.5px dashed color-mix(in srgb, var(--teal) 55%, transparent)', color: 'var(--ink-secondary)' },
     cancelled: { background: 'var(--fill-tertiary)', border: '1px solid var(--separator)', color: 'var(--ink-tertiary)' },
+    gated: { background: 'color-mix(in srgb, var(--orange) 10%, var(--bg-elevated))', border: '1.5px solid color-mix(in srgb, var(--orange) 48%, transparent)', color: 'var(--ink)' },
   };
-  const icon: Record<Status, React.ReactNode> = { running: <Spinner size={12} color="var(--purple)" />, gated: <Icon name="pause" size={13} style={{ color: 'var(--orange)' }} />,
+  const icon: Record<Status, React.ReactNode> = { running: <Spinner size={12} color="var(--purple)" />,
     queued: <Icon name="clock" size={13} />, failed: <Icon name="x" size={13} stroke={2.6} style={{ color: 'var(--red)' }} />,
     done: <Icon name="check" size={13} stroke={2.6} style={{ color: 'var(--green)' }} />, scheduled: <Icon name="clock" size={13} style={{ color: 'var(--teal)' }} />,
-    cancelled: <Icon name="x" size={13} stroke={2.6} style={{ color: 'var(--ink-tertiary)' }} /> };
+    cancelled: <Icon name="x" size={13} stroke={2.6} style={{ color: 'var(--ink-tertiary)' }} />,
+    gated: <Icon name="alert" size={13} stroke={2.4} style={{ color: 'var(--orange)' }} /> };
 
   return (
     <div data-cap={job.id} onClick={() => onClick(job)} className={`capsule cap-${job.status}`} style={{ ...base, ...fills[job.status],
       boxShadow: selected ? `0 0 0 2px var(--blue), var(--card-shadow)` : 'none' }}>
       <span style={{ flexShrink: 0, display: 'grid', placeItems: 'center' }}>{icon[job.status]}</span>
       <span style={{ flex: 1, minWidth: 0, font: '600 var(--fs-footnote)/1 var(--font-text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{job.name}</span>
-      {(job.status === 'running' || job.status === 'gated' || job.status === 'failed' || job.status === 'done') && cost > 0 && (
+      {(job.status === 'running' || job.status === 'failed' || job.status === 'done') && cost > 0 && (
         <span style={{ flexShrink: 0, font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>${cost.toFixed(2)}</span>
       )}
     </div>
@@ -483,10 +480,11 @@ function laneOf(lanes: Lane[], id: string): Lane {
 function MonStatus({ status }: { status: Status }) {
   const m = STATUS_META[status];
   const node = {
-    running: <Spinner size={12} color={m.tint} />, gated: <Icon name="pause" size={13} />,
+    running: <Spinner size={12} color={m.tint} />,
     queued: <Icon name="clock" size={13} />, failed: <Icon name="x" size={13} stroke={2.6} />,
     done: <Icon name="check" size={13} stroke={2.6} />, scheduled: <Icon name="clock" size={13} />,
     cancelled: <Icon name="x" size={13} stroke={2.6} />,
+    gated: <Icon name="alert" size={13} stroke={2.4} />,
   }[status];
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: m.tint, font: '600 var(--fs-footnote)/1 var(--font-text)' }}>
@@ -758,7 +756,6 @@ function CancelSheet({ job, onClose, onConfirm }: CancelSheetProps) {
 const MON_FILTERS = [
   { key: 'all', label: 'All' },
   { key: 'running', label: 'Running' },
-  { key: 'gated', label: 'Gated' },
   { key: 'scheduled', label: 'Scheduled' },
   { key: 'failed', label: 'Failed' },
 ];
@@ -824,7 +821,6 @@ export default function JobMonitor() {
 
   const counts = {
     running: jobs.filter(j => j.status === 'running').length,
-    gated: jobs.filter(j => j.status === 'gated').length,
     queued: jobs.filter(j => j.status === 'queued').length,
   };
   const shown = jobs.filter(j => filter === 'all' || j.status === filter);
@@ -867,7 +863,6 @@ export default function JobMonitor() {
           <h1 style={{ margin: 0, font: '700 var(--fs-large-title)/1 var(--font-display)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>Jobs</h1>
           <div style={{ display: 'inline-flex', gap: 8 }}>
             <CounterPill n={counts.running} label="running" tint="var(--purple)" />
-            <CounterPill n={counts.gated} label="gated" tint="var(--orange)" />
             <CounterPill n={counts.queued} label="queued" tint="var(--ink-secondary)" />
           </div>
           <span style={{ flex: 1 }} />

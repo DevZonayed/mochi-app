@@ -57,6 +57,7 @@ describe('contextIntake', () => {
     expect(jobs[0].title).toBe('WhatsApp: Acme Corp (bug)');
     expect(jobs[0].input).toContain('checkout throws a 500'); // transcript included
     expect(jobs[0].input).toContain('UNTRUSTED');             // fenced as third-party data
+    expect(jobs[0].intent).toEqual({ schemaVersion: 1, effort: 'balanced', plan: false, goal: false, browser: false });
     expect((engine.run as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(jobs[0].id, {});
   });
 
@@ -106,7 +107,28 @@ describe('operator quoted-reply routing', () => {
     expect(jobs[0].title).toBe('Operator reply (WhatsApp)');
     expect(jobs[0].input).toContain('yes, go ahead');
     expect(jobs[0].input).toContain('Should I ship the checkout fix'); // the quoted send, for context
+    expect(jobs[0].intent).toEqual({ schemaVersion: 1, effort: 'balanced', plan: false, goal: false, browser: false });
     expect(engine.run).toHaveBeenCalledWith(jobs[0].id, {});
+  });
+
+  it('does not collapse distinct replies that share length and first 32 characters', async () => {
+    const { store, ctx, session, engine, deps } = setup();
+    store.recordContextWaSend({ projectId: ctx.id, sessionId: session.id, chatId: 'me@s.whatsapp.net', text: 'Should I ship the checkout fix to staging?' });
+    const handle = makeOperatorReplyHandler(deps);
+    const prefix = 'same first thirty-two characters';
+    const a = `${prefix} A`;
+    const b = `${prefix} B`;
+    expect(a.length).toBe(b.length);
+    expect(a.slice(0, 32)).toBe(b.slice(0, 32));
+
+    expect(await handle({ chatId: 'me@s.whatsapp.net', quotedText: 'Should I ship the checkout fix', text: a })).toBe(true);
+    expect(await handle({ chatId: 'me@s.whatsapp.net', quotedText: 'Should I ship the checkout fix', text: b })).toBe(true);
+
+    const jobs = store.listJobs(ctx.id);
+    expect(jobs).toHaveLength(2);
+    expect(jobs.map(j => j.input).join('\n')).toContain(a);
+    expect(jobs.map(j => j.input).join('\n')).toContain(b);
+    expect(engine.run).toHaveBeenCalledTimes(2);
   });
 
   it('returns false on no ring match, empty reply, or a non-context owner', async () => {
@@ -163,6 +185,7 @@ describe('dispatch settle + report', () => {
     expect(jobs[0].input).toContain('DONE');
     expect(jobs[0].input).toContain('missing env var');
     expect(jobs[0].input).toContain('"acme-web"'); // target named for the agent
+    expect(jobs[0].intent).toEqual({ schemaVersion: 1, effort: 'balanced', plan: false, goal: false, browser: false });
     expect(engine.run).toHaveBeenCalledTimes(1);
 
     // Settle-once: a duplicate post-turn (retry, double event) must NOT re-report.

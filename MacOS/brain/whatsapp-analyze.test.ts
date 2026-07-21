@@ -93,6 +93,21 @@ describe('whatsapp analyzer', () => {
     expect(sent).toHaveLength(0);
   });
 
+  it('default summarizer runs explicit normal chat intent when transport has no mode input', async () => {
+    const { s, engine } = setup();
+    s.setWhatsappState({ sendApproved: true });
+    (engine.run as ReturnType<typeof vi.fn>).mockImplementation(async (jobId: string) => ({ status: 'done', output: s.getJob(jobId)?.output ?? 'summary' }));
+    const { client } = sendSpy();
+    const analyze = makeWhatsappAnalyzer({ store: s, engine, client, emit: vi.fn() });
+
+    await analyze(s.armWhatsappTimer({ chatId: 'c1', projectId: null }));
+
+    const jobs = s.listJobs();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].intent).toEqual({ schemaVersion: 1, effort: 'fast', plan: false, goal: false, browser: false });
+    expect(engine.run).toHaveBeenCalledWith(jobs[0].id, {});
+  });
+
   it('approveWhatsappSend flips the gate and flushes the held summary once', async () => {
     const { s, engine } = setup();
     const { client, sent } = sendSpy();

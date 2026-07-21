@@ -5,13 +5,14 @@
 // native SwiftUI app gets the full local RPC surface — identical to what `window.maestro.call`
 // reached. Brain logic is unchanged; only the transport differs (WS instead of Electron IPC).
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, promises as fsp } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync, promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { app as shimApp } from './electron-shim.ts';
+import { app as shimApp, safeStorage } from './electron-shim.ts';
 import { startWsHost } from './ws-host.ts';
 import { serveDesign } from './design-serve.ts';
+import { makeFilePreviewHttp } from './file-preview-http.ts';
 
 import { Store } from '../../brain/store.js';
 import { Providers } from '../../brain/providers.js';
@@ -34,6 +35,19 @@ import { ExternalMcp } from '../../brain/mcp/external-mcp.js';
 import { setEnginesRoot } from '../../brain/engines.js';
 import { bootstrapNodePath } from '../../brain/node-shim.js';
 import { HostClient } from '../../brain/hostClient.js';
+import { ShadowHostEnrollmentRuntime } from '../../brain/shadow-enrollment-host.js';
+import { ShadowProductProjection } from '../../brain/shadow-product-projection.js';
+import { ShadowActionReceiptStore } from '../../brain/shadow-action-receipt.js';
+import { buildControllerActionRegistryEntries } from '../../brain/shadow-controller-actions.js';
+import { SafeStorageVault, FileHostEnrollmentPersistence } from '../../brain/shadow-host-adapters.js';
+import { createShadowHostDispatch } from '../../brain/shadow-host-dispatch.js';
+import { screenShareRegistry } from '../../brain/shadow-screen-registry.js';
+import { ScreenHostOwner } from '../../brain/shadow-screen-host-owner.js';
+import { ScreenRelayHostLink } from '../../brain/shadow-screen-relay-link.js';
+import { nodeShadowCrypto as screenBackend } from '@maestro/realtime/shadowCryptoNode';
+import type { ScreenSourcePolicy, ScreenAuthoritySnapshot } from '@maestro/realtime/shadowScreenStream';
+import { ShadowHostDataService, defineShadowCommandRegistry, type HostCommandExecutor, type ShadowCommandRegistry } from '../../brain/shadow-host-service.js';
+import { ShadowHostDataLifecycle } from './shadow-host-data-lifecycle.js';
 import { buildModelGroups, refreshModelGroups } from '../../brain/models.js';
 import { isRemoteBlocked } from '../../brain/remote-guard.js';
 import type { Asset, Job } from '../../brain/store.js';
@@ -57,6 +71,9 @@ process.on('unhandledRejection', (e) => {
 
 const RELAY_URL = (process.env.MAESTRO_SERVER_URL || 'https://api.nexalance.cloud').replace(/\/$/, '');
 const ACCOUNT_SESSION_PATH = path.join(shimApp.getPath('userData'), 'account-session.json');
+// M-A: the operator-confirmed screen-sharing display, persisted HOST-LOCAL (never synced;
+// the remote can't read or set it). Revalidated against the live source list on boot/report.
+const SCREEN_SOURCE_PATH = path.join(shimApp.getPath('userData'), 'screen-source.json');
 
 function warn(label: string, e: unknown) {
   process.stderr.write(`[sidecar] ${label}: ${(e as Error)?.message ?? e}\n`);
@@ -92,41 +109,30 @@ try {
 } catch (e) { warn('engines/node-path setup', e); }
 
 const engine = new LocalEngine(store, emit, providers);
-const media = new MediaEngine(store, emit, () => providers.getLocalKey('fal'));
+const media = new MediaEngine(store, emit, () => providers.getLocalKey('fal'), () => providers.keyState('fal'));
 const research = new ResearchEngine(store, engine, emit);
 const publishing = new PublishingEngine(store, emit);
 try { engine.setPublishing(publishing); } catch (e) { warn('setPublishing', e); }
 
 // Image generation: wire the SAME closure as main.ts so the in-process "maestro" MCP exposes the
 // `generate_image` tool to the agent (without this, the agent reports "image generation offline" —
-// the tool is gated on `imageGen` being set). Codex-first (free native image_gen, edits via `-i`),
-// fal FLUX fallback (schnell for fresh, kontext for edits).
+// the tool is gated on `imageGen` being set). When Image routing is Codex the native built-in
+// image_gen tool is the ONLY backend and fails CLOSED to Codex (never FAL, never the OpenAI Images
+// API); the fal FLUX media backend (schnell fresh / kontext edit) serves ONLY when routing is Claude.
 try {
   engine.setImageGen(async (prompt, opts) => {
-    const editing = !!(opts.sourceImagePath || opts.sourceImageUrl);
-    // The "Codex" image route: NATIVE first — Codex's built-in image_gen tool on
-    // the operator's ChatGPT sign-in, NO API key (one-shot non-ephemeral `codex
-    // exec`; the PNG is decoded from the session rollout, the only place exec mode
-    // surfaces the bytes). Fallbacks, in order: gpt-image-2 via a stored OpenAI key,
-    // then fal. Codex/OpenAI edits need a LOCAL source file; a url-only source → fal.
-    const localEditOk = !editing || !!(opts.sourceImagePath && existsSync(opts.sourceImagePath));
-    if (store.routing().image === 'codex' && localEditOk && engine.status('codex').available) {
-      const falReady = providers.list().some(c => c.provider === 'fal');
-      const hasOpenaiKey = !!providers.getLocalKey('openai');
-      try {
-        return await engine.imageViaCodex(prompt, { aspect: opts.aspect, projectId: opts.projectId, sourceImagePath: opts.sourceImagePath });
-      } catch (e) {
-        if (!hasOpenaiKey && !falReady) throw e; // nothing to fall back to — surface codex's error
-      }
-      if (hasOpenaiKey) {
-        try {
-          return await engine.imageViaOpenAI(prompt, { aspect: opts.aspect, projectId: opts.projectId, sourceImagePath: opts.sourceImagePath });
-        } catch (e) {
-          if (!falReady) throw e; // no fal to fall back to — surface OpenAI's error
-        }
-      }
-      // else fall through to fal below
+    // Image routing = Codex → NATIVE Codex image_gen ONLY, and FAIL CLOSED to Codex.
+    // A Codex-selected generate_image call must NEVER silently fall back to any other
+    // backend — not FAL/media.generateAndWait, and not the OpenAI Images API. Masking a
+    // `codex-no-image` with a non-native result would violate the standing requirement
+    // ("Codex native image_gen only"). imageViaCodex runs the built-in image_gen tool on
+    // the ChatGPT sign-in (NO API key) and throws actionable Codex errors (sign-in /
+    // no-image) that are surfaced VERBATIM.
+    if (store.routing().image === 'codex') {
+      return await engine.imageViaCodex(prompt, { aspect: opts.aspect, projectId: opts.projectId, sourceImagePath: opts.sourceImagePath });
     }
+    // Image routing = Claude → the FAL media backend (schnell for fresh, kontext for edits).
+    const editing = !!(opts.sourceImagePath || opts.sourceImageUrl);
     const asset = editing
       ? await media.generateAndWait({ modelKey: 'flux-kontext', prompt, projectId: opts.projectId ?? null, imageUrl: opts.sourceImageUrl, imagePath: opts.sourceImagePath, aspect: opts.aspect })
       : await media.generateAndWait({ modelKey: 'flux-schnell', prompt, projectId: opts.projectId ?? null, aspect: opts.aspect });
@@ -331,6 +337,9 @@ async function handleAccountCall(method: string, params: Record<string, unknown>
       return { signedIn: true, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: await accountDevices().catch(() => []) };
     }
     case 'accountSignOut':
+      await stopScreenHostOwner();
+      await stopShadowHostData();
+      await stopShadowHost();
       if (accountSessionToken) await authPost('/api/auth/sign-out', {}, accountSessionToken).catch(() => ({ token: '', body: null, status: 0 }));
       stopAccountHost();
       clearAccountToken();
@@ -338,6 +347,9 @@ async function handleAccountCall(method: string, params: Record<string, unknown>
     case 'accountSetSession': {
       const token = typeof params.token === 'string' ? params.token.trim() : '';
       if (!token) {
+        await stopScreenHostOwner();
+        await stopShadowHostData();
+        await stopShadowHost();
         stopAccountHost();
         clearAccountToken();
         return { signedIn: false, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: [] };
@@ -349,6 +361,399 @@ async function handleAccountCall(method: string, params: Record<string, unknown>
     default:
       return undefined;
   }
+}
+
+// ── Shadow host enrollment runtime (Phase 3A2a) ────────────────────────────
+// Exactly one lifecycle-managed ShadowHostEnrollmentRuntime, keyed to the
+// signed-in account, wired through the same trusted WS dispatch surface the
+// renderer (and 3A2b) calls — using the existing account session token, device
+// id (deck) and authenticated fetch path. Private/scope material lives only as
+// safeStorage ciphertext; the QR is returned ONLY from the explicit create call
+// and never logged. Fails visibly/read-only when auth or the vault is unavailable.
+let shadowHost: { accountId: string; rt: ShadowHostEnrollmentRuntime } | null = null;
+let cachedAccount: { token: string; accountId: string } | null = null;
+
+async function resolveAccountId(): Promise<string> {
+  if (!accountSessionToken) throw Object.assign(new Error('not signed in'), { statusCode: 401 });
+  if (cachedAccount && cachedAccount.token === accountSessionToken) return cachedAccount.accountId;
+  const res = await fetch(`${RELAY_URL}/api/auth/get-session`, { headers: { authorization: `Bearer ${accountSessionToken}` } });
+  if (!res.ok) throw Object.assign(new Error(res.status === 401 ? 'session expired' : `session lookup failed (${res.status})`), { statusCode: res.status });
+  const data = await res.json().catch(() => null) as { user?: { id?: string } } | null;
+  const id = data?.user?.id;
+  if (!id) throw Object.assign(new Error('no account session'), { statusCode: 401 });
+  cachedAccount = { token: accountSessionToken, accountId: id };
+  return id;
+}
+
+function shadowHostFile(accountId: string): string {
+  const safe = accountId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128);
+  return path.join(shimApp.getPath('userData'), `shadow-host-enrollment.${safe}.json`);
+}
+
+async function getShadowHostFor(): Promise<ShadowHostEnrollmentRuntime> {
+  const accountId = await resolveAccountId();
+  if (shadowHost && shadowHost.accountId === accountId) return shadowHost.rt;
+  if (shadowHost) { try { await shadowHost.rt.stop(); } catch { /* noop */ } shadowHost = null; }
+  const rt = new ShadowHostEnrollmentRuntime({
+    vault: new SafeStorageVault(safeStorage),
+    persistence: new FileHostEnrollmentPersistence(shadowHostFile(accountId)),
+    session: { get: async () => ({ accountId, hostDeviceId: store.deck.deckId, sessionToken: accountSessionToken, relayOrigin: RELAY_URL }) },
+    transport: { fetch: (url, init) => fetch(url, init as RequestInit) as unknown as ReturnType<ConstructorParameters<typeof ShadowHostEnrollmentRuntime>[0]['transport']['fetch']> },
+  });
+  shadowHost = { accountId, rt };
+  return rt;
+}
+
+async function ensureShadowHostStarted(rt: ShadowHostEnrollmentRuntime): Promise<void> {
+  if (rt.status().state === 'running') return;
+  try { await rt.start(); } catch (e) { warn('shadowHost.start', e); }
+}
+
+async function stopShadowHost(): Promise<void> {
+  if (shadowHost) { try { await shadowHost.rt.stop(); } catch { /* noop */ } shadowHost = null; }
+  cachedAccount = null;
+}
+
+const handleShadowHostCall = createShadowHostDispatch({
+  signedIn: () => !!accountSessionToken,
+  hostDeviceId: () => store.deck.deckId,
+  vaultAvailable: () => new SafeStorageVault(safeStorage).isEncryptionAvailable(),
+  getRuntime: () => getShadowHostFor(),
+  ensureStarted: (rt) => ensureShadowHostStarted(rt),
+  afterApprove: (rt) => onShadowControllerApproved(rt),
+  // Phase 3B0 NOTE-2: refresh (deny + rebuild) the live data plane after a revoke.
+  afterRevoke: (rt) => onShadowControllerRevoked(rt),
+  // Phase 3D1: the host-visible screen-share status + local Stop (registry-backed;
+  // the screen coordinator writes it on start/stop). Metadata only, never frames.
+  screenShareStatus: () => screenShareRegistry.get(),
+  screenShareStop: () => screenShareRegistry.stop(),
+});
+
+// ── Shadow host DATA/COMMAND plane (Phase 3A2a) ────────────────────────────
+// Exactly one ShadowHostDataService (over a REAL ShadowHostCore) per account,
+// composed from the enrollment runtime's scope key + authority fence once a
+// controller is enrolled. Controller commands execute ONLY through this strict
+// allowlist into the existing brain dispatch (operator gates preserved); their
+// results become command-bound completion state events. No new port.
+let shadowHostDataCoordinator: ShadowHostDataLifecycle<ShadowHostDataService> | null = null;
+
+/**
+ * A read-only controller command: dispatches a proven READ-ONLY brain method and
+ * returns a command-bound checkpoint completion (the raw result never leaves the
+ * host). Re-evaluation after a crash is harmless (no external mutation), and the
+ * durable completion event is idempotent by content-addressed eventId.
+ */
+function readOnlyControllerCommand(method: string): HostCommandExecutor {
+  return async ({ params, commandId }) => {
+    try {
+      await dispatch(method, params as Record<string, unknown>);
+      return { ok: true, completion: { collection: 'command', op: 'checkpoint', entityId: commandId, revision: 1, payload: { method, ok: true } } };
+    } catch {
+      // Phase 3B0 NOTE-3: never surface the raw executor exception (which may carry
+      // a filesystem path, SQL text, or connection string) into the command ACK —
+      // emit a stable generic reason. The ACK builder sanitizes again as a backstop.
+      return { ok: false, code: 'exec-error', message: 'command failed' };
+    }
+  };
+}
+
+/**
+ * Typed production command registry. Only read-only / event-only methods are
+ * representable + registrable (a mutating method cannot be typed or constructed —
+ * see `defineShadowCommandRegistry`). Mutating product actions are deferred to 3B,
+ * where they must add product-level ATOMIC idempotency before registration.
+ */
+/**
+ * Durable Store-adjacent receipt for capability-gated product-idempotent actions
+ * (Section C). One store across accounts (keyed by scopeId); persists exactly-once
+ * receipts + conflict detection.
+ */
+const shadowActionReceipts = new ShadowActionReceiptStore(path.join(shimApp.getPath('userData'), 'shadow-host-core', 'action-receipts'));
+
+/**
+ * FROZEN production registry: read-only listing/health + the six capability-gated
+ * product-idempotent actions wired through NARROW closures into concrete Store/engine
+ * methods (never a generic `dispatch(method)`). Execution-time capability enforcement
+ * + durable receipts live in the data service / adapters.
+ */
+const SHADOW_CONTROLLER_COMMAND_REGISTRY: ShadowCommandRegistry = defineShadowCommandRegistry({
+  listProjects: { effectMode: 'read-only', execute: readOnlyControllerCommand('listProjects') },
+  health: { effectMode: 'read-only', execute: readOnlyControllerCommand('health') },
+  ...buildControllerActionRegistryEntries({
+    store: {
+      getProject: (id) => store.getProject(id),
+      getSession: (id) => store.getSession(id),
+      getJob: (id) => store.getJob(id),
+      listApprovals: () => store.listApprovals(),
+      listSchedules: () => store.listSchedules(),
+      claimIdempotentJob: (key, spec) => store.claimIdempotentJob(key, spec as Parameters<typeof store.claimIdempotentJob>[1]),
+      // Product-idempotent question answer via the atomic Store seam (durable schedule-disable
+      // + deterministic answer Job under the command key). Boot recovery launches a
+      // freshly-materialized pending answer Job (idempotentPendingJobIds → recoverSessionRuns).
+      claimIdempotentQuestionAnswer: (key, input) => store.claimIdempotentQuestionAnswer(key, input),
+      resolveApproval: (id, status) => store.resolveApproval(id, status),
+      updateSession: (id, patch) => store.updateSession(id, patch),
+    },
+    engine: {
+      launchJob: (jobId) => { void engine.run(jobId, {}).catch(() => { /* engine records failure on the job */ }); },
+      cancelJob: (jobId) => engine.cancel(jobId) !== null,
+    },
+    receipts: shadowActionReceipts,
+  }),
+});
+
+function shadowHostCoreDir(accountId: string): string {
+  const safe = accountId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128);
+  return path.join(shimApp.getPath('userData'), 'shadow-host-core', safe);
+}
+
+function getShadowHostDataCoordinator(): ShadowHostDataLifecycle<ShadowHostDataService> {
+  if (shadowHostDataCoordinator) return shadowHostDataCoordinator;
+  shadowHostDataCoordinator = new ShadowHostDataLifecycle<ShadowHostDataService>({
+    renewBeforeMs: SHADOW_LEASE_RENEW_BEFORE_MS,
+    intervalMs: 15_000,
+    getAccountId: () => resolveAccountId(),
+    getRuntime: () => getShadowHostFor(),
+    ensureStarted: (rt) => ensureShadowHostStarted(rt as ShadowHostEnrollmentRuntime),
+    dataPlaneUnavailableReason: (rt) => (rt as ShadowHostEnrollmentRuntime).dataPlaneUnavailableReason(),
+    buildPlane: (rt, accountId) => {
+      // Phase 3A2b1 Section B: build the FULL data plane — accepted encrypted host
+      // data/command service + the all-project redacted ShadowProductProjection sharing
+      // ONE ShadowHostCore. The Store singleton is the projection source; a narrow
+      // post-durable-write hook drives incremental projection, plus one startup reconcile.
+      const plane = (rt as ShadowHostEnrollmentRuntime).buildDataPlane({
+        rootDir: shadowHostCoreDir(accountId),
+        transport: { fetch: (url, init) => fetch(url, init as RequestInit) as unknown as Parameters<ShadowHostEnrollmentRuntime['buildDataPlane']>[0]['transport']['fetch'] },
+        commandRegistry: SHADOW_CONTROLLER_COMMAND_REGISTRY,
+        store,
+        log: (m) => warn('shadowProjection', m),
+      });
+      if (!plane) return null;
+      return { accountId, svc: plane.svc, projection: plane.projection };
+    },
+    bindProjection: (plane) => {
+      const projection = plane.projection as ShadowProductProjection | null;
+      if (!projection) return;
+      store.onDurableChange(projection.onDurableChange);
+      void projection.start().catch((e) => warn('shadowProjection.start', e));
+    },
+    unbindProjection: () => store.onDurableChange(null),
+    onAuthorityChanged: () => screenOwner?.onAuthorityChanged(),
+    onLoopService: async (svc) => {
+      await svc.publishAllPending();
+      await svc.pollAndExecuteCommands();
+    },
+    warn,
+  });
+  return shadowHostDataCoordinator;
+}
+
+async function getShadowHostDataService(): Promise<ShadowHostDataService | null> {
+  return getShadowHostDataCoordinator().getService();
+}
+
+async function getShadowHostDataInactiveReason(): Promise<string> {
+  try {
+    const rt = await getShadowHostFor();
+    await ensureShadowHostStarted(rt);
+    return rt.dataPlaneUnavailableReason() ?? 'data plane unavailable';
+  } catch {
+    return 'runtime-not-running';
+  }
+}
+
+async function stopShadowHostData(options: { stopTimer?: boolean } = {}): Promise<void> {
+  await getShadowHostDataCoordinator().stop(options);
+}
+
+/**
+ * Phase 3B0 NOTE-2: the SINGLE path that refreshes the live data service's
+ * authority from the runtime's current truth — fence, lease expiry, the rotated
+ * scope-key id, AND the revoked-controller set. Feeding the revoked set + rotated
+ * key id here is what makes the fence `revoked` branch (and every read-only
+ * enumeration) deny a revoked controller on the LIVE plane, not only after a
+ * restart. A missing fence is a no-op.
+ */
+function applyLiveHostAuthority(rt: ShadowHostEnrollmentRuntime): void {
+  getShadowHostDataCoordinator().applyLiveAuthority(rt);
+}
+
+// ── Phase 3D1 (B2): PRODUCTION host screen-stream owner ─────────────────────────
+// Constructs ScreenStreamHostCoordinator, dials /ws/host/screen, drives native
+// ScreenCaptureKit via renderer events, receives frames over the loopback seam, and
+// writes screenShareRegistry. The configured display source is host-confirmed via the
+// Controllers/settings surface and persisted (metadata only) — no start without it.
+let screenOwner: ScreenHostOwner | null = null;
+let screenPermission: 'granted' | 'denied' | 'undetermined' = 'undetermined';
+let screenSourcePolicy: ScreenSourcePolicy | null = loadScreenSourcePolicy();
+
+/** M-A: load the persisted operator-confirmed display (host-local). Revalidated against
+ * the live source list on the renderer's first source report, so a stale/removed display
+ * doesn't allow a start. */
+function loadScreenSourcePolicy(): ScreenSourcePolicy | null {
+  try {
+    const raw = JSON.parse(readFileSync(SCREEN_SOURCE_PATH, 'utf8')) as Partial<ScreenSourcePolicy>;
+    if (raw && typeof raw.sourcePolicyId === 'string' && raw.sourcePolicyId && typeof raw.width === 'number' && typeof raw.height === 'number') {
+      return { sourcePolicyId: raw.sourcePolicyId, kind: 'display', label: String(raw.label ?? '').slice(0, 120), width: raw.width, height: raw.height };
+    }
+  } catch { /* none persisted */ }
+  return null;
+}
+
+function persistScreenSourcePolicy(p: ScreenSourcePolicy | null): void {
+  try {
+    if (!p) { unlinkSync(SCREEN_SOURCE_PATH); return; }
+    mkdirSync(path.dirname(SCREEN_SOURCE_PATH), { recursive: true });
+    writeFileSync(SCREEN_SOURCE_PATH, JSON.stringify(p), { mode: 0o600 });
+  } catch { /* best-effort; in-memory selection still governs this session */ }
+}
+
+function buildScreenAuthoritySnapshot(rt: ShadowHostEnrollmentRuntime, controllerDeviceId: string): ScreenAuthoritySnapshot | null {
+  const a = rt.liveAuthority();
+  if (!a) return null;
+  const caps = rt.capabilitiesFor(controllerDeviceId) ?? [];
+  return {
+    fence: a.fence, leaseExpiresAtMs: a.leaseExpiresAt, grantedCapabilities: caps,
+    revokedControllerDeviceIds: a.revokedControllerDeviceIds, hostOnline: !!accountSessionToken,
+    configuredSourcePolicyId: screenSourcePolicy?.sourcePolicyId ?? null, foreground: true,
+  };
+}
+
+async function getScreenHostOwner(): Promise<ScreenHostOwner | null> {
+  if (screenOwner) return screenOwner;
+  if (!accountSessionToken || !screenSourcePolicy) return null;
+  const rt = await getShadowHostFor();
+  await ensureShadowHostStarted(rt);
+  screenOwner = new ScreenHostOwner({
+    backend: screenBackend,
+    authority: {
+      snapshot: (id) => buildScreenAuthoritySnapshot(rt, id),
+      hostAgreementPrivate: () => rt.screenHostKeyMaterial()?.hostAgreementPrivate ?? null,
+      hostSigningPrivate: () => rt.screenHostKeyMaterial()?.hostSigningPrivate ?? null,
+      hostSigningKeyId: () => rt.screenHostKeyMaterial()?.hostSigningKeyId ?? null,
+      controllerAgreementPublic: (id) => rt.controllerAgreementPublicFor(id),
+      controllerSigningPublic: (id) => rt.controllerSigningPublicFor(id),
+      sourcePolicy: () => screenSourcePolicy,
+    },
+    native: {
+      permission: () => screenPermission,
+      start: (opts) => emit('screen-capture-start', opts, { desktopOnly: true }),
+      stop: () => emit('screen-capture-stop', {}, { desktopOnly: true }),
+    },
+    registry: screenShareRegistry,
+    dialRelay: () => new ScreenRelayHostLink({ relayOrigin: RELAY_URL, sessionToken: accountSessionToken, hostDeviceId: store.deck.deckId }),
+    now: () => Date.now(),
+    audit: () => { /* metadata-only audit is emitted via the coordinator's status events */ },
+  });
+  screenOwner.start();
+  return screenOwner;
+}
+
+async function stopScreenHostOwner(): Promise<void> {
+  if (!screenOwner) return;
+  try { await screenOwner.stop(); } catch { /* */ }
+  screenOwner = null;
+}
+
+/** Renderer/native → brain screen calls (loopback IPC seam). Frames are latest-only,
+ * bounded, and forwarded to the owner to seal + relay — never persisted. */
+async function handleScreenCall(method: string, params: Record<string, unknown>): Promise<unknown> {
+  if (method === 'screenPermission') { const p = params.permission; if (p === 'granted' || p === 'denied' || p === 'undetermined') screenPermission = p; return { ok: true }; }
+  // M-A: EXPLICIT operator confirmation of a display (from the Controllers "Screen
+  // sharing" card). Persisted host-local; builds the owner so a stream can start.
+  if (method === 'screenConfigureSource') {
+    const id = String(params.sourcePolicyId ?? '');
+    const width = Number(params.width ?? 0); const height = Number(params.height ?? 0);
+    const label = String(params.label ?? '');
+    if (!id || !(width > 0) || !(height > 0)) { return { ok: false, configured: false }; }
+    screenSourcePolicy = { sourcePolicyId: id, kind: 'display', label: label.slice(0, 120), width, height };
+    persistScreenSourcePolicy(screenSourcePolicy);
+    await getScreenHostOwner();
+    return { ok: true, configured: true };
+  }
+  // M-A: operator clears the confirmed display → any active stream stops (source-required).
+  if (method === 'screenClearSource') {
+    screenSourcePolicy = null;
+    persistScreenSourcePolicy(null);
+    await screenOwner?.onAuthorityChanged();
+    return { ok: true, configured: false };
+  }
+  // M-A: the UI reads the current confirmed selection (host-local). The source LIST is
+  // enumerated by the renderer via the native bridge — never here — so no window titles
+  // or app names cross this seam.
+  if (method === 'screenSourceState') {
+    return { ok: true, selected: screenSourcePolicy ? { sourcePolicyId: screenSourcePolicy.sourcePolicyId, label: screenSourcePolicy.label, width: screenSourcePolicy.width, height: screenSourcePolicy.height } : null };
+  }
+  // M-A: the renderer reports the CURRENTLY-available display ids on boot / source-list
+  // change; if the persisted selection is no longer present, drop it (→ source-required)
+  // and stop any active stream. Revalidation only — never an auto-pick.
+  if (method === 'screenReportSources') {
+    const ids = Array.isArray(params.ids) ? (params.ids as unknown[]).map((x) => String(x)) : [];
+    if (screenSourcePolicy && !ids.includes(screenSourcePolicy.sourcePolicyId)) {
+      screenSourcePolicy = null;
+      persistScreenSourcePolicy(null);
+      await screenOwner?.onAuthorityChanged();
+      return { ok: true, revalidated: false };
+    }
+    return { ok: true, revalidated: true };
+  }
+  if (method === 'screenFrame') {
+    const owner = screenOwner; if (!owner) return { ok: false };
+    const b64 = String(params.b64 ?? ''); const ts = Number(params.ts ?? Date.now());
+    if (!b64 || b64.length > 2_000_000) return { ok: false }; // bounded; latest-only
+    let bytes: Buffer;
+    try { bytes = Buffer.from(b64, 'base64'); } catch { return { ok: false }; }
+    owner.pushFrame(new Uint8Array(bytes), ts);
+    return { ok: true };
+  }
+  if (method === 'screenCaptureError') { screenOwner?.pushError(String(params.reason ?? 'capture error').slice(0, 120)); return { ok: true }; }
+  return { ok: false };
+}
+
+/** Renew the host lease before it expires and atomically refresh the data service authority. */
+const SHADOW_LEASE_RENEW_BEFORE_MS = 120_000;
+async function renewShadowHostLease(): Promise<void> {
+  await getShadowHostDataCoordinator().renewLease();
+}
+
+/**
+ * Phase 3B0 NOTE-2: after a controller REVOKE the scope key is rotated to a fresh
+ * random key, so the live plane must (a) immediately deny the revoked controller
+ * by feeding the new revoked set into the in-force authority, then (b) tear down
+ * so the very next access rebuilds a plane bound to the ROTATED scope key. No
+ * stale poller/service survives with the old authority or key.
+ */
+async function onShadowControllerRevoked(rt: ShadowHostEnrollmentRuntime): Promise<void> {
+  await getShadowHostDataCoordinator().onRevoked(rt);
+}
+
+async function onShadowControllerApproved(rt: ShadowHostEnrollmentRuntime): Promise<void> {
+  const svc = await getShadowHostDataCoordinator().onApproved(rt);
+  if (!svc) return;
+  try { await svc.publishAllPending(); } catch (e) { warn('shadowHostData.approve.publish', e); }
+}
+
+async function handleShadowHostDataCall(method: string): Promise<unknown> {
+  if (!accountSessionToken) throw Object.assign(new Error('not signed in'), { statusCode: 401 });
+  const svc = await getShadowHostDataService();
+  if (!svc) return { active: false, reason: await getShadowHostDataInactiveReason() };
+  switch (method) {
+    case 'shadowHostDataStatus':
+      return { active: true, ...svc.status() };
+    case 'shadowHostDataSync': {
+      await renewShadowHostLease();
+      const published = await svc.publishAllPending();
+      const commands = await svc.pollAndExecuteCommands();
+      return { active: true, published, commands };
+    }
+    default:
+      throw Object.assign(new Error('unknown shadowHostData method'), { statusCode: 404 });
+  }
+}
+
+/** Best-effort live sync loop (publish pending events + pull/execute commands). */
+function startShadowHostDataLoop(): void {
+  getShadowHostDataCoordinator().startLoop(() => !!accountSessionToken);
 }
 
 const WEB_ROOT = process.env.MAESTRO_WEB_ROOT ? path.resolve(process.env.MAESTRO_WEB_ROOT) : '';
@@ -409,8 +814,14 @@ async function serveWebApp(req: import('node:http').IncomingMessage, res: import
   return true;
 }
 
-// HTTP handler for the WebKit app bundle and design live-preview routes.
+// The ws-host generates its token INSIDE startWsHost, so hold it in a mutable ref the file-preview
+// handler validates against once the host has resolved (requests can only arrive after listen).
+const tokenRef = { value: '' };
+const filePreview = makeFilePreviewHttp({ store, getToken: () => tokenRef.value });
+
+// HTTP handler for the WebKit app bundle, file-preview stream, and design live-preview routes.
 const httpHandler = async (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse): Promise<boolean> => {
+  if (await filePreview(req, res)) return true;
   const url = req.url ?? '';
   if (await serveWebApp(req, res)) return true;
   const m = url.match(/^\/design\/([^/]+)(\/.*)?$/);
@@ -427,14 +838,25 @@ const httpHandler = async (req: import('node:http').IncomingMessage, res: import
 async function boot() {
   const host = await startWsHost(async (method, params) => {
     if (method.startsWith('account')) return await handleAccountCall(method, params);
+    if (method.startsWith('shadowHostData')) return await handleShadowHostDataCall(method);
+    if (method.startsWith('shadowHost')) return await handleShadowHostCall(method, params);
+    // Phase 3D1 (B2): renderer/native → brain screen seam (frame / permission / source
+    // config / capture error). NOT the native screenCapture* methods (those go to Swift).
+    if (method === 'screenFrame' || method === 'screenPermission' || method === 'screenConfigureSource' || method === 'screenCaptureError') return await handleScreenCall(method, params);
     return await dispatch(method, params);
   }, httpHandler);
+  tokenRef.value = host.token; // arm the file-preview route with the real host token
   emitToClients = host.emit;
 
   process.stdout.write(JSON.stringify({ ready: true, port: host.port, token: host.token }) + '\n');
   process.stderr.write(`[sidecar] full dispatch live on 127.0.0.1:${host.port}\n`);
 
   // Best-effort boot resumes (run AFTER the host is up so their events have somewhere to go).
+  // SessionRunQueue recovery: settleOrphanedRuns() (above) already terminalized any
+  // crashed lease OWNERS; now heal each session lease whose owner is terminal/stale and
+  // re-dispatch the promoted (never-started) queued waiter EXACTLY ONCE. A partially-run
+  // owner is never re-run — only queued work that never began.
+  try { engine.recoverSessionRuns(); } catch (e) { warn('recoverSessionRuns', e); }
   try { externalMcp?.start(); } catch (e) { warn('externalMcp.start', e); }
   try { cron.start(); } catch (e) { warn('cron.start', e); }
   try { media.resumeOnBoot(); } catch (e) { warn('media.resumeOnBoot', e); }
@@ -444,9 +866,13 @@ async function boot() {
   if (persistedToken) {
     try { startAccountHost(persistedToken); } catch (e) { warn('account host', e); }
   }
+  try { startShadowHostDataLoop(); } catch (e) { warn('shadowHostData.loop.start', e); }
 
   for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     process.on(sig, () => {
+      try { void stopScreenHostOwner(); } catch { /* noop */ }
+      try { void stopShadowHostData(); } catch { /* noop */ }
+      try { void stopShadowHost(); } catch { /* noop */ }
       try { stopAccountHost(); } catch { /* noop */ }
       try { cron.stop(); } catch { /* noop */ }
       try { externalMcp?.stop(); } catch { /* noop */ }

@@ -76,6 +76,12 @@ describe('waSendMedia: chatId + (path or dataB64)', () => {
   });
 });
 
+describe('WhatsApp reconnect contract', () => {
+  it('advertises an explicit reconnect operation with no parameters', () => {
+    accepts('reconnectWhatsApp', {});
+  });
+});
+
 describe('updateFeedback: id + status (the only accepted patch field)', () => {
   it('requires a valid status', () => {
     accepts('updateFeedback', { id: 'f', status: 'done' });
@@ -214,6 +220,8 @@ describe('session-targeted tools accept both sessionId and id (schema/dispatch p
     rejects('answerQuestion', { answer: 'a' }, { sessionId: 's' });
     accepts('extendQuestion', { sessionId: 's' }, { id: 's' });
     rejects('extendQuestion', {});
+    accepts('cancelQuestion', { sessionId: 's' }, { id: 's' });
+    rejects('cancelQuestion', {});
   });
 });
 

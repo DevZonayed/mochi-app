@@ -9,7 +9,7 @@ export interface NotifCategory { key: string; label: string; kinds: AppEventKind
 
 /** User-facing categories, each mapped to the real AppEvent kinds it covers. */
 export const NOTIF_CATEGORIES: NotifCategory[] = [
-  { key: 'gates', label: 'Gates', kinds: ['approval-created', 'approval-resolved'] },
+  { key: 'gates', label: 'Gates', kinds: ['approval-created', 'approval-resolved', 'job-gated'] },
   { key: 'completions', label: 'Completions', kinds: ['job-done', 'clone-done'] },
   { key: 'failures', label: 'Failures', kinds: ['job-failed', 'clone-failed', 'job-cancelled'] },
   { key: 'media', label: 'Media', kinds: ['asset'] },

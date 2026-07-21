@@ -14,7 +14,11 @@ import type { Store, Asset, AssetKind, PublishDraft } from './store.js';
 
 const EXPORTS_ROOT = path.join(homedir(), 'Maestro', 'Exports');
 
-function kindFromExt(file: string): AssetKind {
+/** Classify an asset kind from a file's EXTENSION. Exported so the Codex-image
+    normalization seam can be regression-tested: an arbitrary/extensionless Codex
+    output must be copied to a `.png/.jpg/.webp` name BEFORE importAsset, or it
+    would classify as 'other' here instead of 'image'. */
+export function kindFromExt(file: string): AssetKind {
   const e = (file.split('.').pop() ?? '').toLowerCase();
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic'].includes(e)) return 'image';
   if (['mp4', 'mov', 'webm', 'm4v'].includes(e)) return 'video';

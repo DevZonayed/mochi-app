@@ -2,14 +2,25 @@
    loaded here: the socket is dependency-injected as a mock, so these tests
    exercise the parts that matter (normalize, capture→store→arm-timer routing,
    send-to-self, connection-state) without touching the network. */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { rmSync } from 'node:fs';
 
-const hoisted = vi.hoisted(() => ({ dir: `/tmp/maestro-store-wa-client-test-${process.pid}` }));
+const hoisted = vi.hoisted(() => ({
+  dir: `/tmp/maestro-store-wa-client-test-${process.pid}`,
+  powerHandlers: {} as Record<string, Array<() => void>>,
+  rmMock: vi.fn(async (...args: unknown[]) => {
+    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    return fs.rm(...args as Parameters<typeof fs.rm>);
+  }),
+}));
 vi.mock('electron', () => ({
   app: { getPath: () => hoisted.dir },
-  powerMonitor: { on: () => {} },
+  powerMonitor: { on: (event: string, cb: () => void) => { (hoisted.powerHandlers[event] ||= []).push(cb); } },
 }));
+vi.mock('node:fs/promises', async () => {
+  const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+  return { ...actual, rm: hoisted.rmMock };
+});
 
 import { Store } from './store.js';
 import { WhatsAppClient, normalizeWaMessage, waSendAllowed } from './whatsapp.js';
@@ -32,6 +43,10 @@ function mockSocket(ownId = '15551234567:3@s.whatsapp.net') {
   return { sock, sent, reads, fire };
 }
 
+function transientClose(code = 500) {
+  return { connection: 'close', lastDisconnect: { error: { output: { statusCode: code } } } };
+}
+
 function textMsg(chatId: string, text: string, opts: { fromMe?: boolean; pushName?: string; ts?: number } = {}) {
   return {
     key: { remoteJid: chatId, fromMe: !!opts.fromMe, id: `id-${text}` },
@@ -41,7 +56,23 @@ function textMsg(chatId: string, text: string, opts: { fromMe?: boolean; pushNam
   };
 }
 
-beforeEach(() => { rmSync(hoisted.dir, { recursive: true, force: true }); });
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (err: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+beforeEach(() => {
+  rmSync(hoisted.dir, { recursive: true, force: true });
+  hoisted.powerHandlers = {};
+  hoisted.rmMock.mockClear();
+  hoisted.rmMock.mockImplementation(async (...args: unknown[]) => {
+    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    return fs.rm(...args as Parameters<typeof fs.rm>);
+  });
+});
+afterEach(() => { vi.useRealTimers(); });
 
 describe('normalizeWaMessage', () => {
   it('normalizes a text DM, converting the timestamp to ms', () => {
@@ -317,6 +348,714 @@ describe('WhatsAppClient — connection + send', () => {
     fire('messages.upsert', { messages: [textMsg('111@s.whatsapp.net', 'via socket')] });
 
     expect(s.getWaTranscript('111@s.whatsapp.net').map(m => m.text)).toEqual(['via socket']);
+  });
+
+  it('reconnects after a generic 500 stream error without QR and preserves linked metadata', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', name: 'Jonayed PA', sendApproved: true, notifyJid: '999@s.whatsapp.net' });
+    const first = mockSocket('15551234567:3@s.whatsapp.net');
+    const second = mockSocket('15551234567:3@s.whatsapp.net');
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.sock : second.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    await client.connect();
+    first.fire('connection.update', { connection: 'open' });
+    first.fire('connection.update', transientClose(500));
+
+    expect(s.whatsappState()).toMatchObject({
+      connected: false,
+      status: 'retrying',
+      jid: '15551234567@s.whatsapp.net',
+      name: 'Jonayed PA',
+      linkedAt: 100,
+      sendApproved: true,
+      notifyJid: '999@s.whatsapp.net',
+    });
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(makeSocket).toHaveBeenCalledTimes(2);
+    second.fire('connection.update', { connection: 'open' });
+
+    expect(s.whatsappState()).toMatchObject({
+      connected: true,
+      status: 'connected',
+      jid: '15551234567@s.whatsapp.net',
+      name: 'Jonayed PA',
+      linkedAt: 100,
+    });
+    expect(s.whatsappState().connectedAt).toEqual(expect.any(Number));
+  });
+
+  it('retries when makeSocket rejects on boot and later succeeds', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', status: 'offline', connected: true });
+    const sock = mockSocket('15551234567:3@s.whatsapp.net');
+    const makeSocket = vi.fn()
+      .mockRejectedValueOnce(new Error('boot network down'))
+      .mockResolvedValueOnce(sock.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    client.resumeOnBoot();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.whatsappState()).toMatchObject({ connected: false, status: 'retrying' });
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(makeSocket).toHaveBeenCalledTimes(2);
+    sock.fire('connection.update', { connection: 'open' });
+    expect(s.whatsappState()).toMatchObject({ connected: true, status: 'connected' });
+  });
+
+  it('continues retrying past five transient failures with one socket attempt and one timer at a time', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net' });
+    const sockets = Array.from({ length: 7 }, () => mockSocket('15551234567:3@s.whatsapp.net'));
+    const makeSocket = vi.fn(async () => sockets[makeSocket.mock.calls.length - 1].sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    await client.connect();
+    for (let i = 0; i < 6; i++) {
+      sockets[i].fire('connection.update', transientClose(500));
+      expect(s.whatsappState().status).toBe('retrying');
+      if (i < 5) await vi.advanceTimersByTimeAsync(s.whatsappState().nextRetryAt! - Date.now());
+    }
+
+    expect(makeSocket).toHaveBeenCalledTimes(6);
+    expect(s.whatsappState().retryAttempt).toBe(6);
+    expect(s.whatsappState().nextRetryAt).toEqual(expect.any(Number));
+  });
+
+  it('ignores stale close events from an old socket after a newer socket is live', async () => {
+    const s = new Store();
+    const first = mockSocket('15551234567:3@s.whatsapp.net');
+    const second = mockSocket('15551234567:3@s.whatsapp.net');
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.sock : second.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    await client.connect();
+    first.fire('connection.update', { connection: 'open' });
+    client.disconnect();
+    await client.reconnect();
+    second.fire('connection.update', { connection: 'open' });
+    first.fire('connection.update', transientClose(500));
+
+    expect(s.whatsappState()).toMatchObject({ connected: true, status: 'connected' });
+    expect(makeSocket).toHaveBeenCalledTimes(2);
+  });
+
+  it('pause cancels retry, persists across restart, and resume reconnects', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net' });
+    const first = mockSocket('15551234567:3@s.whatsapp.net');
+    const second = mockSocket('15551234567:3@s.whatsapp.net');
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.sock : second.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+    await client.connect();
+    first.fire('connection.update', transientClose(500));
+
+    client.disconnect();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+    expect(new Store().whatsappState()).toMatchObject({ status: 'paused', linkedAt: 100 });
+
+    const restartedStore = new Store();
+    const restarted = new WhatsAppClient(restartedStore, vi.fn(), { makeSocket });
+    restarted.resumeOnBoot();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    await restarted.reconnect();
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledTimes(2));
+    second.fire('connection.update', { connection: 'open' });
+    expect(restartedStore.whatsappState()).toMatchObject({ connected: true, status: 'connected' });
+  });
+
+  it('401 unlinks auth state while 440 needs manual attention without wiping auth metadata', async () => {
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', name: 'Me', sendApproved: true });
+    const loggedOut = mockSocket('15551234567:3@s.whatsapp.net');
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => loggedOut.sock });
+    await client.connect();
+    loggedOut.fire('connection.update', transientClose(401));
+    await vi.waitFor(() => expect(s.whatsappState().status).toBe('unlinked'));
+    expect(s.whatsappState()).toMatchObject({ status: 'unlinked', linkedAt: null, jid: null, sendApproved: false });
+
+    s.setWhatsappState({ linkedAt: 200, jid: '15551234567@s.whatsapp.net', name: 'Me', sendApproved: true });
+    const replaced = mockSocket('15551234567:3@s.whatsapp.net');
+    const client2 = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => replaced.sock });
+    await client2.connect();
+    replaced.fire('connection.update', transientClose(440));
+    await vi.waitFor(() => expect(s.whatsappState().status).toBe('needs-attention'));
+    expect(s.whatsappState()).toMatchObject({ status: 'needs-attention', linkedAt: 200, jid: '15551234567@s.whatsapp.net', name: 'Me', sendApproved: true });
+  });
+
+  it('whatsappLink on an already linked account rejects instead of reconnecting', async () => {
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', status: 'offline' });
+    const sock = mockSocket('15551234567:3@s.whatsapp.net');
+    const makeSocket = vi.fn(async () => sock.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    await expect(client.link()).rejects.toMatchObject({ code: 'WA_ALREADY_LINKED', statusCode: 409 });
+    sock.fire('connection.update', { connection: 'open' });
+    expect(makeSocket).not.toHaveBeenCalled();
+    expect(s.whatsappState()).toMatchObject({ connected: false, status: 'offline' });
+  });
+
+  it('whatsappLink on an already connected linked account rejects without cycling the socket', async () => {
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', status: 'connected', connected: true });
+    const sock = mockSocket('15551234567:3@s.whatsapp.net');
+    const makeSocket = vi.fn(async () => sock.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    await expect(client.link()).rejects.toMatchObject({ code: 'WA_ALREADY_LINKED', statusCode: 409 });
+    expect(makeSocket).not.toHaveBeenCalled();
+    expect(s.whatsappState()).toMatchObject({ connected: true, status: 'connected' });
+  });
+
+  it('unlinked reconnect rejects before socket, QR, event, or state mutation', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const emit = vi.fn();
+    const { sock, fire } = mockSocket();
+    const makeSocket = vi.fn(async () => sock);
+    const client = new WhatsAppClient(s, emit, { makeSocket });
+    const before = s.whatsappState();
+
+    await expect(client.reconnect()).rejects.toMatchObject({ code: 'WA_NOT_LINKED', statusCode: 409 });
+    fire('connection.update', { qr: 'stale-qr' });
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(makeSocket).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+    expect(s.whatsappState()).toEqual(before);
+  });
+
+  it('linked reconnect reuses credentials and remains single-flight while connecting', async () => {
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', status: 'offline' });
+    const gate = deferred<ReturnType<typeof mockSocket>>();
+    const makeSocket = vi.fn(async () => (await gate.promise).sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    await expect(Promise.all([client.reconnect(), client.reconnect()])).resolves.toEqual([{ ok: true }, { ok: true }]);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    const linkedSocket = mockSocket('15551234567:3@s.whatsapp.net');
+    gate.resolve(linkedSocket);
+    await vi.waitFor(() => expect(s.whatsappState().status).toBe('connecting'));
+    await Promise.resolve();
+    await Promise.resolve();
+    linkedSocket.fire('connection.update', { connection: 'open' });
+    expect(s.whatsappState()).toMatchObject({ connected: true, status: 'connected', linkedAt: 100 });
+  });
+
+  it('first-time whatsappLink remains the QR path for an unlinked account', async () => {
+    const s = new Store();
+    const { sock, fire } = mockSocket();
+    const makeSocket = vi.fn(async () => sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket, qrToDataUrl: async (qr) => `data:${qr}` });
+
+    const pending = client.link();
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledOnce());
+    await Promise.resolve();
+    await Promise.resolve();
+    fire('connection.update', { qr: 'first-qr' });
+
+    await expect(pending).resolves.toEqual({ method: 'qr', dataUrl: 'data:first-qr' });
+  });
+
+  it('keeps a first-time link pending across transient close retry and accepts the replacement QR', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const first = mockSocket();
+    const second = mockSocket();
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.sock : second.sock);
+    const emit = vi.fn();
+    const client = new WhatsAppClient(s, emit, { makeSocket, qrToDataUrl: async (qr) => `data:${qr}` });
+
+    const pending = client.link();
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledTimes(1));
+    first.fire('connection.update', transientClose(500));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(makeSocket).toHaveBeenCalledTimes(2);
+    second.fire('connection.update', { qr: 'retry-qr' });
+
+    await expect(pending).resolves.toEqual({ method: 'qr', dataUrl: 'data:retry-qr' });
+    expect(emit).toHaveBeenCalledWith('whatsapp-qr', { dataUrl: 'data:retry-qr' });
+  });
+
+  it('resumes an in-progress first-time link after sleep without requiring linked credentials', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const first = mockSocket();
+    const second = mockSocket();
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.sock : second.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket, qrToDataUrl: async (qr) => `data:${qr}` });
+
+    const pending = client.link();
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    await Promise.resolve();
+    hoisted.powerHandlers.suspend?.forEach(cb => cb());
+    hoisted.powerHandlers.resume?.forEach(cb => cb());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(makeSocket).toHaveBeenCalledTimes(2);
+    second.fire('connection.update', { qr: 'wake-qr' });
+
+    await expect(pending).resolves.toEqual({ method: 'qr', dataUrl: 'data:wake-qr' });
+  });
+
+  it('keeps an unresolved first-time link alive across suspend and settles it from exactly one fresh resumed socket', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const emit = vi.fn();
+    const first = deferred<ReturnType<typeof mockSocket>['sock']>();
+    const stale = mockSocket();
+    const resumed = mockSocket();
+    stale.sock.end = vi.fn();
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.promise : resumed.sock);
+    const client = new WhatsAppClient(s, emit, { makeSocket, qrToDataUrl: async qr => `data:${qr}` });
+
+    const pending = client.link();
+    const settled = vi.fn();
+    pending.then(settled, settled);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    hoisted.powerHandlers.suspend?.forEach(cb => cb());
+    hoisted.powerHandlers.resume?.forEach(cb => cb());
+    hoisted.powerHandlers.resume?.forEach(cb => cb());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    first.resolve(stale.sock);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledTimes(2));
+    expect(stale.sock.end).toHaveBeenCalledTimes(1);
+    stale.fire('connection.update', { qr: 'stale-sleep-qr' });
+    stale.fire('connection.update', { connection: 'open' });
+    expect(settled).not.toHaveBeenCalled();
+    expect(client.currentQr()).toBeNull();
+    expect(emit).not.toHaveBeenCalledWith('whatsapp-qr', expect.anything());
+    expect(s.whatsappState()).toMatchObject({ connected: false, status: 'connecting', linkedAt: null });
+
+    resumed.fire('connection.update', { qr: 'fresh-wake-qr' });
+    await expect(pending).resolves.toEqual({ method: 'qr', dataUrl: 'data:fresh-wake-qr' });
+    expect(emit).toHaveBeenCalledWith('whatsapp-qr', { dataUrl: 'data:fresh-wake-qr' });
+  });
+
+  it('does not expire a first-time pending link timeout during OS sleep', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const emit = vi.fn();
+    const first = deferred<ReturnType<typeof mockSocket>['sock']>();
+    const stale = mockSocket();
+    const fresh = mockSocket();
+    stale.sock.end = vi.fn();
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.promise : fresh.sock);
+    const client = new WhatsAppClient(s, emit, { makeSocket, qrToDataUrl: async qr => `data:${qr}` });
+
+    const pending = client.link();
+    const settled = vi.fn();
+    pending.then(settled, settled);
+    await vi.advanceTimersByTimeAsync(59_000);
+    hoisted.powerHandlers.suspend?.forEach(cb => cb());
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(settled).not.toHaveBeenCalled();
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    hoisted.powerHandlers.resume?.forEach(cb => cb());
+    first.resolve(stale.sock);
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledTimes(2));
+    expect(stale.sock.end).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(settled).not.toHaveBeenCalled();
+
+    fresh.fire('connection.update', { qr: 'after-long-sleep' });
+    await expect(pending).resolves.toEqual({ method: 'qr', dataUrl: 'data:after-long-sleep' });
+    expect(emit).toHaveBeenCalledWith('whatsapp-qr', { dataUrl: 'data:after-long-sleep' });
+  });
+
+  it('keeps a first-time pending link when a pre-suspend makeSocket rejects after resume queues a fresh connect', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const first = deferred<ReturnType<typeof mockSocket>['sock']>();
+    const fresh = mockSocket();
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.promise : fresh.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket, qrToDataUrl: async qr => `data:${qr}` });
+
+    const pending = client.link();
+    const settled = vi.fn();
+    pending.then(settled, settled);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+    hoisted.powerHandlers.suspend?.forEach(cb => cb());
+    hoisted.powerHandlers.resume?.forEach(cb => cb());
+    first.reject(new Error('stale pre-suspend connect failed'));
+    await vi.advanceTimersByTimeAsync(1000);
+
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledTimes(2));
+    expect(settled).not.toHaveBeenCalled();
+    fresh.fire('connection.update', { qr: 'fresh-after-stale-reject' });
+    await expect(pending).resolves.toEqual({ method: 'qr', dataUrl: 'data:fresh-after-stale-reject' });
+  });
+
+  it('ignores a pre-suspend linked reconnect socket and queues exactly one fresh socket on resume', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', status: 'offline' });
+    const first = deferred<ReturnType<typeof mockSocket>['sock']>();
+    const stale = mockSocket('15551234567:3@s.whatsapp.net');
+    const fresh = mockSocket('15551234567:3@s.whatsapp.net');
+    stale.sock.end = vi.fn();
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.promise : fresh.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    await client.reconnect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+    hoisted.powerHandlers.suspend?.forEach(cb => cb());
+    hoisted.powerHandlers.resume?.forEach(cb => cb());
+    hoisted.powerHandlers.resume?.forEach(cb => cb());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    first.resolve(stale.sock);
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledTimes(2));
+    expect(stale.sock.end).toHaveBeenCalledTimes(1);
+    stale.fire('connection.update', { connection: 'open' });
+    expect(s.whatsappState()).toMatchObject({ connected: false, status: 'connecting', linkedAt: 100 });
+
+    fresh.fire('connection.update', { connection: 'open' });
+    expect(s.whatsappState()).toMatchObject({ connected: true, status: 'connected', linkedAt: 100 });
+  });
+
+  it('does not start a fresh socket while still suspended when a stale in-flight attempt resolves', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', status: 'offline' });
+    const first = deferred<ReturnType<typeof mockSocket>['sock']>();
+    const stale = mockSocket('15551234567:3@s.whatsapp.net');
+    const fresh = mockSocket('15551234567:3@s.whatsapp.net');
+    stale.sock.end = vi.fn();
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.promise : fresh.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    await client.reconnect();
+    await vi.advanceTimersByTimeAsync(0);
+    hoisted.powerHandlers.suspend?.forEach(cb => cb());
+    first.resolve(stale.sock);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(stale.sock.end).toHaveBeenCalledTimes(1);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    hoisted.powerHandlers.resume?.forEach(cb => cb());
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledTimes(2));
+    fresh.fire('connection.update', { connection: 'open' });
+    expect(s.whatsappState()).toMatchObject({ connected: true, status: 'connected', linkedAt: 100 });
+  });
+
+  it('rejects a pending QR link immediately on pause so the UI can clear busy state', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const { sock } = mockSocket();
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => sock });
+
+    const pending = client.link();
+    await vi.advanceTimersByTimeAsync(0);
+    client.disconnect();
+
+    await expect(pending).rejects.toMatchObject({ code: 'WA_LINK_CANCELLED', reason: 'paused' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.whatsappState()).toMatchObject({ connected: false, status: 'unlinked' });
+  });
+
+  it('rejects a link cancelled during deferred socket creation and stale connect cannot create a pending QR timer', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const make = deferred<ReturnType<typeof mockSocket>['sock']>();
+    const emit = vi.fn();
+    const client = new WhatsAppClient(s, emit, { makeSocket: async () => make.promise, qrToDataUrl: async qr => `qr:${qr}` });
+
+    const pending = client.link();
+    await vi.advanceTimersByTimeAsync(0);
+    client.disconnect();
+
+    await expect(pending).rejects.toMatchObject({ code: 'WA_LINK_CANCELLED', reason: 'paused' });
+    const stale = mockSocket();
+    make.resolve(stale.sock);
+    await vi.advanceTimersByTimeAsync(0);
+    stale.fire('connection.update', { qr: 'stale-after-pause' });
+    await vi.advanceTimersByTimeAsync(61_000);
+
+    expect(client.currentQr()).toBeNull();
+    expect(emit).not.toHaveBeenCalledWith('whatsapp-qr', expect.anything());
+    expect(s.whatsappState()).toMatchObject({ connected: false, status: 'unlinked' });
+  });
+
+  it('rejects a link cancelled by unlink during deferred socket creation before auth deletion resolves', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const make = deferred<ReturnType<typeof mockSocket>['sock']>();
+    let finishRm!: () => void;
+    hoisted.rmMock.mockImplementation(async () => { await new Promise<void>(resolve => { finishRm = resolve; }); });
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => make.promise });
+
+    const pending = client.link();
+    await vi.advanceTimersByTimeAsync(0);
+    const unlinking = client.unlink();
+
+    await expect(pending).rejects.toMatchObject({ code: 'WA_LINK_CANCELLED', reason: 'unlinked' });
+    const stale = mockSocket();
+    make.resolve(stale.sock);
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(client.currentQr()).toBeNull();
+    expect(s.whatsappState().status).not.toBe('connected');
+
+    finishRm();
+    await unlinking;
+    expect(s.whatsappState()).toMatchObject({ connected: false, status: 'unlinked', linkedAt: null, jid: null });
+  });
+
+  it('replacing a pending QR link rejects only the old request and its timeout cannot affect the newer link', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const { sock, fire } = mockSocket();
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => sock, qrToDataUrl: async qr => `qr:${qr}` });
+
+    const oldPending = client.link();
+    await vi.advanceTimersByTimeAsync(0);
+    const newPending = client.link();
+    await expect(oldPending).rejects.toMatchObject({ code: 'WA_LINK_CANCELLED', reason: 'replaced' });
+
+    await vi.advanceTimersByTimeAsync(59_999);
+    fire('connection.update', { qr: 'new-qr' });
+
+    await expect(newPending).resolves.toEqual({ method: 'qr', dataUrl: 'qr:new-qr' });
+  });
+
+  it('ignores stale old-generation QR conversion after a generation change and keeps the newer request pending until its QR', async () => {
+    const s = new Store();
+    const first = mockSocket();
+    const second = mockSocket();
+    const qr1 = deferred<string>();
+    const qr2 = deferred<string>();
+    const qrToDataUrl = vi.fn((qr: string) => qr === 'old' ? qr1.promise : qr2.promise);
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.sock : second.sock);
+    const emit = vi.fn();
+    const client = new WhatsAppClient(s, emit, { makeSocket, qrToDataUrl });
+
+    await client.connect();
+    const oldPending = client.link();
+    first.fire('connection.update', { qr: 'old' });
+    await vi.waitFor(() => expect(qrToDataUrl).toHaveBeenCalledWith('old'));
+
+    client.disconnect();
+    await expect(oldPending).rejects.toMatchObject({ code: 'WA_LINK_CANCELLED', reason: 'paused' });
+    await client.connect();
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledTimes(2));
+    const newPending = client.link();
+    await Promise.resolve();
+    second.fire('connection.update', { qr: 'new' });
+    await vi.waitFor(() => expect(qrToDataUrl).toHaveBeenCalledWith('new'));
+
+    qr1.resolve('qr:old');
+    await Promise.resolve();
+    expect(client.currentQr()).toBeNull();
+    expect(emit).not.toHaveBeenCalledWith('whatsapp-qr', { dataUrl: 'qr:old' });
+
+    qr2.resolve('qr:new');
+    await expect(newPending).resolves.toEqual({ method: 'qr', dataUrl: 'qr:new' });
+    expect(client.currentQr()).toBe('qr:new');
+    expect(emit).toHaveBeenCalledWith('whatsapp-qr', { dataUrl: 'qr:new' });
+  });
+
+  it('only lets the newest QR conversion in one generation settle and update lastQr', async () => {
+    const s = new Store();
+    const { sock, fire } = mockSocket();
+    const slow = deferred<string>();
+    const fast = deferred<string>();
+    const qrToDataUrl = vi.fn((qr: string) => qr === 'slow' ? slow.promise : fast.promise);
+    const emit = vi.fn();
+    const makeSocket = vi.fn(async () => sock);
+    const client = new WhatsAppClient(s, emit, { makeSocket, qrToDataUrl });
+
+    await client.connect();
+    const pending = client.link();
+    fire('connection.update', { qr: 'slow' });
+    fire('connection.update', { qr: 'fast' });
+    await vi.waitFor(() => expect(qrToDataUrl).toHaveBeenCalledTimes(2));
+
+    slow.resolve('qr:slow');
+    await Promise.resolve();
+    expect(client.currentQr()).toBeNull();
+    expect(emit).not.toHaveBeenCalledWith('whatsapp-qr', { dataUrl: 'qr:slow' });
+
+    fast.resolve('qr:fast');
+    await expect(pending).resolves.toEqual({ method: 'qr', dataUrl: 'qr:fast' });
+    expect(client.currentQr()).toBe('qr:fast');
+    expect(emit).toHaveBeenCalledWith('whatsapp-qr', { dataUrl: 'qr:fast' });
+  });
+
+  it('continues emitting QR rotations after the initial link promise resolves', async () => {
+    const s = new Store();
+    const { sock, fire } = mockSocket();
+    const emit = vi.fn();
+    const client = new WhatsAppClient(s, emit, { makeSocket: async () => sock, qrToDataUrl: async qr => `qr:${qr}` });
+
+    const pending = client.link();
+    await Promise.resolve();
+    await Promise.resolve();
+    fire('connection.update', { qr: 'first' });
+    await expect(pending).resolves.toEqual({ method: 'qr', dataUrl: 'qr:first' });
+
+    fire('connection.update', { qr: 'rotated' });
+    await vi.waitFor(() => expect(client.currentQr()).toBe('qr:rotated'));
+    expect(emit).toHaveBeenCalledWith('whatsapp-qr', { dataUrl: 'qr:rotated' });
+  });
+
+  it('open settles a pending QR link and leaves no old timeout that can later reject', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    const { sock, fire } = mockSocket();
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket: async () => sock });
+
+    const pending = client.link();
+    await vi.advanceTimersByTimeAsync(0);
+    fire('connection.update', { connection: 'open' });
+
+    await expect(pending).resolves.toEqual({ method: 'connected' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.whatsappState()).toMatchObject({ connected: true, status: 'connected' });
+  });
+
+  it('unlink is single-flight and blocks reconnect/socket creation until auth deletion completes', async () => {
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', status: 'connected', connected: true });
+    const { sock } = mockSocket();
+    const makeSocket = vi.fn(async () => sock);
+    let finishRm!: () => void;
+    const rmStarted = vi.fn();
+    hoisted.rmMock.mockImplementation(async () => {
+      rmStarted();
+      await new Promise<void>(resolve => { finishRm = resolve; });
+    });
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    const first = client.unlink();
+    const second = client.unlink();
+    await vi.waitFor(() => expect(rmStarted).toHaveBeenCalledTimes(1));
+
+    await expect(client.reconnect()).rejects.toMatchObject({ code: 'WA_UNLINK_IN_PROGRESS' });
+    await expect(client.connect()).rejects.toMatchObject({ code: 'WA_UNLINK_IN_PROGRESS' });
+    await expect(client.link()).rejects.toMatchObject({ code: 'WA_UNLINK_IN_PROGRESS' });
+    expect(makeSocket).not.toHaveBeenCalled();
+
+    finishRm();
+    await Promise.all([first, second]);
+    expect(hoisted.rmMock).toHaveBeenCalledTimes(1);
+    expect(s.whatsappState()).toMatchObject({ connected: false, status: 'unlinked', linkedAt: null, jid: null });
+
+    await expect(client.reconnect()).rejects.toMatchObject({ code: 'WA_NOT_LINKED', statusCode: 409 });
+    expect(makeSocket).not.toHaveBeenCalled();
+  });
+
+  it('sets the unlink guard before synchronous socket release can re-enter reconnect', async () => {
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', status: 'connected', connected: true });
+    let reentrant: Promise<unknown> | null = null;
+    const { sock } = mockSocket();
+    const makeSocket = vi.fn(async () => sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+    await client.connect();
+    sock.end = () => { reentrant = client.reconnect(); reentrant.catch(() => {}); };
+
+    await client.unlink();
+
+    expect(reentrant).not.toBeNull();
+    await expect(reentrant).rejects.toMatchObject({ code: 'WA_UNLINK_IN_PROGRESS' });
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+    expect(s.whatsappState()).toMatchObject({ status: 'unlinked', linkedAt: null, jid: null });
+  });
+
+  it('401 unlink blocks reconnect until auth deletion completes and remains unlinked afterward', async () => {
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', name: 'Me', sendApproved: true });
+    let finishRm!: () => void;
+    hoisted.rmMock.mockImplementation(async () => { await new Promise<void>(resolve => { finishRm = resolve; }); });
+    const first = mockSocket('15551234567:3@s.whatsapp.net');
+    const second = mockSocket('15551234567:3@s.whatsapp.net');
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.sock : second.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+    await client.connect();
+
+    first.fire('connection.update', transientClose(401));
+    await vi.waitFor(() => expect(hoisted.rmMock).toHaveBeenCalledTimes(1));
+    await expect(client.reconnect()).rejects.toMatchObject({ code: 'WA_UNLINK_IN_PROGRESS' });
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    finishRm();
+    await vi.waitFor(() => expect(s.whatsappState().status).toBe('unlinked'));
+    expect(s.whatsappState()).toMatchObject({ linkedAt: null, jid: null, sendApproved: false });
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+  });
+
+  it('suspend clears retry before releasing the socket and resume reconnects wanted sessions exactly once', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net' });
+    const first = mockSocket('15551234567:3@s.whatsapp.net');
+    const second = mockSocket('15551234567:3@s.whatsapp.net');
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.sock : second.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+    await client.connect();
+    first.fire('connection.update', transientClose(500));
+    expect(s.whatsappState().status).toBe('retrying');
+
+    hoisted.powerHandlers.suspend?.forEach(cb => cb());
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    hoisted.powerHandlers.resume?.forEach(cb => cb());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(makeSocket).toHaveBeenCalledTimes(2);
+    hoisted.powerHandlers.resume?.forEach(cb => cb());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(makeSocket).toHaveBeenCalledTimes(2);
+  });
+
+  it('queues resume when pause invalidates an in-flight socket creation before it settles', async () => {
+    vi.useFakeTimers();
+    const s = new Store();
+    s.setWhatsappState({ linkedAt: 100, jid: '15551234567@s.whatsapp.net', status: 'offline' });
+    const first = deferred<ReturnType<typeof mockSocket>['sock']>();
+    const second = mockSocket('15551234567:3@s.whatsapp.net');
+    const makeSocket = vi.fn(async () => makeSocket.mock.calls.length === 1 ? first.promise : second.sock);
+    const client = new WhatsAppClient(s, vi.fn(), { makeSocket });
+
+    const firstConnect = client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+    client.disconnect();
+    await client.reconnect();
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+
+    const stale = mockSocket('15551234567:3@s.whatsapp.net');
+    first.resolve(stale.sock);
+    await firstConnect;
+    await vi.waitFor(() => expect(makeSocket).toHaveBeenCalledTimes(2));
+    second.fire('connection.update', { connection: 'open' });
+
+    expect(s.whatsappState()).toMatchObject({ connected: true, status: 'connected', linkedAt: 100 });
   });
 });
 

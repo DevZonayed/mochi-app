@@ -9,6 +9,8 @@ import { Card, Mono } from '../ui';
 import { api, type Approval, type ApprovalKind, type Project } from '../api';
 import { biometricGateEnabled, confirmBiometric } from '../biometrics';
 import { pullSync, pullSyncIfStale, useSyncStore } from '../syncStore';
+import { requireShadowController } from '../controllerMode';
+import { SecureControllerBlocked } from './SecureControllerBlocked';
 
 type TintKey = 'blue' | 'purple' | 'green' | 'orange' | 'teal' | 'indigo' | 'red';
 type Platform = 'x' | 'linkedin';
@@ -289,7 +291,19 @@ function GateCard({ g, approving, onApprove, onReject }: { g: Gate; approving: b
   );
 }
 
+/**
+ * F2 defense-in-depth: while secure-controller mode is active the legacy tree is
+ * unmounted at the ROOT (this screen never mounts). This guard wrapper blocks the
+ * direct-server `api.approveApproval` / `api.denyApproval` mutation surface if a stray
+ * navigation ever reached here — `requireShadowController()` holds an enrolled OR
+ * revoked/expired controller out of the legacy authority.
+ */
 export function ApprovalsScreen() {
+  if (requireShadowController()) return <SecureControllerBlocked />;
+  return <ApprovalsScreenInner />;
+}
+
+function ApprovalsScreenInner() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
   // Pending approvals + projects come from the unified SyncStore — live SSE

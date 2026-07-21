@@ -130,8 +130,17 @@ export class TelegramBot {
       if (!prompt) { this.reply(chatId, 'Send /run followed by what you want done.'); return; }
       const project = (binding.projectId ? this.store.getProject(binding.projectId) : undefined) ?? this.store.listProjects()[0];
       if (!project) { this.reply(chatId, 'No project to run in yet. Create one in Mochlet first.'); return; }
-      const job = this.store.createJob(project.id, prompt, `Telegram: ${prompt.slice(0, 40)}`, 'balanced');
+      // TRIGGER IDEMPOTENCY: Telegram can re-deliver the same update; key by chat +
+      // message id so a retried delivery resolves to the ORIGINAL job (no second run).
+      const messageId = (msg as { message_id?: number }).message_id;
+      const idemKey = messageId != null ? `tg:${chatId}:${messageId}` : null;
+      const jobSpec = { projectId: project.id, input: prompt, title: `Telegram: ${prompt.slice(0, 40)}`, effort: 'balanced' as const, intent: { effort: 'balanced' as const, plan: false, goal: false, browser: false } };
+      const claim = idemKey
+        ? this.store.claimIdempotentJob(idemKey, jobSpec)
+        : { job: this.store.createJob(jobSpec.projectId, jobSpec.input, jobSpec.title, jobSpec.effort, undefined, undefined, undefined, undefined, jobSpec.intent), duplicate: false };
+      const job = claim.job;
       this.emit('job', job);
+      if (claim.duplicate) { this.reply(chatId, `▶️ Already running that — ${job.title}.`); return; }
       this.reply(chatId, `▶️ On it — running in ${project.name}…`);
       void this.engine.run(job.id).then(done => {
         if (binding.permissions.receiveReports) {

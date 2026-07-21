@@ -31,14 +31,23 @@ export const DEVICE_PLATFORM = Platform.OS;
 /* ── Session token ─────────────────────────────────────────────────────── */
 
 let sessionToken = getStr(SESSION_TOKEN);
+const sessionSubs = new Set<() => void>();
 export function getSessionToken(): string { return sessionToken; }
 export function setSessionToken(token: string): void {
-  sessionToken = (token ?? '').trim();
+  const next = (token ?? '').trim();
+  if (next === sessionToken) return;
+  sessionToken = next;
   setStr(SESSION_TOKEN, sessionToken);
+  // Notify: a sign-in / sign-out / account switch changed the authenticated identity, even
+  // when the active host id is unchanged. Consumers (e.g. the shadow controller) reset so no
+  // prior-account scope key / timer / subscription lingers.
+  for (const cb of sessionSubs) { try { cb(); } catch { /* ignore broken listener */ } }
 }
 /** Re-read the token from storage after async hydration (see storage.hydrate). */
 export function reloadSessionToken(): void { sessionToken = getStr(SESSION_TOKEN); }
 export function isAuthed(): boolean { return !!sessionToken; }
+/** Subscribe to authenticated-identity (session token) changes — sign-in/out/account switch. */
+export function subscribeSession(cb: () => void): () => void { sessionSubs.add(cb); return () => { sessionSubs.delete(cb); }; }
 
 /* ── Per-device identity ────────────────────────────────────────────────── */
 

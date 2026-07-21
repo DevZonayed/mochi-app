@@ -9,11 +9,14 @@ function fakeStore(opts: { jobs?: any[]; projects?: any[]; sessions?: any[] } = 
   const projects = opts.projects ?? [{ id: 'p1', name: 'Proj One', kind: 'coding', color: '#abc' }];
   const sessions = opts.sessions ?? [{ id: 's1', projectId: 'p1', title: 'Chat 1', updatedAt: 2 }];
   const jobs = opts.jobs ?? [];
+  const idempotent = new Map<string, string>();
   return {
     extensionToken: TOKEN,
     listProjects: () => projects,
     listSessions: (pid?: string) => sessions.filter((s: any) => !pid || s.projectId === pid),
     listJobs: (pid?: string, sid?: string) => jobs.filter((j: any) => (!pid || j.projectId === pid) && (!sid || j.sessionId === sid)),
+    idempotentJobIdFor: (key: string) => idempotent.get(key),
+    __claimIdempotent: (key: string, jobId: string) => idempotent.set(key, jobId),
   };
 }
 
@@ -145,6 +148,25 @@ describe('ExtensionBridge', () => {
     expect(String(reply.error)).toMatch(/busy/i);
     // Critically: neither cancelJob NOR sendChat was called — the running turn is untouched.
     expect(calls.map(c => c.method)).toEqual([]);
+  });
+
+  it('routes send_message retry with known idempotencyKey through sendChat even while busy', async () => {
+    const calls: { method: string; params: any }[] = [];
+    const dispatch = async (method: string, params: any) => {
+      calls.push({ method, params });
+      if (method === 'sendChat') return { session: { id: 's1' }, job: { id: 'original-job' } };
+      return { ok: true };
+    };
+    const store = fakeStore({ jobs: [{ id: 'original-job', projectId: 'p1', sessionId: 's1', status: 'running' }] });
+    store.__claimIdempotent('chat:msg-1', 'original-job');
+    const { port } = startBridge(store, dispatch);
+    const a = await open(port, hello('a', 'A'));
+    await waitFor(() => lastOfType(a.msgs, 'welcome'));
+    a.ws.send(JSON.stringify({ id: 6, type: 'send_message', params: { projectId: 'p1', sessionId: 's1', text: 'hello retry', idempotencyKey: 'msg-1' } }));
+    const reply = await waitFor(() => a.msgs.find(m => m.id === 6));
+    expect(reply.ok).toBe(true);
+    expect(reply.result).toEqual({ sessionId: 's1', jobId: 'original-job' });
+    expect(calls).toEqual([{ method: 'sendChat', params: { projectId: 'p1', sessionId: 's1', text: 'hello retry', idempotencyKey: 'msg-1' } }]);
   });
 
   it('routes send_message → just sendChat when the session is idle (still happy-path)', async () => {

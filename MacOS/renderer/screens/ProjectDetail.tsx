@@ -18,7 +18,7 @@ import {
   Switch,
   Spinner,
   EffortDial,
-  EFFORT_EST,
+  EFFORT_DEPTH,
   EFFORT_META,
   ModelSwitcher,
   ProviderGlyph,
@@ -28,9 +28,10 @@ import {
 import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
-import { OpenPathContext, pathIsInside, type OpenPathFn } from '../lib/openPath';
+import { OpenPathContext, type OpenPathFn } from '../lib/openPath';
 import { displayCodename } from '../lib/git-types';
 import { canDrainQueue } from '../lib/queue-drain';
+import { projectPendingQuestions } from '../lib/question-projection';
 import { GitOpsDock } from '../components/GitOpsDock';
 import { SessionStateDot, SessionActivityDot } from './SessionStateDot';
 import { useSession, useSessionGitState } from '../lib/useSessionGitState';
@@ -331,7 +332,7 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 }
 
 /* ───────────────── shared job atoms (from pd-jobs.jsx) ───────────────── */
-type JobStatus = 'running' | 'gated' | 'scheduled' | 'done' | 'failed';
+type JobStatus = 'running' | 'scheduled' | 'done' | 'failed' | 'gated';
 
 const TRIGGER_ICON: Record<string, IconName> = { hand: 'play', clock: 'clock', chat: 'command', webhook: 'bolt' };
 const TRIGGER_LABEL: Record<string, string> = { hand: 'Manual', clock: 'Scheduled', chat: 'From chat', webhook: 'Webhook' };
@@ -339,10 +340,10 @@ const TRIGGER_LABEL: Record<string, string> = { hand: 'Manual', clock: 'Schedule
 function JobStatusIcon({ status }: { status: JobStatus }) {
   const map: Record<JobStatus, { tint: string; node: React.ReactNode }> = {
     running:   { tint: 'var(--purple)', node: <Spinner size={13} color="var(--purple)" /> },
-    gated:     { tint: 'var(--orange)', node: <Icon name="enter" size={15} /> },
     scheduled: { tint: 'var(--teal)',   node: <Icon name="clock" size={15} /> },
     done:      { tint: 'var(--green)',  node: <Icon name="check" size={14} stroke={2.6} /> },
     failed:    { tint: 'var(--red)',    node: <Icon name="x" size={14} stroke={2.6} /> },
+    gated:     { tint: 'var(--orange)', node: <Icon name="alert" size={14} stroke={2.4} /> },
   };
   const s = map[status] || map.done;
   return (
@@ -392,6 +393,7 @@ const API_STATUS_TO_LOCAL: Record<Job['status'], JobStatus> = {
   done: 'done',
   failed: 'failed',
   cancelled: 'failed',
+  gated: 'gated',
 };
 
 function relativeTime(ts: number): string {
@@ -430,7 +432,6 @@ const JOB_FILTERS: { key: string; label: string }[] = [
   { key: 'all', label: 'All' },
   { key: 'running', label: 'Running' },
   { key: 'scheduled', label: 'Scheduled' },
-  { key: 'gated', label: 'Gated' },
   { key: 'failed', label: 'Failed' },
 ];
 
@@ -481,7 +482,7 @@ function JobsTab({ jobs }: { jobs: ProjectJob[] }) {
               <span style={{ font: '500 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{j.name}</span>
             </span>
             <span><ShapeChip shape={j.shape} /></span>
-            <span style={{ font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: j.status === 'failed' ? 'var(--red)' : j.status === 'gated' ? 'var(--orange)' : 'var(--ink-secondary)', textTransform: 'capitalize' }}>{j.status}</span>
+            <span style={{ font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: j.status === 'failed' ? 'var(--red)' : 'var(--ink-secondary)', textTransform: 'capitalize' }}>{j.status}</span>
             <span style={{ textAlign: 'right', font: '600 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink)' }}>{j.cost === '—' ? '—' : '$' + j.cost}</span>
             <span style={{ textAlign: 'right', font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)', whiteSpace: 'nowrap' }}>{j.started}</span>
             <span style={{ textAlign: 'right', font: '500 var(--fs-footnote)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{j.duration}</span>
@@ -493,21 +494,12 @@ function JobsTab({ jobs }: { jobs: ProjectJob[] }) {
 }
 
 /* ───────────────── Overview tab (from pd-overview.jsx) ───────────────── */
-interface AutonomyMode { key: string; label: string; hint: string }
-const AUTONOMY: AutonomyMode[] = [
-  { key: 'plan',   label: 'Plan first', hint: 'Agent proposes a plan; you approve before it runs.' },
-  { key: 'gated',  label: 'Gated',      hint: 'Runs freely but stops at merge / publish / spend gates.' },
-  { key: 'unatt',  label: 'Unattended', hint: 'Runs end-to-end. Only hard guardrails can stop it.' },
-];
-
 function GoalComposer({ projectId, onRun }: { projectId: string | null; onRun: () => void }) {
   const [goal, setGoal] = React.useState('');
   const [effort, setEffort] = React.useState<EffortStop>('BALANCED');
   const [engine, setEngine] = React.useState('auto');
-  const [autonomy, setAutonomy] = React.useState('gated');
   const [running, setRunning] = React.useState(false);
-  const est = EFFORT_EST[effort];
-  const ai = AUTONOMY.findIndex(a => a.key === autonomy);
+  const depth = EFFORT_DEPTH[effort];
 
   const run = async () => {
     const text = goal.trim();
@@ -565,81 +557,14 @@ function GoalComposer({ projectId, onRun }: { projectId: string | null; onRun: (
           <ModelSwitcher value={engine} onChange={setEngine} compact />
         </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-          <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)' }}>Autonomy</span>
-          <div style={{ position: 'relative', display: 'inline-flex', padding: 2, background: 'var(--fill-secondary)', borderRadius: 9 }}>
-            <div style={{ position: 'absolute', top: 2, bottom: 2, left: `calc(${ai * 33.333}% + 2px)`, width: `calc(33.333% - 4px)`,
-              background: 'var(--bg-elevated)', borderRadius: 7, boxShadow: '0 1px 3px rgba(0,0,0,0.14)', transition: 'left 280ms var(--spring)' }} />
-            {AUTONOMY.map(a => (
-              <button key={a.key} onClick={() => setAutonomy(a.key)} title={a.hint} style={{
-                position: 'relative', zIndex: 1, padding: '6px 13px', font: '700 11px/1 var(--font-text)', letterSpacing: '0.03em',
-                color: autonomy === a.key ? 'var(--ink)' : 'var(--ink-secondary)', cursor: 'pointer', whiteSpace: 'nowrap',
-              }}>{a.label}</button>
-            ))}
-          </div>
-        </div>
-
         <span style={{ flex: 1 }} />
 
-        {/* effort guide — runs on your subscription, so no per-run dollar estimate */}
         <div style={{ textAlign: 'right' }}>
           <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 5 }}>Depth</div>
           <div key={effort} className="estimate" style={{ font: '600 var(--fs-callout)/1 var(--font-mono)', color: 'var(--ink)' }}>
-            ~{est.mins} min <span style={{ color: 'var(--ink-tertiary)', fontWeight: 400 }}>at {effort}</span>
+            {depth.label} <span style={{ color: 'var(--ink-tertiary)', fontWeight: 400 }}>{depth.detail}</span>
           </div>
         </div>
-      </div>
-
-      <div style={{ marginTop: 12, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-        {AUTONOMY[ai].hint}
-      </div>
-    </div>
-  );
-}
-
-interface SubProject { id: string; name: string; branch: string; tint: string; spent: number; cap: number; jobs: number }
-const SUBPROJECTS: SubProject[] = [
-  { id: 's1', name: 'Auth service', branch: 'auth-refactor', tint: 'var(--blue)', spent: 8.20, cap: 20, jobs: 1 },
-  { id: 's2', name: 'Rate limiter', branch: 'ratelimit',     tint: 'var(--purple)', spent: 2.10, cap: 15, jobs: 1 },
-  { id: 's3', name: 'API docs',     branch: 'docs-site',     tint: 'var(--teal)', spent: 4.60, cap: 10, jobs: 0 },
-  { id: 's4', name: 'CI pipeline',  branch: 'ci-hardening',  tint: 'var(--indigo)', spent: 3.50, cap: 12, jobs: 0 },
-];
-
-function SubProjects() {
-  return (
-    <div>
-      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 12 }}>
-        <ZoneLabel icon="gitMerge" tint="var(--blue)">Sub-projects · {SUBPROJECTS.length}</ZoneLabel>
-        <span style={{ flex: 1 }} />
-        <button className="link-btn" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--blue)' }}>
-          <Icon name="plus" size={14} stroke={2.4} /> New branch
-        </button>
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(208px, 1fr))', gap: 12 }}>
-        {SUBPROJECTS.map(s => {
-          const pct = Math.min(100, (s.spent / s.cap) * 100);
-          return (
-            <div key={s.id} className="sub-card" style={{
-              background: 'var(--bg-elevated)', borderRadius: 14, border: '0.5px solid var(--separator)',
-              boxShadow: 'var(--card-shadow)', padding: 14, cursor: 'pointer',
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-                <span style={{ width: 8, height: 8, borderRadius: 4, background: s.tint, flexShrink: 0 }} />
-                <span style={{ font: '600 var(--fs-callout)/1.2 var(--font-text)', color: 'var(--ink)', flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.name}</span>
-                {s.jobs > 0 && <span className="breathe" style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--purple)' }} />}
-              </div>
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', marginBottom: 12 }}>
-                <Icon name="gitMerge" size={12} /> {s.branch}
-              </div>
-              <div style={{ height: 4, borderRadius: 2, background: 'var(--fill-secondary)', overflow: 'hidden', marginBottom: 6 }}>
-                <div style={{ width: `${pct}%`, height: '100%', borderRadius: 2, background: s.tint }} />
-              </div>
-              <div style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-secondary)' }}>
-                <b style={{ color: 'var(--ink)', fontWeight: 600 }}>${s.spent.toFixed(2)}</b> / ${s.cap}
-              </div>
-            </div>
-          );
-        })}
       </div>
     </div>
   );
@@ -667,32 +592,6 @@ function RecentJobs({ jobs }: { jobs: ProjectJob[] }) {
 }
 
 /* ───────────────── Instructions tab (from pd-tabs.jsx) ───────────────── */
-const INSTRUCTION_DOC = `You maintain the Atlas API — a TypeScript service on Fastify + Postgres.
-
-Architecture
-Keep handlers thin. Business logic lives in services/, data access in repositories/. Never import a repository directly from a route.
-
-Style
-Match the existing code. Prefer composition over inheritance. No new dependencies without noting why in the PR description.
-
-Testing
-Every behavioral change ships with a test. Run the suite before opening a PR; a red suite never reaches review.
-
-Pull requests
-One concern per PR. Write a plain-language summary a reviewer can skim in 30 seconds. Link the issue.`;
-
-const RESOLVED: { origin: string; tint: string; text: string }[] = [
-  { origin: 'Workspace', tint: 'var(--indigo)', text: 'Write plainly. No emoji in code, comments, or PRs. Cite sources for any external claim.' },
-  { origin: 'Project', tint: 'var(--blue)', text: 'Maintain the Atlas API — TypeScript, Fastify, Postgres. Thin handlers; logic in services/.' },
-  { origin: 'Sub-project', tint: 'var(--purple)', text: 'auth-refactor: migrating sessions to short-lived JWTs. Keep the legacy cookie path until v2 ships.' },
-];
-
-const GUARDRAILS: { text: string; origin: string }[] = [
-  { text: 'Never publish or deploy without a gate', origin: 'Workspace rule' },
-  { text: 'Hard budget cap — stop at $50, no exceptions', origin: 'Project rule' },
-  { text: 'Never force-push to main', origin: 'Workspace rule' },
-];
-
 function InstructionsTab({ projectId, project, onSaved }: { projectId: string | null; project: Project | null; onSaved: (instructions: string) => void }) {
   const [text, setText] = React.useState(project?.instructions ?? '');
   const [state, setState] = React.useState<'idle' | 'saving' | 'saved'>('idle');
@@ -865,7 +764,7 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
       <div>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 10 }}>
           <div style={{ font: '700 var(--fs-headline)/1 var(--font-display)', color: 'var(--ink)' }}>Add a skill</div>
-          {meta && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{meta.count} secure skills in the registry</span>}
+          {meta && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{meta.count} registry skills</span>}
         </div>
         <div style={{ position: 'relative', marginBottom: 10 }}>
           <Icon name="search" size={15} style={{ position: 'absolute', left: 12, top: 11, color: 'var(--ink-tertiary)' }} />
@@ -910,7 +809,10 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
                 <div style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>{s.name}</div>
                 {s.description && <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.description}</div>}
               </div>
-              {s.sha256 && <span title={s.sha256} style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{s.sha256.slice(0, 8)}</span>}
+              {s.trustLabel?.provenance === 'registry' && s.integrity?.status === 'verified' && s.sha256 && <span title={s.sha256} style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{s.sha256.slice(0, 8)}</span>}
+              {s.trustLabel?.provenance === 'bundled-native' && <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--purple)' }}>Native / bundled</span>}
+              {s.trustLabel?.provenance === 'local-operator' && <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--orange)' }}>Local / not registry-audited</span>}
+              {s.trustLabel?.provenance === 'legacy-registry' && <span style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--red)' }}>Registry / re-install required</span>}
               <code style={{ font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>.claude/skills/{s.slug}</code>
               <button onClick={() => void remove(s)} className="link-btn" style={{ font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Remove</button>
             </div>
@@ -977,72 +879,21 @@ function SkillsTab({ projectId }: { projectId: string | null }) {
 }
 
 /* ───────────────── Budget tab (from pd-tabs.jsx) ───────────────── */
-interface BudgetBar { name: string; cost: number; tint: string }
-const BUDGET_BARS: BudgetBar[] = [
-  { name: 'Refactor auth service', cost: 8.40, tint: 'var(--purple)' },
-  { name: 'Nightly test suite', cost: 6.10, tint: 'var(--teal)' },
-  { name: 'Dependency audit', cost: 4.20, tint: 'var(--blue)' },
-  { name: 'OG image generation', cost: 2.90, tint: 'var(--indigo)' },
-  { name: 'Misc / chat', cost: 1.30, tint: 'var(--ink-tertiary)' },
-];
-
 function BudgetTab() {
-  const [cap, setCap] = React.useState(50);
-  const spent = 22.90;
-  const ring = 2 * Math.PI * 52;
-  const frac = Math.min(1, spent / cap);
-  const maxBar = Math.max(...BUDGET_BARS.map(b => b.cost));
+  const navigate = useNavigate();
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '300px minmax(0,1fr)', gap: 20, alignItems: 'start' }}>
-      {/* gauge card */}
-      <div style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)',
-        padding: 22, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-        <div style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', alignSelf: 'flex-start' }}>This month</div>
-        <svg width="180" height="180" viewBox="0 0 128 128" style={{ transform: 'rotate(-90deg)', margin: '14px 0 6px' }}>
-          <circle cx="64" cy="64" r="52" fill="none" stroke="var(--fill-secondary)" strokeWidth="11" />
-          <circle cx="64" cy="64" r="52" fill="none" stroke={frac >= 0.9 ? 'var(--red)' : frac >= 0.75 ? 'var(--orange)' : 'var(--green)'} strokeWidth="11" strokeLinecap="round"
-            strokeDasharray={ring} strokeDashoffset={ring * (1 - frac)} />
-        </svg>
-        <div style={{ font: '600 var(--fs-title1)/1 var(--font-mono)', letterSpacing: '-0.02em', color: 'var(--ink)' }}>${spent.toFixed(2)}</div>
-        <div style={{ font: '400 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 4 }}>of ${cap}.00 cap · {Math.round(frac * 100)}%</div>
-
-        {/* hard cap stepper */}
-        <div style={{ width: '100%', marginTop: 20, paddingTop: 18, borderTop: '0.5px solid var(--separator)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 10 }}>
-            <Icon name="lock" size={14} style={{ color: 'var(--red)' }} />
-            <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Hard cap</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 4, borderRadius: 12, border: '1.5px solid var(--red)',
-            background: 'rgba(255,59,48,0.05)' }}>
-            <button onClick={() => setCap(c => Math.max(10, c - 5))} className="step-btn" style={{ width: 38, height: 38, borderRadius: 9, display: 'grid', placeItems: 'center',
-              background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 20px/1 var(--font-text)' }}>−</button>
-            <span style={{ flex: 1, textAlign: 'center', font: '600 var(--fs-title2)/1 var(--font-mono)', color: 'var(--ink)' }}>${cap}</span>
-            <button onClick={() => setCap(c => Math.min(500, c + 5))} className="step-btn" style={{ width: 38, height: 38, borderRadius: 9, display: 'grid', placeItems: 'center',
-              background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 20px/1 var(--font-text)' }}>+</button>
-          </div>
-          <div style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 9 }}>
-            Jobs stop the moment spend would cross this line. Raising it asks for confirmation.
-          </div>
+    <div style={{ maxWidth: 620 }}>
+      <div style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 22 }}>
+        <div style={{ width: 42, height: 42, borderRadius: 12, display: 'grid', placeItems: 'center', background: 'color-mix(in srgb, var(--green) 14%, transparent)', color: 'var(--green)', marginBottom: 14 }}>
+          <Icon name="gauge" size={21} />
         </div>
-      </div>
-
-      {/* per-job bars */}
-      <div style={{ background: 'var(--bg-grouped)', borderRadius: 18, border: '0.5px solid var(--separator)', padding: 20,
-        backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}>
-        <div style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 18 }}>Spend by job</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {BUDGET_BARS.map((b, i) => (
-            <div key={i}>
-              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 7 }}>
-                <span style={{ flex: 1, font: '500 var(--fs-subhead)/1 var(--font-text)', color: 'var(--ink)' }}>{b.name}</span>
-                <span style={{ font: '600 var(--fs-subhead)/1 var(--font-mono)', color: 'var(--ink)' }}>${b.cost.toFixed(2)}</span>
-              </div>
-              <div style={{ height: 8, borderRadius: 4, background: 'var(--fill-secondary)', overflow: 'hidden' }}>
-                <div style={{ width: `${(b.cost / maxBar) * 100}%`, height: '100%', borderRadius: 4, background: b.tint }} />
-              </div>
-            </div>
-          ))}
+        <div style={{ font: '700 var(--fs-title3)/1.2 var(--font-display)', color: 'var(--ink)', marginBottom: 6 }}>Project budget data unavailable</div>
+        <div style={{ font: '400 var(--fs-callout)/1.45 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 16 }}>
+          This project view does not expose per-project caps or spend breakdowns yet. Use Costs for the live ledger.
         </div>
+        <button onClick={() => navigate('/costs')} style={{ height: 36, padding: '0 14px', borderRadius: 9, background: 'var(--blue)', color: '#fff', font: '600 var(--fs-subhead)/1 var(--font-text)', cursor: 'pointer' }}>
+          Open Costs
+        </button>
       </div>
     </div>
   );
@@ -1240,10 +1091,12 @@ function PathLink({ path, mono = true }: { path: string; mono?: boolean }) {
   const onClick = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    // ⌘/Ctrl-click always falls back to Finder, even when an opener is present —
-    // matches the "reveal" reflex from VS Code / Cursor.
-    if (openInTab && !(e.metaKey || e.ctrlKey)) { openInTab(path); return; }
-    void api.revealPath(path);
+    // ⌘/Ctrl-click reveals in Finder even when an opener is present (VS Code reflex).
+    // Both routes go through the provider so the path is CONFINED (project/session
+    // resolver) before any tab-open or native reveal. Without a provider (rare —
+    // a PathLink outside a chat), reveal with no project → the brain safely 404s.
+    if (openInTab) { openInTab(path, e.metaKey || e.ctrlKey ? { reveal: true } : undefined); return; }
+    void api.revealFile('', path);
   };
   return (
     <button onClick={onClick} title={action} style={{
@@ -1623,7 +1476,7 @@ function OptionRow({ label, description, on, multi, answered, onPick, recommende
   );
 }
 
-function QuestionCard({ ask, onAnswer, answered, pending, onExtend, onCancel }: { ask?: string; onAnswer: (text: string) => void; answered: boolean; pending?: Schedule | null; onExtend?: () => void; onCancel?: () => void }) {
+function QuestionCard({ ask, onAnswer, answered, pending, onExtend, onCancel, label = 'Claude is asking', context }: { ask?: string; onAnswer: (text: string) => void; answered: boolean; pending?: Schedule | null; onExtend?: () => void; onCancel?: () => void; label?: string; context?: React.ReactNode }) {
   const questions = parseAsk(ask);
   const [picked, setPicked] = React.useState<Record<number, Set<string>>>({});
   const [custom, setCustom] = React.useState('');
@@ -1660,8 +1513,9 @@ function QuestionCard({ ask, onAnswer, answered, pending, onExtend, onCancel }: 
       border: '0.5px solid var(--separator)', background: 'var(--bg-grouped)', opacity: answered ? 0.6 : 1 }}>
       <span style={{ position: 'absolute', left: 0, top: 11, bottom: 11, width: 2.5, borderRadius: 2, background: answered ? 'var(--green)' : 'var(--blue)' }} />
       <div style={{ display: 'inline-flex', alignItems: 'center', gap: 5, marginBottom: 7, font: '600 var(--fs-caption)/1 var(--font-text)', color: answered ? 'var(--green)' : 'var(--ink-tertiary)' }}>
-        <Icon name={answered ? 'check' : 'enter'} size={11} stroke={answered ? 2.6 : 2} /> {answered ? 'Answered' : 'Claude is asking'}
+        <Icon name={answered ? 'check' : 'enter'} size={11} stroke={answered ? 2.6 : 2} /> {answered ? 'Answered' : label}
       </div>
+      {context && <div style={{ margin: '-2px 0 8px', font: '500 var(--fs-caption)/1.35 var(--font-text)', color: 'var(--ink-tertiary)' }}>{context}</div>}
       {/* Auto-answer countdown — fires the recommended option on timeout; extend to buy time. */}
       {counting && pending?.fireAt && (
         <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 10, padding: '7px 10px', borderRadius: 9,
@@ -1747,6 +1601,60 @@ function QuestionCard({ ask, onAnswer, answered, pending, onExtend, onCancel }: 
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function UnavailableQuestionCard({ sourceJobId }: { sourceJobId?: string }) {
+  const hasSource = !!sourceJobId;
+  return (
+    <div style={{ margin: '8px 0', borderRadius: 13, padding: '11px 13px', position: 'relative',
+      border: '0.5px solid var(--separator)', background: 'var(--fill-tertiary)' }}>
+      <span style={{ position: 'absolute', left: 0, top: 11, bottom: 11, width: 2.5, borderRadius: 2, background: 'var(--ink-tertiary)' }} />
+      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 5, font: '600 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+        <Icon name="enter" size={11} /> {hasSource ? 'Question unavailable - missing question snapshot' : 'Question unavailable - missing source identity'}
+      </div>
+      <div style={{ font: '500 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+        {hasSource ? `Source job ${sourceJobId} has no stored question snapshot.` : 'This legacy pending row cannot be answered safely.'}
+      </div>
+    </div>
+  );
+}
+
+function HiddenQuestionRecovery({ questions, legacy, onAnswer, onExtend, onCancel }: {
+  questions: Schedule[];
+  legacy: Schedule[];
+  onAnswer: (sourceJobId: string, text: string) => void;
+  onExtend: (sourceJobId: string) => void;
+  onCancel: (sourceJobId: string) => void;
+}) {
+  if (questions.length === 0 && legacy.length === 0) return null;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '11px 12px', borderRadius: 12,
+      background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--ink-secondary)', font: '600 var(--fs-footnote)/1.35 var(--font-text)' }}>
+        <Icon name="enter" size={13} style={{ color: 'var(--blue)' }} />
+        Pending questions from earlier turns
+      </div>
+      {questions.map((q) => {
+        const sourceJobId = q.sourceJobId ?? '';
+        return q.questionAsk ? (
+          <QuestionCard
+            key={q.id}
+            ask={q.questionAsk}
+            onAnswer={(text) => onAnswer(sourceJobId, text)}
+            answered={false}
+            pending={q}
+            onExtend={() => onExtend(sourceJobId)}
+            onCancel={() => onCancel(sourceJobId)}
+            label="Pending question from earlier turn"
+            context={<>Source job <span style={{ fontFamily: 'var(--font-mono)' }}>{sourceJobId}</span> is not in the loaded transcript window.</>}
+          />
+        ) : (
+          <UnavailableQuestionCard key={q.id} sourceJobId={sourceJobId} />
+        );
+      })}
+      {legacy.map((q) => <UnavailableQuestionCard key={q.id} />)}
     </div>
   );
 }
@@ -1872,7 +1780,7 @@ function InlineAttach({ path, images, files }: { path: string; images?: ChatImag
 const AUTO_CONTINUE_PREFIX = '[Auto-continue]:';
 
 /** Auto-continue turns are machine-generated continuation prompts (a goal echo
-    + a "you outlined these next moves" bullet list + autonomy boilerplate).
+    + a "you outlined these next moves" bullet list + follow-up context).
     Rendered through UserBubble they became a giant blue bubble of raw,
     pre-wrap text — literal `-`/`#` markdown and blank-line bloat (image_yhpsb.png).
     They aren't something the USER typed, so they shouldn't masquerade as a user
@@ -2035,16 +1943,124 @@ function ReviewCard({ item }: { item: TranscriptItem }) {
   const needsWork = item.verdict === 'needs-work' && !resolved;
   const tint = needsWork ? 'var(--orange)' : 'var(--green)';
   const label = resolved ? 'Resolved' : needsWork ? 'Needs work' : 'Approved';
+  const findings = item.findings ?? [];
   return (
     <div style={{ margin: '8px 0 2px', border: `0.5px solid color-mix(in srgb, ${tint} 38%, var(--separator))`, borderRadius: 12, background: `color-mix(in srgb, ${tint} 6%, var(--bg-elevated))`, overflow: 'hidden' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: '0.5px solid var(--separator)' }}>
-        <Icon name={resolved ? 'checkCircle' : 'shield'} size={14} style={{ color: tint, flexShrink: 0 }} />
+        <Icon name={needsWork ? 'alert' : resolved ? 'checkCircle' : 'shield'} size={14} style={{ color: tint, flexShrink: 0 }} />
         <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)' }}>Reviewer · {item.name ?? 'review'}</span>
         {resolved && <span style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>· addressed by the agent</span>}
         <span style={{ flex: 1 }} />
         <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: tint, textTransform: 'uppercase' }}>{label}</span>
       </div>
-      <div style={{ padding: '6px 12px 8px' }}>{renderChatBody(item.text, 'rvb')}</div>
+      <div style={{ padding: '8px 12px 10px' }}>
+        {findings.length > 0 ? (
+          <div style={{ display: 'grid', gap: 7 }}>
+            {findings.map((finding, idx) => (
+              <div key={idx} style={{ display: 'grid', gap: 3, padding: '7px 9px', borderRadius: 9, background: `color-mix(in srgb, ${tint} 7%, var(--bg))`, border: `0.5px solid color-mix(in srgb, ${tint} 20%, transparent)` }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                  <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', color: tint, textTransform: 'uppercase' }}>{finding.severity}</span>
+                  {finding.file && <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', font: '500 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)' }}>{finding.file}</span>}
+                </div>
+                <div style={{ font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink)' }}>{finding.message}</div>
+              </div>
+            ))}
+          </div>
+        ) : renderChatBody(item.text, 'rvb')}
+      </div>
+    </div>
+  );
+}
+
+function legacyReviewProjection(job: Job): Job['review'] | undefined {
+  if (job.review) return job.review;
+  if (job.status !== 'failed' || job.phase !== 'Review blocked') return undefined;
+  const item = [...(job.transcript ?? [])].reverse().find(t => t.kind === 'review' && t.verdict === 'needs-work' && !t.resolved);
+  if (!item) return undefined;
+  try {
+    const parsed = JSON.parse(item.text) as { schemaVersion?: unknown; verdict?: unknown; findings?: unknown[]; summary?: unknown };
+    if (parsed.schemaVersion !== 1 || parsed.verdict !== 'NEEDS_WORK' || !Array.isArray(parsed.findings)) throw new Error('bad legacy review');
+    const findings = parsed.findings.slice(0, 20).flatMap((f): NonNullable<Job['review']>['findings'] => {
+      if (!f || typeof f !== 'object') return [];
+      const r = f as { severity?: unknown; message?: unknown; file?: unknown };
+      if (r.severity !== 'low' && r.severity !== 'medium' && r.severity !== 'high' && r.severity !== 'critical') return [];
+      if (typeof r.message !== 'string' || !r.message.trim()) return [];
+      return [{ severity: r.severity, message: r.message.slice(0, 700), ...(typeof r.file === 'string' && r.file.trim() ? { file: r.file.slice(0, 300) } : {}) }];
+    });
+    return {
+      schemaVersion: 1,
+      status: 'needs-work',
+      verdict: 'NEEDS_WORK',
+      gateId: 'legacy',
+      artifactId: 'legacy',
+      reviewer: item.name ?? 'reviewer',
+      reason: 'Reviewer returned NEEDS_WORK.',
+      summary: typeof parsed.summary === 'string' && parsed.summary.trim() ? parsed.summary.slice(0, 700) : 'Reviewer requested changes.',
+      findings,
+      completedAt: item.ts ?? job.updatedAt,
+    };
+  } catch {
+    return {
+      schemaVersion: 1,
+      status: 'failed-closed',
+      gateId: 'legacy',
+      artifactId: 'legacy',
+      reviewer: item.name ?? 'reviewer',
+      reason: 'Legacy review text could not be parsed safely.',
+      summary: 'Review could not complete safely.',
+      findings: [],
+      completedAt: item.ts ?? job.updatedAt,
+    };
+  }
+}
+
+function continuationPrompt(input: string, review: NonNullable<Job['review']>): string {
+  const lines = [
+    'Continue fixing the reviewer findings for the original task below.',
+    '',
+    'Original task:',
+    input,
+    '',
+    `Review status: ${review.status}`,
+    `Review summary: ${review.summary}`,
+    `Review reason: ${review.reason}`,
+    '',
+    'Findings to fix:',
+  ];
+  if (!review.findings.length) lines.push('- Review could not provide safe structured findings. Inspect the current work, correct the review failure safely, and rerun the relevant tests.');
+  for (const f of review.findings) lines.push(`- [${f.severity}]${f.file ? ` ${f.file}:` : ''} ${f.message}`);
+  lines.push('', 'Fix every listed item, rerun the relevant tests, and summarize what changed.');
+  return lines.join('\n');
+}
+
+function TerminalReviewCard({ review, originalInput, onRetry }: { review: NonNullable<Job['review']>; originalInput: string; onRetry: (input: string) => void }) {
+  const [all, setAll] = React.useState(false);
+  const findings = all ? review.findings : review.findings.slice(0, 5);
+  const failedClosed = review.status === 'failed-closed';
+  return (
+    <div style={{ marginTop: 8, padding: '11px 13px', borderRadius: 11, background: 'color-mix(in srgb, var(--orange) 9%, var(--bg-elevated))',
+      border: '0.5px solid color-mix(in srgb, var(--orange) 34%, transparent)', font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink)' }}>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--orange)', fontWeight: 700, marginBottom: 4 }}>
+        <Icon name="alert" size={13} /> {failedClosed ? 'Review could not complete safely' : 'Reviewer needs work'}
+      </span>
+      <div style={{ color: 'var(--ink-secondary)' }}>{review.reviewer} · {review.summary} {review.findings.length ? `· ${review.findings.length} finding${review.findings.length === 1 ? '' : 's'}` : ''}</div>
+      {findings.length > 0 && (
+        <div style={{ display: 'grid', gap: 7, marginTop: 9 }}>
+          {findings.map((f, idx) => (
+            <div key={idx} style={{ padding: '7px 9px', borderRadius: 9, background: 'color-mix(in srgb, var(--orange) 7%, var(--bg))', border: '0.5px solid color-mix(in srgb, var(--orange) 20%, transparent)' }}>
+              <div style={{ display: 'flex', gap: 7, minWidth: 0, color: 'var(--orange)', font: '700 var(--fs-caption)/1 var(--font-text)', textTransform: 'uppercase' }}>
+                <span>{f.severity}</span>{f.file && <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--ink-tertiary)', fontFamily: 'var(--font-mono)' }}>{f.file}</span>}
+              </div>
+              <div style={{ marginTop: 3, color: 'var(--ink)' }}>{f.message}</div>
+            </div>
+          ))}
+        </div>
+      )}
+      {review.findings.length > 5 && <button onClick={() => setAll(v => !v)} style={{ marginTop: 8, color: 'var(--orange)', font: '600 var(--fs-footnote)/1 var(--font-text)', cursor: 'pointer' }}>{all ? 'Show less' : 'Show all'}</button>}
+      <button onClick={() => onRetry(continuationPrompt(originalInput, review))} style={{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 5, height: 28, padding: '0 12px', borderRadius: 'var(--r-pill)',
+        background: 'var(--fill-secondary)', font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', cursor: 'pointer' }}>
+        <Icon name="arrowRight" size={13} stroke={2.4} style={{ transform: 'rotate(-45deg)' }} /> Continue fixing
+      </button>
     </div>
   );
 }
@@ -2244,7 +2260,7 @@ function renderTranscript(items: TranscriptItem[], keyPrefix: string, opts: { ca
 /* React.memo so a ChatPane re-render (typing in the composer, a job event for
    ANOTHER turn) doesn't re-parse the markdown of every settled turn. Only turns
    whose job object actually changed re-render; onRetry/onAnswer are stable. */
-const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer, isLast, pendingAsk, onExtendAsk, onCancelAsk }: { job: Job; onRetry: (input: string) => void; onAnswer: (text: string) => void; isLast: boolean; pendingAsk?: Schedule | null; onExtendAsk?: () => void; onCancelAsk?: () => void }) {
+const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer, isLast, pendingAsk, onExtendAsk, onCancelAsk }: { job: Job; onRetry: (input: string) => void; onAnswer: (sourceJobId: string, text: string) => void; isLast: boolean; pendingAsk?: Schedule | null; onExtendAsk?: (sourceJobId: string) => void; onCancelAsk?: (sourceJobId: string) => void }) {
   // ScheduleWakeup parking: while the SDK iterator is dormant waiting for a
   // wakeup, the job stays status:'running' (the stream truly is still open)
   // but `pausedUntil` is set. The user-facing semantics requested are "session
@@ -2256,6 +2272,8 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   const engineLabel = job.engine === 'codex' ? 'Codex' : 'Claude Code';
   const provider = job.engine === 'codex' ? 'openai' as const : 'anthropic' as const;
   const transcript = job.transcript ?? [];
+  const terminalReview = legacyReviewProjection(job);
+  const visibleTranscript = terminalReview ? transcript.filter(t => !(t.kind === 'review' && t.verdict === 'needs-work' && !t.resolved)) : transcript;
   const hasBody = transcript.length > 0 || !!(job.output && job.output.length > 0);
 
   const [, tick] = React.useReducer((x: number) => x + 1, 0);
@@ -2280,23 +2298,23 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
   // The final answer = last text/result block. Everything before it is "work"
   // (narration + tools) that collapses once the turn is done. A turn that ends
   // in a question stays fully expanded — questions are never hidden.
-  const hasAsk = transcript.some(t => t.kind === 'ask');
+  const hasAsk = visibleTranscript.some(t => t.kind === 'ask');
   // A generated image is never "work" to be collapsed away — keep image turns fully
   // expanded so the picture (and anything after it) always renders.
-  const hasImage = transcript.some(t => t.kind === 'image');
+  const hasImage = visibleTranscript.some(t => t.kind === 'image');
   let finalIdx = -1;
-  for (let k = transcript.length - 1; k >= 0; k--) { if (transcript[k].kind === 'text' || transcript[k].kind === 'result') { finalIdx = k; break; } }
-  const collapsible = !live && !hasAsk && !hasImage && finalIdx > 0 && transcript.slice(0, finalIdx).some(t => t.kind === 'tool' || t.kind === 'text' || t.kind === 'thinking');
+  for (let k = visibleTranscript.length - 1; k >= 0; k--) { if (visibleTranscript[k].kind === 'text' || visibleTranscript[k].kind === 'result') { finalIdx = k; break; } }
+  const collapsible = !live && !hasAsk && !hasImage && finalIdx > 0 && visibleTranscript.slice(0, finalIdx).some(t => t.kind === 'tool' || t.kind === 'text' || t.kind === 'thinking');
   const [expanded, setExpanded] = React.useState(false);
 
-  const toolCount = transcript.filter(t => t.kind === 'tool').length;
-  const replyText = (finalIdx >= 0 ? transcript[finalIdx].text : '') || job.output || '';
-  const lastIdx = transcript.length - 1;
+  const toolCount = visibleTranscript.filter(t => t.kind === 'tool').length;
+  const replyText = (finalIdx >= 0 ? visibleTranscript[finalIdx].text : '') || job.output || '';
+  const lastIdx = visibleTranscript.length - 1;
 
   let body: React.ReactNode = null;
-  if (transcript.length > 0) {
+  if (visibleTranscript.length > 0) {
     if (collapsible) {
-      const work = transcript.slice(0, finalIdx);
+      const work = visibleTranscript.slice(0, finalIdx);
       const workTools = work.filter(t => t.kind === 'tool').length;
       const workThought = work.some(t => t.kind === 'thinking');
       body = (
@@ -2304,13 +2322,22 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
           <WorkBar toolCount={workTools} thought={workThought} elapsed={elapsed} expanded={expanded} onToggle={() => setExpanded(e => !e)}>
             <div style={{ font: '400 13px/1.55 var(--font-text)' }}>{renderTranscript(work, 'w', { answered: true, jobId: job.id })}</div>
           </WorkBar>
-          <div style={{ marginTop: 6 }}>{renderChatBody(transcript[finalIdx].text, 'fa')}</div>
+          <div style={{ marginTop: 6 }}>{renderChatBody(visibleTranscript[finalIdx].text, 'fa')}</div>
         </div>
       );
     } else {
+      const answerQuestion = pendingAsk?.sourceJobId ? (text: string) => onAnswer(pendingAsk.sourceJobId!, text) : undefined;
       body = (
         <div style={{ font: '400 14px/1.62 var(--font-text)', color: 'var(--ink)' }}>
-          {renderTranscript(transcript, 'a', { caretAt: live ? lastIdx : undefined, onAnswer, answered: !isLast, jobId: job.id, pendingAsk, onExtendAsk, onCancelAsk })}
+          {renderTranscript(visibleTranscript, 'a', {
+            caretAt: live ? lastIdx : undefined,
+            onAnswer: answerQuestion,
+            answered: !pendingAsk && !isLast,
+            jobId: job.id,
+            pendingAsk,
+            onExtendAsk: pendingAsk?.sourceJobId ? () => onExtendAsk?.(pendingAsk.sourceJobId!) : undefined,
+            onCancelAsk: pendingAsk?.sourceJobId ? () => onCancelAsk?.(pendingAsk.sourceJobId!) : undefined,
+          })}
         </div>
       );
     }
@@ -2374,7 +2401,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
             <span style={{ fontVariantNumeric: 'tabular-nums', color: 'var(--ink)' }}>{fmtCountdown((job.pausedUntil ?? 0) - Date.now())}</span>
           </div>
         )}
-        {job.status === 'failed' && (
+        {job.status === 'failed' && !terminalReview && (
           <div style={{ marginTop: 8, padding: '11px 13px', borderRadius: 11, background: 'color-mix(in srgb, var(--red) 8%, var(--bg-elevated))',
             border: '0.5px solid color-mix(in srgb, var(--red) 32%, transparent)', font: '400 var(--fs-footnote)/1.45 var(--font-text)', color: 'var(--ink)' }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--red)', fontWeight: 600, marginBottom: 4 }}>
@@ -2387,6 +2414,7 @@ const AssistantTurn = React.memo(function AssistantTurn({ job, onRetry, onAnswer
             </button>
           </div>
         )}
+        {terminalReview && <TerminalReviewCard review={terminalReview} originalInput={job.input} onRetry={onRetry} />}
         {job.status === 'cancelled' && (
           <div style={{ marginTop: 5, display: 'inline-flex', alignItems: 'center', gap: 5, font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
             <Icon name="x" size={11} stroke={2.4} /> Stopped
@@ -2648,7 +2676,7 @@ function SchedulePicker({ initial, onPick, onRepeat, onClose }: { initial?: numb
   );
 }
 
-function QueuePanel({ queue, hold, canSteer, onSteerNow, onMoveToFront, onRemove, onEdit, onReorder }: { queue: QueueItem[]; hold?: 'limit' | 'paused' | 'failed' | 'cancelled' | null; canSteer?: boolean; onSteerNow?: (i: number) => void; onMoveToFront: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
+function QueuePanel({ queue, hold, canSteer, onSteerNow, onMoveToFront, onRemove, onEdit, onReorder }: { queue: QueueItem[]; hold?: 'limit' | 'paused' | 'failed' | 'cancelled' | 'gated' | null; canSteer?: boolean; onSteerNow?: (i: number) => void; onMoveToFront: (i: number) => void; onRemove: (i: number) => void; onEdit: (i: number) => void; onReorder: (from: number, to: number) => void }) {
   // When the drainer is holding (the agent isn't at a clean idle), surface WHY so a
   // paused/limited queue never looks stuck. Send-now / edit / remove stay available.
   const holdBadge =
@@ -2656,12 +2684,14 @@ function QueuePanel({ queue, hold, canSteer, onSteerNow, onMoveToFront, onRemove
     : hold === 'paused' ? 'paused'
     : hold === 'failed' ? 'held — last turn failed'
     : hold === 'cancelled' ? 'held — last turn stopped'
+    : hold === 'gated' ? 'held — reviewer needs work'
     : null;
   const holdHint =
     hold === 'limit' ? 'The Claude usage limit was hit — the current turn auto-continues when it resets, then queued messages resume one at a time.'
     : hold === 'paused' ? 'The current turn is parked and resumes on its own — queued messages send once it wakes.'
     : hold === 'failed' ? 'The last turn failed; queued messages are held until it succeeds (a retry resumes them). Send now to override.'
     : hold === 'cancelled' ? 'The last turn was stopped; queued messages are held so they aren’t dumped into a stopped session. Send now to override.'
+    : hold === 'gated' ? 'The reviewer asked for changes; queued messages are held until those findings are fixed. Send now to override.'
     : null;
   const [collapsed, setCollapsed] = React.useState(false);
   const [sel, setSel] = React.useState(-1);
@@ -3067,8 +3097,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   /** Open a generated/attached image in an in-app viewer tab (Workspace only). */
   onOpenImage?: (assetId: string, name: string, imagePath?: string) => void;
   /** Open a file referenced in the transcript as an in-app FileViewer tab
-      (Workspace only). The path may be absolute or relative to the project. */
-  onOpenFile?: (filePath: string) => void;
+      (Workspace only). The path may be absolute or relative to the project;
+      `sessionId` scopes it to the active chat's worktree so the tab resolves
+      the same bytes the agent is looking at. */
+  onOpenFile?: (filePath: string, sessionId?: string | null) => void;
   flush?: boolean;
   autoFocus?: boolean;
 }) {
@@ -3090,18 +3122,27 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   // this project's folder (FileViewer is path-confined to the project).
   const onOpenFileRef = React.useRef(onOpenFile);
   onOpenFileRef.current = onOpenFile;
-  const projectPathRef = React.useRef(project?.path);
-  projectPathRef.current = project?.path;
-  const openPathStable = React.useMemo<OpenPathFn | null>(() => (p: string) => {
+  const projectIdRef = React.useRef(projectId);
+  projectIdRef.current = projectId;
+  // Keep the active session id in a ref so the stable opener closure can read
+  // the CURRENT session without being re-created (its deps stay []).
+  const openActiveIdRef = React.useRef<string | null>(sessionId);
+  const openPathStable = React.useMemo<OpenPathFn | null>(() => (p: string, opts?: { reveal?: boolean }) => {
+    const pid = projectIdRef.current ?? '';
+    const sid = openActiveIdRef.current ?? undefined;
+    // ⌘/Ctrl-click → confined native reveal (brain resolves against the project +
+    // session roots, or a trusted asset path, before Finder opens).
+    if (opts?.reveal) { void api.revealFile(pid, p, sid); return; }
+    // Otherwise open in-tab and let readFile confine — it resolves against the
+    // project root AND every session worktree, so an absolute path inside the
+    // active worktree (which lives OUTSIDE project.path) still opens in-tab. A
+    // path outside all roots simply surfaces a readFile error in the viewer.
     const handler = onOpenFileRef.current;
-    const root = projectPathRef.current;
-    if (handler && (!p.startsWith('/') || (root && pathIsInside(p, root)))) {
-      handler(p);
-    } else {
-      void api.revealPath(p);
-    }
+    if (handler) handler(p, openActiveIdRef.current);
+    else void api.revealFile(pid, p, sid);
   }, []);
   const [activeId, setActiveId] = React.useState<string | null>(sessionId);
+  openActiveIdRef.current = activeId; // sync the opener's session ref every render
   // Active ChatSession (autopilot / reviewer-enabled toggles read off this).
   // useSession live-syncs via the 'session' event emitter, so a setSessionAutopilot
   // call from another window updates the button state here too.
@@ -3313,33 +3354,35 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     () => schedules.filter(s => (s.kind === 'message' || s.kind === 'auto-continue') && (s.fireAt ?? 0) > schedNow - 35_000).sort((a, b) => (a.fireAt ?? 0) - (b.fireAt ?? 0)),
     [schedules, schedNow],
   );
-  // The live AskUserQuestion auto-answer countdown for this chat (at most one).
-  const pendingAsk = React.useMemo(
-    () => schedules.find(s => s.kind === 'auto-answer' && s.sessionId === activeId && s.enabled) ?? null,
-    [schedules, activeId],
+  const pendingQuestions = React.useMemo(
+    () => projectPendingQuestions(schedules, turns, activeId),
+    [schedules, turns, activeId],
   );
   const schedulesRef = React.useRef(schedules);
   schedulesRef.current = schedules;
   // Answer a surfaced question: cancels the countdown and resumes the session with the
   // choice tagged `[User answered AskUserQuestion]:` so the agent treats it as the answer.
-  const answerLiveQuestion = React.useCallback((text: string) => {
+  const answerLiveQuestion = React.useCallback((sourceJobId: string, text: string) => {
     const sid = activeRef.current; const t = text.trim();
-    if (!sid || !t) return;
-    setSchedules(list => list.filter(s => !(s.kind === 'auto-answer' && s.sessionId === sid))); // drop countdown
-    void api.answerQuestion({ sessionId: sid, answer: t })
-      .then(job => setTurns(ts => [...ts.filter(x => x.id !== job.id), job].sort(compareTurnsOldestFirst)))
-      .catch(e => setSendError(e instanceof Error ? e.message : 'Could not send your answer — try again.'));
-  }, []);
-  const extendLiveQuestion = React.useCallback(() => {
-    const sid = activeRef.current; if (!sid) return;
-    void api.extendQuestion(sid).then(s => setSchedules(list => upsertSchedule(list, s))).catch(() => {});
-  }, []);
-  const cancelLiveQuestion = React.useCallback(() => {
-    const sid = activeRef.current; if (!sid) return;
-    const pend = schedulesRef.current.find(s => s.kind === 'auto-answer' && s.sessionId === sid);
+    if (!sid || !sourceJobId || !t) return;
+    const pend = schedulesRef.current.find(s => s.kind === 'auto-answer' && s.sessionId === sid && s.enabled && s.sourceJobId === sourceJobId);
     if (!pend) return;
     setSchedules(list => list.filter(s => s.id !== pend.id));
-    void api.deleteSchedule(pend.id).catch(() => {});
+    void api.answerQuestion({ sessionId: sid, sourceJobId, answer: t })
+      .then(job => setTurns(ts => [...ts.filter(x => x.id !== job.id), job].sort(compareTurnsOldestFirst)))
+      .catch(e => setSendError(e instanceof Error ? e.message : 'Could not send your answer - try again.'));
+  }, []);
+  const extendLiveQuestion = React.useCallback((sourceJobId: string) => {
+    const sid = activeRef.current; if (!sid) return;
+    if (!sourceJobId) return;
+    void api.extendQuestion({ sessionId: sid, sourceJobId }).then(s => setSchedules(list => upsertSchedule(list, s))).catch(() => {});
+  }, []);
+  const cancelLiveQuestion = React.useCallback((sourceJobId: string) => {
+    const sid = activeRef.current; if (!sid) return;
+    const pend = schedulesRef.current.find(s => s.kind === 'auto-answer' && s.sessionId === sid && s.sourceJobId === sourceJobId);
+    if (!pend) return;
+    setSchedules(list => list.filter(s => s.id !== pend.id));
+    void api.cancelQuestion({ sessionId: sid, sourceJobId }).catch(() => {});
   }, []);
 
   // Seed the background-task list for this project (records persist across turns).
@@ -3428,11 +3471,12 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   const awaitingLimitReset = !!lastTurn?.blockedByLimit;
   // Why the drainer is holding the queue (for the QueuePanel badge/hint). null = free
   // to drain. Order mirrors canDrainQueue's guards.
-  const queueHoldReason: 'limit' | 'paused' | 'failed' | 'cancelled' | null =
+  const queueHoldReason: 'limit' | 'paused' | 'failed' | 'cancelled' | 'gated' | null =
     awaitingLimitReset ? 'limit'
     : lastTurnPaused ? 'paused'
     : lastTurn?.status === 'failed' ? 'failed'
     : lastTurn?.status === 'cancelled' ? 'cancelled'
+    : lastTurn?.status === 'gated' ? 'gated'
     : null;
 
   // The actual send — no guards. Used directly, by the queue drainer, and by steer.
@@ -3918,11 +3962,18 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
                     ? <AutoContinueBubble text={t.input} />
                     : <UserBubble text={t.input} images={t.inputImages} files={t.inputFiles} />}
                   <AssistantTurn job={t} isLast={i === turns.length - 1} onRetry={sendText}
-                    onAnswer={i === turns.length - 1 ? answerLiveQuestion : sendText}
-                    pendingAsk={i === turns.length - 1 ? pendingAsk : null}
+                    onAnswer={answerLiveQuestion}
+                    pendingAsk={pendingQuestions.bySourceJobId.get(t.id) ?? null}
                     onExtendAsk={extendLiveQuestion} onCancelAsk={cancelLiveQuestion} />
                 </div>
               ))}
+              <HiddenQuestionRecovery
+                questions={pendingQuestions.hidden}
+                legacy={pendingQuestions.legacy}
+                onAnswer={answerLiveQuestion}
+                onExtend={extendLiveQuestion}
+                onCancel={cancelLiveQuestion}
+              />
             </ImageOpenContext.Provider>
           </OpenPathContext.Provider>
         </div>
