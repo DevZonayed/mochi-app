@@ -18,13 +18,14 @@ import Svg, {
  * (Lucide-style, 24×24, 1.75px stroke, inherits the passed `color`).
  */
 export type IconName =
-  | 'check' | 'arrowRight' | 'arrowLeft' | 'folder' | 'lock' | 'key' | 'gauge'
+  | 'check' | 'checkCheck' | 'arrowRight' | 'arrowLeft' | 'folder' | 'lock' | 'key' | 'gauge'
   | 'smartphone' | 'sun' | 'moon' | 'spark' | 'shield' | 'bolt' | 'home' | 'layers'
   | 'jobs' | 'bell' | 'search' | 'command' | 'plus' | 'calendar' | 'clock'
   | 'telescope' | 'checkCircle' | 'xCircle' | 'more' | 'chevronRight' | 'chevronDown'
   | 'gitMerge' | 'send' | 'settings' | 'x' | 'clapper' | 'sliders' | 'dollar'
   | 'refresh' | 'image' | 'play' | 'pause' | 'camera' | 'chat' | 'bookmark' | 'terminal' | 'file'
-  | 'alert' | 'monitor';
+  | 'alert' | 'monitor' | 'palette' | 'compass' | 'eye' | 'maximize' | 'messageCircle'
+  | 'zap' | 'wifi' | 'wifiOff';
 
 const PATHS: Record<IconName, React.ReactElement> = {
   check: <Polyline points="20 6 9 17 4 12" />,
@@ -73,6 +74,15 @@ const PATHS: Record<IconName, React.ReactElement> = {
   file: <><Path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" /><Polyline points="14 2 14 8 20 8" /></>,
   alert: <><Path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" /><Line x1="12" y1="9" x2="12" y2="13" /><Line x1="12" y1="17" x2="12.01" y2="17" /></>,
   monitor: <><Rect x="2" y="4" width="20" height="13" rx="2" /><Line x1="8" y1="21" x2="16" y2="21" /><Line x1="12" y1="17" x2="12" y2="21" /></>,
+  checkCheck: <><Path d="M18 6 7 17l-5-5" /><Path d="m22 10-7.5 7.5L13 16" /></>,
+  palette: <><Circle cx="13.5" cy="6.5" r="1.5" /><Circle cx="17.5" cy="10.5" r="1.5" /><Circle cx="8.5" cy="7.5" r="1.5" /><Circle cx="6.5" cy="12.5" r="1.5" /><Path d="M12 2a10 10 0 0 0-1 19.8 1.4 1.4 0 0 0 1.6-1.4V17a2 2 0 0 1 2-2h3a1.4 1.4 0 0 0 1.3-2A10 10 0 0 0 12 2Z" /></>,
+  compass: <><Circle cx="12" cy="12" r="9" /><Polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" /></>,
+  eye: <><Path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z" /><Circle cx="12" cy="12" r="3" /></>,
+  maximize: <><Polyline points="15 3 21 3 21 9" /><Polyline points="9 21 3 21 3 15" /><Line x1="21" y1="3" x2="14" y2="10" /><Line x1="3" y1="21" x2="10" y2="14" /></>,
+  messageCircle: <Path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5Z" />,
+  zap: <Polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />,
+  wifi: <><Path d="M5 12.55a11 11 0 0 1 14 0" /><Path d="M1.42 9a16 16 0 0 1 21.16 0" /><Path d="M8.53 16.11a6 6 0 0 1 6.95 0" /><Circle cx="12" cy="20" r="1" /></>,
+  wifiOff: <><Path d="M1.42 9a16 16 0 0 1 6.1-2.7" /><Path d="M16.72 6.26A16 16 0 0 1 22.58 9" /><Line x1="1" y1="1" x2="23" y2="23" /><Path d="M8.53 16.11a6 6 0 0 1 6.95 0" /><Circle cx="12" cy="20" r="1" /></>,
 };
 
 export function Icon({

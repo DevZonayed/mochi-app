@@ -134,3 +134,80 @@ export function idTint(id: string, theme: ReturnType<typeof useTheme>['theme']):
 }
 
 export function useInsets() { return useSafeAreaInsets(); }
+
+// ── project type helpers ────────────────────────────────────────────────────
+export type ProjectKind = 'code' | 'design' | 'content' | 'research' | 'general';
+const KIND_META: Record<ProjectKind, { icon: IconName; label: string }> = {
+  code: { icon: 'terminal', label: 'Code' },
+  design: { icon: 'palette', label: 'Design' },
+  content: { icon: 'file', label: 'Content' },
+  research: { icon: 'telescope', label: 'Research' },
+  general: { icon: 'folder', label: 'General' },
+};
+export function kindMeta(kind: string | undefined): { icon: IconName; label: string } {
+  return KIND_META[(kind ?? 'general') as ProjectKind] ?? KIND_META.general;
+}
+export function kindColor(kind: string | undefined, theme: ReturnType<typeof useTheme>['theme']): string {
+  switch (kind) {
+    case 'code': return theme.color.blue;
+    case 'design': return theme.color.purple;
+    case 'content': return theme.color.orange;
+    case 'research': return theme.color.teal;
+    default: return theme.color.indigo;
+  }
+}
+
+/** Small colored type badge for project kind. */
+export function KindBadge({ kind, size = 36 }: { kind: string | undefined; size?: number }) {
+  const { theme } = useTheme();
+  const color = kindColor(kind, theme);
+  const meta = kindMeta(kind);
+  return (
+    <View style={{ width: size, height: size, borderRadius: size * 0.3, backgroundColor: color + '20', alignItems: 'center', justifyContent: 'center' }}>
+      <Icon name={meta.icon} size={size * 0.48} color={color} />
+    </View>
+  );
+}
+
+// ── WhatsApp-style delivery indicators ──────────────────────────────────────
+export type DeliveryPhase = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+export function DeliveryIndicator({ phase }: { phase: DeliveryPhase }) {
+  const { theme } = useTheme();
+  if (phase === 'sending') return <Icon name="clock" size={13} color={theme.color.inkTertiary} />;
+  if (phase === 'failed') return <Icon name="alert" size={13} color={theme.color.red} />;
+  const checkColor = phase === 'read' ? theme.color.blue : theme.color.inkTertiary;
+  if (phase === 'sent') return <Icon name="check" size={13} color={checkColor} />;
+  return <Icon name="checkCheck" size={13} color={checkColor} />;
+}
+
+/** A WhatsApp-style message bubble. */
+export function MessageBubble({ text, time, delivery, fromMe }: { text: string; time?: string; delivery?: DeliveryPhase; fromMe: boolean }) {
+  const { theme } = useTheme();
+  return (
+    <View style={{ alignSelf: fromMe ? 'flex-end' : 'flex-start', maxWidth: '82%', marginVertical: 3 }}>
+      <View style={{
+        backgroundColor: fromMe ? theme.color.blue : theme.color.bgElevated,
+        borderRadius: 18, borderBottomRightRadius: fromMe ? 4 : 18, borderBottomLeftRadius: fromMe ? 18 : 4,
+        paddingHorizontal: 14, paddingTop: 10, paddingBottom: 8,
+        borderWidth: fromMe ? 0 : 0.5, borderColor: theme.color.separator,
+      }}>
+        <Text style={{ fontSize: 15, lineHeight: 21, color: fromMe ? '#fff' : theme.color.ink }}>{text}</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 4, marginTop: 4 }}>
+          {time ? <Text style={{ fontSize: 11, color: fromMe ? 'rgba(255,255,255,0.7)' : theme.color.inkTertiary }}>{time}</Text> : null}
+          {delivery && fromMe ? <DeliveryIndicator phase={delivery} /> : null}
+        </View>
+      </View>
+    </View>
+  );
+}
+
+/** A floating pill-style connection badge. */
+export function ConnBadge({ online }: { online: boolean }) {
+  const { theme } = useTheme();
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 12, height: 28, borderRadius: 14, backgroundColor: (online ? theme.color.green : theme.color.orange) + '18', borderWidth: 0.5, borderColor: (online ? theme.color.green : theme.color.orange) + '40' }}>
+      <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: online ? theme.color.green : theme.color.orange }} />
+      <Text style={{ fontSize: 12.5, fontWeight: '600', color: theme.color.ink }}>{online ? 'Live' : 'Offline'}</Text>
+    </View>
+  );
+}
