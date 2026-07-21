@@ -3,7 +3,7 @@
  * the real controller state machine (loading / unenrolled / confirming / requesting /
  * pending / approving / denied / expired / revoked / repair). Every fact shown is an
  * authoritative, safe field from `ShadowUiState.enrollment` — short ids + host
- * fingerprint + the account.read capability label. No fake progress, no raw secrets.
+ * fingerprint + the staged requested capability labels. No fake progress, no raw secrets.
  * Local component state controls ONLY the scanner overlay — never authority.
  */
 import React from 'react';
@@ -80,6 +80,7 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
   const [error, setError] = React.useState<string | null>(null);
   const [macs, setMacs] = React.useState<AccountEnrollmentMac[]>([]);
   const [loadingMacs, setLoadingMacs] = React.useState(false);
+  const [startingEnrollment, setStartingEnrollment] = React.useState(false);
   // Least-privilege enrollment choice (Section A): default View only; Control actions is an
   // EXPLICIT opt-in with per-family selection (nothing pre-selected). account.read is always
   // requested (the read floor). The chosen set is applied to the runtime BEFORE the scan.
@@ -90,10 +91,25 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
   const [screenView, setScreenView] = React.useState(false);
   const phase = state.phase;
 
-  const beginScan = React.useCallback(() => {
-    void controller.setRequestedCapabilities(requestedCapabilitiesFor(mode, [...selected], screenView));
-    setError(null); setScanning(true);
+  const applyRequestedCapabilities = React.useCallback(async () => {
+    const applied = await controller.setRequestedCapabilities(requestedCapabilitiesFor(mode, [...selected], screenView));
+    if (!applied) {
+      setError('Could not apply the selected access before enrollment. Try again.');
+      return false;
+    }
+    return true;
   }, [controller, mode, selected, screenView]);
+  const beginScan = React.useCallback(async () => {
+    if (startingEnrollment) return;
+    setStartingEnrollment(true);
+    try {
+      setError(null);
+      if (!await applyRequestedCapabilities()) return;
+      setScanning(true);
+    } finally {
+      setStartingEnrollment(false);
+    }
+  }, [applyRequestedCapabilities, startingEnrollment]);
   const loadMacs = React.useCallback(async () => {
     setLoadingMacs(true);
     const res = await controller.listAccountMacs();
@@ -103,11 +119,17 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
   }, [controller]);
   React.useEffect(() => { if (phase === 'unenrolled') void loadMacs(); }, [phase, loadMacs]);
   const beginAccountMac = React.useCallback(async (hostDeviceId: string) => {
-    void controller.setRequestedCapabilities(requestedCapabilitiesFor(mode, [...selected], screenView));
-    setError(null);
-    const res = await controller.beginAccountEnrollment(hostDeviceId);
-    if (!res.ok) setError(res.reason ?? 'Request failed');
-  }, [controller, mode, selected, screenView]);
+    if (startingEnrollment) return;
+    setStartingEnrollment(true);
+    try {
+      setError(null);
+      if (!await applyRequestedCapabilities()) return;
+      const res = await controller.beginAccountEnrollment(hostDeviceId);
+      if (!res.ok) setError(res.reason ?? 'Request failed');
+    } finally {
+      setStartingEnrollment(false);
+    }
+  }, [applyRequestedCapabilities, controller, startingEnrollment]);
   const confirmEnrollment = React.useCallback(async () => {
     setError(null);
     const res = await controller.confirmEnrollment();
@@ -121,7 +143,7 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
   if (scanning && phase === 'unenrolled') {
     return (
       <ShadowScanner
-        busy={state.busy}
+        busy={state.busy || startingEnrollment}
         onCancel={() => { setScanning(false); setError(null); }}
         onScanned={async (raw) => {
           const res = await controller.beginEnrollment(raw);
@@ -133,10 +155,28 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
 
   switch (phase) {
     case 'loading':
+      if (state.enrollment.errorReason) {
+        return (
+          <Centered>
+            <IconBadge name="refresh" tone={theme.color.orange} />
+            <EmptyState icon="refresh" title="Secure sync is taking longer than expected" body={state.enrollment.errorReason} />
+            <PrimaryButton title="Retry secure sync" icon="refresh" onPress={() => { void controller.retryBootstrap(); }} />
+          </Centered>
+        );
+      }
       return <Busy label="Loading…" />;
     case 'requesting':
       return <Busy label="Sending the request to your Mac…" />;
     case 'approving':
+      if (state.enrollment.errorReason) {
+        return (
+          <Centered>
+            <IconBadge name="refresh" tone={theme.color.orange} />
+            <EmptyState icon="refresh" title="Secure sync is still offline" body={state.enrollment.errorReason} />
+            <PrimaryButton title="Retry secure sync" icon="refresh" onPress={() => { void controller.retryBootstrap(); }} />
+          </Centered>
+        );
+      }
       return <Busy label="Setting up a secure connection…" />;
 
     case 'unenrolled':
@@ -197,12 +237,12 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
             </Text>
             <Text style={{ fontSize: 12, fontWeight: '700', color: theme.color.inkSecondary, marginBottom: 8, marginLeft: 2, textTransform: 'uppercase', letterSpacing: 0.4 }}>Your Macs</Text>
             <View style={{ gap: 10, marginBottom: 14 }}>
-              {loadingMacs ? <Busy label="Finding Macs…" /> : macs.length ? macs.map((m) => <MacRow key={m.hostDeviceId} mac={m} busy={state.busy} onPress={() => void beginAccountMac(m.hostDeviceId)} />) : (
+              {loadingMacs ? <Busy label="Finding Macs…" /> : macs.length ? macs.map((m) => <MacRow key={m.hostDeviceId} mac={m} busy={state.busy || startingEnrollment} onPress={() => void beginAccountMac(m.hostDeviceId)} />) : (
                 <Text style={{ fontSize: 13, color: theme.color.inkTertiary, textAlign: 'center' }}>No eligible Mac is online for this account.</Text>
               )}
             </View>
             {error ?? state.enrollment.errorReason ? <Text role="alert" style={{ fontSize: 13, color: theme.color.red, textAlign: 'center', marginBottom: 14 }}>{error ?? state.enrollment.errorReason}</Text> : null}
-            <GhostButton title="Use enrollment code instead" onPress={beginScan} />
+            <GhostButton title="Use enrollment code instead" onPress={() => void beginScan()} />
             <View style={{ height: 10 }} />
             <GhostButton title="Not now" onPress={() => { void deactivateControllerMode(); }} />
           </ScrollView>
@@ -220,7 +260,7 @@ export function ShadowGate({ state, controller }: { state: ShadowUiState; contro
           <View style={{ backgroundColor: theme.color.bgElevated, borderRadius: 14, borderWidth: 0.5, borderColor: theme.color.separator, padding: 16, marginBottom: 20 }}>
             <LabeledRow label="Mac fingerprint" value={state.enrollment.hostFingerprintShort ?? '—'} mono />
             <View style={{ height: 12 }} />
-            <LabeledRow label="This device" value={state.enrollment.controllerDeviceIdShort ?? '—'} mono />
+            <LabeledRow label="This device" value={state.enrollment.controllerDeviceLabel} mono />
             <View style={{ height: 12 }} />
             <LabeledRow label="Requesting" value={state.enrollment.requestedCapabilityLabels.join(', ')} />
           </View>

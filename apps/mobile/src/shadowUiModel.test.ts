@@ -17,6 +17,7 @@ const NOW = 1_000_000;
 function enr(state: EnrollmentState, over: Partial<EnrollmentStatus> = {}): EnrollmentStatus {
   return {
     state, accountId: 'acct_1', controllerDeviceId: 'ctrl_device_abcdef012345678', hostFingerprint: 'hostkey_fingerprint_zzz999',
+    requestedCapabilities: ['account.read'],
     scopeKeyId: state === 'online' ? 'sk_1' : null, online: state === 'online', ...over,
   };
 }
@@ -61,6 +62,9 @@ describe('deriveShadowUiPhase — enrollment state machine → UI phase', () => 
   it('locked SERVICE (host revoke / 401) beats a cached online grant → revoked', () => {
     expect(deriveShadowUiPhase(inputs({ enrollment: enr('online'), service: svc({ online: true, state: 'online', locked: true }) }))).toBe('revoked');
   });
+  it('live grant + missing local authority → repair', () => {
+    expect(deriveShadowUiPhase(inputs({ enrollment: enr('online'), service: null, localAuthorityMissing: true }))).toBe('repair');
+  });
   it('lapsed renewable lease is truthful OFFLINE (not a terminal), auto-reconcile renews', () => {
     // online grant, service offline, lease already past → offline read-only, never online.
     expect(deriveShadowUiPhase(inputs({ enrollment: enr('online'), service: svc({ online: false, leaseExpiresAt: NOW - 10_000 }) }))).toBe('offline');
@@ -83,12 +87,35 @@ describe('content gate (zero stale flash)', () => {
 });
 
 describe('safe-only field mapping + no fabrication', () => {
-  it('maps short ids + read floor label; requests ONLY account.read', () => {
+  it('maps short ids + canonical staged capability labels', () => {
     const st = deriveShadowUiState(inputs({ enrollment: enr('awaiting-host') }));
     expect(st.enrollment.controllerDeviceIdShort).toBe(shortId('ctrl_device_abcdef012345678'));
+    expect(st.enrollment.controllerDeviceLabel).toBe(shortId('ctrl_device_abcdef012345678'));
     expect(st.enrollment.hostFingerprintShort).toBe(shortId('hostkey_fingerprint_zzz999'));
     expect(st.enrollment.requestedCapabilityLabels).toEqual([capabilityLabel('account.read')]);
     expect(st.enrollment.requestedCapabilityLabels).toEqual(['Read your projects & activity']);
+  });
+  it('renders the full staged set in canonical order', () => {
+    const st = deriveShadowUiState(inputs({
+      enrollment: enr('confirming', {
+        requestedCapabilities: ['screen.view', 'job.cancel', 'account.read', 'job.start', 'session.message', 'question.answer', 'approval.respond', 'session.autopilot.set'],
+      }),
+    }));
+    expect(st.enrollment.requestedCapabilityLabels).toEqual([
+      'Read your projects & activity',
+      'Send messages in a session',
+      'Start jobs',
+      'Cancel jobs',
+      'Respond to approvals',
+      'Answer questions',
+      'Change session autopilot',
+      'View your Mac screen (view only · no audio)',
+    ]);
+  });
+  it('uses bounded device copy before identity generation', () => {
+    const st = deriveShadowUiState(inputs({ enrollment: enr('confirming', { controllerDeviceId: null }) }));
+    expect(st.enrollment.controllerDeviceIdShort).toBeNull();
+    expect(st.enrollment.controllerDeviceLabel).toBe('Created when requested');
   });
   it('lastActivityAt is omitted (null) when unknown — never now/0', () => {
     expect(deriveShadowUiState(inputs({ enrollment: enr('online'), service: svc() })).connection.lastActivityAt).toBeNull();

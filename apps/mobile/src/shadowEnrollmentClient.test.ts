@@ -7,10 +7,12 @@
 import { describe, it, expect } from 'vitest';
 import { nodeShadowCrypto as backend } from '@maestro/realtime/shadowCryptoNode';
 import { base64urlEncode } from '@maestro/realtime/shadowCrypto';
-import { generateShadowIdentity, createEnrollmentSession, encodeEnrollmentBootstrap, verifyEnrollmentRequest } from '@maestro/realtime/shadowEnrollment';
+import { generateShadowIdentity, createEnrollmentSession, encodeEnrollmentBootstrap, verifyEnrollmentRequest, decodeEnrollmentBootstrap, buildEnrollmentRequest, approveEnrollment } from '@maestro/realtime/shadowEnrollment';
 import type { ShadowCapability } from '@maestro/realtime/shadowCapabilities';
 import type { ShadowFetch } from '@maestro/realtime/shadowRequestClient';
 import { ShadowMobileEnrollmentRuntime, type SecureStoreAdapter, type EnrollmentMetaStore, type StoredGrantMeta } from './shadowEnrollmentClient';
+import { createMemoryShadowStore } from './shadowClient';
+import { ShadowControllerService } from './shadowControllerService';
 
 const ORIGIN = 'https://relay.test';
 const ACCOUNT = 'acct_unit';
@@ -26,6 +28,78 @@ class MemMeta implements EnrollmentMetaStore {
   async loadGrant() { return this.g; }
   async saveGrant(m: StoredGrantMeta) { this.g = m; }
   async clearGrant() { this.g = null; }
+}
+
+class FlakyMemMeta extends MemMeta {
+  failNextLoad = false;
+  override async loadGrant() {
+    if (this.failNextLoad) {
+      this.failNextLoad = false;
+      return null;
+    }
+    return super.loadGrant();
+  }
+}
+
+class ReorderedRoundTripMeta extends MemMeta {
+  override async saveGrant(m: StoredGrantMeta) {
+    const normalized = JSON.parse(JSON.stringify(m, (_key, value) => value === undefined ? undefined : value)) as StoredGrantMeta;
+    const reordered = {
+      status: normalized.status,
+      leaseExpiresAt: normalized.leaseExpiresAt,
+      hostAgreementPublicKey: normalized.hostAgreementPublicKey,
+      hostSigningPublicKey: normalized.hostSigningPublicKey,
+      hostSigningKeyId: normalized.hostSigningKeyId,
+      transcriptHash: normalized.transcriptHash,
+      expiresAt: normalized.expiresAt,
+      fence: {
+        leaseId: normalized.fence.leaseId,
+        epoch: normalized.fence.epoch,
+        hostDeviceId: normalized.fence.hostDeviceId,
+        scopeId: normalized.fence.scopeId,
+        accountId: normalized.fence.accountId,
+      },
+      scopeKeyId: normalized.scopeKeyId,
+      keyId: normalized.keyId,
+      grantId: normalized.grantId,
+      controllerDeviceId: normalized.controllerDeviceId,
+      sessionId: normalized.sessionId,
+      capabilityProof: normalized.capabilityProof
+        ? {
+            signature: normalized.capabilityProof.signature,
+            signedAt: normalized.capabilityProof.signedAt,
+            expiresAt: normalized.capabilityProof.expiresAt,
+            keyId: normalized.capabilityProof.keyId,
+            grantId: normalized.capabilityProof.grantId,
+          }
+        : undefined,
+      approvedCapabilities: normalized.approvedCapabilities ? [...normalized.approvedCapabilities].reverse() : undefined,
+    } satisfies StoredGrantMeta;
+    this.g = reordered;
+  }
+}
+
+class MissingIdentitySecureStore extends MemSecureStore {
+  override async getItemAsync(k: string) {
+    if (k.startsWith('maestro.shadow.identity.')) return null;
+    return super.getItemAsync(k);
+  }
+}
+
+class MissingScopeSecureStore extends MemSecureStore {
+  override async getItemAsync(k: string) {
+    if (k.startsWith('maestro.shadow.scopeKey.')) return null;
+    return super.getItemAsync(k);
+  }
+}
+
+interface AcceptedAuthorityDiagnosticScenario {
+  label: string;
+  secureStore: MemSecureStore;
+  metaStore: MemMeta;
+  expectedReason: NonNullable<ReturnType<ShadowMobileEnrollmentRuntime['status']>['acceptedAuthorityPersistenceReason']>;
+  beforePoll?: (store: MemSecureStore, deviceId: string) => Promise<void>;
+  tamperAfterSave?: (store: MemSecureStore, deviceId: string) => Promise<void>;
 }
 
 function scriptedFetch(routes: Record<string, { status: number; body: unknown }>): ShadowFetch {
@@ -57,6 +131,49 @@ async function makeBootstrap(nowMs: number, ttlMs = 120_000) {
   const host = await generateShadowIdentity(backend, 'host_unit');
   const created = await createEnrollmentSession(backend, { host, accountId: ACCOUNT, relayOrigin: ORIGIN, nowMs, ttlMs, serverPepper: new TextEncoder().encode('p') });
   return created.bootstrap;
+}
+
+async function makeApprovalTransport(nowMs: number, requestedCapabilities: readonly ShadowCapability[]) {
+  const host = await generateShadowIdentity(backend, 'host_approved');
+  const creation = await createEnrollmentSession(backend, {
+    host,
+    accountId: ACCOUNT,
+    relayOrigin: ORIGIN,
+    nowMs,
+    ttlMs: 120_000,
+    serverPepper: new TextEncoder().encode('p'),
+  });
+  let pollBody: { status: string; grant?: unknown } = { status: 'pending' };
+  const fetch: ShadowFetch = async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path === '/api/shadow/enroll/request') {
+      const body = JSON.parse(init.body ?? '{}') as { request: Parameters<typeof verifyEnrollmentRequest>[1]['request'] };
+      const verified = await verifyEnrollmentRequest(backend, {
+        request: body.request,
+        bootstrap: creation.bootstrap,
+        expectedAccountId: ACCOUNT,
+        nowMs: nowMs + 3_000,
+      });
+      if (!verified.ok) throw new Error(verified.reason);
+      const fence = { accountId: ACCOUNT, scopeId: `account:${ACCOUNT}`, hostDeviceId: host.deviceId, epoch: 1, leaseId: 'lease_approved' };
+      const approval = await approveEnrollment(backend, {
+        host,
+        fence,
+        controllerDeviceId: body.request.controllerDeviceId,
+        controllerAgreementPublicKey: verified.controllerAgreementPublicKey,
+        transcriptHash: verified.transcriptHash,
+        sessionId: body.request.sessionId,
+        nowMs: nowMs + 3_500,
+        capabilities: requestedCapabilities,
+        requestedCapabilities: verified.requestedCapabilities,
+      });
+      pollBody = { status: 'approved', grant: { grant: approval.grant, keyMaterial: approval.keyMaterial } };
+      return { status: 200, ok: true, text: async () => JSON.stringify({ sessionId: creation.bootstrap.sessionId, controllerDeviceId: body.request.controllerDeviceId, status: 'pending' }) };
+    }
+    if (path === '/api/shadow/enroll/poll') return { status: 200, ok: true, text: async () => JSON.stringify(pollBody) };
+    return { status: 404, ok: false, text: async () => JSON.stringify({ error: 'no route' }) };
+  };
+  return { bootstrap: creation.bootstrap, fetch, hostDeviceId: host.deviceId };
 }
 
 function runtime(fetch: ShadowFetch, controllerDeviceId = 'ctrl_unit') {
@@ -221,9 +338,9 @@ describe('mobile enrollment runtime — transitions + guards', () => {
     const bootstrap = await makeBootstrap(1_700_000_000_000);
     const qr = encodeEnrollmentBootstrap(bootstrap);
     const requestedCapabilities: ShadowCapability[] = ['account.read', 'session.message', 'job.start', 'job.cancel', 'approval.respond', 'question.answer', 'session.autopilot.set', 'screen.view'];
-    const calls: Array<{ request: { controllerDeviceId: string; signingPublicKey: string; signature: string } }> = [];
+    const calls: Array<{ request: { controllerDeviceId: string; signingPublicKey: string; signature: string; requestedCapabilities?: ShadowCapability[] } }> = [];
     const fetch: ShadowFetch = async (_url, init) => {
-      const body = JSON.parse(init.body ?? '{}') as { request: { controllerDeviceId: string; signingPublicKey: string; signature: string } };
+      const body = JSON.parse(init.body ?? '{}') as { request: { controllerDeviceId: string; signingPublicKey: string; signature: string; requestedCapabilities?: ShadowCapability[] } };
       calls.push({ request: body.request });
       const verified = await verifyEnrollmentRequest(backend, { request: body.request as never, bootstrap, expectedAccountId: ACCOUNT, nowMs: 1_700_000_000_000 });
       return verified.ok
@@ -234,10 +351,30 @@ describe('mobile enrollment runtime — transitions + guards', () => {
     await storeIdentityBlob(secureStore, '979459b5-controller', await staleSigningIdentityBlob());
     expect((await rt.parseBootstrap(qr)).ok).toBe(true);
     expect(rt.setRequestedCapabilities(requestedCapabilities)).toBe(true);
+    expect(rt.status().requestedCapabilities).toEqual([
+      'account.read',
+      'session.message',
+      'job.start',
+      'job.cancel',
+      'approval.respond',
+      'question.answer',
+      'session.autopilot.set',
+      'screen.view',
+    ]);
     expect(await rt.requestEnrollment()).toEqual({ ok: true });
     expect(rt.getState()).toBe('awaiting-host');
     expect(calls).toHaveLength(1);
     expect(calls[0]?.request.controllerDeviceId).toBe('979459b5-controller');
+    expect(calls[0]?.request.requestedCapabilities).toEqual([
+      'account.read',
+      'session.message',
+      'job.start',
+      'job.cancel',
+      'approval.respond',
+      'question.answer',
+      'session.autopilot.set',
+      'screen.view',
+    ]);
     const persisted = JSON.parse((await secureStore.getItemAsync('maestro.shadow.identity.979459b5-controller')) ?? '{}') as { v?: number };
     expect(persisted.v).toBe(1);
   });
@@ -306,5 +443,330 @@ describe('mobile enrollment runtime — transitions + guards', () => {
     expect(rt.getState()).toBe('revoked');
     expect(rt.status().readonlyReason).toBe('revoked');
     expect(rt.canIssueCommand()).toBe(false);
+  });
+
+  it('cold restart rebuilds the controller service from persisted identity + accepted grant', async () => {
+    const requested: ShadowCapability[] = ['account.read', 'session.message', 'job.start', 'job.cancel', 'approval.respond', 'question.answer', 'session.autopilot.set', 'screen.view'];
+    const approved = await makeApprovalTransport(1_700_000_000_000, requested);
+    const { secureStore, metaStore } = runtime(scriptedFetch({}), 'ctrl_restart');
+    const persisted = new ShadowMobileEnrollmentRuntime({
+      backend,
+      secureStore,
+      metaStore,
+      session: { get: async () => ({ accountId: ACCOUNT, controllerDeviceId: 'ctrl_restart', sessionToken: 'tok', relayOrigin: ORIGIN }) },
+      transport: { fetch: approved.fetch },
+      allowedOrigins: [ORIGIN],
+      now: () => 1_700_000_000_000,
+    });
+    expect((await persisted.parseBootstrap(encodeEnrollmentBootstrap(approved.bootstrap))).ok).toBe(true);
+    expect(persisted.setRequestedCapabilities(requested)).toBe(true);
+    expect(await persisted.requestEnrollment()).toEqual({ ok: true });
+    expect(await persisted.poll()).toBe('accepted');
+
+    const restored = new ShadowMobileEnrollmentRuntime({
+      backend,
+      secureStore,
+      metaStore,
+      session: { get: async () => ({ accountId: ACCOUNT, controllerDeviceId: 'ctrl_restart', sessionToken: 'tok', relayOrigin: ORIGIN }) },
+      transport: { fetch: scriptedFetch({}) },
+      allowedOrigins: [ORIGIN],
+      now: () => 1_700_000_000_000,
+    });
+    expect((await restored.restore()).state).toBe('online');
+    const store = createMemoryShadowStore('ctrl_restart', approved.bootstrap.hostDeviceId, {
+      fence: metaStore.g!.fence,
+      controllerDeviceId: 'ctrl_restart',
+      leaseExpiresAt: metaStore.g!.leaseExpiresAt,
+    });
+    const svc = await restored.buildControllerService({
+      store,
+      session: async () => ({ accountId: ACCOUNT, controllerDeviceId: 'ctrl_restart', sessionToken: 'tok', relayOrigin: ORIGIN }),
+      transport: { fetch: scriptedFetch({}) },
+    });
+    expect(svc).toBeInstanceOf(ShadowControllerService);
+  });
+
+  it('fails closed and purges partial acceptance when durable read-back verification misses the saved grant', async () => {
+    const requested: ShadowCapability[] = ['account.read', 'job.start'];
+    const approved = await makeApprovalTransport(1_700_000_000_000, requested);
+    const secureStore = new MemSecureStore();
+    const metaStore = new FlakyMemMeta();
+    const rt = new ShadowMobileEnrollmentRuntime({
+      backend,
+      secureStore,
+      metaStore,
+      session: { get: async () => ({ accountId: ACCOUNT, controllerDeviceId: 'ctrl_flaky', sessionToken: 'tok', relayOrigin: ORIGIN }) },
+      transport: { fetch: approved.fetch },
+      allowedOrigins: [ORIGIN],
+      now: () => 1_700_000_000_000,
+    });
+    expect((await rt.parseBootstrap(encodeEnrollmentBootstrap(approved.bootstrap))).ok).toBe(true);
+    expect(rt.setRequestedCapabilities(requested)).toBe(true);
+    expect(await rt.requestEnrollment()).toEqual({ ok: true });
+    metaStore.failNextLoad = true;
+    expect(await rt.poll()).toBe('error');
+    expect(rt.status().lastError).toBe('accepted-authority-persistence-check-failed');
+    expect(rt.status().acceptedAuthorityPersistenceReason).toBe('grant.missing');
+    expect(await metaStore.loadGrant()).toBeNull();
+    expect(await secureStore.getItemAsync(`maestro.shadow.scopeKey.ctrl_flaky.account:${ACCOUNT}`)).toBeNull();
+  });
+
+  it('accepts a semantically identical grant after reordered JSON round-trip and undefined normalization', async () => {
+    const requested: ShadowCapability[] = ['account.read', 'job.start', 'screen.view'];
+    const approved = await makeApprovalTransport(1_700_000_000_000, requested);
+    const secureStore = new MemSecureStore();
+    const metaStore = new ReorderedRoundTripMeta();
+    const rt = new ShadowMobileEnrollmentRuntime({
+      backend,
+      secureStore,
+      metaStore,
+      session: { get: async () => ({ accountId: ACCOUNT, controllerDeviceId: 'ctrl_semantic', sessionToken: 'tok', relayOrigin: ORIGIN }) },
+      transport: { fetch: approved.fetch },
+      allowedOrigins: [ORIGIN],
+      now: () => 1_700_000_000_000,
+    });
+    expect((await rt.parseBootstrap(encodeEnrollmentBootstrap(approved.bootstrap))).ok).toBe(true);
+    expect(rt.setRequestedCapabilities(requested)).toBe(true);
+    expect(await rt.requestEnrollment()).toEqual({ ok: true });
+    expect(await rt.poll()).toBe('accepted');
+    expect(rt.status().lastError).toBeUndefined();
+    expect((await metaStore.loadGrant())?.grantId).toBeTruthy();
+  });
+
+  it('fails closed when any protected persisted grant field changes semantically', async () => {
+    const requested: ShadowCapability[] = ['account.read', 'job.start', 'screen.view'];
+    const approved = await makeApprovalTransport(1_700_000_000_000, requested);
+    const cases: Array<{ label: string; mutate: (meta: StoredGrantMeta) => StoredGrantMeta }> = [
+      { label: 'sessionId', mutate: (meta) => ({ ...meta, sessionId: `${meta.sessionId}_x` }) },
+      { label: 'controllerDeviceId', mutate: (meta) => ({ ...meta, controllerDeviceId: `${meta.controllerDeviceId}_x` }) },
+      { label: 'grantId', mutate: (meta) => ({ ...meta, grantId: `${meta.grantId}_x` }) },
+      { label: 'keyId', mutate: (meta) => ({ ...meta, keyId: `${meta.keyId}_x` }) },
+      { label: 'scopeKeyId', mutate: (meta) => ({ ...meta, scopeKeyId: `${meta.scopeKeyId}_x` }) },
+      { label: 'fence.accountId', mutate: (meta) => ({ ...meta, fence: { ...meta.fence, accountId: `${meta.fence.accountId}_x` } }) },
+      { label: 'fence.scopeId', mutate: (meta) => ({ ...meta, fence: { ...meta.fence, scopeId: `${meta.fence.scopeId}_x` } }) },
+      { label: 'fence.hostDeviceId', mutate: (meta) => ({ ...meta, fence: { ...meta.fence, hostDeviceId: `${meta.fence.hostDeviceId}_x` } }) },
+      { label: 'fence.epoch', mutate: (meta) => ({ ...meta, fence: { ...meta.fence, epoch: meta.fence.epoch + 1 } }) },
+      { label: 'fence.leaseId', mutate: (meta) => ({ ...meta, fence: { ...meta.fence, leaseId: `${meta.fence.leaseId}_x` } }) },
+      { label: 'expiresAt', mutate: (meta) => ({ ...meta, expiresAt: meta.expiresAt + 1 }) },
+      { label: 'transcriptHash', mutate: (meta) => ({ ...meta, transcriptHash: `${meta.transcriptHash}x` }) },
+      { label: 'hostSigningKeyId', mutate: (meta) => ({ ...meta, hostSigningKeyId: `${meta.hostSigningKeyId}_x` }) },
+      { label: 'hostSigningPublicKey', mutate: (meta) => ({ ...meta, hostSigningPublicKey: `${meta.hostSigningPublicKey}x` }) },
+      { label: 'hostAgreementPublicKey', mutate: (meta) => ({ ...meta, hostAgreementPublicKey: `${meta.hostAgreementPublicKey ?? ''}x` }) },
+      { label: 'leaseExpiresAt', mutate: (meta) => ({ ...meta, leaseExpiresAt: meta.leaseExpiresAt + 1 }) },
+      { label: 'status', mutate: (meta) => ({ ...meta, status: 'revoked' }) },
+      { label: 'approvedCapabilities', mutate: (meta) => ({ ...meta, approvedCapabilities: ['account.read', 'job.cancel'] }) },
+      {
+        label: 'capabilityProof.grantId',
+        mutate: (meta) => ({ ...meta, capabilityProof: meta.capabilityProof ? { ...meta.capabilityProof, grantId: `${meta.capabilityProof.grantId}_x` } : meta.capabilityProof }),
+      },
+      {
+        label: 'capabilityProof.keyId',
+        mutate: (meta) => ({ ...meta, capabilityProof: meta.capabilityProof ? { ...meta.capabilityProof, keyId: `${meta.capabilityProof.keyId}_x` } : meta.capabilityProof }),
+      },
+      {
+        label: 'capabilityProof.expiresAt',
+        mutate: (meta) => ({ ...meta, capabilityProof: meta.capabilityProof ? { ...meta.capabilityProof, expiresAt: meta.capabilityProof.expiresAt + 1 } : meta.capabilityProof }),
+      },
+      {
+        label: 'capabilityProof.signedAt',
+        mutate: (meta) => ({ ...meta, capabilityProof: meta.capabilityProof ? { ...meta.capabilityProof, signedAt: meta.capabilityProof.signedAt + 1 } : meta.capabilityProof }),
+      },
+      {
+        label: 'capabilityProof.signature',
+        mutate: (meta) => ({ ...meta, capabilityProof: meta.capabilityProof ? { ...meta.capabilityProof, signature: `${meta.capabilityProof.signature}x` } : meta.capabilityProof }),
+      },
+    ];
+
+    for (const [index, testCase] of cases.entries()) {
+      const controllerDeviceId = `ctrl_mutation_${index}`;
+      const secureStore = new MemSecureStore();
+      const metaStore = new MemMeta();
+      const rt = new ShadowMobileEnrollmentRuntime({
+        backend,
+        secureStore,
+        metaStore,
+        session: { get: async () => ({ accountId: ACCOUNT, controllerDeviceId, sessionToken: 'tok', relayOrigin: ORIGIN }) },
+        transport: { fetch: approved.fetch },
+        allowedOrigins: [ORIGIN],
+        now: () => 1_700_000_000_000,
+      });
+      expect((await rt.parseBootstrap(encodeEnrollmentBootstrap(approved.bootstrap))).ok, testCase.label).toBe(true);
+      expect(rt.setRequestedCapabilities(requested), testCase.label).toBe(true);
+      expect(await rt.requestEnrollment(), testCase.label).toEqual({ ok: true });
+      const originalSaveGrant = metaStore.saveGrant.bind(metaStore);
+      let mutated = false;
+      metaStore.saveGrant = async (meta) => {
+        await originalSaveGrant(mutated ? meta : testCase.mutate(meta));
+        mutated = true;
+      };
+      expect(await rt.poll(), testCase.label).toBe('error');
+      expect(rt.status().lastError, testCase.label).toBe('accepted-authority-persistence-check-failed');
+      expect(rt.status().acceptedAuthorityPersistenceReason, testCase.label).toBe('grant.mismatch');
+      expect(await metaStore.loadGrant(), testCase.label).toBeNull();
+      expect(await secureStore.getItemAsync(`maestro.shadow.scopeKey.${controllerDeviceId}.account:${ACCOUNT}`), testCase.label).toBeNull();
+    }
+  });
+
+  it('fails closed when persisted null substitutes for protected optional fields', async () => {
+    const requested: ShadowCapability[] = ['account.read', 'job.start', 'screen.view'];
+    const approved = await makeApprovalTransport(1_700_000_000_000, requested);
+    const cases: Array<{ label: string; mutate: (meta: StoredGrantMeta) => StoredGrantMeta }> = [
+      {
+        label: 'hostAgreementPublicKey=null',
+        mutate: (meta) => ({ ...meta, hostAgreementPublicKey: null as unknown as string | undefined }),
+      },
+      {
+        label: 'approvedCapabilities=null',
+        mutate: (meta) => ({ ...meta, approvedCapabilities: null as unknown as ShadowCapability[] | undefined }),
+      },
+      {
+        label: 'capabilityProof=null',
+        mutate: (meta) => ({
+          ...meta,
+          capabilityProof: null as unknown as StoredGrantMeta['capabilityProof'],
+        }),
+      },
+      {
+        label: 'expected-undefined-hostAgreementPublicKey-vs-null',
+        mutate: (meta) => ({
+          ...meta,
+          hostAgreementPublicKey: null as unknown as string | undefined,
+          approvedCapabilities: undefined,
+          capabilityProof: undefined,
+        }),
+      },
+      {
+        label: 'expected-undefined-approvedCapabilities-vs-null',
+        mutate: (meta) => ({
+          ...meta,
+          hostAgreementPublicKey: undefined,
+          approvedCapabilities: null as unknown as ShadowCapability[] | undefined,
+          capabilityProof: undefined,
+        }),
+      },
+      {
+        label: 'expected-undefined-capabilityProof-vs-null',
+        mutate: (meta) => ({
+          ...meta,
+          hostAgreementPublicKey: undefined,
+          approvedCapabilities: undefined,
+          capabilityProof: null as unknown as StoredGrantMeta['capabilityProof'],
+        }),
+      },
+    ];
+
+    for (const [index, testCase] of cases.entries()) {
+      const controllerDeviceId = `ctrl_optional_null_${index}`;
+      const secureStore = new MemSecureStore();
+      const metaStore = new MemMeta();
+      const rt = new ShadowMobileEnrollmentRuntime({
+        backend,
+        secureStore,
+        metaStore,
+        session: { get: async () => ({ accountId: ACCOUNT, controllerDeviceId, sessionToken: 'tok', relayOrigin: ORIGIN }) },
+        transport: { fetch: approved.fetch },
+        allowedOrigins: [ORIGIN],
+        now: () => 1_700_000_000_000,
+      });
+      expect((await rt.parseBootstrap(encodeEnrollmentBootstrap(approved.bootstrap))).ok, testCase.label).toBe(true);
+      expect(rt.setRequestedCapabilities(requested), testCase.label).toBe(true);
+      expect(await rt.requestEnrollment(), testCase.label).toEqual({ ok: true });
+      const originalSaveGrant = metaStore.saveGrant.bind(metaStore);
+      let mutated = false;
+      metaStore.saveGrant = async (meta) => {
+        const target = mutated ? meta : testCase.mutate(meta);
+        await originalSaveGrant(target);
+        mutated = true;
+      };
+      expect(await rt.poll(), testCase.label).toBe('error');
+      expect(rt.status().lastError, testCase.label).toBe('accepted-authority-persistence-check-failed');
+      expect(rt.status().acceptedAuthorityPersistenceReason, testCase.label).toBe('grant.mismatch');
+      expect(await metaStore.loadGrant(), testCase.label).toBeNull();
+      expect(await secureStore.getItemAsync(`maestro.shadow.scopeKey.${controllerDeviceId}.account:${ACCOUNT}`), testCase.label).toBeNull();
+    }
+  });
+
+  it('returns only allowlisted accepted-authority verification reasons and never secret-shaped content', async () => {
+    const requested: ShadowCapability[] = ['account.read', 'job.start'];
+    const approved = await makeApprovalTransport(1_700_000_000_000, requested);
+    const scenarios: AcceptedAuthorityDiagnosticScenario[] = [
+      {
+        label: 'identity.missing',
+        secureStore: new MissingIdentitySecureStore(),
+        metaStore: new MemMeta(),
+        expectedReason: 'identity.missing',
+      },
+      {
+        label: 'identity.invalid',
+        secureStore: new MemSecureStore(),
+        metaStore: new MemMeta(),
+        tamperAfterSave: async (store: MemSecureStore, deviceId: string) => {
+          await store.setItemAsync(`maestro.shadow.identity.${deviceId}`, JSON.stringify({
+            v: 1,
+            signingSeed: 'https://relay.test/tok_live_secret_123',
+            signingPub: 'opaque-id-1234567890abcdef',
+            agreementSeed: 'sk_live_regex_safe_secret',
+            agreementPub: 'mailto:test@example.com',
+          }));
+        },
+        expectedReason: 'identity.invalid',
+      },
+      {
+        label: 'scope.missing',
+        secureStore: new MissingScopeSecureStore(),
+        metaStore: new MemMeta(),
+        expectedReason: 'scope.missing',
+      },
+      {
+        label: 'scope.mismatch',
+        secureStore: new MemSecureStore(),
+        metaStore: new MemMeta(),
+        tamperAfterSave: async (store: MemSecureStore, deviceId: string) => {
+          await store.setItemAsync(`maestro.shadow.scopeKey.${deviceId}.account:${ACCOUNT}`, 'https://relay.test/tok_live_secret_123');
+        },
+        expectedReason: 'scope.mismatch',
+      },
+      {
+        label: 'grant.missing',
+        secureStore: new MemSecureStore(),
+        metaStore: new FlakyMemMeta(),
+        expectedReason: 'grant.missing',
+      },
+    ];
+
+    for (const [index, scenario] of scenarios.entries()) {
+      const scenarioMetaStore = scenario.metaStore;
+      const controllerDeviceId = `ctrl_diag_${index}`;
+      const rt = new ShadowMobileEnrollmentRuntime({
+        backend,
+        secureStore: scenario.secureStore,
+        metaStore: scenarioMetaStore,
+        session: { get: async () => ({ accountId: ACCOUNT, controllerDeviceId, sessionToken: 'tok', relayOrigin: ORIGIN }) },
+        transport: { fetch: approved.fetch },
+        allowedOrigins: [ORIGIN],
+        now: () => 1_700_000_000_000,
+      });
+      expect((await rt.parseBootstrap(encodeEnrollmentBootstrap(approved.bootstrap))).ok, scenario.label).toBe(true);
+      expect(rt.setRequestedCapabilities(requested), scenario.label).toBe(true);
+      expect(await rt.requestEnrollment(), scenario.label).toEqual({ ok: true });
+      if (scenario.expectedReason === 'grant.missing' && scenarioMetaStore instanceof FlakyMemMeta) {
+        scenarioMetaStore.failNextLoad = true;
+      }
+      await scenario.beforePoll?.(scenario.secureStore, controllerDeviceId);
+      if (scenario.tamperAfterSave) {
+        const originalSaveGrant = scenarioMetaStore.saveGrant.bind(scenarioMetaStore);
+        let tampered = false;
+        scenarioMetaStore.saveGrant = async (meta) => {
+          await originalSaveGrant(meta);
+          if (!tampered) {
+            tampered = true;
+            await scenario.tamperAfterSave?.(scenario.secureStore, controllerDeviceId);
+          }
+        };
+      }
+      expect(await rt.poll(), scenario.label).toBe('error');
+      expect(rt.status().acceptedAuthorityPersistenceReason, scenario.label).toBe(scenario.expectedReason);
+      expect(rt.status().acceptedAuthorityPersistenceReason, scenario.label).not.toMatch(/https:\/\/|tok_live|opaque-id|sk_live|example\.com/);
+    }
   });
 });

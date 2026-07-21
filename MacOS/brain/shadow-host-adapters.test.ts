@@ -320,6 +320,60 @@ describe('expired persisted shadow host lease recovery', () => {
     expect(saved.leaseExpiresAt).toBe(nowMs + 240_000);
   });
 
+  it('falls back to the single durable active controller when recovery list is server-empty', async () => {
+    const controller = { controllerDeviceId: 'ctrl_failed', grantId: 'grant_failed', keyId: 'key_failed', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
+    const { rt } = await startWithSeededExpiry(1_800_000_000_000 - 1, [controller]);
+    (rt as unknown as { opts: { transport: { fetch: ShadowFetch } } }).opts.transport.fetch = async (url) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/enroll/controllers') return { status: 200, ok: true, text: async () => JSON.stringify({ controllers: [] }) };
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+
+    await expect(rt.start()).rejects.toMatchObject({ statusCode: 409 });
+    await expect(rt.listControllersForRecovery()).resolves.toEqual([{
+      controllerDeviceId: 'ctrl_failed',
+      grantId: 'grant_failed',
+      keyId: 'key_failed',
+      status: 'active',
+      expiresAt: 0,
+    }]);
+  });
+
+  it('keeps the signed server recovery list when it is non-empty', async () => {
+    const controller = { controllerDeviceId: 'ctrl_failed', grantId: 'grant_failed', keyId: 'key_failed', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
+    const { rt, nowMs } = await startWithSeededExpiry(1_800_000_000_000 - 1, [controller]);
+    const serverControllers = [{ controllerDeviceId: 'ctrl_server', grantId: 'grant_server', keyId: 'key_server', status: 'active', expiresAt: nowMs + 600_000 }];
+    (rt as unknown as { opts: { transport: { fetch: ShadowFetch } } }).opts.transport.fetch = async (url) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/enroll/controllers') return { status: 200, ok: true, text: async () => JSON.stringify({ controllers: serverControllers }) };
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+
+    await expect(rt.start()).rejects.toMatchObject({ statusCode: 409 });
+    await expect(rt.listControllersForRecovery()).resolves.toEqual(serverControllers);
+  });
+
+  it('does not expose ambiguous durable controllers as recovery targets, and never returns revoked rows', async () => {
+    const revoked = { controllerDeviceId: 'ctrl_revoked', grantId: 'grant_revoked', keyId: 'key_revoked', agreementPublicKey: 'a', transcriptHash: 't', status: 'revoked' as const };
+    const activeA = { controllerDeviceId: 'ctrl_a', grantId: 'grant_a', keyId: 'key_a', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
+    const activeB = { controllerDeviceId: 'ctrl_b', grantId: 'grant_b', keyId: 'key_b', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
+
+    for (const controllers of [[activeA, activeB], [activeA, revoked, activeB]] as const) {
+      const { rt } = await startWithSeededExpiry(1_800_000_000_000 - 1, [...controllers]);
+      (rt as unknown as { opts: { transport: { fetch: ShadowFetch } } }).opts.transport.fetch = async (url) => {
+        const path = new URL(url).pathname;
+        if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+        if (path === '/api/shadow/enroll/controllers') return { status: 200, ok: true, text: async () => JSON.stringify({ controllers: [] }) };
+        return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+      };
+
+      await expect(rt.start()).rejects.toMatchObject({ statusCode: 409 });
+      await expect(rt.listControllersForRecovery()).resolves.toEqual([]);
+    }
+  });
+
   test.each([
     'after-recovery-intent-before-server',
     'after-recovery-server-before-local',

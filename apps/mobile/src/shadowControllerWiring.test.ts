@@ -60,7 +60,7 @@ describe('production wiring: mobile factory reaches ShadowMobileClient (reviewer
     void base64urlEncode;
 
     const store = createMemoryShadowStore('ctrl_wire', 'h', { fence, controllerDeviceId: 'ctrl_wire', leaseExpiresAt: grant.leaseExpiresAt });
-    const svc = runtime.buildControllerService({
+    const svc = await runtime.buildControllerService({
       store,
       session: async () => ({ accountId: 'a', controllerDeviceId: 'ctrl_wire', sessionToken: 't', relayOrigin: 'https://relay.test' }),
       transport: { fetch: async () => ({ status: 200, ok: true, text: async () => '{}' }) },

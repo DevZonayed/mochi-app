@@ -562,7 +562,22 @@ export class ShadowHostEnrollmentRuntime {
       { method: 'GET', path: '/api/shadow/enroll/controllers' },
     );
     if (!res.ok) throw errStatus(res.error ?? 'list controllers failed', res.status);
-    return res.json?.controllers ?? [];
+    const controllers = res.json?.controllers ?? [];
+    if (controllers.length > 0) return controllers;
+
+    // Exact expired-lease recovery fallback: expose the single durable active
+    // controller so the operator can explicitly revoke it even when the signed
+    // server list is temporarily empty. Ambiguous or non-active local states stay hidden.
+    const localActive = this.activeControllers();
+    if (localActive.length !== 1) return [];
+    const [controller] = localActive;
+    return [{
+      controllerDeviceId: controller.controllerDeviceId,
+      grantId: controller.grantId,
+      keyId: controller.keyId,
+      status: controller.status,
+      expiresAt: 0,
+    }];
   }
 
   /**

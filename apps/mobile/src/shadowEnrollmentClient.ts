@@ -157,10 +157,12 @@ export interface EnrollmentStatus {
   accountId: string | null;
   controllerDeviceId: string | null;
   hostFingerprint: string | null;
+  requestedCapabilities: ShadowCapability[];
   scopeKeyId: string | null;
   online: boolean;
   readonlyReason?: 'offline' | 'revoked' | 'locked' | 'awaiting';
   lastError?: string;
+  acceptedAuthorityPersistenceReason?: AcceptedAuthorityPersistenceCheckReason;
 }
 
 export interface AccountEnrollmentMac {
@@ -255,6 +257,15 @@ interface PersistedIdentityBlob {
   agreementPub: string;
 }
 
+export type AcceptedAuthorityPersistenceCheckReason =
+  | 'ok'
+  | 'identity.missing'
+  | 'identity.invalid'
+  | 'scope.missing'
+  | 'scope.mismatch'
+  | 'grant.missing'
+  | 'grant.mismatch';
+
 function isPersistedIdentityBlob(value: unknown): value is PersistedIdentityBlob {
   if (!value || typeof value !== 'object') return false;
   const r = value as Record<string, unknown>;
@@ -269,6 +280,7 @@ function isPersistedIdentityBlob(value: unknown): value is PersistedIdentityBlob
 export class ShadowMobileEnrollmentRuntime {
   private state: EnrollmentState = 'idle';
   private lastError: string | undefined;
+  private acceptedAuthorityPersistenceReason: AcceptedAuthorityPersistenceCheckReason | undefined;
   private bootstrap: EnrollmentBootstrap | null = null;
   private presentedSecret: Uint8Array | null = null;
   private identity: ShadowIdentity | null = null;
@@ -313,15 +325,18 @@ export class ShadowMobileEnrollmentRuntime {
   }
 
   status(): EnrollmentStatus {
+    const requested = canonicalizeCapabilities(this.requestedCaps);
     return {
       state: this.state,
       accountId: this.bootstrap?.accountId ?? this.grant?.fence.accountId ?? null,
       controllerDeviceId: this.grant?.controllerDeviceId ?? this.identity?.deviceId ?? null,
       hostFingerprint: this.bootstrap?.hostSigningKeyId ?? this.grant?.hostSigningKeyId ?? null,
+      requestedCapabilities: requested.ok ? requested.capabilities : ['account.read'],
       scopeKeyId: this.grant?.scopeKeyId ?? null,
       online: this.online,
       readonlyReason: this.readonlyReason(),
       lastError: this.lastError,
+      acceptedAuthorityPersistenceReason: this.acceptedAuthorityPersistenceReason,
     };
   }
 
@@ -373,6 +388,89 @@ export class ShadowMobileEnrollmentRuntime {
     this.online = false;
     this.transition('online'); // online-but-offline read-only until a connect
     return this.status();
+  }
+
+  private sameFence(a: Fence, b: Fence): boolean {
+    return a.accountId === b.accountId
+      && a.scopeId === b.scopeId
+      && a.hostDeviceId === b.hostDeviceId
+      && a.epoch === b.epoch
+      && a.leaseId === b.leaseId;
+  }
+
+  private sameCapabilityProof(
+    a: StoredGrantMeta['capabilityProof'],
+    b: StoredGrantMeta['capabilityProof'],
+  ): boolean {
+    if (a === undefined || b === undefined) return a === undefined && b === undefined;
+    if (a === null || b === null) return false;
+    return a.grantId === b.grantId
+      && a.keyId === b.keyId
+      && a.expiresAt === b.expiresAt
+      && a.signedAt === b.signedAt
+      && a.signature === b.signature;
+  }
+
+  private sameApprovedCapabilities(
+    a: StoredGrantMeta['approvedCapabilities'],
+    b: StoredGrantMeta['approvedCapabilities'],
+  ): boolean {
+    if (a === undefined || b === undefined) return a === undefined && b === undefined;
+    if (a === null || b === null) return false;
+    const left = canonicalizeCapabilities(a);
+    const right = canonicalizeCapabilities(b);
+    if (!left.ok || !right.ok) return false;
+    if (left.capabilities.length !== right.capabilities.length) return false;
+    return left.capabilities.every((cap, index) => cap === right.capabilities[index]);
+  }
+
+  private sameGrantMeta(a: StoredGrantMeta, b: StoredGrantMeta): boolean {
+    return a.sessionId === b.sessionId
+      && a.controllerDeviceId === b.controllerDeviceId
+      && a.grantId === b.grantId
+      && a.keyId === b.keyId
+      && a.scopeKeyId === b.scopeKeyId
+      && this.sameFence(a.fence, b.fence)
+      && a.expiresAt === b.expiresAt
+      && a.transcriptHash === b.transcriptHash
+      && a.hostSigningKeyId === b.hostSigningKeyId
+      && a.hostSigningPublicKey === b.hostSigningPublicKey
+      && (
+        a.hostAgreementPublicKey === undefined || b.hostAgreementPublicKey === undefined
+          ? a.hostAgreementPublicKey === undefined && b.hostAgreementPublicKey === undefined
+          : a.hostAgreementPublicKey === b.hostAgreementPublicKey
+      )
+      && a.leaseExpiresAt === b.leaseExpiresAt
+      && a.status === b.status
+      && this.sameApprovedCapabilities(a.approvedCapabilities, b.approvedCapabilities)
+      && this.sameCapabilityProof(a.capabilityProof, b.capabilityProof);
+  }
+
+  private async verifyAcceptedAuthorityPersistence(input: {
+    identity: ShadowIdentity;
+    grant: StoredGrantMeta;
+    scopeKey: Uint8Array;
+  }): Promise<AcceptedAuthorityPersistenceCheckReason> {
+    const persistedIdentity = await this.opts.secureStore.getItemAsync(secureKeyIdentity(input.identity.deviceId));
+    if (!persistedIdentity) return 'identity.missing';
+    const loadedIdentity = await this.loadPersistedIdentity(input.identity.deviceId, persistedIdentity);
+    if (!loadedIdentity.ok) return 'identity.invalid';
+    const persistedScopeKey = await this.opts.secureStore.getItemAsync(secureKeyScope(input.grant.fence.scopeId, input.identity.deviceId));
+    if (!persistedScopeKey) return 'scope.missing';
+    if (base64urlEncode(input.scopeKey) !== persistedScopeKey) return 'scope.mismatch';
+    const persistedGrant = await this.opts.metaStore.loadGrant();
+    if (!persistedGrant) return 'grant.missing';
+    if (!this.sameGrantMeta(persistedGrant, input.grant)) return 'grant.mismatch';
+    return 'ok';
+  }
+
+  private async purgeAcceptedAuthorityPersistenceFailure(grant: StoredGrantMeta): Promise<void> {
+    const reasons: string[] = [];
+    try { await this.opts.secureStore.deleteItemAsync(secureKeyScope(grant.fence.scopeId, grant.controllerDeviceId)); }
+    catch (e) { reasons.push(`scopeKey: ${(e as Error)?.message ?? e}`); }
+    try { await this.clearGrantMeta(); }
+    catch (e) { reasons.push(`grant: ${(e as Error)?.message ?? e}`); }
+    if (reasons.length > 0) throw new Error(`accepted-authority purge incomplete: ${reasons.join('; ')}`);
   }
 
   /**
@@ -575,9 +673,7 @@ export class ShadowMobileEnrollmentRuntime {
     }
     const s = await this.opts.session.get();
     // Scope key → SecureStore ONLY. Public grant metadata → SQLite meta store.
-    await this.opts.secureStore.setItemAsync(secureKeyScope(accepted.fence.scopeId, identity.deviceId), base64urlEncode(accepted.scopeKey));
-    this.scopeKey = accepted.scopeKey;
-    this.grant = {
+    const nextGrant: StoredGrantMeta = {
       sessionId: bootstrap.sessionId,
       controllerDeviceId: identity.deviceId,
       grantId: grant.grantId,
@@ -599,7 +695,17 @@ export class ShadowMobileEnrollmentRuntime {
         capabilityProof: { grantId: grant.grantId, keyId: grant.keyId, expiresAt: grant.expiresAt, signedAt: grant.signedAt, signature: grant.signature },
       } : {}),
     };
-    await this.opts.metaStore.saveGrant(this.grant);
+    await this.opts.secureStore.setItemAsync(secureKeyScope(accepted.fence.scopeId, identity.deviceId), base64urlEncode(accepted.scopeKey));
+    await this.opts.metaStore.saveGrant(nextGrant);
+    const verified = await this.verifyAcceptedAuthorityPersistence({ identity, grant: nextGrant, scopeKey: accepted.scopeKey });
+    if (verified !== 'ok') {
+      this.acceptedAuthorityPersistenceReason = verified;
+      await this.purgeAcceptedAuthorityPersistenceFailure(nextGrant).catch(() => {});
+      this.fail('accepted-authority-persistence-check-failed');
+      return this.state;
+    }
+    this.scopeKey = accepted.scopeKey;
+    this.grant = nextGrant;
     void s;
     this.transition('accepted');
     return this.state;
@@ -883,12 +989,16 @@ export class ShadowMobileEnrollmentRuntime {
    * client's crypto adapter receives it). Returns null unless an active grant +
    * scope key are present.
    */
-  buildControllerService(input: {
+  async buildControllerService(input: {
     store: ShadowStore;
     session: () => Promise<ControllerSessionContext>;
     transport: Pick<ShadowTransportConfig, 'fetch'> & Partial<Pick<ShadowTransportConfig, 'allowInsecureLoopback' | 'timeoutMs' | 'maxResponseBytes' | 'randomNonce'>>;
-  }): ShadowControllerService | null {
-    if (!this.grant || !this.scopeKey || !this.identity || this.state === 'revoked' || this.state === 'locked') return null;
+  }): Promise<ShadowControllerService | null> {
+    if (!this.grant || !this.scopeKey || this.state === 'revoked' || this.state === 'locked') return null;
+    if (!this.identity) {
+      try { await this.loadOrCreateIdentity(this.grant.controllerDeviceId); } catch { return null; }
+    }
+    if (!this.identity) return null;
     return new ShadowControllerService({
       backend: this.opts.backend,
       store: input.store,
@@ -929,6 +1039,7 @@ export class ShadowMobileEnrollmentRuntime {
     }
     const changed = this.state !== next;
     this.state = next;
+    if (next !== 'error') this.acceptedAuthorityPersistenceReason = undefined;
     if (changed) this.notifyGrantChange(); // B1-R1: state change → dependents re-evaluate
   }
 
@@ -940,5 +1051,6 @@ export class ShadowMobileEnrollmentRuntime {
     this.online = false;
     this.state = 'idle';
     this.lastError = undefined;
+    this.acceptedAuthorityPersistenceReason = undefined;
   }
 }

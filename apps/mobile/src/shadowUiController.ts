@@ -78,6 +78,15 @@ const EMPTY_PROJECTION: ShadowUiProjection = {
 };
 
 const DEFAULT_POLL_MS = 2_500;
+const RUNTIME_STAGE_TIMEOUT_MS = 15_000;
+const CONTROLLER_STAGE_TIMEOUT_MS = 15_000;
+const BOOTSTRAP_RECOVERY_COPY = 'Secure sync is taking longer than expected. Retry from here.';
+const MAC_REVOKE_REQUIRED_COPY = 'This Mac still has an active access record for this device. Remove it from Controllers on the Mac, then enroll again here.';
+const LOCAL_RESET_FAILED_COPY = 'Reconnect could not clear this device locally. Remove it from Controllers on the Mac, then try again.';
+type LoadingGateLogCategory = 'runtime' | 'controller';
+type LoadingGateLogStatus = 'start' | 'ok' | 'timeout' | 'error' | 'offline' | 'empty';
+type AcceptedAuthorityPersistenceLogReason =
+  Exclude<EnrollmentStatus['acceptedAuthorityPersistenceReason'], undefined | 'ok'>;
 
 function loadingState(now: number, authed: boolean): ShadowUiState {
   return deriveShadowUiState({ authed, purgePending: true, enrollment: null, service: null, lastActivityAt: null, now });
@@ -91,12 +100,21 @@ export class ShadowUiController {
   /** Phase 3C3: cached CURRENT verified granted set (for rendering which actions show). The
       action controller re-checks fresh on every action; this is a display hint only. */
   private granted: ShadowCapability[] | null = null;
+  private bootstrapErrorReason: string | null = null;
+  private localAuthorityMissing = false;
   private controllerUnsub: (() => void) | null = null;
   private pollHandle: unknown = null;
   private purgePending = false;
   private started = false;
   private disposed = false;
   private gen = 0; // bumped on identity change; discards stale async results
+  private runtimeAttemptSeq = 0;
+  private runtimeInitPromise: Promise<EnrollmentRuntimeLike> | null = null;
+  private controllerAttemptSeq = 0;
+  private controllerAcquirePromise: Promise<void> | null = null;
+  private terminalRecoveryPromise: Promise<void> | null = null;
+  private reconnectNeedsMacRevoke = false;
+  private lastAcceptedAuthorityPersistenceLogReason: AcceptedAuthorityPersistenceLogReason | null = null;
   private readonly unsubs: Array<() => void> = [];
   private readonly setT: (fn: () => void, ms: number) => unknown;
   private readonly clearT: (h: unknown) => void;
@@ -197,10 +215,11 @@ export class ShadowUiController {
     if (!authed) { this.stopPoll(); this.detachController(); this.emit(this.derive(null, null)); return; }
 
     let runtime: EnrollmentRuntimeLike;
-    try { runtime = await this.ensureRuntime(); } catch { this.emit(loadingState(this.deps.now(), authed)); return; }
+    try { runtime = await this.ensureRuntime(); } catch { this.emit(this.derive(null, null)); return; }
     if (myGen !== this.gen || this.disposed) return;
 
     const status = runtime.status();
+    this.maybeLogAcceptedAuthorityPersistence(status);
 
     // Authority lost (host revoke / integrity lock / explicit revoked) → durably purge,
     // synchronously blanking content (triggerPurge emits the locked gate).
@@ -213,8 +232,14 @@ export class ShadowUiController {
         if (myGen !== this.gen || this.disposed) return;
       }
       if (!this.controller) {
-        // Grant looks live but no controller could be built — a durable purge is pending
-        // or the build is blocked. FAIL CLOSED: gate to locked/loading, never show cache.
+        // Grant looks live but no controller could be built. A known bootstrap timeout may
+        // surface bounded recovery; otherwise fail closed because a purge/build block may
+        // still be in progress and no cache may be shown.
+        if (this.localAuthorityMissing || this.bootstrapErrorReason) {
+          this.purgePending = false;
+          this.emit(this.derive(status, null));
+          return;
+        }
         this.purgePending = true;
         this.emit(loadingState(this.deps.now(), this.deps.isAuthed()));
         return;
@@ -227,6 +252,7 @@ export class ShadowUiController {
     } else {
       if (this.controller) this.detachController();
       this.granted = null;
+      this.reconnectNeedsMacRevoke = false;
       // A clean, non-locked state (idle/unenrolled/confirming/…) clears any purge gate.
       this.purgePending = false;
     }
@@ -244,8 +270,10 @@ export class ShadowUiController {
       purgePending: this.purgePending,
       enrollment,
       service,
+      localAuthorityMissing: this.localAuthorityMissing,
       lastActivityAt: this.computeLastActivity(),
       granted: this.granted,
+      bootstrapErrorReason: this.bootstrapErrorReason,
       now: this.deps.now(),
     };
     return deriveShadowUiState(inputs);
@@ -289,32 +317,39 @@ export class ShadowUiController {
 
   private async ensureRuntime(): Promise<EnrollmentRuntimeLike> {
     if (this.runtime) return this.runtime;
-    const rt = await this.deps.getRuntime();
-    // Rehydrate persisted authority (restart-safe) without a network round-trip.
-    try { await rt.restore(); } catch { /* a restore failure lands as locked/idle via status() */ }
-    this.runtime = rt;
-    return rt;
+    const myGen = this.gen;
+    const p = this.beginRuntimeInit(myGen);
+    try {
+      return await this.withTimeout(p, RUNTIME_STAGE_TIMEOUT_MS, 'runtime.restore', myGen, () => {
+        if (this.runtimeInitPromise === p) this.runtimeInitPromise = null;
+      });
+    } catch (error) {
+      this.bootstrapErrorReason = BOOTSTRAP_RECOVERY_COPY;
+      throw error;
+    }
   }
 
   private async acquireController(myGen: number): Promise<void> {
-    this.deps.bootstrapController();
-    let controller: ProductionShadowController | null = null;
-    try { controller = await this.deps.getController(); } catch { controller = null; }
-    if (myGen !== this.gen || this.disposed) { try { controller?.close(); } catch { /* ignore */ } return; }
-    if (!controller) return;
-    this.controller = controller;
-    this.controllerUnsub = controller.onChange(() => { void this.refresh(); });
-    // Bring the durable read authority online (reconcile lease → pull events → ACKs).
-    // A locked/denied authority throws → we stay offline read-only, never fabricate online.
-    try { await controller.connect(); } catch { /* offline read-only */ }
+    const p = this.beginControllerAcquire(myGen);
+    try {
+      await this.withTimeout(p, CONTROLLER_STAGE_TIMEOUT_MS, 'controller.acquire', myGen, () => {
+        if (this.controllerAcquirePromise === p) this.controllerAcquirePromise = null;
+      });
+      if (myGen === this.gen && !this.disposed && !this.localAuthorityMissing) this.bootstrapErrorReason = null;
+    } catch {
+      this.bootstrapErrorReason = BOOTSTRAP_RECOVERY_COPY;
+    }
   }
 
   private triggerPurge(): void {
     if (this.purgePending) return;
+    this.gen += 1;
     this.purgePending = true;
     this.stopPoll();
     this.detachController();
     this.runtime = null; // reset drops the factory singleton — re-fetch the fresh one
+    this.bootstrapErrorReason = null;
+    this.localAuthorityMissing = false;
     this.emit(loadingState(this.deps.now(), this.deps.isAuthed())); // synchronous locked gate
     this.deps.resetController();
     const myGen = this.gen;
@@ -374,13 +409,31 @@ export class ShadowUiController {
     return res.ok ? { ok: true } : { ok: false, reason: res.reason };
   }
   async cancelEnrollment(): Promise<void> {
+    this.reconnectNeedsMacRevoke = false;
     const rt = await this.ensureRuntime();
     this.stopPoll();
     await rt.reset();
     await this.refresh();
   }
   /** From a terminal denied/expired: reset to a clean idle so the operator can re-scan. */
-  async retryEnrollment(): Promise<void> { await this.cancelEnrollment(); }
+  async retryEnrollment(): Promise<void> {
+    if (this.terminalRecoveryPromise) {
+      await this.terminalRecoveryPromise;
+      return;
+    }
+    if (this.state.phase === 'repair' || this.state.phase === 'revoked') {
+      await this.retryTerminalRecovery();
+      return;
+    }
+    await this.cancelEnrollment();
+  }
+
+  async retryBootstrap(): Promise<void> {
+    this.reconnectNeedsMacRevoke = false;
+    this.bootstrapErrorReason = null;
+    this.localAuthorityMissing = false;
+    await this.refresh();
+  }
 
   dispose(): void {
     this.disposed = true;
@@ -388,5 +441,177 @@ export class ShadowUiController {
     this.detachController();
     for (const u of this.unsubs.splice(0)) { try { u(); } catch { /* ignore */ } }
     this.listeners.clear();
+  }
+
+  private beginRuntimeInit(myGen: number): Promise<EnrollmentRuntimeLike> {
+    if (this.runtimeInitPromise) return this.runtimeInitPromise;
+    const seq = ++this.runtimeAttemptSeq;
+    const startedAt = this.deps.now();
+    this.logStage('runtime.init.start', { category: 'runtime', status: 'start', gen: myGen, seq });
+    const p = (async () => {
+      const rt = await this.deps.getRuntime();
+      this.logStage('runtime.get.ok', { category: 'runtime', status: 'ok', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
+      try {
+        await rt.restore();
+      } catch {
+        this.logStage('runtime.restore.error', { category: 'runtime', status: 'error', gen: myGen, seq });
+      }
+      if (this.disposed || myGen !== this.gen || seq !== this.runtimeAttemptSeq) return rt;
+      this.runtime = rt;
+      this.bootstrapErrorReason = null;
+      this.localAuthorityMissing = false;
+      this.logStage('runtime.restore.ok', { category: 'runtime', status: 'ok', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
+      void this.refresh();
+      return rt;
+    })();
+    this.runtimeInitPromise = p.finally(() => {
+      if (this.runtimeInitPromise === p) this.runtimeInitPromise = null;
+    });
+    return this.runtimeInitPromise;
+  }
+
+  private beginControllerAcquire(myGen: number): Promise<void> {
+    if (this.controllerAcquirePromise) return this.controllerAcquirePromise;
+    const seq = ++this.controllerAttemptSeq;
+    const startedAt = this.deps.now();
+    this.deps.bootstrapController();
+    this.logStage('controller.acquire.start', { category: 'controller', status: 'start', gen: myGen, seq });
+    const p = (async () => {
+      let controller: ProductionShadowController | null = null;
+      try { controller = await this.deps.getController(); } catch { controller = null; }
+      if (myGen !== this.gen || this.disposed || seq !== this.controllerAttemptSeq) { try { controller?.close(); } catch { /* ignore */ } return; }
+      if (!controller) {
+        this.localAuthorityMissing = true;
+        this.logStage('controller.acquire.empty', { category: 'controller', status: 'empty', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
+        if (this.runtime && myGen === this.gen && !this.disposed && seq === this.controllerAttemptSeq) {
+          this.purgePending = false;
+          this.bootstrapErrorReason = this.reconnectNeedsMacRevoke ? MAC_REVOKE_REQUIRED_COPY : null;
+          this.emit(this.derive(this.runtime.status(), null));
+        }
+        return;
+      }
+      this.localAuthorityMissing = false;
+      this.reconnectNeedsMacRevoke = false;
+      this.controller = controller;
+      this.controllerUnsub = controller.onChange(() => { void this.refresh(); });
+      this.logStage('controller.get.ok', { category: 'controller', status: 'ok', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
+      try {
+        await this.withTimeout(controller.connect(), CONTROLLER_STAGE_TIMEOUT_MS, 'controller.connect', myGen);
+        this.logStage('controller.connect.ok', { category: 'controller', status: 'ok', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
+      } catch {
+        this.logStage('controller.connect.offline', { category: 'controller', status: 'offline', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
+      }
+      if (myGen === this.gen && !this.disposed && seq === this.controllerAttemptSeq) {
+        this.bootstrapErrorReason = null;
+        void this.refresh();
+      }
+    })();
+    this.controllerAcquirePromise = p.finally(() => {
+      if (this.controllerAcquirePromise === p) this.controllerAcquirePromise = null;
+    });
+    return this.controllerAcquirePromise;
+  }
+
+  private async retryTerminalRecovery(): Promise<void> {
+    if (this.terminalRecoveryPromise) return this.terminalRecoveryPromise;
+    const p = (async () => {
+      this.gen += 1;
+      const myGen = this.gen;
+      this.stopPoll();
+      this.detachController();
+      this.runtime = null;
+      this.runtimeInitPromise = null;
+      this.controllerAcquirePromise = null;
+      this.granted = null;
+      this.bootstrapErrorReason = null;
+      this.localAuthorityMissing = false;
+      this.reconnectNeedsMacRevoke = true;
+      this.purgePending = true;
+      this.emit(loadingState(this.deps.now(), this.deps.isAuthed()));
+      this.deps.resetController();
+      try {
+        await this.deps.awaitIdle();
+      } catch {
+        if (myGen !== this.gen || this.disposed) return;
+        this.purgePending = false;
+        this.localAuthorityMissing = true;
+        this.bootstrapErrorReason = LOCAL_RESET_FAILED_COPY;
+        this.emit(this.derive(null, null));
+        return;
+      }
+      if (myGen !== this.gen || this.disposed) return;
+      this.purgePending = false;
+      await this.refresh();
+      if (this.state.phase === 'unenrolled') this.reconnectNeedsMacRevoke = false;
+    })();
+    this.terminalRecoveryPromise = p.finally(() => {
+      if (this.terminalRecoveryPromise === p) this.terminalRecoveryPromise = null;
+    });
+    return this.terminalRecoveryPromise;
+  }
+
+  private withTimeout<T>(promise: Promise<T>, ms: number, stage: string, gen: number, onTimeout?: () => void): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const h = this.setT(() => {
+        if (settled) return;
+        settled = true;
+        onTimeout?.();
+        this.logStage(`${stage}.timeout`, {
+          category: stage.startsWith('runtime.') ? 'runtime' : 'controller',
+          status: 'timeout',
+          gen,
+          ms,
+        });
+        reject(new Error(`${stage} timed out`));
+      }, ms);
+      promise.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          this.clearT(h);
+          resolve(value);
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          this.clearT(h);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private maybeLogAcceptedAuthorityPersistence(status: EnrollmentStatus): void {
+    const reason = status.state === 'error' && status.lastError === 'accepted-authority-persistence-check-failed'
+      ? status.acceptedAuthorityPersistenceReason
+      : undefined;
+    if (!reason || reason === 'ok') {
+      this.lastAcceptedAuthorityPersistenceLogReason = null;
+      return;
+    }
+    if (this.lastAcceptedAuthorityPersistenceLogReason === reason) return;
+    this.lastAcceptedAuthorityPersistenceLogReason = reason;
+    this.logStage('accepted-authority.verify.failed', {
+      category: 'runtime',
+      status: 'error',
+      reason,
+    });
+  }
+
+  private logStage(stage: string, fields: {
+    category: LoadingGateLogCategory;
+    status: LoadingGateLogStatus;
+    gen?: number;
+    seq?: number;
+    tookMs?: number;
+    ms?: number;
+    reason?: AcceptedAuthorityPersistenceLogReason;
+  }): void {
+    const extra = Object.entries(fields)
+      .filter(([, value]) => value !== undefined && value !== null)
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join(' ');
+    console.warn(`[shadow-ui] ${stage}${extra ? ` ${extra}` : ''}`);
   }
 }

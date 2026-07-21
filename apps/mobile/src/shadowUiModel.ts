@@ -24,7 +24,7 @@
  */
 import type { EnrollmentState, EnrollmentStatus } from './shadowEnrollmentClient';
 import type { ControllerServiceStatus } from './shadowControllerService';
-import type { ShadowCapability } from '@maestro/realtime/shadowCapabilities';
+import { canonicalizeCapabilities, type ShadowCapability } from '@maestro/realtime/shadowCapabilities';
 
 /** The clock skew the durable service itself uses before it treats a lease as lapsed. */
 export const UI_LEASE_SKEW_MS = 1_000;
@@ -63,6 +63,8 @@ export function isRetryablePhase(phase: ShadowUiPhase): boolean { return RETRYAB
 export interface EnrollmentDisplay {
   /** Truncated controller (this device) id — decorative, never a security signal. */
   controllerDeviceIdShort: string | null;
+  /** Truthful bounded copy when no local device identifier exists yet. */
+  controllerDeviceLabel: string;
   /** Truncated host signing fingerprint the operator can compare — safe public id. */
   hostFingerprintShort: string | null;
   /** The signed-in account id (public) or null. */
@@ -115,10 +117,14 @@ export interface ShadowUiInputs {
   enrollment: EnrollmentStatus | null;
   /** `ShadowControllerService.status()`, or null before a grant/service exists. */
   service: ControllerServiceStatus | null;
+  /** A restored live grant could not produce a local controller/service. */
+  localAuthorityMissing?: boolean;
   /** Max authoritative entity activity timestamp (for the offline marker), or null. */
   lastActivityAt: number | null;
   /** Phase 3C3: the CURRENT verified granted capabilities (from the runtime), or null. */
   granted?: ShadowCapability[] | null;
+  /** A bounded, retryable bootstrap/runtime message safe to show during loading/approval recovery. */
+  bootstrapErrorReason?: string | null;
   /** Monotonic wall clock (injected for testability). */
   now: number;
 }
@@ -193,6 +199,7 @@ export function deriveShadowUiPhase(inp: ShadowUiInputs): ShadowUiPhase {
   // The durable service locks ONLY on an observed revoke / 401 / 403 — it beats any
   // cached projection so a revoked device can never flash old projects.
   if (inp.service?.locked) return 'revoked';
+  if (inp.localAuthorityMissing) return 'repair';
 
   const e = inp.enrollment;
   if (e) {
@@ -223,18 +230,21 @@ export function deriveShadowUiState(inp: ShadowUiInputs): ShadowUiState {
   const e = inp.enrollment;
   const svc = inp.service;
   const busy = phase === 'requesting' || phase === 'approving' || phase === 'loading';
+  const requested = canonicalizeCapabilities(e?.requestedCapabilities);
   // The CURRENT verified granted set (never a requested/static list). Only surfaced when the
   // grant is live (online/offline) — a locked/terminal authority shows no granted actions.
   const granted = (phase === 'online' || phase === 'offline') && Array.isArray(inp.granted) ? inp.granted : [];
   const enrollment: EnrollmentDisplay = {
     controllerDeviceIdShort: shortId(e?.controllerDeviceId ?? null),
+    controllerDeviceLabel: shortId(e?.controllerDeviceId ?? null) ?? 'Created when requested',
     hostFingerprintShort: shortId(e?.hostFingerprint ?? null),
     accountId: e?.accountId ?? null,
-    // Read-only slice floor: every controller at least requests read access.
-    requestedCapabilityLabels: [capabilityLabel('account.read')],
+    requestedCapabilityLabels: requested.ok
+      ? requested.capabilities.map(capabilityLabel)
+      : [capabilityLabel('account.read')],
     grantedCapabilities: granted,
     grantedCapabilityLabels: granted.map(capabilityLabel),
-    errorReason: genericEnrollmentError(e?.lastError, phase),
+    errorReason: inp.bootstrapErrorReason ?? genericEnrollmentError(e?.lastError, phase),
   };
   const connection: ShadowUiConnection = {
     online: phase === 'online',
