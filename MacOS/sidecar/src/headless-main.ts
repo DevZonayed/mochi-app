@@ -529,7 +529,7 @@ function getShadowHostDataCoordinator(): ShadowHostDataLifecycle<ShadowHostDataS
         log: (m) => warn('shadowProjection', m),
       });
       if (!plane) return null;
-      return { accountId, svc: plane.svc, projection: plane.projection };
+      return { accountId, svc: plane.dataService, projection: plane.projection };
     },
     bindProjection: (plane) => {
       const projection = plane.projection as ShadowProductProjection | null;
