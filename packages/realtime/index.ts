@@ -3,3 +3,5 @@ export * from './src/transport';
 export * from './src/ice';
 export * from './src/connectionManager';
 export * from './src/reliableMessenger';
+export * from './src/shadowProtocol';
+export * from './src/shadowErrorSanitize';

@@ -14,6 +14,8 @@ import React from 'react';
 import hljs from 'highlight.js/lib/common';
 import { Icon } from './icons';
 import { api } from './api';
+import type { FileRead } from './api';
+import { previewKind, webkitCanInline, humanSize, mediaFallbackReason, type PreviewKind } from './filePreview';
 
 const EXT_LANG: Record<string, string> = {
   ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
@@ -286,57 +288,96 @@ export function Markdown({ text }: { text: string }) {
   );
 }
 
-/* A file opened as a Workspace tab. For markdown files we offer Preview / Code
-   tabs + an Edit mode (textarea + Save) + Copy of the source. */
-export function FileViewer({ projectId, filePath }: { projectId: string; filePath: string }) {
-  const [st, setSt] = React.useState<{ loading: boolean; text?: string; truncated?: boolean; error?: string }>({ loading: true });
+/* A small icon+label action button used across the media/binary fallback and
+   the text toolbar. Accessible (aria-label + title). */
+function ActionBtn({ icon, label, onClick, tone = 'quiet' }: {
+  icon: 'command' | 'folder' | 'globe'; label: string; onClick: () => void; tone?: 'quiet' | 'accent';
+}) {
+  return (
+    <button onClick={onClick} title={label} aria-label={label} className="ws-newbtn"
+      style={{ display: 'inline-flex', alignItems: 'center', gap: 7, height: 30, padding: '0 12px', borderRadius: 8,
+        background: tone === 'accent' ? 'var(--fill-secondary)' : 'transparent', border: '0.5px solid var(--separator)',
+        color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer', flexShrink: 0 }}>
+      <Icon name={icon} size={14} /> {label}
+    </button>
+  );
+}
+
+/* A file opened as a Workspace tab. Text files get Preview / Source / Edit +
+   Copy (existing behavior). Binary/media files (image/video/audio/pdf) render a
+   first-class inline preview via the token-gated stream URL; anything WebKit
+   can't render inline (mkv, archives, unknown binary) gets a TRUTHFUL metadata
+   panel with Copy-path / Reveal / Open-with-default actions rather than a
+   broken <video>/<embed>. */
+export function FileViewer({ projectId, filePath, sessionId, onCanonical }: {
+  projectId: string; filePath: string; sessionId?: string; onCanonical?: (canonicalPath: string) => void;
+}) {
+  const [st, setSt] = React.useState<{ loading: boolean; data?: FileRead | null; error?: string }>({ loading: true });
   // load lifecycle: bump this to re-read from disk after a save discards an edit
   const [reloadKey, setReloadKey] = React.useState(0);
+  const onCanonicalRef = React.useRef(onCanonical);
+  onCanonicalRef.current = onCanonical;
   React.useEffect(() => {
     let alive = true;
     setSt({ loading: true });
-    api.readFile(projectId, filePath)
-      .then(r => { if (alive) setSt({ loading: false, text: r?.text ?? '', truncated: r?.truncated }); })
+    api.readFile(projectId, filePath, sessionId)
+      .then(r => { if (!alive) return; setSt({ loading: false, data: r }); if (r?.path) onCanonicalRef.current?.(r.path); })
       .catch(e => { if (alive) setSt({ loading: false, error: e instanceof Error ? e.message : 'Could not open file' }); });
     return () => { alive = false; };
-  }, [projectId, filePath, reloadKey]);
+  }, [projectId, filePath, sessionId, reloadKey]);
 
-  const name = filePath.split('/').pop() ?? filePath;
+  const data = st.data ?? undefined;
+  const name = data?.name ?? (filePath.split('/').pop() ?? filePath);
+  const canonical = data?.path ?? filePath;
+  const text = data?.text;
+  // Binary = the bridge flagged it OR a successful read came back without text.
+  const isBinary = !!data && (data.binary || text == null);
+  const pk: PreviewKind = previewKind(name);
+  const canInline = isBinary && webkitCanInline(pk, name);
+  const streamUrl = data ? api.fileStreamUrl(projectId, canonical, sessionId) : null;
+
   const md = isMarkdown(name);
   // markdown defaults to Preview; everything else opens straight to source
   const [mode, setMode] = React.useState<'preview' | 'code' | 'edit'>(md ? 'preview' : 'code');
   // resync mode if the file in this tab changes identity
   React.useEffect(() => { setMode(isMarkdown(name) ? 'preview' : 'code'); }, [name]);
-  // edit buffer + dirty flag. Initialized from `st.text` whenever we enter
-  // edit mode (or whenever a fresh read lands) so we never overwrite with
-  // stale bytes after a successful save.
+  // edit buffer + dirty flag.
   const [draft, setDraft] = React.useState('');
   const [dirty, setDirty] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [toast, setToast] = React.useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
-  React.useEffect(() => { if (!dirty) setDraft(st.text ?? ''); }, [st.text, dirty]);
+  React.useEffect(() => { if (!dirty) setDraft(text ?? ''); }, [text, dirty]);
   const showToast = (kind: 'ok' | 'err', msg: string) => {
     setToast({ kind, msg });
     window.setTimeout(() => setToast(t => (t && t.msg === msg ? null : t)), 1800);
   };
-  const enterEdit = () => { setDraft(st.text ?? ''); setDirty(false); setMode('edit'); };
-  const exitEdit = (mode: 'preview' | 'code') => {
-    if (dirty) {
-      const ok = window.confirm('Discard unsaved changes?');
-      if (!ok) return;
-    }
-    setDirty(false); setMode(mode);
+  const enterEdit = () => { setDraft(text ?? ''); setDirty(false); setMode('edit'); };
+  const exitEdit = (m: 'preview' | 'code') => {
+    if (dirty) { if (!window.confirm('Discard unsaved changes?')) return; }
+    setDirty(false); setMode(m);
   };
-  const copy = async () => {
-    try { await navigator.clipboard.writeText(mode === 'edit' ? draft : (st.text ?? '')); showToast('ok', 'Copied'); }
-    catch { showToast('err', 'Copy blocked'); }
+  const copyContents = async () => {
+    const r = await api.copyTextNative(mode === 'edit' ? draft : (text ?? ''));
+    showToast(r.ok ? 'ok' : 'err', r.ok ? 'Copied' : (r.error ?? 'Copy blocked'));
+  };
+  const copyPath = async () => {
+    const r = await api.copyTextNative(canonical);
+    showToast(r.ok ? 'ok' : 'err', r.ok ? 'Path copied' : (r.error ?? 'Copy blocked'));
+  };
+  const reveal = async () => {
+    const r = await api.revealFile(projectId, canonical, sessionId);
+    showToast(r.ok ? 'ok' : 'err', r.ok ? 'Revealed in Finder' : (r.error ?? 'Reveal failed'));
+  };
+  const openDefault = async () => {
+    const r = await api.openWithDefault(projectId, canonical, sessionId);
+    showToast(r.ok ? 'ok' : 'err', r.ok ? 'Opened' : (r.error ?? 'Open failed'));
   };
   const save = async () => {
     if (!dirty || saving) return;
     setSaving(true);
     try {
-      await api.writeFile(projectId, filePath, draft);
-      setSt(prev => ({ ...prev, text: draft, truncated: false }));
+      await api.writeFile(projectId, canonical, draft, sessionId);
+      setSt(prev => ({ ...prev, data: prev.data ? { ...prev.data, text: draft, truncated: false } : prev.data }));
       setDirty(false);
       showToast('ok', 'Saved');
     } catch (e) {
@@ -345,7 +386,6 @@ export function FileViewer({ projectId, filePath }: { projectId: string; filePat
       setSaving(false);
     }
   };
-  // ⌘S / Ctrl-S inside the textarea triggers Save.
   const onEditorKey: React.KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') { e.preventDefault(); void save(); }
   };
@@ -354,7 +394,7 @@ export function FileViewer({ projectId, filePath }: { projectId: string; filePat
     const on = mode === k;
     const go = () => { if (k === 'edit') enterEdit(); else exitEdit(k); };
     return (
-      <button onClick={go} title={label} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 26, padding: '0 10px', borderRadius: 7,
+      <button onClick={go} title={label} aria-label={label} aria-pressed={on} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, height: 26, padding: '0 10px', borderRadius: 7,
         background: on ? 'var(--fill-secondary)' : 'transparent', border: '0.5px solid', borderColor: on ? 'var(--separator-strong)' : 'transparent',
         color: on ? 'var(--ink)' : 'var(--ink-tertiary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer', flexShrink: 0 }}>
         <Icon name={icon} size={12} /> {label}
@@ -362,34 +402,53 @@ export function FileViewer({ projectId, filePath }: { projectId: string; filePat
     );
   };
 
+  const headerIcon = isBinary ? (pk === 'image' ? 'image' : pk === 'video' ? 'clapper' : pk === 'audio' ? 'bell' : 'file') : 'file';
+
   return (
     <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'var(--bg-elevated)' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px', borderBottom: '0.5px solid var(--separator)', flexShrink: 0 }}>
-        <Icon name="file" size={14} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
+        <Icon name={headerIcon} size={14} style={{ color: 'var(--ink-secondary)', flexShrink: 0 }} />
         <span style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink)', flexShrink: 0 }}>{name}</span>
         {dirty && <span title="Unsaved changes" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--orange)', flexShrink: 0 }} />}
-        <span style={{ font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{filePath}</span>
+        <span style={{ font: '400 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{canonical}</span>
         <span style={{ flex: 1 }} />
-        {/* view-mode segmented control — markdown gets a Preview; everything has Code + Edit */}
-        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, padding: 2, borderRadius: 9, background: 'var(--fill-tertiary)' }}>
-          {md && <Tab k="preview" label="Preview" icon="bookmark" />}
-          <Tab k="code" label="Source" icon="terminal" />
-          <Tab k="edit" label="Edit" icon="brush" />
-        </div>
-        <button onClick={() => void copy()} title="Copy file contents" className="ws-newbtn"
-          style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
-          <Icon name="command" size={14} />
-        </button>
-        {mode === 'edit' && (
-          <button onClick={() => void save()} disabled={!dirty || saving} title={dirty ? 'Save (⌘S)' : 'No changes to save'}
-            style={{ height: 28, padding: '0 12px', borderRadius: 7, display: 'inline-flex', alignItems: 'center', gap: 6, background: dirty ? 'var(--blue)' : 'var(--fill-tertiary)', color: dirty ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: dirty && !saving ? 'pointer' : 'default', flexShrink: 0, border: 'none' }}>
-            <Icon name={saving ? 'refresh' : 'check'} size={12} /> {saving ? 'Saving…' : 'Save'}
-          </button>
+        {isBinary ? (
+          // Binary/media: no Source/Edit/Save — just working file actions.
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <ActionBtn icon="command" label="Copy path" onClick={() => void copyPath()} />
+            {api.canRevealFile() &&<ActionBtn icon="folder" label="Reveal in Finder" onClick={() => void reveal()} />}
+            {api.canOpenFile() &&<ActionBtn icon="globe" label="Open with default app" onClick={() => void openDefault()} />}
+          </div>
+        ) : (
+          <>
+            {/* view-mode segmented control — markdown gets a Preview; everything has Code + Edit */}
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, padding: 2, borderRadius: 9, background: 'var(--fill-tertiary)' }}>
+              {md && <Tab k="preview" label="Preview" icon="bookmark" />}
+              <Tab k="code" label="Source" icon="terminal" />
+              <Tab k="edit" label="Edit" icon="brush" />
+            </div>
+            <button onClick={() => void copyContents()} title="Copy file contents" aria-label="Copy file contents" className="ws-newbtn"
+              style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+              <Icon name="command" size={14} />
+            </button>
+            <button onClick={() => void copyPath()} title="Copy path" aria-label="Copy path" className="ws-newbtn"
+              style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+              <Icon name="paperclip" size={14} />
+            </button>
+            {mode === 'edit' && (
+              <button onClick={() => void save()} disabled={!dirty || saving} title={dirty ? 'Save (⌘S)' : 'No changes to save'} aria-label="Save"
+                style={{ height: 28, padding: '0 12px', borderRadius: 7, display: 'inline-flex', alignItems: 'center', gap: 6, background: dirty ? 'var(--blue)' : 'var(--fill-tertiary)', color: dirty ? '#fff' : 'var(--ink-tertiary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: dirty && !saving ? 'pointer' : 'default', flexShrink: 0, border: 'none' }}>
+                <Icon name={saving ? 'refresh' : 'check'} size={12} /> {saving ? 'Saving…' : 'Save'}
+              </button>
+            )}
+            {api.canRevealFile() &&(
+              <button onClick={() => void reveal()} title="Reveal in Finder" aria-label="Reveal in Finder" className="ws-newbtn"
+                style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
+                <Icon name="folder" size={14} />
+              </button>
+            )}
+          </>
         )}
-        <button onClick={() => void api.revealPath(filePath)} title="Reveal in Finder" className="ws-newbtn"
-          style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'transparent', color: 'var(--ink-tertiary)', flexShrink: 0 }}>
-          <Icon name="folder" size={14} />
-        </button>
       </div>
       <div style={{ flex: 1, minHeight: 0, overflow: 'auto', position: 'relative' }}>
         {st.loading ? <div style={{ padding: 26, font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Loading…</div>
@@ -399,20 +458,94 @@ export function FileViewer({ projectId, filePath }: { projectId: string; filePat
               <div><button onClick={() => setReloadKey(k => k + 1)} style={{ marginTop: 10, height: 28, padding: '0 12px', borderRadius: 7, background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer', border: '0.5px solid var(--separator)' }}>Retry</button></div>
             </div>
           )
-          : mode === 'preview' ? <Markdown text={st.text ?? ''} />
+          : !data ? (
+            <div style={{ padding: 26, font: '400 var(--fs-footnote)/1.5 var(--font-text)', color: 'var(--ink-tertiary)' }}>
+              File preview is only available in the desktop app.
+            </div>
+          )
+          : isBinary ? (
+            <MediaBody kind={pk} canInline={canInline} streamUrl={streamUrl} canonical={canonical} name={name} mime={data.mime} bytes={data.bytes}
+              onCopyPath={() => void copyPath()} onReveal={() => void reveal()} onOpen={() => void openDefault()} />
+          )
+          : mode === 'preview' ? <Markdown text={text ?? ''} />
           : mode === 'edit' ? (
-            <textarea value={draft} onChange={e => { setDraft(e.target.value); setDirty(e.target.value !== (st.text ?? '')); }} onKeyDown={onEditorKey}
-              spellCheck={false}
+            <textarea value={draft} onChange={e => { setDraft(e.target.value); setDirty(e.target.value !== (text ?? '')); }} onKeyDown={onEditorKey}
+              spellCheck={false} aria-label={`Edit ${name}`}
               style={{ width: '100%', height: '100%', minHeight: '100%', boxSizing: 'border-box', padding: '12px 16px', border: 'none', outline: 'none', resize: 'none', background: 'var(--bg-elevated)', color: 'var(--ink)', font: '400 13px/1.65 var(--font-mono)', whiteSpace: 'pre', overflow: 'auto' }} />
           )
-          : <CodeView code={st.text ?? ''} filename={name} />}
-        {st.truncated && mode !== 'edit' && <div style={{ padding: '8px 18px', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--orange)' }}>Large file — showing the first part only.</div>}
-        {st.truncated && mode === 'edit' && <div style={{ padding: '8px 18px', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--orange)' }}>Truncated — saving would overwrite with this slice. Reveal in Finder to edit safely.</div>}
+          : <CodeView code={text ?? ''} filename={name} />}
+        {data?.truncated && !isBinary && mode !== 'edit' && <div style={{ padding: '8px 18px', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--orange)' }}>Large file — showing the first part only.</div>}
+        {data?.truncated && !isBinary && mode === 'edit' && <div style={{ padding: '8px 18px', font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--orange)' }}>Truncated — saving would overwrite with this slice. Reveal in Finder to edit safely.</div>}
         {toast && (
-          <div style={{ position: 'absolute', right: 16, bottom: 16, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator-strong)', color: toast.kind === 'ok' ? 'var(--green)' : 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)', boxShadow: 'var(--card-shadow)' }}>
+          <div role="status" aria-live="polite" style={{ position: 'absolute', right: 16, bottom: 16, padding: '8px 12px', borderRadius: 8, background: 'var(--bg-grouped)', border: '0.5px solid var(--separator-strong)', color: toast.kind === 'ok' ? 'var(--green)' : 'var(--red)', font: '600 var(--fs-caption)/1 var(--font-text)', boxShadow: 'var(--card-shadow)' }}>
             {toast.msg}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+/* Inline media (image/video/audio/pdf) via the token-gated stream URL, or a
+   truthful metadata panel when WebKit can't render it inline (or there's no
+   stream URL — e.g. a browser build). Media is responsive and dark-mode safe. */
+function MediaBody({ kind, canInline, streamUrl, canonical, name, mime, bytes, onCopyPath, onReveal, onOpen }: {
+  kind: PreviewKind; canInline: boolean; streamUrl: string | null; canonical: string; name: string; mime: string; bytes: number;
+  onCopyPath: () => void; onReveal: () => void; onOpen: () => void;
+}) {
+  // Runtime decode/load failure: a SUPPORTED container can hold a codec WebKit
+  // can't decode, leaving a black/broken element. onError flips to the honest
+  // fallback panel. Reset on the file identity (the canonical path — unique per
+  // file and stable across renders, unlike a URL that could gain a nonce), so a
+  // new file retries inline. The fallback renders NO media element, so onError
+  // can't re-fire → no remount loop.
+  const [decodeFailed, setDecodeFailed] = React.useState(false);
+  React.useEffect(() => { setDecodeFailed(false); }, [canonical]);
+  const onMediaError = React.useCallback(() => setDecodeFailed(true), []);
+
+  const stage: React.CSSProperties = { position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'var(--bg-grouped)', padding: 24, overflow: 'auto' };
+  if (canInline && streamUrl && !decodeFailed) {
+    if (kind === 'image') {
+      return <div style={stage}><img src={streamUrl} alt={name} onError={onMediaError} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', borderRadius: 8, boxShadow: '0 10px 34px rgba(0,0,0,0.28)' }} /></div>;
+    }
+    if (kind === 'video') {
+      return <div style={stage}><video src={streamUrl} controls playsInline aria-label={name} onError={onMediaError} style={{ maxWidth: '100%', maxHeight: '100%', borderRadius: 10, background: '#000', boxShadow: '0 10px 34px rgba(0,0,0,0.32)' }} /></div>;
+    }
+    if (kind === 'audio') {
+      return (
+        <div style={stage}>
+          <div style={{ width: 'min(520px, 100%)', padding: 22, borderRadius: 14, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+              <Icon name="bell" size={16} style={{ color: 'var(--ink-secondary)' }} />
+              <span style={{ font: '600 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+            </div>
+            <audio src={streamUrl} controls aria-label={name} onError={onMediaError} style={{ width: '100%' }} />
+          </div>
+        </div>
+      );
+    }
+    // pdf — WebKit's built-in viewer. No onError: <embed>/<object> error events are
+    // unreliable and can fire on a SUCCESSFUL load, which would wrongly show the
+    // fallback; a genuine PDF load failure surfaces WebKit's own placeholder.
+    return <embed src={streamUrl} type="application/pdf" aria-label={name} style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 'none', background: 'var(--bg-grouped)' }} />;
+  }
+  // Fallback: no inline render — be honest, offer working actions.
+  const typeLabel = mime || (kind === 'binary' ? 'Binary file' : `${kind} file`);
+  const notInlineReason = mediaFallbackReason({ streamUrl, decodeFailed });
+  return (
+    <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', background: 'var(--bg-grouped)', padding: 24 }}>
+      <div style={{ width: 'min(440px, 100%)', padding: 24, borderRadius: 16, background: 'var(--bg-elevated)', border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', textAlign: 'center' }}>
+        <div style={{ width: 52, height: 52, margin: '0 auto 14px', borderRadius: 13, display: 'grid', placeItems: 'center', background: 'var(--fill-tertiary)', color: 'var(--ink-secondary)' }}>
+          <Icon name={kind === 'video' ? 'clapper' : kind === 'audio' ? 'bell' : kind === 'image' ? 'image' : 'file'} size={22} />
+        </div>
+        <div style={{ font: '650 var(--fs-body)/1.3 var(--font-text)', color: 'var(--ink)', wordBreak: 'break-all', marginBottom: 6 }}>{name}</div>
+        <div style={{ font: '400 var(--fs-caption)/1.5 var(--font-mono)', color: 'var(--ink-tertiary)', marginBottom: 4 }}>{typeLabel} · {humanSize(bytes)}</div>
+        <div style={{ font: '400 var(--fs-caption)/1.5 var(--font-text)', color: 'var(--ink-tertiary)', marginBottom: 18 }}>{notInlineReason}</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center' }}>
+          <ActionBtn icon="command" label="Copy path" onClick={onCopyPath} tone="accent" />
+          {api.canRevealFile() &&<ActionBtn icon="folder" label="Reveal in Finder" onClick={onReveal} />}
+          {api.canOpenFile() &&<ActionBtn icon="globe" label="Open with default app" onClick={onOpen} />}
+        </div>
       </div>
     </div>
   );
@@ -438,6 +571,7 @@ export function ImageViewer({ assetId, name, imagePath }: { assetId?: string; na
         <span style={{ flex: 1 }} />
         {src && <button onClick={() => setActual(a => !a)} title={actual ? 'Fit to window' : 'Actual size'}
           style={{ height: 26, padding: '0 11px', borderRadius: 7, border: '0.5px solid var(--separator)', background: 'transparent', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)', cursor: 'pointer', flexShrink: 0 }}>{actual ? 'Fit' : '1:1'}</button>}
+        {/* imagePath is a store-issued Asset localPath (app-owned) → trusted native reveal. */}
         {imagePath && <button onClick={() => void api.revealPath(imagePath)} title="Reveal in Finder"
           style={{ width: 28, height: 28, borderRadius: 7, display: 'grid', placeItems: 'center', background: 'transparent', border: 'none', color: 'var(--ink-tertiary)', cursor: 'pointer', flexShrink: 0 }}><Icon name="folder" size={14} /></button>}
       </div>

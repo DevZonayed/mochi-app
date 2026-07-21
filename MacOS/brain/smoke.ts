@@ -30,7 +30,7 @@ async function runChat(dispatch: Dispatch, projectId: string, text: string, time
   while (Date.now() - start < timeoutMs) {
     await sleep(2500);
     const j: any = await dispatch('getJob', { id: jobId });
-    if (j.status === 'done' || j.status === 'failed' || j.status === 'cancelled') return j;
+    if (j.status === 'done' || j.status === 'failed' || j.status === 'cancelled' || j.status === 'gated') return j;
   }
   throw new Error(`run timed out after ${Math.round(timeoutMs / 1000)}s`);
 }

@@ -361,12 +361,11 @@ export function ModelSwitcher({ value = 'auto', onChange, models, compact, align
   );
 }
 
-// effort → pre-run estimate
-export const EFFORT_EST: Record<EffortStop, { cost: string; mins: string }> = {
-  FAST:     { cost: '0.30', mins: '3' },
-  BALANCED: { cost: '0.60', mins: '6' },
-  DEEP:     { cost: '1.80', mins: '36' },
-  MAX:      { cost: '3.00', mins: '72' },
+export const EFFORT_DEPTH: Record<EffortStop, { label: string; detail: string }> = {
+  FAST:     { label: 'Fast', detail: 'Quick pass' },
+  BALANCED: { label: 'Balanced', detail: 'Default depth' },
+  DEEP:     { label: 'Deep', detail: 'More thorough pass' },
+  MAX:      { label: 'Max', detail: 'Most thorough pass' },
 };
 
 /* Smoothly animated number. Tweens from the value it is CURRENTLY showing to

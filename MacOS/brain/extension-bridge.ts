@@ -247,7 +247,7 @@ export class ExtensionBridge {
         return this.snapshotMessage(this.peers.size ? [...this.peers.values()].some(p => p.active) : false);
       case 'send_message':
       case 'steer_message':
-        return this.deliver(str(params.projectId), params.sessionId ? str(params.sessionId) : null, str(params.text));
+        return this.deliver(str(params.projectId), params.sessionId ? str(params.sessionId) : null, str(params.text), str(params.idempotencyKey) || undefined);
       case 'add_comment':
         return this.addComment(params);
       default:
@@ -263,14 +263,17 @@ export class ExtensionBridge {
       cancels the run" bug). Now, when the session is busy, we refuse the
       delivery cleanly so the caller can choose to retry or store the message
       for the operator. The red abort button in the chat is the only stop. */
-  private async deliver(projectId: string, sessionId: string | null, text: string): Promise<{ sessionId: string; jobId: string }> {
+  private async deliver(projectId: string, sessionId: string | null, text: string, idempotencyKey?: string): Promise<{ sessionId: string; jobId: string }> {
     if (!projectId) throw new Error('projectId required');
     if (!text.trim()) throw new Error('message text required');
     if (sessionId) {
       const running = this.store.listJobs(projectId, sessionId).find(j => j.status === 'running' || j.status === 'pending');
-      if (running) throw new Error('session busy — the agent is mid-turn; try again when it finishes');
+      const knownRetry = !!idempotencyKey && !!this.store.idempotentJobIdFor?.(`chat:${idempotencyKey}`);
+      if (running && !knownRetry) throw new Error('session busy — the agent is mid-turn; try again when it finishes');
     }
-    const res = await this.dispatch('sendChat', { projectId, sessionId: sessionId ?? undefined, text }) as { session: { id: string }; job: { id: string } };
+    // A remote client that supplies a stable message id gets exactly-once delivery: a
+    // redelivered send resolves to the ORIGINAL job + session and runs the agent once.
+    const res = await this.dispatch('sendChat', { projectId, sessionId: sessionId ?? undefined, text, ...(idempotencyKey ? { idempotencyKey } : {}) }) as { session: { id: string }; job: { id: string } };
     return { sessionId: res.session.id, jobId: res.job.id };
   }
 
@@ -296,7 +299,7 @@ export class ExtensionBridge {
         note,
         selector ? `\nselector: \`${selector}\`` : '',
       ].filter(Boolean).join('\n');
-      try { deliveredSession = (await this.deliver(projectId, sessionId, body)).sessionId; } catch { /* comment is still saved */ }
+      try { deliveredSession = (await this.deliver(projectId, sessionId, body, str(params.idempotencyKey) || undefined)).sessionId; } catch { /* comment is still saved */ }
     }
     return { commentId: added.comment.id, sessionId: deliveredSession };
   }

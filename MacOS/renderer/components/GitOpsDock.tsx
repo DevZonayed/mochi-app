@@ -300,6 +300,7 @@ export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps)
   const status = dock.status!;
   const code = codename || codenameFromBranch(status.branch);
   const ghBlocked = needsGitHub && gh != null && (!gh.connected || !gh.hasRepoScope);
+  const reviewBlocked = dock.reviewBlocked;
 
   /** Run an action (either directly or behind the confirm dialog). */
   const trigger = (action: GitOpsAction): void => {
@@ -426,10 +427,10 @@ export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps)
             role="button"
             tabIndex={0}
             aria-label={ariaLabelFor(primary, status.branch, status.pr?.number ?? null)}
-            aria-disabled={busy || ghBlocked || !!primary.stub}
-            onClick={(e) => { e.stopPropagation(); if (busy || ghBlocked) return; trigger(primary); }}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); if (busy || ghBlocked) return; trigger(primary); } }}
-            title={ghBlocked ? 'Connect GitHub first (Settings → GitHub)' : primary.label}
+            aria-disabled={busy || ghBlocked || !!primary.stub || !!primary.blockedReason}
+            onClick={(e) => { e.stopPropagation(); if (busy || ghBlocked || primary.blockedReason) return; trigger(primary); }}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); if (busy || ghBlocked || primary.blockedReason) return; trigger(primary); } }}
+            title={primary.blockedReason ?? (ghBlocked ? 'Connect GitHub first (Settings → GitHub)' : primary.label)}
             style={{
               display: 'inline-flex', alignItems: 'center',
               height: 22, padding: '0 11px', marginLeft: 4, borderRadius: 11,
@@ -437,8 +438,8 @@ export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps)
                 : 'color-mix(in srgb, var(--blue) 16%, transparent)',
               color: primary.tone === 'danger' ? 'var(--red)' : 'var(--blue)',
               font: '700 var(--fs-caption)/1 var(--font-text)',
-              cursor: (busy || ghBlocked) ? 'not-allowed' : 'pointer',
-              opacity: (busy || ghBlocked || primary.stub) ? 0.65 : 1,
+              cursor: (busy || ghBlocked || primary.blockedReason) ? 'not-allowed' : 'pointer',
+              opacity: (busy || ghBlocked || primary.stub || primary.blockedReason) ? 0.65 : 1,
               userSelect: 'none',
             }}>
             {busy ? '…' : primary.label}
@@ -462,6 +463,13 @@ export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps)
           marginLeft: 8, alignSelf: 'center',
           font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--orange, #ff9500)',
         }}>⚠ Connect GitHub</span>
+      )}
+      {!feedback && !ghBlocked && dock.reviewLabel && (
+        <span role="status" style={{
+          marginLeft: 8, alignSelf: 'center',
+          font: '500 var(--fs-caption)/1 var(--font-text)',
+          color: reviewBlocked ? 'var(--orange, #ff9500)' : 'var(--green, #34c759)',
+        }}>{dock.reviewLabel}</span>
       )}
 
       {/* ── Expanded dock (popover) ─────────────────────────────────────── */}
@@ -547,6 +555,17 @@ export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps)
               <span style={{ color: 'var(--orange, #ff9500)' }}>●</span> {status.snapshot.dirtyFiles} dirty file{status.snapshot.dirtyFiles === 1 ? '' : 's'}
             </div>
           )}
+          {dock.reviewLabel && (
+            <div role="status" style={{
+              marginTop: 8, padding: '7px 10px', borderRadius: 8,
+              background: reviewBlocked ? 'color-mix(in srgb, var(--orange, #ff9500) 12%, transparent)' : 'color-mix(in srgb, var(--green, #34c759) 12%, transparent)',
+              border: `0.5px solid ${reviewBlocked ? 'color-mix(in srgb, var(--orange, #ff9500) 30%, transparent)' : 'color-mix(in srgb, var(--green, #34c759) 30%, transparent)'}`,
+              color: reviewBlocked ? 'var(--orange, #ff9500)' : 'var(--green, #34c759)',
+              font: '600 var(--fs-caption)/1.35 var(--font-text)',
+            }}>
+              {dock.reviewLabel}{dock.reviewGate?.reason ? ` · ${dock.reviewGate.reason}` : ''}
+            </div>
+          )}
 
           {/* Action list (all available for this state) */}
           <div role="group" aria-label="Available actions" style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -556,13 +575,13 @@ export function GitOpsDock({ sessionId, codename, onContinue }: GitOpsDockProps)
               </div>
             )}
             {dock.actions.map((a) => {
-              const disabled = busy || a.stub || (a.needsGitHub && ghBlocked);
+              const disabled = busy || a.stub || !!a.blockedReason || (a.needsGitHub && ghBlocked);
               return (
                 <button key={a.kind} type="button"
                   onClick={() => { setExpanded(false); trigger(a); }}
                   disabled={disabled}
                   aria-label={ariaLabelFor(a, status.branch, status.pr?.number ?? null)}
-                  title={a.needsGitHub && ghBlocked ? 'Connect GitHub first (Settings → GitHub)' : a.label}
+                  title={a.blockedReason ?? (a.needsGitHub && ghBlocked ? 'Connect GitHub first (Settings → GitHub)' : a.label)}
                   style={{
                     display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                     height: 32, padding: '0 12px', borderRadius: 8,

@@ -60,90 +60,6 @@ const PLATFORMS: Record<PlatformKey, { name: string; tint: string }> = {
   bluesky:   { name: 'Bluesky',   tint: 'var(--teal)' },
 };
 
-/* ───────────────────────── signal cards ───────────────────────── */
-interface Topic { name: string; m: 'up' | 'down'; d: string; }
-const TOPICS: Topic[] = [
-  { name: 'AI agents that run overnight', m: 'up', d: '+128%' },
-  { name: 'Self-hosted video models', m: 'up', d: '+74%' },
-  { name: 'Cost-per-token explainers', m: 'up', d: '+31%' },
-  { name: 'Prompt engineering tips', m: 'down', d: '−12%' },
-  { name: 'No-code app builders', m: 'down', d: '−8%' },
-];
-interface AudioTrack { name: string; use: string; }
-const AUDIO: AudioTrack[] = [
-  { name: 'Aphex-style ambient loop', use: 'used in 12k posts' },
-  { name: 'Lo-fi tape beat 84bpm', use: 'used in 9.4k posts' },
-  { name: 'Cinematic riser + drop', use: 'used in 6.1k posts' },
-];
-
-function SignalCard({ title, icon, children }: { title: string; icon: IconName; children?: React.ReactNode }) {
-  return (
-    <div style={{ background: 'var(--bg-elevated)', borderRadius: 14, border: '0.5px solid var(--separator)', boxShadow: 'var(--card-shadow)', padding: 16, display: 'flex', flexDirection: 'column' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 13 }}>
-        <Icon name={icon} size={15} style={{ color: 'var(--indigo)' }} />
-        <span style={{ font: '700 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.03em', textTransform: 'uppercase', color: 'var(--ink-secondary)' }}>{title}</span>
-      </div>
-      {children}
-    </div>
-  );
-}
-
-function SignalRow() {
-  const heat = [0.2, 0.5, 0.8, 1, 0.6, 0.3, 0.1, 0.4, 0.7, 0.9, 0.5, 0.2, 0.6, 0.85, 1, 0.7, 0.4, 0.2, 0.3, 0.5, 0.8];
-  return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 }}>
-      <SignalCard title="Trending topics" icon="telescope">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-          {TOPICS.map((t, i) => (
-            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ font: '600 var(--fs-caption)/1 var(--font-mono)', color: 'var(--ink-tertiary)', width: 14 }}>{i + 1}</span>
-              <span style={{ flex: 1, minWidth: 0, font: '500 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.name}</span>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2, font: '600 var(--fs-caption)/1 var(--font-mono)', color: t.m === 'up' ? 'var(--green)' : 'var(--red)' }}>
-                {t.m === 'up' ? '▲' : '▼'} {t.d}
-              </span>
-            </div>
-          ))}
-        </div>
-      </SignalCard>
-
-      <SignalCard title="Trending audio" icon="play">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-          {AUDIO.map((a, i) => (
-            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
-              <button className="tr-play" style={{ width: 28, height: 28, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: 'var(--indigo)' }}><Icon name="play" size={12} /></button>
-              <span style={{ flex: 1, minWidth: 0 }}>
-                <span style={{ display: 'block', font: '500 var(--fs-footnote)/1.1 var(--font-text)', color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.name}</span>
-                <span style={{ display: 'block', font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)', marginTop: 2 }}>{a.use}</span>
-              </span>
-            </div>
-          ))}
-        </div>
-      </SignalCard>
-
-      <SignalCard title="Best times to post" icon="clock">
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 3 }}>
-          {heat.map((v, i) => <div key={i} style={{ aspectRatio: '1', borderRadius: 3, background: `color-mix(in srgb, var(--blue) ${Math.round(v * 80)}%, var(--fill-secondary))` }} />)}
-        </div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-          <span>Mon</span><span>Sun</span>
-        </div>
-        <div style={{ font: '500 var(--fs-caption)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 8 }}>Peak: <b style={{ color: 'var(--ink)' }}>Wed &amp; Sat, 6–8pm</b></div>
-      </SignalCard>
-
-      <SignalCard title="Competitor pulse" icon="cpu">
-        <svg viewBox="0 0 120 50" style={{ width: '100%', height: 50 }} preserveAspectRatio="none">
-          <polyline points="0,40 15,38 30,30 45,33 60,22 75,25 90,14 105,18 120,8" fill="none" stroke="var(--indigo)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-          <polyline points="0,50 0,40 15,38 30,30 45,33 60,22 75,25 90,14 105,18 120,8 120,50" fill="color-mix(in srgb, var(--indigo) 10%, transparent)" stroke="none" />
-        </svg>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 8 }}>
-          <span style={{ font: '700 var(--fs-title2)/1 var(--font-mono)', color: 'var(--ink)' }}>+18%</span>
-          <span style={{ font: '400 var(--fs-caption)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>posting velocity vs last week</span>
-        </div>
-      </SignalCard>
-    </div>
-  );
-}
-
 /* ───────────────────────── brief feed (real research) ───────────────────────── */
 const KNOWN_PLATFORMS: Record<string, PlatformKey> = { x: 'x', twitter: 'x', youtube: 'youtube', yt: 'youtube', linkedin: 'linkedin', tiktok: 'tiktok', instagram: 'instagram', ig: 'instagram' };
 
@@ -332,13 +248,6 @@ function CommandPalette({ open, onClose }: { open: boolean; onClose: () => void 
 }
 
 /* ───────────────────────── page root ───────────────────────── */
-const STREAM_LINES = [
-  'Scanning 1,240 recent uploads in this genre',
-  'Clustering hooks by retention curve',
-  'Drafting title variants',
-  'Scoring thumbnail concepts',
-];
-
 export default function TrendIntelligence() {
   const navigate = useNavigate();
   const [paletteOpen, setPaletteOpen] = React.useState(false);
@@ -403,8 +312,6 @@ export default function TrendIntelligence() {
             <p style={{ margin: '10px 0 0', font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>A deep agent searches the live web on your sign-in and returns content briefs with real sources. Takes a couple of minutes.</p>
           </div>
 
-          <SignalRow />
-
           <div style={{ font: '600 var(--fs-caption)/1 var(--font-text)', letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ink-tertiary)', marginBottom: 14 }}>Content briefs</div>
           {running && (
             <div className="brief-card" style={{ background: 'var(--bg-elevated)', borderRadius: 18, border: '1px solid color-mix(in srgb, var(--indigo) 30%, transparent)', boxShadow: '0 0 0 4px color-mix(in srgb, var(--indigo) 10%, transparent), var(--card-shadow)', padding: 22, marginBottom: 16 }}>
@@ -416,7 +323,7 @@ export default function TrendIntelligence() {
           )}
           {briefs.length === 0 && !running ? (
             <div style={{ padding: '48px 0', textAlign: 'center', background: 'var(--bg-grouped)', borderRadius: 16, border: '0.5px solid var(--separator)', font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>
-              No briefs yet. Enter a topic above and run research.
+              No trend data is available. Enter a topic above and run research.
             </div>
           ) : briefs.map(b => <BriefCard key={b.id} b={b} onStudio={sendStudio} />)}
         </main>

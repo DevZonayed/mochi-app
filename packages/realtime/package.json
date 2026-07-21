@@ -6,7 +6,19 @@
   "description": "Transport-agnostic realtime core (envelope, Transport, ConnectionManager, ReliableMessenger, ICE) shared by desktop + mobile.",
   "main": "./index.ts",
   "types": "./index.ts",
-  "exports": { ".": "./index.ts" },
+  "exports": {
+    ".": "./index.ts",
+    "./shadowProtocol": "./src/shadowProtocol.ts",
+    "./shadowCrypto": "./src/shadowCrypto.ts",
+    "./shadowCryptoNode": "./src/shadowCryptoNode.ts",
+    "./shadowEnrollment": "./src/shadowEnrollment.ts",
+    "./shadowCapabilities": "./src/shadowCapabilities.ts",
+    "./shadowScreenStream": "./src/shadowScreenStream.ts",
+    "./shadowRequestClient": "./src/shadowRequestClient.ts",
+    "./shadowDataCodec": "./src/shadowDataCodec.ts",
+    "./shadowAuthorityTransition": "./src/shadowAuthorityTransition.ts",
+    "./shadowErrorSanitize": "./src/shadowErrorSanitize.ts"
+  },
   "files": ["index.ts", "src"],
   "scripts": {
     "test": "vitest run",

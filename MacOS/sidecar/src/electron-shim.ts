@@ -8,6 +8,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { loadMasterKey, encryptWithKey, decryptWithKey } from './safe-storage-crypto.ts';
 
 const HOME = os.homedir();
 const APP_SUPPORT = path.join(HOME, 'Library', 'Application Support');
@@ -135,12 +136,28 @@ export const app = {
   dock: { setBadge: (_: string) => {}, hide: () => {}, show: () => {} },
 };
 
-// TODO(P1): back safeStorage with the macOS Keychain via the Swift host. Until provider
-// secrets are wired, this passthrough is unused (Providers is not constructed in P0).
+/* Authenticated envelope encryption backed by the macOS Keychain.
+
+   The Swift host provisions a random 32-byte, CHANNEL-SCOPED master key in the
+   login Keychain (AfterFirstUnlockThisDeviceOnly) and passes ONLY its base64
+   form to this process via MAESTRO_SAFE_STORAGE_KEY (never argv/logs/store).
+   encrypt/decrypt use AES-256-GCM (see safe-storage-crypto.ts) so stored
+   secrets are neither plaintext nor reversible without the Keychain key, and a
+   wrong-channel / wrong-device key fails CLOSED. If the host could not provision
+   a key, isEncryptionAvailable() is false and the app stays usable (callers
+   surface "reconnect", never persisting a reversible plaintext credential). */
 export const safeStorage = {
-  isEncryptionAvailable: () => true,
-  encryptString: (s: string) => Buffer.from(s, 'utf8'),
-  decryptString: (b: Buffer) => Buffer.from(b).toString('utf8'),
+  isEncryptionAvailable: (): boolean => loadMasterKey() !== null,
+  encryptString: (s: string): Buffer => {
+    const key = loadMasterKey();
+    if (!key) throw new Error('safeStorage encryption unavailable (no master key)');
+    return encryptWithKey(key, s);
+  },
+  decryptString: (b: Buffer): string => {
+    const key = loadMasterKey();
+    if (!key) throw new Error('safeStorage encryption unavailable (no master key)');
+    return decryptWithKey(key, Buffer.from(b));
+  },
 };
 
 class NoopEmitter { on() { return this; } once() { return this; } removeListener() { return this; } removeAllListeners() { return this; } emit() { return false; } }

@@ -27,6 +27,22 @@ config.resolver.resolveRequest = (context, moduleName, platform) => {
   if (moduleName === 'event-target-shim/index') {
     return resolve(context, 'event-target-shim', platform);
   }
+  // The shared @maestro/realtime crypto/enrollment modules are TypeScript source
+  // that uses NodeNext-style explicit `.js` relative specifiers (they resolve
+  // under Node/tsc). Metro doesn't remap `.js` → `.ts`, so when a relative `.js`
+  // specifier has no real `.js` file, retry against the extensionless name (Metro
+  // then finds the `.ts` source). Real `.js` files still resolve as-is first.
+  if (moduleName.startsWith('.') && moduleName.endsWith('.js')) {
+    try {
+      return resolve(context, moduleName, platform);
+    } catch (err) {
+      try {
+        return resolve(context, moduleName.slice(0, -3), platform);
+      } catch {
+        throw err;
+      }
+    }
+  }
   return resolve(context, moduleName, platform);
 };
 

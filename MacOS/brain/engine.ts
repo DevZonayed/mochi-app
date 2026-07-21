@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
-import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice, ChatSession, Schedule } from './store.js';
+import type { Store, Job, Effort, EngineId, TranscriptItem, RoleChoice, ChatSession, Schedule, CustomMcpServer } from './store.js';
 import type { PublishingEngine } from './publishing.js';
 import type { CodexBridge } from './codex-bridge.js';
 import { assetsDirFor } from './media.js';
@@ -29,15 +29,14 @@ import { branchSlug, isGitRepo } from './git.js';
 import { pickCityCodename } from './codenames.js';
 import { ensureSessionWorktree, worktreeRootDir } from './session-worktree.js';
 import { allocatePortBase, sessionPortEnv } from './session-ports.js';
-import { SessionRunQueue, type RunOpts } from './session-run-queue.js';
 import { normalizeRunMode, canStartBackgroundRun } from './run-mode.js';
 import { readContinuumContext, appendCheckpoint } from './continuum.js';
-import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled } from './skills-registry.js';
+import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, removeSkillFiles, setSkillFilesEnabled, installVerifiedRegistrySkill, reverifyInstalledSkill, evaluateSkillTrustForExecution, buildRegistryReverifyContent, truthfulSkillLabel, skillSlug } from './skills-registry.js';
 import { ensureBrowserSkill } from './browser-skill.js';
 import { DESIGN_DIRECTIVE, DESIGN_PHASES, designDirectiveFor, designNeedsBrowser, designWantsFfmpeg, isWorkflowDesign, parseWorkflowMarker, WORKFLOW_MARKER_REL, type DesignPhase, type DesignFlow } from './design-workflow.js';
 import { resolveFfmpeg, ensureFfmpeg, managedFfmpegTarget } from './ffmpeg.js';
 import { ensureNativeSkills, nativeSkillsPromptBlock, nativeSkillSummaries, isNativeSkill } from './native-skills.js';
-import { buildClaudeCustomMcp, buildCodexCustomMcp, activeServerSkillIds, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
+import { buildClaudeCustomMcp, buildCodexCustomMcp, assignMcpNames, type ClaudeMcpConfig } from './mcp-config.js';
 import { makeScheduleCtx, type ScheduleCtx } from './schedule-ctx.js';
 import { makeGitCtx, isNeedsConfirm, type GitCtx } from './git-ctx.js';
 import type { GitService } from './git-service.js';
@@ -45,9 +44,11 @@ import type { MemorySync } from './memory-sync.js';
 import { generateSessionName } from './session-naming.js';
 import { resolveClaudeOAuthToken } from './claude-usage.js';
 import { waSendAllowed } from './whatsapp.js';
+import { buildWaTools, WA_TOOL_NAMES } from './wa-agent-tools.js';
 import { reportDispatchIfAny } from './context-operator.js';
 import { classifyBashCommand, bgRedirectReason, BG_RUN_IN_BACKGROUND_DENY } from './bg-command-guard.js';
 import type { CronRunner } from './cron.js';
+import type { RunIntentInput } from './run-intent.js';
 import type { McpServerConfig, CanUseTool } from '@anthropic-ai/claude-agent-sdk';
 import { createSteerableInput, type SteerableInput } from './steerable-input.js';
 import type { Providers } from './providers.js';
@@ -56,7 +57,7 @@ import {
   type EngineState, type DownloadProgress,
 } from './engines.js';
 import { codexSpawnEnv } from './node-shim.js';
-import { harvestCodexRolloutImages } from './codex-rollout.js';
+import { harvestCodexRolloutImages, collectCodexGeneratedImages, materializeCodexImage } from './codex-rollout.js';
 import { coreSkillDirective } from './core-skills.js';
 import { resetFromRateLimitInfo, isUsageLimitMessage, parseUsageLimitReset, type RateLimitInfo } from './limit-reset.js';
 import { parseAsk, timeoutAnswer, ASK_BASE_MS } from './ask-question.js';
@@ -69,6 +70,7 @@ import {
   isRetryWorthy, retryDelayMs, retryKeyFor, retryScheduleTitle, retryNote, retryGiveUpNote,
   RETRY_MAX_ATTEMPTS,
 } from './retry-backoff.js';
+import { buildReviewArtifactBody, buildStructuredReviewPrompt, formatReviewContinuationPrompt, gitArtifactIdentity, gitReviewArtifactContext, parseReviewResult, projectReviewGateCheckForJob, projectReviewGateForJob, type JobReviewProjection, type ReviewGate, type ReviewGateScope } from './review-gate.js';
 import { resolveGh, downloadGh } from './gh-cli.js';
 import { ghTokenFrom, githubConnectionStatus, type GithubConnection } from './github-auth.js';
 import { WakeupPauseTracker } from './wakeup-pause.js';
@@ -150,15 +152,17 @@ const browserDirective = (native: boolean): string =>
   `Read \`.claude/skills/browser/SKILL.md\` (auto-installed in this project) for the full tool reference + ` +
   `recipes (image-grab, heavy-DOM rescue, debugging, mobile emulation).`;
 
-const WHATSAPP_DIRECTIVE =
+export const WHATSAPP_DIRECTIVE =
   `\n\n---\n\n[WhatsApp connected] This Mac is linked to the user's WhatsApp. When the user asks anything ` +
-  `about WhatsApp — to read their chats/messages, see who messaged them, or SEND a message (e.g. "message ` +
-  `my number", "send me a confirmation/update", "reply to X", "text the team") — use the ` +
-  `mcp__maestro__wa_list_chats / wa_get_messages / wa_send_message / wa_mark_read tools. Do NOT claim ` +
-  `WhatsApp is unavailable. Messaging the user's OWN number always works (their linked account OR the ` +
+  `about WhatsApp — to read their chats/messages, see who messaged them, or SEND a message/media — use the ` +
+  `mcp__maestro__wa_list_chats / wa_get_messages / wa_send_message / wa_send_media / wa_mark_read tools. ` +
+  `Do NOT claim WhatsApp is unavailable. Messaging the user's OWN number always works (their linked account OR the ` +
   `personal number they set in Comms — for "message my number"/"send me a confirmation", call wa_send_message ` +
   `with no chatId/phone and it goes to that personal number); messaging other contacts is blocked unless they ` +
-  `enabled it (the send tool will tell you). Chats assigned to THIS project are marked [project] — prefer them.`;
+  `enabled it (the send tool will tell you). Chats assigned to THIS project are marked [project] — prefer them.\n\n` +
+  `To send an image, screenshot, document, video, or audio file via WhatsApp, FIRST save or copy the file ` +
+  `into \`.continuum/Attachment/\` under the working directory (create the directory if needed), then call ` +
+  `wa_send_media with the relative path inside that directory. Files outside .continuum/Attachment/ are rejected.`;
 
 /* The context (knowledge/operator) genre directive. Injected on every turn of a
    project whose kind === 'context' — the agent is the operator's UNIVERSAL
@@ -377,6 +381,22 @@ function changedFilesContext(items: TranscriptItem[]): string {
    realtime); disk + relay get a checkpoint every ~1s. */
 const STREAM_THROTTLE_MS = 50;
 const CHECKPOINT_MS = 1000;
+/** How often a session-lease owner refreshes its heartbeat while running (well
+    under LEASE_STALE_MS so a live turn is never reclaimed). */
+const LEASE_HEARTBEAT_MS = 30_000;
+/** Upper bound on how long the session lease is held for the post-turn git pipeline
+    (branch rename/push). Normal pushes finish in seconds; this only prevents a hung
+    push from stalling the session's next turn forever — the git keeps running, the
+    lease releases. */
+const POST_TURN_GIT_FENCE_MS = 60_000;
+/** Releasing a session lease takes the queue-file lock. If it's momentarily contended
+    the release CAS throws (fail-closed) — so we RETRY with this backoff before giving up.
+    Ownership + heartbeat stay valid across the retries so nothing steals the lease. */
+const LEASE_RELEASE_BACKOFF_MS = [0, 50, 150, 400, 1000];
+/** If release still fails after every retry, we arm a durable recovery that promotes the
+    FIFO-next waiter (the owner is already terminal) and settles its parked callers. It
+    re-schedules on this exponential base until it succeeds, so parked callers never hang. */
+const LEASE_RELEASE_RECOVERY_MS = 500;
 
 export interface EngineStatus {
   engine: EngineId;
@@ -509,6 +529,9 @@ interface RunHooks {
         boundary while the current work keeps going.
     Registered per-run via runClaude's `onSteerReady`. See ./steerable-input.ts. */
 export type SteerFn = (text: string, opts?: { interrupt?: boolean }) => Promise<boolean>;
+/** Live cancel/steer handle for a running job (owned by runWithSessionLease, mutated
+    by the turn body: `child` for codex, `steer` while a Claude chat turn is steerable). */
+export type RunHandle = { ac: AbortController; child?: ChildProcess; steer?: SteerFn };
 
 /* Per-1M-token prices for a live cost ESTIMATE (the SDK's exact total_cost_usd
    replaces it when the run finishes). Standard Anthropic pricing; cache reads
@@ -552,8 +575,42 @@ function safeJson(v: unknown): string {
   try { return JSON.stringify(v); } catch { return ''; }
 }
 
-class CancelledError extends Error {
+export class CancelledError extends Error {
   constructor() { super('cancelled'); this.name = 'CancelledError'; }
+}
+
+export type ReviewRunner = (prompt: string) => Promise<EngineRun>;
+export async function executeReviewGate(opts: {
+  store: Store;
+  scope: ReviewGateScope;
+  reviewerIdentity: string;
+  prompt: string;
+  runReviewer: ReviewRunner;
+  rethrowCancelled?: boolean;
+  onGate?: (gate: ReviewGate) => void;
+}): Promise<{ gate: ReviewGate; review?: EngineRun; verdict: 'approved' | 'needs-work'; cancelled: boolean }> {
+  const emitGate = (gate: ReviewGate) => opts.onGate?.({ ...gate });
+  const startedGate = opts.store.startReviewGate(opts.scope, opts.reviewerIdentity);
+  emitGate(startedGate);
+  let review: EngineRun;
+  try {
+    review = await opts.runReviewer(opts.prompt);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : 'reviewer engine failed';
+    const gate = opts.store.failReviewGate(opts.scope, reason || 'reviewer engine failed', undefined, startedGate.id);
+    emitGate(gate);
+    if (err instanceof CancelledError && opts.rethrowCancelled) throw err;
+    return { gate, verdict: 'needs-work', cancelled: err instanceof CancelledError };
+  }
+  const parsed = parseReviewResult(review.text);
+  if (!parsed.ok) {
+    const gate = opts.store.failReviewGate(opts.scope, parsed.reason, review.text, startedGate.id);
+    emitGate(gate);
+    return { gate, review, verdict: 'needs-work', cancelled: false };
+  }
+  const gate = opts.store.completeReviewGate(opts.scope, parsed.result, review.text, startedGate.id);
+  emitGate(gate);
+  return { gate, review, verdict: parsed.result.verdict === 'PASS' ? 'approved' : 'needs-work', cancelled: false };
 }
 
 /* A run failure worth auto-retrying: the bundled `claude`/`codex` process exiting
@@ -565,6 +622,48 @@ function isTransientFailure(e: unknown): boolean {
   // Never retry deterministic/auth problems — they won't get better.
   if (/not signed in|cli not found|not found on this Mac|invalid api key|unauthorized|forbidden|\b40[13]\b|quota|insufficient|payment/i.test(msg)) return false;
   return TRANSIENT_FAIL_RE.test(msg);
+}
+
+export async function ensureMcpRegistrySkillDependency(args: {
+  store: Store;
+  projectId: string;
+  cwd: string;
+  skillId: string;
+}): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const { store, projectId, cwd, skillId } = args;
+  const slugForInstall = skillSlug(skillId);
+  const existing = store.listInstalledSkills(projectId).find(s => s.id === skillId || s.slug === slugForInstall);
+  if (existing) {
+    const decision = evaluateSkillTrustForExecution({ ...existing, enabled: true });
+    if (!decision.ok || decision.trust !== 'registry-audited') {
+      return { ok: false, reason: `registry dependency collision for ${skillId}: ${decision.reason}` };
+    }
+    if (!setSkillFilesEnabled(cwd, existing.id, true)) return { ok: false, reason: `registry dependency could not be enabled for ${skillId}` };
+    const check = reverifyInstalledSkill(cwd, buildRegistryReverifyContent(existing));
+    if (!check.ok) {
+      store.setInstalledSkillEnabled(projectId, existing.id, false);
+      return { ok: false, reason: `registry dependency integrity failed for ${skillId}: ${check.reason}` };
+    }
+    store.setInstalledSkillEnabled(projectId, existing.id, true);
+    return { ok: true };
+  }
+  try {
+    const base = registryBase();
+    const [content, meta] = await Promise.all([
+      fetchSkillContent(base, skillId),
+      getRegistrySkill(base, skillId).catch(() => null),
+    ]);
+    const verified = installVerifiedRegistrySkill(cwd, content);
+    store.recordSkillInstall(projectId, {
+      id: skillId, slug: verified.slug, name: meta?.name || content.name, description: meta?.description,
+      risk: meta?.risk, source: meta?.source, version: meta?.version || 'latest', sha256: verified.sha256,
+      enabled: true, mirrorRepo: meta?.sourceRepo ?? meta?.mirrorRepo, auditStatus: meta?.auditStatus, addedBy: 'agent',
+      integrity: verified.integrity, provenance: verified.provenance, auditEvidence: verified.auditEvidence, policy: verified.policy,
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : `registry dependency failed for ${skillId}` };
+  }
 }
 
 function workDirFor(project?: { name?: string; path?: string }): string {
@@ -630,9 +729,9 @@ interface SkillToolSummary {
 interface SkillsCtx {
   search: (q: string, limit?: number) => Promise<{ count: number; results: SkillToolSummary[] }>;
   get: (skillId: string) => Promise<SkillToolSummary & { source?: string; directory?: string; rawBase?: string; skillPath?: string; excerpt?: string }>;
-  download: (skillId: string) => Promise<{ id: string; name: string; skillMd: string; sha256?: string; enabled?: boolean }>;
+  download: (skillId: string) => Promise<{ id: string; name: string; skillMd: string; sha256?: string | null; enabled?: boolean }>;
   install: (skillId: string) => Promise<{ name: string; slug: string; sha256?: string }>;
-  list: () => Promise<{ id: string; slug: string; name: string; description?: string; risk?: string; version?: string; sha256?: string }[]>;
+  list: () => Promise<{ id: string; slug: string; name: string; description?: string; risk?: string; version?: string; sha256?: string; trustLabel?: { provenance: string; trust: string; digest?: string; version?: string } }[]>;
   remove: (skillId: string) => Promise<{ ok: true }>;
 }
 
@@ -690,7 +789,7 @@ interface BrowserCtx {
 /* WhatsApp capability for the agent — backed by THIS Mac's Baileys socket + store.
    The agent can read the user's chats/messages and send (its OWN number freely;
    other contacts gated behind an opt-in). Off in plan mode / when not linked. */
-interface CommsCtx {
+export interface CommsCtx {
   ownJid: () => string | null;
   notifyJid: () => string | null;
   canSendOthers: () => boolean;
@@ -698,6 +797,7 @@ interface CommsCtx {
   listChats: () => Array<{ chatId: string; name: string; kind: string; unreadCount: number; lastMessageAt: number; lastMessageText: string }>;
   getMessages: (chatId: string, limit: number) => Array<{ fromMe: boolean; senderName: string; text: string; ts: number; kind: string }>;
   sendText: (chatId: string, text: string) => Promise<boolean>;
+  sendMedia: (chatId: string, media: { kind: 'image' | 'video' | 'audio' | 'document'; data: Buffer; mimetype?: string; fileName?: string; caption?: string }) => Promise<boolean>;
   markRead: (chatId: string) => Promise<void>;
   /** Context projects only: remember agent→operator sends (chatId + text) so a
       quoted WhatsApp REPLY from the operator can be routed back into the
@@ -723,7 +823,43 @@ interface OperatorCtx {
   notifyOperator: (text: string) => Promise<boolean>;
 }
 /** The subset of WhatsAppClient the engine drives for the agent (injected via setComms). */
-export interface WaAgentClient { sendText(chatId: string, text: string): Promise<boolean>; markRead(chatId: string): Promise<void> }
+export interface WaAgentClient {
+  sendText(chatId: string, text: string): Promise<boolean>;
+  markRead(chatId: string): Promise<void>;
+  sendMedia(chatId: string, media: { kind: 'image' | 'video' | 'audio' | 'document'; data: Buffer; mimetype?: string; fileName?: string; caption?: string }): Promise<boolean>;
+}
+
+export interface BuildCommsCtxOpts {
+  /** Optional context-project quote-reply recording closure. When provided,
+   *  successful text/captioned-media sends call it so a quoted operator reply
+   *  routes back to the context session. */
+  recordContextSend?: (chatId: string, text: string) => void;
+}
+
+/**
+ * Build a CommsCtx from a Store + WaAgentClient. Exported for testability.
+ * Returns undefined if WhatsApp is not connected.
+ */
+export function buildCommsCtx(
+  store: import('./store.js').Store,
+  comms: WaAgentClient,
+  projectId: string,
+  opts?: BuildCommsCtxOpts,
+): CommsCtx | undefined {
+  if (!store.whatsappState().connected) return undefined;
+  return {
+    ownJid: () => store.whatsappState().jid,
+    notifyJid: () => store.whatsappState().notifyJid ?? null,
+    canSendOthers: () => !!store.whatsappState().agentSendToOthers,
+    projectChatIds: () => store.listProjectWaChats(projectId),
+    listChats: () => store.waListChats().map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, unreadCount: c.unreadCount, lastMessageAt: c.lastMessageAt, lastMessageText: c.lastMessageText })),
+    getMessages: (chatId, limit) => store.waMessages(chatId, { limit }).map(m => ({ fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: m.kind })),
+    sendText: (chatId, text) => comms.sendText(chatId, text),
+    sendMedia: (chatId, media) => comms.sendMedia(chatId, media),
+    markRead: (chatId) => comms.markRead(chatId),
+    ...(opts?.recordContextSend ? { recordContextSend: opts.recordContextSend } : {}),
+  };
+}
 
 /** Side channel for the human-confirm gate (pr_merge + pr_resolve_conflicts).
  *  When the agent calls one of those tools, runClaude/runCodex emits a
@@ -1537,44 +1673,7 @@ async function runClaude(
                 return txt(`Renamed ${r.from} → ${r.to}.`);
               })),
           ] : []),
-          ...(commsCtx ? [
-            tool('wa_list_chats',
-              'List the user\'s WhatsApp chats (DMs, groups, channels) on this Mac, most-recent first. Use when the user asks about their WhatsApp — who messaged, unread chats, or to find a chat to read/reply to. Chats assigned to THIS project are marked [project].',
-              { query: z.string().optional().describe('Filter by name / last-message substring.'), limit: z.number().optional().describe('Max chats (default 30).') },
-              wrap(async (a: { query?: string; limit?: number }) => {
-                const assigned = new Set(commsCtx.projectChatIds());
-                let chats = commsCtx.listChats();
-                if (a.query) { const q = a.query.toLowerCase(); chats = chats.filter(c => (c.name + ' ' + c.lastMessageText).toLowerCase().includes(q)); }
-                chats = chats.slice(0, a.limit ?? 30);
-                if (!chats.length) return txt('No WhatsApp chats found yet (they fill in as WhatsApp syncs).');
-                return txt(chats.map(c => `- ${c.chatId} — ${c.name} [${c.kind}]${assigned.has(c.chatId) ? ' [project]' : ''}${c.unreadCount ? ` · ${c.unreadCount} unread` : ''} · last: ${(c.lastMessageText || '').slice(0, 70)}`).join('\n'));
-              })),
-            tool('wa_get_messages',
-              'Read recent messages from a WhatsApp chat. Pass the chatId from wa_list_chats.',
-              { chatId: z.string(), limit: z.number().optional().describe('How many recent messages (default 30).') },
-              wrap(async (a: { chatId: string; limit?: number }) => {
-                const msgs = commsCtx.getMessages(a.chatId, a.limit ?? 30);
-                if (!msgs.length) return txt('No messages captured for that chat yet.');
-                return txt(msgs.map(m => `[${new Date(m.ts).toISOString().slice(11, 16)}] ${m.fromMe ? 'You' : m.senderName}: ${m.kind !== 'text' ? `[${m.kind}] ` : ''}${m.text}`).join('\n'));
-              })),
-            tool('wa_send_message',
-              'Send a WhatsApp message. Give EITHER chatId (from wa_list_chats) OR phone (digits incl. country code, no +). Messaging the user\'s OWN number always works; other contacts require the user to have enabled "agent can message contacts" — if blocked, relay the tool\'s note to the user.',
-              { chatId: z.string().optional(), phone: z.string().optional().describe('Recipient phone in digits, e.g. "15551234567".'), text: z.string().describe('The message to send.') },
-              wrap(async (a: { chatId?: string; phone?: string; text: string }) => {
-                // No chatId/phone → send to the user themselves (their personal notify number, else the linked account).
-                const target = a.chatId || (a.phone ? `${a.phone.replace(/[^0-9]/g, '')}@s.whatsapp.net` : '') || commsCtx.notifyJid() || commsCtx.ownJid() || '';
-                if (!target) return txt('No recipient: pass a chatId (from wa_list_chats) or a phone number, or have the user set their personal number in Comms.');
-                if (!waSendAllowed(target, [commsCtx.ownJid(), commsCtx.notifyJid()], commsCtx.canSendOthers())) return txt('Blocked: messaging contacts other than your own number(s) is OFF by default (a safety gate). The user can turn on "Let the agent message contacts" in Comms. Message NOT sent.');
-                const ok = await commsCtx.sendText(target, a.text);
-                // Context projects: remember agent→operator sends so a quoted
-                // WhatsApp reply routes back into this operator session.
-                if (ok) { try { commsCtx.recordContextSend?.(target, a.text); } catch { /* ring is best-effort */ } }
-                return txt(ok ? `Sent to ${target}.` : `Could not send to ${target} — is WhatsApp still linked?`);
-              })),
-            tool('wa_mark_read', 'Mark a WhatsApp chat as read (clears its unread badge).',
-              { chatId: z.string() },
-              wrap(async (a: { chatId: string }) => { await commsCtx.markRead(a.chatId); return txt(`Marked ${a.chatId} read.`); })),
-          ] : []),
+          ...(commsCtx ? buildWaTools({ tool, wrap, commsCtx, cwd: cwd! }) : []),
           ...(operatorCtx ? [
             tool('context_projects',
               'List the coding/design projects CONNECTED to this context (operator) project — the ones you may consult and dispatch work into. Returns id, name, kind and local path for each.',
@@ -1642,7 +1741,7 @@ async function runClaude(
     ] : []),
     ...(scheduleCtx ? ['schedule_list', 'schedule_create', 'schedule_update', 'schedule_delete', 'schedule_toggle', 'schedule_run_now', 'projects_list', 'sessions_list'] : []),
     ...(gitCtx ? ['git_status', 'git_push', 'pr_create', 'pr_merge', 'pr_resolve_conflicts', 'branch_rename'] : []),
-    ...(commsCtx ? ['wa_list_chats', 'wa_get_messages', 'wa_send_message', 'wa_mark_read'] : []),
+    ...(commsCtx ? [...WA_TOOL_NAMES] : []),
     ...(operatorCtx ? ['context_projects', 'project_memory', 'dispatch_to_project', 'dispatch_status', 'notify_operator'] : []),
   ].map(n => `mcp__maestro__${n}`);
   // Merge the operator's custom MCP servers (Settings → MCP servers) alongside the
@@ -2091,7 +2190,7 @@ async function runClaude(
 }
 
 /* ── Codex (`codex exec` on the ChatGPT login) ──────────────────────── */
-function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
+export function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false, model?: string,
   ctx?: { store: Store; projectId: string | null; publishing?: PublishingEngine; imageIntent?: boolean; codexBridge?: CodexBridge; openaiKey?: string; customCodexServers?: string[]; gitCtx?: GitCtx; emitConfirm?: EmitConfirm; sessionId?: string | null;
     /** Plan mode (the operator turned on the Plan toggle in the composer). Forces
         sandbox=read-only, disables every MCP bridge that could mutate the
@@ -2103,6 +2202,15 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
     plan?: boolean;
     /** Job id (turn). Logged + used to name the materialized plan file. */
     jobId?: string | null;
+    /** TEST-ONLY / internal: override the `~/.codex/generated_images` root the
+        Codex image collector scans. NEVER set by production callers (they always
+        use the real codex home); a focused engine test injects a temp dir so it
+        touches only scratch paths. */
+    codexImagesRoot?: string;
+    /** TEST-ONLY / internal: override the trusted asset destination the Codex
+        generated-images fallback materializes into (defaults to assetsDirFor).
+        NEVER set by production callers; a focused engine test injects a temp dir. */
+    assetsDir?: string;
   },
   imageFiles?: string[]): Promise<EngineRun> {
   const bin = resolveCodex();
@@ -2309,33 +2417,42 @@ function runCodex(prompt: string, cwd: string, hooks: RunHooks, readOnly = false
             }
           }
         }
-        // (a) image paths parsed from codex's file events + shell commands. Take only
-        //     in-workspace copies that match the nudge's generated-* naming (so a
-        //     mere reference to a pre-existing repo image, e.g. `cat assets/hero.png`,
-        //     is NOT mistaken for a fresh generation). Prefer these stable copies.
+        // (a) WORKSPACE image paths parsed from codex's file events + shell commands.
+        //     Take only in-workspace copies that match the nudge's generated-* naming
+        //     (so a mere reference to a pre-existing repo image, e.g. `cat assets/hero.png`,
+        //     is NOT mistaken for a fresh generation). NOTE: ~/.codex/generated_images
+        //     candidates are DELIBERATELY excluded here — a raw parsed path under the
+        //     codex root would bypass thread isolation / freshness / name / magic checks;
+        //     that root is harvested ONLY by the verified collector in (c) below.
         const codexImgRoot = path.join(homedir(), '.codex', 'generated_images') + path.sep;
         const cands = [...imgCandidates];
         for (const c of cands) if (!c.startsWith(codexImgRoot) && GENERATED_NAME_RE.test(path.basename(c))) take(c);
         // (b) workspace images written this run, named per the nudge (generated-*).
         const recent = recentImagesUnder(cwd, runStart);
         for (const fp of recent) if (GENERATED_NAME_RE.test(path.basename(fp))) take(fp);
-        // (c) the ~/.codex source path codex referenced, if no workspace copy landed.
-        for (const c of cands) if (c.startsWith(codexImgRoot)) take(c);
-        // (d) last fallback: a fresh ~/.codex/generated_images copy, scanned by mtime.
+        // (c) PRIMARY on-disk harvest for codex ≥0.144: the built-in image_gen tool
+        //     writes the finished raster to ~/.codex/generated_images/<threadId>/ and
+        //     puts NOTHING in the rollout, so (0)/(a)/(b) find nothing. This is the ONLY
+        //     path that reads the codex root; collection is by PROVENANCE + CONTENT
+        //     (thread-scoped, confined, bounded walk, fresh, non-symlink, size-capped,
+        //     PNG/JPEG/WebP by MAGIC) — NEVER by filename/extension, so a future codex
+        //     naming change can't break it. Each output is copied into a normalized
+        //     generated-<ts>.<png|jpg|webp> (extension from the DETECTED format, never the
+        //     source name) BEFORE importAsset, so an extensionless/oddly-named source is
+        //     still classified as an image (not 'other'). A raw parsed codex-root path
+        //     never reaches take() (see (a)), so nothing can preempt this collector.
         if (out.length === 0) {
-          try {
-            const root = path.join(homedir(), '.codex', 'generated_images');
-            for (const uuid of readdirSync(root)) {
-              const sub = path.join(root, uuid);
-              let entries: string[] = [];
-              try { entries = readdirSync(sub); } catch { continue; }
-              for (const f of entries) {
-                if (!/^ig_.*\.png$/i.test(f)) continue;
-                const fp = path.join(sub, f);
-                try { if (statSync(fp).mtimeMs >= runStart) take(fp); } catch { /* gone */ }
-              }
+          const collected = collectCodexGeneratedImages({ threadId, since: runStart, root: ctx.codexImagesRoot });
+          if (collected.length) {
+            const project = ctx.projectId ? ctx.store.getProject(ctx.projectId) : undefined;
+            const dir = ctx.assetsDir ?? assetsDirFor(project?.name);
+            // materializeCodexImage does the trusted normalize+copy (extension from the
+            // DETECTED magic format, re-validated at copy time) — a single production
+            // helper shared with the seam regression test, so this contract is covered.
+            for (let i = 0; i < collected.length; i++) {
+              try { take(materializeCodexImage(collected[i], dir, i)); } catch { /* skip this one */ }
             }
-          } catch { /* no codex home / none generated */ }
+          }
         }
         images = out.length ? out : undefined;
       }
@@ -2391,18 +2508,217 @@ type KeepGoingDecision = {
 export class LocalEngine {
   /** jobId → live cancel handle (abort for claude, child for codex). `steer` is set
       while a steerable Claude chat turn is mid-flight (see engine.steer / runClaude). */
-  private running = new Map<string, { ac: AbortController; child?: ChildProcess; steer?: SteerFn }>();
-  /** Per-session serialization: a session may have AT MOST ONE live agent turn.
-      When run() is asked to start a turn on a session that already has one live,
-      the new job is PARKED here (FIFO per session) and drained one-at-a-time as
-      the active turn ends. This enforces the invariant across every run() caller
-      — sendChat, cron/scheduled monitors, whatsapp-analyze, context-operator —
-      at the single choke point, so an injected monitor/check turn can never race
-      a real agent job on the same worktree/SDK session. */
-  private sessionRuns = new SessionRunQueue();
+  private running = new Map<string, RunHandle>();
+  /** SessionRunQueue: parked callers of run() for a job queued behind an active
+      turn on the same session (status persisted 'pending'/'Queued'). A LIST because
+      the SAME job can have MULTIPLE in-process callers (a duplicate trigger); when
+      the job is drained + run once, ALL of them settle with the single result. */
+  private parked = new Map<string, Array<{ resolve: (j: Job) => void; reject: (e: unknown) => void }>>();
+  /** Live lease-heartbeat interval per owning jobId — proof of life so recovery
+      never reclaims a healthy long turn. Cleared at the run's terminal. */
+  private leaseHeartbeats = new Map<string, ReturnType<typeof setInterval>>();
   /** In-flight `codex login` child (browser OAuth), if any. */
   private codexLoginChild?: ChildProcess;
   private githubLoginChild?: ChildProcess;
+
+  /** Refresh the session lease heartbeat every LEASE_HEARTBEAT_MS while `jobId`
+      owns `sessionId`, so a long but healthy turn is never reclaimed as stale. */
+  private startLeaseHeartbeat(sessionId: string, jobId: string): void {
+    this.stopLeaseHeartbeat(jobId);
+    const t = setInterval(() => { try { this.store.heartbeatSessionRun(sessionId, jobId); } catch { /* best effort */ } }, LEASE_HEARTBEAT_MS);
+    if (typeof t.unref === 'function') t.unref();
+    this.leaseHeartbeats.set(jobId, t);
+  }
+  private stopLeaseHeartbeat(jobId: string): void {
+    const t = this.leaseHeartbeats.get(jobId);
+    if (t) { clearInterval(t); this.leaseHeartbeats.delete(jobId); }
+  }
+  /** Settle EVERY parked caller of `jobId` with the same terminal result (or drop
+      the entry with no callers). Called when the job is drained, or when a queued
+      job is cancelled. */
+  private settleParked(jobId: string, outcome: { job?: Job; err?: unknown }): void {
+    const arr = this.parked.get(jobId);
+    if (!arr) return;
+    this.parked.delete(jobId);
+    for (const w of arr) { if (outcome.err !== undefined) w.reject(outcome.err); else if (outcome.job) w.resolve(outcome.job); }
+  }
+
+  /** THE single-writer lease lifecycle wrapper. Every `engine.run` funnels through
+      here so the session lease is claimed at ONE choke point, held across the ENTIRE
+      turn (including the awaited post-turn git that mutates the branch), and released
+      EXACTLY ONCE at the true terminal — even if `execute` throws during startup.
+      Parking (with a resolver LIST for duplicate callers), heartbeat, and draining
+      all live here; the turn body (`execute`) never touches the lease. Kept as a
+      narrow seam so the concurrency contract is unit-testable with a fake `execute`. */
+  private async runWithSessionLease(sessionId: string | undefined, jobId: string, execute: (ac: AbortController, handle: RunHandle) => Promise<Job>): Promise<Job> {
+    const ac = new AbortController();
+    const handle: RunHandle = { ac };
+    if (!sessionId) {
+      // No session → no cross-turn serialization, but still track for cancel/steer.
+      this.running.set(jobId, handle);
+      try { return await execute(ac, handle); } finally { this.running.delete(jobId); }
+    }
+    let claim: { outcome: 'acquired' | 'owned' | 'queued' | 'contended'; promoted?: string | null };
+    try {
+      claim = this.store.acquireSessionRunDetailed(sessionId, jobId); // fail-closed CAS
+    } catch {
+      // The lease CAS could not take the exclusive store lock in time. Fail CLOSED:
+      // NEVER execute unleased. Mark the job failed truthfully so it can be retried.
+      const failed = this.store.updateJob(jobId, { status: 'failed', phase: 'Failed', stage: '', error: 'Could not claim this session safely (the store was busy). Tap Retry.' });
+      this.emit('job', failed);
+      this.store.pushEvent({ kind: 'job-failed', title: `Failed: ${failed.title}`, subtitle: failed.error ?? undefined, projectId: failed.projectId, jobId });
+      this.settleParked(jobId, { job: failed });
+      return failed;
+    }
+    const outcome = claim.outcome;
+    if (outcome === 'queued') {
+      if (claim.promoted && claim.promoted !== jobId && !this.running.has(claim.promoted)) {
+        const promoted = claim.promoted;
+        void this.dispatchRun(promoted).then(
+          (j) => this.settleParked(promoted, { job: j }),
+          (e) => this.settleParked(promoted, { err: e }),
+        );
+      }
+      // A live owner holds this session. PARK: persist a truthful queued state (never
+      // relabelled as running) and return a promise the drainer settles when this job
+      // is later promoted + run once. Multiple duplicate callers share one execution.
+      const q = this.store.updateJob(jobId, { status: 'pending', phase: 'Queued', progress: 0, stage: 'Waiting for the current turn to finish…', error: null });
+      this.emit('job', q);
+      return await new Promise<Job>((resolve, reject) => {
+        const arr = this.parked.get(jobId) ?? [];
+        arr.push({ resolve, reject });
+        this.parked.set(jobId, arr);
+      });
+    }
+    if (outcome === 'contended') {
+      const current = this.store.getJob(jobId);
+      if (current) return current;
+      throw Object.assign(new Error('session lease is owned by another process'), { statusCode: 409 });
+    }
+    // 'acquired' | 'owned' → we own the session lease. Hold it for the whole turn.
+    this.startLeaseHeartbeat(sessionId, jobId);
+    this.running.set(jobId, handle);
+    try {
+      return await execute(ac, handle);
+    } finally {
+      // TRUE terminal — runs after execute() (INCLUDING the awaited post-turn git),
+      // and after any startup throw. Release + drain exactly once; AWAIT the release
+      // (with its fail-closed retry) so the turn isn't reported done until the lease is
+      // actually surrendered — the next same-session turn can't overlap this one.
+      this.running.delete(jobId);
+      await this.releaseAndDrainSession(sessionId, jobId);
+    }
+  }
+
+  /** How a promoted/recovered job is actually run. Defaults to the real run(); a
+      test overrides it (`__setDispatchForTest`) to route drained jobs through the
+      lease seam with a fake turn body. NOT changed by production callers. */
+  private dispatchRun: (jobId: string) => Promise<Job> = (jobId) => this.run(jobId, {});
+  /** TEST SEAM (internal): replace how drained/recovered jobs are dispatched. */
+  __setDispatchForTest(fn: (jobId: string) => Promise<Job>): void { this.dispatchRun = fn; }
+
+  /** Release `jobId`'s lease on `sessionId` and DRAIN the FIFO-next waiter: promote
+      it, run it once, and settle ALL of its parked callers with the terminal result.
+      The promoted job's own lease terminal drains the one after it (the chain).
+
+      FAIL-CLOSED: the release CAS can throw if the queue-file lock is momentarily
+      contended. We RETRY with bounded backoff (keeping the heartbeat/ownership valid so
+      nothing steals the lease mid-retry). Only if EVERY retry fails do we stop the
+      heartbeat and arm a durable, self-rescheduling recovery — the owner is terminal, so
+      recoverSessionRuns() promotes the next waiter and settles its parked callers. We
+      NEVER swallow the failure into a fake success, and parked callers always eventually
+      settle (either the drain here, or the recovery). */
+  private releaseBackoffMs: number[] = LEASE_RELEASE_BACKOFF_MS;
+  private releaseRecoveryBaseMs = LEASE_RELEASE_RECOVERY_MS;
+  private releaseRecoveryTimers = new Set<ReturnType<typeof setTimeout>>();
+  /** TEST SEAM (internal): shrink the release retry/recovery delays so the fail-closed
+      behavior is exercised in milliseconds. NOT used by production callers. */
+  __setLeaseReleaseTuningForTest(o: { backoff?: number[]; recoveryBase?: number }): void {
+    if (o.backoff) this.releaseBackoffMs = o.backoff;
+    if (o.recoveryBase != null) this.releaseRecoveryBaseMs = o.recoveryBase;
+  }
+  private async releaseAndDrainSession(sessionId: string, jobId: string): Promise<void> {
+    let promoted: string | null = null;
+    let released = false;
+    for (let i = 0; i < this.releaseBackoffMs.length; i++) {
+      if (this.releaseBackoffMs[i]) await this.delay(this.releaseBackoffMs[i]);
+      try { promoted = this.store.releaseSessionRun(sessionId, jobId); released = true; break; }
+      catch { /* lock contended — ownership + heartbeat still held; retry */ }
+    }
+    this.stopLeaseHeartbeat(jobId); // the owner's turn is over either way
+    if (!released) {
+      // Persistent lock failure. Report truthfully (never fabricate success) and arm a
+      // durable recovery so the FIFO-next waiter is eventually promoted + its parked
+      // callers settle — the stopped heartbeat means the lease is now safely reclaimable.
+      this.emit('log', { level: 'error', scope: 'session-lease', msg: `could not release session ${sessionId} (job ${jobId}) after ${this.releaseBackoffMs.length} attempts — scheduling recovery` });
+      this.scheduleReleaseRecovery(0);
+      return;
+    }
+    if (promoted && promoted !== jobId && !this.running.has(promoted)) {
+      const next = promoted;
+      void this.dispatchRun(next).then(
+        (j) => this.settleParked(next, { job: j }),
+        (e) => this.settleParked(next, { err: e }),
+      );
+    }
+  }
+
+  /** Bounded sleep whose timer never keeps the process alive. */
+  private delay(ms: number): Promise<void> {
+    return new Promise<void>((r) => { const t = setTimeout(r, ms); if (typeof (t as { unref?: () => void }).unref === 'function') (t as { unref: () => void }).unref(); });
+  }
+
+  /** Durable fallback for a lease whose release CAS kept failing: retry recoverSessionRuns()
+      (which promotes terminal-owner leases + settles parked callers) on an exponential
+      backoff until it goes through, capped so a truly wedged lock can't loop forever. */
+  private scheduleReleaseRecovery(attempt: number): void {
+    const delay = Math.min(this.releaseRecoveryBaseMs * 2 ** attempt, 8000);
+    const t = setTimeout(() => {
+      this.releaseRecoveryTimers.delete(t);
+      try { this.recoverSessionRuns(); }
+      catch { this.scheduleReleaseRecovery(attempt + 1); }
+    }, delay);
+    this.releaseRecoveryTimers.add(t);
+    if (typeof (t as { unref?: () => void }).unref === 'function') (t as { unref: () => void }).unref();
+  }
+
+  /** Boot recovery: after settleOrphanedRuns() terminalizes crashed OWNERS, heal
+      every session lease whose owner is terminal/stale/never-started and dispatch
+      the job to run EXACTLY ONCE. A job that partially ran (a crashed running owner)
+      is NEVER re-run — only never-started queued/promoted work is. */
+  recoverSessionRuns(): void {
+    const isTerminal = (id: string): boolean => {
+      const j = this.store.getJob(id);
+      return !j || j.status === 'done' || j.status === 'failed' || j.status === 'cancelled' || j.status === 'gated';
+    };
+    for (const promoted of this.store.recoverSessionRuns(isTerminal)) {
+      if (!this.running.has(promoted)) void this.dispatchRun(promoted).then(
+        (j) => this.settleParked(promoted, { job: j }),
+        (e) => this.settleParked(promoted, { err: e }),
+      );
+    }
+    // Crash-safe idempotency: a trigger that RESERVED + created a job but crashed before
+    // engine.run (still 'pending', never leased) is re-dispatched here EXACTLY ONCE so a
+    // claimed trigger always yields one run. run()'s lease + running-guard block any double.
+    for (const jid of this.store.idempotentPendingJobIds()) {
+      if (!this.running.has(jid)) void this.dispatchRun(jid).catch(() => { /* failure lands on the job */ });
+    }
+  }
+
+  /** TEST SEAM (internal): exercise the lease lifecycle wrapper with a fake `execute`
+      so the single-writer concurrency contract is verifiable without spawning a real
+      engine. NOT used by production callers. */
+  async __runWithSessionLeaseForTest(sessionId: string | undefined, jobId: string, execute: (ac: AbortController, handle: RunHandle) => Promise<Job>): Promise<Job> {
+    return this.runWithSessionLease(sessionId, jobId, execute);
+  }
+  /** TEST SEAM (internal): clear timers owned by the lease/recovery machinery so
+      runner teardown cannot hang after assertions have already completed. */
+  __disposeLeaseTimersForTest(): void {
+    for (const t of this.leaseHeartbeats.values()) clearInterval(t);
+    this.leaseHeartbeats.clear();
+    for (const t of this.releaseRecoveryTimers) clearTimeout(t);
+    this.releaseRecoveryTimers.clear();
+  }
   /** In-flight engine binary downloads → their abort handle (one per engine). */
   private engineInstalls = new Map<EngineId, AbortController>();
 
@@ -2641,7 +2957,7 @@ export class LocalEngine {
       bytes land in exec mode). Primary backend for Settings → Image = Codex. */
   async imageViaCodex(prompt: string, opts: { aspect?: string; projectId?: string | null; sourceImagePath?: string }): Promise<ImageGenResult> {
     const st = this.status('codex');
-    if (!st.available) throw Object.assign(new Error(`Codex isn’t ready for image generation — ${st.reason || 'sign into Codex'}. Or set Image generation to Claude (fal) in Settings.`), { statusCode: 503, code: 'codex-unavailable' });
+    if (!st.available) throw Object.assign(new Error(`Codex isn’t ready for image generation — ${st.reason || 'sign into Codex'}.`), { statusCode: 503, code: 'codex-unavailable' });
     if (!this.publishing) throw Object.assign(new Error('image pipeline not initialised'), { statusCode: 500 });
     const orient = opts.aspect === '9:16' ? ' Portrait orientation.' : opts.aspect === '16:9' ? ' Landscape orientation.' : '';
     const editing = !!opts.sourceImagePath && existsSync(opts.sourceImagePath);
@@ -2663,7 +2979,7 @@ export class LocalEngine {
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
     }
     const img = run.images?.[0];
-    if (!img) throw Object.assign(new Error(`Codex did not ${editing ? 'edit the' : 'return an'} image — try again, or switch Image generation to Claude (fal) in Settings.`), { statusCode: 502, code: 'codex-no-image' });
+    if (!img) throw Object.assign(new Error(`Codex did not ${editing ? 'edit the' : 'return an'} image — try again.`), { statusCode: 502, code: 'codex-no-image' });
     // Freshness guard: content-dedup can hand back a PRE-EXISTING asset (e.g. the
     // unchanged source on an edit) — never return or re-stamp a stale asset.
     const harvested = this.store.getAsset(img.assetId);
@@ -2678,11 +2994,12 @@ export class LocalEngine {
       the OpenAI Images API. Only reached when the native imageViaCodex path above
       fails AND the operator has stored an OpenAI API key (the ChatGPT subscription
       login can't drive the Images API — most operators won't have this). Without a
-      key this throws `openai-key-missing` and the caller (main.ts) falls back to
-      fal. Never required: the native rollout-harvest path is the primary. */
+      key this throws `openai-key-missing` and the caller surfaces the Codex error:
+      Codex-selected image generation fails CLOSED to Codex — it never falls back to
+      FAL. The native built-in image_gen path is the primary. */
   async imageViaOpenAI(prompt: string, opts: { aspect?: string; projectId?: string | null; sourceImagePath?: string }): Promise<ImageGenResult> {
     const key = this.providers?.getLocalKey('openai');
-    if (!key) throw Object.assign(new Error('OpenAI image generation needs an OpenAI API key (Settings → Accounts) — the ChatGPT subscription can’t drive the Images API. Or set Image generation to Claude (fal) in Settings.'), { statusCode: 503, code: 'openai-key-missing' });
+    if (!key) throw Object.assign(new Error('OpenAI image generation needs an OpenAI API key (Settings → Accounts) — the ChatGPT subscription can’t drive the Images API.'), { statusCode: 503, code: 'openai-key-missing' });
     if (!this.publishing) throw Object.assign(new Error('image pipeline not initialised'), { statusCode: 500 });
     // gpt-image-2 sizes: portrait / landscape / square (no free-form aspect).
     const size = opts.aspect === '9:16' ? '1024x1536' : opts.aspect === '16:9' ? '1536x1024' : '1024x1024';
@@ -2716,8 +3033,8 @@ export class LocalEngine {
     } catch (e) {
       apiErr = e instanceof Error ? e.message : String(e);
     }
-    if (apiErr) throw Object.assign(new Error(`OpenAI image generation failed — ${apiErr}. Or switch Image generation to Claude (fal) in Settings.`), { statusCode: 502 });
-    if (!b64) throw Object.assign(new Error(`OpenAI returned no image — try again, or switch Image generation to Claude (fal) in Settings.`), { statusCode: 502 });
+    if (apiErr) throw Object.assign(new Error(`OpenAI image generation failed — ${apiErr}.`), { statusCode: 502 });
+    if (!b64) throw Object.assign(new Error(`OpenAI returned no image — try again.`), { statusCode: 502 });
     // Write the bytes into the project's assets dir and register as an Asset. Keep
     // source 'import' (importAsset) — it wasn't a fal spend, so it stays out of the
     // fal cost ledger — but stamp model + prompt so Media Studio can regenerate it.
@@ -2923,70 +3240,54 @@ export class LocalEngine {
     return { ok: true };
   }
 
-  /** Cancel a running job. Returns the updated (cancelled) job, or null if not running. */
+  /** Cancel a running OR queued job. Returns the updated (cancelled) job, or null.
+      - ACTIVE (owns the session lease + running): abort it; the run's terminal
+        releases the lease and advances the queue exactly once.
+      - QUEUED (parked behind another turn, not running): remove ONLY this item
+        from the wait list — the active turn keeps running — and resolve its parked
+        promise. Never advances/steals the lease. */
   cancel(jobId: string): Job | null {
     const h = this.running.get(jobId);
     if (!h) {
-      // Not live — but it may be PARKED (queued behind the session's active turn).
-      // Cancel it in place so it never runs; the active turn is untouched.
-      if (this.unparkJob(jobId)) {
-        const job = this.store.getJob(jobId);
-        if (job && job.status !== 'cancelled' && job.status !== 'done' && job.status !== 'failed') {
-          const c = this.store.updateJob(jobId, { status: 'cancelled', phase: 'Cancelled', stage: '', error: null });
-          this.emit('job', c);
-          this.store.pushEvent({ kind: 'job-cancelled', title: `Cancelled: ${c.title}`, projectId: c.projectId, jobId });
-          return c;
-        }
-        return job ?? null;
+      // Not running — is it a parked/queued waiter? Remove just this item.
+      const job = this.store.getJob(jobId);
+      const sessionId = job?.sessionId;
+      const lease = sessionId ? this.store.sessionRunLease(sessionId) : undefined;
+      if (job && sessionId && lease && lease.waiters.includes(jobId)) {
+        this.store.dequeueSessionRun(sessionId, jobId);
+        const cancelled = this.store.updateJob(jobId, { status: 'cancelled', phase: 'Cancelled', stage: '', error: null });
+        this.emit('job', cancelled);
+        this.store.pushEvent({ kind: 'job-cancelled', title: `Cancelled: ${cancelled.title}`, projectId: cancelled.projectId, jobId });
+        // Settle EVERY in-process caller parked on this queued job (a duplicate trigger
+        // may have parked more than one) — none must hang.
+        this.settleParked(jobId, { job: cancelled });
+        return cancelled;
       }
       return null;
     }
+    const job = this.store.getJob(jobId);
+    if (!job) { this.running.delete(jobId); return null; }
+    // A duplicate cancel on an already-terminal job is a no-op: NO second external kill,
+    // no revival — the durable terminal status stands.
+    if (job.status !== 'running') { this.running.delete(jobId); return job; }
+    // LOW-fix (cancel order): persist the durable `cancelled` transition BEFORE the external
+    // abort/kill. A crash between the persist and the kill therefore leaves a durable
+    // 'cancelled' (restart reconciles; an in-process child died with us), and the aborted
+    // run's own terminal handler never overwrites a 'cancelled' status (see the abort guard).
+    const cancelled = this.store.updateJob(jobId, { status: 'cancelled', phase: 'Cancelled', stage: '', error: null });
+    // External kill AFTER the durable transition — at most once (the handle is then dropped).
     h.ac.abort();
     try { h.child?.kill('SIGTERM'); } catch { /* gone */ }
     this.running.delete(jobId);
-    const job = this.store.getJob(jobId);
-    if (!job || job.status !== 'running') return job ?? null;
-    const cancelled = this.store.updateJob(jobId, { status: 'cancelled', phase: 'Cancelled', stage: '', error: null });
+    // NB: the session lease is released + the next turn drained by the run's own terminal
+    // (the aborted run unwinds into the wrapper's finally → releaseAndDrainSession), so the
+    // next turn starts only AFTER this engine has actually ended — never mid-abort.
     this.emit('job', cancelled);
     this.store.pushEvent({ kind: 'job-cancelled', title: `Cancelled: ${cancelled.title}`, projectId: cancelled.projectId, jobId });
-    // The active turn just ended — let the session's next parked turn (if any) run.
-    this.drainSessionRuns(job.sessionId);
     return cancelled;
   }
 
   isRunning(jobId: string): boolean { return this.running.has(jobId); }
-
-  /** True if the session has a LIVE (currently executing) turn other than
-      `exceptJobId`. Backs the one-turn-per-session guard. */
-  isSessionBusy(sessionId: string, exceptJobId?: string): boolean {
-    for (const id of this.running.keys()) {
-      if (id === exceptJobId) continue;
-      if (this.store.getJob(id)?.sessionId === sessionId) return true;
-    }
-    return false;
-  }
-
-  /** Park a job behind the session's active turn, remembering its run options so
-      the drain can replay them verbatim. */
-  private parkSessionRun(sessionId: string, jobId: string, opts: RunOpts): void {
-    this.sessionRuns.park(sessionId, jobId, opts);
-  }
-
-  /** Remove a job from its session queue (used when it's cancelled while parked). */
-  private unparkJob(jobId: string): boolean {
-    return this.sessionRuns.unpark(jobId);
-  }
-
-  /** Called when a session's active turn ends: start the next parked turn (if the
-      session is now free and the next job is still pending). Skips jobs that were
-      cancelled/settled while parked. */
-  private drainSessionRuns(sessionId?: string | null): void {
-    if (!sessionId) return;
-    if (this.isSessionBusy(sessionId)) return; // another turn is still live — wait
-    const nextRun = this.sessionRuns.next(sessionId, (id) => this.store.getJob(id)?.status === 'pending');
-    if (!nextRun) return;
-    void this.run(nextRun.jobId, nextRun.opts).catch(() => { /* the run records its own failure */ });
-  }
 
   /** STEER a running chat turn: inject a follow-up user message into the LIVE Claude
       Agent SDK session (streaming input) — same subprocess, full context, NO
@@ -3023,7 +3324,7 @@ export class LocalEngine {
       asked and didn't act afterwards), the session has AUTOPILOT enabled (opt-in
       per-chat — was always-on before; the operator wanted explicit control), and
       nothing is already armed for this session. */
-  private armAskFollowup(sessionId: string, projectId: string, items: TranscriptItem[], effort: Effort): boolean {
+  private armAskFollowup(sessionId: string, projectId: string, sourceJobId: string, items: TranscriptItem[], effort: Effort, intent?: RunIntentInput): boolean {
     // Per-chat opt-in: autopilot must be ON for this session, or the auto-answer
     // is just user-hostile (the operator typed a question to be ANSWERED, not
     // auto-resolved). The toggle lives on the composer; default is OFF.
@@ -3036,12 +3337,15 @@ export class LocalEngine {
     for (let i = askIdx + 1; i < items.length; i++) { if (items[i].kind === 'tool') return false; }
     const questions = parseAsk(items[askIdx].ask);
     if (!questions.length) return false;
-    if (this.store.listSchedules().some(s => s.kind === 'auto-answer' && s.sessionId === sessionId && s.enabled)) return true;
+    const ask = items[askIdx].ask;
+    if (!ask) return false;
     const armedAt = Date.now();
-    const sched = this.store.createSchedule({
-      projectId, sessionId, kind: 'auto-answer',
+    const { schedule: sched } = this.store.upsertAutoAnswerForSource({
+      projectId, sessionId,
       title: 'Auto-answer question', prompt: timeoutAnswer(questions),
-      fireAt: armedAt + ASK_BASE_MS, armedAt, extends: 0, effort,
+      questionAsk: ask,
+      fireAt: armedAt + ASK_BASE_MS, armedAt, extends: 0, effort, intent,
+      sourceJobId,
     });
     this.emit('schedule', sched);
     return true;
@@ -3161,6 +3465,7 @@ export class LocalEngine {
     sessionId: string;
     projectId: string;
     effort: Effort;
+    intent?: RunIntentInput;
     goalMode: boolean;
     originalGoal?: string;
     sourceJobId: string;
@@ -3198,6 +3503,7 @@ export class LocalEngine {
       prompt,
       fireAt,
       effort: opts.effort,
+      intent: opts.intent,
       sourceJobId: opts.sourceJobId,
       maxPerSession: KEEP_GOING_MAX_PER_SESSION,
     });
@@ -3278,32 +3584,72 @@ export class LocalEngine {
       attempt,
       effort: opts.job.effort,
       goal: opts.job.goal,
+      intent: opts.job.intent,
     });
     return { schedule: res.schedule, attempt };
   }
 
+  async retryReviewGate(sessionId: string): Promise<ReviewGate> {
+    const session = this.store.getSession(sessionId);
+    if (!session) throw Object.assign(new Error('session not found'), { statusCode: 404 });
+    const reviewerChoice = session.reviewer;
+    if (!session.reviewerEnabled || !reviewerChoice || reviewerChoice === 'off') {
+      throw Object.assign(new Error('reviewer is disabled for this session'), { statusCode: 400 });
+    }
+    const reviewer = reviewerChoice.engine;
+    if (!this.available(reviewer)) {
+      throw Object.assign(new Error(`${ENGINE_LABEL[reviewer]} is unavailable — ${this.status(reviewer).reason}`), { statusCode: 409 });
+    }
+    const latest = this.store.listJobs(session.projectId, session.id).find(j => j.status === 'failed' || j.status === 'done');
+    if (!latest) throw Object.assign(new Error('no completed job to retry review for'), { statusCode: 400 });
+    const project = this.store.getProject(session.projectId);
+    const cwd = session.worktreePath || project?.path || process.cwd();
+    const artifactId = gitArtifactIdentity(cwd);
+    const scope: ReviewGateScope = { projectId: session.projectId, sessionId: session.id, jobId: latest.id, artifactId };
+    const prompt = buildStructuredReviewPrompt({
+      task: latest.input,
+      body: [
+        'Previous terminal job output/error:',
+        (latest.output ?? latest.error ?? '').slice(0, 12000),
+        '',
+        'Current exact artifact context:',
+        gitReviewArtifactContext(cwd),
+      ].join('\n'),
+      mode: 'code',
+    });
+    const reviewerModel = reviewerChoice.model;
+    const reviewerKey = () => (this.status('claude').method === 'apiKey' ? this.providers?.getLocalKey('anthropic') : undefined);
+    const result = await executeReviewGate({
+      store: this.store,
+      scope,
+      reviewerIdentity: `${ENGINE_LABEL[reviewer]}${reviewerModel ? `:${reviewerModel}` : ''}`,
+      prompt,
+      onGate: (gate) => this.emit('review-gate', gate),
+      runReviewer: (p) => reviewer === 'claude'
+        ? runClaude(p, cwd, 'fast', reviewerKey(), 3, {}, undefined, reviewerModel)
+        : runCodex(p, cwd, {}, true, reviewerModel),
+    });
+    return result.gate;
+  }
+
   /** Run an existing job to completion on this Mac. Resolves with the final job. */
-  async run(jobId: string, opts: RunOpts = {}): Promise<Job> {
+  async run(jobId: string, opts: RunIntentInput = {}): Promise<Job> {
     const job = this.store.getJob(jobId);
     if (!job) throw Object.assign(new Error('job not found'), { statusCode: 404 });
+    // Idempotency: this exact job is already executing in-process — never start a
+    // second concurrent run of the same job (a duplicate trigger is a no-op).
+    if (this.running.has(jobId)) return job;
 
-    // ── One active agent turn per session ──
-    // If this session already has a live turn, PARK this job instead of racing a
-    // second run() on the same worktree + SDK session (the injected-monitor bug).
-    // It drains automatically when the active turn ends (drainSessionRuns). This
-    // runs BEFORE anything mutates `this.running`, so concurrent run() calls
-    // serialize deterministically (no await precedes it). A job with no session
-    // (project-level work) is never serialized.
-    if (job.sessionId && this.isSessionBusy(job.sessionId, jobId)) {
-      this.parkSessionRun(job.sessionId, jobId, opts);
-      const parked = this.store.updateJob(jobId, {
-        status: 'pending', phase: 'Queued',
-        stage: 'waiting for the current turn to finish…',
-      });
-      this.emit('job', parked);
-      return parked;
-    }
-
+    // SessionRunQueue — the AUTHORITATIVE single-writer claim. Every backend trigger
+    // (direct message, createAndRunJob, cron/retry, WhatsApp/remote, autopilot) funnels
+    // through this ONE lease-lifecycle wrapper: it claims the session lease, holds it
+    // across the WHOLE turn (INCLUDING the awaited post-turn git that mutates the branch),
+    // and releases it EXACTLY ONCE at the true terminal — even if a startup step below
+    // throws. `execute` (the turn body) never touches the lease. A job with no session
+    // (project-level work) skips serialization but still tracks cancel/steer via `handle`.
+    return this.runWithSessionLease(job.sessionId, jobId, async (ac, handle) => {
+    const intent = this.store.resolveJobIntent(jobId, opts);
+    opts = intent;
     const project = this.store.getProject(job.projectId);
     const routing = this.store.routing();
     const roles = this.store.getRoles();
@@ -3317,20 +3663,17 @@ export class LocalEngine {
       if (!opts.engine && this.available(other)) {
         master = other; // routing target unavailable — fall back to the signed-in engine
       } else {
-        const failed = this.store.updateJob(jobId, { status: 'failed', phase: 'Failed', stage: '', engine: master, error: `${ENGINE_LABEL[master]} is unavailable — ${this.status(master).reason}` });
+        const failed = this.store.updateJob(jobId, { status: 'failed', phase: 'Failed', stage: '', engine: master, intent, error: `${ENGINE_LABEL[master]} is unavailable — ${this.status(master).reason}` });
         this.emit('job', failed);
         this.store.pushEvent({ kind: 'job-failed', title: `Failed: ${failed.title}`, subtitle: failed.error ?? undefined, projectId: failed.projectId, jobId });
         return failed;
       }
     }
 
-    const ac = new AbortController();
-    const handle: { ac: AbortController; child?: ChildProcess; steer?: SteerFn } = { ac };
-    this.running.set(jobId, handle);
-
     let cur = this.store.updateJob(jobId, {
       status: 'running', phase: 'Working', progress: 20, output: '', error: null, engine: master,
       ...(masterModel ? { model: masterModel } : {}),
+      intent,
       stage: `running on this Mac via ${ENGINE_LABEL[master]}…`,
     });
     this.emit('job', cur);
@@ -3545,30 +3888,20 @@ export class LocalEngine {
       const enabledMcpServers = !opts.plan ? this.store.listMcpServers().filter(s => s.enabled) : [];
       // The servers that actually attach this turn, paired with the EXACT namespace
       // they'll be registered under (collision-deduped) — Codex takes stdio only.
-      const attachedMcp = assignMcpNames(enabledMcpServers, { stdioOnly: master === 'codex' });
+      let attachedMcp = assignMcpNames(enabledMcpServers, { stdioOnly: master === 'codex' });
       if (job.projectId && attachedMcp.length) {
-        const have = new Set(this.store.listInstalledSkills(job.projectId).map(s => s.id));
-        for (const skillId of activeServerSkillIds(attachedMcp.map(a => a.server))) {
-          try {
-            if (have.has(skillId)) {
-              // Already installed — a server depends on it, so make sure it's enabled.
-              setSkillFilesEnabled(cwd, skillId, true);
-              this.store.setInstalledSkillEnabled(job.projectId, skillId, true);
-              continue;
+        const blockedMcp = new Set<string>();
+        for (const { server } of attachedMcp) {
+          for (const skillId of server.skillIds ?? []) {
+            const dep = await ensureMcpRegistrySkillDependency({ store: this.store, projectId: job.projectId, cwd, skillId });
+            if (!dep.ok) {
+              blockedMcp.add(server.id);
+              try { this.store.updateMcpServer(server.id, { lastSkillError: dep.reason } as Partial<CustomMcpServer>); } catch { /* best-effort diagnostic */ }
+              break;
             }
-            const base = registryBase();
-            const [content, meta] = await Promise.all([
-              fetchSkillContent(base, skillId),
-              getRegistrySkill(base, skillId).catch(() => null),
-            ]);
-            const slug = installSkillFiles(cwd, skillId, content.skillMd);
-            this.store.recordSkillInstall(job.projectId, {
-              id: skillId, slug, name: meta?.name || content.name, description: meta?.description,
-              risk: meta?.risk, source: meta?.source, version: meta?.version || 'latest', sha256: content.sha256,
-              enabled: true, mirrorRepo: meta?.sourceRepo ?? meta?.mirrorRepo, auditStatus: meta?.auditStatus, addedBy: 'agent',
-            });
-          } catch { /* registry/network hiccup — the server still attaches; the skill just isn't pre-installed */ }
+          }
         }
+        attachedMcp = attachedMcp.filter(a => !blockedMcp.has(a.server.id));
       }
 
       // Native skills: the always-on catalog bundled with the app (from
@@ -3591,10 +3924,11 @@ export class LocalEngine {
               .filter(s => s.addedBy === 'native' && s.enabled === false)
               .map(s => s.slug),
           );
-          ensureNativeSkills(cwd, offNative);
+          const nativeEnsure = ensureNativeSkills(cwd, offNative);
+          const unavailableNative = new Set([...offNative, ...nativeEnsure.filter(r => r.status === 'kept').map(r => r.slug)]);
           // Mirror them into the store (enabled by default) so the UI lists them and
           // the operator can toggle any off. Preserves an existing disable.
-          this.store.recordNativeSkills(job.projectId, nativeSkillSummaries().map(s => ({
+          this.store.recordNativeSkills(job.projectId, nativeSkillSummaries().filter(s => !unavailableNative.has(s.slug)).map(s => ({
             id: s.id, slug: s.slug, name: s.name, description: s.description,
             source: 'https://github.com/openai/skills', version: 'bundled', sha256: s.sha256,
             enabled: true, addedBy: 'native' as const,
@@ -3603,7 +3937,7 @@ export class LocalEngine {
           // sending it the full 40+ line catalog index would DOUBLE-LIST every skill
           // (~2.5K wasted tokens per turn). Claude gets the lean block (imagegen rule
           // + pointer); Codex has no auto-discovery, so it keeps the full index.
-          nativeSkillsBlock = nativeSkillsPromptBlock(offNative, { index: master !== 'claude' });
+          nativeSkillsBlock = nativeSkillsPromptBlock(unavailableNative, { index: master !== 'claude' });
         } catch { /* best-effort — a bundled-skill hiccup never fails a run */ }
       }
 
@@ -3619,13 +3953,26 @@ export class LocalEngine {
         // its files (renamed SKILL.md.disabled) but is hidden from the run. Native
         // skills are excluded here — they get their own dedicated block above.
         const installed = this.store.listInstalledSkills(job.projectId)
-          .filter(s => s.enabled !== false && s.addedBy !== 'native' && !isNativeSkill(s.id));
+          .filter(s => {
+            if (s.enabled === false || s.addedBy === 'native' || isNativeSkill(s.id)) return false;
+            const decision = evaluateSkillTrustForExecution(s);
+            if (!decision.ok) return false;
+            if (decision.trust === 'registry-audited') {
+              const check = reverifyInstalledSkill(cwd, buildRegistryReverifyContent(s));
+              if (!check.ok) {
+                this.store.setInstalledSkillEnabled(job.projectId, s.id, false);
+                return false;
+              }
+            }
+            return true;
+          });
         const list = installed.map(s => {
           const meta = [
             s.version ? `version=${s.version}` : '',
             s.risk ? `risk=${s.risk}` : '',
             s.sha256 ? `sha256=${s.sha256.slice(0, 12)}` : '',
             s.auditStatus ? `audit=${s.auditStatus}` : '',
+            truthfulSkillLabel(s).trust ? `trust=${truthfulSkillLabel(s).trust}` : '',
           ].filter(Boolean).join(', ');
           return `- ${s.name}: ${(s.description || '').slice(0, 160)} (path=.claude/skills/${s.slug}/SKILL.md${meta ? `, ${meta}` : ''})`;
         }).join('\n');
@@ -3713,7 +4060,10 @@ export class LocalEngine {
             fetchSkillContent(base, skillId),
             getRegistrySkill(base, skillId).catch(() => null),
           ]);
-          const slug = installSkillFiles(cwd, skillId, content.skillMd);
+          const slugForInstall = skillSlug(skillId);
+          const existing = this.store.listInstalledSkills(projForSkills).find(s => s.id === skillId || s.slug === slugForInstall);
+          const verified = installVerifiedRegistrySkill(cwd, content, { existing });
+          const slug = verified.slug;
           const rec = this.store.recordSkillInstall(projForSkills, {
             id: skillId,
             slug,
@@ -3722,23 +4072,25 @@ export class LocalEngine {
             risk: meta?.risk,
             source: meta?.source,
             version: meta?.version || 'latest',
-            sha256: content.sha256,
+            sha256: verified.sha256,
             enabled: content.enabled !== false && meta?.enabled !== false,
             disabledReason: meta?.disabledReason,
             mirrorRepo: meta?.sourceRepo ?? meta?.mirrorRepo,
             auditStatus: meta?.auditStatus,
             addedBy: 'agent',
+            integrity: verified.integrity, provenance: verified.provenance, auditEvidence: verified.auditEvidence, policy: verified.policy,
           });
           return { name: rec.name, slug: rec.slug, sha256: rec.sha256 };
         },
-        list: async () => this.store.listInstalledSkills(projForSkills).map(s => ({
+        list: async () => this.store.listInstalledSkills(projForSkills).filter(s => evaluateSkillTrustForExecution(s).ok).map(s => ({
           id: s.id,
           slug: s.slug,
           name: s.name,
           description: s.description,
           risk: s.risk,
-          version: s.version,
-          sha256: s.sha256,
+          version: truthfulSkillLabel(s).provenance === 'registry' ? s.version : undefined,
+          sha256: truthfulSkillLabel(s).provenance === 'registry' ? s.sha256 : undefined,
+          trustLabel: truthfulSkillLabel(s),
         })),
         remove: async (skillId: string) => {
           removeSkillFiles(cwd, skillId);
@@ -3830,30 +4182,18 @@ export class LocalEngine {
       if (isChat && gitCtx?.available()) prompt += PR_DIRECTIVE;
       // WhatsApp capability: when a number is linked, give the agent read/send tools
       // backed by THIS Mac's socket + store, scoped to this project's assigned chats.
-      const commsCtx: CommsCtx | undefined = (this.comms && this.store.whatsappState().connected && !opts.plan) ? {
-        ownJid: () => this.store.whatsappState().jid,
-        notifyJid: () => this.store.whatsappState().notifyJid ?? null,
-        canSendOthers: () => !!this.store.whatsappState().agentSendToOthers,
-        projectChatIds: () => this.store.listProjectWaChats(job.projectId ?? ''),
-        listChats: () => this.store.waListChats().map(c => ({ chatId: c.chatId, name: c.name, kind: c.kind, unreadCount: c.unreadCount, lastMessageAt: c.lastMessageAt, lastMessageText: c.lastMessageText })),
-        getMessages: (chatId, limit) => this.store.waMessages(chatId, { limit }).map(m => ({ fromMe: m.fromMe, senderName: m.senderName, text: m.text, ts: m.ts, kind: m.kind })),
-        sendText: (chatId, text) => this.comms!.sendText(chatId, text),
-        markRead: (chatId) => this.comms!.markRead(chatId),
-        // Context projects: remember operator-bound sends so the human can
-        // REPLY on WhatsApp (quote) and land back in this operator session.
-        // Only own-number sends are recorded — client-chat traffic must not
-        // evict operator sends from the small ring.
-        ...(project?.kind === 'context' ? {
-          recordContextSend: (chatId: string, text: string) => {
-            try {
-              const st = this.store.whatsappState();
-              if (chatId !== st.jid && chatId !== st.notifyJid) return;
-              const sid = session?.id ?? this.store.primarySessionOf(project.id)?.id;
-              if (sid) this.store.recordContextWaSend({ projectId: project.id, sessionId: sid, chatId, text });
-            } catch { /* ring is best-effort */ }
-          },
-        } : {}),
-      } : undefined;
+      const commsCtx: CommsCtx | undefined = (this.comms && !opts.plan)
+        ? buildCommsCtx(this.store, this.comms, job.projectId ?? '', project?.kind === 'context' ? {
+            recordContextSend: (chatId: string, text: string) => {
+              try {
+                const st = this.store.whatsappState();
+                if (chatId !== st.jid && chatId !== st.notifyJid) return;
+                const sid = session?.id ?? this.store.primarySessionOf(project.id)?.id;
+                if (sid) this.store.recordContextWaSend({ projectId: project.id, sessionId: sid, chatId, text });
+              } catch { /* ring is best-effort */ }
+            },
+          } : undefined)
+        : undefined;
       // Context (knowledge/operator) capability: linked-project awareness +
       // cross-project dispatch + a WhatsApp line to the operator. Mounted only
       // for context-genre projects on real (non-plan) runs; Claude-engine-only
@@ -3989,7 +4329,7 @@ export class LocalEngine {
             const res = this.store.upsertAutoContinueForSession({
               projectId: job.projectId, sessionId: session.id,
               title: 'Continue when Claude limit resets', prompt: CONTINUE_PROMPT,
-              fireAt, effort,
+              fireAt, effort, intent: opts,
             });
             created = res.created;
             this.emit('schedule', res.schedule);
@@ -4120,6 +4460,11 @@ export class LocalEngine {
         endsOnAsk ||
         (keepGoingDecision != null &&
           (keepGoingDecision.verdict !== 'done' || keepGoingDecision.hasBlocking));
+      let armedAskBeforeReview = false;
+      if (endsOnAsk && isChat && !opts.plan && !main.hitLimit && !ac.signal.aborted) {
+        try { armedAskBeforeReview = this.armAskFollowup(session.id, job.projectId, jobId, allItems, effort, opts); }
+        catch { armedAskBeforeReview = false; }
+      }
 
       /* SP3 — primary↔reviewer loop. A reviewer engine (e.g. Codex) checks the
          primary's (e.g. Opus) changes for security/weak code/bugs; if it flags
@@ -4147,26 +4492,97 @@ export class LocalEngine {
       // A reviewer fix pass rewrote the tail → the post-done arming re-judges
       // on the fresh output instead of reusing the pre-review decision.
       let reviewFixApplied = false;
+      const willRunReviewer =
+        reviewer !== 'off' &&
+        this.available(reviewer) &&
+        reviewerOn &&
+        !main.hitLimit &&
+        !ac.signal.aborted &&
+        !autopilotContinuable;
+      let checkpointWrittenBeforeReview = false;
 
-      if (reviewer !== 'off' && this.available(reviewer) && reviewerOn && !main.hitLimit && !ac.signal.aborted && !autopilotContinuable) {
+      if (willRunReviewer) {
+        // Artifact identity includes tracked files and branch name. Any automatic
+        // metadata write that can change those values must happen BEFORE the
+        // pending review gate is created, otherwise a PASS authorizes a stale
+        // artifact and the final fail-closed check blocks the turn.
+        if ((wroteFiles || project?.kind === 'design') && !opts.plan) {
+          try {
+            appendCheckpoint(cwd, {
+              summary: `${cur.input.slice(0, 200).trim()}${output ? `\n→ ${output.slice(0, 300).trim()}` : ''}`,
+              tags: project?.kind ? [project.kind] : [],
+            }, Date.now());
+            checkpointWrittenBeforeReview = true;
+          } catch { /* memory is best-effort */ }
+        }
+        if (isChat && this.gitService) {
+          const gs = this.gitService;
+          const fresh = this.store.getSession(session.id);
+          if (fresh && fresh.branch && fresh.codename && !fresh.branchRenamedAt) {
+            const userMessage = cur.input;
+            const assistantText = output;
+            const key = anthropicKey ?? this.providers?.getLocalKey('anthropic');
+            let slugOverride: string | undefined;
+            try {
+              const oauthToken = key ? undefined : (await resolveClaudeOAuthToken() ?? undefined);
+              if (key || oauthToken) {
+                const named = await generateSessionName({ userMessage, assistantText, apiKey: key, oauthToken });
+                if (named) {
+                  slugOverride = named.slug;
+                  try {
+                    const s2 = this.store.updateSession(session.id, { title: named.title.slice(0, 60) });
+                    this.emit('session', s2);
+                  } catch { /* session gone mid-flight */ }
+                }
+              }
+              await gs.renameSessionBranch(fresh, slugOverride);
+              await this.refreshGitAfterTurn(session.id);
+            } catch { /* best-effort; review gates the artifact we actually have */ }
+          }
+        }
+      }
+
+      if (reviewer !== 'off' && reviewerOn && !this.available(reviewer) && !main.hitLimit && !ac.signal.aborted && !autopilotContinuable) {
+        const artifactId = gitArtifactIdentity(cwd);
+        const gateScope: ReviewGateScope = { projectId: job.projectId, ...(session?.id ? { sessionId: session.id } : {}), jobId, artifactId };
+        this.store.failReviewGate(gateScope, `${ENGINE_LABEL[reviewer]} is unavailable — ${this.status(reviewer).reason}`);
+      }
+
+      if (willRunReviewer) {
         for (let round = 0; round < REVIEW_MAX_ROUNDS; round++) {
           cur = this.store.updateJob(jobId, { progress: 88, stage: `reviewer (${ENGINE_LABEL[reviewer]}) checking…` });
           this.emit('job', cur);
           const isDesign = project?.kind === 'design';
-          const reviewPrompt = isDesign
-            // Design genre: review it as a DESIGNER (craft), not a code reviewer.
-            ? `You are a senior product designer reviewing a live, self-contained design (\`design/index.html\`). The user asked:\n${cur.input}\n\nHere is what the agent produced:\n\n${changedFilesContext(allItems)}\n\nReview it as a DESIGN, not as code. Judge: visual hierarchy & layout, type scale & readability, colour palette & contrast (incl. accessibility), spacing & rhythm, responsiveness (does it hold up at phone width?), real vs placeholder content, interactive states & polish (hover/focus, shadows, motion), and overall craft — does it look genuinely premium and intentional, or templated/generic? Give each issue as a short, specific, actionable DESIGN fix. If it's genuinely strong, say so in one line. End with EXACTLY one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".`
-            : wroteFiles
-            ? `You are a senior code reviewer. The user asked:\n${cur.input}\n\nThe coding agent made these changes:\n\n${changedFilesContext(allItems)}\n\nReview ONLY for real problems — security vulnerabilities, broken or weak logic, and correctness bugs. List each as a short, specific, actionable finding (file + what's wrong). If it's solid, say so in one line. End with EXACTLY one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".`
-            : `You are the reviewer. Briefly review the result below for correctness and completeness (3-5 tight bullets), then end with exactly one line: "Verdict: APPROVED" or "Verdict: NEEDS WORK".\n\n## Task\n${cur.input}\n\n## Result\n${output.slice(0, 12000)}`;
-          let review: EngineRun;
-          try {
-            review = reviewer === 'claude'
-              ? await runClaude(reviewPrompt, cwd, 'fast', reviewerKey(), 3, {}, undefined, reviewerModel)
-              : await runCodex(reviewPrompt, cwd, {}, true, reviewerModel);
-          } catch (re) { if (re instanceof CancelledError) throw re; break; }
-          reviewVerdict = /verdict:\s*needs\s*work/i.test(review.text) ? 'needs-work' : 'approved';
-          const reviewItem: TranscriptItem = { kind: 'review', name: ENGINE_LABEL[reviewer], text: review.text, verdict: reviewVerdict, ts: Date.now() };
+          const transcriptContext = isDesign || wroteFiles ? changedFilesContext(allItems) : output.slice(0, 12000);
+          const reviewPrompt = buildStructuredReviewPrompt({
+            task: cur.input,
+            body: buildReviewArtifactBody(cwd, transcriptContext),
+            mode: isDesign ? 'design' : wroteFiles ? 'code' : 'result',
+          });
+          const artifactId = gitArtifactIdentity(cwd);
+          const gateScope: ReviewGateScope = { projectId: job.projectId, ...(session?.id ? { sessionId: session.id } : {}), jobId, artifactId };
+          const reviewResult = await executeReviewGate({
+            store: this.store,
+            scope: gateScope,
+            reviewerIdentity: `${ENGINE_LABEL[reviewer]}${reviewerModel ? `:${reviewerModel}` : ''}`,
+            prompt: reviewPrompt,
+            rethrowCancelled: true,
+            onGate: (gate) => this.emit('review-gate', gate),
+            runReviewer: (prompt) => reviewer === 'claude'
+              ? runClaude(prompt, cwd, 'fast', reviewerKey(), 3, {}, undefined, reviewerModel)
+              : runCodex(prompt, cwd, {}, true, reviewerModel),
+          });
+          const review = reviewResult.review;
+          reviewVerdict = reviewResult.verdict;
+          if (!review) break;
+          const reviewItem: TranscriptItem = {
+            kind: 'review',
+            name: ENGINE_LABEL[reviewer],
+            text: review.text,
+            verdict: reviewVerdict,
+            findings: reviewResult.gate.parsedResult?.findings ?? [],
+            ts: Date.now(),
+          };
           allItems.push(reviewItem);
           tokens += review.tokens; cost = Math.round((cost + review.cost) * 1000) / 1000;
           this.emit('job', this.store.updateJob(jobId, { transcript: allItems.slice(-400), tokens, cost, progress: 92 }));
@@ -4174,7 +4590,10 @@ export class LocalEngine {
           // Feed the findings back to the primary to fix — streamed live.
           cur = this.store.updateJob(jobId, { progress: 93, stage: 'fixing the reviewer’s findings…' });
           this.emit('job', cur);
-          const fixPrompt = isDesign
+          const reviewProjection = projectReviewGateForJob(reviewResult.gate);
+          const fixPrompt = reviewProjection
+            ? formatReviewContinuationPrompt(job.input, reviewProjection)
+            : isDesign
             ? `A senior designer reviewed your design and flagged improvements. Apply them now by EDITING \`design/index.html\` — make the design genuinely better (hierarchy, type, colour, spacing, responsiveness, polish). Don't re-explain — just improve the design.${DESIGN_DIRECTIVE}\n\nReviewer's notes:\n${review.text}`
             : `A code reviewer (${ENGINE_LABEL[reviewer]}) reviewed your changes and flagged issues. Fix them now, editing the files as needed. Don't re-explain — just make the corrections.\n\n${review.text}`;
           const fixHooks: RunHooks = { signal: ac.signal, onProgress: (_p, items, usage) => { const merged = [...allItems, ...items]; flush(proseOf(merged), merged, usage); }, onChild: (c) => { handle.child = c; } };
@@ -4197,6 +4616,36 @@ export class LocalEngine {
         }
       }
       settleStream(); // stream is over — no trailing frame may race the final states below
+
+      // Continuum: append a terse checkpoint link for turns that changed files (or
+      // any design turn) so the chain reflects real deltas, not chatter. This is a
+      // repository write, so it must happen BEFORE the final exact-artifact review
+      // gate check; otherwise the approved hash would be stale before push/PR gates.
+      if (!checkpointWrittenBeforeReview && (wroteFiles || project?.kind === 'design') && !opts.plan) {
+        try { appendCheckpoint(cwd, { summary: `${cur.input.slice(0, 200).trim()}${output ? `\n→ ${output.slice(0, 300).trim()}` : ''}`, tags: project?.kind ? [project.kind] : [] }, Date.now()); } catch { /* memory is best-effort */ }
+      }
+
+      if (reviewerOn && reviewer !== 'off' && !main.hitLimit && !ac.signal.aborted && !autopilotContinuable) {
+        const artifactId = gitArtifactIdentity(cwd);
+        const gateScope: ReviewGateScope = { projectId: job.projectId, ...(session?.id ? { sessionId: session.id } : {}), jobId, artifactId };
+        const gate = this.store.reviewGateCheck(gateScope, true);
+        if (!gate.allowed) {
+          const review = projectReviewGateCheckForJob(gate, gateScope, Date.now(), ENGINE_LABEL[reviewer]);
+          const failedClosed = review.status === 'failed-closed';
+          const gated = this.store.updateJob(jobId, {
+            status: 'gated', phase: failedClosed ? 'Review could not complete safely' : 'Review needs changes', progress: 100, stage: '',
+            output, tokens, cost, model, transcript: allItems.slice(-400),
+            review,
+            error: null,
+          });
+          this.running.delete(jobId);
+          if (isChat) this.store.touchSession(session.id);
+          this.emit('job', gated);
+          this.store.pushEvent({ kind: 'job-gated', title: failedClosed ? `Review could not complete safely: ${gated.title}` : `Reviewer needs work: ${gated.title}`, subtitle: review.summary, projectId: gated.projectId, jobId });
+          await this.autoCloseBrowserSession(session?.id ?? null);
+          return gated;
+        }
+      }
 
       const done = this.store.updateJob(jobId, {
         status: 'done', phase: 'Done', progress: 100, stage: '',
@@ -4222,9 +4671,8 @@ export class LocalEngine {
         // armed auto-continue fires — see limitPausedUntil above.
         pausedUntil: limitPausedUntil, pausedReason: limitPausedUntil ? 'limit' : null,
       });
-      this.running.delete(jobId);
-      // The session's active turn ended — release any turn parked behind it.
-      this.drainSessionRuns(job.sessionId);
+      // (session lease released + next turn drained by the wrapper's finally — the
+      //  TRUE terminal AFTER the awaited post-turn git below.)
       if (isChat) this.store.touchSession(session.id);
       this.emit('job', done);
       // Context dispatch settled? Claim its one report slot and fire the result
@@ -4240,11 +4688,14 @@ export class LocalEngine {
       //      staged / pushed during the turn, and the chat-header chip +
       //      contextual action are purely event-driven, so without this they'd
       //      sit stale until the 30s background poller catches up.
-      // Naming/rename fire once per session (gated by branchRenamedAt); the
-      // push + refresh run after EVERY chat turn. All fire-and-forget — a git
-      // or model hiccup never breaks the finished turn. The rename is owned by
-      // this pipeline (AI slug > deterministic slug), so the trailing refresh
-      // never re-runs it (no allowRename).
+      // Naming/rename fire once per session (gated by branchRenamedAt); the push +
+      // refresh run after EVERY chat turn. FENCED under the session lease: this git
+      // pipeline RENAMES the branch / PUSHES / mutates worktree status, so the lease
+      // must cover it — the next same-session turn cannot start until it settles. We
+      // capture it in `postTurnGit` and AWAIT it before returning (so the wrapper's
+      // finally releases the lease AFTER git); a git/model hiccup still never breaks
+      // the finished turn (errors are swallowed by the trailing refresh/catch).
+      let postTurnGit: Promise<unknown> = Promise.resolve();
       if (isChat && this.gitService) {
         const gs = this.gitService;
         const fresh = this.store.getSession(session.id);
@@ -4253,7 +4704,7 @@ export class LocalEngine {
           const userMessage = cur.input;
           const assistantText = output;
           const key = anthropicKey ?? this.providers?.getLocalKey('anthropic');
-          void (async () => {
+          postTurnGit = (async () => {
             let slugOverride: string | undefined;
             // Subscription sign-ins have NO raw API key — the naming call
             // silently never ran and every session kept the deterministic
@@ -4277,9 +4728,12 @@ export class LocalEngine {
         } else if (fresh) {
           // autoPushSession early-bails (disabled / no token / nothing new)
           // WITHOUT emitting status, so the refresh must run unconditionally.
-          void gs.autoPushSession(fresh).then(refresh, refresh);
+          postTurnGit = gs.autoPushSession(fresh).then(refresh, refresh);
         }
       }
+      // Hold the session lease until the branch rename/push actually settles (or a
+      // safety timeout) so no concurrent turn races the worktree/branch. Never throws.
+      await Promise.race([postTurnGit, new Promise((r) => { const t = setTimeout(r, POST_TURN_GIT_FENCE_MS); if (typeof t.unref === 'function') t.unref(); })]).catch(() => { /* git hiccup — lease still releases */ });
       // AskUserQuestion follow-up: if this chat turn ended on a question the user
       // hasn't answered (the SDK auto-dismisses it headless), arm a countdown that
       // auto-sends the recommended option after ASK_BASE_MS. The question card shows
@@ -4289,7 +4743,7 @@ export class LocalEngine {
       // wait shape, organized prompt built from the model's own outlined next items.
       if (isChat && !opts.plan && !ac.signal.aborted) {
         try {
-          const armedAsk = this.armAskFollowup(session.id, job.projectId, allItems, effort);
+          const armedAsk = armedAskBeforeReview || this.armAskFollowup(session.id, job.projectId, jobId, allItems, effort, opts);
           if (!armedAsk) {
             // Reuse the decision judgeKeepGoing already made BEFORE the reviewer
             // (autopilot-first gate above) — one Sonnet call per turn. Only
@@ -4312,6 +4766,7 @@ export class LocalEngine {
                 sessionId: session.id,
                 projectId: job.projectId,
                 effort,
+                intent: opts,
                 goalMode,
                 originalGoal: goalMode ? cur.input : undefined,
                 sourceJobId: jobId,
@@ -4333,10 +4788,7 @@ export class LocalEngine {
       } else {
         try { this.store.resetRetryCounter(retryKeyFor({ sessionId: undefined, jobId })); } catch { /* best-effort */ }
       }
-      // Continuum: append a terse checkpoint link for turns that changed files (or
-      // any design turn) so the chain reflects real deltas, not chatter.
       if ((wroteFiles || project?.kind === 'design') && !opts.plan) {
-        try { appendCheckpoint(cwd, { summary: `${cur.input.slice(0, 200).trim()}${output ? `\n→ ${output.slice(0, 300).trim()}` : ''}`, tags: project?.kind ? [project.kind] : [] }, Date.now()); } catch { /* memory is best-effort */ }
         // Mirror the fresh checkpoint into the memory repository (debounced).
         try { this.memorySync?.scheduleSync(job.projectId); } catch { /* best-effort */ }
       }
@@ -4395,19 +4847,21 @@ export class LocalEngine {
       return done;
     } catch (e) {
       settleStream();
-      this.running.delete(jobId);
-      // The session's active turn ended (cancel/steer-interrupt/failure) — release
-      // any turn parked behind it so the session doesn't stall.
-      this.drainSessionRuns(job.sessionId);
       // Same tidy-up on cancel/failure: a stopped or crashed browser job shouldn't
-      // strand an agent-opened window. The retry path (if any) reopens on its own.
-      void this.autoCloseBrowserSession(this.store.getJob(jobId)?.sessionId ?? null);
-      // The turn ended unhappily (cancel / steer-interrupt / failure) but the
-      // agent may have ALREADY committed or pushed before it did. The success
-      // path refreshes git-status; mirror that here so the chip + contextual
-      // action advance instead of staying stuck on "Uncommitted" until the 30s
-      // poller catches up. No auto-rename on a non-success turn. Best-effort.
-      this.refreshGitAfterTurn(this.store.getJob(jobId)?.sessionId);
+      // strand an agent-opened window. FENCED under the lease (AWAITED before this catch
+      // returns, so the wrapper's finally releases only after cleanup) — otherwise the
+      // next same-session turn could start while this mutates the shared browser session.
+      const cleanupSession = this.store.getJob(jobId)?.sessionId ?? null;
+      await this.autoCloseBrowserSession(cleanupSession);
+      // The turn ended unhappily (cancel / steer-interrupt / failure) but the agent may
+      // have ALREADY committed or pushed before it did. Mirror the success-path git
+      // refresh so the chip advances — and FENCE it under the lease (git mutates the
+      // branch/worktree) with the same safety timeout the success path uses, so a hung
+      // git op can't stall the session's next turn forever. No auto-rename on failure.
+      await Promise.race([
+        this.refreshGitAfterTurn(cleanupSession ?? undefined),
+        new Promise<void>((r) => { const t = setTimeout(r, POST_TURN_GIT_FENCE_MS); if (typeof (t as { unref?: () => void }).unref === 'function') (t as { unref: () => void }).unref(); }),
+      ]).catch(() => { /* git hiccup — lease still releases */ });
       if (e instanceof CancelledError || ac.signal.aborted) {
         const existing = this.store.getJob(jobId);
         if (existing && existing.status !== 'cancelled') {
@@ -4465,6 +4919,7 @@ export class LocalEngine {
       if (!retryArmed) reportDispatchIfAny({ store: this.store, engine: this, emit: (n, d) => this.emit(n, d) }, jobId, 'failed', failed.error ?? errMsg);
       return failed;
     }
+    }); // end runWithSessionLease(execute) — the lease is released in its finally
   }
 
   /** A chat turn just ended (success, cancel, or failure) — the agent may have
@@ -4480,20 +4935,22 @@ export class LocalEngine {
       against the freshest session so the emitted status carries the renamed
       branch. Fire-and-forget; every git op is best-effort and a no-op for
       non-chat / non-repo / branch-less sessions. */
-  private refreshGitAfterTurn(sessionId: string | undefined, opts: { allowRename?: boolean } = {}): void {
+  private async refreshGitAfterTurn(sessionId: string | undefined, opts: { allowRename?: boolean } = {}): Promise<void> {
     const git = this.gitService;
     if (!git || !sessionId) return;
     const fresh = this.store.getSession(sessionId);
     if (!fresh || !fresh.branch) return;
-    const refresh = () => {
+    const refresh = async (): Promise<void> => {
       const f2 = this.store.getSession(sessionId);
-      if (f2) void git.fullStatus(f2, { withPr: false }).catch(() => { /* best effort */ });
+      if (f2) await git.fullStatus(f2, { withPr: false }).catch(() => { /* best effort */ });
     };
+    // AWAIT the git work (returns a Promise now) so callers holding the session lease can
+    // FENCE it — the next same-session turn must not start while this mutates the branch.
     if (opts.allowRename && fresh.codename && !fresh.branchRenamedAt) {
       // renameSessionBranch gates its own no-op cases; refresh either way.
-      void git.renameSessionBranch(fresh).then(refresh, refresh);
+      await git.renameSessionBranch(fresh).then(refresh, refresh);
     } else {
-      refresh();
+      await refresh();
     }
   }
 }

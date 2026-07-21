@@ -23,7 +23,8 @@ export type IconName =
   | 'jobs' | 'bell' | 'search' | 'command' | 'plus' | 'calendar' | 'clock'
   | 'telescope' | 'checkCircle' | 'xCircle' | 'more' | 'chevronRight' | 'chevronDown'
   | 'gitMerge' | 'send' | 'settings' | 'x' | 'clapper' | 'sliders' | 'dollar'
-  | 'refresh' | 'image' | 'play' | 'pause' | 'camera' | 'chat' | 'bookmark' | 'terminal' | 'file';
+  | 'refresh' | 'image' | 'play' | 'pause' | 'camera' | 'chat' | 'bookmark' | 'terminal' | 'file'
+  | 'alert' | 'monitor';
 
 const PATHS: Record<IconName, React.ReactElement> = {
   check: <Polyline points="20 6 9 17 4 12" />,
@@ -70,6 +71,8 @@ const PATHS: Record<IconName, React.ReactElement> = {
   bookmark: <Path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2Z" />,
   terminal: <><Polyline points="4 17 10 11 4 5" /><Line x1="12" y1="19" x2="20" y2="19" /></>,
   file: <><Path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" /><Polyline points="14 2 14 8 20 8" /></>,
+  alert: <><Path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" /><Line x1="12" y1="9" x2="12" y2="13" /><Line x1="12" y1="17" x2="12.01" y2="17" /></>,
+  monitor: <><Rect x="2" y="4" width="20" height="13" rx="2" /><Line x1="8" y1="21" x2="16" y2="21" /><Line x1="12" y1="17" x2="12" y2="21" /></>,
 };
 
 export function Icon({

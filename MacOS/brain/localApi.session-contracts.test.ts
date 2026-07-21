@@ -149,6 +149,34 @@ describe('createAndRunJob — returns a job handle promptly (async run)', () => 
   });
 });
 
+describe('reconnectWhatsApp — explicit non-QR reconnect contract', () => {
+  beforeEach(() => rmSync(hoisted.dir, { recursive: true, force: true }));
+
+  it('dispatches to the WhatsApp reconnect method and returns only ok', async () => {
+    const s = new Store();
+    const emit = vi.fn();
+    const whatsapp = { reconnect: vi.fn(async () => ({ ok: true })) };
+    const stub = {} as never;
+    const dispatch = createDispatch(s, stub, stub, stub, stub, stub, whatsapp as never, stub, emit);
+
+    const r = await dispatch('reconnectWhatsApp', {});
+
+    expect(whatsapp.reconnect).toHaveBeenCalledOnce();
+    expect(r).toEqual({ ok: true });
+  });
+
+  it('surfaces typed reconnect failures without converting them to ok', async () => {
+    const s = new Store();
+    const emit = vi.fn();
+    const err = Object.assign(new Error('WhatsApp is not linked'), { code: 'WA_NOT_LINKED', statusCode: 409 });
+    const whatsapp = { reconnect: vi.fn(async () => { throw err; }) };
+    const stub = {} as never;
+    const dispatch = createDispatch(s, stub, stub, stub, stub, stub, whatsapp as never, stub, emit);
+
+    await expect(dispatch('reconnectWhatsApp', {})).rejects.toMatchObject({ code: 'WA_NOT_LINKED', statusCode: 409 });
+  });
+});
+
 describe('sendChat — prompt/message aliases for text', () => {
   beforeEach(() => rmSync(hoisted.dir, { recursive: true, force: true }));
 

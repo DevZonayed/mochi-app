@@ -14,7 +14,7 @@ import { pathForNav } from '../lib/routes';
 import {
   APP_W, APP_H, useAppScale, useTheme, TrafficLights, Sidebar, Toolbar,
 } from '../lib/appShell';
-import { Icon, OpenAIGlyph, type IconName } from '../lib/icons';
+import { Icon, type IconName } from '../lib/icons';
 import { api, type Approval, type ApprovalKind, type Project } from '../lib/api';
 
 /* ───────────────────────── page-specific CSS (from Approvals Center.html) ───────────────────────── */
@@ -118,9 +118,9 @@ function buildDetail(type: keyof typeof GATE_TYPE, a: Approval): GateDetailData 
   const text = a.detail || a.subtitle || '';
   switch (type) {
     case 'budget':
-      return { need: 0, cap: 0, spent: 0, run: a.title } as BudgetDetailData;
+      return { need: Number.NaN, cap: Number.NaN, spent: Number.NaN, run: a.title } as BudgetDetailData;
     case 'merge':
-      return { pr: 0, files: 0, add: 0, del: 0, verdict: 'clear', findings: text } as MergeDetailData;
+      return { pr: Number.NaN, files: Number.NaN, add: Number.NaN, del: Number.NaN, verdict: '—', findings: text } as MergeDetailData;
     case 'skill':
       return { skill: a.title, ver: '—', publisher: a.subtitle || '—', caps: [] } as SkillDetailData;
     case 'publish':
@@ -258,17 +258,23 @@ function PlanDetail({ d }: { d: PlanDetailData }) {
     <Card pad={0}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '16px 20px', borderBottom: '0.5px solid var(--separator)' }}>
         <span style={{ font: '700 var(--fs-headline)/1.1 var(--font-text)', color: 'var(--ink)', flex: 1 }}>{d.title}</span>
-        <Badge icon="gauge" tint="var(--blue)">PLANNED AT {d.effort}</Badge>
+        {d.effort !== '—' && <Badge icon="gauge" tint="var(--blue)">PLANNED AT {d.effort}</Badge>}
       </div>
       <div>
-        {d.steps.map((s, i) => (
+        {d.steps.length === 0 ? (
+          <div style={{ padding: '12px 20px', font: '500 var(--fs-callout)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>No plan details supplied.</div>
+        ) : d.steps.map((s, i) => (
           <div key={i} style={{ display: 'flex', gap: 12, padding: '12px 20px', borderBottom: i < d.steps.length - 1 ? '0.5px solid var(--separator)' : 'none' }}>
             <span style={{ width: 24, height: 24, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', background: 'var(--fill-secondary)', color: 'var(--ink-secondary)', font: '700 var(--fs-caption)/1 var(--font-mono)' }}>{i + 1}</span>
             <span style={{ font: '500 var(--fs-callout)/1.4 var(--font-text)', color: 'var(--ink)' }}>{s}</span>
           </div>
         ))}
       </div>
-      <div style={{ padding: '13px 20px', background: 'var(--fill-tertiary)', font: '600 var(--fs-subhead)/1 var(--font-mono)', color: 'var(--ink)' }}>≈ ${d.cost} · ~{d.mins} min</div>
+      {(d.cost !== '—' || d.mins !== '—') && (
+        <div style={{ padding: '13px 20px', background: 'var(--fill-tertiary)', font: '600 var(--fs-subhead)/1 var(--font-mono)', color: 'var(--ink)' }}>
+          {d.cost !== '—' ? `$${d.cost}` : '—'}{d.mins !== '—' ? ` · ${d.mins} min` : ''}
+        </div>
+      )}
     </Card>
   );
 }
@@ -306,20 +312,18 @@ function MergeDetail({ d }: { d: MergeDetailData }) {
   return (
     <Card>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 16 }}>
-        <div style={{ font: '600 var(--fs-headline)/1 var(--font-mono)', color: 'var(--ink)' }}>PR #{d.pr}</div>
-        <span style={{ font: '600 var(--fs-callout)/1 var(--font-mono)', color: 'var(--green)' }}>+{d.add}</span>
-        <span style={{ font: '600 var(--fs-callout)/1 var(--font-mono)', color: 'var(--red)' }}>−{d.del}</span>
-        <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{d.files} files</span>
+        <div style={{ font: '600 var(--fs-headline)/1 var(--font-mono)', color: 'var(--ink)' }}>{Number.isFinite(d.pr) ? `PR #${d.pr}` : 'PR —'}</div>
+        {Number.isFinite(d.add) && <span style={{ font: '600 var(--fs-callout)/1 var(--font-mono)', color: 'var(--green)' }}>+{d.add}</span>}
+        {Number.isFinite(d.del) && <span style={{ font: '600 var(--fs-callout)/1 var(--font-mono)', color: 'var(--red)' }}>−{d.del}</span>}
+        {Number.isFinite(d.files) && <span style={{ font: '500 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>{d.files} files</span>}
         <span style={{ flex: 1 }} />
         <a onClick={(e) => { e.preventDefault(); navigate('/plan-diff-gate'); }} href="/plan-diff-gate" className="link-btn" style={{ font: '600 var(--fs-footnote)/1 var(--font-text)', color: 'var(--blue)', textDecoration: 'none', cursor: 'pointer' }}>Open full diff →</a>
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '13px 14px', borderRadius: 12, background: 'rgba(52,199,89,0.10)', border: '0.5px solid rgba(52,199,89,0.3)' }}>
-        <span style={{ width: 30, height: 30, borderRadius: 8, display: 'grid', placeItems: 'center', background: 'var(--bg-elevated)', color: 'var(--ink-secondary)' }}><OpenAIGlyph size={17} /></span>
+      <div style={{ padding: '13px 14px', borderRadius: 12, background: 'var(--fill-tertiary)', border: '0.5px solid var(--separator)' }}>
         <div style={{ flex: 1 }}>
-          <div style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>Reviewer: all clear</div>
-          <div style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{d.findings}</div>
+          <div style={{ font: '600 var(--fs-subhead)/1.2 var(--font-text)', color: 'var(--ink)' }}>Review result unavailable</div>
+          <div style={{ font: '400 var(--fs-footnote)/1.3 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>{d.findings || '—'}</div>
         </div>
-        <Badge icon="shield" tint="var(--green)">3/3 judges</Badge>
       </div>
     </Card>
   );
@@ -331,18 +335,14 @@ function BudgetDetail({ d, onRaise }: { d: BudgetDetailData; onRaise: () => void
     <Card>
       <div style={{ textAlign: 'center', padding: '8px 0 20px' }}>
         <div style={{ font: '400 var(--fs-callout)/1 var(--font-text)', color: 'var(--ink-secondary)', marginBottom: 10 }}>This run needs</div>
-        <div style={{ font: '700 56px/1 var(--font-mono)', letterSpacing: '-0.02em', color: 'var(--orange)' }}>+${d.need.toFixed(2)}</div>
-        <div style={{ font: '500 var(--fs-callout)/1 var(--font-mono)', color: 'var(--ink-tertiary)', marginTop: 10 }}>${d.spent.toFixed(2)} spent of ${d.cap} cap · “{d.run}”</div>
+        <div style={{ font: '700 56px/1 var(--font-mono)', letterSpacing: '-0.02em', color: 'var(--orange)' }}>{Number.isFinite(d.need) ? `+$${d.need.toFixed(2)}` : '—'}</div>
+        <div style={{ font: '500 var(--fs-callout)/1 var(--font-mono)', color: 'var(--ink-tertiary)', marginTop: 10 }}>
+          {Number.isFinite(d.spent) && Number.isFinite(d.cap) ? `$${d.spent.toFixed(2)} spent of $${d.cap} cap` : 'Budget details unavailable'} · “{d.run}”
+        </div>
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
         <button onClick={onRaise} className="budget-opt primary" style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '13px 16px', borderRadius: 12, background: 'var(--blue)', color: '#fff', textAlign: 'left', boxShadow: '0 6px 16px rgba(0,122,255,0.28)' }}>
-          <Icon name="gauge" size={18} /><span style={{ flex: 1, font: '600 var(--fs-callout)/1.2 var(--font-text)' }}>Raise cap to $60</span><Icon name="chevronRight" size={16} />
-        </button>
-        <button className="budget-opt" style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '13px 16px', borderRadius: 12, background: 'var(--fill-secondary)', color: 'var(--ink)', textAlign: 'left' }}>
-          <Icon name="cpu" size={18} style={{ color: 'var(--ink-secondary)' }} /><span style={{ flex: 1, font: '600 var(--fs-callout)/1.2 var(--font-text)' }}>Downgrade model <span style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>· finishes within cap</span></span>
-        </button>
-        <button className="budget-opt" style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '13px 16px', borderRadius: 12, background: 'transparent', color: 'var(--red)', textAlign: 'left', border: '0.5px solid var(--separator)' }}>
-          <Icon name="x" size={18} /><span style={{ flex: 1, font: '600 var(--fs-callout)/1.2 var(--font-text)' }}>Abort run</span>
+          <Icon name="gauge" size={18} /><span style={{ flex: 1, font: '600 var(--fs-callout)/1.2 var(--font-text)' }}>Approve budget request</span><Icon name="chevronRight" size={16} />
         </button>
       </div>
     </Card>
@@ -513,11 +513,11 @@ function RaiseSheet({ onClose, onConfirm }: { onClose: () => void; onConfirm: ()
       <div onMouseDown={e => e.stopPropagation()} className="sheet-pop" style={{ width: 400, textAlign: 'center', background: 'var(--bg-elevated)', borderRadius: 18,
         border: '0.5px solid var(--glass-border)', boxShadow: '0 40px 100px rgba(10,15,40,0.5)', padding: '26px 24px 20px' }}>
         <span style={{ display: 'inline-grid', placeItems: 'center', width: 50, height: 50, borderRadius: '50%', background: 'rgba(255,149,0,0.14)', color: 'var(--orange)', marginBottom: 15 }}><Icon name="gauge" size={25} /></span>
-        <h2 style={{ margin: '0 0 8px', font: '700 var(--fs-title2)/1.2 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Raise this project’s cap to $60?</h2>
-        <p style={{ margin: '0 0 20px', font: '400 var(--fs-subhead)/1.45 var(--font-text)', color: 'var(--ink-secondary)', textWrap: 'pretty' }}>Market Scan’s monthly ceiling goes from $50 to $60. The run continues immediately.</p>
+        <h2 style={{ margin: '0 0 8px', font: '700 var(--fs-title2)/1.2 var(--font-display)', letterSpacing: '-0.01em', color: 'var(--ink)' }}>Approve this budget request?</h2>
+        <p style={{ margin: '0 0 20px', font: '400 var(--fs-subhead)/1.45 var(--font-text)', color: 'var(--ink-secondary)', textWrap: 'pretty' }}>Only the approval record supplied by the backend will be resolved.</p>
         <div style={{ display: 'flex', gap: 10 }}>
           <button onClick={onClose} style={{ flex: 1, height: 44, borderRadius: 'var(--r-pill)', background: 'var(--fill-secondary)', color: 'var(--ink)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Cancel</button>
-          <button onClick={onConfirm} className="primary-cta" style={{ flex: 1, height: 44, borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Raise &amp; approve</button>
+          <button onClick={onConfirm} className="primary-cta" style={{ flex: 1, height: 44, borderRadius: 'var(--r-pill)', background: 'var(--blue)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)', boxShadow: '0 6px 18px rgba(0,122,255,0.3)' }}>Approve</button>
         </div>
       </div>
     </div>

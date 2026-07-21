@@ -22,7 +22,7 @@ import { sAdd, sRem, sMembers, sCard, setNxEx } from './redis.js';
     link the right session chat (or Approvals when no session applies). Keep
     small — Expo caps push data at 4KB. */
 export interface PushNavData {
-  kind: 'job-done' | 'job-failed' | 'approval' | 'schedule-late';
+  kind: 'job-done' | 'job-failed' | 'job-gated' | 'approval' | 'schedule-late';
   hostId?: string;          // so the phone can switch active host on tap
   projectId?: string;
   sessionId?: string;
@@ -137,7 +137,8 @@ export async function sendExpoPush(
 
 /* ── Event → push mapping (matches the phone's in-app LiveNotifier) ───── */
 
-interface JobEvent  { id?: string; status?: string; title?: string; projectId?: string; sessionId?: string }
+interface JobReviewProjection { summary?: string; findings?: unknown[]; status?: 'needs-work' | 'failed-closed' }
+interface JobEvent  { id?: string; status?: string; title?: string; projectId?: string; sessionId?: string; review?: JobReviewProjection }
 interface ApprovalEvent { id?: string; status?: string; title?: string; projectId?: string | null; jobId?: string | null; sessionId?: string }
 interface ScheduleLateEvent { id?: string; title?: string; firedAt?: number; projectId?: string; sessionId?: string }
 
@@ -177,6 +178,12 @@ export async function maybePush(
       body  = j.title || 'A run failed on your Mac.';
       nav   = { kind: 'job-failed', ...base };
       dedupe = `job:${j.id}:failed`;
+    } else if (j.status === 'gated') {
+      const count = Array.isArray(j.review?.findings) ? j.review.findings.length : 0;
+      title = j.review?.status === 'failed-closed' ? 'Review needs attention' : 'Reviewer needs work';
+      body  = j.review?.summary ? `${j.review.summary}${count ? ` (${count} finding${count === 1 ? '' : 's'})` : ''}` : (j.title || 'A reviewer asked for changes.');
+      nav   = { kind: 'job-gated', ...base };
+      dedupe = `job:${j.id}:gated`;
     } else {
       return false; // other statuses (running/queued/…) aren't alert-worthy
     }

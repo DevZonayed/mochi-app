@@ -1,0 +1,15 @@
+**
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!apps/
+!apps/server/
+!apps/server/package.json
+!apps/server/tsconfig.json
+!apps/server/src/
+!apps/server/src/**
+!apps/server/registry/
+!apps/server/registry/**
+!packages/
+!packages/realtime/
+!packages/realtime/**

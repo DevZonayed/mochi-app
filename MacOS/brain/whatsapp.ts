@@ -12,7 +12,7 @@
 import { app, powerMonitor } from 'electron';
 import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
-import type { Store } from './store.js';
+import { DEFAULT_WHATSAPP_STATE, type Store } from './store.js';
 import type { WaChatKind, WaStoredMessage, WaMediaRef } from './wa-store.js';
 import { flushSummaries } from './whatsapp-analyze.js';
 
@@ -228,7 +228,56 @@ export interface WaSocket {
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
-export type LinkResult = { method: 'qr'; dataUrl: string } | { method: 'pairing'; code: string };
+export type LinkResult = { method: 'qr'; dataUrl: string } | { method: 'pairing'; code: string } | { method: 'connected' };
+type PendingLinkReason = 'paused' | 'unlinked' | 'reconnect' | 'replaced' | 'stale' | 'timeout';
+type PendingLink = {
+  id: number;
+  generation: number;
+  qrSeq: number;
+  resolve: (r: LinkResult) => void;
+  reject: (err: Error) => void;
+  timeout: ReturnType<typeof setTimeout> | null;
+};
+
+class WhatsAppLinkError extends Error {
+  code = 'WA_LINK_CANCELLED';
+  statusCode = 409;
+  mcpPublic = true;
+  constructor(public reason: PendingLinkReason) {
+    super(reason === 'timeout' ? 'WhatsApp link timed out' : `WhatsApp link cancelled: ${reason}`);
+    this.name = 'WhatsAppLinkError';
+  }
+}
+
+class WhatsAppUnlinkInProgressError extends Error {
+  code = 'WA_UNLINK_IN_PROGRESS';
+  statusCode = 409;
+  mcpPublic = true;
+  constructor() {
+    super('WhatsApp unlink is in progress');
+    this.name = 'WhatsAppUnlinkInProgressError';
+  }
+}
+
+class WhatsAppNotLinkedError extends Error {
+  code = 'WA_NOT_LINKED';
+  statusCode = 409;
+  mcpPublic = true;
+  constructor() {
+    super('WhatsApp is not linked');
+    this.name = 'WhatsAppNotLinkedError';
+  }
+}
+
+class WhatsAppAlreadyLinkedError extends Error {
+  code = 'WA_ALREADY_LINKED';
+  statusCode = 409;
+  mcpPublic = true;
+  constructor() {
+    super('WhatsApp is already linked; use reconnect');
+    this.name = 'WhatsAppAlreadyLinkedError';
+  }
+}
 
 interface WaDeps {
   makeSocket?: (authDir: string) => Promise<WaSocket>;
@@ -242,10 +291,9 @@ interface WaDeps {
 
 // Permanent-failure close codes that must NOT auto-reconnect (adapted from the
 // plugin): loggedOut, connectionReplaced, badSession.
-const NO_RECONNECT = new Set([401, 440, 500]);
-const MAX_RECONNECTS = 5;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
+const RECONNECT_SLOW_MS = 5 * 60_000;
 // In-memory contact cache cap (Map insertion order = LRU when re-set). A typical
 // WhatsApp account has ~500-2000 contacts; an active operator with chats inside
 // many groups can rack up tens of thousands of *participants* over a session,
@@ -257,15 +305,36 @@ export class WhatsAppClient {
   private sock: WaSocket | null = null;
   private wantConnected = false;
   private reconnects = 0;
+  private generation = 0;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private connecting: Promise<void> | null = null;
+  private connectingGeneration = 0;
+  private connectQueued = false;
+  private lifecycleSuspended = false;
   private lastQr: string | null = null;
-  private pendingQr: ((r: LinkResult) => void) | null = null;
+  private pendingLink: PendingLink | null = null;
+  private nextLinkId = 0;
+  private qrSeq = 0;
+  private unlinking: Promise<void> | null = null;
+  private unlinkInProgress = false;
   /** jid → contact display name, learned from contacts.upsert / history sync. */
   private contacts = new Map<string, string>();
 
   constructor(private store: Store, private emit: (name: string, data: unknown) => void, private deps: WaDeps = {}) {
     try {
-      powerMonitor.on('resume', () => { if (this.wantConnected && !this.sock) void this.connect().catch(() => {}); });
-      powerMonitor.on('suspend', () => { this.releaseSocket(); });
+      powerMonitor.on('resume', () => {
+        this.lifecycleSuspended = false;
+        this.rearmPendingLinkTimeout();
+        if (!this.wantConnected || this.sock) return;
+        void (this.pendingLink ? this.connect() : this.reconnect()).catch(() => {});
+      });
+      powerMonitor.on('suspend', () => {
+        this.lifecycleSuspended = true;
+        this.clearRetry();
+        this.pausePendingLinkTimeout();
+        this.generation++;
+        this.releaseSocket();
+      });
     } catch { /* powerMonitor absent (tests) */ }
   }
 
@@ -281,6 +350,95 @@ export class WhatsAppClient {
     } catch { /* mock sockets may not be EventEmitters */ }
     try { this.sock?.end?.(); } catch { /* already dead */ }
     this.sock = null;
+  }
+
+  private clearRetry(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
+  private assertNotUnlinking(): void {
+    if (this.unlinkInProgress) throw new WhatsAppUnlinkInProgressError();
+  }
+
+  private isCurrentLink(pending: PendingLink): boolean {
+    return this.pendingLink === pending && pending.generation === this.generation;
+  }
+
+  private createPendingLink(): { pending: PendingLink; promise: Promise<LinkResult> } {
+    this.cancelPendingLink('replaced');
+    this.lastQr = null;
+    const id = ++this.nextLinkId;
+    const pending = {} as PendingLink;
+    const promise = new Promise<LinkResult>((resolve, reject) => {
+      Object.assign(pending, {
+        id,
+        generation: this.generation,
+        qrSeq: this.qrSeq,
+        resolve,
+        reject,
+        timeout: setTimeout(() => {
+          if (this.pendingLink === pending) this.cancelPendingLink('timeout');
+        }, 60_000),
+      });
+    });
+    this.pendingLink = pending;
+    return { pending, promise };
+  }
+
+  private rearmPendingLinkTimeout(): void {
+    const pending = this.pendingLink;
+    if (!pending) return;
+    if (pending.timeout) clearTimeout(pending.timeout);
+    pending.timeout = setTimeout(() => {
+      if (this.pendingLink === pending) this.cancelPendingLink('timeout');
+    }, 60_000);
+  }
+
+  private pausePendingLinkTimeout(): void {
+    const pending = this.pendingLink;
+    if (!pending?.timeout) return;
+    clearTimeout(pending.timeout);
+    pending.timeout = null;
+  }
+
+  private settlePendingLink(result: LinkResult): void {
+    const pending = this.pendingLink;
+    if (!pending) return;
+    this.pendingLink = null;
+    if (pending.timeout) clearTimeout(pending.timeout);
+    pending.resolve(result);
+  }
+
+  private cancelPendingLink(reason: PendingLinkReason): void {
+    const pending = this.pendingLink;
+    if (!pending) return;
+    this.pendingLink = null;
+    if (pending.timeout) clearTimeout(pending.timeout);
+    pending.reject(new WhatsAppLinkError(reason));
+  }
+
+  private retryDelay(attempt: number): number {
+    if (attempt <= 0) return RECONNECT_BASE_MS;
+    if (attempt <= 6) return Math.min(RECONNECT_BASE_MS * 2 ** (attempt - 1), RECONNECT_MAX_MS);
+    return RECONNECT_SLOW_MS;
+  }
+
+  private scheduleRetry(code: number | null): void {
+    if (!this.wantConnected || this.lifecycleSuspended) return;
+    this.clearRetry();
+    const attempt = this.reconnects + 1;
+    const delay = this.retryDelay(attempt);
+    const gen = this.generation;
+    const nextRetryAt = Date.now() + delay;
+    this.store.setWhatsappState({ connected: false, status: 'retrying', lastDisconnectCode: code, nextRetryAt, retryAttempt: attempt, connectedAt: null });
+    this.emit('comms', this.store.commsStatus());
+    this.retryTimer = setTimeout(() => {
+      if (gen !== this.generation || !this.wantConnected || this.sock) return;
+      this.retryTimer = null;
+      this.reconnects = attempt;
+      void this.connect().catch(() => this.scheduleRetry(code));
+    }, delay);
   }
 
   status() { return this.store.whatsappState(); }
@@ -441,11 +599,27 @@ export class WhatsAppClient {
 
   /** Open the socket (mock-injectable) and wire capture + lifecycle. */
   async connect(): Promise<void> {
+    this.assertNotUnlinking();
+    if (this.lifecycleSuspended) return;
     if (this.sock) return;
+    if (this.connecting) {
+      if (this.connectingGeneration !== this.generation) this.connectQueued = true;
+      return this.connecting;
+    }
     this.wantConnected = true;
-    const make = this.deps.makeSocket ?? ((authDir: string) => this.realMakeSocket(authDir));
-    const sock = await make(this.authDir());
-    this.sock = sock;
+    this.clearRetry();
+    const gen = ++this.generation;
+    this.connectingGeneration = gen;
+    if (this.pendingLink) this.pendingLink.generation = gen;
+    this.store.setWhatsappState({ connected: false, status: 'connecting', nextRetryAt: null, connectedAt: null });
+    const run = (async () => {
+      const make = this.deps.makeSocket ?? ((authDir: string) => this.realMakeSocket(authDir));
+      const sock = await make(this.authDir());
+      if (gen !== this.generation || !this.wantConnected || this.lifecycleSuspended) {
+        try { sock.end?.(); } catch { /* stale socket */ }
+        return;
+      }
+      this.sock = sock;
     const guard = (fn: () => void) => { try { fn(); } catch { /* one bad event can't stop capture */ } };
     sock.ev.on('messages.upsert', (payload: { messages?: Raw[]; type?: string }) => {
       for (const raw of payload?.messages ?? []) guard(() => this.ingest(raw));
@@ -457,23 +631,51 @@ export class WhatsAppClient {
     sock.ev.on('contacts.update', (cs: ContactRec[]) => guard(() => { for (const c of cs ?? []) this.ingestContact(c); }));
     sock.ev.on('messages.update', (u: Array<{ key?: { remoteJid?: string; id?: string }; update?: { status?: number } }>) => guard(() => this.ingestMessageUpdates(u)));
     sock.ev.on('messages.reaction', (r: Array<{ key?: { remoteJid?: string; id?: string }; reaction?: { text?: string; key?: { fromMe?: boolean } } }>) => guard(() => this.ingestReactions(r)));
-    sock.ev.on('connection.update', (u: { connection?: string; qr?: string; lastDisconnect?: { error?: { output?: { statusCode?: number } } } }) => this.onConnectionUpdate(u));
+      sock.ev.on('connection.update', (u: { connection?: string; qr?: string; lastDisconnect?: { error?: { output?: { statusCode?: number } } } }) => this.onConnectionUpdate(sock, gen, u));
+    })();
+    this.connecting = run;
+    try { await run; }
+    catch (err) {
+      if (gen === this.generation && this.wantConnected && !this.lifecycleSuspended) this.scheduleRetry(null);
+      throw err;
+    } finally {
+      if (this.connecting === run) {
+        this.connecting = null;
+        this.connectingGeneration = 0;
+        if (this.connectQueued && this.wantConnected && !this.sock && !this.lifecycleSuspended) {
+          this.connectQueued = false;
+          void this.connect().catch(() => {});
+        } else {
+          this.connectQueued = false;
+        }
+      }
+    }
   }
 
   /** Begin linking: returns a QR data-URL (default) or a pairing code (if phone
       given). The UI shows it; scanning flips the account to connected via the
       connection.update 'open' event. */
   async link(opts: { phone?: string } = {}): Promise<LinkResult> {
-    await this.connect();
-    if (opts.phone && this.sock?.requestPairingCode) {
-      const code = await this.sock.requestPairingCode(opts.phone.replace(/[^0-9]/g, ''));
-      return { method: 'pairing', code };
-    }
-    if (this.lastQr) return { method: 'qr', dataUrl: this.lastQr };
-    return await new Promise<LinkResult>((resolve, reject) => {
-      this.pendingQr = resolve;
-      setTimeout(() => { if (this.pendingQr) { this.pendingQr = null; reject(Object.assign(new Error('QR not emitted in time'), { statusCode: 504 })); } }, 60_000);
-    });
+    this.assertNotUnlinking();
+    const st = this.store.whatsappState();
+    if (st.linkedAt != null) throw new WhatsAppAlreadyLinkedError();
+    const owned = this.createPendingLink();
+    void (async () => {
+      try {
+        await this.connect();
+        if (this.pendingLink === owned.pending) owned.pending.generation = this.generation;
+        if (!this.isCurrentLink(owned.pending)) return;
+        if (opts.phone && this.sock?.requestPairingCode) {
+          const code = await this.sock.requestPairingCode(opts.phone.replace(/[^0-9]/g, ''));
+          if (this.isCurrentLink(owned.pending)) this.settlePendingLink({ method: 'pairing', code });
+          return;
+        }
+        if (this.lastQr && this.isCurrentLink(owned.pending)) this.settlePendingLink({ method: 'qr', dataUrl: this.lastQr });
+      } catch {
+        if (this.pendingLink === owned.pending && !this.wantConnected) this.cancelPendingLink('stale');
+      }
+    })();
+    return owned.promise;
   }
 
   /** Send a message to the operator's notify destination — their configured personal
@@ -593,38 +795,79 @@ export class WhatsAppClient {
 
   /** Reconnect on boot if a number was previously linked. */
   resumeOnBoot(): void {
-    if (this.store.whatsappState().linkedAt != null) { this.wantConnected = true; void this.connect().catch(() => {}); }
+    const st = this.store.whatsappState();
+    if (st.linkedAt == null || st.status === 'paused') return;
+    this.wantConnected = true;
+    this.store.setWhatsappState({ connected: false, status: 'retrying', connectedAt: null, nextRetryAt: null });
+    void this.connect().catch(() => {});
+  }
+
+  /** Explicit non-QR reconnect using existing linked credentials. */
+  async reconnect(): Promise<{ ok: true }> {
+    this.assertNotUnlinking();
+    const st = this.store.whatsappState();
+    if (st.linkedAt == null) throw new WhatsAppNotLinkedError();
+    this.wantConnected = true;
+    this.clearRetry();
+    this.cancelPendingLink('reconnect');
+    this.releaseSocket();
+    void this.connect().catch(() => {});
+    return { ok: true };
   }
 
   /** Stop the socket but keep auth (a transient disconnect). */
   disconnect(): void {
     this.wantConnected = false;
+    this.clearRetry();
+    this.generation++;
+    this.cancelPendingLink('paused');
     this.releaseSocket();
     this.lastQr = null;
-    this.store.setWhatsappState({ connected: false });
+    this.store.setWhatsappState({ connected: false, status: this.store.whatsappState().linkedAt != null ? 'paused' : 'unlinked', nextRetryAt: null, connectedAt: null });
     this.emit('comms', this.store.commsStatus());
   }
 
   /** Fully unlink: drop the socket, wipe auth, forget the number + send approval. */
   async unlink(): Promise<void> {
-    this.disconnect();
-    this.contacts.clear();
-    try { this.store.wa.clear(); } catch { /* */ } // wipe captured chats/messages (keeps the store dir)
-    // Remove ONLY the auth — NOT the whole `whatsapp/<account>` folder, which also
-    // holds the message store dir the live WaStore writes to (deleting it made every
-    // post-relink write silently fail into a gone directory).
-    try { const { rm } = await import('node:fs/promises'); await rm(join(app.getPath('userData'), 'whatsapp', ACCOUNT, 'auth'), { recursive: true, force: true }); } catch { /* */ }
-    this.store.setWhatsappState({ connected: false, jid: null, name: null, linkedAt: null, sendApproved: false, agentSendToOthers: false });
-    this.emit('wa-chats', null);
-    this.emit('comms', this.store.commsStatus());
+    if (this.unlinking) return this.unlinking;
+    this.unlinkInProgress = true;
+    const run = (async () => {
+      this.wantConnected = false;
+      this.clearRetry();
+      this.generation++;
+      this.cancelPendingLink('unlinked');
+      this.releaseSocket();
+      this.lastQr = null;
+      this.contacts.clear();
+      try { this.store.wa.clear(); } catch { /* */ } // wipe captured chats/messages (keeps the store dir)
+      // Remove ONLY the auth — NOT the whole `whatsapp/<account>` folder, which also
+      // holds the message store dir the live WaStore writes to (deleting it made every
+      // post-relink write silently fail into a gone directory).
+      try { const { rm } = await import('node:fs/promises'); await rm(join(app.getPath('userData'), 'whatsapp', ACCOUNT, 'auth'), { recursive: true, force: true }); } catch { /* */ }
+      this.clearRetry();
+      this.store.setWhatsappState({ ...DEFAULT_WHATSAPP_STATE, pendingSummaries: [] });
+      this.emit('wa-chats', null);
+      this.emit('comms', this.store.commsStatus());
+    })();
+    this.unlinking = run;
+    try { await this.unlinking; }
+    finally {
+      if (this.unlinking === run) {
+        this.unlinking = null;
+        this.unlinkInProgress = false;
+      }
+    }
   }
 
-  private async onConnectionUpdate(u: { connection?: string; qr?: string; lastDisconnect?: { error?: { output?: { statusCode?: number } } } }): Promise<void> {
-    if (u.qr) await this.handleQr(u.qr);
+  private async onConnectionUpdate(sock: WaSocket, gen: number, u: { connection?: string; qr?: string; lastDisconnect?: { error?: { output?: { statusCode?: number } } } }): Promise<void> {
+    if (gen !== this.generation || sock !== this.sock) return;
+    if (u.qr) await this.handleQr(sock, gen, u.qr);
     if (u.connection === 'open') {
       this.reconnects = 0;
+      this.clearRetry();
+      this.settlePendingLink({ method: 'connected' });
       const prev = this.store.whatsappState();
-      this.store.setWhatsappState({ connected: true, jid: ownJidOf(this.sock) ?? prev.jid, name: this.sock?.user?.name ?? prev.name, linkedAt: prev.linkedAt ?? Date.now() });
+      this.store.setWhatsappState({ connected: true, status: 'connected', jid: ownJidOf(this.sock) ?? prev.jid, name: this.sock?.user?.name ?? prev.name, linkedAt: prev.linkedAt ?? Date.now(), connectedAt: Date.now(), lastDisconnectCode: null, nextRetryAt: null, retryAttempt: 0 });
       this.emit('comms', this.store.commsStatus());
       // Deliver any summaries queued while we were offline (e.g. a quiet-timer that
       // fired during a power-off and couldn't reach the socket yet). Retried here on
@@ -632,20 +875,34 @@ export class WhatsAppClient {
       void flushSummaries({ store: this.store, client: this, emit: this.emit });
       return;
     }
-    if (u.connection === 'close') await this.onClose(u);
+    if (u.connection === 'close') await this.onClose(sock, gen, u);
   }
 
-  private async handleQr(qr: string): Promise<void> {
+  private async handleQr(sock: WaSocket, gen: number, qr: string): Promise<void> {
+    if (gen !== this.generation || sock !== this.sock) return;
+    const pending = this.pendingLink;
+    if (pending && pending.generation !== gen) return;
+    if (!pending && this.store.whatsappState().linkedAt != null) return;
+    const seq = ++this.qrSeq;
+    if (pending) pending.qrSeq = seq;
     const toData = this.deps.qrToDataUrl ?? (async (s: string) => {
       try { const qrcode = (await import('qrcode')).default; return await qrcode.toDataURL(s); }
       catch { return `data:text/plain;base64,${Buffer.from(s).toString('base64')}`; }
     });
-    this.lastQr = await toData(qr);
-    this.emit('whatsapp-qr', { dataUrl: this.lastQr });
-    if (this.pendingQr) { const resolve = this.pendingQr; this.pendingQr = null; resolve({ method: 'qr', dataUrl: this.lastQr }); }
+    const dataUrl = await toData(qr);
+    if (gen !== this.generation || sock !== this.sock) return;
+    if (pending) {
+      if (this.pendingLink !== pending || pending.qrSeq !== seq) return;
+    } else if (this.pendingLink || this.qrSeq !== seq || this.store.whatsappState().linkedAt != null) {
+      return;
+    }
+    this.lastQr = dataUrl;
+    this.emit('whatsapp-qr', { dataUrl });
+    if (pending) this.settlePendingLink({ method: 'qr', dataUrl });
   }
 
-  private async onClose(u: { lastDisconnect?: { error?: { output?: { statusCode?: number } } } }): Promise<void> {
+  private async onClose(sock: WaSocket, gen: number, u: { lastDisconnect?: { error?: { output?: { statusCode?: number } } } }): Promise<void> {
+    if (gen !== this.generation || sock !== this.sock) return;
     // Eagerly drop every listener bound to the OLD socket's EventEmitter so the
     // closure tree (each callback captures `this`) can be GC'd immediately,
     // rather than waiting on whatever internal references Baileys still holds.
@@ -655,13 +912,16 @@ export class WhatsAppClient {
     this.releaseSocket();
     const code = u.lastDisconnect?.error?.output?.statusCode ?? null;
     if (code === 401) { await this.unlink(); return; }                  // logged out → forget
-    this.store.setWhatsappState({ connected: false });
+    if (code === 440) {
+      this.wantConnected = false;
+      this.clearRetry();
+      this.store.setWhatsappState({ connected: false, status: 'needs-attention', lastDisconnectCode: 440, nextRetryAt: null, connectedAt: null });
+      this.emit('comms', this.store.commsStatus());
+      return;
+    }
+    this.store.setWhatsappState({ connected: false, status: 'offline', lastDisconnectCode: code, connectedAt: null });
     this.emit('comms', this.store.commsStatus());
-    if (!this.wantConnected || (code != null && NO_RECONNECT.has(code))) return;
-    if (++this.reconnects > MAX_RECONNECTS) return;
-    const delay = Math.min(RECONNECT_BASE_MS * 2 ** (this.reconnects - 1), RECONNECT_MAX_MS);
-    await new Promise(r => setTimeout(r, delay));
-    if (this.wantConnected && !this.sock) await this.connect().catch(() => {});
+    this.scheduleRetry(code);
   }
 
   /** Real baileys socket — lazily imported so tests never load it. */

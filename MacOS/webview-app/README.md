@@ -71,7 +71,10 @@ shell only wires I/O. **There is deliberately no `--force` / bypass flag.**
 
 1. Captures the source fingerprint, resolves the next PATCH candidate.
 2. Runs CI-equivalent gates from the repo root, failing closed:
-   `pnpm install --frozen-lockfile` → `pnpm test` → `pnpm typecheck` → `pnpm build`.
+   `pnpm install --frozen-lockfile --offline` → `pnpm test` → `pnpm typecheck` → `pnpm build`.
+   The offline install is intentional: local release must use the already-resolved
+   lockfile and local pnpm store, and it must fail clearly if the cache is
+   incomplete instead of retaining registry network handles after completion.
 3. Packages `MAESTRO_CHANNEL=preview MAESTRO_VERSION=<candidate>`.
 4. Smokes the **exact** `dist/Mochlet Preview.app` (its embedded node + sidecar)
    in a throwaway `MAESTRO_USER_DATA_DIR`, `MAESTRO_CHANNEL=preview`,

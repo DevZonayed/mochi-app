@@ -210,8 +210,9 @@ const GROUPS: Record<McpCategoryId, Row[]> = {
     ['listApprovals', 'List pending tool-use approvals. Params: {status?}.'],
     ['approveApproval', 'Approve a pending tool-use gate. Params: {id}.'],
     ['denyApproval', 'Deny a pending tool-use gate. Params: {id}.'],
-    ['answerQuestion', 'Answer an agent AskUserQuestion. Params: {sessionId, answer}.'],
-    ['extendQuestion', 'Extend an agent question\'s deadline. Params: {sessionId}.'],
+    ['answerQuestion', 'Answer an agent AskUserQuestion. Params: {sessionId, sourceJobId?, answer}. sourceJobId is required when multiple questions are pending in one session.'],
+    ['extendQuestion', 'Extend an agent question\'s deadline. Params: {sessionId, sourceJobId?}. sourceJobId is required when multiple questions are pending in one session.'],
+    ['cancelQuestion', 'Cancel an agent question\'s deadline. Params: {sessionId, sourceJobId?}. sourceJobId is required when multiple questions are pending in one session.'],
   ],
   schedule: [
     ['listSchedules', 'List schedules.'],
@@ -330,6 +331,7 @@ const GROUPS: Record<McpCategoryId, Row[]> = {
   whatsapp: [
     ['whatsappStatus', 'WhatsApp connection status.'],
     ['whatsappLink', 'Begin linking WhatsApp (returns pairing state). Params: {phone?}.'],
+    ['reconnectWhatsApp', 'Reconnect WhatsApp using existing linked credentials.'],
     ['whatsappQr', 'Get the current WhatsApp link QR.'],
     ['disconnectWhatsApp', 'Disconnect the WhatsApp socket.', true],
     ['unlinkWhatsApp', 'Unlink WhatsApp entirely.', true],
@@ -602,6 +604,7 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     effort: enumStr(['fast', 'balanced', 'deep', 'max']),
     plan: bool('Plan mode.'), goal: bool('Goal mode.'), browser: bool('Grant browser tools.'),
     agentContext: str('Hidden context delivered to the model but not shown in transcript.'),
+    idempotencyKey: str('Optional dedupe key (e.g. an upstream message/update id). A duplicate delivery with the same key resolves to the ORIGINAL job + session and runs the agent exactly once — even across restart. Omit for normal user sends.'),
   }, ['projectId'], {
     // dispatch: projectId AND (NONBLANK text|prompt|message OR >=1 image OR >=1
     // file). Whitespace-only text is trimmed away by dispatch, so `\S` (nonblank)
@@ -648,13 +651,21 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     projectId: str('Project id.'), input: str('The job prompt/input.'), title: str(),
     effort: enumStr(['fast', 'balanced', 'deep', 'max']),
   }, ['projectId', 'input']),
-  runJob: S({ id: str('Job id.'), effort: enumStr(['fast', 'balanced', 'deep', 'max']), engine: str(), model: str() }, ['id']),
+  runJob: S({
+    id: str('Job id.'),
+    effort: enumStr(['fast', 'balanced', 'deep', 'max']), engine: str(), model: str(),
+    reviewer: objOrOff('{engine, model} reviewer role, OR the literal "off".'),
+    browser: bool(), plan: bool(), goal: bool(),
+  }, ['id']),
   cancelJob: S({ id: str('Job id.') }, ['id']),
   steerJob: S({ id: str('Job id.'), text: str('Steering message.'), interrupt: bool('Interrupt now (default) vs queue at next boundary.') }, ['id', 'text']),
   deleteJob: S({ id: str('Job id.') }, ['id']),
   createAndRunJob: S({
     projectId: str('Project id.'), input: str('The job prompt/input.'), title: str(),
     effort: enumStr(['fast', 'balanced', 'deep', 'max']), engine: str(), model: str(),
+    reviewer: objOrOff('{engine, model} reviewer role, OR the literal "off".'),
+    browser: bool(), plan: bool(), goal: bool(),
+    idempotencyKey: str('Optional dedupe key: a retried request with the same key returns the original job without starting a second run.'),
   }, ['projectId', 'input']),
   listBgTasks: S({ projectId: str('Filter to one project (optional).') }),
   bgOutput: S({ id: str('Background task id.'), tailKB: num('Tail size in KB.') }, ['id']),
@@ -662,8 +673,9 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
   listApprovals: S({ status: str('Filter by approval status (optional).') }),
   approveApproval: S({ id: str('Approval id.') }, ['id']),
   denyApproval: S({ id: str('Approval id.') }, ['id']),
-  answerQuestion: S({ sessionId: str('Session id the question belongs to (id also accepted).'), id: str('Alias of sessionId.'), answer: str('The chosen answer text.') }, ['answer'], oneOf('sessionId', 'id')),
-  extendQuestion: S({ sessionId: str('Session id whose question countdown to extend (id also accepted).'), id: str('Alias of sessionId.') }, [], oneOf('sessionId', 'id')),
+  answerQuestion: S({ sessionId: str('Session id the question belongs to (id also accepted).'), id: str('Alias of sessionId.'), sourceJobId: str('Exact source job id for the question; required when a session has multiple pending questions.'), answer: str('The chosen answer text.') }, ['answer'], oneOf('sessionId', 'id')),
+  extendQuestion: S({ sessionId: str('Session id whose question countdown to extend (id also accepted).'), id: str('Alias of sessionId.'), sourceJobId: str('Exact source job id for the question; required when a session has multiple pending questions.') }, [], oneOf('sessionId', 'id')),
+  cancelQuestion: S({ sessionId: str('Session id whose question countdown to cancel (id also accepted).'), id: str('Alias of sessionId.'), sourceJobId: str('Exact source job id for the question; required when a session has multiple pending questions.') }, [], oneOf('sessionId', 'id')),
 
   // ── schedule ────────────────────────────────────────────────────────────
   listSchedules: S(),
@@ -676,13 +688,17 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     everyMinutes: num('Recurring interval in minutes.'),
     catchUp: bool(),
     effort: enumStr(['fast', 'balanced', 'deep', 'max']),
-    browser: bool(), plan: bool(),
+    engine: str(), model: str(),
+    reviewer: objOrOff('{engine, model} reviewer role, OR the literal "off".'),
+    browser: bool(), plan: bool(), goal: bool(),
   }, ['title']),
   toggleSchedule: S({ id: str('Schedule id.'), enabled: bool('Enable/disable.') }, ['id', 'enabled']),
   updateSchedule: S({
     id: str('Schedule id.'),
     title: str(), prompt: str(), time: str(), cadence: str(), everyMinutes: num(),
-    catchUp: bool(), enabled: bool(), effort: str(), browser: bool(), plan: bool(), sessionId: str(), projectId: str(),
+    catchUp: bool(), enabled: bool(), effort: str(), engine: str(), model: str(),
+    reviewer: objOrOff('{engine, model} reviewer role, OR the literal "off".'),
+    browser: bool(), plan: bool(), goal: bool(), sessionId: str(), projectId: str(),
   }, ['id']),
   deleteSchedule: S({ id: str('Schedule id.') }, ['id']),
   scheduleCheck: S({
@@ -693,7 +709,9 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
     fireAt: num('Absolute fire time (ms epoch, >= 30s ahead).'),
     prompt: str('Message text to send.'),
     sessionId: str(), projectId: str(),
-    effort: enumStr(['fast', 'balanced', 'deep', 'max']), browser: bool(), plan: bool(), goal: bool(),
+    effort: enumStr(['fast', 'balanced', 'deep', 'max']), engine: str(), model: str(),
+    reviewer: objOrOff('{engine, model} reviewer role, OR the literal "off".'),
+    browser: bool(), plan: bool(), goal: bool(),
   }, ['fireAt', 'prompt']),
 
   // ── skills ──────────────────────────────────────────────────────────────
@@ -851,6 +869,7 @@ export const TOOL_SCHEMAS: Record<string, McpInputSchema> = {
   // ── whatsapp ────────────────────────────────────────────────────────────
   whatsappStatus: S(),
   whatsappLink: S({ phone: str('Phone number for pairing-code linking (optional).') }),
+  reconnectWhatsApp: S(),
   whatsappQr: S(),
   disconnectWhatsApp: S(),
   unlinkWhatsApp: S(),

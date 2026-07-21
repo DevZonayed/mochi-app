@@ -25,6 +25,7 @@ import { randomUUID } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import type { WebSocket } from 'ws';
 import { registerRegistry } from './registry.js';
+import { sanitizeForwardError } from './errorSanitize.js';
 import { DeviceRegistry } from './devices.js';
 import { turnConfigFromEnv } from './turn.js';
 
@@ -381,7 +382,7 @@ export function buildServer(config: RelayConfig = {}): FastifyInstance {
       the phone to the right session chat (or Approvals when no session applies).
       Kept small — Expo caps push data at 4KB. */
   type PushNavData = {
-    kind: 'job-done' | 'job-failed' | 'approval' | 'schedule-late';
+    kind: 'job-done' | 'job-failed' | 'job-gated' | 'approval' | 'schedule-late';
     projectId?: string;
     sessionId?: string;
     jobId?: string;
@@ -412,11 +413,16 @@ export function buildServer(config: RelayConfig = {}): FastifyInstance {
   function maybePush(deck: Deck, name: string, data: unknown): void {
     if (!deck.pushTokens.size) return;
     if (name === 'job') {
-      const j = data as { id?: string; status?: string; title?: string; projectId?: string; sessionId?: string } | null;
+      const j = data as { id?: string; status?: string; title?: string; projectId?: string; sessionId?: string; review?: { summary?: string; findings?: unknown[]; status?: string } } | null;
       if (!j?.id) return;
       const nav = { projectId: j.projectId, sessionId: j.sessionId, jobId: j.id };
       if (j.status === 'done' && rememberPushKey(`${deck.deckId}:${j.id}:done`)) void sendExpoPush(deck, 'Conversation complete', j.title || 'A run finished on your Mac.', { kind: 'job-done', ...nav });
       else if (j.status === 'failed' && rememberPushKey(`${deck.deckId}:${j.id}:failed`)) void sendExpoPush(deck, 'Job failed', j.title || 'A run failed on your Mac.', { kind: 'job-failed', ...nav });
+      else if (j.status === 'gated' && rememberPushKey(`${deck.deckId}:${j.id}:gated`)) {
+        const count = Array.isArray(j.review?.findings) ? j.review.findings.length : 0;
+        const body = j.review?.summary ? `${j.review.summary}${count ? ` (${count} finding${count === 1 ? '' : 's'})` : ''}` : (j.title || 'A reviewer asked for changes.');
+        void sendExpoPush(deck, j.review?.status === 'failed-closed' ? 'Review needs attention' : 'Reviewer needs work', body, { kind: 'job-gated', ...nav });
+      }
     } else if (name === 'approval') {
       const a = data as { id?: string; status?: string; title?: string; projectId?: string | null; jobId?: string | null } | null;
       if (a?.id && a.status === 'pending' && rememberPushKey(`${deck.deckId}:appr:${a.id}`)) {
@@ -471,8 +477,12 @@ export function buildServer(config: RelayConfig = {}): FastifyInstance {
     try {
       return await cmd(deck, method, params);
     } catch (e) {
-      const err = e as Error & { statusCode?: number };
-      return reply.code(err.statusCode ?? 500).send({ error: err.message });
+      // Phase 3B0 NOTE-3: never echo a raw exception (path / stack / SQL /
+      // connection string with userinfo/token) to the client. The central mapper
+      // collapses statusCode-less / internal-500 failures to a generic message and
+      // sanitizes even typed-domain messages that happen to carry a canary.
+      const safe = sanitizeForwardError(e);
+      return reply.code(safe.statusCode).send({ error: safe.message, code: safe.code });
     }
   }
 

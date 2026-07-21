@@ -59,6 +59,10 @@ describe('canDrainQueue', () => {
     expect(canDrainQueue({ ...ready, lastStatus: 'cancelled' })).toBe(false);
   });
 
+  it('holds on a gated turn (reviewer needs work)', () => {
+    expect(canDrainQueue({ ...ready, lastStatus: 'gated' })).toBe(false);
+  });
+
   it('holds on a running/pending turn', () => {
     expect(canDrainQueue({ ...ready, lastStatus: 'running', streaming: true })).toBe(false);
     expect(canDrainQueue({ ...ready, lastStatus: 'pending', streaming: true })).toBe(false);

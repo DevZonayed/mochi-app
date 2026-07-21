@@ -22,7 +22,7 @@ import type { Store } from './store.js';
 import type { BgTaskRecord, EmitConfirm } from './engine.js';
 import type { GitCtx } from './git-ctx.js';
 import { isNeedsConfirm } from './git-ctx.js';
-import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles } from './skills-registry.js';
+import { registryBase, searchRegistry, getRegistrySkill, fetchSkillContent, removeSkillFiles, installVerifiedRegistrySkill, reverifyInstalledSkill, evaluateSkillTrustForExecution, buildRegistryReverifyContent, truthfulSkillLabel, skillSlug } from './skills-registry.js';
 import { nextActionFor } from './git-ctx.js';
 
 /** Background-task hooks injected from main.ts — the engine OWNS the processes; the
@@ -211,7 +211,10 @@ export class CodexBridge {
         ]);
         const root = projectRoot();
         mkdirSync(root, { recursive: true });
-        const slug = installSkillFiles(root, skillId, content.skillMd);
+        const slugForInstall = skillSlug(skillId);
+        const existing = this.store.listInstalledSkills(pid).find(s => s.id === skillId || s.slug === slugForInstall);
+        const verified = installVerifiedRegistrySkill(root, content, { existing });
+        const slug = verified.slug;
         const rec = this.store.recordSkillInstall(pid, {
           id: skillId,
           slug,
@@ -220,12 +223,13 @@ export class CodexBridge {
           risk: meta?.risk,
           source: meta?.source,
           version: meta?.version || 'latest',
-          sha256: content.sha256,
+          sha256: verified.sha256,
           enabled: content.enabled !== false && meta?.enabled !== false,
           disabledReason: meta?.disabledReason,
           mirrorRepo: meta?.sourceRepo ?? meta?.mirrorRepo,
           auditStatus: meta?.auditStatus,
           addedBy: 'agent',
+          integrity: verified.integrity, provenance: verified.provenance, auditEvidence: verified.auditEvidence, policy: verified.policy,
         });
         // Deliver the skill body INLINE so the agent follows it THIS turn instead of
         // depending on a follow-up Read it sometimes skipped ("dynamically loaded but not
@@ -240,8 +244,26 @@ export class CodexBridge {
       case 'list_project_skills': {
         if (!reg.skills) return errRes('skill tools are not enabled for this run');
         if (!pid) return errRes('project skill tools require a project');
-        const rows = this.store.listInstalledSkills(pid);
-        return txt(rows.length ? rows.map(x => `- ${x.id} — ${x.name} (.claude/skills/${x.slug}/SKILL.md${x.version ? `, version=${x.version}` : ''}${x.sha256 ? `, sha256=${x.sha256.slice(0, 12)}` : ''}${x.risk ? `, risk=${x.risk}` : ''})`).join('\n') : 'No skills are installed in this project yet.');
+        const root = projectRoot();
+        const rows = this.store.listInstalledSkills(pid).filter(s => {
+          const decision = evaluateSkillTrustForExecution(s);
+          if (!decision.ok) return false;
+          if (decision.trust === 'registry-audited') {
+            const check = reverifyInstalledSkill(root, buildRegistryReverifyContent(s));
+            if (!check.ok) {
+              this.store.setInstalledSkillEnabled(pid, s.id, false);
+              return false;
+            }
+          }
+          return true;
+        });
+        return txt(rows.length ? rows.map(x => {
+          const label = truthfulSkillLabel(x);
+          const registryMeta = label.provenance === 'registry'
+            ? `${x.version ? `, version=${x.version}` : ''}${x.sha256 ? `, sha256=${x.sha256.slice(0, 12)}` : ''}${x.risk ? `, risk=${x.risk}` : ''}`
+            : `, trust=${label.trust}`;
+          return `- ${x.id} — ${x.name} (.claude/skills/${x.slug}/SKILL.md${registryMeta})`;
+        }).join('\n') : 'No skills are installed in this project yet.');
       }
       case 'remove_project_skill': {
         if (!reg.skills) return errRes('skill tools are not enabled for this run');

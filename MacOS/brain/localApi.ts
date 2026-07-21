@@ -2,7 +2,9 @@
    (over IPC) and remote controls (phone/web via the relay). Every command
    executes locally on this Mac against the local store + local engine. */
 
-import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem, FeedbackCategory, FeedbackContext, FeedbackSource, CustomMcpServer, McpKv } from './store.js';
+import type { Store, Effort, ApprovalStatus, EngineId, Routing, Roles, RoleChoice, AppSettings, ProjectKind, AssetStatus, ChatImage, ChatFile, TranscriptItem, FeedbackCategory, FeedbackContext, FeedbackSource, CustomMcpServer, McpKv, Job, Schedule, IdempotentJobSpec } from './store.js';
+import { sessionIdForKey } from './store.js';
+import type { RunIntentInput } from './run-intent.js';
 import { answerMessage, nextExtend } from './ask-question.js';
 import { resolveModelKey, buildModelGroups, refreshModelGroups } from './models.js';
 import type { LocalEngine } from './engine.js';
@@ -29,20 +31,32 @@ import { bootstrapNewProject, bootstrapProject, realFs, realGit, readOriginRemot
 import { openProjectMemory, closeMemoryWatcher } from './project-lifecycle.js';
 import { fetchRepoMetadata, makeGhRunner } from './repo-metadata.js';
 import type { GitService } from './git-service.js';
+import { gitArtifactIdentity, type ReviewGateScope } from './review-gate.js';
 import type { GitWatcher } from './git-watcher.js';
 import type { ExtensionBridge } from './extension-bridge.js';
 import { readProjectState, writeProjectState, listCheckpoints } from './continuum.js';
 import { saveAttachment, substitutePlaceholders } from './attachments.js';
-import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, installSkillFiles, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug } from './skills-registry.js';
+import { registryBase, searchRegistry, registryMeta, getRegistrySkill, fetchSkillContent, removeSkillFiles, setSkillFilesEnabled, listInstalledSlugsDetailed, skillSlug, installVerifiedRegistrySkill, reverifyInstalledSkill, truthfulSkillLabel, evaluateSkillTrustForExecution, buildRegistryReverifyContent } from './skills-registry.js';
 import { nativeSkillSummaries } from './native-skills.js';
 import { scanConversations, parseConversation, type ConvSource } from './conversation-sync.js';
 import { sanitizeDesignBrief, serializeWorkflowMarker, WORKFLOW_MARKER_REL, type DesignFlow, type DesignPhase } from './design-workflow.js';
-import { existsSync, mkdirSync, cpSync, readdirSync, statSync, realpathSync, writeFileSync, promises as fsp } from 'node:fs';
+import { existsSync, mkdirSync, cpSync, readdirSync, statSync, writeFileSync, promises as fsp } from 'node:fs';
 import { homedir } from 'node:os';
 import nodePath from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { app, shell } from 'electron';
+
+/** Validated release channel for the health response. Reads ONLY MAESTRO_CHANNEL;
+ *  an unknown or unset value falls back to 'production' (matches the packaging /
+ *  sidecar channel map). Kept brain-local so `health` never depends on the runtime
+ *  electron alias. */
+function healthChannel(env: NodeJS.ProcessEnv = process.env): 'production' | 'preview' | 'development' {
+  const c = env.MAESTRO_CHANNEL;
+  return c === 'preview' || c === 'development' ? c : 'production';
+}
 import { locateExtension } from './extension-locator.js';
+import { rootsForProject, resolveProjectFile } from './file-resolve.js';
+import { isBinarySample, mimeForPath } from './binary-detect.js';
 
 type Params = Record<string, unknown>;
 const NATIVE_WEBKIT = process.env.MAESTRO_NATIVE_WEBKIT === '1';
@@ -68,6 +82,10 @@ function projectRootOf(proj: { name?: string; path?: string }): string {
   if (proj.path && existsSync(proj.path)) return proj.path;
   const safe = (proj.name || 'default').replace(/[^a-zA-Z0-9 _-]/g, '').trim() || 'default';
   return nodePath.join(homedir(), 'Maestro', safe);
+}
+
+function hasNativeSkillMarker(projectRoot: string, slug: string): boolean {
+  return existsSync(nodePath.join(projectRoot, '.claude', 'skills', slug, '.mochi-native'));
 }
 
 function asEngine(v: unknown): EngineId | undefined {
@@ -126,27 +144,49 @@ function asModel(v: unknown): string | undefined {
   return typeof v === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:\[\]-]{0,63}$/.test(v) ? v : undefined;
 }
 
+function asReviewer(v: unknown): RoleChoice | 'off' | undefined {
+  if (v === 'off') return 'off';
+  if (!v || typeof v !== 'object') return undefined;
+  const r = v as { engine?: unknown; model?: unknown };
+  const engine = asEngine(r.engine);
+  return engine ? { engine, model: asModel(r.model) } : undefined;
+}
+
+function runIntentFromParams(p: Params): RunIntentInput {
+  return {
+    effort: p.effort as Effort | undefined,
+    engine: asEngine(p.engine),
+    model: asModel(p.model),
+    reviewer: asReviewer(p.reviewer),
+    plan: p.plan === undefined ? undefined : p.plan === true,
+    goal: p.goal === undefined ? undefined : p.goal === true,
+    browser: p.browser === undefined ? undefined : p.browser === true,
+  };
+}
+
+function resolvePendingQuestion(store: Store, sessionId: string, sourceJobId: string): { schedule: Schedule; sourceJob: Job } {
+  const pendingAutoAnswers = store.listSchedules()
+    .filter(s => s.kind === 'auto-answer' && s.sessionId === sessionId && s.enabled);
+  const schedule = sourceJobId
+    ? pendingAutoAnswers.find(s => s.sourceJobId === sourceJobId)
+    : pendingAutoAnswers.length === 1 ? pendingAutoAnswers[0] : undefined;
+  if (!schedule) {
+    if (!sourceJobId && pendingAutoAnswers.length > 1) throw Object.assign(new Error('ambiguous pending question; sourceJobId required'), { statusCode: 409 });
+    throw Object.assign(new Error('pending question not found'), { statusCode: 404 });
+  }
+  if (!schedule.sourceJobId) throw Object.assign(new Error('pending question has no exact source job'), { statusCode: 409 });
+  const sourceJob = store.getJob(schedule.sourceJobId);
+  if (!sourceJob) throw Object.assign(new Error('question source job not found'), { statusCode: 409 });
+  if (sourceJob.sessionId !== sessionId) throw Object.assign(new Error('question source job does not belong to session'), { statusCode: 409 });
+  return { schedule, sourceJob };
+}
+
 /* ── File/dir/command surface (ported VERBATIM from the Electron-only
    `ipcMain.handle('maestro:*')` channels in main.ts so the headless macOS
    sidecar — which serves ONLY dispatch(method, params) — gets identical
    behavior: same path confinement, caps, filters, sort, and return shapes). */
 
 const IMG_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
-
-/* Resolve `rel` to a canonical path that is provably INSIDE the project root.
-   Defends against `..` escapes and symlinks pointing out of the repo. Accepts
-   either a path relative to the root or an absolute path that lands inside it. */
-const resolveInsideRoot = (rawRoot: string, rel: string): string => {
-  const root = rawRoot.startsWith('~/') || rawRoot === '~' ? nodePath.join(app.getPath('home'), rawRoot.slice(1)) : rawRoot;
-  const rootReal = realpathSync(nodePath.resolve(root));
-  const target = nodePath.resolve(rootReal, String(rel ?? ''));
-  const relToRoot = nodePath.relative(rootReal, target);
-  if (relToRoot.startsWith('..') || nodePath.isAbsolute(relToRoot)) throw new Error('path escapes project');
-  const real = realpathSync(target);
-  const relReal = nodePath.relative(rootReal, real);
-  if (relReal.startsWith('..') || nodePath.isAbsolute(relReal)) throw new Error('symlink escapes project');
-  return real;
-};
 
 /** A project's working root on disk for the file/dir arms (matches the
     `projectRoot` helper in main.ts). Throws if the project has no folder. */
@@ -156,38 +196,12 @@ const rootOfProject = (store: Store, projectId: unknown): string => {
   return root;
 };
 
-/* Candidate roots for a file RPC, in priority order:
-     1. the ACTIVE session's worktree (when a sessionId is passed) — the Files
-        panel is session-scoped: each chat works on its own branch/worktree,
-        so the tree must show THAT checkout, not the project root,
-     2. the project root,
-     3. every other session worktree of the project — chat path links carry
-        absolute worktree paths that must stay openable after switching chats.
-   Everything still funnels through resolveInsideRoot, so the escape/symlink
-   defenses hold for each candidate. */
-const rootsFor = (store: Store, projectId: unknown, sessionId?: unknown): string[] => {
-  const pid = String(projectId);
-  const roots: string[] = [];
-  const sid = sessionId == null ? '' : String(sessionId);
-  if (sid) {
-    const s = store.getSession(sid);
-    if (s && s.projectId === pid && s.worktreePath && existsSync(s.worktreePath)) roots.push(s.worktreePath);
-  }
-  const proj = store.getProject(pid)?.path;
-  if (proj && !roots.includes(proj)) roots.push(proj);
-  for (const s of store.listSessions()) {
-    if (s.projectId === pid && s.worktreePath && existsSync(s.worktreePath) && !roots.includes(s.worktreePath)) roots.push(s.worktreePath);
-  }
-  if (!roots.length) throw new Error('this project has no folder on disk');
-  return roots;
-};
-const resolveInRoots = (roots: string[], rel: string): string => {
-  let lastErr: unknown;
-  for (const r of roots) {
-    try { return resolveInsideRoot(r, rel); } catch (e) { lastErr = e; }
-  }
-  throw lastErr instanceof Error ? lastErr : new Error('path escapes project');
-};
+/* Candidate roots for a file RPC, in priority order (active session worktree →
+   project root → other session worktrees). Delegates to the single canonical
+   definition in file-resolve.ts so localApi and the sidecar stream route share
+   one implementation of the confinement + priority semantics. */
+const rootsFor = (store: Store, projectId: unknown, sessionId?: unknown): string[] =>
+  rootsForProject(store, projectId, sessionId);
 
 /** Module-level map of runId → child process for the `runCommand`/`killCommand`
     pair (matches the `runningCmds` map in main.ts). */
@@ -236,7 +250,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
     const p = params ?? {};
     switch (method) {
       case 'health':
-        return { ok: true, name: 'maestro-desktop', version: app.getVersion(), engine: 'claude-code', time: Date.now() };
+        // Live app version (app.getVersion(), never a hardcoded/package value) + a
+        // VALIDATED channel from MAESTRO_CHANNEL so concurrently-running builds are
+        // distinguishable. Only these fields are returned — no other env is exposed.
+        return { ok: true, name: 'maestro-desktop', version: app.getVersion(), channel: healthChannel(), engine: 'claude-code', time: Date.now() };
 
       // ── Aggregates ─────────────────────────────────────────────
       case 'dashboard': return store.dashboard();
@@ -978,6 +995,55 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           base: typeof p.base === 'string' ? p.base : undefined,
         });
       }
+      case 'getReviewGate': {
+        const sessionId = String(p.sessionId ?? p.id ?? '');
+        if (sessionId) {
+          const s = store.getSession(sessionId); if (!s) return bad('session not found', 404);
+          const required = s.reviewerEnabled === true && s.reviewer !== 'off';
+          if (!required) return { status: 'not-required', reason: 'Reviewer is not required for this session.' };
+          const latest = store.listJobs(s.projectId, s.id).find(j => j.status === 'done' || j.status === 'failed');
+          if (!latest) return { status: 'failed-closed', reason: 'No reviewed job exists for this session.' };
+          const project = store.getProject(s.projectId);
+          const dir = s.worktreePath || project?.path;
+          if (!dir) return { status: 'failed-closed', reason: 'No project directory is available for review gate inspection.', projectId: s.projectId, sessionId: s.id, jobId: latest.id };
+          const artifactId = gitArtifactIdentity(dir);
+          const scope: ReviewGateScope = { projectId: s.projectId, sessionId: s.id, jobId: latest.id, artifactId };
+          const check = store.reviewGateCheck(scope, true);
+          return check.gate ?? { status: check.status, reason: check.reason, projectId: s.projectId, sessionId: s.id, jobId: latest.id, artifactId };
+        }
+        const jobId = String(p.jobId ?? '');
+        if (jobId) {
+          const j = store.getJob(jobId); if (!j) return bad('job not found', 404);
+          return store.listReviewGates({ jobId })[0] ?? { status: 'not-required', reason: 'No reviewer gate recorded.' };
+        }
+        return bad('sessionId or jobId required', 400);
+      }
+      case 'overrideReviewGate': {
+        const sessionId = String(p.sessionId ?? p.id ?? '');
+        const reason = typeof p.reason === 'string' ? p.reason : '';
+        if (!sessionId) return bad('sessionId required', 400);
+        const s = store.getSession(sessionId); if (!s) return bad('session not found', 404);
+        const latest = store.listJobs(s.projectId, s.id).find(j => j.status === 'done' || j.status === 'failed');
+        if (!latest) return bad('no terminal job to override', 400);
+        const project = store.getProject(s.projectId);
+        const dir = s.worktreePath || project?.path;
+        if (!dir) return bad('no project directory is available for review gate inspection', 400);
+        const artifactId = gitArtifactIdentity(dir);
+        const scope: ReviewGateScope = { projectId: s.projectId, sessionId: s.id, jobId: latest.id, artifactId };
+        const gate = store.overrideReviewGate(scope, reason);
+        emit('review-gate', gate);
+        return gate;
+      }
+      case 'retryReviewGate': {
+        const sessionId = String(p.sessionId ?? p.id ?? '');
+        if (!sessionId) return bad('sessionId required', 400);
+        const s = store.getSession(sessionId); if (!s) return bad('session not found', 404);
+        const running = store.listJobs(undefined, sessionId).find(j => engine.isRunning(j.id) || j.status === 'running' || j.status === 'pending');
+        if (running) return bad('cannot retry review while a session run is active', 409);
+        const gate = await engine.retryReviewGate(sessionId);
+        emit('review-gate', gate);
+        return gate;
+      }
       // pr_merge HUMAN-CONFIRMED path: this dispatch case calls gitService directly,
       // which executes the merge immediately. It is `desktopOnly` via remote-guard,
       // so only the renderer (a human clicking "Confirm Merge" in the dialog) can
@@ -1104,6 +1170,21 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!projectId || (!text && !rawImages.length && !rawFiles.length)) bad('projectId and a message, image, or file required');
         const project = store.getProject(projectId);
         if (!project) bad('project not found', 404);
+        // TRIGGER IDEMPOTENCY (finding 4): an upstream caller (a remote /run relay, an
+        // extension re-post, a retried renderer/bridge call) may pass `idempotencyKey` so
+        // a duplicate delivery resolves to the ORIGINAL job + session and runs engine.run
+        // EXACTLY ONCE — including across restart. Keyless sends are unchanged. The cheap
+        // pre-check short-circuits the dominant case (a sequential retry): no second
+        // session, no re-saved attachments, no second job/run.
+        const chatIdemKey = typeof p.idempotencyKey === 'string' && p.idempotencyKey ? `chat:${p.idempotencyKey}` : null;
+        if (chatIdemKey) {
+          const existingId = store.idempotentJobIdFor(chatIdemKey);
+          const existingJob = existingId ? store.getJob(existingId) : undefined;
+          if (existingJob) {
+            const existingSession = existingJob.sessionId ? store.getSession(existingJob.sessionId) : undefined;
+            return { session: existingSession, job: existingJob };
+          }
+        }
         // Clean prose for the rail/header — strip the composer's `«attach:<id>»`
         // chip placeholders AND any already-substituted `@<.continuum/Attachment/…>`
         // path markers, so a message that's "[image] device is connected…" shows
@@ -1117,6 +1198,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           .trim();
         let session = p.sessionId ? store.getSession(String(p.sessionId)) : undefined;
         if (p.sessionId && !session) bad('session not found', 404);
+        let lazyCreatedSession = false;
         // Context (knowledge/operator) projects hold ONE continuous conversation:
         // any message without an explicit session routes into the primary
         // operator session (oldest non-archived) instead of opening a new chat.
@@ -1135,7 +1217,14 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           // session here so engine.ts's first run forks the worktree from it.
           const baseBranch = typeof p.baseBranch === 'string' && p.baseBranch.trim() ? p.baseBranch.trim()
             : (typeof p.base === 'string' && p.base.trim() ? p.base.trim() : undefined);
-          session = store.createSession(projectId, seedTitle, codename, baseBranch ? { baseBranch } : undefined);
+          // When keyed, DETERMINISTICALLY bind the lazily-created session to the key so a
+          // crash BEFORE the idempotency reservation is recoverable: a retry with the same
+          // key re-derives the SAME session id (createSession returns the existing row)
+          // instead of spawning a second empty chat. The session id is reserved the moment
+          // it's exposed, closing the "unreserved orphan session" window.
+          const lazySessionId = chatIdemKey ? sessionIdForKey(chatIdemKey) : undefined;
+          session = store.createSession(projectId, seedTitle, codename, { ...(baseBranch ? { baseBranch } : {}), ...(lazySessionId ? { id: lazySessionId } : {}) });
+          lazyCreatedSession = true;
           emit('session', session);
         }
         // The project's working root — where `.continuum/Attachment/` lives.
@@ -1241,7 +1330,25 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // `agentContext` (e.g. browser page-context) is delivered to the model in the
         // prompt but never rendered in the transcript — it stays off the user's screen.
         const agentContext = typeof p.agentContext === 'string' && p.agentContext.trim() ? p.agentContext.slice(0, 200_000) : undefined;
-        const job = store.createJob(projectId, finalText, jobTitle, p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined, agentContext);
+        // Keyed sends claim atomically (crash-safe: reservation persisted before the row);
+        // keyless sends create the job directly (normal UI path, unchanged).
+        const intent: RunIntentInput = { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true, browser: p.browser === true };
+        const chatSpec: IdempotentJobSpec = { projectId, input: finalText, title: jobTitle, effort: p.effort as Effort | undefined, sessionId: session.id, inputImages: inputImages.length ? inputImages : undefined, inputFiles: inputFiles.length ? inputFiles : undefined, agentContext, intent };
+        const chatClaim = chatIdemKey
+          ? store.claimIdempotentJob(chatIdemKey, chatSpec)
+          : { job: store.createJob(projectId, finalText, jobTitle, p.effort as Effort | undefined, session.id, inputImages.length ? inputImages : undefined, inputFiles.length ? inputFiles : undefined, agentContext, intent), duplicate: false };
+        const job = chatClaim.job;
+        if (chatIdemKey && chatClaim.duplicate) {
+          // A concurrent duplicate raced us to the claim → return the ORIGINAL job WITHOUT
+          // starting a second run. The lazy session is deterministically bound to the key
+          // (sessionIdForKey), so BOTH racers derived the SAME session — nothing extra to
+          // clean up. The guard below only fires in the impossible case of a divergent id
+          // (defensive): never delete the shared/original session.
+          if (lazyCreatedSession && job.sessionId && job.sessionId !== session.id) { try { store.deleteSession(session.id); } catch { /* best-effort cleanup */ } }
+          emit('job', job);
+          const originalSession = job.sessionId ? store.getSession(job.sessionId) : session;
+          return { session: originalSession, job };
+        }
         emit('job', job);
         // A real user-initiated turn lands → the keep-going auto-continue
         // streak for this session resets (image_0ss8f.png: a real reply means
@@ -1273,7 +1380,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           }
         } catch { /* best-effort */ }
         // Fire the run async — the reply streams in over job events.
-        void engine.run(job.id, { effort: p.effort as Effort | undefined, engine: primary.engine, model: primary.model, reviewer, plan: p.plan === true, goal: p.goal === true, browser: p.browser === true });
+        void engine.run(job.id, job.intent ?? intent);
         return { session, job };
       }
 
@@ -1305,7 +1412,8 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'createJob': {
         if (!p.projectId || !p.input) bad('projectId and input required');
         if (!store.getProject(String(p.projectId))) bad('project not found', 404);
-        const j = store.createJob(String(p.projectId), String(p.input), String(p.title ?? ''), (p.effort as Effort) ?? 'balanced');
+        const intent = runIntentFromParams(p);
+        const j = store.createJob(String(p.projectId), String(p.input), String(p.title ?? ''), (p.effort as Effort) ?? 'balanced', undefined, undefined, undefined, undefined, intent);
         emit('job', j);
         return j;
       }
@@ -1316,8 +1424,9 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const jobId = String(p.id ?? '');
         const j = store.getJob(jobId);
         if (!j) return bad('job not found', 404);
-        void engine.run(jobId, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model) }).catch(() => { /* engine records failure on the job */ });
-        return j;
+        const persisted = store.persistJobIntent(jobId, runIntentFromParams(p));
+        void engine.run(jobId, {}).catch(() => { /* engine records failure on the job */ });
+        return persisted;
       }
       case 'cancelJob': {
         const c = engine.cancel(String(p.id ?? ''));
@@ -1345,12 +1454,23 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'createAndRunJob': {
         if (!p.projectId || !p.input) bad('projectId and input required');
         if (!store.getProject(String(p.projectId))) bad('project not found', 404);
-        const j = store.createJob(String(p.projectId), String(p.input), String(p.title ?? ''), (p.effort as Effort) ?? 'balanced');
+        // TRIGGER IDEMPOTENCY: an API caller (external MCP client) may supply an
+        // `idempotencyKey` so a retried request resolves to the ORIGINAL job instead
+        // of executing a second side effect. Without a key, ordinary distinct calls
+        // each create their own job (unchanged).
+        const idemKey = typeof p.idempotencyKey === 'string' && p.idempotencyKey ? `api:${p.idempotencyKey}` : null;
+        const intent = runIntentFromParams(p);
+        const jobSpec: IdempotentJobSpec = { projectId: String(p.projectId), input: String(p.input), title: String(p.title ?? ''), effort: (p.effort as Effort) ?? 'balanced', intent };
+        const claim = idemKey
+          ? store.claimIdempotentJob(idemKey, jobSpec)
+          : { job: store.createJob(jobSpec.projectId, jobSpec.input, jobSpec.title, jobSpec.effort, undefined, undefined, undefined, undefined, intent), duplicate: false };
+        const j = claim.job;
         emit('job', j);
         // Return the job HANDLE promptly and run the agent in the background —
         // callers (external MCP clients especially) track execution via
-        // getJob/listJobs instead of blocking on a long agent turn.
-        void engine.run(j.id, { effort: p.effort as Effort | undefined, engine: asEngine(p.engine), model: asModel(p.model) }).catch(() => { /* engine records failure on the job */ });
+        // getJob/listJobs instead of blocking on a long agent turn. A duplicate key
+        // returns the original job WITHOUT starting a second run.
+        if (!claim.duplicate) void engine.run(j.id, {}).catch(() => { /* engine records failure on the job */ });
         return j;
       }
 
@@ -1379,7 +1499,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           everyMinutes: Number.isFinite(Number(p.everyMinutes)) && Number(p.everyMinutes) > 0 ? Number(p.everyMinutes) : undefined,
           catchUp: p.catchUp === true,
           effort: p.effort as Effort | undefined,
-          browser: p.browser === true, plan: p.plan === true,
+          engine: asEngine(p.engine),
+          model: asModel(p.model),
+          reviewer: asReviewer(p.reviewer),
+          browser: p.browser === undefined ? undefined : p.browser === true,
+          plan: p.plan === undefined ? undefined : p.plan === true,
+          goal: p.goal === undefined ? undefined : p.goal === true,
         });
         emit('schedule', s);
         return s;
@@ -1390,7 +1515,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!id) bad('id required');
         if (p.sessionId && !store.getSession(String(p.sessionId))) bad('session not found', 404);
         const patch: Record<string, unknown> = {};
-        for (const k of ['title', 'prompt', 'time', 'cadence', 'everyMinutes', 'catchUp', 'enabled', 'effort', 'browser', 'plan', 'sessionId', 'projectId'] as const) {
+        for (const k of ['title', 'prompt', 'time', 'cadence', 'everyMinutes', 'catchUp', 'enabled', 'effort', 'engine', 'model', 'reviewer', 'browser', 'plan', 'goal', 'sessionId', 'projectId'] as const) {
           if (p[k] !== undefined) patch[k] = p[k];
         }
         const s = store.updateSchedule(id, patch);
@@ -1428,7 +1553,12 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
           title: prompt.slice(0, 60), prompt, fireAt,
           kind: 'message',
           effort: (p.effort as Effort | undefined),
-          browser: p.browser === true, plan: p.plan === true, goal: p.goal === true,
+          engine: asEngine(p.engine),
+          model: asModel(p.model),
+          reviewer: asReviewer(p.reviewer),
+          browser: p.browser === undefined ? undefined : p.browser === true,
+          plan: p.plan === undefined ? undefined : p.plan === true,
+          goal: p.goal === undefined ? undefined : p.goal === true,
         });
         emit('schedule', sched);
         return sched;
@@ -1438,15 +1568,15 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // message, resuming the session so the agent continues with the answer.
       case 'answerQuestion': {
         const sessionId = String(p.sessionId ?? p.id ?? '');
+        const sourceJobId = typeof p.sourceJobId === 'string' ? p.sourceJobId.trim() : '';
         const answer = typeof p.answer === 'string' ? p.answer.trim().slice(0, 8000) : '';
         if (!sessionId) bad('sessionId required');
         if (!answer) bad('answer required');
         const session = store.getSession(sessionId);
         if (!session) return bad('session not found', 404);
-        // Cancel any pending auto-answer countdown for this session.
-        for (const s of store.listSchedules()) {
-          if (s.kind === 'auto-answer' && s.sessionId === sessionId) { store.deleteSchedule(s.id); emit('schedule', { id: s.id, deleted: true }); }
-        }
+        const { schedule: pending, sourceJob } = resolvePendingQuestion(store, sessionId, sourceJobId);
+        store.updateSchedule(pending.id, { enabled: false });
+        emit('schedule', { id: pending.id, deleted: true });
         const text = answerMessage(answer);
         // THE OVERLAP FIX (image_hx5ow.png): the SDK "dismisses" AskUserQuestion and
         // the asking turn often KEEPS RUNNING (thinking/wrap-up) while the card is
@@ -1456,19 +1586,19 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // both use this RPC via the shared ChatThread). If the asking turn is still
         // live, STEER the answer into it (queue-steer: same subprocess, delivered at
         // the next boundary, no lost work) instead of launching a parallel run.
-        const liveJob = store.listJobs(undefined, sessionId).find(j => engine.isRunning(j.id));
-        if (liveJob) {
-          const { steered } = await engine.steer(liveJob.id, text, { interrupt: false });
-          if (steered) return store.getJob(liveJob.id) ?? liveJob;
+        const sourceIsRunning = engine.isRunning(sourceJob.id);
+        if (sourceIsRunning) {
+          const { steered } = await engine.steer(sourceJob.id, text, { interrupt: false });
+          if (steered) return store.getJob(sourceJob.id) ?? sourceJob;
           // Live but not steerable (codex / plan-mode / non-chat run): cancel the
           // stale asking turn so the answer below can't race it. Cancel-and-reseed
           // is the pre-steer behaviour — correct, just less seamless.
-          if (engine.isRunning(liveJob.id)) engine.cancel(liveJob.id);
+          if (engine.isRunning(sourceJob.id)) engine.cancel(sourceJob.id);
         }
-        const job = store.createJob(session.projectId, text, text.slice(0, 60), undefined, session.id);
+        const inherited = sourceJob.intent ?? { effort: 'balanced' as const, plan: false, goal: false, browser: false };
+        const job = store.createJob(session.projectId, text, text.slice(0, 60), undefined, session.id, undefined, undefined, undefined, inherited);
         emit('job', job);
-        const opts = session.primary ? { engine: session.primary.engine, model: session.primary.model, reviewer: session.reviewer } : {};
-        void engine.run(job.id, opts).catch(() => { /* engine records failure on the job */ });
+        void engine.run(job.id, {}).catch(() => { /* engine records failure on the job */ });
         return job;
       }
       // Extend an AskUserQuestion countdown by the next escalating step (+5, +10, +15…).
@@ -1476,14 +1606,27 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // the question then waits indefinitely for a manual reply.
       case 'extendQuestion': {
         const sessionId = String(p.sessionId ?? p.id ?? '');
-        const s = store.listSchedules().find(x => x.kind === 'auto-answer' && x.sessionId === sessionId && x.enabled && !x.paused);
-        if (!s) return bad('no pending question to extend', 404);
+        const sourceJobId = typeof p.sourceJobId === 'string' ? p.sourceJobId.trim() : '';
+        if (!sessionId) bad('sessionId required');
+        const { schedule: s } = resolvePendingQuestion(store, sessionId, sourceJobId);
+        if (s.paused) return bad('no pending question to extend', 404);
         const out = nextExtend(s.armedAt ?? s.createdAt, s.extends ?? 0);
         const updated = out.capped
           ? store.updateSchedule(s.id, { paused: true })
           : store.updateSchedule(s.id, { fireAt: out.deadline, extends: out.extends });
         emit('schedule', updated);
         return updated;
+      }
+      case 'cancelQuestion': {
+        const sessionId = String(p.sessionId ?? p.id ?? '');
+        const sourceJobId = typeof p.sourceJobId === 'string' ? p.sourceJobId.trim() : '';
+        if (!sessionId) bad('sessionId required');
+        const session = store.getSession(sessionId);
+        if (!session) return bad('session not found', 404);
+        const { schedule } = resolvePendingQuestion(store, sessionId, sourceJobId);
+        store.updateSchedule(schedule.id, { enabled: false });
+        emit('schedule', { id: schedule.id, deleted: true });
+        return { ok: true };
       }
 
       // ── Skills / Templates ─────────────────────────────────────
@@ -1527,11 +1670,25 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         // scan missed it (path quirks shouldn't make installed skills vanish from the
         // UI). When the folder IS found, trust its real enabled state (SKILL.md vs
         // .disabled); otherwise fall back to the record's flag.
+        const projectRoot = projectRootOf(proj);
         const skills = records.map(r => {
           const d = diskBySlug.get(r.slug);
+          if ((r.addedBy === 'native' || r.provenance?.kind === 'bundled-native') && d && !hasNativeSkillMarker(projectRoot, r.slug)) {
+            return null;
+          }
           diskBySlug.delete(r.slug);
-          return d ? { ...r, enabled: d.enabled } : r;
-        });
+          const decision = evaluateSkillTrustForExecution(r);
+          if (decision.ok && decision.trust === 'registry-audited') {
+            const check = reverifyInstalledSkill(projectRoot, buildRegistryReverifyContent(r));
+            if (!check.ok) {
+              store.setInstalledSkillEnabled(projId, r.id, false);
+              return { ...r, enabled: false, disabledReason: check.reason, integrity: { ...(r.integrity ?? { algorithm: 'sha256', digest: r.sha256 ?? '', checkedAt: Date.now() }), status: 'quarantined', failure: check.reason }, trustLabel: truthfulSkillLabel(r) };
+            }
+          } else if (!decision.ok && r.enabled !== false) {
+            return { ...r, enabled: false, disabledReason: decision.reason, trustLabel: truthfulSkillLabel(r) };
+          }
+          return { ...(d ? { ...r, enabled: d.enabled } : r), trustLabel: truthfulSkillLabel(r) };
+        }).filter((s): s is NonNullable<typeof s> => s !== null);
         // Built-in (native) skills ship with the app and are materialised on the
         // FIRST real run — but the operator must see them in the Skills UI even
         // before that run (otherwise "where is imagegen?"). Merge any bundled
@@ -1541,17 +1698,21 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         for (const n of nativeSkillSummaries()) {
           if (have.has(n.slug)) continue;
           const d = diskBySlug.get(n.slug);
-          diskBySlug.delete(n.slug);
+          const hasNativeMarker = d ? hasNativeSkillMarker(projectRoot, n.slug) : false;
+          if (d && !hasNativeMarker) continue;
+          if (d) diskBySlug.delete(n.slug);
           skills.push({
             id: n.id, slug: n.slug, name: n.name, description: n.description,
             source: `https://github.com/${n.id.split('/').slice(0, 2).join('/')}`,
             version: 'bundled', sha256: n.sha256,
             enabled: d ? d.enabled : true, addedBy: 'native', installedAt: 0,
+            provenance: { kind: 'bundled-native' }, integrity: { algorithm: 'sha256', digest: n.sha256, status: 'verified', checkedAt: 0 },
+            trustLabel: { provenance: 'bundled-native', trust: 'bundle-hash', version: 'bundled' },
           });
         }
         // Folders on disk with no record (e.g. dropped in manually / by another tool).
         for (const d of diskBySlug.values()) {
-          skills.push({ id: d.slug, slug: d.slug, name: d.slug, enabled: d.enabled, addedBy: 'agent', installedAt: 0 });
+          skills.push({ id: d.slug, slug: d.slug, name: d.slug, enabled: d.enabled, addedBy: 'operator', installedAt: 0, provenance: { kind: 'local-operator' }, integrity: { algorithm: 'sha256', digest: '', status: 'unverified-local', checkedAt: 0 }, trustLabel: { provenance: 'local-operator', trust: 'not-registry-audited' } });
         }
         return { skills };
       }
@@ -1563,19 +1724,23 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const content = await fetchSkillContent(registryBase(relayUrl), skillId);
         const root = projectRootOf(proj);
         mkdirSync(root, { recursive: true });
-        const slug = installSkillFiles(root, skillId, content.skillMd);
+        const slugForInstall = skillSlug(skillId);
+        const existing = store.listInstalledSkills(proj.id).find(s => s.id === skillId || s.slug === slugForInstall);
+        const verified = installVerifiedRegistrySkill(root, content, { existing });
+        const slug = verified.slug;
         const rec = store.recordSkillInstall(proj.id, {
           id: skillId, slug, name: typeof p.name === 'string' && p.name ? p.name : content.name,
           description: typeof p.description === 'string' ? p.description : undefined,
           risk: typeof p.risk === 'string' ? p.risk : undefined,
           source: typeof p.source === 'string' ? p.source : undefined,
           version: typeof p.version === 'string' ? p.version : 'latest',
-          sha256: content.sha256,
+          sha256: verified.sha256,
           enabled: content.enabled !== false,
           disabledReason: typeof p.disabledReason === 'string' ? p.disabledReason : undefined,
           mirrorRepo: typeof p.mirrorRepo === 'string' ? p.mirrorRepo : undefined,
           auditStatus: typeof p.auditStatus === 'string' ? p.auditStatus : undefined,
           addedBy: p.via === 'agent' ? 'agent' : 'operator',
+          integrity: verified.integrity, provenance: verified.provenance, auditEvidence: verified.auditEvidence, policy: verified.policy,
         });
         return { skill: rec };
       }
@@ -1585,6 +1750,26 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         const idOrSlug = String(p.skillId ?? p.slug ?? '');
         if (!idOrSlug) return bad('skillId required');
         const enabled = Boolean(p.enabled);
+        const existing = store.listInstalledSkills(proj.id).find(x => x.id === idOrSlug || x.slug === idOrSlug);
+        const slug = skillSlug(idOrSlug);
+        const disk = listInstalledSlugsDetailed(projectRootOf(proj)).find(d => d.slug === slug);
+        const localNativeSlugCollision = !!disk && !hasNativeSkillMarker(projectRootOf(proj), slug) && !!nativeSkillSummaries().find(n => n.slug === slug || n.id === idOrSlug);
+        if (enabled && existing) {
+          if ((existing.addedBy === 'native' || existing.provenance?.kind === 'bundled-native') && localNativeSlugCollision) {
+            const fileOk = setSkillFilesEnabled(projectRootOf(proj), idOrSlug, enabled);
+            const rec = store.recordSkillInstall(proj.id, { id: slug, slug, name: slug, enabled, addedBy: 'operator', provenance: { kind: 'local-operator' }, integrity: { algorithm: 'sha256', digest: '', status: 'unverified-local', checkedAt: 0 } });
+            return { ok: fileOk, skill: rec };
+          }
+          const decision = evaluateSkillTrustForExecution({ ...existing, enabled: true });
+          if (!decision.ok) return bad(`skill cannot be enabled: ${decision.reason}`, 403);
+          if (decision.trust === 'registry-audited') {
+            const check = reverifyInstalledSkill(projectRootOf(proj), buildRegistryReverifyContent(existing));
+            if (!check.ok) {
+              store.setInstalledSkillEnabled(proj.id, idOrSlug, false);
+              return bad(`skill integrity failed: ${check.reason}`, 403);
+            }
+          }
+        }
         // Move the SKILL.md on disk so Claude's settingSources actually stops/starts
         // loading it, then mirror the flag in the store record.
         const fileOk = setSkillFilesEnabled(projectRootOf(proj), idOrSlug, enabled);
@@ -1592,11 +1777,10 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (!rec) { // no record yet — create one so the flag sticks (a bundled
           // native toggled BEFORE its first-run materialisation must be recorded
           // as native, so the disable survives ensureNativeSkills/recordNativeSkills)
-          const slug = skillSlug(idOrSlug);
-          const native = nativeSkillSummaries().find(n => n.slug === slug || n.id === idOrSlug);
+          const native = localNativeSlugCollision ? undefined : nativeSkillSummaries().find(n => n.slug === slug || n.id === idOrSlug);
           rec = store.ensureInstalledSkill(proj.id, native
-            ? { id: native.id, slug: native.slug, name: native.name, description: native.description, version: 'bundled', sha256: native.sha256, enabled, addedBy: 'native' }
-            : { id: idOrSlug, slug, name: slug, enabled, addedBy: 'agent' });
+            ? { id: native.id, slug: native.slug, name: native.name, description: native.description, version: 'bundled', sha256: native.sha256, enabled, addedBy: 'native', provenance: { kind: 'bundled-native' }, integrity: { algorithm: 'sha256', digest: native.sha256, status: 'verified', checkedAt: 0 } }
+            : { id: idOrSlug, slug, name: slug, enabled, addedBy: 'operator', provenance: { kind: 'local-operator' }, integrity: { algorithm: 'sha256', digest: '', status: 'unverified-local', checkedAt: 0 } });
           store.setInstalledSkillEnabled(proj.id, idOrSlug, enabled);
         }
         // A native toggled pre-materialisation has no folder to rename yet — the
@@ -2011,6 +2195,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       case 'whatsappStatus': return store.whatsappState();
       case 'listWaChats': return store.listWaChats();
       case 'whatsappLink': return whatsapp.link({ phone: p.phone ? String(p.phone) : undefined });
+      case 'reconnectWhatsApp': return whatsapp.reconnect();
       case 'whatsappQr': return { dataUrl: whatsapp.currentQr() };
       case 'disconnectWhatsApp': { whatsapp.disconnect(); return { ok: true }; }
       case 'unlinkWhatsApp': { await whatsapp.unlink(); return { ok: true }; }
@@ -2202,12 +2387,39 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // main.ts `{ ok, error }` envelope — dispatch arms return data directly
       // and the WS/IPC layer surfaces thrown errors to the caller.
 
-      // Reveal a path in Finder — path-guarded. Expands a leading ~.
+      // Reveal an APP-OWNED path in Finder — the ORIGINAL trusted contract (project
+      // folders, generated assets, exports, and MCP/relay callers). Expands a leading
+      // ~ and performs the OS reveal (a no-op in the sidecar shim; the native WebKit
+      // layer handles the actual reveal). Returns { ok: true } on success.
       case 'revealPath': {
         const pth = p.path;
         if (typeof pth !== 'string' || !pth) return bad('no path');
         const abs = pth.startsWith('~/') || pth === '~' ? nodePath.join(app.getPath('home'), pth.slice(1)) : pth;
         if (existsSync(abs)) { shell.showItemInFolder(abs); return { ok: true }; }
+        return bad('path not found', 404);
+      }
+
+      // Resolve+CONFINE a FILE-ARTIFACT path to a canonical absolute path inside this
+      // project's roots (the SAME resolver readFile uses) OR a trusted store-issued
+      // Asset localPath. Returns { ok, path } with NO OS side effect — the native
+      // (Swift) revealFile/openFile two-step performs the reveal/open on THIS path
+      // only, so a raw transcript path can never reveal/open an arbitrary local file.
+      case 'resolveFilePath': {
+        const rel = typeof p.path === 'string' ? p.path : '';
+        if (!rel) return bad('no path');
+        let real: string | null = null;
+        let resolveErr: string | null = null;
+        if (p.projectId != null && String(p.projectId)) {
+          try { real = resolveProjectFile(rootsFor(store, p.projectId, p.sessionId), rel); }
+          catch (e) { resolveErr = (e as { code?: string })?.code ?? 'not-found'; }
+        }
+        // Trusted fallback: a raw path is honoured ONLY when it exactly equals a known
+        // Asset.localPath (store-issued, never free-form user input).
+        if (!real && store.listAssets().some(a => a.localPath && a.localPath === rel)) real = rel;
+        if (real && existsSync(real)) return { ok: true, path: real };
+        // Surface the resolver's distinction so the UI can tell escape/ambiguous/missing apart.
+        if (resolveErr === 'escape') return bad('path escapes project', 403);
+        if (resolveErr === 'ambiguous') return bad('ambiguous path — be more specific', 409);
         return bad('path not found', 404);
       }
 
@@ -2228,17 +2440,26 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // first when a sessionId is passed, then project root, then other
       // session worktrees — chat path links carry absolute worktree paths).
       case 'readFile': {
-        const real = resolveInRoots(rootsFor(store, p.projectId, p.sessionId), String(p.path ?? ''));
+        const real = resolveProjectFile(rootsFor(store, p.projectId, p.sessionId), String(p.path ?? ''));
         const st = await fsp.stat(real);
         if (!st.isFile()) return bad('not a file');
+        const name = nodePath.basename(real);
+        const mime = mimeForPath(real);
+        // Binary sniff on the first 4 KB (magic bytes + NUL + control-ratio). A binary
+        // file returns metadata + mime and NO text field so the UI can preview/download it.
+        const sniff = await fsp.open(real, 'r');
+        let sample: Buffer;
+        try { const buf = Buffer.alloc(Math.min(4096, Math.max(0, st.size))); const { bytesRead } = await sniff.read(buf, 0, buf.length, 0); sample = buf.subarray(0, bytesRead); }
+        finally { await sniff.close(); }
+        if (isBinarySample(sample)) return { path: real, name, bytes: st.size, binary: true, mime };
         if (st.size > 2 * 1024 * 1024) {
           const fd = await fsp.open(real, 'r');
-          try { const buf = Buffer.alloc(512 * 1024); const { bytesRead } = await fd.read(buf, 0, buf.length, 0); return { path: real, text: buf.subarray(0, bytesRead).toString('utf8'), bytes: st.size, truncated: true }; }
+          try { const buf = Buffer.alloc(512 * 1024); const { bytesRead } = await fd.read(buf, 0, buf.length, 0); return { path: real, name, text: buf.subarray(0, bytesRead).toString('utf8'), bytes: st.size, truncated: true, binary: false, mime }; }
           finally { await fd.close(); }
         }
         const text = await fsp.readFile(real, 'utf8');
         if (text.includes('\u0000')) return bad('binary file');
-        return { path: real, text, bytes: st.size, truncated: false };
+        return { path: real, name, text, bytes: st.size, truncated: false, binary: false, mime };
       }
 
       // Write a file's text — confined to the project folder, ONLY overwrites an
@@ -2248,7 +2469,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
         if (typeof text !== 'string') return bad('text must be a string');
         if (text.length > 4 * 1024 * 1024) return bad('file too large to save here (4 MB cap)');
         if (text.includes('\u0000')) return bad('refused to write NUL byte (binary)');
-        const real = resolveInRoots(rootsFor(store, p.projectId, p.sessionId), String(p.path ?? ''));
+        const real = resolveProjectFile(rootsFor(store, p.projectId, p.sessionId), String(p.path ?? ''));
         const st = await fsp.stat(real);
         if (!st.isFile()) return bad('not a file');
         await fsp.writeFile(real, text, 'utf8');
@@ -2260,7 +2481,7 @@ export function createDispatch(store: Store, engine: LocalEngine, media: MediaEn
       // sessionId, the listing is scoped to THAT session's worktree (the
       // session's own branch checkout), not the project root.
       case 'listDir': {
-        const real = resolveInRoots(rootsFor(store, p.projectId, p.sessionId), String(p.path ?? ''));
+        const real = resolveProjectFile(rootsFor(store, p.projectId, p.sessionId), String(p.path ?? ''));
         const st = await fsp.stat(real);
         if (!st.isDirectory()) return bad('not a directory');
         const dirents = await fsp.readdir(real, { withFileTypes: true });

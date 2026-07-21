@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Security
 import WebKit
 
 /// Release-channel identity, read from the SIGNED Info.plist (written by
@@ -35,6 +36,83 @@ enum Channel {
 
     /// Debug-log path suffix so channels never clobber each other's log.
     static let logSuffix: String = name == "production" ? "" : "-\(name)"
+}
+
+/// The channel-scoped 32-byte master key that backs the sidecar's authenticated
+/// `safeStorage` (AES-256-GCM envelope). Provisioned in the macOS login Keychain
+/// as a generic-password item keyed to THIS channel's bundle id, so production /
+/// preview / development never share a key. Accessible only AfterFirstUnlock on
+/// THIS device (never syncs to iCloud, never leaves the Mac). The base64 key is
+/// handed to the spawned sidecar ONLY via an environment variable — never argv,
+/// never logged, never written to the store/renderer/health. If the Keychain is
+/// unavailable the app runs without it and `safeStorage.isEncryptionAvailable()`
+/// becomes false (the brain then surfaces "reconnect" rather than persisting a
+/// reversible plaintext credential).
+enum SafeStorageKey {
+    private static let service: String =
+        (Bundle.main.bundleIdentifier ?? "cloud.nexalance.maestro.webkit") + ".safeStorage"
+    private static let account = "master-key"
+    private static let keyLength = 32
+
+    /// Base64 of the existing or freshly-created master key, or nil on failure.
+    static func provisionBase64() -> String? {
+        if let existing = load(), existing.count == keyLength {
+            return existing.base64EncodedString()
+        }
+        guard let fresh = randomKey() else { return nil }
+        switch store(fresh) {
+        case .stored:
+            return fresh.base64EncodedString()
+        case .duplicate:
+            // The item already existed (our load() failed transiently, e.g. a
+            // briefly-locked Keychain). SecItemAdd does NOT overwrite, so the
+            // freshly-generated key was NOT persisted — we MUST return the
+            // ALREADY-STORED key, never `fresh`, or keys encrypted this run would
+            // be undecryptable after restart.
+            if let existing = load(), existing.count == keyLength {
+                return existing.base64EncodedString()
+            }
+            return nil
+        case .failed:
+            return nil
+        }
+    }
+
+    private enum StoreOutcome { case stored, duplicate, failed }
+
+    private static func baseQuery() -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    private static func load() -> Data? {
+        var q = baseQuery()
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        guard status == errSecSuccess, let data = out as? Data else { return nil }
+        return data
+    }
+
+    private static func store(_ key: Data) -> StoreOutcome {
+        var q = baseQuery()
+        q[kSecValueData as String] = key
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = SecItemAdd(q as CFDictionary, nil)
+        if status == errSecSuccess { return .stored }
+        if status == errSecDuplicateItem { return .duplicate }
+        return .failed
+    }
+
+    private static func randomKey() -> Data? {
+        var bytes = [UInt8](repeating: 0, count: keyLength)
+        let status = SecRandomCopyBytes(kSecRandomDefault, keyLength, &bytes)
+        return status == errSecSuccess ? Data(bytes) : nil
+    }
 }
 
 enum DebugLog {
@@ -116,7 +194,16 @@ final class SidecarProcess {
         if let webRoot = resolveWebRoot() {
             env["MAESTRO_WEB_ROOT"] = webRoot.path
         }
+        // Provision (or reuse) THIS channel's Keychain master key and hand ONLY
+        // its base64 form to the sidecar via the environment — never argv, never
+        // logged. If provisioning fails we omit it, and the sidecar's
+        // safeStorage.isEncryptionAvailable() reports false (app stays usable).
+        if let safeStorageKeyB64 = SafeStorageKey.provisionBase64() {
+            env["MAESTRO_SAFE_STORAGE_KEY"] = safeStorageKeyB64
+        }
         proc.environment = env
+        // NB: log exec/args/cwd only — NEVER the environment (it now carries the
+        // safeStorage master key).
         DebugLog.write("[native] launching sidecar exec=\(launch.exec.path) args=\(launch.args.joined(separator: " ")) cwd=\(launch.cwd.path)")
 
         let out = Pipe()
@@ -321,6 +408,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private var loadingWebView: WKWebView?
     private var sidecar: SidecarProcess?
     private var windowObservers: [NSObjectProtocol] = []
+    // Phase 3D1 view-only screen capture. Stored type-erased because the concrete
+    // ScreenCaptureController is @available(macOS 14). Frames are forwarded to the
+    // renderer (`window.__maestroScreenFrame`), which relays them to the brain host
+    // coordinator; NO input path exists in the reverse direction.
+    private var screenCaptureObj: AnyObject?
     private let titleBarHeight: CGFloat = 40
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -877,8 +969,109 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             pickFolder { [weak self] result in self?.resolveNativeRequest(id, result: result) }
         case "importAsset":
             importAsset { [weak self] result in self?.resolveNativeRequest(id, result: result) }
+        case "nativeCopy":
+            nativeCopy(payload["params"] as? [String: Any]) { [weak self] result in self?.resolveNativeRequest(id, result: result) }
+        case "nativeReveal":
+            nativeReveal(payload["params"] as? [String: Any]) { [weak self] result in self?.resolveNativeRequest(id, result: result) }
+        case "nativeOpen":
+            nativeOpen(payload["params"] as? [String: Any]) { [weak self] result in self?.resolveNativeRequest(id, result: result) }
+        case "screenCapturePreflight":
+            resolveNativeRequest(id, result: ["ok": true, "permission": screenCapturePermissionState().rawValue])
+        case "screenCaptureListSources":
+            handleScreenCaptureListSources(id)
+        case "screenCaptureStart":
+            handleScreenCaptureStart(payload["params"] as? [String: Any], id)
+        case "screenCaptureStop":
+            handleScreenCaptureStop(id)
         default:
             resolveNativeRequest(id, result: ["ok": false, "error": "unknown native method"])
+        }
+    }
+
+    // MARK: - Phase 3D1 screen capture bridge (view-only)
+
+    private func handleScreenCaptureListSources(_ id: Int) {
+        guard #available(macOS 14.0, *) else {
+            resolveNativeRequest(id, result: ["ok": false, "error": "unsupported"]); return
+        }
+        let controller = currentScreenController()
+        Task {
+            do {
+                let sources = try await controller.listSources()
+                let mapped = sources.map { ["id": $0.id, "label": $0.label, "width": $0.width, "height": $0.height] as [String: Any] }
+                await MainActor.run { self.resolveNativeRequest(id, result: ["ok": true, "sources": mapped]) }
+            } catch {
+                await MainActor.run { self.resolveNativeRequest(id, result: ["ok": false, "error": "list failed"]) }
+            }
+        }
+    }
+
+    @available(macOS 14.0, *)
+    private func currentScreenController() -> ScreenCaptureController {
+        if let existing = screenCaptureObj as? ScreenCaptureController { return existing }
+        let controller = ScreenCaptureController()
+        controller.onFrame = { [weak self] data, ts in
+            let b64 = data.base64EncodedString()
+            DispatchQueue.main.async {
+                self?.webView?.evaluateJavaScript(
+                    "window.__maestroScreenFrame && window.__maestroScreenFrame('\(b64)', \(ts));",
+                    completionHandler: nil
+                )
+            }
+        }
+        controller.onError = { [weak self] reason in
+            DispatchQueue.main.async {
+                self?.webView?.evaluateJavaScript(
+                    "window.__maestroScreenError && window.__maestroScreenError('\(reason)');",
+                    completionHandler: nil
+                )
+            }
+        }
+        screenCaptureObj = controller
+        return controller
+    }
+
+    private func handleScreenCaptureStart(_ params: [String: Any]?, _ id: Int) {
+        guard #available(macOS 14.0, *) else {
+            resolveNativeRequest(id, result: ["ok": false, "error": "unsupported"]); return
+        }
+        guard screenCapturePermissionState() == .granted else {
+            resolveNativeRequest(id, result: ["ok": false, "error": "permission", "permission": screenCapturePermissionState().rawValue]); return
+        }
+        // B2-R1: the canonical bridge field is `sourceId`. Reject a missing/empty id
+        // BEFORE touching ScreenCaptureKit — this is a not-configured state, distinct from
+        // a stale source (which surfaces below as source-lost / .sourceUnavailable). No
+        // silent empty-id fallback.
+        guard let sourceID = params?["sourceId"] as? String, !sourceID.isEmpty else {
+            resolveNativeRequest(id, result: ["ok": false, "error": "source-required"]); return
+        }
+        let maxDim = (params?["maxDimension"] as? Int) ?? 1280
+        let fps = (params?["fps"] as? Int) ?? 8
+        let showsCursor = (params?["showsCursor"] as? Bool) ?? false
+        let quality = CGFloat((params?["quality"] as? Double) ?? 0.6)
+        let controller = currentScreenController()
+        let config = ScreenCaptureStartConfig(sourceID: sourceID, maxDimension: maxDim, fps: fps, showsCursor: showsCursor, jpegQuality: quality)
+        Task {
+            do {
+                let size = try await controller.start(config)
+                await MainActor.run { self.resolveNativeRequest(id, result: ["ok": true, "width": size.width, "height": size.height]) }
+            } catch ScreenCaptureStartError.permission {
+                await MainActor.run { self.resolveNativeRequest(id, result: ["ok": false, "error": "permission"]) }
+            } catch ScreenCaptureStartError.sourceUnavailable {
+                await MainActor.run { self.resolveNativeRequest(id, result: ["ok": false, "error": "source-lost"]) }
+            } catch {
+                await MainActor.run { self.resolveNativeRequest(id, result: ["ok": false, "error": "start failed"]) }
+            }
+        }
+    }
+
+    private func handleScreenCaptureStop(_ id: Int) {
+        guard #available(macOS 14.0, *), let controller = screenCaptureObj as? ScreenCaptureController else {
+            resolveNativeRequest(id, result: ["ok": true]); return
+        }
+        Task {
+            await controller.stop()
+            await MainActor.run { self.resolveNativeRequest(id, result: ["ok": true]) }
         }
     }
 
@@ -923,6 +1116,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 done(["ok": true, "data": NSNull()])
             }
         }
+    }
+
+    /// Write text to the system pasteboard. WebKit rejects the web
+    /// `navigator.clipboard.writeText`, so the renderer routes tab-transcript
+    /// copies through this native handler.
+    private func nativeCopy(_ params: [String: Any]?, _ done: @escaping ([String: Any]) -> Void) {
+        guard let text = params?["text"] as? String else {
+            done(["ok": false, "error": "text must be a string", "status": 400])
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        let wrote = pasteboard.setString(text, forType: .string)
+        if wrote {
+            done(["ok": true])
+        } else {
+            done(["ok": false, "error": "pasteboard write failed"])
+        }
+    }
+
+    private func nativeReveal(_ params: [String: Any]?, _ done: @escaping ([String: Any]) -> Void) {
+        let path = (params?["path"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
+            done(["ok": false, "error": "path not found", "status": 404])
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        done(["ok": true])
+    }
+
+    private func nativeOpen(_ params: [String: Any]?, _ done: @escaping ([String: Any]) -> Void) {
+        let path = (params?["path"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
+            done(["ok": false, "error": "path not found", "status": 404])
+            return
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        done(["ok": true])
     }
 
     private func resolveNativeRequest(_ id: Int, result: [String: Any]) {
@@ -1142,7 +1373,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             onEvent(cb) { listeners.add(cb); connect().catch(() => {}); return () => listeners.delete(cb); },
             getPathForFile(file) { return file && typeof file.path === 'string' ? file.path : ''; },
             pickFolder,
-            revealPath(path) { return call('revealPath', { path }); },
+            copyText(text) { return nativeRequest('nativeCopy', { text: String(text == null ? '' : text) }); },
+            // Trusted native reveal/open for APP-OWNED paths (project folders,
+            // generated assets, exports). Callers pass app-owned paths only.
+            reveal(path) { return nativeRequest('nativeReveal', { path }); },
+            revealPath(path) { return nativeRequest('nativeReveal', { path }); },
+            openPath(path) { return nativeRequest('nativeOpen', { path }); },
+            // Phase 3D1 (B2): view-only ScreenCaptureKit bridge. The renderer screen
+            // bridge (screenBridge.ts) drives these + relays native frames to the brain.
+            // View-only: there is NO input method exposed here.
+            screenCapturePreflight() { return nativeRequest('screenCapturePreflight'); },
+            screenCaptureListSources() { return nativeRequest('screenCaptureListSources'); },
+            screenCaptureStart(p) { return nativeRequest('screenCaptureStart', p || {}); },
+            screenCaptureStop() { return nativeRequest('screenCaptureStop'); },
+            // FILE-ARTIFACT reveal/open are CONFINED: the brain resolves the path
+            // against the project/session roots (or a trusted asset path) FIRST, and
+            // the native OS action only ever runs on that canonical, confined path —
+            // never a raw transcript path.
+            async revealFile(projectId, path, sessionId) {
+              const g = await call('resolveFilePath', { projectId, path, sessionId });
+              if (!g || !g.ok || !g.data || !g.data.path) return g || envelope(false, null, 'reveal failed', 500);
+              return nativeRequest('nativeReveal', { path: g.data.path });
+            },
+            async openFile(projectId, path, sessionId) {
+              const g = await call('resolveFilePath', { projectId, path, sessionId });
+              if (!g || !g.ok || !g.data || !g.data.path) return g || envelope(false, null, 'open failed', 500);
+              return nativeRequest('nativeOpen', { path: g.data.path });
+            },
+            fileStreamUrl(projectId, path, sessionId) {
+              const enc = encodeURIComponent;
+              let url = `http://127.0.0.1:${endpoint.port}/files/stream?token=${enc(endpoint.token)}&projectId=${enc(projectId == null ? '' : projectId)}&path=${enc(path == null ? '' : path)}`;
+              if (sessionId) url += `&sessionId=${enc(sessionId)}`;
+              return url;
+            },
             importAsset,
             assetImage(assetId) { return call('assetImage', { assetId }); },
             readFile(projectId, path, sessionId) { return call('readFile', { projectId, path, sessionId }); },

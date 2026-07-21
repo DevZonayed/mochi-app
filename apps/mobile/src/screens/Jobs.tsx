@@ -119,8 +119,11 @@ export function JobsScreen() {
 
   const match = (projectId: string | null) => filter === 'all' || projectId === filter;
   // Map live job statuses into the existing section shapes (markup unchanged).
-  const g = jobs
+  const q = jobs
     .filter((j) => j.status === 'pending' && match(j.projectId))
+    .map((j) => ({ id: j.id, projectId: j.projectId, name: j.title, sub: j.phase, cost: cost2(j.cost) }));
+  const g = jobs
+    .filter((j) => j.status === 'gated' && match(j.projectId))
     .map((j) => ({ id: j.id, projectId: j.projectId, name: j.title, sub: j.phase, cost: cost2(j.cost) }));
   const r = jobs
     .filter((j) => j.status === 'running' && match(j.projectId))
@@ -149,6 +152,28 @@ export function JobsScreen() {
             <ProjAvatar key={p.id} proj={p} sel={filter === p.id} onPress={() => setFilter(p.id)} />
           ))}
         </ScrollView>
+
+        {q.length > 0 ? (
+          <Section label="Queued" count={q.length} tint={theme.color.purple}>
+            {q.map((j, i) => (
+              <Pressable
+                key={j.id}
+                onPress={() => nav.navigate('JobTimeline', { jobId: j.id })}
+                style={{ flexDirection: 'row', alignItems: 'center', gap: 11, paddingVertical: 13, paddingHorizontal: 15, borderBottomWidth: i < q.length - 1 ? 0.5 : 0, borderBottomColor: theme.color.separator }}
+              >
+                <View style={{ width: 30, height: 30, borderRadius: 9, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(88,86,214,0.15)' }}>
+                  <Icon name="clock" size={16} color={theme.color.purple} />
+                </View>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={{ fontSize: 16, lineHeight: 19, fontWeight: '600', color: theme.color.ink }}>{j.name}</Text>
+                  <Text style={{ fontSize: 13, color: theme.color.inkTertiary, marginTop: 3 }}>{projById(j.projectId).name} · {j.sub}</Text>
+                </View>
+                <Mono style={{ fontSize: 14, fontWeight: '600', color: theme.color.purple }}>Queued</Mono>
+                <Icon name="chevronRight" size={17} color={theme.color.inkTertiary} />
+              </Pressable>
+            ))}
+          </Section>
+        ) : null}
 
         {g.length > 0 ? (
           <Section label="Gated" count={g.length} tint={theme.color.orange}>

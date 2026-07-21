@@ -6,7 +6,6 @@ import {
   NATIVE_SKILLS, ensureNativeSkills, nativeSkillsPromptBlock, nativeSkillSummaries,
   nativeSkillSlugs, isNativeSkill, nativeSkillsVersion,
 } from './native-skills.js';
-import { installSkillFiles } from './skills-registry.js';
 
 let root: string;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'native-skills-')); });
@@ -80,6 +79,17 @@ describe('ensureNativeSkills', () => {
     expect(readFileSync(join(dir, 'SKILL.md'), 'utf8')).toBe('# my own imagegen');
   });
 
+  it('can exclude kept local collisions from the native prompt instead of advertising them as bundled', () => {
+    const dir = skillDir('imagegen');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'SKILL.md'), '# my own imagegen', 'utf8');
+    const res = ensureNativeSkills(root);
+    const unavailable = new Set(res.filter(r => r.status === 'kept').map(r => r.slug));
+    const prompt = nativeSkillsPromptBlock(unavailable, { index: true });
+    expect(prompt).not.toContain('`imagegen`');
+    expect(prompt).not.toContain('Image generation — NON-NEGOTIABLE');
+  });
+
   it('writes a managed .gitignore so app skills do not pollute the user repo', () => {
     ensureNativeSkills(root);
     const gi = readFileSync(join(root, '.claude', 'skills', '.gitignore'), 'utf8');
@@ -134,7 +144,9 @@ describe('ensureNativeSkills', () => {
   it('a registry install over a native slug takes ownership (marker cleared → never pruned/clobbered)', () => {
     ensureNativeSkills(root);
     // Operator/agent installs their own pdf skill from the registry over ours.
-    installSkillFiles(root, 'some-registry/pdf', '# operator pdf');
+    mkdirSync(skillDir('pdf'), { recursive: true });
+    rmSync(join(skillDir('pdf'), '.mochi-native'), { force: true });
+    writeFileSync(join(skillDir('pdf'), 'SKILL.md'), '# operator pdf', 'utf8');
     const dir = skillDir('pdf');
     expect(existsSync(join(dir, '.mochi-native'))).toBe(false);
     // Later runs keep their folder — no upgrade-clobber, no stale-prune.

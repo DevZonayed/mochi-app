@@ -12,6 +12,7 @@
 
 import * as React from 'react';
 import { api } from '../lib/api';
+import type { ReviewGate } from '../lib/api';
 import { useSessionGitState } from '../lib/useSessionGitState';
 import type { SessionGitState, SessionGitStatus } from '../lib/git-types';
 import { SESSION_STATE_LABELS } from '../lib/git-types';
@@ -46,6 +47,7 @@ export interface GitOpsAction {
   needsGitHub: boolean;
   /** True when the action isn't actionable yet (e.g. T7-pending Continue stub). */
   stub?: boolean;
+  blockedReason?: string;
 }
 
 /** Pure: map a state to its complete action list. The FIRST entry is the
@@ -131,24 +133,93 @@ export interface GitOpsState {
   label: string;
   /** True iff the dock should render at all. `no-repo` + null session → false. */
   visible: boolean;
+  reviewGate: ReviewGate | null;
+  reviewBlocked: boolean;
+  reviewLabel: string | null;
+}
+
+export type ReviewGateLoad =
+  | { state: 'loading'; gate: null; reason: string }
+  | { state: 'error'; gate: null; reason: string }
+  | { state: 'ready'; gate: ReviewGate | null; reason?: undefined };
+
+function gateLabel(gate: ReviewGate | null, load: ReviewGateLoad): string | null {
+  if (load.state !== 'ready') return 'Review status unavailable';
+  if (!gate) return null;
+  switch (gate.status) {
+    case 'not-required': return null;
+    case 'pending': return 'Review pending';
+    case 'pass': return 'Review passed';
+    case 'needs-work': return 'Review needs work';
+    case 'failed-closed': return 'Review failed closed';
+    case 'overridden': return 'Review overridden';
+  }
+}
+
+function gateBlocks(gate: ReviewGate | null, load: ReviewGateLoad): boolean {
+  if (load.state !== 'ready') return true;
+  return !!gate && gate.status !== 'not-required' && gate.status !== 'pass' && gate.status !== 'overridden';
+}
+
+export function applyReviewGateToActions(actions: GitOpsAction[], load: ReviewGateLoad): {
+  actions: GitOpsAction[];
+  reviewGate: ReviewGate | null;
+  reviewBlocked: boolean;
+  reviewLabel: string | null;
+} {
+  const blocked = gateBlocks(load.gate, load);
+  const reason = blocked
+    ? (load.state === 'ready' ? (load.gate?.reason || 'Review gate blocks Git actions.') : load.reason)
+    : undefined;
+  return {
+    actions: actions.map(a =>
+      blocked && (a.kind === 'push' || a.kind === 'create-pr')
+        ? { ...a, blockedReason: reason }
+        : a,
+    ),
+    reviewGate: load.gate,
+    reviewBlocked: blocked,
+    reviewLabel: gateLabel(load.gate, load),
+  };
 }
 
 /** The dock's primary read hook. Pure projection over the existing cache;
     no extra subscriptions or fetches. */
 export function useGitOpsState(sessionId: string | null | undefined): GitOpsState {
   const status = useSessionGitState(sessionId);
+  const [reviewGateLoad, setReviewGateLoad] = React.useState<ReviewGateLoad>({ state: 'ready', gate: null });
+  React.useEffect(() => {
+    if (!sessionId) { setReviewGateLoad({ state: 'ready', gate: null }); return; }
+    let on = true;
+    setReviewGateLoad({ state: 'loading', gate: null, reason: 'Review status unavailable' });
+    api.getReviewGate(sessionId)
+      .then(g => { if (on) setReviewGateLoad({ state: 'ready', gate: g }); })
+      .catch(() => { if (on) setReviewGateLoad({ state: 'error', gate: null, reason: 'Review status unavailable' }); });
+    return () => { on = false; };
+  }, [sessionId, status?.state, status?.lastCheckedAt]);
+  React.useEffect(() => {
+    if (!sessionId) return;
+    return api.subscribe({
+      onReviewGate: (gate) => {
+        if (gate.sessionId === sessionId) setReviewGateLoad({ state: 'ready', gate });
+      },
+    });
+  }, [sessionId]);
   return React.useMemo(() => {
     const state = status?.state ?? null;
-    const actions = state ? actionsFor(state) : [];
+    const projection = applyReviewGateToActions(state ? actionsFor(state) : [], reviewGateLoad);
     return {
       status,
       state,
-      primary: actions[0] ?? null,
-      actions,
+      primary: projection.actions[0] ?? null,
+      actions: projection.actions,
       label: state ? labelFor(state) : '',
       visible: !!status && status.state !== 'no-repo',
+      reviewGate: projection.reviewGate,
+      reviewBlocked: projection.reviewBlocked,
+      reviewLabel: projection.reviewLabel,
     };
-  }, [status]);
+  }, [reviewGateLoad, status]);
 }
 
 /** Run a dock action against the api. The dock owns the toast/dialog UI;
@@ -161,6 +232,7 @@ export async function runGitOpsAction(
   opts?: { onCommit?: () => void; onContinue?: () => void | Promise<void>; onViewDiff?: () => void },
 ): Promise<{ ok: boolean; reason?: string; data?: unknown }> {
   if (!status) return { ok: false, reason: 'no session status' };
+  if (action.blockedReason) return { ok: false, reason: action.blockedReason };
   const sid = status.sessionId;
   switch (action.kind) {
     case 'commit': {

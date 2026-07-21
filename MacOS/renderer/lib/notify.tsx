@@ -172,6 +172,7 @@ export function NotificationCenter() {
         if (!primed || prev === job.status) return;
         if (job.status === 'done' && (prev === 'running' || prev === 'pending')) ring('complete');
         else if (job.status === 'failed' && prev !== 'failed') ring('attention');
+        else if (job.status === 'gated' && prev !== 'gated') ring('attention');
       },
       onApproval: (a) => {
         if (a.status !== 'pending' || seenApprovals.has(a.id)) return;

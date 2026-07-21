@@ -73,7 +73,7 @@ function RecipientField({ wa, onChanged }: { wa: WhatsAppState | null; onChanged
 }
 
 // ── WhatsApp card (link + connection + send gate) ───────────────────────────
-function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tracked: number; onChanged: () => void }) {
+export function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tracked: number; onChanged: () => void }) {
   const navigate = useNavigate();
   const [qr, setQr] = React.useState<string | null>(null);
   const [pairing, setPairing] = React.useState<string | null>(null);
@@ -82,12 +82,17 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
   const [err, setErr] = React.useState('');
   const connected = !!wa?.connected;
   const linked = wa?.linkedAt != null;
+  const status = wa?.status ?? (connected ? 'connected' : linked ? 'offline' : 'unlinked');
+  const identity = wa?.name || wa?.jid || 'linked account';
+  const retryLabel = wa?.nextRetryAt ? `Next retry ${new Date(wa.nextRetryAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : '';
 
   const startLink = async () => {
     setBusy(true); setErr(''); setPairing(null);
     try {
       const r = await api.whatsappLink();
-      if (r.method === 'qr') { setQr(r.dataUrl); setLinking(true); } else setPairing(r.code);
+      if (r.method === 'qr') { setQr(r.dataUrl); setLinking(true); }
+      else if (r.method === 'pairing') setPairing(r.code);
+      else { setLinking(false); setQr(null); onChanged(); }
     } catch (e) { setErr(e instanceof ApiError ? e.message : 'Could not start linking'); }
     finally { setBusy(false); }
   };
@@ -102,6 +107,7 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
   }, [linking, onChanged]);
 
   const disconnect = async () => { setBusy(true); try { await api.disconnectWhatsApp(); onChanged(); } finally { setBusy(false); } };
+  const reconnect = async () => { setBusy(true); setErr(''); try { await api.reconnectWhatsApp(); setLinking(false); setQr(null); onChanged(); } catch (e) { setErr(e instanceof ApiError ? e.message : 'Could not reconnect'); } finally { setBusy(false); } };
   const unlink = async () => { setBusy(true); try { await api.unlinkWhatsApp(); setLinking(false); setQr(null); onChanged(); } finally { setBusy(false); } };
   const approve = async () => { setBusy(true); try { await api.approveWhatsappSend(); onChanged(); } finally { setBusy(false); } };
 
@@ -112,11 +118,14 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
         <div style={{ flex: 1 }}>
           <div style={{ font: '700 var(--fs-title2)/1.1 var(--font-display)', color: 'var(--ink)' }}>WhatsApp</div>
           <div style={{ font: '400 var(--fs-footnote)/1.2 var(--font-text)', color: 'var(--ink-secondary)', marginTop: 2 }}>
-            {connected ? <>Linked{wa?.name ? <> as <b style={{ color: 'var(--ink)' }}>{wa.name}</b></> : ''} · {tracked} tracked chat{tracked !== 1 ? 's' : ''}</>
+            {linked ? <>Linked as <b style={{ color: 'var(--ink)' }}>{identity}</b> · {tracked} tracked chat{tracked !== 1 ? 's' : ''}</>
               : 'Summarize quiet chats and send the digest to your own number.'}
           </div>
         </div>
         {connected && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'rgba(52,199,89,0.14)', color: 'var(--green)', font: '600 var(--fs-caption)/1 var(--font-text)' }}><span style={{ width: 7, height: 7, borderRadius: 4, background: 'var(--green)' }} /> Live</span>}
+        {!connected && linked && status === 'paused' && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'rgba(142,142,147,0.14)', color: 'var(--ink-secondary)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Paused</span>}
+        {!connected && linked && (status === 'retrying' || status === 'offline' || status === 'connecting') && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'rgba(255,159,10,0.14)', color: 'var(--orange, #ff9f0a)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>{status === 'connecting' ? 'Connecting' : 'Offline — retrying'}</span>}
+        {!connected && linked && status === 'needs-attention' && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, height: 26, padding: '0 11px', borderRadius: 'var(--r-pill)', background: 'rgba(255,159,10,0.14)', color: 'var(--orange, #ff9f0a)', font: '600 var(--fs-caption)/1 var(--font-text)' }}>Needs attention</span>}
       </div>
 
       {/* The one-time send gate: never message your number until you allow it. */}
@@ -153,6 +162,25 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
           {IS_LOCAL && <button onClick={disconnect} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--ink)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Pause</button>}
           {IS_LOCAL && <button onClick={unlink} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Unlink</button>}
         </div>
+      ) : linked && status === 'paused' ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>WhatsApp is paused. Tracked chats and history stay on this Mac until you resume or unlink.</div>
+          {IS_LOCAL && <button onClick={reconnect} disabled={busy} style={{ height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Resume</button>}
+          {IS_LOCAL && <button onClick={unlink} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Unlink</button>}
+        </div>
+      ) : linked && status === 'needs-attention' ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>WhatsApp reported this connection was replaced. Credentials are still stored; reconnect manually when the other session is no longer active.</div>
+          {IS_LOCAL && <button onClick={reconnect} disabled={busy} style={{ height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Reconnect</button>}
+          {IS_LOCAL && <button onClick={unlink} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Unlink</button>}
+        </div>
+      ) : linked ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ flex: 1, font: '400 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--ink-tertiary)' }}>{status === 'connecting' ? 'Connecting with existing credentials.' : `Offline — retrying with existing credentials.${retryLabel ? ` ${retryLabel}.` : ''}`}</div>
+          {IS_LOCAL && <button onClick={reconnect} disabled={busy} style={{ height: 38, padding: '0 16px', borderRadius: 'var(--r-pill)', background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Reconnect now</button>}
+          {IS_LOCAL && <button onClick={disconnect} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--ink)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Pause</button>}
+          {IS_LOCAL && <button onClick={unlink} disabled={busy} style={{ height: 38, padding: '0 14px', borderRadius: 'var(--r-pill)', background: 'transparent', color: 'var(--red)', border: '0.5px solid var(--separator)', font: '600 var(--fs-callout)/1 var(--font-text)' }}>Unlink</button>}
+        </div>
       ) : !IS_LOCAL ? (
         <div style={{ font: '400 var(--fs-footnote)/1 var(--font-text)', color: 'var(--ink-tertiary)' }}>Link your WhatsApp number from the desktop app.</div>
       ) : qr ? (
@@ -176,7 +204,7 @@ function WhatsAppCard({ wa, tracked, onChanged }: { wa: WhatsAppState | null; tr
             <Icon name="alert" size={16} style={{ color: 'var(--red)', flexShrink: 0, marginTop: 1 }} />
             <span style={{ font: '400 var(--fs-caption)/1.4 var(--font-text)', color: 'var(--ink-secondary)' }}>This links your <b style={{ color: 'var(--ink)' }}>personal</b> number via an unofficial connection. WhatsApp may ban numbers that automate — this is your own informed choice. Your chats are read and stored only on this Mac (never sent to the relay).</span>
           </div>
-          <button onClick={startLink} disabled={busy} style={{ height: 42, padding: '0 20px', borderRadius: 11, background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{busy ? 'Starting…' : linked ? 'Re-link number' : 'Link your number'}</button>
+          <button onClick={startLink} disabled={busy} style={{ height: 42, padding: '0 20px', borderRadius: 11, background: 'var(--green)', color: '#fff', font: '600 var(--fs-callout)/1 var(--font-text)' }}>{busy ? 'Starting…' : 'Link your number'}</button>
           {err && <div style={{ marginTop: 10, font: '500 var(--fs-footnote)/1.4 var(--font-text)', color: 'var(--red)' }}>{err}</div>}
         </>
       )}
