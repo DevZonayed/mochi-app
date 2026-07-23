@@ -14,7 +14,7 @@
  */
 import { createHash } from 'node:crypto';
 import type { ShadowCollection } from '@maestro/realtime';
-import type { Project, ChatSession, Job, Approval, Schedule } from './store.js';
+import type { Project, ChatSession, Job, Approval, Schedule, TranscriptItem } from './store.js';
 import { redactProjectionPayload, canonicalStringify, DEFAULT_REDACT_BOUNDS } from './shadow-projection-redact.js';
 
 export const SHADOW_PROJECTION_SCHEMA_VERSION = 1 as const;
@@ -171,6 +171,36 @@ export function buildSessionView(s: ChatSession): ProjectionEntity | null {
 
 const JOB_STATUSES = ['pending', 'running', 'done', 'failed', 'cancelled', 'gated'] as const;
 
+// Controller-visible transcript kinds. `image`/`steer` carry no useful remote text and are
+// dropped. Raw tool commands (`TranscriptItem.cmd`) are NEVER projected — only the human
+// label (`text`) + tool name — per the "no raw tool args/commands" boundary above.
+const TRANSCRIPT_KINDS = ['text', 'thinking', 'tool', 'result', 'ask', 'review'] as const;
+const MAX_TRANSCRIPT_ITEMS = 40;         // last N items per turn (the tail is what matters)
+const MAX_TRANSCRIPT_ITEM_BYTES = 1400;  // per item text — redacted + bounded by boundedText
+const MAX_JOB_INPUT_BYTES = 4096;        // the user's full prompt for the turn
+
+/** Bounded, redacted structured transcript for a turn: assistant text, thinking, tool
+ *  labels, results. Every string flows through `boundedText` (redactor + byte cap). */
+function buildTranscript(items: readonly TranscriptItem[] | undefined): Array<Record<string, unknown>> | undefined {
+  if (!Array.isArray(items) || items.length === 0) return undefined;
+  const out: Array<Record<string, unknown>> = [];
+  for (const it of items.slice(-MAX_TRANSCRIPT_ITEMS)) {
+    const kind = safeEnum(it?.kind, TRANSCRIPT_KINDS);
+    if (!kind) continue;
+    const text = boundedText(it.text, MAX_TRANSCRIPT_ITEM_BYTES);
+    const name = boundedText(it.name, 128); // tool name / reviewer label (safe, human)
+    if (!text && !name) continue;
+    out.push(compact({
+      kind,
+      text,
+      name,
+      toolStatus: safeEnum(it.toolStatus, ['running', 'done', 'error'] as const),
+      verdict: safeEnum(it.verdict, ['approved', 'needs-work'] as const),
+    }));
+  }
+  return out.length ? out : undefined;
+}
+
 export function buildJobView(j: Job): ProjectionEntity | null {
   const id = safeId(j?.id);
   const projectId = safeId(j?.projectId);
@@ -191,6 +221,12 @@ export function buildJobView(j: Job): ProjectionEntity | null {
     // HIGH-1: raw `Job.error` / `Job.output` are NEVER projected — they carry filesystem
     // paths, stack traces, and connection-string credentials. Status/phase/stage/progress
     // (bounded enums/short strings, still redactor-scrubbed) convey job state safely.
+    // The controller transcript (Phase 3D2) projects the STRUCTURED run log instead:
+    //   `input`      — the user's prompt for this turn (redacted + bounded), and
+    //   `transcript` — assistant text / thinking / tool LABELS / results (never raw
+    //                  `output`, never raw tool `cmd`). Every string is redactor-scrubbed.
+    input: boundedText(j.input, MAX_JOB_INPUT_BYTES),
+    transcript: buildTranscript(j.transcript),
     createdAt: safeTimestamp(j.createdAt),
     lastActivity: safeTimestamp(j.updatedAt),
   });

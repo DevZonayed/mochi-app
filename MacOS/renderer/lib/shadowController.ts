@@ -260,10 +260,11 @@ export interface ApiErrorLike { status?: number; name?: string }
 export function genericMutationError(e: unknown): string {
   const status = (e as ApiErrorLike | undefined)?.status;
   if (status === 401) return 'Your session ended. Sign in again to manage controllers.';
+  if (status === 403) return 'The enrollment session has expired. Ask the device to send a new request.';
   if (status === 404 || status === 409 || status === 410) {
     return 'That request is no longer available — the list has been refreshed.';
   }
-  return 'That action couldn’t be completed. Please try again.';
+  return "That action couldn’t be completed. Please try again.";
 }
 
 export function genericLoadError(): string {

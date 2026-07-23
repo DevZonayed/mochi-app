@@ -319,6 +319,24 @@ function schedulePullSoon(): void {
   pullSoonTimer = setTimeout(() => { pullSoonTimer = null; void pullSync(); }, 800);
 }
 
+/* ── Rehydration (after storage.hydrate()) ──────────────────────────────────
+   The module-level `loadFromStorage()` runs at import time, BEFORE the async
+   `hydrate()` in App.tsx populates the in-memory cache. That means the sync
+   store always starts with EMPTY_STATE on cold boot. This function re-runs
+   `loadFromStorage()` AFTER hydration so the UI immediately shows the last-known
+   data from disk instead of blanking. Called once from App.tsx right after
+   `reloadActiveHost()` restores the host id. Does NOT kick a network pull —
+   `pullSync()` is called separately. */
+export function rehydrateSyncStore(): void {
+  const reloaded = loadFromStorage();
+  // Only replace if we got real data (persisted slice found); otherwise keep
+  // the current in-memory state (which may already have data from a pull).
+  if (reloaded.lastSync > 0 || reloaded.projects.length > 0) {
+    state = reloaded;
+    notify();
+  }
+}
+
 /* ── Host switch ───────────────────────────────────────────────────────────
    When the user picks a different Mac, swap the in-memory state to that host's
    persisted slice (instant render of its last-known data) and kick a fresh pull.

@@ -12,7 +12,21 @@ function makeClient(): Redis {
     const RedisMock = require('ioredis-mock') as new () => Redis;
     return new RedisMock();
   }
-  return new Redis(process.env.REDIS_URL as string);
+  const client = new Redis(process.env.REDIS_URL as string, {
+    // Keep retrying forever with a bounded backoff instead of giving up.
+    retryStrategy: (times: number) => Math.min(times * 200, 5000),
+    maxRetriesPerRequest: null,
+    enableOfflineQueue: true,
+  });
+  // CRITICAL: ioredis emits an 'error' event on every connection blip (idle close,
+  // network hiccup, reconnect). Without a listener Node treats it as an uncaught
+  // exception and CRASHES the process — which crash-looped the whole relay and hung
+  // every new /ws/remote/screen upgrade. Swallow (log) errors here; ioredis reconnects
+  // on its own via retryStrategy above.
+  client.on('error', (err: Error) => {
+    try { console.error('[redis] connection error (recovering):', err?.message ?? err); } catch { /* */ }
+  });
+  return client;
 }
 
 const main: Redis = makeClient();

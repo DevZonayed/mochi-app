@@ -10,7 +10,7 @@ import { openLiveStream } from './src/api';
 import { reloadSessionToken, reloadActiveHost, isAuthed, getActiveHost, subscribeActiveHost, subscribeSession } from './src/auth';
 import { registerForPush } from './src/push';
 import { setupPushNav } from './src/pushNav';
-import { pullSync, applyLiveEvent, readSyncStore } from './src/syncStore';
+import { pullSync, applyLiveEvent, readSyncStore, rehydrateSyncStore } from './src/syncStore';
 // Phase 3A2a: pull the native-controller enrollment production graph (runtime +
 // expo-secure-store / expo-crypto / expo-sqlite adapters) into the app bundle so
 // 3A2b can lazily start it. No network or auto-start happens on import.
@@ -40,6 +40,7 @@ export default function App() {
     hydrate().then(() => {
       reloadSessionToken();
       reloadActiveHost();
+      rehydrateSyncStore(); // re-read persisted data now that the cache is populated
       getShadowUiController(); // start the controller-UI store's lifecycle subscriptions
       void restoreControllerMode(); // restore the root-tree decision for the current account
       if (alive) setReady(true); // open the UI immediately — the screen runtime wires below

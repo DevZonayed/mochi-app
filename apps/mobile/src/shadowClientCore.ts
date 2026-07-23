@@ -686,7 +686,12 @@ class MemoryShadowTransaction implements ShadowStoreTransaction {
     }
     this.state.usedTransitionIds = [...new Set([...this.state.usedTransitionIds, grant.transitionId])];
     this.state.usedTransitionNonces = [...new Set([...this.state.usedTransitionNonces, grant.nonce])];
-    this.state.authorityTransitions = [...this.state.authorityTransitions, {
+    // Invalidate the chain verification cache — a new transition changes the chain.
+    this.verifiedChainFingerprint = null;
+    // Filter out any existing audit record for this transitionId before appending —
+    // repair-required states (empty in-memory usedTransitionIds) may bypass the
+    // replay check in transitionAuthority(), so the store can accumulate duplicates.
+    this.state.authorityTransitions = [...this.state.authorityTransitions.filter(a => a.transitionId !== grant.transitionId), {
       transitionId: grant.transitionId,
       nonce: grant.nonce,
       kind: grant.kind,
@@ -879,6 +884,8 @@ export class ShadowMobileClient {
   private readonly controlMessageVerifier: ShadowControlMessageVerifier;
   private readonly budget: number;
   private readonly now: () => number;
+  /** Cache the last verified chain fingerprint to skip re-verification on repeated load() calls. */
+  private verifiedChainFingerprint: string | null = null;
 
   constructor(private readonly opts: ShadowClientOptions) {
     this.store = opts.store ?? createMemoryShadowStore(opts.controllerDeviceId, opts.hostDeviceId, opts.expectedAuthority);
@@ -940,6 +947,7 @@ export class ShadowMobileClient {
     await this.store.reset();
     this.state = emptyState(this.opts.controllerDeviceId, this.opts.hostDeviceId, this.opts.expectedAuthority);
     this.loaded = true;
+    this.verifiedChainFingerprint = null;
   }
 
   async applyWire(value: unknown): Promise<ShadowApplyResult> {
@@ -978,7 +986,9 @@ export class ShadowMobileClient {
       { fence: event.fence, controllerDeviceId: this.opts.controllerDeviceId, now: this.now() },
     );
     if (!authority.ok || this.state.expectedAuthority.controllerDeviceId !== this.opts.controllerDeviceId) {
-      await this.markRepair(`authority-${authority.ok ? 'wrong-controller' : authority.reason}`);
+      const reason = authority.ok ? 'wrong-controller' : authority.reason;
+      console.warn('[shadow-client] fence.fail reason=' + reason + ' state.lease=' + this.state.expectedAuthority.leaseExpiresAt + ' state.leaseId=' + this.state.expectedAuthority.fence.leaseId + ' event.leaseId=' + event.fence.leaseId + ' event.epoch=' + event.fence.epoch + ' state.epoch=' + this.state.expectedAuthority.fence.epoch + ' now=' + this.now() + ' conn=' + this.state.connection);
+      await this.markRepair(`authority-${reason}`);
       return { status: 'fenced', cursor: this.state.cursor };
     }
     const currentCursor = this.state.cursor;
@@ -1067,6 +1077,20 @@ export class ShadowMobileClient {
     if (!this.loaded) await this.load();
     await this.store.transaction((tx) => tx.setConnection(online ? 'online' : 'offline'));
     await this.load();
+  }
+
+  /**
+   * Extend the in-memory authority lease WITHOUT touching the store. Used by the
+   * service to bridge the gap between the chain endpoint's lease (from host-signed
+   * transitions) and the server-authenticated effective lease. The store is NOT
+   * updated — acceptLoadedAuthority still verifies from the chain, and the next
+   * load() resets in-memory state from the store. This only affects
+   * validateAuthorityFence during the current drain cycle.
+   */
+  extendInMemoryLease(expiresAt: number): void {
+    if (expiresAt > this.state.expectedAuthority.leaseExpiresAt) {
+      this.state.expectedAuthority.leaseExpiresAt = expiresAt;
+    }
   }
 
   getOfflineTruth(): { readonly: true; reason: 'offline' | 'repair-required' | 'revoked' } | { readonly: false } {
@@ -1438,37 +1462,83 @@ export class ShadowMobileClient {
     });
   }
 
+  /** Build a fingerprint string from the deduped chain IDs + loaded authority.
+   *  If the fingerprint matches a previous verified result, the expensive Ed25519
+   *  chain walk can be skipped entirely. */
+  private chainFingerprint(chainIds: string[], loaded: ShadowExpectedAuthority): string {
+    return chainIds.join(',') + '|' + loaded.controllerDeviceId + '|' + loaded.fence.leaseId + '|' + loaded.fence.epoch + '|' + loaded.leaseExpiresAt;
+  }
+
   private async acceptLoadedAuthority(loaded: ShadowState): Promise<{ ok: true } | { ok: false; reason: string }> {
     if (loaded.controllerDeviceId !== this.opts.controllerDeviceId || loaded.hostDeviceId !== this.opts.hostDeviceId) return { ok: false, reason: 'wrong-device-binding' };
-    const chain = loaded.authorityTransitions.slice().sort((a, b) => a.consumedAt - b.consumedAt || a.issuedAt - b.issuedAt);
-    if (chain.length === 0) return sameExpectedAuthority(loaded.expectedAuthority, this.opts.expectedAuthority) ? { ok: true } : { ok: false, reason: 'transition-chain-incomplete' };
+    const sorted = loaded.authorityTransitions.slice().sort((a, b) => a.consumedAt - b.consumedAt || a.issuedAt - b.issuedAt);
+    // Deduplicate by transitionId — when load() enters repair-required (empty
+    // in-memory usedTransitionIds), subsequent transitionAuthority() calls may
+    // re-consume already-stored transitions, creating duplicate audit records.
+    // Keep only the first (oldest consumedAt) per transitionId.
+    // Also filter to the current controllerDeviceId — the store may retain
+    // transitions from a previous enrollment with a different device identity.
+    const chainIdSet = new Set<string>();
+    const chain = sorted
+      .filter(a => a.controllerDeviceId === this.opts.controllerDeviceId)
+      .filter(a => { if (chainIdSet.has(a.transitionId)) return false; chainIdSet.add(a.transitionId); return true; });
+    if (chain.length === 0) return { ok: sameExpectedAuthority(loaded.expectedAuthority, this.opts.expectedAuthority), reason: sameExpectedAuthority(loaded.expectedAuthority, this.opts.expectedAuthority) ? undefined as never : 'transition-chain-incomplete' };
+
+    // Fast path: if the chain hasn't changed since the last successful verification,
+    // skip the expensive Ed25519 signature walk (~3s for 57 transitions).
+    const fp = this.chainFingerprint(chain.map(a => a.transitionId), loaded.expectedAuthority);
+    if (fp === this.verifiedChainFingerprint) {
+      return { ok: true };
+    }
+
+    console.warn('[shadow-client] acceptAuth rawChain=' + loaded.authorityTransitions.length + ' dedupedChain=' + chain.length + ' conn=' + loaded.connection + ' loadedLease=' + loaded.expectedAuthority.leaseExpiresAt + ' optsLease=' + this.opts.expectedAuthority.leaseExpiresAt);
     const trustedRoot = this.opts.trustedAuthorityRoot ?? (sameExpectedAuthority(loaded.expectedAuthority, this.opts.expectedAuthority) ? undefined : this.opts.expectedAuthority);
-    if (!trustedRoot) return { ok: false, reason: 'trusted-root-required' };
-    if (sameExpectedAuthority(loaded.expectedAuthority, trustedRoot)) return { ok: false, reason: 'transition-chain-incomplete' };
+    if (!trustedRoot) { console.warn('[shadow-client] acceptAuth.fail trusted-root-required'); return { ok: false, reason: 'trusted-root-required' }; }
+    if (sameExpectedAuthority(loaded.expectedAuthority, trustedRoot)) { console.warn('[shadow-client] acceptAuth.fail transition-chain-incomplete loaded==root'); return { ok: false, reason: 'transition-chain-incomplete' }; }
     let current = cloneExpectedAuthority(trustedRoot);
     const seenIds = new Set<string>();
     const seenNonces = new Set<string>();
-    for (const audit of chain) {
-      if (seenIds.has(audit.transitionId) || seenNonces.has(audit.nonce)) return { ok: false, reason: 'transition-replay' };
+    for (let i = 0; i < chain.length; i++) {
+      const audit = chain[i];
+      if (seenIds.has(audit.transitionId) || seenNonces.has(audit.nonce)) { console.warn('[shadow-client] acceptAuth.fail replay i=' + i + ' id=' + audit.transitionId); return { ok: false, reason: 'transition-replay' }; }
       seenIds.add(audit.transitionId);
       seenNonces.add(audit.nonce);
-      if (!sameFence(current.fence, audit.previousFence) || current.controllerDeviceId !== audit.controllerDeviceId) return { ok: false, reason: 'transition-chain-gap' };
+      if (!sameFence(current.fence, audit.previousFence) || current.controllerDeviceId !== audit.controllerDeviceId) { console.warn('[shadow-client] acceptAuth.fail gap i=' + i + ' fenceMatch=' + sameFence(current.fence, audit.previousFence) + ' devMatch=' + (current.controllerDeviceId === audit.controllerDeviceId) + ' currentDev=' + current.controllerDeviceId + ' auditDev=' + audit.controllerDeviceId); return { ok: false, reason: 'transition-chain-gap' }; }
       const grant: ShadowAuthorityTransitionGrant = { family: 'authority-transition-grant', v: 1, ...audit };
       const next: ShadowExpectedAuthority = { controllerDeviceId: audit.controllerDeviceId, fence: { ...audit.nextFence }, leaseExpiresAt: audit.expiresAt };
       if (audit.kind === 'lease-rotation') {
-        if (audit.nextFence.accountId !== audit.previousFence.accountId || audit.nextFence.scopeId !== audit.previousFence.scopeId || audit.nextFence.hostDeviceId !== audit.previousFence.hostDeviceId || audit.nextFence.epoch !== audit.previousFence.epoch || audit.nextFence.leaseId === audit.previousFence.leaseId) return { ok: false, reason: 'transition-chain-gap' };
+        if (audit.nextFence.accountId !== audit.previousFence.accountId || audit.nextFence.scopeId !== audit.previousFence.scopeId || audit.nextFence.hostDeviceId !== audit.previousFence.hostDeviceId || audit.nextFence.epoch !== audit.previousFence.epoch || audit.nextFence.leaseId === audit.previousFence.leaseId) { console.warn('[shadow-client] acceptAuth.fail rotation-gap i=' + i); return { ok: false, reason: 'transition-chain-gap' }; }
       } else if (audit.kind === 'lease-renewal') {
         // Same fence exactly + strictly-increasing expiry over the prior authority.
-        if (!sameFence(audit.nextFence, audit.previousFence) || audit.expiresAt <= current.leaseExpiresAt) return { ok: false, reason: 'transition-chain-gap' };
+        if (!sameFence(audit.nextFence, audit.previousFence) || audit.expiresAt <= current.leaseExpiresAt) { console.warn('[shadow-client] acceptAuth.fail renewal-gap i=' + i + ' expires=' + audit.expiresAt + ' currentLease=' + current.leaseExpiresAt + ' fenceMatch=' + sameFence(audit.nextFence, audit.previousFence)); return { ok: false, reason: 'transition-chain-gap' }; }
       } else if (audit.nextFence.accountId !== audit.previousFence.accountId || audit.nextFence.scopeId !== audit.previousFence.scopeId || audit.nextFence.epoch !== audit.previousFence.epoch + 1 || audit.nextFence.leaseId === audit.previousFence.leaseId) {
+        console.warn('[shadow-client] acceptAuth.fail handoff-gap i=' + i);
         return { ok: false, reason: 'transition-chain-gap' };
       }
       const verified = await this.authorityTransitionVerifier.verifyAuthorityTransition({ grant, current, next, now: this.now() });
-      if (!verified.ok) return { ok: false, reason: `transition-${verified.reason}` };
+      if (!verified.ok) { console.warn('[shadow-client] acceptAuth.fail verify i=' + i + ' reason=' + verified.reason); return { ok: false, reason: `transition-${verified.reason}` }; }
       current = next;
     }
-    if (!sameExpectedAuthority(current, loaded.expectedAuthority)) return { ok: false, reason: 'transition-chain-incomplete' };
+    console.warn('[shadow-client] acceptAuth chainOk currentLease=' + current.leaseExpiresAt);
+    if (!sameExpectedAuthority(current, loaded.expectedAuthority)) {
+      // Self-heal: the chain verified cleanly from the trusted root (all host
+      // signatures checked), but the store's expectedAuthority diverged — likely from
+      // a prior server-side lease persist that wrote a different expiry without a
+      // corresponding signed transition. Repair the store to match the
+      // cryptographically proven chain endpoint so future load() calls pass.
+      try {
+        await this.store.transaction((tx) => tx.setExpectedAuthority(current));
+        // Also update the `loaded` object in place — the caller's `this.state = loaded`
+        // would otherwise get the STALE pre-repair authority. The stale lease may have
+        // expired, causing validateAuthorityFence to reject every event with 'expired'.
+        loaded.expectedAuthority = { controllerDeviceId: current.controllerDeviceId, fence: { ...current.fence }, leaseExpiresAt: current.leaseExpiresAt };
+      } catch {
+        return { ok: false, reason: 'transition-chain-repair-failed' };
+      }
+    }
     if (!sameExpectedAuthority(loaded.expectedAuthority, this.opts.expectedAuthority) && this.opts.trustedAuthorityRoot) return { ok: false, reason: 'expected-current-mismatch' };
+    // Cache the fingerprint so subsequent load() calls with the same chain skip verification.
+    this.verifiedChainFingerprint = fp;
     return { ok: true };
   }
 

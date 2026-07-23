@@ -15,7 +15,8 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function makeService() {
+function makeService(overrides?: { now?: () => number; expected?: ShadowExpectedAuthority }) {
+  const expected = overrides?.expected ?? expectedAuthority;
   const service = new ShadowControllerService({
     backend: {
       randomBytes: (n: number) => new Uint8Array(n).fill(7),
@@ -27,16 +28,16 @@ function makeService() {
       encrypt: async () => ({ iv: new Uint8Array(12), ciphertext: new Uint8Array(0), tag: new Uint8Array(16) }),
       decrypt: async () => new Uint8Array(0),
     } as any,
-    store: createMemoryShadowStore('ctrl', 'host', expectedAuthority),
+    store: createMemoryShadowStore('ctrl', 'host', expected),
     scopeKey: new Uint8Array(32).fill(9),
     scopeKeyId: 'sk1',
-    expectedAuthority,
+    expectedAuthority: expected,
     hostSigningPublicKey: new Uint8Array([1, 2, 3]),
     hostSigningKeyId: 'host-key',
     controllerSigner: { keyId: 'ctrl-key', sign: async () => new Uint8Array([1]) },
     session: async () => ({ accountId: 'acct', controllerDeviceId: 'ctrl', sessionToken: 'tok', relayOrigin: 'https://api.test' }),
     transport: { fetch: async () => { throw new Error('unused'); } },
-    now: () => 1_000,
+    now: overrides?.now ?? (() => 1_000),
   });
   return service as ShadowControllerService & { [k: string]: any };
 }
@@ -74,6 +75,7 @@ describe('ShadowControllerService initial drain and sync notifications', () => {
         return { status: 'applied' };
       },
       setOnline: async (value: boolean) => { online = value; },
+      extendInMemoryLease: () => {},
     };
     (svc as any).pollAcks = async () => { ackCalls += 1; };
     (svc as any).request = async (_method: string, path: string, body?: { hello?: { lastSeq: number } }) => {
@@ -131,7 +133,10 @@ describe('ShadowControllerService initial drain and sync notifications', () => {
     expect(new Set(appliedSeqs).size).toBe(752);
     expect(svc.status().online).toBe(true);
     expect(svc.status().lastSeq).toBe(752);
-    expect(notifications.some((entry) => entry.lastSeq === 500 && entry.online === false)).toBe(true);
+    // Early-online: the controller goes online as soon as authority is verified
+    // (before the event drain completes), so the first notification at lastSeq=500
+    // already has online=true. The drain completes in the background.
+    expect(notifications.some((entry) => entry.lastSeq === 500 && entry.online === true)).toBe(true);
     expect(notifications.some((entry) => entry.lastSeq === 752 && entry.online === true)).toBe(true);
   });
 
@@ -156,6 +161,7 @@ describe('ShadowControllerService initial drain and sync notifications', () => {
         return { status: 'applied' };
       },
       setOnline: async (value: boolean) => { online = value; },
+      extendInMemoryLease: () => {},
     };
     (svc as any).pollAcks = async () => {};
     (svc as any).request = async (_method: string, path: string) => {
@@ -180,11 +186,83 @@ describe('ShadowControllerService initial drain and sync notifications', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(svc.status().online).toBe(false);
+    // Early-online: the controller goes online as soon as authority is verified,
+    // even when the event drain is incomplete. The drain continues in the background.
+    expect(svc.status().online).toBe(true);
     expect(svc.status().lastSeq).toBe(15);
     expect(svc.status().lastError).toBe('baseline-drain-incomplete');
     expect(lastSeq).toBeGreaterThanOrEqual(10);
     expect(Math.min(...appliedSeqs)).toBe(11);
     expect(notifications).toBeGreaterThanOrEqual(2);
+  });
+
+  it('re-extends the (host-renewed) lease mid-drain instead of fencing when a slow drain nears expiry', async () => {
+    // Regression for the "Live but 0 Projects/Jobs" bug: a fresh grant's baseline drain
+    // of hundreds of events over a slow link outlasts the granted lease window, so the
+    // lease expires MID-DRAIN, every remaining event fences, and the projection stays
+    // empty (repair loop). The fix re-fetches the host-renewed lease when the in-memory
+    // lease nears expiry so the drain completes. Here time advances 1.5s per applied event
+    // (a slow drain), the initial lease is only 40s out, and the authority endpoint (the
+    // host actively renewing) always reports a lease 60s past "now".
+    const BASE = 1_000_000;
+    let nowMs = BASE;
+    const expected: ShadowExpectedAuthority = {
+      fence: { accountId: 'acct', scopeId: 'scope', hostDeviceId: 'host', epoch: 43, leaseId: 'lease_43' },
+      controllerDeviceId: 'ctrl',
+      leaseExpiresAt: BASE + 40_000, // only 40s of runway — a 60-event × 1.5s drain must outlast it
+    };
+    const svc = makeService({ now: () => nowMs, expected });
+
+    const authorityCalls: number[] = [];
+    const extendInMemoryCalls: number[] = [];
+    const appliedSeqs: number[] = [];
+    let lastSeq = 0;
+    let online = false;
+
+    (svc as any).client = {
+      load: async () => {},
+      read: () => ({
+        cursor: lastSeq > 0 ? { lastSeq, lastEventId: `e${lastSeq}`, lastDigest: `d${lastSeq}` } : null,
+        connection: online ? 'online' : 'offline',
+        entities: appliedSeqs.map((seq) => ({ seq })),
+        commands: [],
+      }),
+      applyWire: async (wire: { seq: number }) => {
+        appliedSeqs.push(wire.seq);
+        lastSeq = Math.max(lastSeq, wire.seq);
+        nowMs += 1_500; // slow per-event decrypt/verify/write advances the clock
+        return { status: 'applied' };
+      },
+      setOnline: async (value: boolean) => { online = value; },
+      extendInMemoryLease: (v: number) => { extendInMemoryCalls.push(v); },
+    };
+    (svc as any).pollAcks = async () => {};
+    (svc as any).request = async (_method: string, path: string) => {
+      if (path.startsWith('/api/shadow/transitions')) return { ok: true, status: 200, json: { grants: [] } };
+      if (path.startsWith('/api/shadow/authority')) {
+        authorityCalls.push(nowMs);
+        return { ok: true, status: 200, json: { fence: expected.fence, expiresAt: nowMs + 60_000 } };
+      }
+      if (path === '/api/shadow/connect') {
+        return { ok: true, status: 200, json: { decision: { decision: 'delta', fromSeq: 0, toSeq: 60 }, events: Array.from({ length: 60 }, (_, i) => ({ seq: i + 1 })) } };
+      }
+      if (path === '/api/shadow/cursor') return { ok: true, status: 200, json: { ok: true } };
+      if (path.startsWith('/api/shadow/commands/acks')) return { ok: true, status: 200, json: { acks: [] } };
+      throw new Error(`unexpected ${path}`);
+    };
+
+    await svc.connect();
+
+    // The drain completes: all 60 events applied. Without mid-drain re-extension the lease
+    // (40s) would expire ~event 27 (27 × 1.5s > 40s) and the loop would break early.
+    expect(appliedSeqs).toHaveLength(60);
+    expect(new Set(appliedSeqs).size).toBe(60);
+    // The authority was re-fetched DURING the drain (pre-drain reconcile + ≥1 mid-drain
+    // refresh), and each refresh pushed the extended lease into the client.
+    expect(authorityCalls.length).toBeGreaterThan(1);
+    expect(extendInMemoryCalls.length).toBeGreaterThan(1);
+    // The controller stays online with the full head.
+    expect(svc.status().online).toBe(true);
+    expect(svc.status().lastSeq).toBe(60);
   });
 });

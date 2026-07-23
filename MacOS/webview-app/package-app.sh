@@ -354,7 +354,20 @@ else
   echo "  warning: no embedded node at $SMOKE_NODE — skipping native preflight (dev/system-node build)"
 fi
 
-echo "> ad-hoc codesign"
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "  (codesign skipped)"
+# Prefer a STABLE local code-signing identity ("Mochlet Local Signing") when one is
+# installed in the login keychain. macOS TCC (Screen Recording, Accessibility, …) keys a
+# grant to the app's designated requirement; an ad-hoc signature bakes the cdhash into that
+# requirement, so EVERY rebuild changes it and the OS re-prompts for permissions. A stable
+# self-signed cert makes the requirement `certificate leaf = H"…"` (constant across
+# rebuilds), so a granted permission persists. Falls back to ad-hoc when no such identity
+# exists (CI / other machines), preserving the previous behaviour there.
+SIGN_ID="-"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Mochlet Local Signing"; then
+  SIGN_ID="Mochlet Local Signing"
+  echo "> codesign with stable identity ($SIGN_ID)"
+else
+  echo "> ad-hoc codesign (no 'Mochlet Local Signing' identity in keychain)"
+fi
+codesign --force --deep --sign "$SIGN_ID" "$APP" >/dev/null 2>&1 || echo "  (codesign skipped)"
 
 echo "built $APP"

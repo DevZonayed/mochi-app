@@ -33,6 +33,8 @@ import { ProjectSessionsScreen } from './screens/ProjectSessions';
 import { SessionChatScreen } from './screens/SessionChat';
 import { QueueScreen } from './screens/Queue';
 import { CreateProjectScreen } from './screens/CreateProject';
+import { ChatsScreen } from './screens/Chats';
+import { MacScreenScreen } from './screens/MacScreen';
 import { ControllerScreen } from './screens/controller/ControllerScreen';
 
 export type RootStackParamList = {
@@ -50,6 +52,7 @@ export type RootStackParamList = {
   SessionChat: { projectId: string; sessionId?: string; title?: string };
   Queue: undefined;
   CreateProject: undefined;
+  MacScreen: undefined;
 };
 
 /** Secure-controller root param list — a SEPARATE tree with NO route back into the
@@ -64,6 +67,7 @@ const Stack = createNativeStackNavigator<RootStackParamList>();
 const TAB_ICON: Record<string, IconName> = {
   Home: 'home',
   Projects: 'folder',
+  Chats: 'messageCircle',
   Approvals: 'shield',
   Settings: 'settings',
 };
@@ -87,6 +91,7 @@ function Tabs() {
     >
       <Tab.Screen name="Home" component={HomeScreen} />
       <Tab.Screen name="Projects" component={ProjectsScreen} />
+      <Tab.Screen name="Chats" component={ChatsScreen} />
       <Tab.Screen name="Approvals" component={ApprovalsScreen} options={{ tabBarBadge: pending > 0 ? pending : undefined }} />
       <Tab.Screen name="Settings" component={SettingsScreen} />
     </Tab.Navigator>
@@ -211,6 +216,7 @@ export function RootNavigator() {
         <Stack.Screen name="SessionChat" component={SessionChatScreen} />
         <Stack.Screen name="Queue" component={QueueScreen} />
         <Stack.Screen name="CreateProject" component={CreateProjectScreen} options={{ presentation: 'modal' }} />
+        <Stack.Screen name="MacScreen" component={MacScreenScreen} options={{ headerShown: false, animation: 'slide_from_bottom' }} />
       </Stack.Navigator>
     </NavigationContainer>
   );

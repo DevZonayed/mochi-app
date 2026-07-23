@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { View, Text, Pressable, ScrollView, ActivityIndicator, Alert, RefreshControl } from 'react-native';
+import { View, Text, Pressable, ScrollView, TextInput, ActivityIndicator, Alert, RefreshControl } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
@@ -45,6 +45,7 @@ export function ProjectsScreen() {
   const syncing = useSyncStore((s) => s.syncing);
   const hostOnline = useSyncStore((s) => s.hostOnline);
   const [filter, setFilter] = useState<string>('all'); // 'all' or a kind key
+  const [search, setSearch] = useState('');
 
   const colorFor = (c: string): string => (COLOR_NAMES.includes(c as ColorName) ? theme.color[c as ColorName] : theme.color.blue);
 
@@ -180,7 +181,9 @@ export function ProjectsScreen() {
   };
 
   // Which type tabs to show (only kinds that actually have projects) + counts.
-  const present = KINDS.map((k) => ({ ...k, items: projects.filter((p) => bucketOf(p) === k.key) })).filter((g) => g.items.length > 0);
+  const q = search.toLowerCase().trim();
+  const filteredProjects = q ? projects.filter((p) => p.name.toLowerCase().includes(q)) : projects;
+  const present = KINDS.map((k) => ({ ...k, items: filteredProjects.filter((p) => bucketOf(p) === k.key) })).filter((g) => g.items.length > 0);
   const shownGroups = filter === 'all' ? present : present.filter((g) => g.key === filter);
 
   return (
@@ -202,6 +205,28 @@ export function ProjectsScreen() {
             </Pressable>
           </View>
         </View>
+
+        {/* Search bar */}
+        {projects.length > 0 ? (
+          <View style={{ marginHorizontal: 16, marginBottom: 12 }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, height: 40, paddingHorizontal: 12, borderRadius: 12, backgroundColor: theme.color.fillSecondary }}>
+              <Icon name="search" size={16} color={theme.color.inkTertiary} />
+              <TextInput
+                value={search}
+                onChangeText={setSearch}
+                placeholder="Search projects..."
+                placeholderTextColor={theme.color.inkTertiary}
+                style={{ flex: 1, fontSize: 15, color: theme.color.ink, paddingVertical: 0 }}
+                returnKeyType="search"
+              />
+              {search ? (
+                <Pressable onPress={() => setSearch('')} hitSlop={8}>
+                  <Icon name="x" size={14} color={theme.color.inkTertiary} />
+                </Pressable>
+              ) : null}
+            </View>
+          </View>
+        ) : null}
 
         {syncError ? (
           <SyncErrorBanner kind={syncError} onRetry={onRefresh} />

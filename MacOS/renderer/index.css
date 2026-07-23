@@ -30,6 +30,14 @@ label,
   -webkit-app-region: no-drag;
 }
 
+/* Screen-share banner: while a controller is viewing this Mac, ScreenShareBannerHost adds
+   `screen-sharing` to <body>. The banner is a fixed bar at the very top; shift the whole app
+   down by its height so the top navigation is never hidden behind it. The `!important` height
+   override wins over the routes' inline `height:100vh` so nothing overflows off-screen. */
+:root { --share-banner-h: 30px; }
+body.screen-sharing #root { padding-top: var(--share-banner-h); box-sizing: border-box; }
+body.screen-sharing #root > * { height: calc(100vh - var(--share-banner-h)) !important; }
+
 /* Sidebar resize handle: invisible hit-strip with a hairline that lights up on
    hover/drag so the resize affordance is discoverable. Lives globally so it
    works on every screen (the chrome wraps all routes). */

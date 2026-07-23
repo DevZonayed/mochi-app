@@ -137,6 +137,15 @@ const CONTROLLER_BOOTSTRAP_LEASE_MS = 60_000;
 
 export interface MobileSessionProvider {
   get(): Promise<{ accountId: string; controllerDeviceId: string; sessionToken: string; relayOrigin: string }>;
+  /**
+   * Mint a fresh device ID and persist it, replacing the current one. Called
+   * automatically when the server returns 409 "controller already enrolled" —
+   * the local grant data was lost but the server still has the old enrollment
+   * keyed by the previous device ID. Rotating allows a clean re-enrollment
+   * without requiring a Mac-side revoke first.
+   * Optional — when absent the 409 surfaces as a normal error.
+   */
+  rotateDeviceId?(): string;
 }
 
 export interface ShadowMobileEnrollmentOptions {
@@ -287,6 +296,8 @@ export class ShadowMobileEnrollmentRuntime {
   private grant: StoredGrantMeta | null = null;
   private scopeKey: Uint8Array | null = null;
   private online = false;
+  /** Guard against concurrent `acceptGrant` calls from racing poll() invocations. */
+  private accepting = false;
   /** B1-R1: grant/authority-change listeners. Fired on EVERY change that can affect a
    * dependent runtime's material/capabilities — restore, fresh accept, lease renewal,
    * revoke, and purge/clear — so the screen runtime re-attaches (or detaches) the client
@@ -319,9 +330,24 @@ export class ShadowMobileEnrollmentRuntime {
    * retained by the host regardless. Returns false (no-op) if it is too late to change.
    */
   setRequestedCapabilities(caps: readonly ShadowCapability[]): boolean {
-    if (this.state !== 'idle' && this.state !== 'parsing' && this.state !== 'confirming') return false;
+    // Allow 'error' — the UI maps it to 'unenrolled' (the chooser screen),
+    // and resetToIdle() below ensures the state machine re-enters idle cleanly
+    // before the next enrollment starts.
+    if (this.state !== 'idle' && this.state !== 'parsing' && this.state !== 'confirming' && this.state !== 'error') return false;
+    if (this.state === 'error') this.resetToIdle();
     this.requestedCaps = caps;
     return true;
+  }
+
+  /** Synchronous micro-reset from 'error' → 'idle' so the chooser can start fresh. */
+  private resetToIdle(): void {
+    this.bootstrap = null;
+    if (this.presentedSecret) this.presentedSecret.fill(0);
+    this.presentedSecret = null;
+    this.online = false;
+    this.state = 'idle';
+    this.lastError = undefined;
+    this.acceptedAuthorityPersistenceReason = undefined;
   }
 
   status(): EnrollmentStatus {
@@ -455,7 +481,16 @@ export class ShadowMobileEnrollmentRuntime {
     if (!persistedIdentity) return 'identity.missing';
     const loadedIdentity = await this.loadPersistedIdentity(input.identity.deviceId, persistedIdentity);
     if (!loadedIdentity.ok) return 'identity.invalid';
-    const persistedScopeKey = await this.opts.secureStore.getItemAsync(secureKeyScope(input.grant.fence.scopeId, input.identity.deviceId));
+    // Android EncryptedSharedPreferences can resolve the write Promise before the
+    // data is readable on a subsequent get. Retry the scope-key read a few times
+    // with a small delay to handle this platform-level timing window.
+    const scopeKeyName = secureKeyScope(input.grant.fence.scopeId, input.identity.deviceId);
+    let persistedScopeKey: string | null = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      persistedScopeKey = await this.opts.secureStore.getItemAsync(scopeKeyName);
+      if (persistedScopeKey !== null) break;
+      if (attempt < 3) await new Promise(r => setTimeout(r, 150));
+    }
     if (!persistedScopeKey) return 'scope.missing';
     if (base64urlEncode(input.scopeKey) !== persistedScopeKey) return 'scope.mismatch';
     const persistedGrant = await this.opts.metaStore.loadGrant();
@@ -585,7 +620,18 @@ export class ShadowMobileEnrollmentRuntime {
    * one-time secret proof. idle→requesting→awaiting-host.
    */
   async requestEnrollment(): Promise<{ ok: true } | { ok: false; reason: string }> {
-    if (this.state !== 'confirming' || !this.bootstrap) return { ok: false, reason: 'not-confirming' };
+    return this.requestEnrollmentInner(false);
+  }
+
+  /**
+   * Inner request loop. On 409 "controller already enrolled", the local grant
+   * data is missing but the server still has the old enrollment keyed by this
+   * device ID. If a `rotateDeviceId` hook is available, rotate once and retry
+   * with a fresh identity — transparent to the user.
+   */
+  private async requestEnrollmentInner(isRetry: boolean): Promise<{ ok: true } | { ok: false; reason: string }> {
+    if (this.state !== 'confirming' && this.state !== 'requesting') return { ok: false, reason: 'not-confirming' };
+    if (!this.bootstrap) return { ok: false, reason: 'not-confirming' };
     this.transition('requesting');
     try {
       const s = await this.opts.session.get();
@@ -601,6 +647,30 @@ export class ShadowMobileEnrollmentRuntime {
         { method: 'POST', path: '/api/shadow/enroll/request', includeDeviceId: false, body: { sessionId: this.bootstrap.sessionId, request, presentedSecret: base64urlEncode(presentedSecret), idempotencyKey: enrollmentIdempotencyKey(request.nonce) } },
       );
       if (!res.ok) {
+        // 409 "controller already enrolled": local grant lost but server remembers.
+        // Rotate the device ID (if supported) and retry once with a fresh identity.
+        const isAlreadyEnrolled = res.status === 409
+          && (res.code === 'controller_already_enrolled' || res.error === 'controller already enrolled');
+        if (isAlreadyEnrolled && !isRetry && this.opts.session.rotateDeviceId) {
+          // Capture the host id before we tear down the (now stale) bootstrap.
+          const hostDeviceId = this.bootstrap.hostDeviceId;
+          try {
+            await this.opts.secureStore.deleteItemAsync(secureKeyIdentity(identity.deviceId));
+          } catch { /* best-effort cleanup */ }
+          this.identity = null;
+          this.opts.session.rotateDeviceId();
+          // CRITICAL: the existing bootstrap challenge is bound to the PREVIOUS device id.
+          // Reusing it after a device-id rotation makes the host-approved grant unverifiable
+          // on the controller (the challenge↔identity transcript no longer matches), so the
+          // approval silently never lands and the UI hangs forever on "Waiting for your Mac".
+          // Re-issue a FRESH challenge for the rotated device id, then rebuild + resubmit the
+          // request against it. `requestedCaps` is preserved across the rotation.
+          this.bootstrap = null;
+          this.state = 'idle';
+          const rechallenge = await this.startAccountEnrollment(hostDeviceId);
+          if (!rechallenge.ok) return { ok: false, reason: rechallenge.reason };
+          return this.requestEnrollmentInner(true);
+        }
         const reason = safeEnrollmentFailure('enrollment request', res);
         this.fail(reason);
         return { ok: false, reason };
@@ -650,6 +720,21 @@ export class ShadowMobileEnrollmentRuntime {
   }
 
   private async acceptGrant(grant: EnrollmentGrantMessage, keyMaterial: EnrollmentKeyMaterial): Promise<EnrollmentState> {
+    // Guard: multiple concurrent poll() calls can all see "approved" and race into
+    // acceptGrant simultaneously. Each computes a slightly different leaseExpiresAt
+    // (this.now() differs), so concurrent SQLite writes cause grant.mismatch when the
+    // verify step reads back whichever write landed last. Only the FIRST caller runs;
+    // subsequent callers return the current state (which will be 'accepted' or 'error').
+    if (this.accepting || this.state !== 'awaiting-host') return this.state;
+    this.accepting = true;
+    try {
+      return await this.acceptGrantInner(grant, keyMaterial);
+    } finally {
+      this.accepting = false;
+    }
+  }
+
+  private async acceptGrantInner(grant: EnrollmentGrantMessage, keyMaterial: EnrollmentKeyMaterial): Promise<EnrollmentState> {
     const bootstrap = this.bootstrap!;
     const identity = this.identity!;
     const transcriptHash = base64urlDecode(keyMaterial.transcriptHash);
@@ -977,7 +1062,17 @@ export class ShadowMobileEnrollmentRuntime {
       hostSigningPublic,
       identity: {
         accountId: grant.fence.accountId, hostDeviceId: grant.fence.hostDeviceId, controllerDeviceId: grant.controllerDeviceId,
-        grantId: grant.grantId, scopeId: grant.fence.scopeId, epoch: grant.fence.epoch, leaseId: grant.fence.leaseId, leaseExpiresAt: grant.leaseExpiresAt,
+        grantId: grant.grantId, scopeId: grant.fence.scopeId, epoch: grant.fence.epoch, leaseId: grant.fence.leaseId,
+        // grant.leaseExpiresAt is a bootstrap value frozen at accept time (now + 60s) and is
+        // NOT refreshed on ordinary lease renewal — the host renews its lease forward WITHOUT
+        // changing the leaseId, so a live host carries a far-future leaseExpiresAt while this
+        // frozen copy expires within a minute. leaseExpiresAt is NOT bound into the signed
+        // control transcript (only leaseId is), so it need only pass the LOCAL fail-closed
+        // `leaseExpiresAt > now` guard in verifyScreenControl. screenClientMaterial() is only
+        // reached when the controller is currently online + screen.view-granted (authority is
+        // live), so re-seeding the bootstrap window here is truthful — without it EVERY host
+        // screen-accept is rejected `lease-expired` and no frame is ever decoded.
+        leaseExpiresAt: Math.max(grant.leaseExpiresAt, this.now() + CONTROLLER_BOOTSTRAP_LEASE_MS),
       },
     };
   }

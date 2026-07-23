@@ -151,6 +151,28 @@ describe('shadowScreenStream — frame seal/open round-trip', () => {
     }
   });
 
+  it('seals a fractional (non-integer) captureTsMs — native sends Date()*1000.0 floats', async () => {
+    // Regression: the native capture timestamps frames with
+    // `Date().timeIntervalSince1970 * 1000.0` (a Double), so captureTsMs arrives
+    // fractional. The AAD encodes it as u64 (Number.isSafeInteger guard), so an
+    // un-floored float threw 'bad-u64' and EVERY frame failed to seal. The sender
+    // must normalise to an integer; the receiver reads the same floored value.
+    const { hostKey, ctrlKey } = await bothKeys();
+    const sender = new ScreenFrameSender(backend, hostKey, BINDING, 1);
+    const receiver = new ScreenFrameReceiver(backend, ctrlKey, BINDING, 1, { expiresAtMs: 10 ** 15 });
+    const frame = fakeFrame(7);
+    const env = await sender.seal(frame, 1_753_243_484_123.456); // fractional ms
+    const parsed = parseScreenFrameHeader(env);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.header.captureTsMs).toBe(1_753_243_484_123);
+    const res = await receiver.accept(env, 1_753_243_484_200);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(Buffer.from(res.frameBytes).equals(Buffer.from(frame))).toBe(true);
+      expect(res.meta.captureTsMs).toBe(1_753_243_484_123);
+    }
+  });
+
   it('streams many frames in-order with strictly increasing seq', async () => {
     const { hostKey, ctrlKey } = await bothKeys();
     const sender = new ScreenFrameSender(backend, hostKey, BINDING, 1);

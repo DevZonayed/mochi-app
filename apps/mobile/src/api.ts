@@ -432,14 +432,16 @@ export const api = {
 
   /* ── Host snapshot sync ──────────────────────────────────────────────── */
 
-  /** Pull the active host's full mirrored snapshot and adapt it to the store's
-      `SyncDelta` shape (full upsert, tombstones honored). The account server's
-      /api/sync returns {host, snapshot}; there is no incremental delta, so
-      `since` is ignored (kept for call-site compatibility). */
-  sync: async (_since: number): Promise<SyncDelta> => {
+  /** Pull the active host's mirrored snapshot and adapt it to the store's
+      `SyncDelta` shape (full upsert, tombstones honored). Passes `since` so
+      the server can return only the delta when it supports incremental sync;
+      today the server ignores it and returns the full snapshot. */
+  sync: async (since: number): Promise<SyncDelta> => {
     const hostId = getActiveHost();
     if (!hostId) throw new NoHostError();
-    const { host, snapshot } = await accountReq<{ host: string; snapshot: SnapshotShape | null }>('/api/sync' + qp({ host: hostId }));
+    const params: Record<string, string> = { host: hostId };
+    if (since > 0) params.since = String(since);
+    const { host, snapshot } = await accountReq<{ host: string; snapshot: SnapshotShape | null }>('/api/sync' + qp(params));
     return snapshotToDelta(host, snapshot);
   },
 

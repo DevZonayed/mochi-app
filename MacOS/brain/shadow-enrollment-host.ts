@@ -646,6 +646,41 @@ export class ShadowHostEnrollmentRuntime {
   }
 
   /**
+   * Clear SERVER-side "orphan" controller grants — controllers active on the relay that
+   * the host no longer tracks locally (left behind by local resets). Each is host-signed
+   * revoked with EMPTY rotations (no scope-key rotation): the orphans are dead sessions, so
+   * leaving the key unrotated is safe and keeps the local + real-controller scope key intact.
+   * This stops the self-healing lease renewal from having to sign a grant for each orphan
+   * every cycle, which was churning the authority chain and preventing controllers from
+   * reaching a stable verified state. Returns the ids actually revoked.
+   */
+  async purgeServerOrphans(): Promise<{ revoked: string[]; skipped: string[] }> {
+    const { s, identity } = await this.requireRunning();
+    const fence = this.requireFence();
+    const server = await this.listControllers();
+    const serverActive = [...new Set(server.filter((c) => c.status === 'active').map((c) => c.controllerDeviceId))];
+    const localActive = new Set(this.record.controllers.filter((c) => c.status === 'active').map((c) => c.controllerDeviceId));
+    const orphans = serverActive.filter((id) => !localActive.has(id));
+    const client = await this.enrolledClient(s);
+    const revoked: string[] = [];
+    const skipped: string[] = [];
+    for (const controllerDeviceId of orphans) {
+      const keyRotationId = 'kr_' + base64urlEncode(backend.randomBytes(12));
+      const revocation = await signDeviceRevocation(backend, identity, {
+        family: 'device-revocation', v: 1, fence, controllerDeviceId, revokedAt: this.now(), keyRotationId,
+      });
+      const effectiveSeq = this.record.revocationSeq + 1;
+      const res = await client.requestEnrolled<{ ok: boolean; keyRotationId: string; alreadyRevoked: boolean }>(
+        this.shadowSession(s), this.signer(identity),
+        { method: 'POST', path: '/api/shadow/enroll/revoke', body: { scopeId: fence.scopeId, controllerDeviceId, revocation, effectiveSeq, remainingRotations: [] } },
+      );
+      if (res.ok) { this.record.revocationSeq = effectiveSeq; this.persist(); revoked.push(controllerDeviceId); }
+      else skipped.push(`${controllerDeviceId}:${res.status}`);
+    }
+    return { revoked, skipped };
+  }
+
+  /**
    * Explicit local recovery for the expired-lease + active-controller deadlock.
    * It is deliberately narrower than `revoke()`:
    *  - allowed only in the exact expired-active-controller error state;
@@ -859,24 +894,37 @@ export class ShadowHostEnrollmentRuntime {
     const now = this.now();
     const requestedExpiresAt = Math.max(now + LEASE_RENEW_TTL_MS, previousExpiresAt + 1_000);
     const renewalId = `rn_${now}_${base64urlEncode(backend.randomBytes(9))}`;
-    const active = this.record.controllers.filter((c) => c.status === 'active');
+    // renew-with-transitions requires grants covering EXACTLY the SERVER's active
+    // controller set — which can diverge from the local record after a local reset. The
+    // renewal grant is host-signed and needs only the controllerDeviceId, so the host can
+    // sign for controllers it no longer tracks locally. Cover the server's set (deduped) so
+    // renewal never fails "grants must cover exactly the active controllers"; fall back to
+    // the local record if the server list is momentarily unavailable. (Data-plane serving
+    // still uses the local record, so this never resurrects an orphan into the live plane.)
+    const localActiveIds = [...new Set(this.record.controllers.filter((c) => c.status === 'active').map((c) => c.controllerDeviceId))];
+    let activeIds = localActiveIds;
+    try {
+      const server = await this.listControllers();
+      const serverActiveIds = [...new Set(server.filter((c) => c.status === 'active').map((c) => c.controllerDeviceId))];
+      activeIds = serverActiveIds;
+    } catch { /* keep local fallback */ }
     const signedGrants: AuthorityTransitionGrantFields[] = [];
-    for (const c of active) {
+    for (const controllerDeviceId of activeIds) {
       const unsigned: Omit<AuthorityTransitionGrantFields, 'signature'> = {
         family: 'authority-transition-grant', v: 1,
-        transitionId: `tr_${renewalId}_${c.controllerDeviceId}`,
+        transitionId: `tr_${renewalId}_${controllerDeviceId}`,
         kind: 'lease-renewal',
-        controllerDeviceId: c.controllerDeviceId,
+        controllerDeviceId,
         previousFence: fence, nextFence: fence,
         issuedAt: now, expiresAt: requestedExpiresAt,
-        nonce: `n_${renewalId}_${c.controllerDeviceId}`,
+        nonce: `n_${renewalId}_${controllerDeviceId}`,
         keyId: identity.signingKeyId,
       };
       signedGrants.push(await signAuthorityTransition(backend, identity.keys.signing.privateKey, unsigned));
     }
     const intent: PendingLeaseRenewal = {
       renewalId, previousFence: fence, previousExpiresAt, requestedExpiresAt, createdAt: now,
-      signedGrants, activeControllerIds: active.map((c) => c.controllerDeviceId), status: 'pending',
+      signedGrants, activeControllerIds: activeIds, status: 'pending',
     };
     this.record.pendingLeaseRenewal = intent;
     this.persist(); // DURABLE before the network — the crux of the fix.
@@ -900,6 +948,7 @@ export class ShadowHostEnrollmentRuntime {
         expectedCurrentExpiresAt: intent.previousExpiresAt, requestedExpiresAt: intent.requestedExpiresAt, grants: intent.signedGrants,
       } },
     );
+    try { process.stderr.write(`[DIAG renew] ok=${res.ok} status=${res.status} error=${JSON.stringify(res.error ?? null)} sentFence=${JSON.stringify(intent.previousFence)} grants=${intent.signedGrants.length}\n`); } catch { /* */ }
     if (res.ok && res.json) {
       await this.crashAt('after-server-before-local');
       this.record.fence = res.json.fence;
@@ -1130,6 +1179,17 @@ export class ShadowHostEnrollmentRuntime {
     const currentFence = this.record.fence;
     const shouldRenewCurrentLease = !!currentFence && this.hasUsableLease();
     if (currentFence && !shouldRenewCurrentLease && this.activeControllers().length > 0 && !options.allowExpiredActiveControllers) {
+      // The persisted lease expired while controllers are still active. Before forcing
+      // a destructive re-enrollment on every restart/sleep that outlasts the short lease
+      // TTL, attempt an ATOMIC SAME-FENCE renewal via renew-with-transitions. The relay
+      // extends an expired lease ONLY when the proven fence still matches the LIVE server
+      // lease exactly — i.e. NO successor host took the scope — and KEEPS the epoch, so
+      // every enrolled controller's authority chain stays valid (no re-verification, no
+      // re-enroll). A genuine successor (someone else acquired the scope) fails closed
+      // below, which is the only case where re-enrollment is truly required. Durable
+      // intent + crash recovery are reused from the steady-state renewal path.
+      const resumed = await this.resumeExpiredLeaseSameFence(s);
+      if (resumed) return;
       throw errStatus('host lease expired with active controllers; re-enrollment required', 409);
     }
     // On restart the same host RENEWS its lease by proving the persisted fence +
@@ -1150,9 +1210,42 @@ export class ShadowHostEnrollmentRuntime {
       { method: 'POST', path: '/api/shadow/lease', body },
     );
     if (!res.ok || !res.json) throw errStatus(res.error ?? 'lease failed', res.status);
+    try { process.stderr.write(`[DIAG acquire] renew=${shouldRenewCurrentLease} gotFence=${JSON.stringify(res.json.fence)} expiresAt=${res.json.expiresAt} activeCtrls=${this.activeControllers().length}\n`); } catch { /* */ }
     this.record.fence = res.json.fence;
     this.record.leaseExpiresAt = res.json.expiresAt;
     if (!this.record.scopeKeyCipher) this.setScopeKey(backend.randomBytes(32));
+  }
+
+  /**
+   * Restart-resume for an expired lease that still has active controllers, WITHOUT
+   * re-enrollment. Drives the ATOMIC renew-with-transitions endpoint, which extends an
+   * expired lease only when the proven fence still matches the LIVE server lease (no
+   * successor took the scope) and preserves the epoch — keeping every enrolled
+   * controller's authority chain valid. Returns true when the lease was extended;
+   * false on a successor / fail-closed verdict (the caller then requires re-enrollment).
+   * A transient/5xx error propagates so the caller can retry on the next start() tick.
+   */
+  private async resumeExpiredLeaseSameFence(s: Awaited<ReturnType<HostSessionProvider['get']>>): Promise<boolean> {
+    if (!this.identity || !this.record.fence) return false;
+    try {
+      // Resume any durable pending intent first (idempotent replay across a crash), then
+      // mint a fresh one; a stale-but-same-fence intent yields 'retry-fresh' → one retry.
+      let intent = this.record.pendingLeaseRenewal ?? await this.buildRenewalIntent(s);
+      let committed = await this.commitRenewalIntent(s, intent);
+      if (committed === 'retry-fresh') {
+        intent = await this.buildRenewalIntent(s);
+        committed = await this.commitRenewalIntent(s, intent);
+      }
+      return typeof committed === 'object';
+    } catch {
+      // A transient/unavailable renewal (5xx / network) is NOT a resume: return false so
+      // the caller falls through to the fail-closed re-enrollment path. start() is retried
+      // by the data loop on its next tick, which reattempts the resume. Drop any durable
+      // intent left mid-flight so it never masks a later genuine successor verdict.
+      this.record.pendingLeaseRenewal = undefined;
+      try { this.persist(); } catch { /* best-effort */ }
+      return false;
+    }
   }
 
   private hasUsableLease(): boolean {

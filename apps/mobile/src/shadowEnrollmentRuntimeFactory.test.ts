@@ -7,7 +7,7 @@ vi.mock('expo-crypto', () => ({ getRandomBytes: (n: number) => new Uint8Array(n)
 vi.mock('expo-sqlite', () => ({ openDatabaseAsync: async () => ({ execAsync: async () => {}, getAllAsync: async () => [], runAsync: async () => ({}), getFirstAsync: async () => null }) }));
 vi.mock('./shadowSecureStore', () => ({ ExpoSecureStoreAdapter: class { async getItemAsync() { return null; } async setItemAsync() {} async deleteItemAsync() {} } }));
 vi.mock('./shadowEnrollmentMetaStore', () => ({ SQLiteEnrollmentMetaStore: class { async loadGrant() { return null; } async saveGrant() {} async clearGrant() {} } }));
-vi.mock('./auth', () => ({ API_BASE: 'https://relay.example', getSessionToken: () => 'tok', getDeviceId: () => 'ctrl_1' }));
+vi.mock('./auth', () => ({ API_BASE: 'https://relay.example', getSessionToken: () => 'tok', getDeviceId: () => 'ctrl_1', rotateDeviceId: () => 'ctrl_2' }));
 
 describe('getShadowMobileEnrollmentRuntime (B1-R1) — promise-memoized singleton', () => {
   it('concurrent callers await the SAME in-flight construction and get the identical instance', async () => {
