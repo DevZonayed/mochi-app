@@ -52,6 +52,35 @@ describe('HIGH-1 — projection fails closed on paths / stack traces / credentia
     expect(data.progress).toBe(0.5);
   });
 
+  it('buildJobView redacts secrets in input + transcript and NEVER projects raw tool cmd', () => {
+    const job = {
+      id: 'job_2', projectId: 'proj_1', sessionId: 'sess_1', title: 'Fix login',
+      status: 'done', phase: 'Done', progress: 1, engine: 'claude', model: 'opus', cost: 0.2,
+      input: 'deploy postgres://admin:Tr0ub4dor@db.internal:5432/prod from /Users/alice/proj/src/secrets.ts',
+      transcript: [
+        { kind: 'thinking', text: 'the key sits in /Users/alice/.aws/credentials' },
+        { kind: 'text', text: 'I fixed the auth guard and added a test.' },
+        { kind: 'tool', text: 'Bash · install deps', name: 'Bash', cmd: 'curl -H "Authorization: Bearer Aph5xKq9rZsecret" https://x', toolStatus: 'done' },
+        { kind: 'result', text: 'All tests passed.' },
+      ],
+      createdAt: 1_700_000_000_000, updatedAt: 1_700_000_100_000,
+    } as unknown as Job;
+    const view = buildJobView(job);
+    expect(view).not.toBeNull();
+    const text = projectedText(view!.data);
+    // Every canary from input + transcript is scrubbed.
+    for (const c of CANARIES) expect(text.includes(c)).toBe(false);
+    // The raw tool command is NEVER projected — only the human label.
+    expect(text.includes('curl')).toBe(false);
+    expect(text.includes('Bearer')).toBe(false);
+    expect(text.includes('cmd')).toBe(false);
+    // Safe conversation content survives for the controller.
+    expect(text.includes('I fixed the auth guard')).toBe(true);
+    expect(text.includes('All tests passed')).toBe(true);
+    expect(text.includes('Bash')).toBe(true);
+    expect(Array.isArray((view!.data as { transcript?: unknown }).transcript)).toBe(true);
+  });
+
   it('buildProjectView never projects URL userinfo (credential-bearing repo URL)', () => {
     const project = {
       id: 'proj_1', name: 'App', kind: 'coding', color: '#fff', hidden: false,

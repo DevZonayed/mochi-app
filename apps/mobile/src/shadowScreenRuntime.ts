@@ -14,7 +14,7 @@
 import { ScreenStreamClient, type ScreenClientLink, type ScreenClientState, type ScreenClientIdentity } from './shadowScreenClient';
 import type { ScreenViewerStore } from './shadowScreenViewerStore';
 import type { ShadowCryptoBackend } from '@maestro/realtime/shadowCrypto';
-import { SHADOW_SCREEN_HOST_CONFIGURED_SOURCE } from '@maestro/realtime/shadowScreenStream';
+import { SHADOW_SCREEN_HOST_CONFIGURED_SOURCE, SHADOW_SCREEN_MAX_FPS } from '@maestro/realtime/shadowScreenStream';
 
 /** The enrolled material a screen client needs (from `ShadowMobileEnrollmentRuntime
  * .screenClientMaterial()`). Raw private bytes only ever flow runtime → client. */
@@ -78,6 +78,8 @@ class ScreenRelayWsLink implements ScreenClientLink {
   private disconnectCb: (() => void) | null = null;
   private queue: string[] = [];
   private closed = false;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
+  private connectAttempts = 0;
 
   constructor(private readonly url: string, private readonly createWs: (u: string) => ScreenWsLike) {}
 
@@ -96,9 +98,25 @@ class ScreenRelayWsLink implements ScreenClientLink {
 
   private ensureOpen(): void {
     if (this.ws || this.closed) return;
+    try { console.log(`[DIAG4] link OPENING (attempt ${this.connectAttempts}) ${this.url.replace(/token=[^&]+/, 'token=***')}`); } catch { /* */ }
     const ws = this.createWs(this.url);
     this.ws = ws;
-    ws.onopen = () => { const q = this.queue; this.queue = []; for (const t of q) { try { ws.send(t); } catch { /* */ } } };
+    // Connect watchdog: the RN/okhttp WebSocket can hang mid-handshake with no open/
+    // error/close event (a wedged/pooled connection), leaving the viewer stuck on
+    // "Waiting" forever. If we don't reach onopen within the timeout, force-close and
+    // retry a fresh socket (bounded), then give up + report disconnect so the UI recovers.
+    if (this.connectTimer) { clearTimeout(this.connectTimer); }
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null;
+      try { console.log(`[DIAG4] link TIMEOUT (attempt ${this.connectAttempts}) — retrying`); } catch { /* */ }
+      try { ws.onopen = null; ws.onmessage = null; ws.onclose = null; ws.onerror = null; } catch { /* */ }
+      try { ws.close(); } catch { /* */ }
+      if (this.ws === ws) this.ws = null;
+      if (this.closed) return;
+      if (this.connectAttempts < 6) { this.connectAttempts += 1; this.ensureOpen(); }
+      else { this.connectAttempts = 0; this.disconnectCb?.(); }
+    }, 7000);
+    ws.onopen = () => { if (this.connectTimer) { clearTimeout(this.connectTimer); this.connectTimer = null; } this.connectAttempts = 0; try { console.log(`[DIAG4] link OPEN (queued=${this.queue.length})`); } catch { /* */ } const q = this.queue; this.queue = []; for (const t of q) { try { ws.send(t); } catch { /* */ } } };
     ws.onmessage = (ev) => {
       const d = ev.data;
       if (typeof d === 'string') { try { this.controlCb?.(JSON.parse(d)); } catch { /* */ } return; }
@@ -106,8 +124,8 @@ class ScreenRelayWsLink implements ScreenClientLink {
       if (d instanceof ArrayBuffer) { this.frameCb?.(new Uint8Array(d)); return; }
       if (d && typeof (d as { byteLength?: number }).byteLength === 'number') { this.frameCb?.(new Uint8Array((d as ArrayBufferView).buffer)); return; }
     };
-    ws.onclose = () => { this.ws = null; this.disconnectCb?.(); };
-    ws.onerror = () => { try { ws.close(); } catch { /* */ } };
+    ws.onclose = () => { if (this.connectTimer) { clearTimeout(this.connectTimer); this.connectTimer = null; } try { console.log(`[DIAG4] link CLOSE`); } catch { /* */ } if (this.ws === ws) this.ws = null; this.disconnectCb?.(); };
+    ws.onerror = () => { try { console.log(`[DIAG4] link ERROR`); } catch { /* */ } try { ws.close(); } catch { /* */ } };
   }
 
   private scheduleClose(): void {
@@ -188,7 +206,9 @@ export class ScreenRuntime {
         // names a concrete source (it can't enumerate them). The host substitutes its
         // operator-chosen display and echoes the real id in the signed accept.
         leaseId: material.identity.leaseId, leaseExpiresAt: material.identity.leaseExpiresAt, sourcePolicyId: SHADOW_SCREEN_HOST_CONFIGURED_SOURCE,
-        requestedCodec: 'jpeg', requestedMaxDimension: 1280, requestedFps: 8,
+        // Request the protocol's max fps (10) for the smoothest motion the host allows;
+        // the host clamps to [2,10] and its own capture cost. 1280 keeps frames legible.
+        requestedCodec: 'jpeg', requestedMaxDimension: 1280, requestedFps: SHADOW_SCREEN_MAX_FPS,
       };
       const url = `${session.relayOrigin.replace(/^http/, 'ws').replace(/\/$/, '')}/ws/remote/screen?token=${encodeURIComponent(session.sessionToken)}&did=${encodeURIComponent(session.deviceId)}&host=${encodeURIComponent(session.hostId)}`;
       const link = new ScreenRelayWsLink(url, (u) => this.deps.createWs(u));

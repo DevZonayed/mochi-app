@@ -28,7 +28,7 @@ import {
   verifyScreenControl,
   isRelayTeardownControl,
   SHADOW_SCREEN_STREAM_MAX_TTL_MS,
-  SHADOW_SCREEN_TARGET_FPS,
+  SHADOW_SCREEN_MAX_FPS,
   SHADOW_SCREEN_RELAY_TEARDOWN_STREAM_ID,
   SHADOW_SCREEN_CONTROL_CLOCK_SKEW_MS,
   type ScreenAuthoritySnapshot,
@@ -311,7 +311,9 @@ export class ScreenStreamHostCoordinator {
     await this.sendStatus(req.streamId, 'starting', undefined, controlBinding);
 
     // Start capture FIRST to learn the real output dimensions, then bind + key.
-    const fps = Math.max(2, Math.min(SHADOW_SCREEN_TARGET_FPS, req.requestedFps));
+    // Honour the controller's requested fps up to the protocol max (10) for smoother
+    // motion — the native capture caps its own frame interval, so this can't exceed 10.
+    const fps = Math.max(2, Math.min(SHADOW_SCREEN_MAX_FPS, req.requestedFps));
     let started: CaptureStartResult;
     try {
       started = await this.deps.capture.start({
@@ -355,36 +357,43 @@ export class ScreenStreamHostCoordinator {
     };
     const keyEpoch = 1;
     const hostNonce = this.deps.randomNonce();
-    const controllerNonce = decodeStreamNonce(req.controllerNonce);
-    const key = await deriveScreenStreamKey({
-      backend: this.deps.backend,
-      selfAgreementPrivate: this.deps.hostAgreementPrivate,
-      peerAgreementPublic: controllerPub,
-      hostNonce: hostNonce.bytes,
-      controllerNonce,
-      binding,
-      keyEpoch,
-    });
-    const sender = new ScreenFrameSender(this.deps.backend, key, binding, keyEpoch);
-    const expiresAt = Math.min(req.expiresAt, nowMs + SHADOW_SCREEN_STREAM_MAX_TTL_MS, authority.leaseExpiresAtMs);
-    const expiryTimer = setTimeout(() => { void this.stopActive('session expired'); }, Math.max(0, expiresAt - nowMs));
-    if (typeof (expiryTimer as { unref?: () => void }).unref === 'function') (expiryTimer as { unref: () => void }).unref();
+    try {
+      const controllerNonce = decodeStreamNonce(req.controllerNonce);
+      const key = await deriveScreenStreamKey({
+        backend: this.deps.backend,
+        selfAgreementPrivate: this.deps.hostAgreementPrivate,
+        peerAgreementPublic: controllerPub,
+        hostNonce: hostNonce.bytes,
+        controllerNonce,
+        binding,
+        keyEpoch,
+      });
+      const sender = new ScreenFrameSender(this.deps.backend, key, binding, keyEpoch);
+      const expiresAt = Math.min(req.expiresAt, nowMs + SHADOW_SCREEN_STREAM_MAX_TTL_MS, authority.leaseExpiresAtMs);
+      const expiryTimer = setTimeout(() => { void this.stopActive('session expired'); }, Math.max(0, expiresAt - nowMs));
+      if (typeof (expiryTimer as { unref?: () => void }).unref === 'function') (expiryTimer as { unref: () => void }).unref();
 
-    this.active = { streamId: req.streamId, controllerDeviceId: req.controllerDeviceId, binding, controlBinding, sender, startedAt: nowMs, live: false, expiresAt, expiryTimer, seenControlNonces: startNonces };
+      this.active = { streamId: req.streamId, controllerDeviceId: req.controllerDeviceId, binding, controlBinding, sender, startedAt: nowMs, live: false, expiresAt, expiryTimer, seenControlNonces: startNonces };
 
-    // Host-sign the accept so the controller verifies it before deriving the key /
-    // trusting the source label.
-    const acceptBase: ScreenControlMessage = {
-      kind: 'screen-accept', v: 1, streamId: req.streamId, hostNonce: hostNonce.b64,
-      codec: binding.codec, width: binding.width, height: binding.height, fps, keyEpoch,
-      sourcePolicyId: source.sourcePolicyId, sourceLabel: source.label, acceptedAt: nowMs, expiresAt,
-    };
-    const signedAccept = await signScreenControl(this.deps.backend, this.deps.hostSigningPrivate, {
-      role: 'host', signerKeyId: this.deps.hostSigningKeyId, controlNonce: this.deps.randomNonce().b64, message: acceptBase, binding: controlBinding,
-    });
-    this.deps.link.sendControl(signedAccept);
-    this.deps.audit({ event: 'stream-started', streamId: req.streamId, controllerDeviceId: req.controllerDeviceId, sourcePolicyClass: 'display', at: nowMs });
-    this.deps.onShareStatus?.({ active: true, deviceLabel: `Device ${req.controllerDeviceId.slice(-4)}`, sourceLabel: source.label, startedAtMs: nowMs });
+      // Host-sign the accept so the controller verifies it before deriving the key /
+      // trusting the source label.
+      const acceptBase: ScreenControlMessage = {
+        kind: 'screen-accept', v: 1, streamId: req.streamId, hostNonce: hostNonce.b64,
+        codec: binding.codec, width: binding.width, height: binding.height, fps, keyEpoch,
+        sourcePolicyId: source.sourcePolicyId, sourceLabel: source.label, acceptedAt: nowMs, expiresAt,
+      };
+      const signedAccept = await signScreenControl(this.deps.backend, this.deps.hostSigningPrivate, {
+        role: 'host', signerKeyId: this.deps.hostSigningKeyId, controlNonce: this.deps.randomNonce().b64, message: acceptBase, binding: controlBinding,
+      });
+      this.deps.link.sendControl(signedAccept);
+      this.deps.audit({ event: 'stream-started', streamId: req.streamId, controllerDeviceId: req.controllerDeviceId, sourcePolicyClass: 'display', at: nowMs });
+      this.deps.onShareStatus?.({ active: true, deviceLabel: `Device ${req.controllerDeviceId.slice(-4)}`, sourceLabel: source.label, startedAtMs: nowMs });
+    } catch {
+      // Key derivation / accept signing failed after capture started — stop the native
+      // capture and surface a truthful error rather than leaving a half-open stream.
+      try { await this.deps.capture.stop(); } catch { /* */ }
+      await this.sendStatus(req.streamId, 'error', 'stream setup failed', controlBinding);
+    }
   }
 
   private async onCaptureFrame(streamId: string, frameBytes: Uint8Array, captureTsMs: number): Promise<void> {

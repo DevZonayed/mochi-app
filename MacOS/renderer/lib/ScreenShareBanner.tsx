@@ -42,13 +42,22 @@ export function ScreenShareBanner({
       role="status"
       aria-live="polite"
       aria-label={`${status.deviceLabel} is viewing your screen`}
+      // win-drag: the banner sits over the window's title bar, so without this it would
+      // swallow the drag region and the window could no longer be moved. Marking it a drag
+      // handle lets the operator drag the window BY the banner; the <button> below auto
+      // opts out (no-drag) so "Stop sharing" stays clickable. paddingLeft clears the native
+      // traffic-light controls (top-left) so they remain visible + usable. The body gets a
+      // `screen-sharing` class (see ScreenShareBannerHost) that shifts the app content down
+      // by this bar's height so the top navigation is never hidden.
+      className="win-drag"
       style={{
         position: 'fixed', top: 0, left: 0, right: 0, zIndex: 10000,
-        display: 'flex', alignItems: 'center', gap: 12,
-        padding: '8px 14px',
+        height: 'var(--share-banner-h, 30px)', boxSizing: 'border-box',
+        display: 'flex', alignItems: 'center', gap: 10,
+        padding: '0 12px 0 84px',
         background: 'var(--red, #FF3B30)', color: '#fff',
-        font: '600 var(--fs-body, 13px)/1.2 var(--font-text, system-ui)',
-        boxShadow: '0 2px 8px rgba(0,0,0,0.25)',
+        font: '600 12px/1.2 var(--font-text, system-ui)',
+        boxShadow: '0 1px 6px rgba(0,0,0,0.28)',
       }}
     >
       <span aria-hidden style={{ width: 9, height: 9, borderRadius: 999, background: '#fff', boxShadow: '0 0 0 3px rgba(255,255,255,0.35)' }} />
@@ -90,5 +99,15 @@ export function ScreenShareBannerHost() {
   const onStop = React.useCallback(() => {
     api.shadowHostScreenStop().then(() => setStatus((s) => (s ? { ...s, active: false } : s))).catch(() => {});
   }, []);
+  // While a viewer is active, tag <body> so the app content is shifted down by the banner
+  // height (CSS in index.css) — the top navigation stays fully visible instead of being
+  // covered by the fixed banner.
+  const active = !!status && status.active;
+  React.useEffect(() => {
+    const b = typeof document !== 'undefined' ? document.body : null;
+    if (!b) return;
+    if (active) b.classList.add('screen-sharing'); else b.classList.remove('screen-sharing');
+    return () => { b.classList.remove('screen-sharing'); };
+  }, [active]);
   return <ScreenShareBanner status={status} onStop={onStop} now={now} />;
 }

@@ -495,16 +495,37 @@ export class ShadowUiController {
       this.controller = controller;
       this.controllerUnsub = controller.onChange(() => { void this.refresh(); });
       this.logStage('controller.get.ok', { category: 'controller', status: 'ok', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
-      try {
-        await this.withTimeout(controller.connect(), CONTROLLER_STAGE_TIMEOUT_MS, 'controller.connect', myGen);
-        this.logStage('controller.connect.ok', { category: 'controller', status: 'ok', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
-      } catch {
-        this.logStage('controller.connect.offline', { category: 'controller', status: 'offline', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
-      }
-      if (myGen === this.gen && !this.disposed && seq === this.controllerAttemptSeq) {
+      // Emit the offline state IMMEDIATELY with cached SQLite data so the UI renders
+      // before the network connect attempt. Without this, the UI shows 0 data during
+      // the entire connect timeout (up to 15s) — the WhatsApp-like offline experience
+      // requires cached data to appear instantly.
+      if (myGen === this.gen && !this.disposed && seq === this.controllerAttemptSeq && this.runtime) {
         this.bootstrapErrorReason = null;
-        void this.refresh();
+        this.purgePending = false;
+        this.emit(this.derive(this.runtime.status(), controller.status()));
       }
+      // Fire the network connect as a BACKGROUND task — do NOT block on it or wrap it
+      // in a timeout. The connect syncs encrypted events from the relay which can
+      // involve processing hundreds of events (Ed25519 verify + AES-GCM decrypt +
+      // SQLite write per event). On mobile this can take 30s+ for 500 events and must
+      // not be killed by a 15s timeout. When the connect finishes,
+      // `notifyProjectionChange` fires → `onChange` → `refresh()` transitions the UI
+      // from 'offline' → 'online'. The cached data is already visible above.
+      void controller.connect().then(
+        () => {
+          this.logStage('controller.connect.ok', { category: 'controller', status: 'ok', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
+          if (myGen === this.gen && !this.disposed && seq === this.controllerAttemptSeq) {
+            this.bootstrapErrorReason = null;
+            void this.refresh();
+          }
+        },
+        () => {
+          this.logStage('controller.connect.offline', { category: 'controller', status: 'offline', gen: myGen, seq, tookMs: this.deps.now() - startedAt });
+          if (myGen === this.gen && !this.disposed && seq === this.controllerAttemptSeq) {
+            void this.refresh();
+          }
+        },
+      );
     })();
     this.controllerAcquirePromise = p.finally(() => {
       if (this.controllerAcquirePromise === p) this.controllerAcquirePromise = null;

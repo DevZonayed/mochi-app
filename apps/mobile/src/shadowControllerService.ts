@@ -60,6 +60,12 @@ const LEASE_SKEW_MS = 1_000;
 /** Mirrors the server relay batch ceiling so the mobile can keep draining until caught up. */
 const CONNECT_EVENT_BATCH_LIMIT = 500;
 const CONNECT_DRAIN_PAGE_LIMIT = 12;
+/** Re-fetch the (host-renewed) server lease when the in-memory lease is within this margin
+ *  of expiry, so a slow baseline drain doesn't outlast the window and fence every event. */
+const LEASE_REEXTEND_MARGIN_MS = 20_000;
+/** Bound mid-drain authority re-fetches to at most one per this interval (a non-renewing
+ *  host can't spin the drain into a per-event network storm). */
+const LEASE_REEXTEND_THROTTLE_MS = 5_000;
 
 export interface ControllerSessionContext {
   accountId: string;
@@ -118,14 +124,38 @@ export class ShadowControllerService {
   private readonly keyRing = new Map<string, Uint8Array>();
   private readonly codecRings = new Map<string, ScopeKeyring>();
   private currentKeyId: string;
-  private expected: ShadowExpectedAuthority;
+  private readonly expected: ShadowExpectedAuthority;
+  /**
+   * The effective lease expiry used by `leaseExpired()`. Tracks the most
+   * generous lease seen from ANY source — the original enrollment grant, a
+   * host-signed transition consumed by the client, or a server-confirmed
+   * extension via `reconcileAuthority`. This is intentionally SEPARATE from
+   * `this.expected` (the shared `opts.expectedAuthority` reference the client
+   * uses as its trusted root for chain verification). Mutating `this.expected`
+   * or persisting a divergent lease to the store breaks `acceptLoadedAuthority`:
+   * the chain endpoint no longer matches the stored expected authority, causing
+   * every `load()` to fail with `transition-chain-incomplete` → zero entities.
+   */
+  private effectiveLeaseExpiresAt: number;
   private state: ControllerServiceState = 'idle';
   private lastError: string | undefined;
   private reconcileTimer: unknown = null;
   /** Last server-reported lease expiry (observability; the chain authority gates events). */
   private serverLeaseExpiresAt = 0;
+  /** Throttle timestamp for mid-drain lease re-extension (see drainEventPages). */
+  private lastLeaseRefreshMs = 0;
   /** Deduplicates overlapping load/build/connect/tick sync work onto one production seam. */
   private inFlightSync: Promise<number> | null = null;
+  /**
+   * Consecutive 401/403 denial count. A session token can expire without the
+   * enrollment grant being revoked — locking + purging on the FIRST 401 forces a
+   * painful re-enrollment. Instead, the controller goes offline on the first denial
+   * and only locks (→ triggerPurge → enrollment gate) after DENIAL_LOCK_THRESHOLD
+   * consecutive 401/403 responses, confirming the revocation is genuine and not a
+   * transient token refresh issue.
+   */
+  private consecutiveDenials = 0;
+  private static readonly DENIAL_LOCK_THRESHOLD = 3;
 
   constructor(private readonly opts: ShadowControllerServiceOptions) {
     this.backend = opts.backend;
@@ -133,6 +163,7 @@ export class ShadowControllerService {
     this.scopeKey = opts.scopeKey;
     this.currentKeyId = opts.scopeKeyId;
     this.expected = { ...opts.expectedAuthority, fence: { ...opts.expectedAuthority.fence } };
+    this.effectiveLeaseExpiresAt = this.expected.leaseExpiresAt;
     this.keyRing.set(opts.scopeKeyId, opts.scopeKey);
     const crypto: ShadowCryptoAdapter = {
       decryptEvent: async (event: ShadowStateEvent) => {
@@ -179,9 +210,11 @@ export class ShadowControllerService {
   /** Load persisted state (cursor/commands/entities) without a network round-trip. */
   async load(): Promise<ControllerServiceStatus> {
     await this.client.load();
-    // Reconcile the mutable authority to the DURABLE persisted lease (restart-safe).
+    // Track the persisted lease for leaseExpired() without touching this.expected
+    // (the client's trusted root — mutating it breaks acceptLoadedAuthority's chain
+    // verification, causing repair-required with zero entities on every subsequent load).
     const persisted = this.client.read().expectedAuthority;
-    if (persisted && sameFence(persisted.fence, this.expected.fence)) this.expected = { ...persisted, fence: { ...persisted.fence } };
+    if (persisted) this.effectiveLeaseExpiresAt = Math.max(this.effectiveLeaseExpiresAt, persisted.leaseExpiresAt);
     if (this.state === 'idle') this.state = 'offline';
     return this.status();
   }
@@ -194,7 +227,7 @@ export class ShadowControllerService {
       lastSeq: s.cursor?.lastSeq ?? null,
       entities: s.entities.length,
       locked: this.state === 'locked',
-      leaseExpiresAt: this.expected.leaseExpiresAt,
+      leaseExpiresAt: this.effectiveLeaseExpiresAt,
       lastError: this.lastError,
     };
   }
@@ -239,7 +272,13 @@ export class ShadowControllerService {
   /** True once the reconciled lease has expired (fail-closed read-only). Public so the
       production action gate can flip to "unavailable" the instant the lease lapses. */
   leaseExpired(): boolean {
-    return this.now() >= this.expected.leaseExpiresAt + LEASE_SKEW_MS;
+    return this.now() >= this.effectiveLeaseExpiresAt + LEASE_SKEW_MS;
+  }
+
+  /** True when the in-memory lease is within the re-extend margin of expiry — the cue to
+   *  re-fetch the host-renewed server lease mid-drain before events start fencing. */
+  private leaseNearExpiry(): boolean {
+    return this.now() >= this.effectiveLeaseExpiresAt - LEASE_REEXTEND_MARGIN_MS;
   }
 
   /**
@@ -279,8 +318,25 @@ export class ShadowControllerService {
       return false;
     }
     // Server lease itself expired → fail-closed (host has not renewed).
-    if (this.now() >= authority.expiresAt) { this.lastError = 'server-lease-expired'; return false; }
+    if (this.now() >= authority.expiresAt) { this.lastError = 'server-lease-expired'; console.warn('[shadow-svc] authority.fail reason=server-lease-expired server.expiresAt=' + authority.expiresAt + ' now=' + this.now()); return false; }
     this.serverLeaseExpiresAt = authority.expiresAt;
+    // Always adopt the server's expiry when it's more generous — the server
+    // only reports a valid lease when the host has actively renewed, and the
+    // signed transition may lag behind. Previously this was guarded by
+    // `this.leaseExpired()`, but that caused the effective lease to NOT be
+    // extended when the chain endpoint's lease was still valid (e.g. 7s
+    // remaining). Then the drain starts, the chain lease expires mid-drain,
+    // and all remaining events get fenced.
+    if (authority.expiresAt > this.effectiveLeaseExpiresAt) {
+      console.warn('[shadow-svc] authority.serverExtend old=' + this.effectiveLeaseExpiresAt + ' new=' + authority.expiresAt);
+      // Only update the effective lease — NEVER mutate this.expected or persist to the
+      // store. The store's expectedAuthority is managed exclusively by the client's
+      // consumeAuthorityTransition (which atomically adds a signed transition AND
+      // updates the expected authority). Writing a server-extended lease directly
+      // diverges the store from the chain endpoint, causing every subsequent load()
+      // to fail acceptLoadedAuthority with transition-chain-incomplete.
+      this.effectiveLeaseExpiresAt = authority.expiresAt;
+    }
     return !this.leaseExpired();
   }
 
@@ -295,8 +351,12 @@ export class ShadowControllerService {
     try {
       const ok = await this.client.transitionAuthority(grant);
       if (!ok) { this.lastError = 'transition-rejected'; return false; }
+      // Track the transition's lease for leaseExpired(). The client's
+      // consumeAuthorityTransition already updated the store atomically (chain +
+      // expected authority), so future acceptLoadedAuthority checks will verify
+      // from the original trusted root through the full chain.
       const persisted = this.client.read().expectedAuthority;
-      if (persisted) this.expected = { ...persisted, fence: { ...persisted.fence } };
+      if (persisted) this.effectiveLeaseExpiresAt = Math.max(this.effectiveLeaseExpiresAt, persisted.leaseExpiresAt);
       return true;
     } catch (e) { this.lastError = `transition-error:${(e as Error)?.message ?? 'unknown'}`; return false; }
   }
@@ -348,17 +408,63 @@ export class ShadowControllerService {
   private async syncControllerState(loadFirst: boolean): Promise<number> {
     if (this.inFlightSync) return this.inFlightSync;
     this.inFlightSync = (async () => {
-      if (loadFirst) await this.client.load();
+      console.warn('[shadow-svc] sync.start loadFirst=' + loadFirst);
+      if (loadFirst) {
+        await this.client.load();
+        // Track the persisted lease — syncControllerState bypasses the service's
+        // load() which normally does this.
+        const pl = this.client.read().expectedAuthority;
+        if (pl) this.effectiveLeaseExpiresAt = Math.max(this.effectiveLeaseExpiresAt, pl.leaseExpiresAt);
+      }
+      console.warn('[shadow-svc] sync.loaded');
       await this.fetchAndApplyTransitions();
+      // Transitions may have advanced the chain endpoint's lease beyond
+      // effectiveLeaseExpiresAt (applyAuthorityTransition updates it, but
+      // re-sync here to be safe).
+      const postTr = this.client.read().expectedAuthority;
+      if (postTr) this.effectiveLeaseExpiresAt = Math.max(this.effectiveLeaseExpiresAt, postTr.leaseExpiresAt);
+      console.warn('[shadow-svc] sync.transitions done');
       const authorityOk = await this.reconcileAuthority();
+      console.warn('[shadow-svc] sync.authority ok=' + authorityOk + ' leaseExpired=' + this.leaseExpired());
       if (this.isLocked()) throw new Error('controller locked');
+      // Go online as soon as the authority is verified and the lease is valid.
+      // The event drain may take a long time (hundreds/thousands of events with
+      // per-event Ed25519 verify + AES-GCM decrypt + SQLite write). The
+      // auto-reconcile timer continues draining incrementally. The phone already
+      // has cached data from prior syncs — going online enables actions and
+      // screen streaming while the delta catches up in the background.
+      if (!this.isLocked() && authorityOk && !this.leaseExpired()) {
+        await this.client.setOnline(true);
+        this.state = 'online';
+        const cs = this.client.read();
+        console.warn('[shadow-svc] sync.earlyOnline conn=' + cs.connection + ' entities=' + cs.entities.length + ' lease=' + (cs.expectedAuthority?.leaseExpiresAt ?? 'n/a') + ' effectiveLease=' + this.effectiveLeaseExpiresAt);
+        this.notifyProjectionChange();
+      }
+      // Bridge the client's chain-endpoint lease (which may be near-expiry) with
+      // the service's server-authenticated effectiveLeaseExpiresAt. This in-memory
+      // extension does NOT touch the store — acceptLoadedAuthority still verifies the
+      // chain, and the next load() resets in-memory state. It only prevents
+      // validateAuthorityFence from fencing events during this drain cycle.
+      this.client.extendInMemoryLease(this.effectiveLeaseExpiresAt);
       const drained = await this.drainEventPages();
+      console.warn('[shadow-svc] sync.drained applied=' + drained.applied + ' caughtUp=' + drained.caughtUp);
       await this.pollAcks();
       if (!this.isLocked()) {
-        const live = authorityOk && !this.leaseExpired() && drained.caughtUp;
-        await this.client.setOnline(live);
-        this.state = live ? 'online' : 'offline';
+        if (authorityOk) {
+          // Authority verified: go online/offline based on lease.
+          const live = !this.leaseExpired();
+          await this.client.setOnline(live);
+          this.state = live ? 'online' : 'offline';
+        } else if (this.leaseExpired()) {
+          // Lease definitively expired — go offline regardless.
+          await this.client.setOnline(false);
+          this.state = 'offline';
+        }
+        // else: authority check failed transiently (server error / network) but
+        // lease is still valid → preserve the current state. The next
+        // auto-reconcile tick retries the authority check.
       }
+      console.warn('[shadow-svc] sync.final state=' + this.state);
       this.notifyProjectionChange();
       return drained.applied;
     })().finally(() => { this.inFlightSync = null; });
@@ -389,9 +495,32 @@ export class ShadowControllerService {
         return { applied: totalApplied, caughtUp: false };
       }
       const events = Array.isArray(res.json?.events) ? res.json.events : [];
+      console.warn('[shadow-svc] drain.page=' + page + ' events=' + events.length + ' lastSeq=' + lastSeq);
       let pageApplied = 0;
-      for (const wire of events) {
-        const result = await this.client.applyWire(wire);
+      for (let ei = 0; ei < events.length; ei++) {
+        // Keep the lease ahead of a slow baseline drain. A single page can hold up to
+        // CONNECT_EVENT_BATCH_LIMIT (500) events, and per-event Ed25519-verify + AES-GCM
+        // decrypt over a slow link can outlast the granted lease window mid-page. The HOST
+        // actively renews the SERVER lease (see `authority.serverExtend`), so when our
+        // in-memory lease nears expiry we re-fetch the server authority and adopt the
+        // renewed window IN PLACE, instead of fencing every remaining event and dropping
+        // into a repair-required loop that leaves the projection empty (0 entities).
+        // reconcileAuthority is verify-only + chain-safe; the throttle bounds it to at most
+        // one refresh per LEASE_REEXTEND_THROTTLE_MS so a non-renewing host can't spin.
+        if (this.leaseNearExpiry() && this.now() - this.lastLeaseRefreshMs >= LEASE_REEXTEND_THROTTLE_MS) {
+          this.lastLeaseRefreshMs = this.now();
+          try { await this.reconcileAuthority(); this.client.extendInMemoryLease(this.effectiveLeaseExpiresAt); } catch { /* keep going; the expiry break below still guards */ }
+        }
+        // Stop processing events once the lease has genuinely expired — every remaining
+        // event would be fenced, and each fenced event triggers an expensive
+        // load() → acceptLoadedAuthority chain walk (~2s per event × N transitions).
+        // The next auto-reconcile tick will extend the lease and resume draining.
+        if (this.leaseExpired()) {
+          console.warn('[shadow-svc] drain.leaseExpired ei=' + ei + '/' + events.length);
+          break;
+        }
+        const result = await this.client.applyWire(events[ei]!);
+        if (ei === 0 || result.status !== 'applied') console.warn('[shadow-svc] drain.event[' + ei + '] status=' + result.status);
         if (result.status === 'applied') {
           pageApplied += 1;
           totalApplied += 1;
@@ -403,6 +532,10 @@ export class ShadowControllerService {
         await this.submitCursor(cursor.lastSeq, cursor.lastEventId ?? undefined, cursor.lastDigest ?? undefined);
       }
       if (pageApplied > 0) this.notifyProjectionChange();
+      // If the lease expired mid-page and no events were applied, stop fetching
+      // more pages — subsequent pages will hit the same lease-expired break
+      // immediately (ei=0), wasting API round-trips.
+      if (this.leaseExpired() && pageApplied === 0) break;
       const targetHead = typeof res.json?.decision?.toSeq === 'number' ? res.json.decision.toSeq : cursorLastSeq;
       const caughtUp = cursorLastSeq >= targetHead;
       if (caughtUp && events.length < CONNECT_EVENT_BATCH_LIMIT) return { applied: totalApplied, caughtUp: true };
@@ -531,8 +664,25 @@ export class ShadowControllerService {
 
   private handleTransportError(statusCode: number, _where: string): number {
     if (statusCode === 401 || statusCode === 403) {
-      this.lock(`denied-${statusCode}`);
-    } else {
+      this.consecutiveDenials += 1;
+      console.warn('[shadow-svc] denied ' + statusCode + ' count=' + this.consecutiveDenials + ' where=' + _where);
+      if (this.consecutiveDenials >= ShadowControllerService.DENIAL_LOCK_THRESHOLD) {
+        // Confirmed revocation — lock and let the UI controller purge.
+        this.lock(`denied-${statusCode}`);
+      } else {
+        // Likely a transient session-token expiry. Go offline and let the next
+        // auto-reconcile tick retry with a fresh token from session(). If the
+        // token refreshes, the counter resets and the controller goes back online
+        // without a re-enrollment.
+        this.lastError = `denied-${statusCode}-transient`;
+        void this.client.setOnline(false).catch(() => { /* store may be closing */ });
+        if (this.state !== 'locked') this.state = 'offline';
+      }
+    } else if (this.state !== 'online') {
+      // Only go offline on transient errors when NOT already online. An
+      // authority-verified online state survives transient server errors (500/502/
+      // 503) — the next auto-reconcile tick retries, and the lease expiry is the
+      // definitive offline signal. This prevents flicker during brief server hiccups.
       void this.client.setOnline(false).catch(() => { /* store may be closing */ });
       if (this.state !== 'locked') this.state = 'offline';
     }
@@ -540,7 +690,9 @@ export class ShadowControllerService {
   }
 
   private async request<T = unknown>(method: string, path: string, body: unknown) {
+    console.warn('[shadow-svc] req.session ' + method + ' ' + path);
     const session = await this.opts.session();
+    console.warn('[shadow-svc] req.go ' + method + ' ' + path);
     const client = new ShadowRequestClient({
       baseUrl: session.relayOrigin,
       fetch: this.opts.transport.fetch,
@@ -548,13 +700,31 @@ export class ShadowControllerService {
       now: this.now,
       randomNonce: this.opts.transport.randomNonce,
       allowInsecureLoopback: this.opts.transport.allowInsecureLoopback,
-      timeoutMs: this.opts.transport.timeoutMs,
+      timeoutMs: this.opts.transport.timeoutMs ?? 30_000,
       maxResponseBytes: this.opts.transport.maxResponseBytes,
     });
-    return client.requestEnrolled<T>(
-      { accountId: session.accountId, deviceId: session.controllerDeviceId, sessionToken: session.sessionToken },
-      this.opts.controllerSigner,
-      { method, path, body },
-    );
+    let result: Awaited<ReturnType<ShadowRequestClient['requestEnrolled']>>;
+    try {
+      result = await client.requestEnrolled<T>(
+        { accountId: session.accountId, deviceId: session.controllerDeviceId, sessionToken: session.sessionToken },
+        this.opts.controllerSigner,
+        { method, path, body },
+      );
+    } catch (error) {
+      // Transport errors (timeout, network failure) should not throw — they are
+      // returned as non-ok results so callers (drainEventPages, reconcileAuthority)
+      // can handle them through the normal handleTransportError path instead of
+      // crashing the entire syncControllerState promise.
+      const msg = error instanceof Error ? error.message : 'transport-error';
+      console.warn('[shadow-svc] req.error ' + method + ' ' + path + ' ' + msg);
+      return { ok: false as const, status: 0, json: null as T } as { ok: false; status: number; json: T };
+    }
+    console.warn('[shadow-svc] req.done ' + method + ' ' + path + ' status=' + result.status + ' ok=' + result.ok);
+    // Reset the denial counter on any successful (non-401/403) response — the
+    // session token is working, so prior denials were transient.
+    if (result.ok || (result.status !== 401 && result.status !== 403)) {
+      this.consecutiveDenials = 0;
+    }
+    return result;
   }
 }

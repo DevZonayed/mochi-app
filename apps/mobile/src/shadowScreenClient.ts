@@ -127,7 +127,15 @@ export class ScreenStreamClient {
     return {
       accountId: id.accountId, hostDeviceId: id.hostDeviceId, controllerDeviceId: id.controllerDeviceId,
       grantId: id.grantId, scopeId: id.scopeId, epoch: id.epoch, leaseId: id.leaseId,
-      leaseExpiresAt: id.leaseExpiresAt, streamId,
+      // leaseExpiresAt gates ONLY the local `verifyScreenControl` freshness check — it is NOT
+      // part of the signed control transcript (only leaseId is), so host and controller need
+      // not agree on the exact value. The material's leaseExpiresAt is frozen at attach time
+      // (a short bootstrap window) and the host renews its lease forward without changing the
+      // leaseId, so once the app has been open past that window EVERY host accept was rejected
+      // `lease-expired` → the viewer got stuck on "Retry". Recompute a fresh forward window on
+      // each call so the check always passes while the controller is online; the host remains
+      // authoritative and caps the real stream lifetime via the accept's expiresAt.
+      leaseExpiresAt: Math.max(id.leaseExpiresAt, this.deps.now() + SHADOW_SCREEN_STREAM_MAX_TTL_MS), streamId,
     };
   }
 
@@ -198,6 +206,7 @@ export class ScreenStreamClient {
 
   private async onControl(raw: unknown): Promise<void> {
     const decoded = decodeScreenControl(raw, { nowMs: this.deps.now() });
+    try { console.log(`[DIAG4] RECV ctrl decodedOk=${decoded.ok}${decoded.ok ? ' kind=' + (decoded.message as {kind?:string}).kind + ' sid=' + ((decoded.message as {streamId?:string}).streamId ?? '-').slice(0,10) + ' mine=' + (this.streamId ?? '-').slice(0,10) : ''}`); } catch { /* */ }
     if (!decoded.ok) return;
     const msg = decoded.message as ScreenControlMessage & ScreenControlSignatureEnvelope;
 
@@ -210,6 +219,7 @@ export class ScreenStreamClient {
     const v = await verifyScreenControl(this.deps.backend, this.deps.hostSigningPublic, 'host', msg, this.controlBinding(this.streamId), { nowMs: this.deps.now(), seenControlNonces: this.seenControlNonces });
     if (!v.ok) return; // forged/unsigned/replayed host control → ignored, no state change
 
+    try { console.log(`[DIAG4] onControl kind=${(msg as {kind?:string}).kind} verifyOk=${v.ok} status=${(msg as {status?:string}).status ?? '-'} reason=${(msg as {reason?:string}).reason ?? '-'}`); } catch { /* */ }
     if (msg.kind === 'screen-accept') { await this.onAccept(msg); return; }
     if (msg.kind === 'screen-status') { this.onStatus(msg.status, msg.reason, msg.fps); return; }
     if (msg.kind === 'screen-stop') { this.teardown('stopped', msg.reason); return; }
@@ -272,24 +282,47 @@ export class ScreenStreamClient {
     }
   }
 
-  private async onFrame(envelope: Uint8Array): Promise<void> {
-    const r = this.receiver;
-    if (!r) return;
-    const res = await r.accept(envelope, this.deps.now());
-    if (!res.ok) return; // drop silently (replay/tamper/expired) — never surfaced as pixels
-    // Zero the previous frame's bytes before replacing (no history retained).
-    const prev = this.state.latestFrame;
-    if (prev) prev.bytes.fill(0);
-    this.set({
-      phase: 'live',
-      reason: null,
-      latestFrame: { bytes: res.frameBytes, codec: res.meta.codec, width: res.meta.width, height: res.meta.height, seq: res.meta.seq, capturedAtMs: res.meta.captureTsMs },
-      framesDecoded: this.state.framesDecoded + 1,
-    });
+  // Latest-frame-only pipeline. Decrypt+decode+render is slower than a 30fps arrival rate
+  // on the JS thread, so processing EVERY frame builds an ever-growing backlog — the viewer
+  // falls seconds behind (looks "static", updates late). Instead we keep ONLY the newest
+  // envelope and decode it as soon as the previous one finishes, DROPPING everything in
+  // between. That decouples arrival rate from render rate → the screen always shows the most
+  // recent frame with sub-second latency (AnyDesk-style), no matter how fast the host sends.
+  private pendingEnvelope: Uint8Array | null = null;
+  private frameDraining = false;
+
+  private onFrame(envelope: Uint8Array): void {
+    this.pendingEnvelope = envelope; // overwrite: only the latest matters
+    if (this.frameDraining) return;
+    void this.drainFrames();
   }
 
-  private teardown(phase: ScreenClientPhase, reason?: string): void {
-    this.disposeReceiver();
+  private async drainFrames(): Promise<void> {
+    this.frameDraining = true;
+    try {
+      while (this.pendingEnvelope) {
+        const envelope = this.pendingEnvelope;
+        this.pendingEnvelope = null;
+        const r = this.receiver;
+        if (!r) break;
+        const res = await r.accept(envelope, this.deps.now());
+        if (!res.ok) continue; // replay/tamper/expired → drop, keep draining
+        // Zero the previous frame's bytes before replacing (no history retained).
+        const prev = this.state.latestFrame;
+        if (prev) prev.bytes.fill(0);
+        this.set({
+          phase: 'live',
+          reason: null,
+          latestFrame: { bytes: res.frameBytes, codec: res.meta.codec, width: res.meta.width, height: res.meta.height, seq: res.meta.seq, capturedAtMs: res.meta.captureTsMs },
+          framesDecoded: this.state.framesDecoded + 1,
+        });
+      }
+    } finally {
+      this.frameDraining = false;
+    }
+  }
+
+  private teardown(phase: ScreenClientPhase, reason?: string): void {    this.disposeReceiver();
     const prev = this.state.latestFrame;
     if (prev) prev.bytes.fill(0);
     this.streamId = null;

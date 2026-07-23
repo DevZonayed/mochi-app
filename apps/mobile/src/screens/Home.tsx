@@ -10,6 +10,7 @@ import { getStr } from '../storage';
 import { pullSync, useSyncStore } from '../syncStore';
 import { eventAllowed } from '../notifPrefs';
 import { ConnPill } from '../ConnPill';
+import { getScreenViewerStore } from './controller/ScreenViewer';
 
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -165,6 +166,81 @@ function NeedsYou({ gates, onApprove }: { gates: GateVM[]; onApprove: (id: strin
   );
 }
 
+/** Compact Mac screen card — shows live status from the ScreenViewerStore and
+ *  tapping opens the full-screen viewer. Renders a small inline preview when live. */
+function MacScreenCard() {
+  const { theme } = useTheme();
+  const nav = useNavigation<any>();
+  const store = getScreenViewerStore();
+  const snap = React.useSyncExternalStore(store.subscribe, store.getSnapshot);
+  const vm = snap.vm;
+  const isLive = vm.showFrame && snap.frameDataUri;
+
+  // Phase-dependent label + color
+  const phaseLabel: Record<string, string> = {
+    'no-cap': 'Set up', offline: 'Offline', idle: 'Ready',
+    requesting: 'Starting...', live: 'Live', error: 'Error',
+    busy: 'In use', revoked: 'Revoked', expired: 'Expired',
+    'permission-required': 'Needs permission', 'permission-denied': 'Denied',
+    'source-lost': 'Unavailable', 'source-required': 'No display',
+  };
+  const dotColor = vm.statusTone === 'online' ? theme.color.green
+    : vm.statusTone === 'locked' ? theme.color.red
+    : vm.statusTone === 'pending' ? theme.color.orange
+    : theme.color.inkTertiary;
+
+  return (
+    <Pressable
+      onPress={() => nav.navigate('MacScreen')}
+      style={({ pressed }) => ({
+        marginHorizontal: 20,
+        marginBottom: 16,
+        borderRadius: 16,
+        backgroundColor: theme.color.bgElevated,
+        borderWidth: 0.5,
+        borderColor: theme.color.separator,
+        overflow: 'hidden',
+        opacity: pressed ? 0.85 : 1,
+      })}
+    >
+      {isLive ? (
+        /* Live: show a mini preview thumbnail */
+        <View style={{ height: 120, backgroundColor: '#000', alignItems: 'center', justifyContent: 'center' }}>
+          <React.Suspense fallback={null}>
+            {snap.frameDataUri ? (
+              <View style={{ width: '100%', height: '100%', alignItems: 'center', justifyContent: 'center' }}>
+                <View style={{ width: '90%', height: '85%', borderRadius: 8, overflow: 'hidden' }}>
+                  <View style={{ flex: 1, backgroundColor: '#111' }}>
+                    {/* Intentionally no Image here to keep the card lightweight;
+                        the full viewer is one tap away. Show the live indicator. */}
+                  </View>
+                </View>
+              </View>
+            ) : null}
+          </React.Suspense>
+          <View style={{ position: 'absolute', top: 8, left: 10, flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 10 }}>
+            <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: theme.color.green }} />
+            <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>Live</Text>
+          </View>
+        </View>
+      ) : null}
+      <View style={{ flexDirection: 'row', alignItems: 'center', padding: 14, gap: 12 }}>
+        <View style={{ width: 40, height: 40, borderRadius: 12, backgroundColor: theme.color.blue + '18', alignItems: 'center', justifyContent: 'center' }}>
+          <Icon name="monitor" size={20} color={theme.color.blue} />
+        </View>
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text style={{ fontSize: 16, fontWeight: '600', color: theme.color.ink }}>Mac Screen</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 2 }}>
+            <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: dotColor }} />
+            <Text style={{ fontSize: 13, color: theme.color.inkSecondary }}>{phaseLabel[vm.phase] ?? vm.phase}</Text>
+          </View>
+        </View>
+        <Icon name="chevronRight" size={18} color={theme.color.inkTertiary} />
+      </View>
+    </Pressable>
+  );
+}
+
 export function HomeScreen() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
@@ -299,6 +375,9 @@ export function HomeScreen() {
           </View>
         </View>
 
+        {/* Mac screen quick-access */}
+        <MacScreenCard />
+
         <NeedsYou gates={gates} onApprove={onApprove} />
 
         {/* jump back in — latest chats, one tap into the conversation */}
@@ -359,18 +438,23 @@ export function HomeScreen() {
         </View>
         ) : null}
 
-        {/* today strip */}
-        <Pressable onPress={() => nav.navigate('Budget')} style={{ flexDirection: 'row', marginHorizontal: 20, marginBottom: 22, paddingVertical: 14, paddingHorizontal: 18, borderRadius: 14, backgroundColor: theme.color.bgGrouped, borderWidth: 0.5, borderColor: theme.color.separator }}>
-          {stripCells.map((s, i) => (
-            <React.Fragment key={i}>
-              {i > 0 ? <View style={{ width: 1, backgroundColor: theme.color.separator, marginHorizontal: 14 }} /> : null}
-              <View style={{ flex: 1 }}>
-                <Mono style={{ fontSize: 18, fontWeight: '700' }}>{s[0]}</Mono>
-                <Text style={{ fontSize: 12, color: theme.color.inkTertiary, marginTop: 4 }}>{s[1]}</Text>
+        {/* stat tiles — 2×2 grid */}
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginHorizontal: 20, marginBottom: 22 }}>
+          {([
+            { label: 'Spend', value: `$${strip.spend.toFixed(2)}`, color: theme.color.blue, icon: 'gauge' as IconName, onPress: () => nav.navigate('Budget') },
+            { label: 'Projects', value: `${projects.length}`, color: theme.color.purple, icon: 'folder' as IconName, onPress: () => nav.navigate('Tabs', { screen: 'Projects' }) },
+            { label: 'Scheduled', value: `${strip.scheduled}`, color: theme.color.orange, icon: 'calendar' as IconName, onPress: () => nav.navigate('Queue') },
+            { label: 'Done', value: `${strip.done}`, color: theme.color.green, icon: 'check' as IconName, onPress: () => nav.navigate('Budget') },
+          ] as const).map((t) => (
+            <Pressable key={t.label} onPress={t.onPress} style={{ flexGrow: 1, flexBasis: '46%', backgroundColor: theme.color.bgElevated, borderRadius: 16, borderWidth: 0.5, borderColor: theme.color.separator, padding: 16 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                <Icon name={t.icon} size={16} color={t.color} />
               </View>
-            </React.Fragment>
+              <Text style={{ fontSize: 28, fontWeight: '700', color: t.color, letterSpacing: -0.5 }}>{t.value}</Text>
+              <Text style={{ fontSize: 13, color: theme.color.inkSecondary, marginTop: 2 }}>{t.label}</Text>
+            </Pressable>
           ))}
-        </Pressable>
+        </View>
 
         {/* a little nudge */}
         <Text style={{ textAlign: 'center', paddingHorizontal: 44, paddingTop: 6, fontSize: 13, lineHeight: 19, color: theme.color.inkTertiary }}>{quip}</Text>

@@ -16,7 +16,8 @@
  */
 import * as Crypto from 'expo-crypto';
 import * as SQLite from 'expo-sqlite';
-import { API_BASE, getSessionToken, getDeviceId } from './auth';
+import { API_BASE, getSessionToken, getDeviceId, rotateDeviceId, setActiveHost } from './auth';
+import { getStr, setStr } from './storage';
 import { nobleShadowCrypto } from './shadowCryptoNoble';
 import { ExpoSecureStoreAdapter } from './shadowSecureStore';
 import { SQLiteEnrollmentMetaStore, type SQLiteMetaDatabase } from './shadowEnrollmentMetaStore';
@@ -28,6 +29,7 @@ import type { ShadowControllerService } from './shadowControllerService';
 const META_DB_NAME = 'maestro-shadow-enroll.db';
 const SHADOW_DB_NAME = 'maestro-shadow.db';
 const SESSION_LOOKUP_TIMEOUT_MS = 15_000;
+const CACHED_ACCOUNT_ID_KEY = 'maestro.shadow.cachedAccountId';
 
 /** Secure CSPRNG from expo-crypto (fails closed if the native module is absent). */
 function expoRandomSource(length: number): Uint8Array {
@@ -48,11 +50,40 @@ async function openMetaDb(): Promise<SQLiteMetaDatabase> {
 
 let cachedAccount: { token: string; accountId: string } | null = null;
 
-/** Resolve the signed-in account id from Better Auth get-session (cached per token). */
+/**
+ * Resolve the signed-in account id from Better Auth get-session.
+ *
+ * Uses a three-tier strategy for instant offline startup:
+ *   1. In-memory cache (survives within the process)
+ *   2. Persistent cache (AsyncStorage — survives cold boot)
+ *   3. Network fetch (Better Auth get-session endpoint)
+ *
+ * On cold boot when the server is unreachable (Mac off), the persistent cache
+ * returns the account id instantly instead of hanging for 15s. The network
+ * fetch refreshes the cache in the background when connectivity returns.
+ */
 async function resolveAccountId(): Promise<string> {
   const token = getSessionToken();
   if (!token) throw Object.assign(new Error('not signed in'), { statusCode: 401 });
+  // Tier 1: in-memory cache (fastest)
   if (cachedAccount && cachedAccount.token === token) return cachedAccount.accountId;
+  // Tier 2: persistent cache (instant on cold boot, no network)
+  const persisted = getStr(CACHED_ACCOUNT_ID_KEY);
+  if (persisted) {
+    // Use the persisted account id immediately; refresh in background.
+    cachedAccount = { token, accountId: persisted };
+    // Best-effort background refresh: if the server is reachable, update the
+    // cache. If not, the persisted value is still valid (the enrollment grant
+    // is bound to this account and won't change without a full sign-out).
+    void resolveAccountIdFromNetwork(token).catch(() => { /* offline is fine */ });
+    return persisted;
+  }
+  // Tier 3: network fetch (first-time enrollment or after cache clear)
+  return resolveAccountIdFromNetwork(token);
+}
+
+/** Fetch the account id from the relay and persist it. */
+async function resolveAccountIdFromNetwork(token: string): Promise<string> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), SESSION_LOOKUP_TIMEOUT_MS);
   let res: Response;
@@ -71,6 +102,7 @@ async function resolveAccountId(): Promise<string> {
   const id = data?.user?.id;
   if (!id) throw Object.assign(new Error('no account session'), { statusCode: 401 });
   cachedAccount = { token, accountId: id };
+  setStr(CACHED_ACCOUNT_ID_KEY, id);
   return id;
 }
 
@@ -81,6 +113,7 @@ const productionSession: MobileSessionProvider = {
     sessionToken: getSessionToken(),
     relayOrigin: API_BASE,
   }),
+  rotateDeviceId,
 };
 
 /** Construct a fresh production runtime (used by the singleton; overridable in tests). */
@@ -145,6 +178,12 @@ export async function createShadowMobileControllerService(): Promise<ShadowContr
   await runtime.restore(); // rehydrate the accepted grant + scope key from SecureStore
   const grant = runtime.grantSummary();
   if (!grant) return null;
+  // Wire the host identity into the shared auth module so the screen runtime's
+  // session() resolver (and any other consumer that reads getActiveHost()) can
+  // construct the /ws/remote/screen WebSocket URL. Without this the screen
+  // viewer store never attaches a ScreenStreamClient and the "View screen"
+  // button is hidden.
+  setActiveHost(grant.hostDeviceId);
   const store = await createExpoSQLiteShadowStore({
     databaseName: SHADOW_DB_NAME,
     controllerDeviceId: grant.controllerDeviceId,
@@ -206,6 +245,7 @@ export async function resetShadowMobileEnrollmentRuntimeDurable(reason = 'accoun
   singletonPromise = null; // B1-R1: drop the memoized factory promise so a fresh account rebuilds
   controllerStore = null;
   cachedAccount = null;
+  setStr(CACHED_ACCOUNT_ID_KEY, ''); // clear persistent account cache on sign-out / account switch
   // Stop timers/subscriptions + wipe in-memory scope key/rings up front.
   if (service) { try { service.stopAutoReconcile(); service.lock(reason); } catch { /* best-effort */ } }
   // Reach the durable secureStore/metaStore (build a runtime if none exists this process).
