@@ -61,6 +61,16 @@ export function getDeviceId(): string {
   if (!id) { id = mintDeviceId(); setStr(DEVICE_ID, id); }
   return id;
 }
+/** Mint a fresh device ID, replacing the current one. Used to recover from 409
+    "controller already enrolled" — the server still has the old enrollment keyed
+    by the previous device ID, but local grant data was lost (e.g. app data
+    cleared during development). A new ID sidesteps the server conflict so the
+    phone can re-enroll without a Mac-side revoke. */
+export function rotateDeviceId(): string {
+  const id = mintDeviceId();
+  setStr(DEVICE_ID, id);
+  return id;
+}
 
 /* ── Active host (which Mac this phone controls) ────────────────────────── */
 

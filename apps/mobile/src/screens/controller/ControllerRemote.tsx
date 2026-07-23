@@ -92,6 +92,13 @@ export function ControllerRemote() {
                 accessibilityLabel={vm.frameAccessibilityLabel}
                 source={{ uri: snap.frameDataUri! }}
                 resizeMode="contain"
+                // fadeDuration={0}: Android's <Image> runs a ~300ms cross-fade on EVERY
+                // source change by default. Frames arrive every ~125ms (8fps), so each new
+                // frame starts fading in while the last is still mid-fade → constant flicker
+                // ("blinking"). Disabling the fade makes successive frames swap instantly.
+                fadeDuration={0}
+                // progressiveRenderingEnabled off so partial JPEG scans don't paint.
+                progressiveRenderingEnabled={false}
                 style={{ width: width, height: height - insets.top - insets.bottom - 50 }}
               />
             </ScrollView>
@@ -137,9 +144,7 @@ export function ControllerRemote() {
                 ? 'Screen viewing is not enabled for this device. Re-enroll and check "View Mac screen" to enable it.'
                 : !state.connection.online
                   ? 'Your Mac is offline. Connect to start viewing.'
-                  : vm.phase === 'idle'
-                    ? 'Ready to view your Mac screen. No input events are sent — view only.'
-                    : vm.sourceLabel ?? 'Waiting for the screen stream...'}
+                  : vm.subtitle /* truthful per-phase copy (Ready / Starting / Session expired / …) */}
             </Text>
 
             {/* Connection status */}
@@ -147,15 +152,28 @@ export function ControllerRemote() {
               <ConnBadge online={state.connection.online} />
             </View>
 
-            {/* Action buttons */}
-            {vm.showViewButton ? (
+            {/* Action buttons.
+             * Escape-hatch invariant: whenever screen access is GRANTED and we're not
+             * already showing a live frame, ALWAYS offer "View screen" so the viewer can
+             * (re)start or retry. Several reachable states (a `requesting` that never gets
+             * a first frame, a transient non-idle client after a stop/route-exit) leave the
+             * view-model's showViewButton/showStopButton both false — which previously
+             * stranded the user on "Waiting for the screen stream…" with no button at all.
+             * The store's requestView() is safe when no client is attached (it surfaces a
+             * truthful error rather than no-op), so this can never be a dead tap. */}
+            {screenViewGranted ? (
               <View style={{ width: '100%', maxWidth: 280 }}>
-                <PrimaryButton title="View screen" icon="eye" onPress={() => store.requestView()} label="View Mac screen, view only" />
+                <PrimaryButton
+                  title={vm.phase === 'requesting' ? 'Retry' : 'View screen'}
+                  icon="eye"
+                  onPress={() => store.requestView()}
+                  label="View Mac screen, view only"
+                />
               </View>
             ) : null}
 
             {vm.showStopButton ? (
-              <View style={{ width: '100%', maxWidth: 280 }}>
+              <View style={{ width: '100%', maxWidth: 280, marginTop: 10 }}>
                 <GhostButton title="Stop viewing" tone="danger" onPress={() => store.stop()} />
               </View>
             ) : null}

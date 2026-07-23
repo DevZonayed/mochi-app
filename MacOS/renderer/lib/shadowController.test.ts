@@ -130,6 +130,7 @@ describe('shadowController status + errors', () => {
     expect(msg).not.toContain('RAW-HOST-STACKTRACE');
     expect(msg).not.toContain('/Users/secret');
     expect(genericMutationError({ status: 401 })).toMatch(/sign in/i);
+    expect(genericMutationError({ status: 403 })).toMatch(/expired/i);
     expect(genericMutationError({ status: 409 })).toMatch(/no longer available/i);
     expect(genericLoadError()).toBeTruthy();
   });

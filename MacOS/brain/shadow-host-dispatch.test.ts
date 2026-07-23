@@ -20,6 +20,7 @@ function fakeRuntime() {
     listControllersForRecovery: vi.fn(async () => { calls.push('listControllersForRecovery'); return [{ controllerDeviceId: 'c', grantId: 'g', keyId: 'wk', status: 'active', expiresAt: 2 }]; }),
     revoke: vi.fn(async () => { calls.push('revoke'); return { keyRotationId: 'kr_x', alreadyRevoked: false }; }),
     recoverExpiredLeaseController: vi.fn(async () => { calls.push('recoverExpiredLeaseController'); return { keyRotationId: 'kr_recovery', alreadyRevoked: false, leaseReacquired: true }; }),
+    purgeServerOrphans: vi.fn(async () => { calls.push('purgeServerOrphans'); return { revoked: ['c-orphan'], skipped: [] }; }),
   } as unknown as ShadowHostEnrollmentRuntime;
   return { rt, calls };
 }
@@ -42,7 +43,7 @@ describe('shadow host dispatch allowlist', () => {
     expect([...SHADOW_HOST_METHODS]).toEqual([
       'shadowHostStatus', 'shadowHostCreateSession', 'shadowHostListPending', 'shadowHostApprove',
       'shadowHostDeny', 'shadowHostCancel', 'shadowHostListControllers', 'shadowHostRevoke',
-      'shadowHostRecoverExpiredController',
+      'shadowHostRecoverExpiredController', 'shadowHostPurgeServerOrphans',
       // Phase 3D1 view-only screen share — read-only status + local Stop.
       'shadowHostScreenStatus', 'shadowHostScreenStop',
     ]);
@@ -130,6 +131,14 @@ describe('shadow host dispatch allowlist', () => {
     expect(rev).toMatchObject({ keyRotationId: 'kr_recovery', leaseReacquired: true });
     expect(ensureStarted).not.toHaveBeenCalled();
     expect(calls).toContain('recoverExpiredLeaseController');
+  });
+
+  it('ensure-starts, purges server orphans, and returns the revoked/skipped result', async () => {
+    const { dispatch, calls, ensureStarted } = makeDispatch();
+    const res = await dispatch('shadowHostPurgeServerOrphans', {}) as { revoked: string[]; skipped: string[] };
+    expect(res).toEqual({ revoked: ['c-orphan'], skipped: [] });
+    expect(ensureStarted).toHaveBeenCalled();
+    expect(calls).toContain('purgeServerOrphans');
   });
 
   it('lists controllers through the recovery reader when start fails into recovery state', async () => {

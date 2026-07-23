@@ -50,10 +50,13 @@ export const SHADOW_SCREEN_ENVELOPE_MAX_BYTES = SHADOW_SCREEN_FRAME_MAX_BYTES + 
 /** Aspect-fit maximum dimension for a captured frame. */
 export const SHADOW_SCREEN_MAX_DIMENSION = 1280;
 export const SHADOW_SCREEN_MIN_DIMENSION = 16;
-/** Adaptive frame-rate band. */
+/** Adaptive frame-rate band. Raised to real-time video rates (was 2/10/8): the viewer
+ * requests the target and the host + native capture clamp to [MIN,MAX]; the relay's
+ * latest-frame backpressure drops intermediate frames when a slow controller can't keep
+ * up, so a high ceiling never floods a weak device — it just lets fast paths run smooth. */
 export const SHADOW_SCREEN_MIN_FPS = 2;
-export const SHADOW_SCREEN_MAX_FPS = 10;
-export const SHADOW_SCREEN_TARGET_FPS = 8;
+export const SHADOW_SCREEN_MAX_FPS = 30;
+export const SHADOW_SCREEN_TARGET_FPS = 30;
 /** Reject a capture timestamp implausibly far in the future (clock-skew guard). */
 export const SHADOW_SCREEN_MAX_CLOCK_SKEW_MS = 60_000;
 
@@ -639,10 +642,16 @@ export class ScreenFrameSender {
   async seal(frameBytes: Uint8Array, captureTsMs: number): Promise<Uint8Array> {
     if (this.disposed) throw new Error('sender-disposed');
     this.seq += 1;
+    // captureTsMs may arrive as a floating-point millisecond (e.g. the native
+    // capture uses Date().timeIntervalSince1970 * 1000.0). The wire header + AAD
+    // encode it as an unsigned 64-bit integer, so normalise to a non-negative
+    // safe integer here — otherwise the AAD's u64be() throws and every frame
+    // fails to seal. The receiver parses the same integer back from the header.
+    const tsMs = Number.isFinite(captureTsMs) ? Math.max(0, Math.floor(captureTsMs)) : 0;
     return sealScreenFrame(this.backend, this.key, this.binding, {
       keyEpoch: this.keyEpoch,
       seq: this.seq,
-      captureTsMs,
+      captureTsMs: tsMs,
       width: this.binding.width,
       height: this.binding.height,
       codec: this.binding.codec,

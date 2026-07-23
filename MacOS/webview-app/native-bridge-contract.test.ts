@@ -68,9 +68,9 @@ describe('screen capture — real ScreenCaptureKit path (Phase 3D1)', () => {
     expect(preflightBody).not.toContain('CGRequestScreenCaptureAccess');
   });
 
-  it('aspect-fits to a max dimension of 1280 and clamps fps to 2...10', () => {
+  it('aspect-fits to a max dimension of 1280 and clamps fps to 2...60', () => {
     expect(SCREEN).toContain('min(config.maxDimension, 1280)');
-    expect(SCREEN).toContain('max(2, min(config.fps, 10))');
+    expect(SCREEN).toContain('max(2, min(config.fps, 60))');
   });
 
   it('has NO synthetic-input / CGEvent / accessibility path anywhere in the capture bridge', () => {

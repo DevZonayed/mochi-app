@@ -271,11 +271,45 @@ describe('expired persisted shadow host lease recovery', () => {
     expect(leaseBodies[0]).toEqual({ scopeId: `account:${accountId}` });
   });
 
-  it('fails closed instead of refreshing an expired lease when active controllers exist', async () => {
+  it('resumes an expired lease with active controllers via same-fence renew when NO successor took the scope', async () => {
+    const controller = { controllerDeviceId: 'ctrl_live', grantId: 'grant_live', keyId: 'key_live', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
+    const { rt, leaseBodies, nowMs, recordFile } = await startWithSeededExpiry(1_800_000_000_000 - 1, [controller]);
+    const renewBodies: Array<Record<string, unknown>> = [];
+    (rt as unknown as { opts: { transport: { fetch: ShadowFetch } } }).opts.transport.fetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/lease/renew-with-transitions') {
+        renewBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
+        // The relay proves the fence still matches the LIVE lease (no successor) and
+        // extends the expired lease KEEPING the same epoch.
+        return { status: 200, ok: true, text: async () => JSON.stringify({ fence: oldFence, expiresAt: nowMs + 240_000, replayed: false }) };
+      }
+      if (path === '/api/shadow/lease') { leaseBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>); return { status: 409, ok: false, text: async () => '{"error":"expired lease id cannot be reused"}' }; }
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
+    // Same epoch preserved — the controller's authority chain stays valid, no re-enroll.
+    await expect(rt.start()).resolves.toMatchObject({ state: 'running', epoch: oldFence.epoch });
+    // The plain acquire endpoint is never used to refresh an expired active-controller lease.
+    expect(leaseBodies).toHaveLength(0);
+    expect(renewBodies).toHaveLength(1);
+    expect(renewBodies[0]).toMatchObject({ currentFence: oldFence });
+    const saved = JSON.parse(readFileSync(recordFile, 'utf8')) as HostEnrollmentRecord;
+    expect(saved.leaseExpiresAt).toBe(nowMs + 240_000);
+  });
+
+  it('fails closed (re-enrollment required) when a SUCCESSOR took the scope during an expired-lease restart', async () => {
     const controller = { controllerDeviceId: 'ctrl_live', grantId: 'grant_live', keyId: 'key_live', agreementPublicKey: 'a', transcriptHash: 't', status: 'active' as const };
     const { rt, leaseBodies } = await startWithSeededExpiry(1_800_000_000_000 - 1, [controller]);
+    (rt as unknown as { opts: { transport: { fetch: ShadowFetch } } }).opts.transport.fetch = async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/shadow/enroll/host-identity') return { status: 200, ok: true, text: async () => JSON.stringify({ fingerprint: 'fp', signingKeyId: 'sk', agreementKeyId: 'ak' }) };
+      if (path === '/api/shadow/lease/renew-with-transitions') return { status: 409, ok: false, text: async () => '{"error":"successor fence — stale renewal rejected"}' };
+      if (path === '/api/shadow/lease') { leaseBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>); return { status: 200, ok: true, text: async () => JSON.stringify({ fence: oldFence, expiresAt: 0 }) }; }
+      return { status: 404, ok: false, text: async () => '{"error":"no"}' };
+    };
     await expect(rt.start()).rejects.toMatchObject({ statusCode: 409 });
     await expect(rt.start()).rejects.toThrow(/re-enrollment required/i);
+    // A successor means the plain acquire endpoint must NOT be used to steal the scope back.
     expect(leaseBodies).toHaveLength(0);
     expect(rt.status()).toMatchObject({ state: 'error' });
     expect(String(rt.status().lastError ?? '')).not.toMatch(/lease_old|grant_live|key_live|ctrl_live/);

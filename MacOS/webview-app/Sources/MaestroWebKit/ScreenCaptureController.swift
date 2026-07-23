@@ -41,7 +41,7 @@ struct ScreenCaptureSource {
 struct ScreenCaptureStartConfig {
     let sourceID: String
     let maxDimension: Int       // aspect-fit longest edge (<= 1280)
-    let fps: Int                // 2...10
+    let fps: Int                // 2...60
     let showsCursor: Bool       // default false
     let jpegQuality: CGFloat    // 0...1, adaptive
 }
@@ -127,8 +127,8 @@ final class ScreenCaptureController: NSObject, SCStreamOutput, SCStreamDelegate 
         cfg.showsCursor = config.showsCursor          // default false
         cfg.capturesAudio = false                     // NEVER audio
         cfg.pixelFormat = kCVPixelFormatType_32BGRA
-        cfg.queueDepth = 3                             // small — latest-frame only
-        let fps = max(2, min(config.fps, 10))
+        cfg.queueDepth = 5                             // small — latest-frame only, a touch deeper for 30fps
+        let fps = max(2, min(config.fps, 60))          // real-time band: up to 60fps (was hard-capped at 10)
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
 
         self.jpegQuality = max(0.2, min(config.jpegQuality, 0.9))

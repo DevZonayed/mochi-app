@@ -306,6 +306,20 @@ async function accountDevices(): Promise<unknown[]> {
   return await res.json() as unknown[];
 }
 
+/**
+ * After the account host (re)starts — fresh sign-in OR an in-place session swap — bring the
+ * shadow-host background services back up. `stopShadowHostData()` (called on sign-out / session
+ * clear) CLEARS the renewal-loop interval, and nothing else restarts it outside of boot(); a
+ * sign-out→sign-in (or an in-place session reset) would otherwise leave the host lease with no
+ * renewer, so it silently expires and the Mac reports offline to enrollment. `startShadowHostDataLoop`
+ * is idempotent (no-ops when its timer is live), and the screen owner is rebuilt when a display is
+ * already configured so a stream can start without waiting for a re-selection.
+ */
+function resumeShadowHostServices(): void {
+  try { startShadowHostDataLoop(); } catch (e) { warn('shadowHostData.loop.resume', e); }
+  if (screenSourcePolicy) { void getScreenHostOwner().catch((e) => warn('screenHostOwner.resume', e)); }
+}
+
 async function handleAccountCall(method: string, params: Record<string, unknown>): Promise<unknown> {
   switch (method) {
     case 'accountStatus': {
@@ -323,6 +337,7 @@ async function handleAccountCall(method: string, params: Record<string, unknown>
       if (!r.token) throw Object.assign(new Error('signed in but no session token was returned'), { statusCode: 500 });
       writeAccountToken(r.token);
       startAccountHost(r.token);
+      resumeShadowHostServices();
       return { signedIn: true, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: await accountDevices().catch(() => []) };
     }
     case 'accountSignUp': {
@@ -334,6 +349,7 @@ async function handleAccountCall(method: string, params: Record<string, unknown>
       if (!r.token) throw Object.assign(new Error('account created but no session token was returned'), { statusCode: 500 });
       writeAccountToken(r.token);
       startAccountHost(r.token);
+      resumeShadowHostServices();
       return { signedIn: true, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: await accountDevices().catch(() => []) };
     }
     case 'accountSignOut':
@@ -356,6 +372,7 @@ async function handleAccountCall(method: string, params: Record<string, unknown>
       }
       writeAccountToken(token);
       startAccountHost(token);
+      resumeShadowHostServices();
       return { signedIn: true, deviceId: store.deck.deckId, serverUrl: RELAY_URL, devices: await accountDevices().catch(() => []) };
     }
     default:
@@ -371,6 +388,13 @@ async function handleAccountCall(method: string, params: Record<string, unknown>
 // safeStorage ciphertext; the QR is returned ONLY from the explicit create call
 // and never logged. Fails visibly/read-only when auth or the vault is unavailable.
 let shadowHost: { accountId: string; rt: ShadowHostEnrollmentRuntime } | null = null;
+// Memoizes an in-flight getShadowHostFor() so concurrent boot callers (data loop +
+// screen-owner init + renderer status poll) SHARE one runtime. Without this, each caller
+// races past the `await resolveAccountId()` yield, builds a SEPARATE runtime, and each
+// independently calls acquireLease — churning the scope epoch so the cached runtime's fence
+// goes stale and every lease renewal fails "successor". One runtime → rt.start()'s own
+// 'starting' guard prevents a double-acquire.
+let shadowHostInflight: Promise<ShadowHostEnrollmentRuntime> | null = null;
 let cachedAccount: { token: string; accountId: string } | null = null;
 
 async function resolveAccountId(): Promise<string> {
@@ -391,17 +415,23 @@ function shadowHostFile(accountId: string): string {
 }
 
 async function getShadowHostFor(): Promise<ShadowHostEnrollmentRuntime> {
-  const accountId = await resolveAccountId();
-  if (shadowHost && shadowHost.accountId === accountId) return shadowHost.rt;
-  if (shadowHost) { try { await shadowHost.rt.stop(); } catch { /* noop */ } shadowHost = null; }
-  const rt = new ShadowHostEnrollmentRuntime({
-    vault: new SafeStorageVault(safeStorage),
-    persistence: new FileHostEnrollmentPersistence(shadowHostFile(accountId)),
-    session: { get: async () => ({ accountId, hostDeviceId: store.deck.deckId, sessionToken: accountSessionToken, relayOrigin: RELAY_URL }) },
-    transport: { fetch: (url, init) => fetch(url, init as RequestInit) as unknown as ReturnType<ConstructorParameters<typeof ShadowHostEnrollmentRuntime>[0]['transport']['fetch']> },
-  });
-  shadowHost = { accountId, rt };
-  return rt;
+  // Coalesce concurrent creations onto ONE in-flight promise (see shadowHostInflight).
+  if (shadowHostInflight) return shadowHostInflight;
+  shadowHostInflight = (async () => {
+    const accountId = await resolveAccountId();
+    if (shadowHost && shadowHost.accountId === accountId) return shadowHost.rt;
+    if (shadowHost) { try { await shadowHost.rt.stop(); } catch { /* noop */ } shadowHost = null; }
+    const rt = new ShadowHostEnrollmentRuntime({
+      vault: new SafeStorageVault(safeStorage),
+      persistence: new FileHostEnrollmentPersistence(shadowHostFile(accountId)),
+      session: { get: async () => ({ accountId, hostDeviceId: store.deck.deckId, sessionToken: accountSessionToken, relayOrigin: RELAY_URL }) },
+      transport: { fetch: (url, init) => fetch(url, init as RequestInit) as unknown as ReturnType<ConstructorParameters<typeof ShadowHostEnrollmentRuntime>[0]['transport']['fetch']> },
+    });
+    shadowHost = { accountId, rt };
+    return rt;
+  })();
+  try { return await shadowHostInflight; }
+  finally { shadowHostInflight = null; }
 }
 
 async function ensureShadowHostStarted(rt: ShadowHostEnrollmentRuntime): Promise<void> {
@@ -410,6 +440,7 @@ async function ensureShadowHostStarted(rt: ShadowHostEnrollmentRuntime): Promise
 }
 
 async function stopShadowHost(): Promise<void> {
+  shadowHostInflight = null;
   if (shadowHost) { try { await shadowHost.rt.stop(); } catch { /* noop */ } shadowHost = null; }
   cachedAccount = null;
 }
@@ -584,6 +615,12 @@ function applyLiveHostAuthority(rt: ShadowHostEnrollmentRuntime): void {
 // writes screenShareRegistry. The configured display source is host-confirmed via the
 // Controllers/settings surface and persisted (metadata only) — no start without it.
 let screenOwner: ScreenHostOwner | null = null;
+// Memoize an in-flight getScreenHostOwner() so concurrent callers (boot init + the data
+// loop's onAuthorityChanged + screenConfigureSource) SHARE one owner. Without this, each
+// caller races past the two `await`s before `screenOwner` is set, builds a SEPARATE owner,
+// and each opens its own /ws/host/screen link — the relay then supersedes them alternately,
+// producing an endless connect→close→reconnect loop so no screen-start is ever served.
+let screenOwnerInflight: Promise<ScreenHostOwner | null> | null = null;
 let screenPermission: 'granted' | 'denied' | 'undetermined' = 'undetermined';
 let screenSourcePolicy: ScreenSourcePolicy | null = loadScreenSourcePolicy();
 
@@ -621,9 +658,20 @@ function buildScreenAuthoritySnapshot(rt: ShadowHostEnrollmentRuntime, controlle
 
 async function getScreenHostOwner(): Promise<ScreenHostOwner | null> {
   if (screenOwner) return screenOwner;
+  try { process.stderr.write(`[DIAG5] getScreenHostOwner token=${!!accountSessionToken} source=${!!screenSourcePolicy} existing=${!!screenOwner}\n`); } catch { /* */ }
+  if (!accountSessionToken || !screenSourcePolicy) return null;
+  if (screenOwnerInflight) return screenOwnerInflight;
+  screenOwnerInflight = buildScreenHostOwner();
+  try { return await screenOwnerInflight; }
+  finally { screenOwnerInflight = null; }
+}
+
+async function buildScreenHostOwner(): Promise<ScreenHostOwner | null> {
+  if (screenOwner) return screenOwner;
   if (!accountSessionToken || !screenSourcePolicy) return null;
   const rt = await getShadowHostFor();
   await ensureShadowHostStarted(rt);
+  if (screenOwner) return screenOwner; // another path won the race while we awaited
   screenOwner = new ScreenHostOwner({
     backend: screenBackend,
     authority: {
@@ -646,10 +694,12 @@ async function getScreenHostOwner(): Promise<ScreenHostOwner | null> {
     audit: () => { /* metadata-only audit is emitted via the coordinator's status events */ },
   });
   screenOwner.start();
+  try { process.stderr.write(`[DIAG5] screenOwner STARTED (dialing relay)\n`); } catch { /* */ }
   return screenOwner;
 }
 
 async function stopScreenHostOwner(): Promise<void> {
+  screenOwnerInflight = null;
   if (!screenOwner) return;
   try { await screenOwner.stop(); } catch { /* */ }
   screenOwner = null;
@@ -689,7 +739,13 @@ async function handleScreenCall(method: string, params: Record<string, unknown>)
   // and stop any active stream. Revalidation only — never an auto-pick.
   if (method === 'screenReportSources') {
     const ids = Array.isArray(params.ids) ? (params.ids as unknown[]).map((x) => String(x)) : [];
-    if (screenSourcePolicy && !ids.includes(screenSourcePolicy.sourcePolicyId)) {
+    // IMPORTANT: an EMPTY list is NOT authoritative — it happens when Screen Recording
+    // permission isn't granted yet (or the renderer hasn't finished enumerating on boot),
+    // where the native source list comes back empty. Treating that as "the display is gone"
+    // wrongly wiped the operator's confirmed display on every restart (esp. right after a
+    // re-sign/permission reset), forcing a re-pick. Only revalidate-drop against a
+    // NON-EMPTY report, which is the only case that authoritatively proves a display left.
+    if (ids.length > 0 && screenSourcePolicy && !ids.includes(screenSourcePolicy.sourcePolicyId)) {
       screenSourcePolicy = null;
       persistScreenSourcePolicy(null);
       await screenOwner?.onAuthorityChanged();
@@ -699,7 +755,8 @@ async function handleScreenCall(method: string, params: Record<string, unknown>)
   }
   if (method === 'screenFrame') {
     const owner = screenOwner; if (!owner) return { ok: false };
-    const b64 = String(params.b64 ?? ''); const ts = Number(params.ts ?? Date.now());
+    const b64 = String(params.b64 ?? ''); const rawTs = Number(params.ts ?? Date.now());
+    const ts = Number.isFinite(rawTs) ? Math.max(0, Math.floor(rawTs)) : Date.now();
     if (!b64 || b64.length > 2_000_000) return { ok: false }; // bounded; latest-only
     let bytes: Buffer;
     try { bytes = Buffer.from(b64, 'base64'); } catch { return { ok: false }; }
@@ -840,9 +897,10 @@ async function boot() {
     if (method.startsWith('account')) return await handleAccountCall(method, params);
     if (method.startsWith('shadowHostData')) return await handleShadowHostDataCall(method);
     if (method.startsWith('shadowHost')) return await handleShadowHostCall(method, params);
-    // Phase 3D1 (B2): renderer/native → brain screen seam (frame / permission / source
-    // config / capture error). NOT the native screenCapture* methods (those go to Swift).
-    if (method === 'screenFrame' || method === 'screenPermission' || method === 'screenConfigureSource' || method === 'screenCaptureError') return await handleScreenCall(method, params);
+    // Phase 3D1 (B2): renderer/native → brain screen seam. All `screen*` brain methods
+    // are routed here — frame, permission, source config/clear/state/report, capture error.
+    // NOT the native screenCapture* methods (those go to Swift via the native bridge).
+    if (method.startsWith('screen')) return await handleScreenCall(method, params);
     return await dispatch(method, params);
   }, httpHandler);
   tokenRef.value = host.token; // arm the file-preview route with the real host token
@@ -865,6 +923,12 @@ async function boot() {
   const persistedToken = readAccountToken();
   if (persistedToken) {
     try { startAccountHost(persistedToken); } catch (e) { warn('account host', e); }
+    // Phase 3D1: if a screen source was already configured (persisted host-local),
+    // eagerly construct the ScreenHostOwner so the /ws/host/screen link connects on
+    // boot — otherwise the phone's view-request has no host to respond.
+    if (screenSourcePolicy) {
+      void getScreenHostOwner().catch((e) => warn('screenHostOwner.boot', e));
+    }
   }
   try { startShadowHostDataLoop(); } catch (e) { warn('shadowHostData.loop.start', e); }
 
