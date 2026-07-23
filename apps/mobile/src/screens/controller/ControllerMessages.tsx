@@ -1,178 +1,129 @@
 /**
- * ControllerMessages — WhatsApp-style messaging tab. Shows a chat list of sessions
- * grouped by project, with the ability to send messages/prompts. Each sent command
- * gets WhatsApp-style delivery indicators (clock=sending, check=sent, double-check=
- * delivered, blue double-check=done). The compose flow uses the existing action
- * controller for delivery tracking.
+ * ControllerMessages — the Chat tab, trimmed to ACTIVE conversations only.
  *
- * Key design decisions:
- * - Each session is a "conversation" (like a WhatsApp chat)
- * - Starting a job in a project is like "starting a new chat"
- * - Delivery indicators map to ActionReceipt phases
- * - Sent commands are stored in local component state per session
+ * Previously this flattened EVERY session across every project into one endless list,
+ * which was noise. Now it shows only conversations that are actually live: sessions with
+ * a running job, or activity within the last 7 days, newest first, lazy-loaded. Tapping a
+ * conversation opens the shared in-session chat window (SessionChatView) with all controls;
+ * the "+" starts a new job (a new conversation). Archived / stale sessions live under their
+ * project in the Projects tab, not here.
  */
 import React from 'react';
 import {
-  View, Text, FlatList, ScrollView, TextInput, Pressable,
+  View, Text, FlatList, ScrollView, TextInput, Pressable, ActivityIndicator,
   KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { useTheme } from '../../theme';
 import { Icon } from '../../Icon';
 import { useController } from './ControllerContext';
 import { useActionEnv, familyGranted } from './ActionControls';
-import { useActionController, useActionReceipt } from '../../shadowActionRuntime';
+import { useActionController } from '../../shadowActionRuntime';
 import type { ActionIntent } from '../../shadowActionController';
 import type { ProjectView, SessionView } from '../../shadowProjectionSelectors';
 import {
-  Screen, EmptyState, PrimaryButton, KindBadge, MessageBubble,
-  ConnBadge, kindColor, useInsets,
-  type DeliveryPhase,
+  Screen, EmptyState, PrimaryButton, KindBadge, kindColor, useInsets,
 } from './parts';
+import { SessionChatView } from './SessionChatView';
 
-/** Map ActionReceipt phase to WhatsApp delivery phase. */
-function receiptToDelivery(phase: string): DeliveryPhase {
-  switch (phase) {
-    case 'preparing': case 'sent': return 'sending';
-    case 'working': return 'sent';
-    case 'done': return 'delivered';
-    case 'failed': return 'failed';
-    default: return 'sending';
-  }
-}
+const RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // "active" = touched within 7 days
+const PAGE = 12;
 
-interface SentMessage {
-  id: string;
-  text: string;
-  timestamp: number;
-  intent: ActionIntent;
-}
-
-interface ChatRoute {
-  view: 'list' | 'chat' | 'newJob';
-  projectId?: string;
-  sessionId?: string;
-}
+interface ChatRoute { view: 'list' | 'chat' | 'newJob'; projectId?: string; sessionId?: string }
 
 export function ControllerMessages() {
   const { theme } = useTheme();
-  const { state, controller } = useController();
+  const { controller } = useController();
   const insets = useInsets();
   const [route, setRoute] = React.useState<ChatRoute>({ view: 'list' });
+  const [count, setCount] = React.useState(PAGE);
 
   const proj = controller.projection();
   const projects = proj.projects();
 
-  // Gather all sessions across projects, sorted by activity
-  const allSessions = React.useMemo(() => {
-    const out: Array<SessionView & { projectName?: string; projectKind?: string }> = [];
+  // Active conversations: non-archived sessions that are running or recently active.
+  const conversations = React.useMemo(() => {
+    const now = Date.now();
+    const out: Array<SessionView & { projectName?: string; projectKind?: string; running: boolean }> = [];
     for (const p of projects) {
+      const runningSet = new Set(proj.projectJobs(p.id).filter((j) => j.status === 'running' && j.sessionId).map((j) => j.sessionId!));
       for (const s of proj.projectSessions(p.id)) {
-        out.push({ ...s, projectName: p.name, projectKind: p.kind });
+        if (s.archived) continue;
+        const running = runningSet.has(s.id);
+        const last = s.lastActivity ?? s.createdAt ?? 0;
+        if (!running && now - last > RECENT_WINDOW_MS) continue;
+        out.push({ ...s, projectName: p.name, projectKind: p.kind, running });
       }
     }
-    return out.sort((a, b) => (b.lastActivity ?? b.createdAt ?? 0) - (a.lastActivity ?? a.createdAt ?? 0));
+    return out.sort((a, b) => {
+      if (a.running !== b.running) return a.running ? -1 : 1;
+      return (b.lastActivity ?? b.createdAt ?? 0) - (a.lastActivity ?? a.createdAt ?? 0);
+    });
   }, [projects, proj]);
 
-  // Chat detail view
+  const visible = conversations.slice(0, count);
+  const hasMore = count < conversations.length;
+
+  // Chat detail → shared in-session chat window (with controls)
   if (route.view === 'chat' && route.sessionId) {
-    const session = proj.session(route.sessionId);
-    const project = projects.find((p) => p.id === session?.projectId);
-    return (
-      <ChatView
-        session={session}
-        project={project}
-        onBack={() => setRoute({ view: 'list' })}
-      />
-    );
+    return <SessionChatView sessionId={route.sessionId} onBack={() => setRoute({ view: 'list' })} />;
   }
-
-  // New job (start a new chat)
   if (route.view === 'newJob') {
-    return (
-      <NewJobChat
-        projects={projects}
-        onBack={() => setRoute({ view: 'list' })}
-        onSent={() => setRoute({ view: 'list' })}
-      />
-    );
+    return <NewJobChat projects={projects} initialProjectId={route.projectId} onBack={() => setRoute({ view: 'list' })} onSent={() => setRoute({ view: 'list' })} />;
   }
 
-  // Chat list
   return (
     <Screen>
       <View style={{ paddingTop: insets.top + 12, paddingHorizontal: 16, paddingBottom: 6 }}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-          <Text style={{ fontSize: 32, fontWeight: '700', letterSpacing: -0.6, color: theme.color.ink }}>Messages</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+          <Text style={{ fontSize: 32, fontWeight: '700', letterSpacing: -0.6, color: theme.color.ink }}>Chat</Text>
           <Pressable
             onPress={() => setRoute({ view: 'newJob' })}
-            accessibilityLabel="Start a new job"
+            accessibilityRole="button"
+            accessibilityLabel="Start a new conversation"
             style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: theme.color.blue, alignItems: 'center', justifyContent: 'center' }}
           >
             <Icon name="plus" size={20} color="#fff" stroke={2.4} />
           </Pressable>
         </View>
+        <Text style={{ fontSize: 14, color: theme.color.inkSecondary, marginBottom: 8 }}>Active conversations</Text>
       </View>
 
-      {allSessions.length === 0 && projects.length === 0 ? (
-        <EmptyState icon="messageCircle" title="No conversations" body="Start a job on your Mac or tap + to begin." />
+      {conversations.length === 0 ? (
+        <EmptyState icon="messageCircle" title="No active chats" body="Running and recent sessions show here. Tap + to start one." />
       ) : (
         <FlatList
-          data={allSessions}
+          data={visible}
           keyExtractor={(s) => s.id}
           contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: insets.bottom + 24 }}
-          ListHeaderComponent={
-            allSessions.length === 0 ? (
-              <View style={{ paddingVertical: 20, alignItems: 'center' }}>
-                <Text style={{ fontSize: 14, color: theme.color.inkSecondary, textAlign: 'center' }}>
-                  No active sessions. Tap + to start a job.
-                </Text>
-              </View>
-            ) : null
-          }
           renderItem={({ item }) => (
             <ChatListRow
               session={item}
               projectName={item.projectName}
               projectKind={item.projectKind}
+              running={item.running}
               onPress={() => setRoute({ view: 'chat', sessionId: item.id })}
             />
           )}
-          ListFooterComponent={
-            projects.length > 0 ? (
-              <View style={{ marginTop: 16, paddingTop: 16, borderTopWidth: 0.5, borderTopColor: theme.color.separator }}>
-                <Text style={{ fontSize: 13, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary, marginBottom: 10 }}>
-                  Start a new conversation
-                </Text>
-                {projects.slice(0, 8).map((p) => (
-                  <Pressable
-                    key={p.id}
-                    onPress={() => setRoute({ view: 'newJob', projectId: p.id })}
-                    style={({ pressed }) => ({
-                      flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10,
-                      opacity: pressed ? 0.6 : 1,
-                    })}
-                  >
-                    <KindBadge kind={p.kind} size={36} />
-                    <View style={{ flex: 1 }}>
-                      <Text numberOfLines={1} style={{ fontSize: 15, fontWeight: '600', color: theme.color.ink }}>{p.name ?? 'Project'}</Text>
-                    </View>
-                    <Icon name="send" size={16} color={theme.color.blue} />
-                  </Pressable>
-                ))}
-              </View>
-            ) : null
-          }
-          initialNumToRender={14}
+          onEndReached={hasMore ? () => setCount((c) => c + PAGE) : undefined}
+          onEndReachedThreshold={0.5}
+          ListFooterComponent={hasMore ? (
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 18 }}>
+              <ActivityIndicator size="small" color={theme.color.inkTertiary} />
+              <Text style={{ fontSize: 13, color: theme.color.inkTertiary }}>Loading more…</Text>
+            </View>
+          ) : null}
+          initialNumToRender={12}
           windowSize={11}
+          removeClippedSubviews
         />
       )}
     </Screen>
   );
 }
 
-// ── chat list row ─────────────────────────────────────────────────────────
-function ChatListRow({ session, projectName, projectKind, onPress }: {
-  session: SessionView; projectName?: string; projectKind?: string; onPress: () => void;
+// ── chat list row ───────────────────────────────────────────────────────────
+function ChatListRow({ session, projectName, projectKind, running, onPress }: {
+  session: SessionView; projectName?: string; projectKind?: string; running: boolean; onPress: () => void;
 }) {
   const { theme } = useTheme();
   const kc = kindColor(projectKind, theme);
@@ -188,10 +139,11 @@ function ChatListRow({ session, projectName, projectKind, onPress }: {
   return (
     <Pressable
       onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`${session.title ?? session.codename ?? 'Session'}${running ? ', running' : ''}`}
       style={({ pressed }) => ({
         flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 13,
-        borderBottomWidth: 0.5, borderBottomColor: theme.color.separator,
-        opacity: pressed ? 0.6 : 1,
+        borderBottomWidth: 0.5, borderBottomColor: theme.color.separator, opacity: pressed ? 0.6 : 1,
       })}
     >
       <View style={{ width: 48, height: 48, borderRadius: 24, backgroundColor: kc + '20', alignItems: 'center', justifyContent: 'center' }}>
@@ -206,155 +158,26 @@ function ChatListRow({ session, projectName, projectKind, onPress }: {
             {fmtTime(session.lastActivity ?? session.createdAt)}
           </Text>
         </View>
-        <Text numberOfLines={1} style={{ fontSize: 13, color: theme.color.inkSecondary }}>
-          {projectName ?? 'Project'} · {session.engine ?? 'Agent'}
-        </Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          {running ? <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: theme.color.green }} /> : null}
+          <Text numberOfLines={1} style={{ flex: 1, fontSize: 13, color: running ? theme.color.green : theme.color.inkSecondary }}>
+            {running ? 'Running' : (projectName ?? 'Project')} · {session.engine ?? 'Agent'}
+          </Text>
+        </View>
       </View>
     </Pressable>
   );
 }
 
-// ── chat view (WhatsApp-style) ────────────────────────────────────────────
-function ChatView({ session, project, onBack }: {
-  session: SessionView | undefined; project: ProjectView | undefined; onBack: () => void;
+// ── new job chat (start a conversation) ─────────────────────────────────────
+function NewJobChat({ projects, initialProjectId, onBack, onSent }: {
+  projects: ProjectView[]; initialProjectId?: string; onBack: () => void; onSent: () => void;
 }) {
   const { theme } = useTheme();
-  const { state } = useController();
   const env = useActionEnv();
   const ctrl = useActionController();
   const insets = useInsets();
-  const [text, setText] = React.useState('');
-  const [sent, setSent] = React.useState<SentMessage[]>([]);
-  const [busy, setBusy] = React.useState(false);
-
-  if (!session) { onBack(); return <View style={{ flex: 1 }} />; }
-
-  const canMessage = familyGranted(env.granted, 'send-message');
-  const canAutopilot = familyGranted(env.granted, 'set-autopilot');
-
-  const sendMessage = async () => {
-    if (busy || text.trim().length === 0 || !canMessage) return;
-    const msg = text.trim();
-    const intent: ActionIntent = { family: 'send-message', sessionId: session.id, text: msg };
-    const id = `msg-${Date.now()}`;
-    setSent((prev) => [...prev, { id, text: msg, timestamp: Date.now(), intent }]);
-    setText('');
-    setBusy(true);
-    await ctrl.run(intent);
-    setBusy(false);
-  };
-
-  const kc = kindColor(project?.kind, theme);
-
-  return (
-    <Screen>
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
-        {/* Header */}
-        <View style={{ paddingTop: insets.top + 4, paddingHorizontal: 8, paddingBottom: 8, borderBottomWidth: 0.5, borderBottomColor: theme.color.separator, flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-          <Pressable onPress={onBack} hitSlop={8} style={{ width: 44, height: 44, alignItems: 'center', justifyContent: 'center' }}>
-            <Icon name="arrowLeft" size={22} color={theme.color.blue} />
-          </Pressable>
-          <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: kc + '20', alignItems: 'center', justifyContent: 'center' }}>
-            <Icon name="messageCircle" size={17} color={kc} />
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text numberOfLines={1} style={{ fontSize: 16, fontWeight: '600', color: theme.color.ink }}>{session.title ?? session.codename ?? 'Session'}</Text>
-            <Text numberOfLines={1} style={{ fontSize: 12, color: theme.color.inkSecondary }}>{project?.name ?? 'Project'} · {session.engine ?? 'Agent'}</Text>
-          </View>
-          <ConnBadge online={state.connection.online} />
-        </View>
-
-        {/* Messages area */}
-        <ScrollView
-          style={{ flex: 1 }}
-          contentContainerStyle={{ paddingHorizontal: 12, paddingVertical: 16, flexGrow: 1, justifyContent: 'flex-end' }}
-          keyboardShouldPersistTaps="handled"
-        >
-          {sent.length === 0 ? (
-            <View style={{ alignItems: 'center', paddingVertical: 40 }}>
-              <View style={{ width: 56, height: 56, borderRadius: 28, backgroundColor: theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center', marginBottom: 14 }}>
-                <Icon name="messageCircle" size={26} color={theme.color.inkTertiary} />
-              </View>
-              <Text style={{ fontSize: 15, fontWeight: '600', color: theme.color.ink, marginBottom: 4 }}>Send a message</Text>
-              <Text style={{ fontSize: 13, color: theme.color.inkSecondary, textAlign: 'center', maxWidth: 260 }}>
-                Messages you send appear here with delivery status. Type a prompt below.
-              </Text>
-            </View>
-          ) : (
-            sent.map((msg) => (
-              <SentMessageBubble key={msg.id} message={msg} />
-            ))
-          )}
-        </ScrollView>
-
-        {/* Autopilot toggle */}
-        {canAutopilot ? (
-          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 8, borderTopWidth: 0.5, borderTopColor: theme.color.separator }}>
-            <Text style={{ fontSize: 13, color: theme.color.inkSecondary }}>Autopilot {session.autopilot ? 'on' : 'off'}</Text>
-            <Pressable
-              onPress={() => void ctrl.run({ family: 'set-autopilot', sessionId: session.id, enabled: !(session.autopilot ?? false) })}
-              disabled={!env.online}
-              style={{ paddingHorizontal: 12, height: 30, borderRadius: 15, backgroundColor: session.autopilot ? theme.color.green + '20' : theme.color.fillSecondary, alignItems: 'center', justifyContent: 'center' }}
-            >
-              <Text style={{ fontSize: 12, fontWeight: '600', color: session.autopilot ? theme.color.green : theme.color.ink }}>
-                {session.autopilot ? 'On' : 'Turn on'}
-              </Text>
-            </Pressable>
-          </View>
-        ) : null}
-
-        {/* Composer */}
-        {canMessage ? (
-          <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 8, paddingHorizontal: 12, paddingTop: 8, paddingBottom: insets.bottom + 8, borderTopWidth: 0.5, borderTopColor: theme.color.separator, backgroundColor: theme.color.bgElevated }}>
-            <View style={{ flex: 1, minHeight: 40, maxHeight: 120, borderRadius: 20, backgroundColor: theme.color.bg, borderWidth: 0.5, borderColor: theme.color.separator, paddingHorizontal: 14, paddingVertical: 8, justifyContent: 'center' }}>
-              <TextInput
-                value={text}
-                onChangeText={setText}
-                placeholder="Message..."
-                placeholderTextColor={theme.color.inkTertiary}
-                multiline
-                style={{ fontSize: 15, color: theme.color.ink, maxHeight: 100, paddingVertical: 0 }}
-              />
-            </View>
-            <Pressable
-              onPress={() => void sendMessage()}
-              disabled={!env.online || text.trim().length === 0 || busy}
-              style={({ pressed }) => ({
-                width: 40, height: 40, borderRadius: 20,
-                backgroundColor: text.trim().length > 0 && env.online ? theme.color.blue : theme.color.fillSecondary,
-                alignItems: 'center', justifyContent: 'center',
-                opacity: pressed ? 0.7 : 1,
-              })}
-            >
-              <Icon name="send" size={18} color={text.trim().length > 0 && env.online ? '#fff' : theme.color.inkTertiary} />
-            </Pressable>
-          </View>
-        ) : (
-          <View style={{ paddingHorizontal: 16, paddingVertical: 12, paddingBottom: insets.bottom + 12, borderTopWidth: 0.5, borderTopColor: theme.color.separator }}>
-            <Text style={{ fontSize: 13, color: theme.color.inkTertiary, textAlign: 'center' }}>Read-only access. Request message permission to send.</Text>
-          </View>
-        )}
-      </KeyboardAvoidingView>
-    </Screen>
-  );
-}
-
-/** A single sent message with live delivery indicator from the action receipt. */
-function SentMessageBubble({ message }: { message: SentMessage }) {
-  const receipt = useActionReceipt(message.intent);
-  const phase = receipt.phase === 'idle' ? 'sending' : receiptToDelivery(receipt.phase);
-  const time = new Date(message.timestamp);
-  const timeStr = `${time.getHours()}:${time.getMinutes().toString().padStart(2, '0')}`;
-  return <MessageBubble text={message.text} time={timeStr} delivery={phase} fromMe />;
-}
-
-// ── new job chat (start a conversation) ───────────────────────────────────
-function NewJobChat({ projects, onBack, onSent }: { projects: ProjectView[]; onBack: () => void; onSent: () => void }) {
-  const { theme } = useTheme();
-  const env = useActionEnv();
-  const ctrl = useActionController();
-  const insets = useInsets();
-  const [selectedProject, setSelectedProject] = React.useState<string | null>(null);
+  const [selectedProject, setSelectedProject] = React.useState<string | null>(initialProjectId ?? null);
   const [text, setText] = React.useState('');
   const [title, setTitle] = React.useState('');
   const [busy, setBusy] = React.useState(false);
@@ -368,28 +191,21 @@ function NewJobChat({ projects, onBack, onSent }: { projects: ProjectView[]; onB
     setBusy(true);
     const res = await ctrl.run(intent);
     setBusy(false);
-    if (res.ok) {
-      setSent(true);
-      setTimeout(onSent, 1500);
-    }
+    if (res.ok) { setSent(true); setTimeout(onSent, 1500); }
   };
 
   return (
     <Screen>
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
-        {/* Header */}
         <View style={{ paddingTop: insets.top + 4, paddingHorizontal: 8, paddingBottom: 8, borderBottomWidth: 0.5, borderBottomColor: theme.color.separator, flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-          <Pressable onPress={onBack} hitSlop={8} style={{ width: 44, height: 44, alignItems: 'center', justifyContent: 'center' }}>
+          <Pressable onPress={onBack} hitSlop={8} accessibilityRole="button" accessibilityLabel="Back" style={{ width: 44, height: 44, alignItems: 'center', justifyContent: 'center' }}>
             <Icon name="arrowLeft" size={22} color={theme.color.blue} />
           </Pressable>
-          <Text style={{ fontSize: 18, fontWeight: '700', color: theme.color.ink }}>Start a job</Text>
+          <Text style={{ fontSize: 18, fontWeight: '700', color: theme.color.ink }}>New conversation</Text>
         </View>
 
         <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: insets.bottom + 24 }} keyboardShouldPersistTaps="handled">
-          {/* Project selector */}
-          <Text style={{ fontSize: 13, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary, marginBottom: 10 }}>
-            Select project
-          </Text>
+          <Text style={{ fontSize: 13, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary, marginBottom: 10 }}>Select project</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 20 }} contentContainerStyle={{ gap: 8 }}>
             {projects.map((p) => {
               const active = p.id === selectedProject;
@@ -406,22 +222,15 @@ function NewJobChat({ projects, onBack, onSent }: { projects: ProjectView[]; onB
 
           {selectedProject ? (
             <>
-              {/* Job title */}
-              <Text style={{ fontSize: 13, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary, marginBottom: 8 }}>
-                Title (optional)
-              </Text>
+              <Text style={{ fontSize: 13, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary, marginBottom: 8 }}>Title (optional)</Text>
               <TextInput
                 value={title}
                 onChangeText={setTitle}
-                placeholder="Give it a name..."
+                placeholder="Give it a name…"
                 placeholderTextColor={theme.color.inkTertiary}
                 style={{ height: 44, borderRadius: 12, paddingHorizontal: 14, backgroundColor: theme.color.fillSecondary, borderWidth: 0.5, borderColor: theme.color.separator, color: theme.color.ink, fontSize: 15, marginBottom: 16 }}
               />
-
-              {/* Instructions */}
-              <Text style={{ fontSize: 13, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary, marginBottom: 8 }}>
-                Instructions
-              </Text>
+              <Text style={{ fontSize: 13, fontWeight: '700', letterSpacing: 0.4, textTransform: 'uppercase', color: theme.color.inkSecondary, marginBottom: 8 }}>Instructions</Text>
               <TextInput
                 value={text}
                 onChangeText={setText}
@@ -430,16 +239,14 @@ function NewJobChat({ projects, onBack, onSent }: { projects: ProjectView[]; onB
                 multiline
                 style={{ minHeight: 120, borderRadius: 12, paddingHorizontal: 14, paddingTop: 12, backgroundColor: theme.color.fillSecondary, borderWidth: 0.5, borderColor: theme.color.separator, color: theme.color.ink, fontSize: 15, textAlignVertical: 'top', marginBottom: 20 }}
               />
-
-              {/* Send */}
               {sent ? (
                 <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 16 }}>
                   <Icon name="checkCircle" size={22} color={theme.color.green} />
-                  <Text style={{ fontSize: 16, fontWeight: '600', color: theme.color.green }}>Job started</Text>
+                  <Text style={{ fontSize: 16, fontWeight: '600', color: theme.color.green }}>Conversation started</Text>
                 </View>
               ) : (
                 <PrimaryButton
-                  title={busy ? 'Sending...' : 'Start job'}
+                  title={busy ? 'Sending…' : 'Start conversation'}
                   icon="send"
                   disabled={busy || text.trim().length === 0 || !env.online || !canStart}
                   onPress={() => void sendJob()}

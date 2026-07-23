@@ -20,7 +20,11 @@ export const SHADOW_PROJECTION_SCHEMA_VERSION = 1 as const;
 export interface ProjectView { id: string; name?: string; kind?: string; color?: string; hidden?: boolean; repoHost?: string; repoPath?: string; createdAt?: number; lastActivity?: number }
 export interface SessionView { id: string; projectId: string; title?: string; engine?: string; model?: string; autopilot?: boolean; reviewerEnabled?: boolean; reviewer?: string; branch?: string; codename?: string; archived?: boolean; createdAt?: number; lastActivity?: number }
 // HIGH-1: no raw error/output diagnostics cross the boundary; only bounded job state.
-export interface JobView { id: string; projectId: string; sessionId?: string; title?: string; status?: string; phase?: string; stage?: string; progress?: number; engine?: string; model?: string; cost?: number; createdAt?: number; lastActivity?: number }
+// Phase 3D2: `input` (the user's prompt for the turn) + `transcript` (assistant text /
+// thinking / tool labels / results — redacted + bounded on the host) carry the conversation.
+export type TranscriptKind = 'text' | 'thinking' | 'tool' | 'result' | 'ask' | 'review';
+export interface TranscriptEntry { kind: TranscriptKind; text?: string; name?: string; toolStatus?: string; verdict?: string }
+export interface JobView { id: string; projectId: string; sessionId?: string; title?: string; input?: string; transcript?: readonly TranscriptEntry[]; status?: string; phase?: string; stage?: string; progress?: number; engine?: string; model?: string; cost?: number; createdAt?: number; lastActivity?: number }
 export interface ApprovalView { id: string; projectId?: string; jobId?: string; tool?: string; status?: string; title?: string; summary?: string; createdAt?: number; lastActivity?: number }
 export interface QuestionView { id: string; sessionId: string; sourceJobId?: string; question?: string; choices?: string[]; deadline?: number; status?: string; createdAt?: number }
 export interface ScheduleView { id: string; projectId?: string; title?: string; time?: string; cadence?: string; kind?: string; enabled?: boolean; nextRun?: number; createdAt?: number; lastActivity?: number }
@@ -69,9 +73,22 @@ function toSession(e: ShadowEntity): SessionView | null {
   const d = rec(e.data)!; const id = str(d.id); const projectId = str(d.projectId); if (!id || !projectId) return null;
   return Object.freeze({ id, projectId, title: str(d.title), engine: str(d.engine), model: str(d.model), autopilot: bool(d.autopilot), reviewerEnabled: bool(d.reviewerEnabled), reviewer: str(d.reviewer), branch: str(d.branch), codename: str(d.codename), archived: bool(d.archived), createdAt: num(d.createdAt), lastActivity: num(d.lastActivity) });
 }
+const TRANSCRIPT_KINDS: readonly TranscriptKind[] = ['text', 'thinking', 'tool', 'result', 'ask', 'review'];
+function toTranscript(v: unknown): readonly TranscriptEntry[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out: TranscriptEntry[] = [];
+  for (const raw of v) {
+    const r = rec(raw); if (!r) continue;
+    const kind = str(r.kind); if (!kind || !TRANSCRIPT_KINDS.includes(kind as TranscriptKind)) continue;
+    const text = str(r.text); const name = str(r.name);
+    if (!text && !name) continue;
+    out.push(Object.freeze({ kind: kind as TranscriptKind, text, name, toolStatus: str(r.toolStatus), verdict: str(r.verdict) }));
+  }
+  return out.length ? Object.freeze(out) : undefined;
+}
 function toJob(e: ShadowEntity): JobView | null {
   const d = rec(e.data)!; const id = str(d.id); const projectId = str(d.projectId); if (!id || !projectId) return null;
-  return Object.freeze({ id, projectId, sessionId: str(d.sessionId), title: str(d.title), status: str(d.status), phase: str(d.phase), stage: str(d.stage), progress: num(d.progress), engine: str(d.engine), model: str(d.model), cost: num(d.cost), createdAt: num(d.createdAt), lastActivity: num(d.lastActivity) });
+  return Object.freeze({ id, projectId, sessionId: str(d.sessionId), title: str(d.title), input: str(d.input), transcript: toTranscript(d.transcript), status: str(d.status), phase: str(d.phase), stage: str(d.stage), progress: num(d.progress), engine: str(d.engine), model: str(d.model), cost: num(d.cost), createdAt: num(d.createdAt), lastActivity: num(d.lastActivity) });
 }
 function toApproval(e: ShadowEntity): ApprovalView | null {
   const d = rec(e.data)!; const id = str(d.id); if (!id) return null;

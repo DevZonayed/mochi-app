@@ -136,12 +136,17 @@ export function idTint(id: string, theme: ReturnType<typeof useTheme>['theme']):
 export function useInsets() { return useSafeAreaInsets(); }
 
 // ── project type helpers ────────────────────────────────────────────────────
-export type ProjectKind = 'code' | 'design' | 'content' | 'research' | 'general';
+// The HOST projects one of these canonical kinds (shadow-projection-schema.ts →
+// PROJECT_KINDS): 'coding' | 'design' | 'content' | 'research' | 'general' | 'context'.
+// NOTE: the code kind is 'coding' (NOT 'code') — keying on 'code' silently sent every
+// software project into the "Agent" bucket with a generic folder icon.
+export type ProjectKind = 'coding' | 'design' | 'content' | 'research' | 'general' | 'context';
 const KIND_META: Record<ProjectKind, { icon: IconName; label: string }> = {
-  code: { icon: 'terminal', label: 'Code' },
+  coding: { icon: 'terminal', label: 'Code' },
   design: { icon: 'palette', label: 'Design' },
   content: { icon: 'file', label: 'Content' },
   research: { icon: 'telescope', label: 'Research' },
+  context: { icon: 'chat', label: 'Context' },
   general: { icon: 'folder', label: 'General' },
 };
 export function kindMeta(kind: string | undefined): { icon: IconName; label: string } {
@@ -149,10 +154,11 @@ export function kindMeta(kind: string | undefined): { icon: IconName; label: str
 }
 export function kindColor(kind: string | undefined, theme: ReturnType<typeof useTheme>['theme']): string {
   switch (kind) {
-    case 'code': return theme.color.blue;
+    case 'coding': return theme.color.blue;
     case 'design': return theme.color.purple;
     case 'content': return theme.color.orange;
     case 'research': return theme.color.teal;
+    case 'context': return theme.color.green;
     default: return theme.color.indigo;
   }
 }
