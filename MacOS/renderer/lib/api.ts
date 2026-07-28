@@ -1810,7 +1810,7 @@ export const api = {
   listModels: (refresh = false) => call<ModelGroup[]>('listModels', refresh ? { refresh: true } : {}, () => req<ModelGroup[]>('/api/models')),
   getRoles: () => call<Roles>('getRoles', {}, async () => {
     const r = await req<Routing>('/api/routing');
-    return r.roles ?? { primary: { engine: 'claude', model: 'claude-opus-4-8' }, reviewer: 'off' };
+    return r.roles ?? { primary: { engine: 'claude', model: 'opus' }, reviewer: 'off' };
   }),
   setRoles: (patch: { primaryKey?: string; reviewerKey?: string }) =>
     call<Roles>('setRoles', { ...patch }, () =>

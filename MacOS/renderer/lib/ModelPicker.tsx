@@ -49,6 +49,19 @@ export function useModelGroups(): ModelGroup[] {
 }
 
 const OFF_KEY = 'off';
+const MODEL_KEY_ALIASES: Record<string, string> = {
+  'claude:claude-opus-4-8': 'claude:opus',
+  'claude:claude-opus-5': 'claude:opus',
+  'claude:claude-fable-5': 'claude:fable',
+  'claude:claude-sonnet-5': 'claude:sonnet',
+  'claude:claude-haiku-4-5': 'claude:haiku',
+  'claude:claude-haiku-4-5-20251001': 'claude:haiku',
+  'claude:claude-haiku-4-5-20251001-v1': 'claude:haiku',
+};
+
+export function normalizeModelKey(key: string): string {
+  return MODEL_KEY_ALIASES[key] ?? key;
+}
 
 /** A stored role (engine + model) → the matching picker key, for showing the
     current selection / seeding the composer from the workspace defaults. */
@@ -56,7 +69,7 @@ export function keyForRoleChoice(groups: ModelGroup[], rc: RoleChoice | 'off' | 
   if (!rc || rc === 'off') return OFF_KEY;
   for (const g of groups) for (const d of g.models) if (d.provider === rc.engine && (d.id || '') === (rc.model || '')) return d.key;
   for (const g of groups) for (const d of g.models) if (d.provider === rc.engine) return d.key;
-  return groups.find(g => g.provider === 'claude')?.models[0]?.key ?? 'claude:claude-opus-4-8';
+  return groups.find(g => g.provider === 'claude')?.models[0]?.key ?? 'claude:opus';
 }
 function glyph(p: ModelProviderId, size: number) {
   if (p === 'claude') return <ProviderGlyph provider="anthropic" size={size} />;
@@ -93,11 +106,12 @@ export function ModelPicker({ value, onChange, allowOff, favorites = [], onToggl
   const groups = useModelGroups();
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef<HTMLSpanElement>(null);
+  const normalizedValue = normalizeModelKey(value);
 
   const cur = React.useMemo(() => {
-    for (const g of groups) { const d = g.models.find(m => m.key === value); if (d) return d; }
+    for (const g of groups) { const d = g.models.find(m => m.key === normalizedValue); if (d) return d; }
     return undefined;
-  }, [groups, value]);
+  }, [groups, normalizedValue]);
 
   // flat list of runnable models → ⌘-number shortcuts (1..9)
   const runnableFlat = React.useMemo(() => groups.flatMap(g => g.runnable ? g.models.map(d => d.key) : []), [groups]);
@@ -118,7 +132,7 @@ export function ModelPicker({ value, onChange, allowOff, favorites = [], onToggl
     return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey); };
   }, [open, runnableFlat, onChange]);
 
-  const isOff = allowOff && value === OFF_KEY;
+  const isOff = allowOff && normalizedValue === OFF_KEY;
   const h = compact ? 24 : 32;
   const fav = new Set(favorites);
   let shortcut = 0;
@@ -152,7 +166,7 @@ export function ModelPicker({ value, onChange, allowOff, favorites = [], onToggl
                 {!g.runnable && <span title={g.reason} style={{ font: '500 var(--fs-caption)/1 var(--font-text)', color: 'var(--orange)', textTransform: 'none', letterSpacing: 0 }}>· not signed in</span>}
               </div>
               {g.models.map(d => {
-                const on = d.key === value;
+                const on = d.key === normalizedValue;
                 const n = g.runnable ? ++shortcut : 0;
                 const starred = fav.has(d.key);
                 return (

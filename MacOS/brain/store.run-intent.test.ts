@@ -10,6 +10,13 @@ import { Store } from './store.js';
 describe('Store RunIntent persistence', () => {
   beforeEach(() => { rmSync(hoisted.dir, { recursive: true, force: true }); });
 
+  it('normalizes the legacy Opus 4.8 default role to Claude Code current Opus alias', () => {
+    const s = new Store();
+    s.setRouting({ roles: { primary: { engine: 'claude', model: 'claude-opus-4-8' }, reviewer: 'off' } });
+    expect(s.getRoles().primary).toEqual({ engine: 'claude', model: 'opus' });
+    expect(s.routing().roles?.primary).toEqual({ engine: 'claude', model: 'opus' });
+  });
+
   it('persists full job intent before run admission and keeps legacy mirrors truthful', () => {
     const s = new Store();
     const project = s.createProject({ name: 'Proj' });

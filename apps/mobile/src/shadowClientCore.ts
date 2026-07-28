@@ -686,8 +686,6 @@ class MemoryShadowTransaction implements ShadowStoreTransaction {
     }
     this.state.usedTransitionIds = [...new Set([...this.state.usedTransitionIds, grant.transitionId])];
     this.state.usedTransitionNonces = [...new Set([...this.state.usedTransitionNonces, grant.nonce])];
-    // Invalidate the chain verification cache — a new transition changes the chain.
-    this.verifiedChainFingerprint = null;
     // Filter out any existing audit record for this transitionId before appending —
     // repair-required states (empty in-memory usedTransitionIds) may bypass the
     // replay check in transitionAuthority(), so the store can accumulate duplicates.
@@ -1206,6 +1204,8 @@ export class ShadowMobileClient {
     const verified = await this.authorityTransitionVerifier.verifyAuthorityTransition({ grant, current: this.state.expectedAuthority, next: nextExpected, now });
     if (!verified.ok) return false;
     await this.store.transaction((tx) => tx.consumeAuthorityTransition(grant, nextExpected, { accountId: grant.previousFence.accountId, scopeId: grant.previousFence.scopeId }));
+    // Invalidate the chain verification cache — a new transition changes the chain.
+    this.verifiedChainFingerprint = null;
     this.state = await this.store.load();
     return true;
   }

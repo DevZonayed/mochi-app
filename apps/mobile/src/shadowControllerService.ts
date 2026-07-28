@@ -34,6 +34,7 @@ import type { Fence, ShadowStateEvent, HostCommandAck, CommandLifecycleState } f
 import {
   ShadowRequestClient,
   type ShadowRequestSigner,
+  type ShadowResponse,
   type ShadowTransportConfig,
 } from '@maestro/realtime/shadowRequestClient';
 import { base64urlEncode, type ShadowCryptoBackend } from '@maestro/realtime/shadowCrypto';
@@ -689,7 +690,7 @@ export class ShadowControllerService {
     return 0;
   }
 
-  private async request<T = unknown>(method: string, path: string, body: unknown) {
+  private async request<T = unknown>(method: string, path: string, body: unknown): Promise<ShadowResponse<T>> {
     console.warn('[shadow-svc] req.session ' + method + ' ' + path);
     const session = await this.opts.session();
     console.warn('[shadow-svc] req.go ' + method + ' ' + path);
@@ -703,7 +704,7 @@ export class ShadowControllerService {
       timeoutMs: this.opts.transport.timeoutMs ?? 30_000,
       maxResponseBytes: this.opts.transport.maxResponseBytes,
     });
-    let result: Awaited<ReturnType<ShadowRequestClient['requestEnrolled']>>;
+    let result: ShadowResponse<T>;
     try {
       result = await client.requestEnrolled<T>(
         { accountId: session.accountId, deviceId: session.controllerDeviceId, sessionToken: session.sessionToken },
@@ -717,7 +718,7 @@ export class ShadowControllerService {
       // crashing the entire syncControllerState promise.
       const msg = error instanceof Error ? error.message : 'transport-error';
       console.warn('[shadow-svc] req.error ' + method + ' ' + path + ' ' + msg);
-      return { ok: false as const, status: 0, json: null as T } as { ok: false; status: number; json: T };
+      return { ok: false, status: 0, json: undefined };
     }
     console.warn('[shadow-svc] req.done ' + method + ' ' + path + ' status=' + result.status + ' ok=' + result.ok);
     // Reset the denial counter on any successful (non-401/403) response — the
