@@ -25,7 +25,7 @@ import {
   CountUp,
   type EffortStop,
 } from '../lib/ui';
-import { ModelPicker, useModelGroups, keyForRoleChoice } from '../lib/ModelPicker';
+import { ModelPicker, useModelGroups, keyForRoleChoice, normalizeModelKey } from '../lib/ModelPicker';
 import { AppShell, useWorkspaceName } from '../lib/appShell';
 import { api, IS_LOCAL, type Project, type Job, type Effort, type RepoInfo, type ChatSession, type EngineId, type TranscriptItem, type ChatImage, type ChatFile, type InstalledSkill, type RegistrySkillSummary, type Skill as ApiSkill, type ConvSource, type ScannedConversation, type ConversationScan, type BgTask, type Schedule } from '../lib/api';
 import { OpenPathContext, type OpenPathFn } from '../lib/openPath';
@@ -3168,10 +3168,10 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
   // Primary (coding) + reviewer model. Remembered across the app via localStorage;
   // seeded from the workspace role defaults when the user hasn't chosen yet.
   const modelGroups = useModelGroups();
-  const [primaryKey, setPrimaryKeyState] = React.useState<string>(() => { try { return localStorage.getItem('maestro.chat.primary') || ''; } catch { return ''; } });
-  const [reviewerKey, setReviewerKeyState] = React.useState<string>(() => { try { return localStorage.getItem('maestro.chat.reviewer') || ''; } catch { return ''; } });
-  const setPrimaryKey = (k: string) => { setPrimaryKeyState(k); try { localStorage.setItem('maestro.chat.primary', k); } catch { /* storage unavailable */ } };
-  const setReviewerKey = (k: string) => { setReviewerKeyState(k); try { localStorage.setItem('maestro.chat.reviewer', k); } catch { /* storage unavailable */ } };
+  const [primaryKey, setPrimaryKeyState] = React.useState<string>(() => { try { return normalizeModelKey(localStorage.getItem('maestro.chat.primary') || ''); } catch { return ''; } });
+  const [reviewerKey, setReviewerKeyState] = React.useState<string>(() => { try { return normalizeModelKey(localStorage.getItem('maestro.chat.reviewer') || ''); } catch { return ''; } });
+  const setPrimaryKey = (k: string) => { const next = normalizeModelKey(k); setPrimaryKeyState(next); try { localStorage.setItem('maestro.chat.primary', next); } catch { /* storage unavailable */ } };
+  const setReviewerKey = (k: string) => { const next = normalizeModelKey(k); setReviewerKeyState(next); try { localStorage.setItem('maestro.chat.reviewer', next); } catch { /* storage unavailable */ } };
   const [favorites, setFavorites] = React.useState<string[]>([]);
   React.useEffect(() => { api.getSettings().then(s => setFavorites(s.favoriteModels ?? [])).catch(() => {}); }, []);
   const toggleFavorite = (key: string) => setFavorites(prev => {
@@ -3191,7 +3191,7 @@ export function ChatThread({ projectId, project, sessionId, base, onSessionCreat
     if (reviewerKey && reviewerKey !== 'off') return reviewerKey;
     if (primaryKey && primaryKey !== 'off') return primaryKey;
     const first = modelGroups.find(g => g.runnable && g.models.length > 0)?.models[0]?.key;
-    return first ?? 'claude:claude-opus-4-8';
+    return first ?? 'claude:opus';
   }, [modelGroups, primaryKey, reviewerKey]);
   const toggleReviewer = React.useCallback(async () => {
     if (!activeId) return;

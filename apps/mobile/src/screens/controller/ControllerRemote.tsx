@@ -106,7 +106,7 @@ export function ControllerRemote() {
             {/* Floating status bar at top */}
             {toolbarVisible ? (
               <Animated.View style={{ position: 'absolute', top: insets.top + 8, alignSelf: 'center', opacity: toolbarOpacity }}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7, backgroundColor: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(10)', paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20, borderWidth: 0.5, borderColor: 'rgba(255,255,255,0.15)' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 7, backgroundColor: 'rgba(0,0,0,0.7)', paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20, borderWidth: 0.5, borderColor: 'rgba(255,255,255,0.15)' }}>
                   <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: theme.color.green }} />
                   <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }}>Live</Text>
                   <View style={{ width: 1, height: 12, backgroundColor: 'rgba(255,255,255,0.2)' }} />
