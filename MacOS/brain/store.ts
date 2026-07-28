@@ -504,7 +504,7 @@ export interface Roles {
   /** Reviewer model — reviews it, or 'off'. */
   reviewer: RoleChoice | 'off';
 }
-export const DEFAULT_ROLES: Roles = { primary: { engine: 'claude', model: 'claude-opus-4-8' }, reviewer: 'off' };
+export const DEFAULT_ROLES: Roles = { primary: { engine: 'claude', model: 'opus' }, reviewer: 'off' };
 export interface Routing {
   /** Master agent — runs jobs. Mirrors roles.primary.engine for back-compat. */
   master: EngineId;
@@ -517,6 +517,21 @@ export interface Routing {
   roles?: Roles;
 }
 export const DEFAULT_ROUTING: Routing = { master: 'claude', reviewer: 'off', image: 'codex', video: 'codex', roles: { ...DEFAULT_ROLES } };
+
+const LEGACY_DEFAULT_CLAUDE_MODELS = new Set(['claude-opus-4-8']);
+function normalizeRoleChoice(role: RoleChoice): RoleChoice {
+  if (role.engine === 'claude' && role.model && LEGACY_DEFAULT_CLAUDE_MODELS.has(role.model)) {
+    return { ...role, model: 'opus' };
+  }
+  return { ...role };
+}
+function normalizeRoles(roles: Roles | undefined): Roles {
+  const r = roles ?? DEFAULT_ROLES;
+  return {
+    primary: normalizeRoleChoice(r.primary),
+    reviewer: r.reviewer === 'off' ? 'off' : normalizeRoleChoice(r.reviewer),
+  };
+}
 
 export interface Skill { id: string; name: string; description: string; category: string; kind: string; version: string; enabled: boolean; createdAt: number }
 export interface Template { id: string; name: string; description: string; category: string; icon: string; engine: string; createdAt: number }
@@ -1278,10 +1293,17 @@ export class Store {
       if (this.data.routing && !this.data.routing.roles) {
         const r = this.data.routing;
         this.data.routing.roles = {
-          primary: { engine: r.master ?? 'claude', model: (r.master ?? 'claude') === 'claude' ? 'claude-opus-4-8' : undefined },
+          primary: { engine: r.master ?? 'claude', model: (r.master ?? 'claude') === 'claude' ? 'opus' : undefined },
           reviewer: r.reviewer && r.reviewer !== 'off' ? { engine: r.reviewer } : 'off',
         };
         dirty = true;
+      }
+      if (this.data.routing?.roles) {
+        const normalizedRoles = normalizeRoles(this.data.routing.roles);
+        if (JSON.stringify(normalizedRoles) !== JSON.stringify(this.data.routing.roles)) {
+          this.data.routing.roles = normalizedRoles;
+          dirty = true;
+        }
       }
       if (!this.data.settings) { this.data.settings = { ...DEFAULT_SETTINGS }; dirty = true; }
       if (this.data.settings && !this.data.settings.favoriteModels) { this.data.settings.favoriteModels = []; dirty = true; }
@@ -1832,17 +1854,18 @@ export class Store {
     return this.remoteDevices;
   }
 
-  routing(): Routing { return { ...this.data.routing }; }
+  routing(): Routing { return { ...this.data.routing, roles: normalizeRoles(this.data.routing.roles) }; }
   setRouting(patch: Partial<Routing>): Routing {
     this.data.routing = { ...this.data.routing, ...patch };
+    this.data.routing.roles = normalizeRoles(this.data.routing.roles);
     this.save();
     return this.routing();
   }
 
-  getRoles(): Roles { return this.data.routing.roles ? { ...this.data.routing.roles } : { ...DEFAULT_ROLES }; }
+  getRoles(): Roles { return normalizeRoles(this.data.routing.roles); }
   setRoles(patch: Partial<Roles>): Roles {
-    const cur = this.data.routing.roles ?? { ...DEFAULT_ROLES };
-    const next: Roles = { ...cur, ...patch };
+    const cur = this.getRoles();
+    const next: Roles = normalizeRoles({ ...cur, ...patch });
     this.data.routing.roles = next;
     // Keep the legacy engine-level fields consistent (cron + older callers read them).
     this.data.routing.master = next.primary.engine;
