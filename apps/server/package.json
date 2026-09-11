@@ -38,6 +38,6 @@
     "@types/ws": "^8.18.1",
     "ioredis-mock": "^8.13.1",
     "typescript": "^5.6.3",
-    "vitest": "^4.1.9"
+    "vitest": "^4.1.11"
   }
 }
